@@ -1,2 +1,2 @@
 # The cross-language Fernet checks (fernet_golden.py) need only this; pinned to the version the samples were made with.
-cryptography==46.0.5
+cryptography==50.0.0
