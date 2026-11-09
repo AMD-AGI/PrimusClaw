@@ -1,594 +1,598 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "body": [
-          {
-            "items": [
-              {
-                "size": "Medium",
-                "text": "📋 你的事项",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              },
-              {
-                "isSubtle": true,
-                "size": "Small",
-                "spacing": "None",
-                "text": "2 件等你处理",
-                "type": "TextBlock",
-                "wrap": true
-              }
-            ],
-            "type": "Container"
-          },
-          {
-            "columns": [
-              {
-                "id": "badge-needs_you",
-                "items": [
-                  {
-                    "horizontalAlignment": "Center",
-                    "size": "Small",
-                    "text": "⚠️ **2** 待处理",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "style": "warning",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              },
-              {
-                "id": "badge-working",
-                "items": [
-                  {
-                    "horizontalAlignment": "Center",
-                    "size": "Small",
-                    "text": "⏳ **5** 进行中",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "style": "accent",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              },
-              {
-                "id": "badge-good",
-                "items": [
-                  {
-                    "horizontalAlignment": "Center",
-                    "size": "Small",
-                    "text": "✅ **4** 已完成",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "style": "good",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "color": "Warning",
-                    "size": "Medium",
-                    "text": "┃",
-                    "type": "TextBlock",
-                    "weight": "Bolder"
-                  }
-                ],
-                "spacing": "None",
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "text": "⚠️ 待你处理 · 2",
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "id": "band-needs_you",
-            "spacing": "Medium",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "⚠️",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#12** 审 AMD-AGI/Primus-SaFE#481 · 结果 v2 待接受 · 25 分钟前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-c",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "❓",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#11** 给 fleetpilot 加超时告警 · 在问：告警发到哪个 Teams 频道？ · 5 小时前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-d",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "color": "Accent",
-                    "size": "Medium",
-                    "text": "┃",
-                    "type": "TextBlock",
-                    "weight": "Bolder"
-                  }
-                ],
-                "spacing": "None",
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "text": "⏳ 进行中 · 5",
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "id": "band-working",
-            "spacing": "Medium",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "🔍",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#14** 审 example-org/example-repo#292 · 正在看 github\\_review.py 的跟踪逻辑，已读 9 个文件 · 7 分钟前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-a",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "⏳",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#13** 整理本周 SaFE 节点故障 · 已汇总 38 台节点 · 3 小时前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-b",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "⏳",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#15** 排查 mi355x 训练任务 OOM · 复现中：第 3 次运行 · 1 小时前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-i",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "id": "more-in_progress-toggle",
-            "items": [
-              {
-                "color": "Accent",
-                "size": "Small",
-                "text": "还有 2 条 ▾",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              }
-            ],
-            "selectAction": {
-              "targetElements": ["more-in_progress"],
-              "title": "还有 2 条",
-              "type": "Action.ToggleVisibility"
-            },
-            "spacing": "Small",
-            "type": "Container"
-          },
-          {
-            "id": "more-in_progress",
-            "isVisible": false,
-            "items": [
-              {
-                "columns": [
-                  {
-                    "items": [
-                      {
-                        "text": "⏳",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "type": "Column",
-                    "width": "auto"
-                  },
-                  {
-                    "items": [
-                      {
-                        "maxLines": 1,
-                        "text": "**#16** 写本周 Clawy 周报 · 已整理 12 条 · 2 小时前",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "spacing": "Small",
-                    "type": "Column",
-                    "width": "stretch"
-                  }
-                ],
-                "id": "row-j",
-                "spacing": "Small",
-                "type": "ColumnSet"
-              },
-              {
-                "columns": [
-                  {
-                    "items": [
-                      {
-                        "text": "🔍",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "type": "Column",
-                    "width": "auto"
-                  },
-                  {
-                    "items": [
-                      {
-                        "maxLines": 1,
-                        "text": "**#17** 审 AMD-AGI/Hyperloom#80 · 排队中 · 3 小时前",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "spacing": "Small",
-                    "type": "Column",
-                    "width": "stretch"
-                  }
-                ],
-                "id": "row-k",
-                "spacing": "Small",
-                "type": "ColumnSet"
-              }
-            ],
-            "spacing": "Small",
-            "type": "Container"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "color": "Good",
-                    "size": "Medium",
-                    "text": "┃",
-                    "type": "TextBlock",
-                    "weight": "Bolder"
-                  }
-                ],
-                "spacing": "None",
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "text": "✅ 已完成 · 4",
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "id": "band-good",
-            "spacing": "Medium",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "✅",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#9** 审 AMD-AGI/Hyperloom#77 · 2 天前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-e",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "⏹️",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#8** 清理过期的 worktree · 3 天前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-f",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "text": "✅",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "maxLines": 1,
-                    "text": "**#7** 升级 SaFE 节点驱动到 6.4 · 3 天前",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "width": "stretch"
-              }
-            ],
-            "id": "row-g",
-            "spacing": "Small",
-            "type": "ColumnSet"
-          },
-          {
-            "id": "more-done-toggle",
-            "items": [
-              {
-                "color": "Accent",
-                "size": "Small",
-                "text": "还有 1 条 ▾",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              }
-            ],
-            "selectAction": {
-              "targetElements": ["more-done"],
-              "title": "还有 1 条",
-              "type": "Action.ToggleVisibility"
-            },
-            "spacing": "Small",
-            "type": "Container"
-          },
-          {
-            "id": "more-done",
-            "isVisible": false,
-            "items": [
-              {
-                "columns": [
-                  {
-                    "items": [
-                      {
-                        "text": "🗑️",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "type": "Column",
-                    "width": "auto"
-                  },
-                  {
-                    "items": [
-                      {
-                        "maxLines": 1,
-                        "text": "**#6** 审 AMD-AGI/Primus-SaFE#470 · 4 天前",
-                        "type": "TextBlock",
-                        "wrap": true
-                      }
-                    ],
-                    "spacing": "Small",
-                    "type": "Column",
-                    "width": "stretch"
-                  }
-                ],
-                "id": "row-h",
-                "spacing": "Small",
-                "type": "ColumnSet"
-              }
-            ],
-            "spacing": "Small",
-            "type": "Container"
-          }
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "body": [
+     {
+      "items": [
+       {
+        "size": "Medium",
+        "text": "📋 你的事项",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       },
+       {
+        "isSubtle": true,
+        "size": "Small",
+        "spacing": "None",
+        "text": "2 件等你处理",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "type": "Container"
+     },
+     {
+      "columns": [
+       {
+        "id": "badge-needs_you",
+        "items": [
+         {
+          "horizontalAlignment": "Center",
+          "size": "Small",
+          "text": "⚠️ **2** 待处理",
+          "type": "TextBlock",
+          "wrap": true
+         }
         ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
+        "spacing": "Small",
+        "style": "warning",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       },
+       {
+        "id": "badge-working",
+        "items": [
+         {
+          "horizontalAlignment": "Center",
+          "size": "Small",
+          "text": "⏳ **5** 进行中",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "style": "accent",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       },
+       {
+        "id": "badge-good",
+        "items": [
+         {
+          "horizontalAlignment": "Center",
+          "size": "Small",
+          "text": "✅ **4** 已完成",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "style": "good",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Warning",
+          "size": "Medium",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "text": "⚠️ 待你处理 · 2",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "id": "band-needs_you",
+      "spacing": "Medium",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "⚠️",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#12** 审 AMD-AGI/Primus-SaFE#481 · 结果 v2 待接受 · 25 分钟前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-c",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "❓",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#11** 给 fleetpilot 加超时告警 · 在问：告警发到哪个 Teams 频道？ · 5 小时前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-d",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Medium",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "text": "⏳ 进行中 · 5",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "id": "band-working",
+      "spacing": "Medium",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "🔍",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#14** 审 example-org/example-repo#292 · 正在看 github\\_review.py 的跟踪逻辑，已读 9 个文件 · 7 分钟前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-a",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "⏳",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#13** 整理本周 SaFE 节点故障 · 已汇总 38 台节点 · 3 小时前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-b",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "⏳",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#15** 排查 mi355x 训练任务 OOM · 复现中：第 3 次运行 · 1 小时前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-i",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "id": "more-in_progress-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "还有 2 条 ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "more-in_progress"
+       ],
+       "title": "还有 2 条",
+       "type": "Action.ToggleVisibility"
       },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "more-in_progress",
+      "isVisible": false,
+      "items": [
+       {
+        "columns": [
+         {
+          "items": [
+           {
+            "text": "⏳",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "type": "Column",
+          "width": "auto"
+         },
+         {
+          "items": [
+           {
+            "maxLines": 1,
+            "text": "**#16** 写本周 Clawy 周报 · 已整理 12 条 · 2 小时前",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "spacing": "Small",
+          "type": "Column",
+          "width": "stretch"
+         }
+        ],
+        "id": "row-j",
+        "spacing": "Small",
+        "type": "ColumnSet"
+       },
+       {
+        "columns": [
+         {
+          "items": [
+           {
+            "text": "🔍",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "type": "Column",
+          "width": "auto"
+         },
+         {
+          "items": [
+           {
+            "maxLines": 1,
+            "text": "**#17** 审 AMD-AGI/Hyperloom#80 · 排队中 · 3 小时前",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "spacing": "Small",
+          "type": "Column",
+          "width": "stretch"
+         }
+        ],
+        "id": "row-k",
+        "spacing": "Small",
+        "type": "ColumnSet"
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Good",
+          "size": "Medium",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "text": "✅ 已完成 · 4",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "id": "band-good",
+      "spacing": "Medium",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "✅",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#9** 审 AMD-AGI/Hyperloom#77 · 2 天前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-e",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "⏹️",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#8** 清理过期的 worktree · 3 天前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-f",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "text": "✅",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "maxLines": 1,
+          "text": "**#7** 升级 SaFE 节点驱动到 6.4 · 3 天前",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "width": "stretch"
+       }
+      ],
+      "id": "row-g",
+      "spacing": "Small",
+      "type": "ColumnSet"
+     },
+     {
+      "id": "more-done-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "还有 1 条 ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "more-done"
+       ],
+       "title": "还有 1 条",
+       "type": "Action.ToggleVisibility"
+      },
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "more-done",
+      "isVisible": false,
+      "items": [
+       {
+        "columns": [
+         {
+          "items": [
+           {
+            "text": "🗑️",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "type": "Column",
+          "width": "auto"
+         },
+         {
+          "items": [
+           {
+            "maxLines": 1,
+            "text": "**#6** 审 AMD-AGI/Primus-SaFE#470 · 4 天前",
+            "type": "TextBlock",
+            "wrap": true
+           }
+          ],
+          "spacing": "Small",
+          "type": "Column",
+          "width": "stretch"
+         }
+        ],
+        "id": "row-h",
+        "spacing": "Small",
+        "type": "ColumnSet"
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }
