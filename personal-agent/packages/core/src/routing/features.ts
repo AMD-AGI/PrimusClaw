@@ -84,9 +84,9 @@ export interface Attachment {
   readonly cardWindowLine: string;
 }
 
-/** One turn of an attached agent: settles when it is over. */
+/** One turn of an attached agent, as the remote-agent feature follows it: the work that reads it (null: none yet). */
 export interface RemoteTurn {
-  readonly ended: Promise<unknown>;
+  readonly task: { readonly done: Promise<void>; readonly running: boolean } | null;
 }
 
 export interface RemotePrompt {

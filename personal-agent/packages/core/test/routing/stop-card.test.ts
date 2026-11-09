@@ -122,6 +122,17 @@ test("test_the_card_of_an_earlier_turn_never_stops_the_next_one", async () => {
 
 function remoteWorld() {
   let turn: (RemoteTurn & { end: () => void }) | undefined;
+  const turnOf = (): RemoteTurn & { end: () => void } => {
+    const ended = gate();
+    const task = { done: ended.promise, running: true };
+    return {
+      task,
+      end: () => {
+        task.running = false;
+        ended.open();
+      },
+    };
+  };
   const stops: unknown[] = [];
   const w = world({
     remote: {
@@ -130,8 +141,7 @@ function remoteWorld() {
       windowed: () => false,
       currentTurn: () => turn,
       prompt: () => {
-        const ended = gate();
-        turn = { ended: ended.promise, end: ended.open };
+        turn = turnOf();
         return Promise.resolve();
       },
       stop: (_chat, _key, _conv, only) => {

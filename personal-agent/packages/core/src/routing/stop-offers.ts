@@ -72,22 +72,13 @@ export class StopOffers {
     const { remote } = this.ctx.deps;
     const userId = chat.sender.id;
     const turn = remote.currentTurn?.(userId);
-    if (
-      turn === undefined ||
-      turn === before ||
-      remote.windowed?.(userId) !== false ||
-      !isMobile(message.clientPlatform)
-    )
-      return;
-    let over = false;
-    void turn.ended.then(
-      () => (over = true),
-      () => (over = true),
-    );
+    const task = turn?.task ?? null;
+    if (turn === undefined || turn === before || task === null || !task.running) return;
+    if (remote.windowed?.(userId) !== false || !isMobile(message.clientPlatform)) return;
     offerStopCard(this.ctx, chat, {
       kind: "remote",
-      alive: () => Promise.resolve(!over && remote.currentTurn?.(userId) === turn),
-      ended: turn.ended,
+      alive: () => Promise.resolve(task.running && remote.currentTurn?.(userId) === turn),
+      ended: task.done,
       stop: (at, credential) => remote.stop(at.sender, credential, at.conversation, turn),
     });
   }
