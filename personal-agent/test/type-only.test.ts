@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
-import { packagesToCheck } from "../scripts/coverage.js";
+import { codeOutsideSrc, missingFromReport, packagesToCheck } from "../scripts/coverage.js";
 import { isTypeOnly, sourceFiles, symlinksUnder, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -148,4 +148,76 @@ test("a package's src that is itself a link, and a package directory that is a l
     "packages/core/src is a symbolic link (not allowed: src must be the package's own directory)",
     "packages/teams/src is a symbolic link (not allowed: src must be the package's own directory)",
   ]);
+});
+
+test("a package without src is refused, not skipped", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  fs.mkdirSync(path.join(packages, "empty"), { recursive: true });
+  fs.writeFileSync(path.join(packages, "empty", "package.json"), "{}");
+  assert.deepEqual(packagesToCheck(packages, { empty: 85 }).errors, ["packages/empty has no src directory"]);
+});
+
+test("a file with runtime code that c8's report does not hold is named, wherever the report put its paths", () => {
+  const base = "/w";
+  const expected = ["packages/a/src/x.ts", "packages/a/src/test/y.ts", "packages/a/src/node_modules/z.ts"];
+  assert.deepEqual(missingFromReport(expected, ["/w/packages/a/src/x.ts"], base), [
+    "packages/a/src/test/y.ts",
+    "packages/a/src/node_modules/z.ts",
+  ]);
+  assert.deepEqual(
+    missingFromReport(expected, [...expected.map((f) => `/w/${f}`), "/w/packages/a/src/extra.ts"], base),
+    [],
+  );
+  assert.deepEqual(missingFromReport(expected, expected, base), []);
+});
+
+test("the judgement reads statements, not emitted text: what only looks like compiler output still counts", () => {
+  assert.equal(isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\n', "a.ts"), false);
+  assert.equal(
+    isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\nexport {};\n', "a.cts"),
+    false,
+  );
+  assert.equal(isTypeOnly('"use strict";\n'), false);
+  assert.equal(isTypeOnly("#!/usr/bin/env node\nexport interface A {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly('import { type A } from "./a.js";\nexport type B = A;\n'), false);
+  assert.equal(isTypeOnly('export { type A } from "./a.js";\n'), false);
+  assert.equal(isTypeOnly('import type { A } from "./a.js";\nexport { type A };\n'), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export type X = string;\n}\n"), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export const x = 1;\n}\n"), false);
+  assert.equal(isTypeOnly("declare global {\n  interface Window { x: string }\n}\nexport {};\n"), true);
+  assert.equal(isTypeOnly("export declare enum E { A }\nexport const enum F { B }\n"), false);
+  assert.equal(isTypeOnly("export default interface D {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly("const x = 1;\nexport default x;\n"), false);
+  assert.equal(isTypeOnly("export = {};\n", "a.cts"), false);
+});
+
+test("a package whose entry points or source files lie outside src is refused", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  const pkg = path.join(packages, "core");
+  fs.mkdirSync(path.join(pkg, "src"), { recursive: true });
+  fs.mkdirSync(path.join(pkg, "test"));
+  fs.mkdirSync(path.join(pkg, "lib"));
+  fs.mkdirSync(path.join(pkg, "node_modules", "x"), { recursive: true });
+  const manifest = {
+    exports: { ".": { types: "./src/index.ts", default: "./outside.js" }, "./more": "./src/more.ts" },
+    main: "./src/index.ts",
+    bin: { tool: "./bin/tool.js" },
+  };
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify(manifest));
+  for (const f of ["src/index.ts", "test/a.test.ts", "outside.js", "lib/helper.ts", "node_modules/x/index.js"]) {
+    fs.writeFileSync(path.join(pkg, f), "export const x = 1;\n");
+  }
+  fs.writeFileSync(path.join(pkg, "README.md"), "# core\n");
+  assert.deepEqual(codeOutsideSrc(packages, "core"), [
+    "packages/core/package.json points at ./outside.js, outside src (the floor would not see it)",
+    "packages/core/package.json points at ./bin/tool.js, outside src (the floor would not see it)",
+    "packages/core/lib/helper.ts is source outside src/ and test/",
+    "packages/core/outside.js is source outside src/ and test/",
+  ]);
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ exports: { ".": "./src/index.ts" } }));
+  fs.rmSync(path.join(pkg, "outside.js"));
+  fs.rmSync(path.join(pkg, "lib"), { recursive: true });
+  assert.deepEqual(codeOutsideSrc(packages, "core"), []);
 });

@@ -65,3 +65,26 @@ test("an offset that moves a time out of the years one to 9999 is not a time and
   assert.equal(whenOf("0001-01-01T00:00+01:00"), "");
   assert.equal(whenOf("2026-11-03T08:36:40+01:60"), "2026-11-03 06:36 UTC");
 });
+
+test("a time written in any script's decimal digits reads as python's int() reads it", () => {
+  // (expected values computed by the Python worker's _when)
+  const cases: Array<[string, string]> = [
+    ["1762152800", "2025-11-03 06:53 UTC"],
+    ["1762152800123", "2025-11-03 06:53 UTC"],
+    ["١٧٦٢١٥٢٨٠٠", "2025-11-03 06:53 UTC"],
+    ["１７６２１５２８００", "2025-11-03 06:53 UTC"],
+    ["１７６２１５２８００１２３", "2025-11-03 06:53 UTC"],
+    ["¹⁷⁶²", ""],
+    ["17621528001234567890123", ""],
+    ["0", "1970-01-01 00:00 UTC"],
+    ["99999999999999999999999999999999999", ""],
+    ["2026-11-03T08:36:00+08:00", "2026-11-03 00:36 UTC"],
+    ["２０２６-11-03", ""],
+    ["20261103T0836Z", "2026-11-03 08:36 UTC"],
+    ["2026-W45-2T10:00", "2026-11-03 10:00 UTC"],
+    ["  1762152800 ", "2025-11-03 06:53 UTC"],
+    ["1762152800.5", ""],
+    ["", ""],
+  ];
+  for (const [raw, expected] of cases) assert.equal(whenOf(raw), expected, raw);
+});

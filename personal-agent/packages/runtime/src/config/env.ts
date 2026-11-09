@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ConfigError, pyStrip } from "@primusclaw/personal-agent";
+import { ConfigError, decimalBigInt, pyStrip } from "@primusclaw/personal-agent";
 
 /** The process environment, or a test's. */
 export type Env = Readonly<Record<string, string | undefined>>;
@@ -49,19 +49,23 @@ export class EnvReader {
   positiveInt(name: string, fallback: number): number {
     const value = this.text(name);
     if (value === "") return fallback;
-    if (!/^[0-9]+$/.test(value) || Number(value) <= 0) {
+    // Python's `raw.isdigit() and int(raw) > 0`: decimal digits of any script
+    const number = decimalBigInt(value);
+    if (number === undefined || number <= 0n) {
       throw new ConfigError(`${name} must be a positive whole number, not ${pyRepr(value)}`);
     }
-    return Number(value);
+    return Number(number);
   }
 
   /** A whole number (Python's `int()` of the value: a sign, surrounding space and `_` between digits allowed). */
   int(name: string, fallback: string): number {
     const value = pyStrip(this.raw(name, fallback));
-    if (!/^[+-]?[0-9]+(?:_[0-9]+)*$/.test(value)) {
+    const match = /^([+-]?)(\p{Nd}+(?:_\p{Nd}+)*)$/u.exec(value);
+    const digits = match === null ? undefined : decimalBigInt((match[2] ?? "").replaceAll("_", ""));
+    if (match === null || digits === undefined) {
       throw new ConfigError(`${name} must be a whole number, not ${pyRepr(value)}`);
     }
-    return Number(value.replaceAll("_", ""));
+    return Number(match[1] === "-" ? -digits : digits);
   }
 
   /** A whole number, or null when unset or blank. */

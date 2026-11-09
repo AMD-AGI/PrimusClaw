@@ -54,3 +54,4 @@ export * from "./observability/security-fields.js";
 export * from "./observability/security-log.js";
 export * from "./claw/py-value.js";
 export * from "./observability/metrics-catalog.js";
+export * from "./language/detect.js";

@@ -26,7 +26,7 @@ import type {
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { bodyJson, json, type HttpRequest, type HttpResponse, type HttpRoute } from "./routes.js";
+import { bodyJson, json, pythonStr, type HttpRequest, type HttpResponse, type HttpRoute } from "./routes.js";
 
 /** The largest event Claw posts, with room (a say of 9000 characters with its sources, or an image carried inline). */
 export const MAX_BODY_BYTES = 128 * 1024;
@@ -66,14 +66,11 @@ function sameText(a: string, b: string): boolean {
   return x.length === y.length ? timingSafeEqual(x, y) : !timingSafeEqual(y, y);
 }
 
-const ClawEvent = z.object({ event_id: z.unknown(), user_id: z.unknown() }).loose();
-
-/** Python's `str(x)` of a JSON scalar (an id written as a number is the same id). */
-function idText(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return String(value);
-  return undefined;
-}
+/** The event's two ids must be there (of any JSON type: Python's `str()` is taken of them). */
+const ClawEvent = z
+  .object({ event_id: z.unknown(), user_id: z.unknown() })
+  .loose()
+  .refine((event) => "event_id" in event && "user_id" in event);
 
 /** Seconds from when Claw says the event happened (ISO 8601 with a zone) to `nowSeconds`; null when it does not say. */
 export function sinceOccurred(occurredAt: unknown, nowSeconds: number): number | null {
@@ -118,9 +115,8 @@ function parsedEvent(request: HttpRequest): ParsedEvent | undefined {
   const raw = bodyJson(request);
   const parsed = ClawEvent.safeParse(raw);
   if (!parsed.success || !isEvent(raw)) return undefined;
-  const eventId = idText(parsed.data.event_id);
-  const userId = idText(parsed.data.user_id);
-  if (eventId === undefined || userId === undefined) return undefined;
+  const eventId = pythonStr(parsed.data.event_id);
+  const userId = pythonStr(parsed.data.user_id);
   // (the header is not signed: the signed body's id is the one used, and a header that disagrees is refused)
   if ((request.headers["x-claw-event-id"] ?? eventId) !== eventId) return undefined;
   return { event: raw, eventId, userId };

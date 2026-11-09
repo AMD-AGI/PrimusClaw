@@ -14,8 +14,11 @@ import { redactPublicJson } from "../events/redaction.js";
 import {
   REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
-  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat,
+  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
 } from "@claw/protocol";
+import { withHidden } from "./hidden.js";
+
+export { withHidden };
 
 export type Row = Record<string, any>;
 
@@ -244,28 +247,8 @@ async function hiddenRefs(owner: string): Promise<Map<string, Set<string>>> {
   return out;
 }
 
-/**
- * An agent row with the conversations its owner hid taken out of `capabilities.resumable` (`includeHidden`: kept, marked
- * `hidden: true`), and how many were (`capabilities.hidden_count`). A conversation a process has open (`live`) or that a session
- * of theirs holds (`attached`) is never hidden: it is listed whatever was asked.
- */
-export function withHidden(agent: Row, hidden: Set<string> | undefined, includeHidden: boolean): Row {
-  const caps = agent.capabilities;
-  if (!hidden?.size || !caps || typeof caps !== "object" || !Array.isArray((caps as Row).resumable)) return agent;
-  const kept: unknown[] = [];
-  let count = 0;
-  for (const entry of (caps as Row).resumable as unknown[]) {
-    const ref = entry && typeof entry === "object" ? String((entry as Row).ref ?? "") : "";
-    const state = entry && typeof entry === "object" ? (entry as Row).state : null;
-    if (!hidden.has(ref) || state === "live" || state === "attached") { kept.push(entry); continue; }
-    count += 1;
-    if (includeHidden) kept.push({ ...(entry as Row), hidden: true });
-  }
-  return { ...agent, capabilities: { ...(caps as Row), resumable: kept, hidden_count: count } };
-}
-
-/** What a hide or show of conversations did: the refs changed, and the ones refused with why. */
-export interface HideOutcome { changed: string[]; refused: Array<{ ref: string; reason: "live" | "unknown_conversation" }> }
+/** What a hide or show of conversations did: the refs changed, and the ones refused with why (`@claw/protocol`). */
+export type HideOutcome = RemoteHidden;
 
 /**
  * Hide (or show again) conversations of one of the owner's machines in their lists. Only conversations the machine reports now
