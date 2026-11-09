@@ -8,12 +8,12 @@
 import { APPROVAL_CARDS } from "./approval.js";
 import type { CatalogEntry } from "./catalog.js";
 import { REMOTE } from "./remote.js";
+import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...REMOTE];
+export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...REMOTE, ...TURN];
 
 const BY_LINE = {
-  W4: ["binding", "link", "onboarding", "repo"],
-  W4b: ["changes", "error_note", "inactive_note", "session", "show_here_note"],
+  W4: ["binding", "link", "onboarding", "repo", "session"],
   W5: [
     "answered",
     "approval_decided",
@@ -24,7 +24,6 @@ const BY_LINE = {
     "assistant_confirm",
     "board",
     "board_asked",
-    "delivery",
     "digest",
     "question_item",
     "run_completed",

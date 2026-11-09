@@ -9,11 +9,13 @@ import { approvalRenderers } from "./approval/index.js";
 import { FEEDBACK_RENDERERS } from "./feedback/index.js";
 import type { Renderers } from "./registry.js";
 import { REMOTE_RENDERERS } from "./remote/index.js";
+import { TURN_RENDERERS } from "./turn/index.js";
 
 export const RENDERERS: Renderers = {
   ...approvalRenderers,
   ...FEEDBACK_RENDERERS,
   ...REMOTE_RENDERERS,
+  ...TURN_RENDERERS,
 };
 
 export { renderView, type Renderer, type Renderers, type TeamsMessage } from "./registry.js";
