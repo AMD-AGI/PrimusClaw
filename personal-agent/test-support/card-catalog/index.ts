@@ -33,7 +33,6 @@ const BY_LINE = {
     "work_result",
     "work_stopped",
   ],
-  W6b: ["remote_window", "remote_window_en"],
   W7: ["github_connect", "review_confirm_merge", "review_confirm_post", "review_end", "review_mode", "review_start"],
   W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;

@@ -5,7 +5,14 @@
 import { remoteView } from "../../packages/core/src/index.js";
 import { ConnectorSetup, setupFrom } from "../../packages/core/src/remote/connector/setup.js";
 import type { Agent, Connector, Session } from "../../packages/core/src/remote/model.js";
-import { agentsCard, permissionCard, sessionsCard, statusCard } from "../../packages/teams/src/views/remote/index.js";
+import { WindowView } from "../../packages/core/src/remote/window/view.js";
+import {
+  agentsCard,
+  permissionCard,
+  sessionsCard,
+  statusCard,
+  windowCard,
+} from "../../packages/teams/src/views/remote/index.js";
 import { disconnectCard } from "../../packages/teams/src/views/remote/small-cards.js";
 import { type CatalogEntry, NOW, TZ, entriesWithEmoji } from "./catalog.js";
 
@@ -69,6 +76,20 @@ const sessions = (
   sessionsCard(
     remoteView.sessionsView({ connectors, sessions: list, attached, now: NOW, lang: "zh", setup: SETUP, waiting }),
   );
+
+/** A window's view of session rs-1 as the Python tests build it (`WindowView(session_id="rs-1", ...)`). */
+export function windowState(
+  fields: Partial<Pick<WindowView, "text" | "step" | "sent" | "queued" | "note">> = {},
+): WindowView {
+  const view = new WindowView();
+  view.reset("rs-1");
+  view.setText(fields.text ?? "");
+  view.step = fields.step ?? "";
+  view.sent = fields.sent ?? "";
+  view.queued = fields.queued ?? "";
+  view.note = fields.note ?? "";
+  return view;
+}
 
 export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
   remoteView.KIND_ICONS,
@@ -219,6 +240,67 @@ export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
         ],
         [],
         null,
+      ),
+  ],
+  [
+    "remote_window", // (the session card as the window: output, an approval waiting, the text box and Send)
+    () =>
+      windowCard(
+        remoteView.windowView({
+          label: "🟠 Claude Code",
+          host: "robin-dev",
+          cwd: "/root/ws/active",
+          mode: "default",
+          sessionId: "rs-1",
+          phase: "working",
+          at: NOW,
+          lang: "zh",
+          zone: TZ,
+          hasModes: true,
+          bot: "Clawy",
+          view: windowState({
+            text: Array.from({ length: 40 }, (_, i) => `collected ${String(i)} items`).join("\n") + "\nAll 40 passed.",
+            step: "Run pytest",
+            sent: "run the tests",
+          }),
+          approvals: [
+            {
+              actionId: "ac-1",
+              tool: "Bash: npm test",
+              expiresAt: NOW + 600,
+              buttons: remoteView
+                .optionButtons(
+                  [
+                    { optionId: "o1", kind: "allow_once", name: "Allow" },
+                    { optionId: "o3", kind: "reject_once", name: "Reject" },
+                  ],
+                  "rs-1",
+                  "ac-1",
+                )
+                .map((b) => ({ ...b, inWindow: true })),
+            },
+          ],
+        }),
+      ),
+  ],
+  [
+    "remote_window_en",
+    () =>
+      windowCard(
+        remoteView.windowView({
+          label: "⬛ Codex",
+          host: "robin-dev",
+          cwd: "/root/ws/active",
+          mode: null,
+          sessionId: "rs-1",
+          phase: "idle",
+          at: NOW,
+          lang: "en",
+          zone: TZ,
+          bot: "Clawy",
+          view: windowState({ text: "Done: the build is green.", queued: "a turn is running in the terminal" }),
+          approvals: [],
+        }),
       ),
   ],
 );

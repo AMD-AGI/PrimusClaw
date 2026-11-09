@@ -20,7 +20,12 @@ export type RemoteOp =
   | "mode"
   | "set_mode"
   | "pair"
-  | "takeover";
+  | "takeover"
+  | "full"
+  | "send"
+  | "hide"
+  | "hidden"
+  | "unhide";
 
 /** A button's look: the primary act (`positive`), a primary act that stops or removes (`destructive`), or plain. */
 export type ButtonStyle = "positive" | "destructive" | "default";
@@ -58,15 +63,18 @@ export interface DecisionButton {
   readonly optionId: string;
   /** The one primary button (allow once). */
   readonly primary: boolean;
+  /** On the session card as the window: the answer refreshes the window, not a permission card of its own. */
+  readonly inWindow?: boolean;
 }
 
 /** What a decision button carries (wire format: the worker reads it back). */
-export function decisionData(button: DecisionButton): Record<string, string> {
+export function decisionData(button: DecisionButton): Record<string, string | boolean> {
   return {
     primusclaw: "remote_decision",
     session_id: button.sessionId,
     action_id: button.actionId,
     option_id: button.optionId,
+    ...(button.inWindow ? { in_window: true } : {}),
   };
 }
 
