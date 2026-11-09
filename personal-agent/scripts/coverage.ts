@@ -53,6 +53,8 @@ function checkPackage(pkg: string, floor: number): boolean {
     src,
     "--include",
     `${src}/**/*.{${SOURCE_EXTENSIONS.map((e) => e.slice(1)).join(",")}}`,
+    // c8's own extension list leaves out .mts and .cts: without these, --all would not see such a file at all.
+    ...SOURCE_EXTENSIONS.flatMap((extension) => ["--extension", extension]),
     ...excluded.flatMap((file) => ["--exclude", file]),
     "--reporter=text",
     "--check-coverage",
