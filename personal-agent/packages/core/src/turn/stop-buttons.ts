@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A Stop button of our own for a turn that started from a phone (stop_button.py, internal #458). Teams' own Stop under a
+ * A Stop button of our own for a turn that started from a phone (stop_button.py). Teams' own Stop under a
  * streaming reply is greyed out on a phone, so a turn a phone starts in a 1:1 chat gets a small card with one Stop button,
  * sent STOP_CARD_DELAY_SECONDS after the turn starts (a quick answer never shows one). It covers the three kinds of turn a
  * phone starts: a turn on the chat's own session, a message to the person's assistant, a message to an attached agent.
