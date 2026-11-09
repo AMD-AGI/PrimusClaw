@@ -95,11 +95,7 @@ function hasEntries(agent: Agent, connectorId: string, active: readonly Session[
 }
 
 /** An agent with nothing to list is left out when another agent of the machine has something: one "no session" line at most. */
-function listedAgents(
-  agents: readonly Agent[],
-  connectorId: string,
-  active: readonly Session[],
-): Agent[] {
+function listedAgents(agents: readonly Agent[], connectorId: string, active: readonly Session[]): Agent[] {
   const listed = agents.filter((a) => hasEntries(a, connectorId, active));
   const quiet = agents.filter((a) => !listed.includes(a));
   if (listed.length > 0 && quiet.length > 0) return listed;

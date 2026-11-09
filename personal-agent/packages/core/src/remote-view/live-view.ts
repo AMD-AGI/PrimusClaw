@@ -7,10 +7,9 @@
  * newest part that fits is kept). Credentials are masked at render time over the whole text, so a secret split across two
  * chunks is still caught.
  */
-import { redactText } from "./pending-redact.js";
 import type { RemoteStep } from "./events.js";
 import { splitErrorTail } from "./pending-public-error.js";
-import { neutral } from "./inert.js";
+import { masked as redactText, neutral } from "./inert.js";
 import type { Lang } from "../locales/lang.js";
 import { ACTIVE_STEPS_MAX, BLOCK_KEEP_CHARS, THOUGHT_MAX, TOOL_TITLE_MAX } from "./limits.js";
 import { length, lstrip, slice, squash, strip } from "./py-text.js";

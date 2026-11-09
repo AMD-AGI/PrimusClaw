@@ -29,7 +29,7 @@ function row(entry: remoteView.AgentRow): CardElement[] {
 /** The connect steps on a card: each command a monospace line of its own. */
 export function connectBlocks(steps: remoteView.ConnectSteps): CardElement[] {
   return [
-    text(steps.head),
+    text(steps.lead),
     ...steps.commands.map((command) => text(command, { mono: true, spacing: "Small" })),
     text(steps.after, { size: "Small" }),
     text(steps.notes, { subtle: true, size: "Small" }),

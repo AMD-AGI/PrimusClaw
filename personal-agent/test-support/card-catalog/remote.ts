@@ -1,0 +1,205 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/** The remote-agent cards (Python `card_catalog`, the `remote_*` entries; W6b). */
+import { remoteView } from "../../packages/core/src/index.js";
+import { ConnectorSetup, setupFrom } from "../../packages/core/src/remote/connector/setup.js";
+import type { Agent, Connector, Session } from "../../packages/core/src/remote/model.js";
+import { agentsCard, sessionsCard, statusCard } from "../../packages/teams/src/views/remote/index.js";
+import { disconnectCard } from "../../packages/teams/src/views/remote/small-cards.js";
+import { type CatalogEntry, NOW, entries } from "./catalog.js";
+
+/** What the worker's tests configure: the address it reaches Claw at. */
+export const SETUP = new ConnectorSetup(setupFrom(null, "https://claw.example.com/claw-api"));
+
+export function agent(fields: Partial<Agent> & Pick<Agent, "agentId">): Agent {
+  return { kind: "", name: "", capabilities: {}, ...fields };
+}
+
+export function connector(fields: Partial<Connector> & Pick<Connector, "connectorId">): Connector {
+  return {
+    name: "",
+    online: false,
+    version: "",
+    versionStatus: "",
+    lastSeenAt: "",
+    heartbeatAt: "",
+    paired: false,
+    agents: [],
+    ...fields,
+  };
+}
+
+export function session(fields: Partial<Session> & Pick<Session, "sessionId">): Session {
+  return { connectorId: "", agentId: "", cwd: "", status: "", readOnly: null, updatedAt: "", ...fields };
+}
+
+export const CONNECTORS: readonly Connector[] = [
+  connector({
+    connectorId: "c1",
+    name: "robin-dev",
+    online: true,
+    agents: [agent({ agentId: "a1", kind: "claude", name: "Claude Code" })],
+  }),
+  connector({ connectorId: "c2", name: "laptop", agents: [agent({ agentId: "a2", kind: "codex", name: "Codex" })] }),
+];
+
+export const SESSIONS: readonly Session[] = [
+  session({
+    sessionId: "rs-1",
+    connectorId: "c1",
+    agentId: "a1",
+    cwd: "/root/ws/active",
+    status: "active",
+    updatedAt: "2026-11-06T07:55:00Z",
+  }),
+];
+
+const CLAUDE_SESSIONS = (capabilities: Record<string, unknown>): Connector => ({
+  ...(CONNECTORS[0] as Connector),
+  agents: [agent({ agentId: "a1-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities })],
+});
+
+const sessions = (
+  connectors: readonly Connector[],
+  list: readonly Session[],
+  attached: string | null,
+  waiting: ReadonlySet<string> = new Set(),
+) =>
+  sessionsCard(
+    remoteView.sessionsView({ connectors, sessions: list, attached, now: NOW, lang: "zh", setup: SETUP, waiting }),
+  );
+
+export const REMOTE: readonly CatalogEntry[] = entries(
+  [
+    "remote_agents",
+    () =>
+      agentsCard(
+        remoteView.agentsView({ connectors: CONNECTORS, sessions: SESSIONS, attached: null, now: NOW, setup: SETUP }),
+      ),
+  ],
+  [
+    "remote_status",
+    () =>
+      statusCard(
+        remoteView.statusView({
+          label: "Claude Code",
+          host: "robin-dev",
+          cwd: "/root/ws/active",
+          mode: "default",
+          sessionId: "rs-1",
+          phase: "working",
+          at: NOW,
+          lang: "zh",
+          hasModes: true,
+          bot: "Clawy",
+        }),
+      ),
+  ],
+  ["remote_sessions", () => sessions(CONNECTORS, SESSIONS, "rs-1")],
+  ["remote_disconnect", () => disconnectCard(remoteView.disconnectView("robin-dev", "c1", SETUP))],
+  [
+    "remote_sessions_waiting",
+    () =>
+      sessions(
+        [
+          {
+            ...(CONNECTORS[0] as Connector),
+            agents: [
+              ...(CONNECTORS[0] as Connector).agents,
+              agent({
+                agentId: "a1-sessions",
+                kind: "attach",
+                name: "Claude Code (existing sessions)",
+                capabilities: {
+                  resumable: [
+                    {
+                      ref: "r-1",
+                      title: "修 flaky 测试",
+                      cwd: "/root/ws/active",
+                      updated_at: NOW - 120,
+                      state: "live",
+                      activity: "waiting",
+                      waiting_for: "permission prompt",
+                    },
+                    {
+                      ref: "r-2",
+                      title: "重构连接器",
+                      cwd: "/root/ws/conn",
+                      updated_at: NOW - 30,
+                      state: "live",
+                      activity: "working",
+                    },
+                    { ref: "r-3", title: "写文档", cwd: "/root/ws/docs", updated_at: NOW - 3600, state: "idle" },
+                  ],
+                },
+              }),
+            ],
+          },
+          CONNECTORS[1] as Connector,
+        ],
+        SESSIONS,
+        null,
+        new Set(["rs-1"]),
+      ),
+  ],
+  [
+    "remote_sessions_watch",
+    () =>
+      sessions(
+        [
+          CLAUDE_SESSIONS({
+            watch_live: true,
+            resumable: [
+              {
+                ref: "r-1",
+                title: "修 flaky 测试",
+                cwd: "/root/ws/active",
+                updated_at: NOW - 120,
+                state: "live",
+                activity: "waiting",
+                waiting_for: "permission prompt",
+              },
+              {
+                ref: "r-2",
+                title: "重构连接器",
+                cwd: "/root/ws/conn",
+                updated_at: NOW - 30,
+                state: "live",
+                activity: "working",
+              },
+              { ref: "r-3", title: "写文档", cwd: "/root/ws/docs", updated_at: NOW - 3600, state: "live" },
+            ],
+          }),
+        ],
+        [],
+        null,
+      ),
+  ],
+  [
+    "remote_sessions_shared",
+    () =>
+      sessions(
+        [
+          CLAUDE_SESSIONS({
+            watch_live: true,
+            terminal_input: true,
+            takeover: true,
+            resumable: [
+              {
+                ref: "r-1",
+                title: "hosting",
+                cwd: "/root/ws/active",
+                updated_at: NOW - 120,
+                state: "live",
+                input: "terminal",
+              },
+              { ref: "r-2", title: "不在 tmux 里", cwd: "/root/ws/conn", updated_at: NOW - 30, state: "live" },
+            ],
+          }),
+        ],
+        [],
+        null,
+      ),
+  ],
+);

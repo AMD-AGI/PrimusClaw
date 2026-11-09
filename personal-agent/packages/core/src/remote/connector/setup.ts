@@ -12,6 +12,7 @@
  */
 import type { ConnectSteps, ConnectorSetupWords } from "../../remote-view/setup.js";
 import type { Reported } from "../../remote-view/reported.js";
+import type { Connector } from "../model.js";
 import { recordOf, textOf } from "../fields.js";
 import { connectorSetupText } from "../../locales/connector-setup.js";
 import type { Lang } from "../../locales/lang.js";
@@ -160,8 +161,8 @@ export class ConnectorSetup implements ConnectorSetupWords {
     return connectSteps(this.setup, lang, lead);
   }
 
-  versionNote(connector: Reported, lang: Lang): string | null {
-    return versionNote(connector, lang);
+  versionNote(connector: Connector, lang: Lang): string | null {
+    return versionNote({ version: connector.version, version_status: connector.versionStatus }, lang);
   }
 
   offlineHint(lang: Lang): string {

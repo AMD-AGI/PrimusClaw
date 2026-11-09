@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
+import { remoteView } from "@primusclaw/personal-agent";
 import { Ajv } from "ajv";
 
 import { CJK } from "../src/cards/cjk.js";
@@ -31,7 +32,7 @@ const FOUR_BUTTONS = new Set(["remote_permission", "remote_status", "remote_wind
 const HALF_NEXT_TO_CJK = new RegExp(`${CJK}[,:;?!]|[,;?!]${CJK}`);
 /** Besides the kit's own: the thumbs, a remote agent's kind icons, and the robot. */
 const EXTRA_EMOJI = ["\u{1f44d}", "\u{1f44e}", "\u{1f916}"];
-let allowedEmoji = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI]);
+let allowedEmoji = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI, ...remoteView.KIND_ICONS]);
 
 /** Lines that port cards with their own emoji (a remote agent's kind icons) add them here. */
 export function allowEmoji(...emoji: string[]): void {
@@ -40,6 +41,7 @@ export function allowEmoji(...emoji: string[]): void {
 
 /** A JSON value as the text it shows. */
 function s(value: unknown): string {
+  if (value === undefined) return "";
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 

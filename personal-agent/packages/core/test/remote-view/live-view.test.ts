@@ -4,7 +4,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { type SseEvent, decode, remoteStep } from "../../src/remote-view/events.js";
+import type { SseEvent } from "../../src/claw/model.js";
+import { decode, remoteStep } from "../../src/remote-view/events.js";
 import { RemoteLiveView } from "../../src/remote-view/live-view.js";
 import { PLAIN_ERRORS, acp, frame } from "./frames.js";
 

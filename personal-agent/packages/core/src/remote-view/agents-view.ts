@@ -129,13 +129,7 @@ interface Joined {
   readonly mine: ReadonlySet<string>;
 }
 
-function agentBlock(
-  connector: Connector,
-  agent: Agent,
-  slot: number,
-  input: AgentsInput,
-  joined: Joined,
-): AgentBlock {
+function agentBlock(connector: Connector, agent: Agent, slot: number, input: AgentsInput, joined: Joined): AgentBlock {
   const lang = input.lang ?? "en";
   const { icon, label } = kindLabel(agent.kind);
   const conversations = conversationItems(connector, agent, input.now, lang, joined);

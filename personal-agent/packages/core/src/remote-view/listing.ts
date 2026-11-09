@@ -23,7 +23,7 @@ export function offlineSince(connector: Connector, lang: Lang = "en"): string {
 
 /** Sessions newest first (by `updated_at` as Claw wrote it), the order kept among equals. */
 export function newestFirst(sessions: readonly Session[]): Session[] {
-  const key = (s: Session): string => s.updatedAt ?? "";
+  const key = (s: Session): string => s.updatedAt;
   return [...sessions].sort((a, b) => (key(a) < key(b) ? 1 : key(a) > key(b) ? -1 : 0));
 }
 
@@ -81,11 +81,7 @@ export function sessionFacts(
 }
 
 /** `/agents` as text. With no machine: the exact commands that connect one (markdown, for a rich message). */
-export function agentsText(
-  connectors: readonly Connector[],
-  setup: ConnectorSetupWords,
-  lang: Lang = "en",
-): string {
+export function agentsText(connectors: readonly Connector[], setup: ConnectorSetupWords, lang: Lang = "en"): string {
   if (connectors.length === 0) return setup.connectMarkdown(lang);
   const words = remoteText.in(lang);
   const blocks = [`**${words.yourAgents}**`];

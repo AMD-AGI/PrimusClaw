@@ -1,7 +1,9 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { type PublicErrors, type RemoteStep, type SseEvent, NOTHING, decode } from "./events.js";
+import type { SseEvent } from "../claw/model.js";
+import type { PublicErrors } from "../public-error/public-errors.js";
+import { type RemoteStep, NOTHING, decode } from "./events.js";
 import { SEEN_KEPT, SEGMENT_KEEP_CHARS, SEGMENTS_KEPT } from "./limits.js";
 import { slice, strip } from "./py-text.js";
 

@@ -14,7 +14,7 @@ export * from "./conversations-view.js";
 export * from "./conversations.js";
 export * from "./events.js";
 export * from "./health.js";
-export { defang, lit, neutral, plain } from "./inert.js";
+export { defang, lit, plain } from "./inert.js";
 export * from "./limits.js";
 export * from "./lines.js";
 export * from "./listing.js";

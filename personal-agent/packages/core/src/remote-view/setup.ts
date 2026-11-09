@@ -7,7 +7,7 @@ import type { Connector } from "../remote/model.js";
 /** The connect steps for a card: the first line (the lead, or "You have no machine connected.", then what to run), each command
  * on a line of its own, what to do after, and the per-system notes (one line each, joined by newlines). */
 export interface ConnectSteps {
-  readonly head: string;
+  readonly lead: string;
   readonly commands: readonly string[];
   readonly after: string;
   readonly notes: string;

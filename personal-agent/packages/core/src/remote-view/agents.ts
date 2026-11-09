@@ -18,6 +18,9 @@ const KINDS: readonly (readonly [prefix: string, label: string, icon: string])[]
   ["cursor", "Cursor", "\u{1f537}"],
 ];
 
+/** The icons of the agent kinds, and of an agent of no known kind. */
+export const KIND_ICONS: readonly string[] = [...KINDS.map(([, , icon]) => icon), "\u{1f916}"];
+
 export interface KindLabel {
   readonly icon: string;
   readonly label: string;

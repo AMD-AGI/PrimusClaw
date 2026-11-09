@@ -38,9 +38,7 @@ function problemsOf(agent: Agent): { problems: readonly unknown[]; checked: stri
 
 /** The machine's problems, failures first, a machine-wide one once, and when they were checked; null when no agent reports
  * health (an older connector: unknown, not fine). */
-export function machineProblems(
-  connector: Connector,
-): { problems: MachineProblem[]; checked: string | null } | null {
+export function machineProblems(connector: Connector): { problems: MachineProblem[]; checked: string | null } | null {
   const out: MachineProblem[] = [];
   const seen = new Set<string>();
   let reported = false;

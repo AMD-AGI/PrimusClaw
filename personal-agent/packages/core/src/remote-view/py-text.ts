@@ -74,11 +74,6 @@ export function slice(text: string, start: number, end?: number): string {
   return Array.from(text).slice(start, end).join("");
 }
 
-/** `text` cut to `limit` code points with an ellipsis marking the cut (the right side stripped first, as Python's `rstrip`). */
-export function clipWithEllipsis(text: string, limit: number): string {
-  return length(text) <= limit ? text : rstrip(slice(text, 0, limit - 1)) + "…";
-}
-
 /** Python `str(value)` for the JSON-ish values a connector reports (None is "None", a bool "True"/"False"). */
 export function pyStr(value: unknown): string {
   if (value === null || value === undefined) return "None";
