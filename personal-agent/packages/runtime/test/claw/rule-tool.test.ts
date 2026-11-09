@@ -79,10 +79,11 @@ describe("the rule on the wire", () => {
     await claw.sessions.create("ak-a", { text: "hi", idempotencyKey: "idem" });
     await claw.sessions.sendMessage("ak-a", "s", "again");
     const [create, send] = wire.messages();
-    assert.equal(create?.rawPath, "/v1/sessions");
-    assert.equal(send?.rawPath, "/v1/sessions/s/messages");
-    const created = create?.body as { name: string; message: Record<string, unknown> };
-    const sent = send?.body as Record<string, unknown>;
+    assert.ok(create && send);
+    assert.equal(create.rawPath, "/v1/sessions");
+    assert.equal(send.rawPath, "/v1/sessions/s/messages");
+    const created = create.body as { name: string; message: Record<string, unknown> };
+    const sent = send.body as Record<string, unknown>;
     assert.equal(created.name, "hi");
     assert.equal(created.message["content"], `hi\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`);
     assert.equal(created.message["pluginId"], 2);
@@ -116,7 +117,9 @@ describe("the rule on the wire", () => {
     assert.equal(wire.downloads().length, 2);
     assert.equal(wire.lastBody()["content"], `three\n\n${CHANGE}\n\n${RULE_HEADING}\n\nA newer rule.`);
   });
+});
 
+describe("a rule that cannot be read", () => {
   const unreadable: Record<string, () => Response> = {
     "a 404": () => json(404, { error: "not found" }),
     "not a zip": () => new Response("<html>not a zip</html>"),
@@ -133,7 +136,9 @@ describe("the rule on the wire", () => {
       assert.equal(line?.fields["fallback"], "the message goes without it");
     });
   }
+});
 
+describe("what rides on a message", () => {
   it("a rule that stops being readable leaves the last copy in use", async () => {
     const wire = new RuleWire();
     const clock = new FakeClock();

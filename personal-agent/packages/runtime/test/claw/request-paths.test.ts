@@ -42,10 +42,9 @@ type Drive = (claw: ClawPort, id: string) => Promise<unknown>;
 
 /** Reads the first event of a stream (the fake sends none) and stops. */
 async function first(events: AsyncIterable<unknown>): Promise<void> {
-  for await (const event of events) {
-    void event;
-    break;
-  }
+  const iterator = events[Symbol.asyncIterator]();
+  await iterator.next();
+  await iterator.return?.();
 }
 
 /** Every request method of the client that takes an id, by `<resource>.<method>:<argument>`. */

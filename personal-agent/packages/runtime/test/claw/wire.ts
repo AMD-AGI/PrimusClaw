@@ -14,6 +14,7 @@ export interface Sent {
   readonly headers: Headers;
   readonly body: unknown;
   readonly form: FormData | null;
+  readonly signal: AbortSignal | null;
 }
 
 export type Answer = (request: Sent) => Response | Promise<Response>;
@@ -42,6 +43,7 @@ export class Wire {
       headers: new Headers(init.headers),
       body: typeof body === "string" ? JSON.parse(body) : undefined,
       form: body instanceof FormData ? body : null,
+      signal: init.signal ?? null,
     };
     this.sent.push(sent);
     return this.answer(sent);
@@ -87,7 +89,7 @@ export class RecordingLogger implements Logger {
 }
 
 /** A zip archive of `files` (deflated, as Python's `zipfile` writes with ZIP_DEFLATED; `stored` keeps them as they are). */
-export function zip(files: Record<string, string | Uint8Array>, stored = false): Uint8Array {
+export function zip(files: Record<string, string | Uint8Array>, stored = false): Uint8Array<ArrayBuffer> {
   const locals: Buffer[] = [];
   const centrals: Buffer[] = [];
   let offset = 0;

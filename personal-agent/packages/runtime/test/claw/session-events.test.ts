@@ -83,9 +83,10 @@ describe("session events", () => {
     const { wire } = oldClaw(Array.from({ length: 1000 }, (_, i) => row(i + 1)));
     const rows = await wire.client().sessions.events("ak-a", "s1");
     assert.equal(rows.length, 1000);
-    assert.equal(wire.sent.length, 1);
-    assert.equal(wire.sent[0]?.url.searchParams.get("tail"), null);
-    assert.equal(wire.sent[0]?.url.searchParams.get("mode"), "replay");
+    const [request] = wire.sent;
+    assert.ok(request && wire.sent.length === 1);
+    assert.equal(request.url.searchParams.get("tail"), null);
+    assert.equal(request.url.searchParams.get("mode"), "replay");
   });
 
   it("an older claw's whole history is cut to the tail here", async () => {

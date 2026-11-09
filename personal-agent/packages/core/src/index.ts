@@ -24,7 +24,6 @@ export * from "./claw/model.js";
 export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
-export * from "./public-error/public-errors.js";
 export * from "./claw/message-text.js";
 export * from "./claw/requester-view.js";
 export * from "./claw/service-refusal.js";
