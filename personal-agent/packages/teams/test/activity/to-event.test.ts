@@ -219,6 +219,8 @@ test("teams' own thumbs on the desktop become a vote on the answer they were giv
   );
   const disliked = toInboundEvent(thumb("dislike", "wrong repo"));
   assert.ok(disliked.ok && disliked.value?.type === "vote" && disliked.value.comment === "wrong repo");
+  const numeric = toInboundEvent({ ...thumb("like", ""), replyToId: 7 });
+  assert.ok(numeric.ok && numeric.value?.type === "vote" && numeric.value.messageId === ""); // (Python: (7, None))
   const other = toInboundEvent(thumb("meh", ""));
   assert.ok(other.ok && other.value === undefined);
 });
