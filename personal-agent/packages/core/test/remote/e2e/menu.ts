@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 
 import { assertValidCard, buttonsOf, elements } from "../../../../../test-support/adaptive-card.js";
+import type { OutMessage } from "../../../src/ports/surface.js";
+import type { FakeCommand, FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE, type RemoteWorld, Script, USER_A } from "../../../../../test-support/remote-world.js";
 import { AAD, TWO_AGENTS } from "./helpers.js";
 
@@ -165,3 +167,90 @@ export async function attachedWith(
 export const STATUS_TITLES = ["Switch", "Back to assistant", "Stop", "Mode"];
 export const MODES = ["default", "plan", "bypassPermissions"];
 export const FLAGS: Readonly<Record<string, boolean>> = { default: false, plan: false, bypassPermissions: true };
+
+/** The worker's insides a test reaches into, as the Python tests reach into `w.agent._remote`. */
+export interface Insides {
+  readonly chats: { readonly agentTakeover: Map<string, boolean> };
+  readonly state: { phase(chatKey: string): string };
+  readonly board: {
+    statusOf(chatKey: string, state: unknown, phase: string): { readonly message: OutMessage };
+  };
+}
+export const insides = (w: RemoteWorld): Insides => w.remote as unknown as Insides;
+
+const STAMP = /^(?:Updated|更新于) \d\d:\d\d:\d\dZ$/u;
+
+/** The status card as the chat shows it now: the last one sent or edited in. */
+export function lastStatus(w: RemoteWorld): Json {
+  const found = w.operations().filter((o) => o.op !== "delete" && o.card && textsIn(o.card).some((t) => STAMP.test(t)));
+  const card = found.at(-1)?.card;
+  assert.ok(card, "no status card");
+  return card;
+}
+
+/** What a connector's `claude-attach` agent reports: the conversations it can take over, newest first. */
+export function attachCaps(nowSeconds: number, options: { watch?: boolean; change?: Json } = {}): Record<string, Json> {
+  const entries = [
+    {
+      ref: "r-idle",
+      title: "Fix the parser",
+      cwd: "/home/me/work/parser",
+      updated_at: nowSeconds - 600,
+      state: "idle",
+    },
+    {
+      ref: "r-live",
+      title: "Open in a terminal",
+      cwd: "/home/me/work/term",
+      updated_at: nowSeconds - 3600,
+      state: "live",
+    },
+    {
+      ref: "r-held",
+      title: "Held by this connector",
+      cwd: "/home/me/work/held",
+      updated_at: nowSeconds - 7200,
+      state: "attached",
+    },
+    {
+      ref: "r-unknown",
+      title: "Cannot tell",
+      cwd: "/home/me/work/x",
+      updated_at: nowSeconds - 86400,
+      state: "unknown",
+    },
+  ];
+  return {
+    "claude-attach": {
+      roots: ["/home/me/work"],
+      modes: ["default", "plan"],
+      ask_mode: "default",
+      resumable: entries,
+      ...((options.watch ?? true) ? { watch_live: true } : {}),
+      ...(options.change ?? {}),
+    },
+  };
+}
+
+export const ATTACH_AGENT = [["claude-attach", "attach", "Claude Code (existing sessions)"]] as const;
+
+/** A connector whose conversation is open in a terminal: the session it opens is read-only (connector `spectate`). */
+export class Watching extends Script {
+  protected override async handle(srv: FakeRemote, cmd: FakeCommand): Promise<void> {
+    if (cmd.type === "session.new") {
+      await srv.emit(cmd.session_id, "session_started", {
+        acp_session_id: "acp-1",
+        attached: true,
+        read_only: true,
+        read_only_reason: "session_live",
+        modes: [],
+        currentMode: null,
+        unattended: false,
+      });
+    } else if (cmd.type === "prompt") {
+      // (what the connector would do, were it sent: it is not)
+      await srv.emit(cmd.session_id, "command_rejected", { type: "prompt", reason: "read_only_live_session" });
+      await srv.end(cmd.session_id, "error");
+    }
+  }
+}
