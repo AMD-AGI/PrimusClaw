@@ -11,7 +11,7 @@
 
 import { toLang } from "../locales/lang.js";
 import { turnText } from "../locales/turn.js";
-import { collapseSpaces, pyLen, pyRstrip, pySlice } from "../text/python-str.js";
+import { cpLength, cpSlice, pyRstrip, squashSpaces } from "../text/py-text.js";
 import { isObject, type JsonObject } from "./json.js";
 
 export const TODO_TOOLS: ReadonlySet<string> = new Set(["todo_write", "todowrite"]);
@@ -49,9 +49,9 @@ function isTodoStatus(value: unknown): value is TodoStatus {
 function todoOf(item: unknown): Todo | undefined {
   if (!isObject(item) || typeof item["content"] !== "string") return undefined;
   // (a code fence would swallow the rest of the view)
-  let text = collapseSpaces(item["content"].replaceAll("```", "'"));
+  let text = squashSpaces(item["content"].replaceAll("```", "'"));
   if (!text) return undefined;
-  if (pyLen(text) > TODO_ITEM_MAX) text = `${pyRstrip(pySlice(text, 0, TODO_ITEM_MAX - 1))}…`;
+  if (cpLength(text) > TODO_ITEM_MAX) text = `${pyRstrip(cpSlice(text, 0, TODO_ITEM_MAX - 1))}…`;
   const state = item["status"];
   return [text, isTodoStatus(state) ? state : "pending"];
 }
@@ -62,7 +62,7 @@ function todoOf(item: unknown): Todo | undefined {
  * never raised: an item that is not an object or has no text; a status Brain does not know counts as pending.
  */
 export function todosOf(tool: string, status: string, data: JsonObject): Todo[] | undefined {
-  if (!TODO_TOOLS.has(collapseSpaces(tool).toLowerCase()) || status !== "success") return undefined;
+  if (!TODO_TOOLS.has(squashSpaces(tool).toLowerCase()) || status !== "success") return undefined;
   const detail = data["argumentsDetail"];
   const inner = isObject(detail) ? detail["todo_write"] : undefined;
   const items = isObject(inner) ? inner["todos"] : undefined;

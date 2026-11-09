@@ -5,12 +5,13 @@
  * The turn's cards in Teams (render.py's delivery_card and changes_card): a file the agent delivered, and what the
  * session changed under a finished answer.
  */
-import { turn } from "@primusclaw/personal-agent";
+import { pyRstrip, turn } from "@primusclaw/personal-agent";
 
 import { buttons, execute, header, message, note, openUrl, text, TITLE_MAX } from "../../cards/kit.js";
 import type { CardElement } from "../../cards/json.js";
 import type { Renderers } from "../registry.js";
 import { noteCard } from "./note.js";
+import { stopCard } from "./stop.js";
 
 /** Files listed on the changes card, over all repositories; the rest is one "+N more" line. */
 export const CHANGES_MAX_FILES = 8;
@@ -65,7 +66,7 @@ function repoLines(changes: turn.Changes): { readonly lines: CardElement[]; read
 
 /** An absolute https URL for a Claw-relative link; undefined for anything else (never an arbitrary URL). */
 function openLink(link: string, publicBaseUrl: string): string | undefined {
-  const base = publicBaseUrl.replace(/\/+$/, "");
+  const base = pyRstrip(publicBaseUrl, "/");
   return link.startsWith("/") && !link.startsWith("//") && base.startsWith("https://") ? base + link : undefined;
 }
 
@@ -90,4 +91,5 @@ export const TURN_RENDERERS = {
   delivery: deliveryCard,
   changes: changesCard,
   note: noteCard,
+  turnStop: stopCard,
 } satisfies Partial<Renderers>;

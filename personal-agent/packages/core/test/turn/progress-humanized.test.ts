@@ -8,22 +8,19 @@
  */
 
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, it } from "node:test";
+import { it } from "node:test";
 
 import { LIVE_HEADER, LIVE_HEADERS, LiveView } from "../../src/turn/live-view.js";
 import type { Step } from "../../src/turn/step.js";
 import { TurnState } from "../../src/turn/turn-state.js";
-import { labelFor, setIntegrations, skillInCommand } from "../../src/turn/upstream.js";
+import { integrationRegistry } from "../../src/plugins/integrations.js";
+import { labelFor, skillInCommand } from "../../src/turn/step-labels.js";
 import { play } from "./play.js";
 import { end, ev, said, type Script, tool } from "./world.js";
 
 /** A deployment's MCP server whose reads a progress line names: a fictional job service. */
-beforeEach(() => {
-  setIntegrations({ jobhub: "JobHub" }, ["jobhub"]);
-});
-afterEach(() => {
-  setIntegrations({}, []);
-});
+const JOBHUB = integrationRegistry();
+JOBHUB.addMcpServer("jobhub", "JobHub", { query: true });
 
 // --- the label mapping -------------------------------------------------------------------------------------------------
 
@@ -65,7 +62,7 @@ const LABELS: Array<[string, string | undefined, string, string]> = [
 
 it("test_a_tool_gets_a_human_label", () => {
   for (const [toolName, skill, lang, expected] of LABELS) {
-    assert.equal(labelFor(toolName, skill, lang).one, expected, `${expected} [${toolName || "empty"}]`);
+    assert.equal(labelFor(toolName, skill, lang, JOBHUB).one, expected, `${expected} [${toolName || "empty"}]`);
   }
 });
 
@@ -87,7 +84,7 @@ const ODD_NAMES = [
 it("test_no_label_ever_carries_a_raw_mcp_name", () => {
   for (const name of ODD_NAMES) {
     for (const lang of ["en", "zh"]) {
-      const view = new LiveView(lang);
+      const view = new LiveView(lang, JOBHUB);
       view.apply({ tool: [name, "start"] });
       view.apply({ tool: [name, "error"] });
       view.apply({ tool: [name, "start"] });
@@ -264,7 +261,7 @@ const VIEWS: Array<[string, "en" | "zh", Step[], string[]]> = [
 
 it("test_the_view_shows_what_the_agent_said_and_one_line_for_the_step_running_now", () => {
   for (const [name, lang, steps, expected] of VIEWS) {
-    const view = new LiveView(lang);
+    const view = new LiveView(lang, JOBHUB);
     for (const step of steps) view.apply(step);
     const out = view.render();
     assert.equal(out, [LIVE_HEADERS[lang], ...expected].join("\n\n"), name); // (the header in the person's language too)
@@ -275,14 +272,14 @@ it("test_the_view_shows_what_the_agent_said_and_one_line_for_the_step_running_no
 });
 
 it("test_a_repeat_count_is_not_a_list_of_finished_tools", () => {
-  const view = new LiveView();
+  const view = new LiveView("en", JOBHUB);
   for (let n = 1; n < 31; n += 1) for (const step of board(n)) view.apply(step);
   view.apply(start("mcp__agent-board__issue_read", "last"));
   assert.equal(view.render(), `${LIVE_HEADER}\n\n⏳ Reading board topics (31)`);
 });
 
 it("test_apply_says_when_the_view_changed", () => {
-  const view = new LiveView();
+  const view = new LiveView("en", JOBHUB);
   assert.ok(view.apply(start("read", "r")));
   assert.ok(!view.apply(start("read", "r"))); // the same call again: nothing new to send
   assert.ok(view.apply(done("read", "r")));
@@ -338,7 +335,7 @@ it("test_a_skill_in_the_command_of_another_tool_is_not_read", () => {
 it("test_real_event_shapes_become_the_lines_a_person_expects", () => {
   // The shapes Brain really sends: start with argumentsDetail, then success with a description.
   const state = new TurnState("m1");
-  const view = new LiveView();
+  const view = new LiveView("en", JOBHUB);
   view.apply(
     state.feed(
       ev("toolUsed", "m1", {

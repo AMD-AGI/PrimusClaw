@@ -8,7 +8,7 @@
  */
 
 import { turnEnglish } from "../locales/turn.js";
-import { pyStrip } from "../text/python-str.js";
+import { fixedN, pyStrip } from "../text/py-text.js";
 import { clip, plain, SUMMARY_MAX } from "./clip.js";
 import { isObject, type JsonObject } from "./json.js";
 
@@ -102,23 +102,9 @@ export function sizeText(size: number): string {
   for (const unit of ["KB", "MB", "GB"]) {
     scaled /= 1024;
     if (scaled < 1024 || unit === "GB")
-      return scaled < 10 ? `${pyFixed(scaled, 1)} ${unit}` : `${pyFixed(scaled, 0)} ${unit}`;
+      return scaled < 10 ? `${fixedN(scaled, 1)} ${unit}` : `${fixedN(scaled, 0)} ${unit}`;
   }
   return "";
-}
-
-/**
- * Python's `f"{x:.Nf}"`. Both round the exact binary value, but an exact tie goes to the even digit in Python and up in
- * `toFixed` (1.25 is "1.2" there, "1.3" here). A size over a power of 1024 is a dyadic fraction, so the tie test is exact.
- */
-function pyFixed(value: number, digits: number): string {
-  const scale = 10 ** digits;
-  const scaled = value * scale;
-  if (Number.isInteger(scaled * 2) && !Number.isInteger(scaled)) {
-    const down = Math.floor(scaled);
-    return ((down % 2 === 0 ? down : down + 1) / scale).toFixed(digits);
-  }
-  return value.toFixed(digits);
 }
 
 /** A group chat's line for a delivered file: its name and the link, which only the person who asked can open. */

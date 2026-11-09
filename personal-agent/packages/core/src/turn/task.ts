@@ -44,10 +44,6 @@ export class Task<T> {
     return this.finished;
   }
 
-  get signal(): AbortSignal {
-    return this.controller.signal;
-  }
-
   cancel(): void {
     if (!this.finished) this.controller.abort(new Cancelled());
   }
@@ -55,13 +51,6 @@ export class Task<T> {
   /** Wait until it is over, whatever came of it. */
   async settled(): Promise<void> {
     await this.outcome;
-  }
-
-  /** What it returned, or what it threw, thrown here. */
-  async result(): Promise<T> {
-    const outcome = await this.outcome;
-    if (outcome.ok) return outcome.value;
-    throw outcome.error;
   }
 }
 

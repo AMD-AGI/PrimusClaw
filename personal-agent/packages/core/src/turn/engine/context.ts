@@ -5,6 +5,7 @@
 
 import type { Lang } from "../../locales/lang.js";
 import type { PullRef } from "../../claw/model.js";
+import type { Integrations } from "../../plugins/integrations.js";
 import type { ModelRefusalPolicy } from "../../plugins/model-refusal-policy.js";
 import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
@@ -131,6 +132,8 @@ export interface TurnDeps {
   /** What a person is told of a failure, and what is kept back for the log. */
   readonly errors: PublicErrors;
   readonly style: TurnStyle;
+  /** A deployment's MCP servers, named in progress lines (none: the public build's). */
+  readonly integrations?: Integrations;
 }
 
 /** What the turn records as it runs, for whoever runs something after it. */

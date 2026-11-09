@@ -4,7 +4,7 @@
 /** How a final answer is cut into the messages that carry it. */
 
 import { turnEnglish } from "../locales/turn.js";
-import { pyLen, pyLstrip, pyRfind, pyRstrip, pySlice, pyStrip } from "../text/python-str.js";
+import { cpLength, cpRfind, cpSlice, pyLstrip, pyRstrip, pyStrip } from "../text/py-text.js";
 
 export const MAX_ANSWER_CHARS = 3000;
 /** A long answer: at most this many messages (1:1 and group alike), then the link. */
@@ -19,7 +19,7 @@ export function deepLink(publicBaseUrl: string, sessionId: string): string {
 /** Where `window` is best cut: at its last paragraph (else line) break past its middle that `fits`; else at its end. */
 function cutOf(window: string, limit: number, fits: (at: number) => boolean = () => true): number {
   for (const sep of ["\n\n", "\n"]) {
-    const at = pyRfind(window, sep);
+    const at = cpRfind(window, sep);
     if (at > Math.floor(limit / 2) && fits(at)) return at;
   }
   return limit;
@@ -28,10 +28,10 @@ function cutOf(window: string, limit: number, fits: (at: number) => boolean = ()
 function splitAtParagraphs(text: string, limit: number): string[] {
   const chunks: string[] = [];
   let rest = text;
-  while (pyLen(rest) > limit) {
-    const cut = cutOf(pySlice(rest, 0, limit), limit);
-    chunks.push(pyRstrip(pySlice(rest, 0, cut)));
-    rest = pyLstrip(pySlice(rest, cut), "\n");
+  while (cpLength(rest) > limit) {
+    const cut = cutOf(cpSlice(rest, 0, limit), limit);
+    chunks.push(pyRstrip(cpSlice(rest, 0, cut)));
+    rest = pyLstrip(cpSlice(rest, cut), "\n");
   }
   chunks.push(rest);
   return chunks;
@@ -61,14 +61,14 @@ export function answerParts(text: string, link: string, group = false, lead = ""
 export function wholeParts(text: string, limit = MAX_ANSWER_CHARS, most = MAX_ANSWER_MESSAGES): string[] {
   const parts: string[] = [];
   let rest = pyStrip(text);
-  while (pyLen(rest) > limit && parts.length < most - 1) {
+  while (cpLength(rest) > limit && parts.length < most - 1) {
     const roomAfter = limit * (most - 1 - parts.length);
-    const length = pyLen(rest);
-    const cut = cutOf(pySlice(rest, 0, limit), limit, (at) => length - at <= roomAfter);
-    parts.push(pyRstrip(pySlice(rest, 0, cut)));
-    rest = pyLstrip(pySlice(rest, cut), "\n");
+    const length = cpLength(rest);
+    const cut = cutOf(cpSlice(rest, 0, limit), limit, (at) => length - at <= roomAfter);
+    parts.push(pyRstrip(cpSlice(rest, 0, cut)));
+    rest = pyLstrip(cpSlice(rest, cut), "\n");
   }
-  if (pyLen(rest) > limit) rest = pyRstrip(pySlice(rest, 0, limit - pyLen(WHOLE_CUT_NOTE))) + WHOLE_CUT_NOTE;
+  if (cpLength(rest) > limit) rest = pyRstrip(cpSlice(rest, 0, limit - cpLength(WHOLE_CUT_NOTE))) + WHOLE_CUT_NOTE;
   parts.push(rest);
   const kept = parts.filter((p) => p);
   return kept.length ? kept : [""];
@@ -81,7 +81,7 @@ export function wholeParts(text: string, limit = MAX_ANSWER_CHARS, most = MAX_AN
 export function replyParts(text: string, shown = ""): string[] {
   const parts = wholeParts(text);
   const core = pyRstrip(shown);
-  if (core && text.startsWith(core) && pyLen(core) > pyLen(parts[0] ?? "")) {
+  if (core && text.startsWith(core) && cpLength(core) > cpLength(parts[0] ?? "")) {
     const rest = text.slice(core.length);
     return [shown, ...(pyStrip(rest) ? wholeParts(rest) : [])];
   }

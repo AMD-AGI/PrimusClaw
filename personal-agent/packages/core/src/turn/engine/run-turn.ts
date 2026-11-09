@@ -10,7 +10,7 @@
 import { errorName } from "../../errors.js";
 import type { SuggestedReply } from "../../ports/surface.js";
 import { SUGGESTED_REPLIES, turnEnglish, turnText } from "../../locales/turn.js";
-import { pyStrip } from "../../text/python-str.js";
+import { pyStrip } from "../../text/py-text.js";
 import { deepLink } from "../answer-parts.js";
 import { sleepSeconds } from "../ports.js";
 import { plainMessage } from "../progress/answer-messages.js";
@@ -313,6 +313,7 @@ export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise
     streamReplyTo: replyTo,
     group: ctx.request.group ?? false,
     streamText: ctx.deps.style.streamText && !ctx.request.group,
+    ...(ctx.deps.integrations ? { integrations: ctx.deps.integrations } : {}),
   });
   status.begin();
   const run = new TurnRun(ctx, controls, status);

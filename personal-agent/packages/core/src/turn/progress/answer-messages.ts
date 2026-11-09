@@ -21,12 +21,6 @@ export function plainMessage(text: string, ai = false): OutMessage {
   return { body: { type: "text", text }, ...(ai ? { aiGenerated: true } : {}) };
 }
 
-/** What a finished message's text is, whatever its body. */
-export function textOfMessage(message: OutMessage): string {
-  const body = message.body;
-  return body.type === "text" ? body.text : body.type === "rich" ? body.markdown : body.fallbackText;
-}
-
 /**
  * The messages that carry `parts`: each rich or markdown and, for an agent's answer, labelled as AI. Its links stay links
  * and never become citations: an address the model wrote is not a source.

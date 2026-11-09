@@ -9,11 +9,6 @@
 
 import type { OutMessage, ViewButton } from "../ports/surface.js";
 
-/** A view's button, marked as the primary (or a destructive) choice when it is one. INTERIM: `style` until W0-b has it. */
-export type NoteButton = ViewButton & { readonly style?: ButtonStyle };
-
-export type ButtonStyle = "positive" | "destructive";
-
 /** How the note's headline reads: its colour and its emoji. */
 export type NoteTone = "default" | "good" | "attention" | "warning" | "accent";
 
@@ -22,7 +17,7 @@ export interface NoteModel {
   /** A headline over the note (none: the note alone). */
   readonly title?: string;
   readonly tone?: NoteTone;
-  readonly buttons?: readonly NoteButton[];
+  readonly buttons?: readonly ViewButton[];
 }
 
 declare module "../ports/surface.js" {
