@@ -17,6 +17,9 @@ import { Fernet, SqliteStore, type SecurityEventSink } from "@primusclaw/persona
 import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 
+/** A security-event sink for tests that do not look at the events. */
+export const ignoreEvents: SecurityEventSink = () => undefined;
+
 export interface TestStoreOptions {
   readonly clock?: FakeClock;
   readonly random?: Random;
@@ -43,7 +46,7 @@ export function openTestStore(options: TestStoreOptions = {}): TestStore {
     clock,
     random: options.random ?? new SeededRandom(7),
     ...(options.linkLimits ? { linkLimits: options.linkLimits } : {}),
-    ...(options.securityEvent ? { securityEvent: options.securityEvent } : {}),
+    securityEvent: options.securityEvent ?? ignoreEvents,
   });
   return { store, clock, encryptionKeys };
 }
@@ -89,7 +92,15 @@ export function openFileTestStore(options: Omit<TestStoreOptions, "path"> = {}):
     dir: dir.path,
     raw,
     reopen: (more = {}) => {
-      const other = openTestStore({ clock: opened.clock, encryptionKeys: opened.encryptionKeys, ...more, path }).store;
+      // Another process draws other random values (its boot id, its codes) than the first.
+      const random = new SeededRandom(100 + others.length);
+      const other = openTestStore({
+        clock: opened.clock,
+        encryptionKeys: opened.encryptionKeys,
+        random,
+        ...more,
+        path,
+      }).store;
       others.push(other);
       return other;
     },

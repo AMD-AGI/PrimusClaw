@@ -12,7 +12,7 @@ import { test } from "node:test";
 
 import { Fernet, SqliteStore } from "@primusclaw/personal-agent-runtime";
 
-import { storeStructure, tempDir, type StoreStructure } from "../../../../test-support/index.js";
+import { storeStructure, tempDir, type StoreStructure, ignoreEvents } from "../../../../test-support/index.js";
 
 const EXPECTED = JSON.parse(
   readFileSync(new URL("../../../../test-support/data/store-structure.json", import.meta.url), "utf8"),
@@ -24,7 +24,8 @@ function structureAfter(prepare: (path: string) => void, opens = 1): StoreStruct
     const path = join(dir.path, "s.db");
     prepare(path);
     const key = Fernet.generateKey();
-    for (let i = 0; i < opens; i++) new SqliteStore({ path, encryptionKeys: [key] }).close();
+    for (let i = 0; i < opens; i++)
+      new SqliteStore({ path, encryptionKeys: [key], securityEvent: ignoreEvents }).close();
     return storeStructure(path);
   } finally {
     dir.remove();
@@ -62,7 +63,7 @@ test("a database whose sessions were keyed by the person alone is rebuilt as the
     );
     db.exec("INSERT INTO sessions VALUES ('aad-a', 's-1', 'p-1', 1.5)");
     db.close();
-    const store = new SqliteStore({ path, encryptionKeys: [Fernet.generateKey()] });
+    const store = new SqliteStore({ path, encryptionKeys: [Fernet.generateKey()], securityEvent: ignoreEvents });
     assert.equal(store.sessions.getSession("aad-a"), "s-1");
     assert.equal(store.sessions.getSessionPlugin("aad-a"), "p-1");
     store.close();

@@ -403,3 +403,22 @@ test("the default link limits are 5 per person, 100 for everyone, in 600 seconds
   assert.deepEqual(DEFAULT_LINK_LIMITS, { perUser: 5, global: 100, windowSeconds: 600 });
   assert.equal(openTestStore().store.links.linkWindowSeconds, 600);
 });
+
+test("a link records its Claw user, found back from either side", () => {
+  const { store } = openTestStore();
+  const links = store.links;
+  assert.equal(links.needsClawUserId("aad-a"), false); // not linked: nothing to fill in
+  links.redeemPending("aad-b", "Bob", links.stashPending("ak-b"));
+  links.redeemPending("aad-a", "Alice", links.stashPending("ak-a"));
+  assert.equal(links.needsClawUserId("aad-a"), true);
+  assert.equal(links.clawUserIdOf("aad-a"), null);
+  links.setClawUserId("aad-a", "u-1");
+  links.setClawUserId("aad-b", "u-1");
+  assert.equal(links.needsClawUserId("aad-a"), false);
+  assert.equal(links.clawUserIdOf("aad-a"), "u-1");
+  assert.deepEqual(links.linkedUsers(), ["aad-a", "aad-b"]);
+  assert.ok(["aad-a", "aad-b"].includes(links.userForClawUser("u-1") ?? ""));
+  assert.equal(links.userForClawUser("u-9"), null);
+  assert.deepEqual(new Set(links.usersForClawUser("u-1")), new Set(["aad-a", "aad-b"]));
+  assert.equal(links.getKey("aad-a"), "ak-a");
+});

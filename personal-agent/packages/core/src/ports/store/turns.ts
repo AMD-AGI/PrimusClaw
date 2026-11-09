@@ -6,7 +6,7 @@
 
 export type AnsweredInChat = "delivered" | "running" | "lost";
 
-export interface TurnRun {
+export interface FinishedRun {
   /** When the run finished (Claw's notification). */
   readonly finishedAt: number;
   /** A turn this process started and younger than this is still running. */
@@ -26,7 +26,7 @@ export interface TurnAnswerRepository {
   turnDelivered(sessionId: string, turn?: { readonly messageId?: string; readonly turnId?: string }): void;
   turnNotDelivered(sessionId: string, turnId?: string): void;
   /** Whether a chat turn answered the run of this session that finished at `run.finishedAt`; null if none. */
-  answeredInChat(sessionId: string, run: TurnRun): AnsweredInChat | null;
+  answeredInChat(sessionId: string, run: FinishedRun): AnsweredInChat | null;
   /** What was asked in the turn that started the run ('' when no chat turn did). */
   turnPrompt(sessionId: string, finishedAt: number): string;
 }

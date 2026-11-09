@@ -146,3 +146,14 @@ test("markSettled counts a message as settled without editing it", () => {
   assert.equal(c.edited.has("m7"), true);
   assert.deepEqual(surface.outbox, []);
 });
+
+test("without a hold, an update is recorded at the call, in the order of the calls", () => {
+  const surface = new FakeSurface();
+  const c = surface.conversation(testConversation());
+  void c.update("m1", textMessage("edited"));
+  void c.send(textMessage("after"));
+  assert.deepEqual(
+    surface.outbox.map((r) => r.op),
+    ["update", "send"],
+  );
+});
