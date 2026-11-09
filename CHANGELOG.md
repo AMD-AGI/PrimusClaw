@@ -1200,6 +1200,13 @@ record it.
   Claw with #503, live since :202611080436); an unchanged connector.json is no longer rewritten (and flushed) after every
   heartbeat (its modification time is still set), so on a slow disk a session's start no longer queues behind those durable
   writes (#527).
+- `@primusclaw/connector` 0.1.14: a phone message to a conversation open in a terminal is typed in any permission mode
+  (manual, plan, accept edits, auto, don't ask, bypass permissions), and `session_started.terminal_mode` names the mode so the
+  chat can say when a message runs without asking; a conversation with a name (`/rename`) is typed into at once (its name in the
+  rule above the input box made the connector wait 10 minutes and refuse it as `terminal_busy`); a screen that is not Claude
+  Code's input box is refused in 30 s as `terminal_screen_unknown` (#555). In a container, `claw-connector service install`
+  restarts a running supervisor so an edited agents.toml or environment takes effect, and an ended supervisor that PID 1 never
+  reaps is no longer taken for a running one (#549).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
