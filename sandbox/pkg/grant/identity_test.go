@@ -5,82 +5,34 @@ package grant
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynfake "k8s.io/client-go/dynamic/fake"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 )
 
-func TestListedWorkspacesPrefersPluralKey(t *testing.T) {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"spec": map[string]any{
-			"resources": map[string]any{
-				"workspaces": []any{"project1-dev"},
-				"workspace":  []any{"other"},
-			},
-		},
-	}}
-	got, err := listedWorkspaces(obj)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0] != "project1-dev" {
-		t.Fatalf("workspaces = %v", got)
-	}
-}
+// failingReviewer answers every review with an API error.
+type failingReviewer struct{}
 
-func TestListedWorkspacesFallsBackToSingularKey(t *testing.T) {
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"spec": map[string]any{
-			"resources": map[string]any{
-				"workspace": []any{"project1-dev"},
-			},
-		},
-	}}
-	got, err := listedWorkspaces(obj)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0] != "project1-dev" {
-		t.Fatalf("workspace = %v", got)
-	}
-}
-
-func userObject(name, role, workspace string) *unstructured.Unstructured {
-	spec := map[string]any{
-		"resources": map[string]any{"workspaces": []any{workspace}},
-	}
-	if role != "" {
-		spec["roles"] = []any{role}
-	}
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "amd.com/v1",
-		"kind":       "User",
-		"metadata":   map[string]any{"name": name},
-		"spec":       spec,
-	}}
-}
-
-func TestSystemAdminIgnoresWorkspaceMembership(t *testing.T) {
-	user := userObject("admin-1", SystemAdminRole, "global-control-plane")
-	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
-		userGVR: "UserList",
-	}, user)
-	err := NewUserCRMembership(dc).Check(context.Background(), "admin-1", []string{"top-models"})
-	if err != nil {
-		t.Fatal(err)
-	}
+func (failingReviewer) Create(context.Context, *authorizationv1.SubjectAccessReview, metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	return nil, errors.New("apiserver down")
 }
 
 func TestMemberStillNeedsTheWorkspace(t *testing.T) {
-	user := userObject("user-1", "", "global-control-plane")
-	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
-		userGVR: "UserList",
-	}, user)
-	err := NewUserCRMembership(dc).Check(context.Background(), "user-1", []string{"top-models"})
+	svc := New(Options{Authz: authz.NewClient(workspaceReviewer{allow: []string{"global-control-plane"}}, "primus:")})
+	err := svc.checkWorkspaces(context.Background(), "user-1", nil, []string{"top-models"})
 	if !IsReason(err, "user_not_in_workspace") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWorkspaceReviewErrorIsUnavailable(t *testing.T) {
+	svc := New(Options{Authz: authz.NewClient(failingReviewer{}, "primus:")})
+	err := svc.checkWorkspaces(context.Background(), "user-1", nil, []string{"top-models"})
+	if !IsReason(err, "membership_unavailable") {
 		t.Fatalf("err=%v", err)
 	}
 }

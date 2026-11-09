@@ -23,6 +23,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -35,6 +36,8 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 type staticAuth struct{}
@@ -43,21 +46,20 @@ func (staticAuth) Authenticate(context.Context, string) error { return nil }
 
 type staticIdentity struct{}
 
-func (staticIdentity) Check(context.Context, string, string) (string, error) {
-	return "alice", nil
+func (staticIdentity) Introspect(context.Context, string) (identity.Token, error) {
+	return identity.Token{Subject: "u-123", Username: "alice"}, nil
 }
 
-type staticMembership struct {
+// workspaceReviewer allows use of the listed workspaces and nothing else.
+type workspaceReviewer struct {
 	allow []string
 }
 
-func (m staticMembership) Check(_ context.Context, _ string, workspaces []string) error {
-	for _, ws := range workspaces {
-		if !contains(m.allow, ws) {
-			return opErr(403, "user_not_in_workspace", ws)
-		}
-	}
-	return nil
+func (r workspaceReviewer) Create(_ context.Context, sar *authorizationv1.SubjectAccessReview, _ metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	out := sar.DeepCopy()
+	a := sar.Spec.ResourceAttributes
+	out.Status.Allowed = a != nil && a.Resource == "workspaces" && a.Verb == "use" && contains(r.allow, a.Name)
+	return out, nil
 }
 
 type memRecord struct {
@@ -127,16 +129,16 @@ func testService(t *testing.T, now time.Time, intercept ...interceptor.Funcs) (*
 	rec := &memRecord{}
 	reclaimer := &memReclaimer{}
 	svc := New(Options{
-		Client:     cl,
-		Namespace:  "agent-sandbox-system",
-		DataKey:    bytes32('k'),
-		Authn:      staticAuth{},
-		Attest:     checker,
-		Identity:   staticIdentity{},
-		Membership: staticMembership{allow: []string{"top-models", "lab"}},
-		Reclaimer:  reclaimer,
-		Record:     rec,
-		Now:        func() time.Time { return now },
+		Client:    cl,
+		Namespace: "agent-sandbox-system",
+		DataKey:   bytes32('k'),
+		Authn:     staticAuth{},
+		Attest:    checker,
+		Identity:  staticIdentity{},
+		Authz:     authz.NewClient(workspaceReviewer{allow: []string{"top-models", "lab"}}, "primus:"),
+		Reclaimer: reclaimer,
+		Record:    rec,
+		Now:       func() time.Time { return now },
 	})
 	return svc, priv, rec, reclaimer
 }

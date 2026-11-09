@@ -23,6 +23,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
@@ -37,7 +38,9 @@ type Config struct {
 	MaxConcurrentRequests int
 	EnableAuth            bool
 	// Identity validates caller credentials on /v1 when EnableAuth is set.
-	Identity           *identity.Client
+	Identity *identity.Client
+	// Authz resolves the caller's platform role. nil reads the role from the token.
+	Authz              *authz.Client
 	WorkloadManagerURL string
 	Namespace          string
 	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.

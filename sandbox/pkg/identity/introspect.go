@@ -43,9 +43,12 @@ var ErrUnavailable = errors.New("identity is unavailable")
 
 // Token is the introspection result of an active key.
 type Token struct {
-	Subject string
-	Email   string
-	Roles   []string
+	Subject  string
+	Username string
+	Email    string
+	Roles    []string
+	// Groups are the platform groups of the subject.
+	Groups  []string
 	expires time.Time
 }
 
@@ -188,8 +191,10 @@ func (c *Client) Introspect(ctx context.Context, key string) (Token, error) {
 type introspection struct {
 	Active   *bool           `json:"active"`
 	Sub      string          `json:"sub"`
+	Username string          `json:"username"`
 	Email    string          `json:"email"`
 	Roles    []string        `json:"roles"`
+	Groups   []string        `json:"groups"`
 	Audience json.RawMessage `json:"aud"`
 	ClientID string          `json:"client_id"`
 	Exp      json.Number     `json:"exp"`
@@ -238,7 +243,7 @@ func (c *Client) call(ctx context.Context, key string) (Token, bool, error) {
 		c.refuse(reason)
 		return Token{}, false, nil
 	}
-	tok := Token{Subject: out.Sub, Email: out.Email, Roles: out.Roles}
+	tok := Token{Subject: out.Sub, Username: out.Username, Email: out.Email, Roles: out.Roles, Groups: out.Groups}
 	if out.Exp != "" {
 		if f, err := out.Exp.Float64(); err == nil && f > 0 {
 			tok.expires = time.Unix(int64(f), 0)

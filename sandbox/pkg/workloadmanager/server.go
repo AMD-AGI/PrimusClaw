@@ -27,6 +27,7 @@ import (
 
 	"sigs.k8s.io/agent-sandbox/pkg/api"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
@@ -49,7 +50,9 @@ type Config struct {
 	Port       int
 	EnableAuth bool
 	// Identity validates caller credentials on /v1 when EnableAuth is set.
-	Identity   *identity.Client
+	Identity *identity.Client
+	// Authz resolves the caller's platform role. nil reads the role from the token.
+	Authz      *authz.Client
 	Namespace  string
 	GCInterval time.Duration
 	DefaultTTL time.Duration

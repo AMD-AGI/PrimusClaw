@@ -61,13 +61,14 @@ func newTestClient(t *testing.T, f *fakeIdentity, secret string) (*Client, *time
 
 func TestIntrospectActiveInactiveAndUnavailable(t *testing.T) {
 	f := &fakeIdentity{answers: map[string]map[string]any{
-		"ak-good": {"active": true, "sub": "u-1", "email": "a@example.com", "roles": []string{"system-admin"}},
+		"ak-good": {"active": true, "sub": "u-1", "username": "alice", "email": "a@example.com", "roles": []string{"system-admin"}, "groups": []string{"system-admin"}},
 	}}
 	c, now := newTestClient(t, f, testSecret)
 	ctx := context.Background()
 
 	tok, err := c.Introspect(ctx, "ak-good")
-	if err != nil || tok.Subject != "u-1" || tok.Email != "a@example.com" || !tok.HasRole("system-admin") {
+	if err != nil || tok.Subject != "u-1" || tok.Username != "alice" || tok.Email != "a@example.com" || !tok.HasRole("system-admin") ||
+		len(tok.Groups) != 1 || tok.Groups[0] != "system-admin" {
 		t.Fatalf("active = %+v %v", tok, err)
 	}
 	if _, err := c.Introspect(ctx, "ak-bad"); !errors.Is(err, ErrInactive) {

@@ -4,7 +4,9 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -13,18 +15,39 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
 
-// introspectAnswer writes an RFC 7662 answer for an active key owned by sub.
+// introspectAnswer writes an RFC 7662 answer for an active key owned by sub. The roles are also the groups.
 func introspectAnswer(sub, email string, roles ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"active": true, "sub": sub, "email": email, "roles": roles,
+			"active": true, "sub": sub, "email": email, "roles": roles, "groups": roles,
 		})
 	}
+}
+
+// adminGroupReviewer allows every review for Group primus:system-admin and fails when down is set.
+type adminGroupReviewer struct {
+	down bool
+}
+
+func (r adminGroupReviewer) Create(_ context.Context, sar *authorizationv1.SubjectAccessReview, _ metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	if r.down {
+		return nil, errors.New("apiserver down")
+	}
+	out := sar.DeepCopy()
+	for _, g := range sar.Spec.Groups {
+		if g == "primus:system-admin" {
+			out.Status.Allowed = true
+		}
+	}
+	return out, nil
 }
 
 // inactiveAnswer writes the RFC 7662 answer for a key identity does not accept.
@@ -45,6 +68,7 @@ func newTestRouterWithAuth(t *testing.T, introspect http.HandlerFunc) (*Server, 
 			Port:       8080,
 			EnableAuth: true,
 			Identity:   identity.NewClient(idServer.URL, "agent-sandbox", "secret", ""),
+			Authz:      authz.NewClient(adminGroupReviewer{}, "primus:"),
 		},
 		store: store.NewMemoryStore(),
 	}
@@ -137,6 +161,19 @@ func TestCallerAuth_AccessTokenIsIntrospected(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, "uid-admin", resp["headerUserId"])
 	assert.Equal(t, "system-admin", resp["headerUserRole"])
+}
+
+func TestCallerAuth_RoleReviewUnavailable(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-admin", "", "system-admin"))
+	s.cfg.Authz = authz.NewClient(adminGroupReviewer{down: true}, "primus:")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer ak-valid-key")
+	s.engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "membership_unavailable")
 }
 
 func TestCallerAuth_InactiveCredential(t *testing.T) {
