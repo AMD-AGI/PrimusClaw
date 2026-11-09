@@ -12,6 +12,7 @@ import { errorName } from "../errors.js";
 import type { Lang } from "../locales/lang.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import { agentsText, pairText, sessionsText } from "../remote-view/index.js";
+import { agentsMessage, sessionsMessage } from "./cards.js";
 import { ConnectorSetup, pairCommand, setupFrom } from "./connector/setup.js";
 import type { RemoteContext } from "./context.js";
 import { type Connector, type Session, connectorFrom, sessionFrom } from "./model.js";
@@ -124,7 +125,7 @@ export class Lists {
     const { sessions } = await this.sessions(key);
     const state = this.ctx.remoteState.attachedRemote(chatKey);
     const attached = state?.sessionId ?? null;
-    const card = this.ctx.views.agents({
+    const card = agentsMessage({
       connectors: listed.connectors,
       sessions,
       attached,
@@ -139,6 +140,7 @@ export class Lists {
         ]),
       ),
       own: this.ctx.sessionNames.remoteSessionAcps(chatKey),
+      setup: this.ctx.setup,
     });
     if (!machines && card.listing.length === 0) {
       const { text, listing } = sessionsText(sessions, listed.connectors, attached, this.now(), lang);
@@ -159,7 +161,7 @@ export class Lists {
     const listed = await this.machines(key);
     const { sessions } = await this.sessions(key);
     const state = this.ctx.remoteState.attachedRemote(chatKey);
-    const card = this.ctx.views.sessions({
+    const card = sessionsMessage({
       connectors: listed.connectors,
       sessions,
       attached: state?.sessionId ?? null,
