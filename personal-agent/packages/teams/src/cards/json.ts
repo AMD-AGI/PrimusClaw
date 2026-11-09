@@ -4,7 +4,7 @@
 /** JSON values as they go on the wire: what a card, an activity or an envelope is made of. */
 export type Json = string | number | boolean | null | Json[] | JsonObject;
 export interface JsonObject {
-  [key: string]: Json | undefined;
+  [key: string]: Json;
 }
 
 /** One element of an Adaptive Card (a TextBlock, a Container, an Action...): a JSON object with a `type`. */

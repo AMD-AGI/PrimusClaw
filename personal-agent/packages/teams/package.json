@@ -9,6 +9,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@azure/core-auth": "^1.11.0",
+    "@azure/service-bus": "^7.10.0",
     "@primusclaw/personal-agent": "0.0.0",
     "@primusclaw/personal-agent-runtime": "0.0.0"
   }
