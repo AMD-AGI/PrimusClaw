@@ -95,7 +95,8 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 # upstream published most recently.
 ARG BUN_VERSION=1.3.14
 ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
-RUN curl -fsSL -o /tmp/bun.zip \
+# --retry: GitHub's release downloads answer 504 for minutes during GitHub incidents (2026-11-09); curl --retry retries 5xx/timeouts.
+RUN curl -fsSL --retry 6 --retry-delay 20 -o /tmp/bun.zip \
       "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
  && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
  && unzip -q /tmp/bun.zip -d /tmp/bun \
