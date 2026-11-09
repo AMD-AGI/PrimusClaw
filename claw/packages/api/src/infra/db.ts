@@ -2694,6 +2694,8 @@ export async function buildDeferredIndexes(): Promise<"built" | "held_elsewhere"
   client.on("error", (err) => logger.warn({ err }, "db.deferred_indexes_connection_lost"));
   await client.connect();
   try {
+    // The schema the pools serve (they set it on connect, above); a bare client would build in the default one.
+    if (DB_SCHEMA) await client.query(`SET search_path TO "${DB_SCHEMA}"`);
     await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
     const got = (await client.query("SELECT pg_try_advisory_lock($1) AS got", [DEFERRED_INDEX_LOCK_ID])).rows[0]?.got === true;
     if (!got) {
