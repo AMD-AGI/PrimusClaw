@@ -8,7 +8,7 @@ import { test } from "node:test";
 import type { JsonObject, Logger, LogFields } from "@primusclaw/personal-agent";
 
 import type { AssistantRouteRequest } from "../../src/routing/features.js";
-import { ALICE } from "./fixtures.js";
+import { ALICE, BOB } from "./fixtures.js";
 import { clickOf, link, message, said, world } from "./world.js";
 
 test("test_a_session_made_with_another_plugin_is_kept_and_records_the_new_plugin", async () => {
@@ -99,4 +99,22 @@ test("test_by_the_plain_route_a_chat_attached_to_nothing_says_so_and_a_worker_wi
   link(off, ALICE.id, "ak");
   await off.router.handle(message("还连着吗"));
   assert.ok(routed[1] !== undefined && !("attached" in routed[1]));
+});
+
+test("test_link_codes_and_the_keys_they_carry_are_not_logged (the router's lines and security events)", async () => {
+  const w = world();
+  const { logger, lines } = recording();
+  const events: string[] = [];
+  Object.assign(w.deps, {
+    logger,
+    securityEvent: (name: string, fields: object) => events.push(`${name} ${JSON.stringify(fields)}`),
+  });
+  const code = w.store.links.stashPending(SAFE_KEY);
+  await w.router.handle(message("/link WRONG222", { id: "w1" }));
+  await w.router.handle(message(`/link ${code.toLowerCase()}`, { id: "ok" }));
+  await w.router.handle(message(`/link ${code}`, { user: BOB, id: "replay" })); // (single use: refused)
+  assert.equal(w.store.links.getKey(ALICE.id), SAFE_KEY);
+  assert.equal(w.store.links.getKey(BOB.id), null);
+  const logged = [...lines, ...events].join("\n");
+  for (const mark of [SAFE_KEY, code, code.toLowerCase(), "WRONG222"]) assert.ok(!logged.includes(mark), mark);
 });

@@ -96,3 +96,41 @@ test("test_a_message_after_the_deadline_starts_a_turn_again", async () => {
     ["send", "ak", "sess-ak", "and now?"],
   ]);
 });
+
+for (const [status, words] of [
+  [404, "Nothing is running."],
+  [500, "could not stop the task (error 500)"],
+] as const) {
+  test(`test_stop_when_the_session_cannot_be_read ${String(status)}`, async () => {
+    const w = world();
+    link(w, ALICE.id, "ak");
+    w.store.sessions.setSession(ALICE.id, { sessionId: "s1" });
+    w.claw.busy.set("s1", status);
+    await w.router.handle(message("/stop"));
+    assert.ok(said(w).at(-1)?.includes(words));
+    assert.ok(!w.claw.calls.some((c) => c[0] === "interrupt"));
+  });
+}
+
+test("test_a_new_chat_is_created_with_the_model_and_never_patched (the router's part: the model and what the session has)", async () => {
+  const w = world({ config: { model: "claude-x" } });
+  link(w, ALICE.id, "ak");
+  await w.router.handle(message("hello"));
+  await w.router.settled();
+  assert.equal(w.store.sessions.getSessionModel(ALICE.id), "claude-x");
+  await w.router.handle(message("and again"));
+  await w.router.handle(message("in the group", { kind: "group", conversation: "g-1" }));
+  await w.router.settled();
+  assert.deepEqual(
+    w.turns.runs.map((r) => [r.sessionId, r.model, r.sessionModel]),
+    [
+      [null, "claude-x", ""],
+      ["sess-ak", "claude-x", "claude-x"],
+      [null, "claude-x", ""],
+    ],
+  );
+  await w.router.handle(message("/new"));
+  await w.router.handle(message("fresh"));
+  await w.router.settled();
+  assert.deepEqual(w.turns.runs.at(-1)?.sessionId, null);
+});
