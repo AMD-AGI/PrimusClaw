@@ -96,3 +96,55 @@ test("naming oneself asks the identity service about one github account once", a
   assert.deepEqual(world.identity.askedAbout(), ["external:teams.microsoft.com|aad-a"], groupText(world));
   assert.equal(world.started.length, 1);
 });
+
+test("an asker with no identity binding is sent the binding card and not the link steps", async () => {
+  const world = reviewWorld();
+  world.bound.delete("aad-a");
+  await ask(world);
+  assert.equal(world.started.length, 0);
+  assert.equal(world.said.onboard, 1, JSON.stringify(world.said)); // (the host sends the card that connects her: onboarding)
+  assert.deepEqual(steps(world), []);
+});
+
+test("the group is never told the switch is the reason for a verdict", async () => {
+  const world = reviewWorld();
+  await ask(world);
+  const text = world.started[0]?.turn.shapeAnswer("没有发现必须修复的问题。\nVERDICT: CLEAN", "", "", [], 0, "") ?? "";
+  assert.ok(
+    text.includes("没有发现必须修复的问题") && !text.includes("VERDICT") && !text.includes("未开启自动合入"),
+    text,
+  );
+});
+
+test("a review with nothing held makes no card and the reviewer is only told afterwards", async () => {
+  const world = reviewWorld();
+  await ask(world);
+  const [turn] = world.started;
+  assert.ok(turn);
+  turn.review.sessionId = "sess-1";
+  await world.service.afterTurn(
+    turn.review,
+    "没有发现必须修复的问题，已批准并合入。\nVERDICT: CLEAN",
+    {
+      moved: false,
+      refusal: null,
+      ranModel: "",
+      wrote: [
+        ["gh_review_submit", "submitted", "APPROVE"],
+        ["gh_pr_merge", "merged", ""],
+      ],
+      prSummary: "",
+    },
+    world.surface.conversation(groupMessage("x").conversation),
+  );
+  assert.deepEqual(
+    world.surface.of("personal:aad-b").filter((r) => "message" in r && r.message.body.type === "view"),
+    [],
+  );
+  assert.deepEqual(
+    world.claw.calls.filter((c) => c[0] === "decide"),
+    [],
+  );
+  const dm = saidIn(world.surface, "personal:aad-b");
+  assert.ok(dm.includes("已批准并合入") && dm.includes("Alice"), dm); // he hears it afterwards, in his own chat
+});

@@ -11,7 +11,7 @@ import { test } from "node:test";
 
 import type { IntentReader, UserRef } from "../../src/index.js";
 import { pullsIn, shortName } from "../../src/review-text/pull-ref.js";
-import { MEMBERS, MENTIONS } from "../../../../test-support/review-requests.js";
+import { MEMBERS, MENTIONS, REQUESTS } from "../../../../test-support/review-requests.js";
 import {
   ALICE,
   CONV,
@@ -203,3 +203,154 @@ for (const [name, answer] of [
     assert.deepEqual(numbers(world), [1], groupText(world));
   });
 }
+
+function setupWithoutRoster(answer: Record<string, unknown> | undefined): ReviewWorld {
+  const intent: IntentReader = {
+    read: () => Promise.resolve(answer === undefined ? undefined : { ...answer }),
+    readMode: () => Promise.resolve(undefined),
+    readAnswer: () => Promise.resolve(undefined),
+  };
+  return reviewWorld(["AMD-AGI"], { intent });
+}
+
+for (const [name, text, answer] of [
+  [
+    "the models own list",
+    `{Bob} 合入 ${H1}，Carol 合入 ${H2}，都先 review 一下`,
+    reading({ reviewer: "29:b", prs: [H1, H2], reviewers: ["29:b", "Carol"] }),
+  ],
+  [
+    "a line for each",
+    `请 {Bob} review 合入 ${H1}\n请 Carol review 合入 ${H2}`,
+    reading({ reviewer: "29:b", prs: [H1, H2], reviewers: ["29:b"] }),
+  ],
+  ["a line for each by the rules", `请 {Bob} review 合入 ${H1}\n请 Carol review 合入 ${H2}`, undefined], // the rules read it
+] as const) {
+  test(`without the member list the other checks still find the second person (${name})`, async () => {
+    const world = setupWithoutRoster(answer);
+    await ask(world, text);
+    assert.equal(world.started.length, 0);
+    assert.ok(groupText(world).includes("只能请同一位 reviewer"), groupText(world));
+  });
+}
+
+test("the model is asked only when the message names a pull request and with the askers own key", async () => {
+  const asked: string[] = [];
+  const intent: IntentReader = {
+    read: (key) => {
+      asked.push(key);
+      return Promise.resolve(reading());
+    },
+    readMode: () => Promise.resolve(undefined),
+    readAnswer: () => Promise.resolve(undefined),
+  };
+  const world = reviewWorld(["AMD-AGI"], { rosters: { [CONV]: MEMBERS }, intent });
+  await ask(world, "请 {Bob} 帮我 review 合入");
+  await ask(world, "你好");
+  assert.deepEqual(asked, []);
+  await ask(world, `请 Bob 帮我 review 合入 ${H1}`);
+  assert.deepEqual(asked, ["ak-alice-linked"]);
+  world.store.links.unlink("aad-a"); // no key of the asker's: no model call (the rules read it)
+  await ask(world, `请 {Bob} 帮我 review 合入 ${H2}`);
+  assert.equal(asked.length, 1);
+});
+
+test("the member list is read once for a few minutes", async () => {
+  const world = setup(undefined);
+  const surface = world.surface;
+  const members = surface.members.bind(surface);
+  let calls = 0;
+  surface.members = (conversation) => {
+    calls += 1;
+    return members(conversation);
+  };
+  for (const [n, wait] of [
+    [1, 0],
+    [2, 200_000],
+    [3, 101_000],
+  ] as const) {
+    await world.clock.advance(wait);
+    world.started.forEach((s) => {
+      s.ended();
+    });
+    await ask(world, `请 Bob 帮我 review 合入 AMD-AGI/Hyperloom#${String(n)}`);
+  }
+  assert.equal(calls, 2);
+  assert.equal(world.started.length, 3);
+});
+
+for (const [name, typed, says] of [
+  ["ambiguous", "Carol", "这个群里有不止一位叫「Carol」的成员：Carol、Carol SaFE"],
+  ["only close", "Lin", "没有找到「Lin」（相近的有：Lin, Mei）"],
+  ["absent", "Zed", "没有找到「Zed」，请写出 TA 的全名"],
+] as const) {
+  test(`a name that is not exactly one member is a question with the candidates (${name})`, async () => {
+    const world = setup(undefined); // (the rules read it: the name goes the same way whoever read the request)
+    await ask(world, `请 ${typed} 帮我 review 合入 ${H1}`);
+    assert.equal(world.started.length, 0);
+    assert.ok(groupText(world).includes(says), groupText(world));
+    assert.deepEqual(world.identity.requests, []); // nobody was guessed
+  });
+}
+
+for (const [id, pref, lang] of [
+  ["en-mention", "zh", "en"],
+  ["zh-name", "en", "zh"],
+] as const) {
+  test(`a reviews own lines are said in the language of its request (${id})`, async () => {
+    const c = REQUESTS.find((r) => r.id === id);
+    assert.ok(c);
+    const world = setup({ ...c.reading });
+    world.store.prefs.setLang("aad-a", pref, true);
+    await ask(world, c.text);
+    assert.ok(world.started.length > 0);
+    assert.deepEqual(new Set(world.started.map((s) => s.review.lang)), new Set([lang]));
+  });
+}
+
+test("a read member list keeps the addresses of people already known", async () => {
+  const world = reviewWorld(["AMD-AGI"], {
+    rosters: {
+      [CONV]: [
+        ...MEMBERS,
+        {
+          channelUserId: "29:new",
+          userId: "",
+          name: "Nobody Known",
+          givenName: "",
+          surname: "",
+          email: "nobody@example.com",
+          userPrincipalName: "",
+        },
+      ],
+    },
+  });
+  world.store.members.rememberMember("29:w", "aad-w", "Lin, Mei");
+  await ask(world, "请 Bob 帮我 review 合入 AMD-AGI/Hyperloom#1");
+  const known = new Map(world.store.members.knownMembers().map((k) => [k.id, k]));
+  assert.equal(known.has("29:new"), false);
+  assert.deepEqual(
+    [known.get("29:b")?.email, known.get("29:w")?.email],
+    ["bob.smith@example.com", "linmei0120@example.com"],
+  );
+});
+
+test("a reviewer the asker did not name is never acted as even when the reading names them", async () => {
+  const intent: IntentReader = {
+    read: () => Promise.resolve(reading({ reviewer: "Zhang Mei Lin", prs: [H1] })),
+    readMode: () => Promise.resolve(undefined),
+    readAnswer: () => Promise.resolve(undefined),
+  };
+  const zhang = {
+    channelUserId: "29:z",
+    userId: "aad-z",
+    name: "Mei Lin Zhang",
+    givenName: "",
+    surname: "",
+    email: "",
+    userPrincipalName: "",
+  };
+  const world = reviewWorld(["AMD-AGI"], { rosters: { [CONV]: [...MEMBERS, zhang] }, intent });
+  await ask(world, `请 Zhang Mei Lin 帮我 review 合入 ${H1}`);
+  assert.deepEqual(world.identity.askedAbout(), ["external:teams.microsoft.com|aad-z"]); // named in any order: it is them
+});
