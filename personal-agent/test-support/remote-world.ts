@@ -35,7 +35,8 @@ import { SeededRandom } from "./random.js";
 import { type FakeCommand, FakeRemote, KEYS } from "./remote-fake.js";
 import { type Recorded, FakeSurface } from "./surface.js";
 import { parseAgentCommand } from "../packages/core/src/commands/agent-args.js";
-import { commandArgs } from "../packages/core/src/commands/parse.js";
+import { commandArgs, menuCommand } from "../packages/core/src/commands/parse.js";
+import { naturalCommand } from "../packages/core/src/capabilities/natural.js";
 import { openTestStore } from "./store.js";
 
 export const USER_A = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
@@ -225,10 +226,11 @@ export class RemoteWorld {
   }
 
   /** One message from the user, without waiting for the turn it starts. */
-  async send(text: string, user = USER_A): Promise<void> {
+  async send(typed: string, user = USER_A): Promise<void> {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
+    const text = this.asTheRouterReadsIt(typed, user.id);
     // (as the router reads it: `/agents` alone or with words that are no subcommand is the list; `/agents new` is `/agent new`)
     const agents = commandArgs(text, "agents");
     if (agents !== null && parseAgentCommand(agents) === null) return this.remote.agents(sender, key, to);
@@ -258,6 +260,18 @@ export class RemoteWorld {
         provider: undefined,
       });
     }
+  }
+
+  /**
+   * What a 1:1 message says as the router reads it (routing/personal-text.ts): a menu word or a sentence that is a command is that
+   * command, with the words that are not commands here left as words (no assistant, no GitHub in this world).
+   */
+  private asTheRouterReadsIt(text: string, userId: string): string {
+    const attached = this.remote.attached(userId);
+    const off = new Set(["github", "board", "brief", "brief now"]);
+    if (!this.settings.enabled) for (const word of ["agents", "agent"]) off.add(word);
+    if (!attached) for (const word of ["agent detach", "stop it"]) off.add(word);
+    return naturalCommand(menuCommand(text, false), false, off);
   }
 
   /** A tap on a card's button. */
