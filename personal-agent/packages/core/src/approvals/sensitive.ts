@@ -10,22 +10,72 @@
  */
 
 import { MASK, redactText } from "../security/redact.js";
+import { cpLength } from "../text/py-text.js";
 
 const WORDS = new Set([
-  "token", "secret", "secrets", "password", "passwords", "passwd", "passphrase", "passphrases", "authorization", "auth", "auths",
-  "authentication", "authenticate", "authorisation", "credential", "credentials", "cookie", "cookies", "apikey", "apikeys",
-  "accesskey", "secretkey", "privatekey", "platformkey", "virtualkey", "pgpassword", "pgpass", "pat", "pats", "dsn",
+  "token",
+  "secret",
+  "secrets",
+  "password",
+  "passwords",
+  "passwd",
+  "passphrase",
+  "passphrases",
+  "authorization",
+  "auth",
+  "auths",
+  "authentication",
+  "authenticate",
+  "authorisation",
+  "credential",
+  "credentials",
+  "cookie",
+  "cookies",
+  "apikey",
+  "apikeys",
+  "accesskey",
+  "secretkey",
+  "privatekey",
+  "platformkey",
+  "virtualkey",
+  "pgpassword",
+  "pgpass",
+  "pat",
+  "pats",
+  "dsn",
   "connectionstring",
   // A bare `pwd` too: as the name of a tool argument it is a password far more often than a path.
   "pwd",
 ]);
 const PAIRS = new Set([
-  "api key", "access key", "secret key", "private key", "platform key", "virtual key", "signing key", "encryption key", "ssh key",
-  "database url", "db url", "database uri", "db uri", "connection string",
+  "api key",
+  "access key",
+  "secret key",
+  "private key",
+  "platform key",
+  "virtual key",
+  "signing key",
+  "encryption key",
+  "ssh key",
+  "database url",
+  "db url",
+  "database uri",
+  "db uri",
+  "connection string",
 ]);
 const TOKEN_PAIRS = new Set([
-  "api token", "access token", "auth token", "authorization token", "bearer token", "refresh token", "session token",
-  "service token", "secret token", "private token", "id token", "identity token",
+  "api token",
+  "access token",
+  "auth token",
+  "authorization token",
+  "bearer token",
+  "refresh token",
+  "session token",
+  "service token",
+  "secret token",
+  "private token",
+  "id token",
+  "identity token",
 ]);
 const COUNTERS = new Set(["token usage", "token count", "token limit", "token len"]);
 const MIN_SECRET = 4;
@@ -65,7 +115,7 @@ export function credentialValues(value: unknown, underSecret = false, depth = 0)
   if (depth > MAX_DEPTH || value === null || value === undefined) return [];
   if (typeof value === "string" || typeof value === "number") {
     const text = String(value);
-    return underSecret && Array.from(text).length >= MIN_SECRET ? [text] : [];
+    return underSecret && cpLength(text) >= MIN_SECRET ? [text] : [];
   }
   if (Array.isArray(value)) {
     return value.slice(0, MAX_CHILDREN).flatMap((child) => credentialValues(child, underSecret, depth + 1));
@@ -80,7 +130,7 @@ export function credentialValues(value: unknown, underSecret = false, depth = 0)
 
 /** `text` with every occurrence of each secret replaced; longest first, so one inside another goes whole. */
 export function scrub(text: string, secrets: readonly string[]): string {
-  const ordered = [...new Set(secrets)].sort((a, b) => Array.from(b).length - Array.from(a).length);
+  const ordered = [...new Set(secrets)].sort((a, b) => cpLength(b) - cpLength(a));
   return ordered.reduce((out, secret) => out.split(secret).join(MASK), text);
 }
 

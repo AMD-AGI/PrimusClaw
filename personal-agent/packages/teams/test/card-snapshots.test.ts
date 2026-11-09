@@ -9,14 +9,24 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { remoteView } from "@primusclaw/personal-agent";
+import { pyJsonDumps } from "@primusclaw/personal-agent";
 import { Ajv } from "ajv";
 
 import { CJK } from "../src/cards/cjk.js";
 import { isObject, walk, type JsonObject } from "../src/cards/json.js";
-import { ADAPTIVE_CARD, BUTTONS_MAX, CARD_VERSION, emojiBudget, emojiIn, ICONS } from "../src/cards/kit.js";
+import {
+  ADAPTIVE_CARD,
+  BUTTONS_MAX,
+  CARD_VERSION,
+  emojiBudget,
+  emojiIn,
+  execute,
+  facts,
+  ICONS,
+  message,
+  text,
+} from "../src/cards/kit.js";
 import { CATALOG, PENDING } from "../../../test-support/card-catalog/index.js";
-import { pythonJson } from "../../../test-support/python-json.js";
 
 const DATA = new URL("../../../test-support/data/", import.meta.url);
 const SNAPSHOTS = new URL("card_snapshots/", DATA);
@@ -30,19 +40,19 @@ const validate = new Ajv({ strict: false, allErrors: false }).compile({
 /** The cards whose buttons are someone else's whole set of choices, each of which must stay one tap away. */
 const FOUR_BUTTONS = new Set(["remote_permission", "remote_status", "remote_window", "remote_window_en"]);
 const HALF_NEXT_TO_CJK = new RegExp(`${CJK}[,:;?!]|[,;?!]${CJK}`);
-/** Besides the kit's own: the thumbs, a remote agent's kind icons, and the robot. */
+/** Besides the kit's own: the thumbs and the robot; a card's feature adds its own icons (`CatalogEntry.emoji`). */
 const EXTRA_EMOJI = ["\u{1f44d}", "\u{1f44e}", "\u{1f916}"];
-let allowedEmoji = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI, ...remoteView.KIND_ICONS]);
+const KIT_EMOJI = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI]);
 
-/** Lines that port cards with their own emoji (a remote agent's kind icons) add them here. */
-export function allowEmoji(...emoji: string[]): void {
-  allowedEmoji = new Set([...allowedEmoji, ...emoji]);
-}
-
-/** A JSON value as the text it shows. */
+/** A JSON value as the text it shows (Python's `str(node.get(key, ""))`: an absent value is ""). */
 function s(value: unknown): string {
   if (value === undefined) return "";
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/** What Python's `json.dumps(value, ensure_ascii=False, indent=1, sort_keys=True)` writes, with the file's final newline. */
+function pythonJson(value: unknown): string {
+  return pyJsonDumps(value, { indent: 1, sortKeys: true }) + "\n";
 }
 
 function omit(object: JsonObject, ...keys: string[]): JsonObject {
@@ -70,6 +80,33 @@ function* words(card: JsonObject): Generator<readonly ["text" | "fact" | "button
   }
 }
 
+/** The text of a card's header title (the first TextBlock of its first element, medium and bolder), if it has one. */
+function headerTitle(card: JsonObject): string | undefined {
+  const body = card["body"] as JsonObject[];
+  const top = body[0] ?? {};
+  const columns = (top["columns"] ?? []) as JsonObject[];
+  const head = (top["items"] ?? columns[columns.length - 1]?.["items"] ?? []) as JsonObject[];
+  const title = head[0];
+  if (!title || title["type"] !== "TextBlock" || title["size"] !== "Medium" || title["weight"] !== "Bolder")
+    return undefined;
+  return s(title["text"]);
+}
+
+test("the words of a card skip nodes without a type (a button's data) and read texts, facts and buttons", () => {
+  const built = message(
+    [text("✅ done"), ...facts([["作者", "林"]])],
+    [execute("🔍 Review", "primusclaw.review", { pr: { number: 7, repo: "o/r" } })],
+  );
+  assert.deepEqual(
+    [...words(content(built))],
+    [
+      ["text", "✅ done"],
+      ["fact", "作\u2060者林"],
+      ["button", "🔍 Review"],
+    ],
+  );
+});
+
 test("the catalog names each card once", () => {
   const ids = CATALOG.map((e) => e.id);
   assert.equal(ids.length, new Set(ids).size);
@@ -90,6 +127,15 @@ test("no snapshot is left without a card", () => {
     [],
     "an entry that is ported is no longer pending",
   );
+});
+
+test("every snapshot file is written as Python writes it (indent 1, sorted keys), so a formatter cannot rewrite one unseen", () => {
+  const files = readdirSync(SNAPSHOTS).filter((f) => f.endsWith(".json"));
+  assert.ok(files.length >= 50);
+  for (const file of files) {
+    const written = readFileSync(new URL(file, SNAPSHOTS), "utf8");
+    assert.equal(pythonJson(JSON.parse(written)), written, file);
+  }
 });
 
 for (const entry of CATALOG) {
@@ -124,6 +170,7 @@ for (const entry of CATALOG) {
 
   test(`card uses emoji as the kit says: ${entry.id}`, () => {
     const card = content(entry.build());
+    const allowedEmoji = new Set([...KIT_EMOJI, ...(entry.emoji ?? [])]);
     const found: string[] = [];
     for (const [where, line] of words(card)) {
       const emoji = emojiIn(line);
@@ -136,14 +183,10 @@ for (const entry of CATALOG) {
       }
     }
     assert.ok(found.length <= emojiBudget(card), found.join(" "));
-    const body = card["body"] as JsonObject[];
-    const top = body[0] ?? {};
-    const columns = (top["columns"] ?? []) as JsonObject[];
-    const head = (top["items"] ?? columns[columns.length - 1]?.["items"] ?? []) as JsonObject[];
-    const title = head[0];
-    if (title && title["type"] === "TextBlock" && title["size"] === "Medium" && title["weight"] === "Bolder") {
-      const lead = emojiIn(s(title["text"]))[0];
-      assert.ok(lead !== undefined && s(title["text"]).startsWith(lead), s(title["text"]));
+    const title = headerTitle(card);
+    if (title !== undefined) {
+      const lead = emojiIn(title)[0];
+      assert.ok(lead !== undefined && title.startsWith(lead), title);
     }
   });
 }

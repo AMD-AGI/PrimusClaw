@@ -5,10 +5,11 @@
  * The card catalog: every feature's entries. A line that ports a feature's cards adds its module here and takes its ids off
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).
  */
+import { APPROVAL_CARDS } from "./approval.js";
 import type { CatalogEntry } from "./catalog.js";
 import { REMOTE } from "./remote.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...REMOTE];
+export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...REMOTE];
 
 const BY_LINE = {
   W4: ["binding", "link", "onboarding", "repo"],
@@ -17,17 +18,14 @@ const BY_LINE = {
     "answered",
     "approval_decided",
     "approval_expired",
-    "approval_group",
     "approval_item",
     "approval_proactive",
-    "approval_turn",
     "assistant_action",
     "assistant_confirm",
     "board",
     "board_asked",
     "delivery",
     "digest",
-    "question",
     "question_item",
     "run_completed",
     "run_failed",
@@ -36,8 +34,7 @@ const BY_LINE = {
     "work_result",
     "work_stopped",
   ],
-  W6b: ["remote_permission"], // (on the approval card's body, W5's)
-  W3: ["remote_window", "remote_window_en"],
+  W6b: ["remote_window", "remote_window_en"],
   W7: ["github_connect", "review_confirm_merge", "review_confirm_post", "review_end", "review_mode", "review_start"],
   W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;

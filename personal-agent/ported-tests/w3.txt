@@ -7,3 +7,33 @@ teams/tests/test_card_snapshots.py::test_full_width_punctuation_next_to_chinese_
 teams/tests/test_card_snapshots.py::test_the_kit_refuses_a_fourth_button_and_an_unknown_tone -> packages/teams/test/cards-kit.test.ts::the kit refuses a fourth button and an unknown tone
 teams/tests/test_card_snapshots.py::test_only_the_first_button_is_primary -> packages/teams/test/cards-kit.test.ts::only the first button is primary
 teams/tests/test_card_snapshots.py::test_full_width_punctuation_takes_linear_time_on_any_text -> packages/teams/test/cards-kit.test.ts::full width punctuation takes linear time on any text: brackets
+teams/tests/test_richtext.py::test_markdown_becomes_exactly_this_html -> packages/teams/test/richtext/exact.test.ts::markdown becomes exactly this html: plain text is only escaped
+teams/tests/test_richtext.py::test_only_the_first_bold_line_is_the_heading_and_only_when_it_leads -> packages/teams/test/richtext/exact.test.ts::only the first bold line is the heading and only when it leads
+teams/tests/test_richtext.py::test_status_colours_are_readable_on_light_and_dark_themes -> packages/teams/test/richtext/exact.test.ts::status colours are readable on light and dark themes
+teams/tests/test_richtext.py::test_a_realistic_answer -> packages/teams/test/richtext/exact.test.ts::a realistic answer
+teams/tests/test_richtext.py::test_hostile_text_never_produces_a_tag_of_its_own -> packages/teams/test/richtext/hostile.test.ts::hostile text never produces a tag of its own: "<script>alert(1)</script>"
+teams/tests/test_richtext.py::test_a_link_url_cannot_close_its_attribute -> packages/teams/test/richtext/hostile.test.ts::a link url cannot close its attribute
+teams/tests/test_richtext.py::test_safe_url -> packages/teams/test/richtext/hostile.test.ts::safe url: "https://example.com/a?b=1"
+teams/tests/test_richtext.py::test_the_validator_refuses_anything_off_the_allow_list -> packages/teams/test/richtext/hostile.test.ts::the validator refuses anything off the allow list: <script>x</script>
+teams/tests/test_richtext.py::test_the_validator_accepts_what_the_converter_writes -> packages/teams/test/richtext/hostile.test.ts::the validator accepts what the converter writes
+teams/tests/test_richtext.py::test_a_converter_that_escaped_nothing_fails_closed -> packages/teams/test/richtext/hostile.test.ts::a converter that escaped nothing fails closed
+teams/tests/test_richtext.py::test_random_markup_never_escapes_the_allow_list -> packages/teams/test/richtext/hostile.test.ts::random markup never escapes the allow list
+teams/tests/test_richtext.py::test_pathological_input_is_fast -> packages/teams/test/richtext/limits.test.ts::pathological input is fast: many unclosed stars
+teams/tests/test_richtext.py::test_an_enormous_answer_is_refused_so_the_caller_falls_back -> packages/teams/test/richtext/limits.test.ts::an enormous answer is refused so the caller falls back
+teams/tests/test_richtext.py::test_the_worst_case_part_still_fits_in_a_teams_message -> packages/teams/test/richtext/limits.test.ts::the worst case part still fits in a teams message
+teams/tests/test_richtext.py::test_markup_that_would_not_fit_a_teams_message_is_refused_so_the_caller_falls_back -> packages/teams/test/richtext/limits.test.ts::markup that would not fit a teams message is refused so the caller falls back
+teams/tests/test_richtext.py::test_each_line_pattern_is_linear_on_the_run_that_made_it_quadratic -> packages/teams/test/richtext/linear.test.ts::each line pattern is linear on the run that made it quadratic: fence
+teams/tests/test_richtext.py::test_the_converter_is_linear_on_a_hostile_line -> packages/teams/test/richtext/linear.test.ts::the converter is linear on a hostile line: heading
+teams/tests/test_richtext.py::test_the_rewritten_pattern_reads_every_short_line_as_before -> packages/teams/test/richtext/linear.test.ts::the rewritten pattern reads every short line as before: fence
+teams/tests/test_outbound_log.py::test_every_outbound_operation_is_logged_without_its_text -> packages/teams/test/messenger/outbound-log.test.ts::every outbound operation is logged without its text
+teams/tests/test_outbound_log.py::test_a_status_message_whose_ack_never_comes_is_reported -> packages/teams/test/messenger/outbound-log.test.ts::a status message whose ack never comes is reported
+teams/tests/test_status_ack_wait.py::test_an_ack_that_arrives_after_the_wait_is_logged_as_late -> packages/teams/test/messenger/acks.test.ts::an ack that arrives after the wait is logged as late
+teams/tests/test_status_ack_wait.py::test_a_stray_ack_is_not_reported_as_late -> packages/teams/test/messenger/acks.test.ts::a stray ack is not reported as late
+teams/tests/test_status_ack_wait.py::test_a_slow_hand_off_to_the_queue_is_logged -> packages/teams/test/messenger/acks.test.ts::a slow hand off to the queue is logged
+teams/tests/test_status_ack_wait.py::test_a_sender_idle_for_minutes_is_replaced_before_the_send_not_after_it_fails -> packages/teams/test/servicebus/servicebus.test.ts::a sender idle for minutes is replaced before the send, not after it fails
+teams/tests/test_status_ack_wait.py::test_a_stale_sender_that_cannot_even_be_closed_does_not_stop_the_send -> packages/teams/test/servicebus/servicebus.test.ts::a stale sender that cannot even be closed does not stop the send
+teams/tests/test_transport.py::test_envelope_shapes -> packages/teams/test/activity/outbound.test.ts::envelope shapes
+teams/tests/test_transport.py::test_poison_message_is_dead_lettered_and_handler_failure_abandoned -> packages/teams/test/servicebus/servicebus.test.ts::poison message is dead lettered and handler failure abandoned
+teams/tests/test_transport.py::test_only_the_idle_timeout_is_silent_other_service_bus_errors_are_logged -> packages/teams/test/servicebus/servicebus.test.ts::only the idle timeout is silent: other service bus errors are logged
+teams/tests/test_reply_style.py::test_the_informative_text_is_cut_to_teams_limits_keeping_the_newest -> packages/teams/test/stream/informative.test.ts::the informative text is cut to teams limits keeping the newest
+teams/tests/test_reply_style.py::test_merging_keeps_one_root_entity_whatever_the_activity_came_with -> packages/teams/test/activity/decorations.test.ts::merging keeps one root entity whatever the activity came with

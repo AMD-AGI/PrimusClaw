@@ -14,6 +14,11 @@ export interface CatalogEntry {
   readonly id: string;
   /** The message activity the card goes out in. */
   readonly build: () => JsonObject;
+  /**
+   * Emoji the card may carry besides the kit's ICONS and the thumbs: its feature's own icons, taken from the production
+   * module that draws them (a remote agent's kind icons), never written out here.
+   */
+  readonly emoji?: readonly string[];
 }
 
 export const NOW = 1793952000.0; // fixed: 2026-11-06 08:00 UTC
@@ -23,4 +28,12 @@ export const TZ = "Asia/Shanghai";
 
 export function entries(...list: Array<readonly [string, () => JsonObject]>): CatalogEntry[] {
   return list.map(([id, build]) => ({ id, build }));
+}
+
+/** `entries`, each allowed `emoji` besides the kit's (a feature whose cards carry icons of their own). */
+export function entriesWithEmoji(
+  emoji: readonly string[],
+  ...list: Array<readonly [string, () => JsonObject]>
+): CatalogEntry[] {
+  return list.map(([id, build]) => ({ id, build, emoji }));
 }

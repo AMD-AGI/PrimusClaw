@@ -1,20 +1,20 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "body": [
-          {
-            "text": "This button is no longer active.",
-            "type": "TextBlock",
-            "wrap": true
-          }
-        ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
-      },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "body": [
+     {
+      "text": "This button is no longer active.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }

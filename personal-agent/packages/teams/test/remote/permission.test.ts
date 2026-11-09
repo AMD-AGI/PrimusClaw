@@ -10,7 +10,6 @@ import { remoteView } from "@primusclaw/personal-agent";
 import { assertValidCard, cardOf, textsOf } from "../../../../test-support/adaptive-card.js";
 import { CLAUDE_OPTIONS, CODEX_OPTIONS, CURSOR_OPTIONS } from "../../../../test-support/remote-fake-data.js";
 import { decidedCard, permissionCard, remoteAskCard } from "../../src/views/remote/index.js";
-import { pendingApprovalBody } from "../../src/views/remote/pending-approval-body.js";
 
 type Json = Record<string, unknown>;
 const data = (b: Json): Json => b["data"] as Json;
@@ -25,7 +24,7 @@ function cardFor(options: unknown, request: Json = REQUEST): Json {
     1_000_000,
     "UTC",
   );
-  const card = cardOf(permissionCard(view, pendingApprovalBody));
+  const card = cardOf(permissionCard(view));
   assertValidCard(card);
   return card;
 }

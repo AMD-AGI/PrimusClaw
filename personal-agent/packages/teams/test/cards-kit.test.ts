@@ -6,7 +6,6 @@ import { test } from "node:test";
 
 import { clip, hasCjk, zh } from "../src/cards/cjk.js";
 import type { CardElement } from "../src/cards/json.js";
-import { collapse, isSpace, lstrip, pyLen, pySlice, pySplit, rstrip, str, strip } from "../src/text/pystr.js";
 import {
   buttons,
   card,
@@ -194,20 +193,4 @@ test("buttons, links and the card around them", () => {
   });
   assert.equal(hasCjk("中"), true);
   assert.equal(hasCjk(null), false);
-});
-
-test("python string semantics: code points and Python's whitespace", () => {
-  assert.equal(pyLen("a😀"), 2);
-  assert.equal(pySlice("a😀b", 1, 2), "😀");
-  assert.equal(pySlice("a😀b", 1), "😀b");
-  assert.deepEqual(pySplit("\u001fa b﻿"), ["a", "b﻿"]);
-  assert.equal(collapse(" a 　 b "), "a b");
-  assert.equal(strip("\u0085 x  "), "x");
-  assert.equal(lstrip("  x "), "x ");
-  assert.equal(rstrip("  x "), "  x");
-  assert.equal(isSpace(""), false);
-  assert.deepEqual(
-    [str("s"), str(0), str(2), str(Number.NaN), str(0n), str(3n), str(true), str(false), str(null), str({})],
-    ["s", "", "2", "", "", "3", "True", "", "", ""],
-  );
 });

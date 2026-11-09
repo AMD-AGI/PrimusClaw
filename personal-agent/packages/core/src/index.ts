@@ -8,13 +8,16 @@
  * but itself, zod and the Claw wire contract (through ./protocol.ts). Everything else reaches it through a port
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
+export * from "./approvals/index.js";
 export * from "./errors.js";
+export * from "./feedback/index.js";
 export * from "./json.js";
 export * from "./locales/index.js";
 export * from "./plugins/index.js";
 export * from "./ports/index.js";
 export * from "./protocol.js";
 export * from "./result.js";
+export * from "./text/py-text.js";
 export * from "./validate.js";
 export * from "./claw/credential.js";
 export * from "./claw/errors.js";
@@ -24,3 +27,4 @@ export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
 export * as remoteView from "./remote-view/index.js";
+export * from "./inbound-text/index.js";
