@@ -8,7 +8,7 @@
  * nothing all end the same way, as undefined, and the user sees no changes block and no error.
  */
 
-import { collapseSpaces, pySlice, pyRstrip } from "../text/python-str.js";
+import { cpSlice, pyRstrip, squashSpaces } from "../text/py-text.js";
 import { isObject, objectOr } from "./json.js";
 import { errorName } from "../errors.js";
 import type { Logger } from "../ports/logger.js";
@@ -67,7 +67,7 @@ function count(value: unknown): number | undefined {
 }
 
 function text(value: unknown, limit: number): string {
-  return typeof value === "string" ? pySlice(collapseSpaces(value), 0, limit) : "";
+  return typeof value === "string" ? cpSlice(squashSpaces(value), 0, limit) : "";
 }
 
 function fileOf(raw: unknown): FileChange | undefined {

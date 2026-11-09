@@ -7,7 +7,7 @@
  */
 
 import type { OutMessage } from "../../ports/surface.js";
-import { pyLen, pyStrip } from "../../text/python-str.js";
+import { cpLength, pyStrip } from "../../text/py-text.js";
 import { LiveView } from "../live-view.js";
 import type { Step } from "../step.js";
 import { type FinishOptions, plainMessage } from "./answer-messages.js";
@@ -102,6 +102,6 @@ export class TurnStatusPolicy implements StatusPolicy<Step> {
   streamable(streamed: string): string {
     if (!this.streamText) return "";
     const text = [...this.said, ...(this.partial ? [this.partial] : [])].join("\n\n");
-    return pyLen(text) > STREAM_TEXT_MAX || !text.startsWith(streamed) ? streamed : text;
+    return cpLength(text) > STREAM_TEXT_MAX || !text.startsWith(streamed) ? streamed : text;
   }
 }

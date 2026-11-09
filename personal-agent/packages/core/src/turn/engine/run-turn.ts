@@ -10,7 +10,7 @@
 import { errorName } from "../../errors.js";
 import type { SuggestedReply } from "../../ports/surface.js";
 import { SUGGESTED_REPLIES, turnEnglish, turnText } from "../../locales/turn.js";
-import { pyStrip } from "../../text/python-str.js";
+import { pyStrip } from "../../text/py-text.js";
 import { deepLink } from "../answer-parts.js";
 import { sleepSeconds } from "../ports.js";
 import { plainMessage } from "../progress/answer-messages.js";

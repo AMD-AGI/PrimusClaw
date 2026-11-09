@@ -3,7 +3,17 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { pyFullmatch } from "../../src/text/py-regex.js";
+import {
+  PY_B_END,
+  PY_B_START,
+  PY_D,
+  PY_W,
+  PY_W_CHARS,
+  isAsciiAlpha,
+  pyFullmatch,
+  pyIsAlnum,
+  pyRegExp,
+} from "../../src/text/py-regex.js";
 
 /**
  * (pattern, flags, text, what Python 3's re.fullmatch said). `\\p{Lu}` was checked in Python with the class of the
@@ -67,4 +77,57 @@ test("pyFullmatch keeps groups and refuses a negated class escape inside a class
   assert.equal(pyFullmatch("[]a]").test("]"), true);
   assert.equal(pyFullmatch("[^]a]").test("b"), true);
   assert.equal(pyFullmatch("a", "u").flags, "u");
+});
+
+/** (pattern, flags, text, "search" or "full", what Python 3's re.search / re.fullmatch said). */
+const MORE: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["a", "", "a\n", "full", false],
+  ["a$", "", "a\n", "search", true],
+  ["a", "m", "x\na", "full", false],
+  ["^a$", "m", "x\na\ny", "search", true],
+  ["^a", "", "x\na", "search", false],
+  ["\\Aa", "", "ba", "search", false],
+  ["a\\Z", "", "a\n", "search", false],
+  ["(?i)abc", "", "ABC", "full", true],
+  ["(?i)link", "", "L\u0130NK", "full", true],
+  ["a.b", "", "a\nb", "full", false],
+  ["a.b", "s", "a\nb", "full", true],
+  ["a.b", "", "a\rb", "full", true],
+  ["(?P<id>i+)", "i", "II", "full", true],
+  ["(?P<x>a)(?P=x)", "", "aa", "full", true],
+  ["k+", "i", "\u212a\u212a", "full", true],
+  ["s", "i", "\u017f", "full", true],
+  ["i", "i", "\u0131", "full", true],
+  ["i", "i", "\u0130", "full", true],
+  ["bearer [a-z]+", "i", "Bearer \u212axxx", "search", true],
+  ["\\b\u00e9", "", "caf\u00e9", "search", false],
+  ["\\b\u00e9", "", "\u00e9", "search", true],
+  ["\u00e9\\b", "", "\u00e9a", "search", false],
+  ["\\bcaf\u00e9\\b", "", "a caf\u00e9.", "search", true],
+  ["\\B\u00e9", "", "caf\u00e9", "search", true],
+  ["abc", "", "xabcx", "search", true],
+  ["abc", "", "xabcx", "full", false],
+  ["^a", "m", "b\ra", "search", false],
+  ["a$", "m", "a\rb", "search", false],
+];
+
+test("anchors, dots, named groups, inline flags and Unicode case and word boundaries are Python's", () => {
+  for (const [pattern, flags, text, how, python] of MORE) {
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.equal(regex.test(text), python, `${how} ${pattern} /${flags} ${JSON.stringify(text)}`);
+  }
+  assert.equal(pyRegExp("(?P<id>\\d+)").exec("ab 12")?.groups?.["id"], "12");
+  assert.throws(() => pyRegExp("(?x)a b"), /no JavaScript form/);
+  assert.equal(pyRegExp("a", "g").flags, "gu");
+});
+
+test("the building blocks of Python's word, digit and boundary are exported for patterns of their own", () => {
+  const word = new RegExp(`${PY_B_START}abc${PY_B_END}`, "u");
+  assert.equal(word.test("中abc"), false); // Python: re.search(r"(?<![\w])abc(?![\w])", "中abc") is None
+  assert.equal(word.test(" abc."), true);
+  assert.ok(new RegExp(`^${PY_D}+$`, "u").test("١٢"));
+  assert.ok(new RegExp(`^[${PY_W_CHARS}.-]+$`, "u").test("名字.x-1"));
+  assert.ok(new RegExp(`^${PY_W}$`, "u").test("é") && !new RegExp(`^${PY_W}$`, "u").test("-"));
+  assert.ok(pyIsAlnum("中") && pyIsAlnum("٣") && !pyIsAlnum("_") && !pyIsAlnum(" "));
+  assert.ok(isAsciiAlpha("abc") && !isAsciiAlpha("abç") && !isAsciiAlpha("ab1") && !isAsciiAlpha(""));
 });

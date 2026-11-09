@@ -15,6 +15,7 @@ import { Ajv } from "ajv";
 import { isObject, walk, type JsonObject } from "../src/cards/json.js";
 import { ADAPTIVE_CARD } from "../src/cards/kit.js";
 import { CHANGES_PATH_MAX, changesCard, deliveryCard } from "../src/views/turn/index.js";
+import { stopCard } from "../src/views/turn/stop.js";
 
 const PUBLIC = "https://example.test";
 const ID = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -400,4 +401,22 @@ it("test_a_finished_answer_is_followed_by_the_changes_card (card)", () => {
   const rendered = card(MIXED, SESSION);
   assert.deepEqual(lines(rendered).slice(0, 2), ["📝 Changes", "5 files changed, +59 -14"]);
   assert.equal((actions(rendered)[0]?.["data"] as JsonObject)["session_id"], SESSION);
+});
+
+it("test_the_card_says_what_it_does_in_the_persons_language_and_carries_only_the_token", () => {
+  const zh = stopCard({ token: "tok", lang: "zh" });
+  const en = stopCard({ token: "tok", lang: "en" });
+  const zhCard = zh.attachments[0]?.content as Record<string, unknown>;
+  const enCard = en.attachments[0]?.content as Record<string, unknown>;
+  assert.deepEqual(zhCard["actions"], [
+    {
+      type: "Action.Execute",
+      title: "停止",
+      verb: "primusclaw.turn_stop",
+      style: "destructive",
+      data: { primusclaw: "turn_stop", turn: "tok" },
+    },
+  ]);
+  assert.equal((enCard["actions"] as Array<Record<string, unknown>>)[0]?.["title"], "Stop");
+  assert.equal(zhCard["version"], "1.5");
 });

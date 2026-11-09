@@ -10,7 +10,7 @@
 import type { Lang } from "../locales/lang.js";
 import { ASSISTANT_STEPS, SAFE_OBJECTS, stepText } from "../locales/steps.js";
 import { type Integrations, noIntegrations } from "../plugins/integrations.js";
-import { collapseSpaces, pySlice, pyStrip } from "../text/python-str.js";
+import { cpSlice, pyStrip, squashSpaces } from "../text/py-text.js";
 
 export class Label {
   constructor(
@@ -78,7 +78,7 @@ function plainLabel(kind: Kind, lang: Lang): Label {
 
 function words(name: string): string {
   const spaced = pyStrip(name.replace(CAMEL, " ").replace(SEPARATORS, " ")).toLowerCase();
-  return pyStrip(pySlice(spaced.replace(UNSAFE, ""), 0, NAME_MAX));
+  return pyStrip(cpSlice(spaced.replace(UNSAFE, ""), 0, NAME_MAX));
 }
 
 /** The skill directory a shell command works in (`python3 /workspace/.skills/<name>/scripts/x.py`), else undefined. */
@@ -126,7 +126,7 @@ export function labelFor(
 ): Label {
   const key: Lang = lang === "zh" ? "zh" : "en";
   const t = stepText.in(key);
-  const raw = collapseSpaces(tool);
+  const raw = squashSpaces(tool);
   if (skill) return new Label(t.skill({ skill }));
   const kind = PLAIN[raw.toLowerCase()];
   if (kind) return plainLabel(kind, key);
@@ -142,7 +142,7 @@ export function labelFor(
  */
 export function lookupLabel(tool: string, lang = "en", integrations: Integrations = noIntegrations): string {
   const zh = lang === "zh";
-  const match = MCP.exec(collapseSpaces(tool));
+  const match = MCP.exec(squashSpaces(tool));
   const server = (match?.[1] ?? "").toLowerCase();
   const verb = (match?.[2] ?? "").toLowerCase();
   return lookupOf(server, verb, zh, integrations) ?? labelFor(tool, undefined, lang, integrations).one;
