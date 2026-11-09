@@ -31,6 +31,7 @@ import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, 
 import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
+import { clipPrSummary } from "./pr-summary.js";
 import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
@@ -669,7 +670,7 @@ export class GithubReview {
       // are items (`recordPosted`): a restart reads what the old session posted and stops it under this lock, so a review still being
       // posted is either in what the next one continues or refused as stopped, never posted after it was read.
       const locked = event === "APPROVE" || this.deps.recordPosted === true;
-      return ok(this.withMode(ctx, locked ? await this.oneAtATime(ctx, ref, review) : await review()), (t) => ctx.client.redact(t));
+      return ok(withPrSummary(this.withMode(ctx, locked ? await this.oneAtATime(ctx, ref, review) : await review()), args), (t) => ctx.client.redact(t));
     });
   }
 
@@ -717,9 +718,9 @@ export class GithubReview {
       if (method !== undefined && !["squash", "merge", "rebase"].includes(method)) {
         throw new Refusal("invalid_method", "method must be squash, merge or rebase");
       }
-      return ok(this.withMode(ctx, await this.oneAtATime(ctx, ref, () => this.merge(ctx, ref, headSha, {
+      return ok(withPrSummary(this.withMode(ctx, await this.oneAtATime(ctx, ref, () => this.merge(ctx, ref, headSha, {
         method: method as "squash" | "merge" | "rebase" | undefined, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
-      }))), (t) => ctx.client.redact(t));
+      }))), args), (t) => ctx.client.redact(t));
     });
   }
 
@@ -1981,11 +1982,22 @@ export class GithubReview {
   }
 }
 
-/** The arguments as the audit log keeps them: names and sizes, not the text of a review. Also the GitHub tools' (github-mcp/mcp.ts). */
+/**
+ * A review or merge answer with the sentence of what the pull request does that the call gave (`pr_summary`), clipped as it is shown, so
+ * that a channel following the turn shows it with the verdict. Unchanged when the call gave none.
+ */
+function withPrSummary(body: Record<string, unknown>, args: Record<string, unknown>): Record<string, unknown> {
+  const summary = clipPrSummary(args.pr_summary);
+  // (next to the status, so that an answer cut for display still has it)
+  return summary ? { ...("status" in body ? { status: body.status } : {}), pr_summary: summary, ...body } : body;
+}
+
+/** The arguments as the audit log keeps them: names and sizes, not the text of a review (the one sentence of what the pull request does is kept, clipped). Also the GitHub tools' (github-mcp/mcp.ts). */
 export function summarise(args: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args)) {
-    if (typeof v === "string") out[k] = k === "body" ? `[${v.length} characters]` : v.slice(0, 200);
+    // (`pr_summary` is kept as it is shown, one line, masked and clipped: the requester's view and the confirmation read it from here)
+    if (typeof v === "string") out[k] = k === "body" ? `[${v.length} characters]` : k === "pr_summary" ? clipPrSummary(v) : v.slice(0, 200);
     else if (Array.isArray(v)) out[k] = `[${v.length} items]`;
     else if (typeof v === "number" || typeof v === "boolean" || v === null) out[k] = v;
     else out[k] = "[object]";

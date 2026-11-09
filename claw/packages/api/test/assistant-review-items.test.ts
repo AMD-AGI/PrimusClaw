@@ -736,7 +736,7 @@ describe("assistant review items", { skip }, () => {
     const it = await askedOfBob({ review_only: false });
     const read = async (user = "alice") => app.inject({ method: "GET", url: `/v1/work-items/${it.item_id}`, headers: { "x-test-user": user } });
     const view = (await read()).json();
-    assert.deepEqual(view, { ok: true, data: { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null } });
+    assert.deepEqual(view, { ok: true, data: { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null, pr_summary: null } });
     assert.equal((await read("carol")).statusCode, 404, "nobody else's");
     assert.ok("worker_session_id" in (await read("bob")).json().data, "the reviewer sees their item as ever");
     assert.equal((await call("alice", `/v1/work-items/${it.item_id}/accept`, { version: 0 })).status, 404, "accepting is the reviewer's");
@@ -744,7 +744,7 @@ describe("assistant review items", { skip }, () => {
     await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
     await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"APPROVE\"}'::jsonb WHERE session_id = $1", [it.session_id]);
     const stopped = await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
-    assert.deepEqual(stopped, { status: 200, body: { ok: true, data: { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: "approve", merged: false, waiting_for: null, findings: null, note: null } } });
+    assert.deepEqual(stopped, { status: 200, body: { ok: true, data: { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: "approve", merged: false, waiting_for: null, findings: null, note: null, pr_summary: null } } });
     assert.equal((await w.q("SELECT status FROM claw_github_confirmations WHERE confirmation_id = $1", [held]))[0].status, "denied", "what was held is denied");
     assert.equal(interrupts.length, 1, "and the session interrupted");
     const closed = await w.item(it.item_id);
@@ -758,14 +758,14 @@ describe("assistant review items", { skip }, () => {
     const merged = await askedOfBob({ prs: [PR(400)] });
     await audit(merged.session_id, "gh_pr_merge", "ok", "merged", "bob");
     const late = await call("alice", `/v1/work-items/${merged.item_id}/stop`, {});
-    assert.deepEqual(late, { status: 409, body: { ok: false, error: "already_merged", data: { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/400", verdict: null, merged: true, waiting_for: null, findings: null, note: null } } });
+    assert.deepEqual(late, { status: 409, body: { ok: false, error: "already_merged", data: { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/400", verdict: null, merged: true, waiting_for: null, findings: null, note: null, pr_summary: null } } });
     // A review that closes by its facts (posted, turn over) is frozen the same way.
     const posted = await askedOfBob({ prs: [PR(500)] });
     await turnRan(posted.session_id);
     await audit(posted.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
     await w.q("UPDATE claw_github_audit SET arguments = '{\"event\": \"COMMENT\"}'::jsonb WHERE session_id = $1", [posted.session_id]);
     await ri.syncReviewItem(posted.item_id);
-    assert.deepEqual((await w.item(posted.item_id)).params.requester_view, { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/500", verdict: "comment", merged: false, waiting_for: null, findings: null, note: null });
+    assert.deepEqual((await w.item(posted.item_id)).params.requester_view, { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/500", verdict: "comment", merged: false, waiting_for: null, findings: null, note: null, pr_summary: null });
   });
 
   test("Q6c while it waits for the reviewer the requester is told for what, and what the review found; the list of reviews asked of others has them", async () => {
@@ -787,7 +787,7 @@ describe("assistant review items", { skip }, () => {
     const view = await read(held.item_id);
     assert.deepEqual([view.status, view.verdict, view.merged, view.waiting_for, view.findings], ["waiting_for_reviewer", "approve", false, "confirm_merge", 2]);
     assert.ok(view.note.startsWith("Nit: the lock is taken twice; token ") && view.note.length <= 160 && !view.note.includes(secret), view.note);
-    assert.deepEqual(Object.keys(view).sort(), ["findings", "merged", "note", "pr_url", "status", "verdict", "waiting_for"], "nothing else of bob's item");
+    assert.deepEqual(Object.keys(view).sort(), ["findings", "merged", "note", "pr_summary", "pr_url", "status", "verdict", "waiting_for"], "nothing else of bob's item");
 
     // A review that failed: it waits for a restart (bob's, or alice asking again), and says so.
     const failed = await askedOfBob({ prs: [PR(401)] });
@@ -812,7 +812,7 @@ describe("assistant review items", { skip }, () => {
     const old = { status: "done", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/401", verdict: "approve", merged: true };
     await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'accepted', closed_at = NOW(), params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
       [failed.item_id, JSON.stringify(old)]);
-    assert.deepEqual(await read(failed.item_id), { ...old, waiting_for: null, findings: null, note: null });
+    assert.deepEqual(await read(failed.item_id), { ...old, waiting_for: null, findings: null, note: null, pr_summary: null });
   });
 
   test("Q6d a requester's stop freezes what the review had posted by then, though no sync wrote it to the item yet", async () => {
@@ -851,6 +851,37 @@ describe("assistant review items", { skip }, () => {
     assert.ok(finished, "the submit landed in between");
     const frozen = (await w.item(it.item_id)).params.requester_view;
     assert.deepEqual([frozen.verdict, frozen.findings, frozen.note], ["approve", 1, "Nit: a name"]);
+  });
+
+  test("Q6f the requester's view carries the review's one sentence of what the pull request does, clipped and masked; the router's does not; the held write's listing has it", async () => {
+    const rv = await import("../src/assistant/requester-view.js");
+    const read = async (id: string) => (await app.inject({ method: "GET", url: `/v1/work-items/${id}`, headers: { "x-test-user": "alice" } })).json().data;
+    const it = await askedOfBob({ review_only: false });
+    assert.equal((await read(it.item_id)).pr_summary, null, "no review call yet: none, and the view reads as before");
+    // A review call, as the tools audit it (`summarise` keeps the sentence clipped), held for bob's confirmation.
+    const held = await confirmation(it.session_id, "pending", "merge", "bob");
+    await audit(it.session_id, "gh_review_submit", "ok", "submitted", "bob", true);
+    const secret = "ghp_" + "A1b2C3d4E5".repeat(4);
+    await w.q("UPDATE claw_github_audit SET arguments = $2::jsonb WHERE session_id = $1", [it.session_id,
+      JSON.stringify({ event: "APPROVE", pr_summary: `给评审结论卡加一句话概述 PR 做了什么 ${secret}` })]);
+    const view = await read(it.item_id);
+    assert.ok(view.pr_summary.startsWith("给评审结论卡加一句话概述 PR 做了什么") && !view.pr_summary.includes(secret), view.pr_summary);
+    assert.equal(rv.routerView(view).pr_summary, null, "the router is not given what the reviewer's session wrote");
+    // The listing of held writes, which the acting user's confirmation card is made from, has it too.
+    const listed = await app.inject({ method: "GET", url: `/v1/github-review/confirmations?session_id=${it.session_id}`, headers: { "x-test-user": "bob" } });
+    assert.equal(listed.statusCode, 200, listed.body);
+    const item = (listed.json().data.items as Array<Record<string, unknown>>).find((c) => c.id === held);
+    assert.equal(item?.pr_summary, view.pr_summary);
+    // A later merge call's sentence is the one shown; one too long is cut, in whichever language it is written.
+    await audit(it.session_id, "gh_pr_merge", "refused", "ci_not_green", "bob");
+    const long = "Adds a one-sentence summary of what the pull request does to the review conclusion card, " + "and more words ".repeat(20);
+    await w.q("UPDATE claw_github_audit SET arguments = $2::jsonb WHERE session_id = $1 AND tool = 'gh_pr_merge'", [it.session_id, JSON.stringify({ pr_summary: long })]);
+    const later = (await read(it.item_id)).pr_summary as string;
+    assert.ok(later.startsWith("Adds a one-sentence summary") && later.endsWith("…") && Array.from(later).length === 160, later);
+    // Frozen with the item: what the session says after it closed does not reach alice.
+    await call("alice", `/v1/work-items/${it.item_id}/stop`, {});
+    await w.q("UPDATE claw_github_audit SET arguments = '{\"pr_summary\": \"something else\"}'::jsonb WHERE session_id = $1", [it.session_id]);
+    assert.equal((await read(it.item_id)).pr_summary, later);
   });
 
   test("Q6b a requested review's held writes are the reviewer's alone: the requester lists none of them, by any filter; their own sessions' still list", async () => {

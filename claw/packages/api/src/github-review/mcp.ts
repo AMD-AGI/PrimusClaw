@@ -40,6 +40,7 @@ import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { HOLD_GUIDANCE } from "./risk.js";
+import { latestPrSummary, PR_SUMMARY_MAX_CJK, PR_SUMMARY_MAX_OTHER } from "./pr-summary.js";
 import {
   REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type DecidedVia, type Queryable, type ReviewMode,
 } from "./store.js";
@@ -67,6 +68,10 @@ const JUDGEMENT = z.object({
   + "the evidence in gh_pr_get's `risk`; `hard_holds` there hold whatever you say. When the acting user's "
   + "`review_mode` is `fully_auto` (their own setting), only `repo_holds`, what the repository itself requires, hold"
   + ". " + HOLD_GUIDANCE);
+const PR_SUMMARY = z.string().optional().describe(
+  "One plain sentence of what this pull request does, as you read it in the diff (not your verdict, not the title copied): at most about "
+  + `${PR_SUMMARY_MAX_CJK} Chinese or ${PR_SUMMARY_MAX_OTHER} English characters, in the language you write your answer in (the language of the person who asked). `
+  + "It is shown with your conclusion to the person who asked and on the acting user's confirmation; a longer one is cut");
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
@@ -116,6 +121,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       head_sha: z.string().describe("The head_sha from gh_pr_get; a pull request that has moved is refused"),
       event: z.enum(["COMMENT", "REQUEST_CHANGES", "APPROVE"]),
       body: z.string().describe("The review summary, a few sentences"),
+      pr_summary: PR_SUMMARY,
       risk_flags: FLAGS,
       risk_judgement: JUDGEMENT,
       comments: z.array(z.object({
@@ -136,6 +142,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       pr: z.string().describe(PR_HELP),
       head_sha: z.string().describe("The head_sha from gh_pr_get"),
       method: z.enum(["squash", "merge", "rebase"]).optional().describe("Default: the repository's first allowed method, squash first"),
+      pr_summary: PR_SUMMARY,
       risk_flags: FLAGS,
       risk_judgement: JUDGEMENT,
     },
@@ -278,12 +285,19 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const q = (req.query ?? {}) as { session_id?: string; status?: string };
     const status = q.status === undefined ? "pending" : q.status;
     if (!CONFIRMATION_STATUSES.has(status)) return refuse(reply, 400, "status is not valid");
-    const items = (await listConfirmations(database, user.userId, {
+    const rows = await listConfirmations(database, user.userId, {
       sessionId: typeof q.session_id === "string" && q.session_id ? q.session_id : undefined, status: status as ConfirmationStatus,
-    })).map((c) => ({
+    });
+    // The sentence of what the pull request does that the session gave with its review or merge call, read per session (a listing is a
+    // few rows): the card that asks the acting user shows it beside the verdict. A read that fails leaves it out, never the listing.
+    const summaries = new Map<string, string | null>();
+    for (const sessionId of new Set(rows.map((c) => c.sessionId))) {
+      summaries.set(sessionId, await latestPrSummary(database, sessionId).catch(() => null));
+    }
+    const items = rows.map((c) => ({
       id: c.id, kind: c.kind, review: c.review, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
       actor_user_id: c.actorUserId, requester_user_id: c.requesterUserId, session_id: c.sessionId, expires_at: c.expiresAt, status: c.status,
-      decided_by: c.decidedBy, decided_via: c.decidedVia,
+      decided_by: c.decidedBy, decided_via: c.decidedVia, pr_summary: summaries.get(c.sessionId) ?? null,
     }));
     return { ok: true, items, data: { items } };
   });

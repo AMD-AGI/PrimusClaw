@@ -153,10 +153,11 @@ credentials with the request: `x-acting-as-token` (X's delegated identity-provid
 - `requester_note` (up to 2000 characters) is quoted after the first message as untrusted text that cannot change merging, the
   model or the pull request; a body naming `requested_by` or `sandbox_profile` is a 400.
 - R is answered without the session's ids, may stop the review and read it, and sees its requester view only on every answer
-  (`{status, pr_url, verdict, merged, waiting_for, findings, note}`, frozen into `params.requester_view` when the item closes):
+  (`{status, pr_url, verdict, merged, waiting_for, findings, note, pr_summary}`, frozen into `params.requester_view` when the item closes):
   the four facts; while it waits for X, for what (`confirm_merge`, `confirm_review`, `failed`: restarted by X or asked again by R,
   or `reviewer`); and what the review posted on the pull request (open findings and the first of them in one line, credentials
-  masked). `GET /v1/work-items/asked-of-others` lists R's reviews of others (open, or closed in the last 3 days) with whom R asked
+  masked); and what the pull request does, in the one sentence the review gave with its review or merge call (`pr_summary`, null
+  when it gave none; like `note`, left out of what R's router is given). `GET /v1/work-items/asked-of-others` lists R's reviews of others (open, or closed in the last 3 days) with whom R asked
   and that view, for R's channel to show beside R's board. Restart and accept are X's
   (404 for R), and R cannot send a turn into X's session. The writes the session holds for confirmation are X's alone: R's
   `GET /v1/github-review/confirmations` lists none of them, whatever the filter.
