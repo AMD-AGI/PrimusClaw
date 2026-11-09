@@ -36,6 +36,7 @@ import (
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
@@ -43,7 +44,6 @@ import (
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/nsadmission"
 	"sigs.k8s.io/agent-sandbox/pkg/router"
-	"sigs.k8s.io/agent-sandbox/pkg/safe"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 	"sigs.k8s.io/agent-sandbox/pkg/workloadmanager"
 )
@@ -134,8 +134,7 @@ func main() {
 	var deprecatedSessionTimeout time.Duration
 	var namespaceSelector string
 	var deprecatedEnableIdleGC bool
-	// Accepted and ignored: caller authentication uses identity introspection.
-	// SAFE_API_URL (environment) still feeds the grant identity check.
+	// Accepted and ignored: caller and grant identity use identity introspection.
 	var deprecatedSafeAPIURL string
 
 	routerPort = 8080
@@ -147,7 +146,7 @@ func main() {
 	flag.BoolVar(&routerCfg.EnableAuth, "enable-auth", routerCfg.EnableAuth,
 		"Require an identity provider credential on /v1 (default true; IDENTITY_INTROSPECT_URL and client credentials)")
 	flag.StringVar(&deprecatedSafeAPIURL, "safe-api-url", "",
-		"Deprecated and ignored for authentication: /v1 credentials are checked by identity introspection")
+		"Deprecated and ignored: credentials are checked by identity introspection")
 	flag.StringVar(&namespaceSelector, "namespace-selector", "",
 		"Label selector (kubectl -l syntax) of the namespaces the Router and Workload Manager serve; "+
 			"empty serves every namespace. Overridden by "+nsadmission.EnvVar)
@@ -215,8 +214,8 @@ func main() {
 	}
 	if deprecatedSafeAPIURL != "" {
 		fmt.Fprintln(os.Stderr,
-			"WARNING: --safe-api-url is ignored. /v1 credentials are checked by identity introspection "+
-				"(IDENTITY_INTROSPECT_URL); the grant identity check reads SAFE_API_URL from the environment.")
+			"WARNING: --safe-api-url is ignored. Credentials are checked by identity introspection "+
+				"(IDENTITY_INTROSPECT_URL).")
 	}
 	callerIdentity, err := identity.FromEnv()
 	if err != nil {
@@ -295,6 +294,13 @@ func main() {
 	if err != nil {
 		log.Error("failed to create K8s clientset", "error", err)
 		os.Exit(1)
+	}
+	if authz.WorkspaceSARFromEnv() {
+		routerCfg.Authz = authz.FromClientset(clientset)
+		wmCfg.Authz = routerCfg.Authz
+		log.Info("workspace SAR enabled", "subjectPrefix", authz.PrefixFromEnv())
+	} else {
+		log.Info("workspace SAR disabled")
 	}
 
 	workloadmanager.InitPublicKeyCache(ctx, clientset)
@@ -385,6 +391,14 @@ func main() {
 		log.Error("identity attestation config is invalid", "error", err)
 		os.Exit(1)
 	}
+	if os.Getenv("ENABLE_WORKLOAD_ASSERTION") == "true" {
+		if attester == nil {
+			log.Error("ENABLE_WORKLOAD_ASSERTION=true requires IDENTITY_TOKEN_URL, IDENTITY_CLIENT_ID and IDENTITY_CLIENT_SECRET")
+			os.Exit(1)
+		}
+		workloads.SetAttestWorkloads(true)
+		log.Info("workload assertion enabled")
+	}
 	if attester != nil {
 		workloads.SetIdentityAttester(attester)
 	}
@@ -454,7 +468,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, apiServer, st, workloads, wmCfg.Namespace)
+	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, callerIdentity, routerCfg.Authz, apiServer, st, workloads, wmCfg.Namespace)
 	if err != nil {
 		log.Error("grant service init failed", "error", err)
 		os.Exit(1)
@@ -470,9 +484,6 @@ func main() {
 		}
 		if idClient != nil {
 			opts.Identity = idClient
-			if attester == nil {
-				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
-			}
 		}
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
@@ -583,7 +594,7 @@ func retryOwnerPolicy(ctx context.Context, grants *grant.Service, policy grant.O
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps
 // expired grants. Claw remains the authority; this process keeps the
 // execution copy.
-func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, dyn dynamic.Interface, api *workloadmanager.Server, st store.Store, workloads *workloadmanager.SafeWorkloadCreator, namespace string) (*grant.Service, error) {
+func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, dyn dynamic.Interface, ids *identity.Client, az *authz.Client, api *workloadmanager.Server, st store.Store, workloads *workloadmanager.SafeWorkloadCreator, namespace string) (*grant.Service, error) {
 	dataKey, err := grant.DataKeyFromEnv()
 	if err != nil {
 		return nil, fmt.Errorf("GRANT_DATA_KEY: %w", err)
@@ -599,13 +610,13 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Re
 			return nil, fmt.Errorf("grant JWKS: %w", err)
 		}
 	}
-	var identity grant.IdentityChecker
-	if url := os.Getenv("SAFE_API_URL"); url != "" {
-		identity = grant.NewSafeIdentityChecker(safe.NewClient(url))
+	var introspector grant.Introspector
+	if ids != nil {
+		introspector = ids
 	}
-	var membership grant.MembershipChecker
-	if dyn != nil {
-		membership = grant.NewUserCRMembership(dyn)
+	var authorizer grant.Authorizer
+	if az != nil {
+		authorizer = az
 	}
 	ns := grant.Namespace(namespace)
 	svc := grant.New(grant.Options{
@@ -615,8 +626,9 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Re
 		DataKey:    dataKey,
 		Authn:      grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),
 		Attest:     attest,
-		Identity:   identity,
-		Membership: membership,
+		Identity:   introspector,
+		Authz:      authorizer,
+		Workspaces: authz.NewWorkspaceLister(dyn),
 		Reclaimer:  workloadmanager.NewGrantReclaimer(api),
 		Exists:     workloadmanager.NewGrantExists(st, workloads),
 		Record:     api,

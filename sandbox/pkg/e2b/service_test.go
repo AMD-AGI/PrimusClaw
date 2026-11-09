@@ -29,6 +29,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 type fakeRunner struct {
@@ -120,6 +121,17 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 
 func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	return testPlaneReviewed(t, maxSec, perGPU, maxSandboxes, spec, workspaces, defaultAuthz())
+}
+
+// testPlaneInWorkspacesWith builds the default grant plane with the given permission reviews.
+func testPlaneInWorkspacesWith(t *testing.T, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneReviewed(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"top-models"}, az)
+}
+
+func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -136,8 +148,9 @@ func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandbo
 	}
 	gs := grant.New(grant.Options{
 		Client: cl, Namespace: "agent-sandbox-system", DataKey: bytes32(),
-		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{}, Membership: allowMember{},
-		Now: func() time.Time { return now },
+		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{}, Authz: az,
+		Workspaces: staticWorkspaces{"lab", "prod", "top-models"},
+		Now:        func() time.Time { return now },
 	})
 	req := grant.IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
@@ -207,13 +220,51 @@ type allowAuth struct{}
 
 func (allowAuth) Authenticate(context.Context, string) error { return nil }
 
+// allowIdentity answers every platform key as the grant owner u-123.
 type allowIdentity struct{}
 
-func (allowIdentity) Check(context.Context, string, string) (string, error) { return "alice", nil }
+func (allowIdentity) Introspect(context.Context, string) (identity.Token, error) {
+	return identity.Token{Subject: "u-123", Username: "alice"}, nil
+}
 
-type allowMember struct{}
+// fakeAuthz answers permission reviews from per-user workspace lists and a set of
+// platform admins. A "*" workspace allows any workspace.
+type fakeAuthz struct {
+	workspaces map[string][]string
+	admins     map[string]bool
+	err        error
+}
 
-func (allowMember) Check(context.Context, string, []string) error { return nil }
+func (f *fakeAuthz) CanUseWorkspace(_ context.Context, sub string, _ []string, ws string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.admins[sub] || contains(f.workspaces[sub], "*") || contains(f.workspaces[sub], ws), nil
+}
+
+func (f *fakeAuthz) PlatformRole(_ context.Context, sub string, _ []string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	if f.admins[sub] {
+		return identity.RoleSystemAdmin, nil
+	}
+	return identity.RoleDefault, nil
+}
+
+// defaultAuthz lets the grant owner use any workspace, u-1 use lab, u-2 use lab and prod,
+// and makes u-8 and u-9 platform admins.
+func defaultAuthz() *fakeAuthz {
+	return &fakeAuthz{
+		workspaces: map[string][]string{"u-123": {"*"}, "u-1": {"lab"}, "u-2": {"lab", "prod"}},
+		admins:     map[string]bool{"u-8": true, "u-9": true},
+	}
+}
+
+// staticWorkspaces lists a fixed set of workspaces.
+type staticWorkspaces []string
+
+func (w staticWorkspaces) ListWorkspaces(context.Context) ([]string, error) { return w, nil }
 
 func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	cases := []struct {

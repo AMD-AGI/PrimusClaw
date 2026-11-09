@@ -114,7 +114,7 @@ if ! env PATH="$tmp/bin:$PATH" \
   HELM_CAPTURE="$capture" \
   HELM_VALUES_CAPTURE="$values_capture" \
   MOCK_HELM_APPLIED="$tmp/helm.applied" \
-  SAFE_API_URL="https://safe.example" \
+  RBAC_SUBJECT_PREFIX="primus:" \
   IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
   FORCE_SANDBOX=true \
   AUTO_INSTALL_HELM=false \
@@ -124,7 +124,11 @@ if ! env PATH="$tmp/bin:$PATH" \
   exit 1
 fi
 
-grep -q -- '--set router.config.safeApiUrl=https://safe.example' "$capture"
+grep -q -- '--set-string controlplane.config.rbac.subjectPrefix=primus:' "$capture"
+grep -q -- 'safeApiUrl' "$capture" && {
+  echo "installer still passes safeApiUrl Helm sets" >&2
+  exit 1
+}
 grep -q -- '--set router.config.enableAuth=true' "$capture"
 grep -q -- '--set controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect' "$capture"
 grep -q -- '--set redis\.' "$capture" && {

@@ -59,8 +59,9 @@ type Service struct {
 	dataKey    []byte
 	authn      Authenticator
 	attest     AttestationChecker
-	identity   IdentityChecker
-	membership MembershipChecker
+	identity   Introspector
+	authz      Authorizer
+	workspaces WorkspaceLister
 	reclaimer  Reclaimer
 	exists     SandboxExists
 	promoter   PendingPromoter
@@ -110,8 +111,9 @@ type Options struct {
 	DataKey    []byte
 	Authn      Authenticator
 	Attest     AttestationChecker
-	Identity   IdentityChecker
-	Membership MembershipChecker
+	Identity   Introspector
+	Authz      Authorizer
+	Workspaces WorkspaceLister
 	Reclaimer  Reclaimer
 	Exists     SandboxExists
 	Record     Recorder
@@ -136,7 +138,8 @@ func New(opt Options) *Service {
 		authn:      opt.Authn,
 		attest:     opt.Attest,
 		identity:   opt.Identity,
-		membership: opt.Membership,
+		authz:      opt.Authz,
+		workspaces: opt.Workspaces,
 		reclaimer:  opt.Reclaimer,
 		exists:     opt.Exists,
 		record:     opt.Record,
@@ -166,20 +169,16 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err := s.attest.Check(req.Attestation, req); err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if s.identity == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "identity_unavailable", "SaFE client is not configured")
-	}
-	userName, err := s.identity.Check(ctx, req.PlatformKey, req.Owner.UserID)
+	tok, err := s.ownerToken(ctx, req.PlatformKey, req.Owner.UserID)
 	if err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if userName != "" {
-		req.Owner.UserName = userName
+	if tok.Username != "" {
+		req.Owner.UserName = tok.Username
+	} else if tok.Email != "" {
+		req.Owner.UserName = tok.Email
 	}
-	if s.membership == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	if err := s.membership.Check(ctx, req.Owner.UserID, req.Owner.Workspaces); err != nil {
+	if err := s.checkWorkspaces(ctx, tok.Subject, tok.Groups, req.Owner.Workspaces); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	roles, expanded, stored, err := expandTemplates(req.Issuer.AppRunID, req.Roles, req.Templates)

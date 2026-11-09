@@ -288,6 +288,7 @@ not silently install an unauthenticated control plane.
 ```bash
 # Recommended: authenticate /v1 callers through identity provider introspection.
 # The client Secret (client_id, client_secret) must exist in the release namespace.
+# IDENTITY_TOKEN_URL can be added later: the process exits until it is set.
 IDENTITY_INTROSPECT_URL=https://<identity>/oauth/introspect deploy/scripts/install.sh
 
 # Development clusters only: install without authentication.

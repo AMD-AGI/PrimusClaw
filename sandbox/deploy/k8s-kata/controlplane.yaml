@@ -107,8 +107,8 @@ rules:
     resources: ["tokenreviews"]
     verbs: ["create"]
   - apiGroups: ["amd.com"]
-    resources: ["users"]
-    verbs: ["get"]
+    resources: ["workspaces"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["amd.com"]
     resources: ["workloads"]
     # update writes spec.timeout. patch is not granted.
@@ -132,6 +132,65 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: agent-sandbox-controlplane
+---
+# SubjectAccessReview for workspace and platform permission.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-controlplane-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-controlplane
+    namespace: agent-sandbox-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+---
+# Platform roles. sessions is a virtual resource that is only reviewed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox:platform-admin
+rules:
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sessions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox:platform-viewer
+rules:
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sessions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox:platform-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "primus:system-admin"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox:platform-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox:platform-viewer
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "primus:system-admin-readonly"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox:platform-viewer
 ---
 apiVersion: v1
 kind: Service
@@ -231,10 +290,15 @@ spec:
               value: "8080"
             - name: ENABLE_AUTH
               value: "__ENABLE_AUTH__"
-            - name: SAFE_API_URL
-              value: "__SAFE_API_URL__"
+            # Prefix of identity users and groups in SubjectAccessReview.
+            - name: RBAC_SUBJECT_PREFIX
+              value: "primus:"
+            - name: ENABLE_WORKSPACE_SAR
+              value: "false"
+            - name: ENABLE_WORKLOAD_ASSERTION
+              value: "false"
             # Required when ENABLE_AUTH=false. Render to "true" only for an
-            # isolated development cluster; production must use SAFE_API_URL.
+            # isolated development cluster; production must set ENABLE_AUTH=true.
             - name: ALLOW_INSECURE_NO_AUTH
               value: "__ALLOW_INSECURE_NO_AUTH__"
             - name: EGRESS_ENABLED

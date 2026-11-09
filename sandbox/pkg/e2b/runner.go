@@ -36,7 +36,8 @@ type CreateRequest struct {
 	IdentityAttestation string
 	// OwnerKey marks a sandbox charged to an identity-key owner record, which has no Claw attestation.
 	OwnerKey bool
-	// SubjectKey is the identity key the caller presented. The identity provider attests for its owner.
+	// SubjectKey is the identity key of the sandbox owner: the caller's identity key, or the
+	// platform key of the grant. The identity provider attests for its owner.
 	SubjectKey string
 	Env        map[string]string
 	// SigningKeyPEM is the PKCS#8 Ed25519 private key written into a sealed sandbox.

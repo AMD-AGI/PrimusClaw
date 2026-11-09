@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -40,7 +41,7 @@ func stripUntrustedIdentityHeaders() gin.HandlerFunc {
 }
 
 // setUserContext sets userId, userName, and userRole in both Gin context and request headers.
-func setUserContext(c *gin.Context, tok identity.Token) {
+func setUserContext(c *gin.Context, tok identity.Token, role string) {
 	c.Request.Header.Set(UserIDHeader, tok.Subject)
 	if tok.Email != "" {
 		c.Request.Header.Set(UserNameHeader, tok.Email)
@@ -48,7 +49,6 @@ func setUserContext(c *gin.Context, tok identity.Token) {
 	c.Set("userId", tok.Subject)
 	c.Set("userName", tok.Email)
 
-	role := identity.PlatformRole(tok.Roles)
 	c.Set("userRole", role)
 	c.Request.Header.Set(UserRoleHeader, role)
 }
@@ -87,9 +87,15 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		setUserContext(c, tok)
+		role, err := s.cfg.Authz.CallerRole(c.Request.Context(), tok)
+		if err != nil {
+			log.Warn("caller platform role unreadable", "userId", tok.Subject, "error", err)
+			abortCaller(c, authz.Unavailable)
+			return
+		}
+		setUserContext(c, tok, role)
 		log.Debug("auth OK", "userId", tok.Subject,
-			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
+			"role", role, "path", c.Request.URL.Path)
 		c.Next()
 	}
 }

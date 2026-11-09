@@ -5,148 +5,114 @@ package grant
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-
-	"sigs.k8s.io/agent-sandbox/pkg/safe"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
-// userGVR is the cluster-scoped SaFE User CR. Its name is the user id.
-var userGVR = schema.GroupVersionResource{Group: "amd.com", Version: "v1", Resource: "users"}
-
-// IdentityChecker confirms the delegated platform key belongs to the grant owner.
-type IdentityChecker interface {
-	Check(ctx context.Context, platformKey, userID string) (userName string, err error)
+// Introspector validates an identity provider key.
+type Introspector interface {
+	Introspect(ctx context.Context, key string) (identity.Token, error)
 }
 
-// SafeIdentityChecker calls SaFE's API-key verification.
-type SafeIdentityChecker struct {
-	client *safe.Client
+// Authorizer answers workspace and platform permission questions for an identity subject.
+type Authorizer interface {
+	CanUseWorkspace(ctx context.Context, sub string, groups []string, ws string) (bool, error)
+	PlatformRole(ctx context.Context, sub string, groups []string) (string, error)
 }
 
-// NewSafeIdentityChecker wraps a SaFE client.
-func NewSafeIdentityChecker(client *safe.Client) *SafeIdentityChecker {
-	return &SafeIdentityChecker{client: client}
+// WorkspaceLister lists the names of all workspaces.
+type WorkspaceLister interface {
+	ListWorkspaces(ctx context.Context) ([]string, error)
 }
 
-// Check verifies the platform key and requires the returned user id to match.
-func (c *SafeIdentityChecker) Check(ctx context.Context, platformKey, userID string) (string, error) {
-	if c == nil || c.client == nil {
-		return "", opErr(http.StatusServiceUnavailable, "identity_unavailable", "SaFE client is not configured")
+// ownerToken introspects a delegated platform key and requires its subject to be userID.
+func (s *Service) ownerToken(ctx context.Context, platformKey, userID string) (identity.Token, error) {
+	if s.identity == nil {
+		return identity.Token{}, opErr(http.StatusServiceUnavailable, "identity_unavailable", "identity client is not configured")
 	}
-	info, err := c.client.VerifyAPIKey(ctx, platformKey)
-	if err != nil {
-		return "", opErr(http.StatusForbidden, "platform_key_rejected", "platform key was rejected")
-	}
-	if info.UserID != userID {
-		return "", opErr(http.StatusForbidden, "user_mismatch", "platform key user does not match owner.userId")
-	}
-	return info.UserName, nil
-}
-
-// MembershipChecker confirms the user belongs to every requested workspace.
-type MembershipChecker interface {
-	Check(ctx context.Context, userID string, workspaces []string) error
-}
-
-// OwnerUser is the SaFE User data an identity-key request uses.
-type OwnerUser struct {
-	Found      bool
-	Admin      bool
-	Workspaces []string
-}
-
-// UserReader reads a SaFE User once. A missing User is Found=false with no error.
-type UserReader interface {
-	ReadUser(ctx context.Context, userID string) (OwnerUser, error)
-}
-
-// UserCRMembership reads users.amd.com and compares the workspace list.
-type UserCRMembership struct {
-	client dynamic.Interface
-}
-
-// NewUserCRMembership reads cluster-scoped User objects named by user id.
-func NewUserCRMembership(client dynamic.Interface) *UserCRMembership {
-	return &UserCRMembership{client: client}
-}
-
-// listedWorkspaces reads spec.resources.workspaces, which is the key SaFE writes.
-// spec.resources.workspace is accepted when that key is absent.
-func listedWorkspaces(obj *unstructured.Unstructured) ([]string, error) {
-	for _, key := range []string{"workspaces", "workspace"} {
-		got, found, err := unstructured.NestedStringSlice(obj.Object, "spec", "resources", key)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			return got, nil
-		}
-	}
-	return nil, nil
-}
-
-// SystemAdminRole matches SaFE's system-admin role. That role is not limited to listed workspaces.
-const SystemAdminRole = "system-admin"
-
-// isSystemAdmin reports whether spec.roles contains the system-admin role.
-func isSystemAdmin(obj *unstructured.Unstructured) bool {
-	roles, _, err := unstructured.NestedStringSlice(obj.Object, "spec", "roles")
-	if err != nil {
-		return false
-	}
-	return contains(roles, SystemAdminRole)
-}
-
-// ReadUser reads the User once. A read error other than not-found is returned unchanged.
-func (m *UserCRMembership) ReadUser(ctx context.Context, userID string) (OwnerUser, error) {
-	if m == nil || m.client == nil {
-		return OwnerUser{}, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	obj, err := m.client.Resource(userGVR).Get(ctx, userID, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return OwnerUser{}, nil
+	tok, err := s.identity.Introspect(ctx, platformKey)
+	if errors.Is(err, identity.ErrInactive) {
+		return identity.Token{}, opErr(http.StatusForbidden, "platform_key_rejected", "platform key was rejected")
 	}
 	if err != nil {
-		return OwnerUser{}, err
+		return identity.Token{}, opWrap(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable", err)
 	}
-	u := OwnerUser{Found: true, Admin: isSystemAdmin(obj)}
-	if u.Workspaces, err = listedWorkspaces(obj); err != nil {
-		return OwnerUser{}, opWrap(http.StatusForbidden, "user_not_in_workspace", "workspace list is unreadable", err)
+	if tok.Subject != userID {
+		return identity.Token{}, opErr(http.StatusForbidden, "user_mismatch", "platform key user does not match owner.userId")
 	}
-	return u, nil
+	return tok, nil
 }
 
-// Check rejects a missing user and any workspace not listed on the User.
-// A system admin is accepted for every workspace.
-func (m *UserCRMembership) Check(ctx context.Context, userID string, workspaces []string) error {
-	u, err := m.ReadUser(ctx, userID)
-	if _, ok := err.(*OpError); ok {
-		return err
-	}
-	if err != nil || !u.Found {
-		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
-	}
-	return u.allows(workspaces)
+// WorkspaceSAR reports whether workspace and platform permission are reviewed.
+func (s *Service) WorkspaceSAR() bool {
+	return s != nil && s.authz != nil
 }
 
-// allows rejects any workspace not listed on the User unless the User is a system admin.
-func (u OwnerUser) allows(workspaces []string) error {
-	if !u.Found {
-		return opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+// canUse reports whether the subject may use workspace ws. A review error is 503.
+// With workspace SAR off the question is not asked and the answer is allow.
+func (s *Service) canUse(ctx context.Context, sub string, groups []string, ws string) (bool, error) {
+	if s.authz == nil {
+		return true, nil
 	}
-	if u.Admin {
-		return nil
+	ok, err := s.authz.CanUseWorkspace(ctx, sub, groups, ws)
+	if err != nil {
+		return false, opWrap(http.StatusServiceUnavailable, "membership_unavailable", "workspace permission is temporarily unreadable", err)
 	}
+	return ok, nil
+}
+
+// checkWorkspaces rejects any workspace the subject may not use.
+func (s *Service) checkWorkspaces(ctx context.Context, sub string, groups []string, workspaces []string) error {
 	for _, ws := range workspaces {
-		if !contains(u.Workspaces, ws) {
+		ok, err := s.canUse(ctx, sub, groups, ws)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			return opErr(http.StatusForbidden, "user_not_in_workspace", ws)
 		}
 	}
 	return nil
+}
+
+// PlatformRole returns the platform role of the subject. A review error is 503.
+func (s *Service) PlatformRole(ctx context.Context, sub string, groups []string) (string, error) {
+	if s.authz == nil {
+		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "authorization client is not configured")
+	}
+	role, err := s.authz.PlatformRole(ctx, sub, groups)
+	if err != nil {
+		return "", opWrap(http.StatusServiceUnavailable, "membership_unavailable", "platform role is temporarily unreadable", err)
+	}
+	return role, nil
+}
+
+// CheckGrantOwner confirms that the sealed platform key of a grant still belongs
+// to the grant owner and that the owner may use workspace. It returns the platform key.
+func (s *Service) CheckGrantOwner(ctx context.Context, grantID, workspace string) (string, error) {
+	g, err := s.get(ctx, grantID)
+	if err != nil {
+		return "", err
+	}
+	if g.Spec.PlatformKeyCiphertext == "" {
+		return "", opErr(http.StatusForbidden, "platform_key_rejected", "grant holds no platform key")
+	}
+	if len(s.dataKey) == 0 {
+		return "", opErr(http.StatusServiceUnavailable, "grant_data_key_missing", "GRANT_DATA_KEY is not configured")
+	}
+	plain, err := Open(s.dataKey, g.Spec.PlatformKeyCiphertext)
+	if err != nil {
+		return "", opWrap(http.StatusInternalServerError, "grant_unseal_failed", "platform key cannot be opened", err)
+	}
+	key := string(plain)
+	tok, err := s.ownerToken(ctx, key, g.Spec.Owner.UserID)
+	if err != nil {
+		return "", err
+	}
+	if err := s.checkWorkspaces(ctx, tok.Subject, tok.Groups, []string{workspace}); err != nil {
+		return "", err
+	}
+	return key, nil
 }

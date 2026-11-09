@@ -114,8 +114,8 @@ rules:
     resources: ["tokenreviews"]
     verbs: ["create"]
   - apiGroups: ["amd.com"]
-    resources: ["users"]
-    verbs: ["get"]
+    resources: ["workspaces"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["amd.com"]
     resources: ["workloads"]
     # update writes spec.timeout. patch is not granted.
@@ -145,6 +145,65 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: agent-sandbox-controlplane-{{ .Release.Name }}
+---
+# SubjectAccessReview for workspace and platform permission.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-controlplane-{{ .Release.Name }}-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-controlplane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+---
+# Platform roles. sessions is a virtual resource that is only reviewed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox:platform-admin
+rules:
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sessions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox:platform-viewer
+rules:
+  - apiGroups: ["runtime.agent-sandbox.io"]
+    resources: ["sessions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox:platform-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: {{ printf "%ssystem-admin" .Values.controlplane.config.rbac.subjectPrefix | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox:platform-admin
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox:platform-viewer
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: {{ printf "%ssystem-admin-readonly" .Values.controlplane.config.rbac.subjectPrefix | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox:platform-viewer
 ---
 apiVersion: v1
 kind: Service
@@ -262,8 +321,12 @@ spec:
             - name: SANDBOX_UPSTREAM_ONLY
               value: {{ $upstreamOnly | toString | quote }}
             {{- end }}
-            - name: SAFE_API_URL
-              value: {{ .Values.router.config.safeApiUrl | quote }}
+            - name: RBAC_SUBJECT_PREFIX
+              value: {{ .Values.controlplane.config.rbac.subjectPrefix | quote }}
+            - name: ENABLE_WORKSPACE_SAR
+              value: {{ ternary "true" "false" (default false .Values.controlplane.config.rbac.workspaceSAR) | quote }}
+            - name: ENABLE_WORKLOAD_ASSERTION
+              value: {{ ternary "true" "false" (default false .Values.controlplane.config.identity.attestWorkloads) | quote }}
             {{- if .Values.router.config.namespaceSelector }}
             - name: NAMESPACE_SELECTOR
               value: {{ .Values.router.config.namespaceSelector | quote }}
@@ -325,14 +388,14 @@ spec:
                 configMapKeyRef:
                   name: {{ .ownerPolicyConfigMap | quote }}
                   key: policy.json
-            {{- if .tokenUrl }}
+            {{- end }}
+            {{- if and .introspectUrl .tokenUrl }}
             - name: IDENTITY_TOKEN_URL
               value: {{ .tokenUrl | quote }}
             - name: IDENTITY_ASSERTION_AUDIENCE
               value: {{ .assertionAudience | quote }}
             - name: IDENTITY_ASSERTION_DETAIL_TYPE
               value: {{ .assertionDetailType | quote }}
-            {{- end }}
             {{- end }}
             {{- end }}
             {{- with .Values.router.extraEnv }}
