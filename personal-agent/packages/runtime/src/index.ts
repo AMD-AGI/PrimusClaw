@@ -16,3 +16,7 @@ export * from "./sqlite/context.js";
 export * from "./sqlite/reencrypt.js";
 export * from "./sqlite/store.js";
 export * from "./sqlite/open.js";
+export * from "./claw/index.js";
+export * from "./metrics/index.js";
+export * from "./exchange/index.js";
+export * from "./config/index.js";
