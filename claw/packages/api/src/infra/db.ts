@@ -1706,7 +1706,7 @@ export async function initDb(): Promise<void> {
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_memory_links_to ON claw_memory_links(user_id, to_kind, to_id)");
 
-    // Per-user opt-in for long-term memory. No row means off.
+    // Per-user choice of long-term memory. No row means the deployment's default (CLAW_MEMORY_DEFAULT_ON, off unless set).
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_user_memory_prefs (
         user_id     TEXT PRIMARY KEY,
