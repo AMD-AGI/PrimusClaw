@@ -217,19 +217,13 @@ const FOLLOW_UP: readonly (readonly [string, string, string, string, boolean])[]
   ["\\bA", "i", "\u03b9A", "search", false],
   ["\\w+", "i", "\u0399\u03b9a", "full", true],
   ["\\123", "", "S", "full", true],
-  ["\\w", "i", "\u0345", "full", false],
-  ["\\W", "i", "\u0345", "full", true],
-  ["\\bA", "i", "\u0345A", "search", true],
-  ["[\\w]", "i", "\u0345", "full", false],
-  ["[^\\w]", "i", "\u0345", "full", true],
-  ["[\\w\u0345]", "i", "\u0345", "full", true],
   ["[\\w-]+", "i", "Ab-c", "full", true],
   ["(?#c)(?i)a", "", "A", "full", true],
   ["(?i)(?#c)(?m)^a$", "", "x\nA", "search", true],
   ["(?im)^a", "", "b\nA", "search", true],
 ];
 
-test("U+0345 is no word character under IGNORECASE and flag groups may follow a leading comment, as in Python", () => {
+test("ι stays a word character under IGNORECASE and flag groups may follow a leading comment, as in Python", () => {
   for (const [pattern, flags, text, how, python] of FOLLOW_UP) {
     const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
     assert.equal(regex.test(text), python, `${how} ${pattern} /${flags} ${JSON.stringify(text)}`);
@@ -247,4 +241,13 @@ test("a full match is the same on every call and Python's own errors are refused
   for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a", `${"()".repeat(400)}\\400`]) {
     assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
   }
+});
+
+test("the one kept difference: under IGNORECASE U+0345 counts as a word character, and Kelvin still folds beside \\b", () => {
+  // Python: re.fullmatch(r"\w", "\u0345", re.I) is None. JavaScript folds U+0345 to ι; leaving it out would need a
+  // scoped (?-i:...), which in V8 stops the Kelvin sign matching [A-Za-z] anywhere in the pattern (the case below).
+  assert.equal(pyFullmatch("\\w", "i").test("\u0345"), true);
+  assert.equal(pyFullmatch("\\w").test("\u0345"), false);
+  // Python: re.search(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", "Bearer \u212a" + "x" * 33) matches
+  assert.ok(pyRegExp(String.raw`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}`).test(`Bearer \u212a${"x".repeat(33)}`));
 });

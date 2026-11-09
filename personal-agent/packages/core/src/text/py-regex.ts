@@ -2,16 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { InvariantError } from "../errors.js";
-import {
-  COMBINING_IOTA,
-  END,
-  I_VARIANTS,
-  PY_W_CHARS,
-  START,
-  literal,
-  translateEscape,
-  type EscapeContext,
-} from "./py-regex-escapes.js";
+import { END, I_VARIANTS, START, literal, translateEscape, type EscapeContext } from "./py-regex-escapes.js";
 
 export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes.js";
 
@@ -27,6 +18,9 @@ export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes
  *  - `\-`, `\ `, `\#` (what `re.escape` writes) are the characters themselves, as are `\x..`, `\u....`, `\U........`,
  *    octal escapes and `\a`; a `{` or `}` that is no quantifier and a `]` outside a class are literal; `{,n}` is `{0,n}`;
  *  - with the `i` flag, `i`, `I`, `ı` and `İ` all match one another, as Python folds them (JavaScript does not).
+ *    One difference is kept: under `i` JavaScript folds U+0345 (a combining mark) into `\w` through ι, where Python
+ *    does not. Leaving it out would take a scoped `(?-i:...)`, which in V8 turns off the Unicode case folding of every
+ *    class in the pattern (the Kelvin sign then no longer matches `[a-z]`): a far larger difference.
  * The `u` flag is always on. What has no JavaScript form is refused when the pattern is built, with an InvariantError:
  * an escape Python refuses, `\N{...}`, a negated class escape inside a class (`[\S]`), inline flags anywhere but at the
  * start or scoped to a group (`(?s:...)`), a backreference under `i` (JavaScript folds it without `ı`/`İ`), and any
@@ -62,9 +56,7 @@ interface Step {
 
 /**
  * With `i`: a class that takes any of `i`, `I`, `ı`, `İ` takes all four (a negated one then refuses them all). They go
- * first in the class, so a class ending in a literal `-` keeps it literal. And a class with `\w` would take U+0345
- * (JavaScript folds it to ι), which Python's does not: unless the class names it itself, it is kept out (a negated
- * one lets it through).
+ * first in the class, so a class ending in a literal `-` keeps it literal.
  */
 function closeClass(state: State, ignoreCase: boolean): void {
   const body = state.out.slice(state.classStart);
@@ -75,11 +67,7 @@ function closeClass(state: State, ignoreCase: boolean): void {
     const at = negated ? 2 : 1;
     inner = inner.slice(0, at) + I_VARIANTS + inner.slice(at);
   }
-  inner += "]";
-  if (ignoreCase && body.includes(PY_W_CHARS) && !compile(positive, "u").test("\u0345")) {
-    inner = negated ? `(?:${COMBINING_IOTA}|${inner})` : `(?:(?!${COMBINING_IOTA})${inner})`;
-  }
-  state.out = state.out.slice(0, state.classStart) + inner;
+  state.out = state.out.slice(0, state.classStart) + inner + "]";
   state.inClass = false;
 }
 
