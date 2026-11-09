@@ -212,8 +212,11 @@ export interface SuggestedReply {
  * renders it as its own button (Teams: Action.Execute / Action.OpenUrl).
  */
 export type ViewButton =
-  | { readonly title: string; readonly verb: string; readonly data: JsonObject }
-  | { readonly title: string; readonly url: string };
+  | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
+  | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
+
+/** How a button is emphasised (Teams: the action's `style`); none is the channel's default look. */
+export type ButtonStyle = "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
@@ -299,6 +302,11 @@ export interface Conversation {
   readonly ref: ConversationRef;
   /** The messages this conversation has tried to replace (a clicked card is settled when its id is here). */
   readonly edited: ReadonlySet<MessageId>;
+  /**
+   * Count message `id` as settled without editing it (it is about to be deleted): the safety net that closes an
+   * unsettled click then leaves it alone instead of editing a deleted message (Python `messenger.edited.add(id)`).
+   */
+  markSettled(id: MessageId): void;
   typing(): Promise<void>;
   /** Post and do not wait for the new message's id. */
   send(message: OutMessage): Promise<void>;

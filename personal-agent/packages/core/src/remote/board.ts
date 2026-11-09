@@ -28,11 +28,6 @@ export interface Shown {
   readonly takesInput: boolean;
 }
 
-/** Until the channel port says it: mark a message as settled so nothing edits a message that is gone. */
-export function markSettled(to: Conversation, id: MessageId): void {
-  (to as Conversation & { markSettled?: (id: MessageId) => void }).markSettled?.(id);
-}
-
 /** How a refresh of the window goes. */
 export interface Refresh {
   /** A turn's end is shown. */
@@ -159,7 +154,7 @@ export class StatusBoard {
       view.kept.push(old);
       return true;
     }
-    markSettled(to, old); // (a card tapped just now is settled: the safety net must not edit a message that is gone)
+    to.markSettled(old); // (a card tapped just now is settled: the safety net must not edit a message that is gone)
     await this.removeOrRetire(chatKey, to, old);
     return true;
   }
