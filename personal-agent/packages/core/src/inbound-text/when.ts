@@ -6,16 +6,16 @@
  * not a time: the Python worker's `activity._when`. Epoch seconds or milliseconds (more than ten digits), or an ISO
  * 8601 date as `datetime.fromisoformat` reads it (a time without an offset is UTC).
  *
- * Differences from CPython, chosen: only ASCII digits are a number (Python's `int()` also reads other decimal digits);
- * a time an offset moves out of the years 1-9999 is "" (Python raised there).
+ * A number is decimal digits of any script, as Python's `int()` reads them (`١٧٦٢١٥٢٨٠٠` is a time too). One difference,
+ * a fix of a Python defect: a time its offset moves out of the years 1-9999 is "" here, where Python's `astimezone` raised
+ * outside the `try` and failed the whole message (any member of a group could send such a quote).
  */
-import { pyStrip } from "../text/py-text.js";
+import { cpLength, decimalBigInt, pyStrip } from "../text/py-text.js";
 
 /** The last instant `datetime` can hold, in epoch milliseconds (9999-12-31 23:59:59.999 UTC). */
 const MAX_MS = 253402300799999;
 const DAY_MS = 86_400_000;
 
-const DIGITS = /^[0-9]+$/;
 const CALENDAR = /^([0-9]{4})(?:-([0-9]{2})-([0-9]{2})|([0-9]{2})([0-9]{2}))/;
 const WEEK = /^([0-9]{4})(?:-W([0-9]{2})(?:-([1-7]))?|W([0-9]{2})([1-7])?)/;
 const TIME =
@@ -93,7 +93,8 @@ function timeOf(rest: string): number | undefined {
 }
 
 function epochMs(raw: string): number | undefined {
-  if (DIGITS.test(raw)) return raw.length > 10 ? Number(raw) : Number(raw) * 1000;
+  const digits = decimalBigInt(raw);
+  if (digits !== undefined) return cpLength(raw) > 10 ? Number(digits) : Number(digits) * 1000;
   const date = dateOf(raw);
   if (date === undefined) return undefined;
   const time = timeOf(raw.slice(date.length));

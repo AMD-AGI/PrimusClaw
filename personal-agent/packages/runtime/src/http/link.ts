@@ -10,7 +10,7 @@
 import { LINK_CODE_TTL_SECONDS, type LinkRepository } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { bodyJson, json, type HttpRoute } from "./routes.js";
+import { bodyJson, json, pythonStr, type HttpRoute } from "./routes.js";
 
 /** Both routes of the link flow live under this prefix, so one ingress path exposes them. */
 export const PREFIX = "/primus-claw-agent";
@@ -18,7 +18,11 @@ export const PREFIX = "/primus-claw-agent";
 /** Whether Claw takes `key` (a key Claw refuses gets no code). */
 export type KeyCheck = (key: string) => Promise<boolean>;
 
-const LinkBody = z.object({ key: z.union([z.string(), z.number(), z.boolean()]) }).loose();
+/** A JSON object with a `key` (of any JSON type: Python's `str()` is taken of it). */
+const LinkBody = z
+  .object({ key: z.unknown() })
+  .loose()
+  .refine((body) => "key" in body);
 
 export function linkRoute(links: Pick<LinkRepository, "stashPending">, checkKey: KeyCheck): HttpRoute {
   return {
@@ -27,9 +31,7 @@ export function linkRoute(links: Pick<LinkRepository, "stashPending">, checkKey:
     async handle(request) {
       const body = LinkBody.safeParse(bodyJson(request));
       if (!body.success) return json(400, { error: "key_required" });
-      // (Python's str(...) of a JSON scalar)
-      const raw = body.data.key;
-      const key = typeof raw === "boolean" ? (raw ? "True" : "False") : String(raw);
+      const key = pythonStr(body.data.key);
       if (!(await checkKey(key))) return json(422, { error: "key_rejected" });
       return json(200, { code: links.stashPending(key), expires_in: LINK_CODE_TTL_SECONDS });
     },

@@ -20,8 +20,7 @@
  *  - one `=` introduces a value (`a==b` has the value "=b", as in HTML5); 3.12 skips any number of them;
  *  - an end tag ends at its first `>` (as in 3.12), its attributes ignored;
  *  - an unterminated comment runs to the end of the markup; `--!>` does not end a comment;
- *  - only `script` and `style` are raw text (3.12's CDATA_CONTENT_ELEMENTS); 3.14 adds more elements;
- *  - named character references outside the subset of `entities.ts` are left as written.
+ *  - only `script` and `style` are raw text (3.12's CDATA_CONTENT_ELEMENTS); 3.14 adds more elements.
  */
 import { unescape } from "./entities.js";
 
