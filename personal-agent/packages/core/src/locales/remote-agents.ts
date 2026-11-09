@@ -129,6 +129,11 @@ export const remoteAgentText = defineCatalog({
     modeNow: (p: { mode: string }) => `Mode is now \`${p.mode}\`.`,
     modeUnconfirmed: (p: { mode: string }) =>
       `I asked the agent to switch to \`${p.mode}\`; it has not confirmed yet. \`/agent mode\` shows what it is.`,
+    startsUnattendedRefused: (p: { refused: string }) =>
+      `${p.refused} This agent starts in a mode that does not ask for approval, so a new session of it counts as one; no session was started.`,
+    workingNow: "It is working right now; I will tell you what it says when it pauses.",
+    agentsOnHost: (p: { host: string; names: string }) => `${p.host} has more than one agent. Name one: ${p.names}.`,
+    whichConversation: "I could not tell which conversation you mean. Send `/agent sessions` to pick one.",
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -234,6 +239,12 @@ export const remoteAgentText = defineCatalog({
     notReportedLead: "agent 还没有报到。可以直接发消息，它会在启动后收到。",
     modeNow: (p) => `模式已切换为 \`${p.mode}\`。`,
     modeUnconfirmed: (p) => `已请 agent 切换到 \`${p.mode}\`，它还没有确认。发 \`/agent mode\` 看当前模式。`,
+    startsUnattendedRefused: (p) =>
+      `${p.refused} This agent starts in a mode that does not ask for approval, so a new session of it counts as one; no session was started.`,
+    workingNow: "它现在正在干活，停下来时我把它说的话发给你。",
+    agentsOnHost: (p) => `${p.host} 上有不止一个 agent。指定一个：${p.names}。`,
+    // (said in English, as the worker did)
+    whichConversation: "I could not tell which conversation you mean. Send `/agent sessions` to pick one.",
   },
 });
 
