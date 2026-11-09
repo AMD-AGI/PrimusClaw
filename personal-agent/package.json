@@ -1,0 +1,41 @@
+{
+  "name": "@primusclaw/personal-agent-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The personal agent: a chat assistant that works through Claw. Channel-neutral core, Node runtime adapters, Microsoft Teams adapter.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "workspaces": [
+    "packages/core",
+    "packages/runtime",
+    "packages/teams"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint --max-warnings=0 .",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "depcruise": "depcruise --config .dependency-cruiser.cjs packages test-support",
+    "test": "node --import tsx --test --test-concurrency=2 \"packages/*/test/**/*.test.ts\" \"test-support/**/*.test.ts\" \"test/**/*.test.ts\"",
+    "coverage": "node scripts/coverage.mjs --names test-names.jsonl",
+    "ported-tests": "node --import tsx scripts/check-ported-tests.ts --names test-names.jsonl",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run depcruise && npm run coverage && npm run ported-tests"
+  },
+  "devDependencies": {
+    "@eslint-community/eslint-plugin-eslint-comments": "^4.8.1",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "c8": "^12.0.0",
+    "dependency-cruiser": "^18.7.2",
+    "eslint": "^10.14.0",
+    "eslint-import-resolver-typescript": "^4.4.5",
+    "eslint-plugin-import-x": "^4.18.1",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.72.1"
+  }
+}

@@ -87,13 +87,16 @@ function comparePrerelease(a: string, b: string): number {
   const x = a.split(".");
   const y = b.split(".");
   for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    if (x[i] === undefined) return -1;
-    if (y[i] === undefined) return 1;
-    const nx = /^\d+$/.test(x[i]);
-    const ny = /^\d+$/.test(y[i]);
-    if (nx && ny) { const d = Number(x[i]) - Number(y[i]); if (d) return d < 0 ? -1 : 1; continue; }
+    // (read once into locals: a consumer compiling this file with noUncheckedIndexedAccess sees them narrowed)
+    const xi = x[i];
+    const yi = y[i];
+    if (xi === undefined) return -1;
+    if (yi === undefined) return 1;
+    const nx = /^\d+$/.test(xi);
+    const ny = /^\d+$/.test(yi);
+    if (nx && ny) { const d = Number(xi) - Number(yi); if (d) return d < 0 ? -1 : 1; continue; }
     if (nx !== ny) return nx ? -1 : 1;
-    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+    if (xi !== yi) return xi < yi ? -1 : 1;
   }
   return 0;
 }
