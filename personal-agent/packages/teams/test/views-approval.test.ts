@@ -123,8 +123,9 @@ it("the buttons are unchanged", () => {
     [approve?.["title"], approve?.["style"], approve?.["verb"]],
     ["批准", "positive", "primusclaw.decision"],
   );
-  assert.equal(deny?.["title"], "拒绝");
-  assert.ok(!Object.hasOwn(deny ?? {}, "style"));
+  assert.ok(deny !== undefined);
+  assert.equal(deny["title"], "拒绝");
+  assert.ok(!Object.hasOwn(deny, "style"));
   const english = card({ event: { summary: "Stop workload w1" }, lang: "en" })["actions"] as Node[];
   assert.deepEqual(
     english.map((b) => b["title"]),
