@@ -414,6 +414,14 @@ const unpairedNote = (code: string): string => " The user has no machine connect
   + (code === "rate_limited" ? " They can also ask again in a minute for a one-line pairing command instead." : "");
 const noteFor = (c: ConnectNew): string => (c.pairing ? PAIRED_NOTE : c.refused ? unpairedNote(c.refused) : SETUP_NOTE);
 
+/**
+ * With no machine at all, what the answer names of machines: none. A machine that appears in the work item list, a memory or an
+ * earlier message is where some work ran or what was said then, not one of the user's now: "之前的 dev-box-1 已离线"
+ * was said with no machine connected and none in the tool's result (DM21-zms-a, 2026-11-07).
+ */
+export const NO_MACHINE_NOTE = " The user has no machine at all: name none, not even to say one is offline, was connected before or "
+  + "was used last time. A machine named in the work item list, a memory or an earlier message is not one of theirs now.";
+
 /** devenv_send's no_machine with no machine at all: what to say, by what connect_a_machine carries (the evaluation's stand-in says it too). */
 export function sendConnectMessage(c: ConnectNew): string {
   if (c.pairing) {
@@ -542,7 +550,7 @@ export async function devenvList(
       }
       : {}),
     note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (made ? (allOffline ? ALL_OFFLINE_NOTE : noteFor(made)) : "")
-      + (old ? OUTDATED_NOTE : "") + (cut ? SESSIONS_CUT_NOTE : ""),
+      + (old ? OUTDATED_NOTE : "") + (cut ? SESSIONS_CUT_NOTE : "") + (all.length === 0 ? NO_MACHINE_NOTE : ""),
   };
 }
 
@@ -1135,7 +1143,7 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
     if (planned.none) {
       // No machine at all: what connects one, as devenv_list gives it (a one-line pairing made now, in a turn that may make one).
       const made = await connectNew(claims, await mayPairHere(claims));
-      throw new ToolRefused("no_machine", `${planned.message}: nothing was sent. ${sendConnectMessage(made)}`, {
+      throw new ToolRefused("no_machine", `${planned.message}: nothing was sent. ${sendConnectMessage(made)}${NO_MACHINE_NOTE}`, {
         connect_a_machine: {
           commands: made.commands, text_en: made.text.en, text_zh: made.text.zh, ...(made.pairing ? { pairing: made.pairing } : {}),
         },

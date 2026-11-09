@@ -170,6 +170,14 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
+  with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
+  which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation
+  identity's assistant session is deleted between runs but its items are not. The list now leaves off a closed development
+  environment item whose machine is no longer the user's (an open one is listed with no name), the instruction cards voided because
+  their machine was revoked no longer name it, the results of `devenv_list` and `devenv_send` with no machine at all tell the router
+  to name none, and the router's prompt takes a machine's name from this turn's `devenv_list` or `devenv_send` alone.
+  Router prompt router-devenv-v14.
 - The assistant tells a person the commands they can type back in the language it answers them in: approve #ref and deny #ref for a
   card, undo #N after something is remembered, and 批准 / 拒绝 / 撤销 only in a Chinese conversation. The tool results (a memory save,
   a scheduled task, a GitHub comment or a devenv_send instruction card put to the person), what waits for them in the router's state
