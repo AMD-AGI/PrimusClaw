@@ -22,7 +22,7 @@ import type { ReviewDeps, StartedReviewTurn } from "./deps.js";
 import type { AskerFollow } from "./follow.js";
 import { modeOf } from "./identity.js";
 import type { ItemCards } from "./item-cards.js";
-import type { ReviewItems } from "./items.js";
+import type { ItemsAsked, ReviewItems } from "./items.js";
 import type { Notices } from "./notices.js";
 import type { Settled } from "./start.js";
 import type { ReviewTurns } from "./turns.js";
@@ -304,10 +304,15 @@ export class ReviewLaunch {
       note: s.ctx.text,
       handoffId: "",
     };
-    const asked = await this.items.start(request, [review], refused);
-    const [started] = asked.kind === "started" ? asked.reviews : [];
-    // (not started this way either: refused, a 404 again, or an error: never done, as the session before it was not)
-    if (started === undefined) s.giveBack([review]);
+    let started: ReviewTurn | undefined;
+    let asked: ItemsAsked;
+    try {
+      asked = await this.items.start(request, [review], refused);
+      [started] = asked.kind === "started" ? asked.reviews : [];
+    } finally {
+      // (not started this way either: refused, a 404 again, or an error on the way: never done, as the session before it was not)
+      if (started === undefined) s.giveBack([review]);
+    }
     if (asked.kind === "refused") {
       await say(this.deps, s.ctx.conversation, asked.text);
       return true;

@@ -269,3 +269,13 @@ test("a github command forgets what was remembered of the connection", async () 
   await offer(world, () => Promise.resolve(), "我的 CI 挂了吗");
   assert.equal(connectionReads(world), 2); // asked again after the unbind
 });
+
+test("repositories are read from links and names next to a github word", () => {
+  assert.deepEqual(repositoriesNamed("看下 https://github.com/example-org/example-repo/pull/288"), [
+    ["example-org", "example-repo"],
+  ]);
+  assert.deepEqual(repositoriesNamed("clone https://github.com/AMD-AGI/PrimusClaw.git"), [["AMD-AGI", "PrimusClaw"]]); // (a clone URL)
+  assert.deepEqual(repositoriesNamed("AMD-AGI/Primus#12 的 CI 挂了吗"), [["AMD-AGI", "Primus"]]);
+  assert.deepEqual(repositoriesNamed("a/b 是什么"), []); // (no GitHub word: "and/or" is no repository)
+  assert.deepEqual(repositoriesNamed("CI/CD 的 PR 怎么写"), []); // (words, not a repository)
+});

@@ -17,6 +17,7 @@ import {
   saidIn,
   type ReviewWorld,
 } from "../../../../test-support/review-world.js";
+import { cards, confirmation } from "./held-world.js";
 
 const PR1 = "AMD-AGI/Hyperloom#1";
 const PR2 = "AMD-AGI/Hyperloom#2";
@@ -130,4 +131,28 @@ test("a pull request under review is not started twice and is free again when it
   await Promise.resolve();
   await ask(w, `请 {Bob} 帮我 review 合入 ${PR2}`, "g3");
   assert.equal(w.started.length, 2);
+});
+
+test("each pull request gets its own confirmation card", async () => {
+  const w = world();
+  w.claw.confirmations = [confirmation({ id: "cf-1", pr: 1 }), confirmation({ id: "cf-2", pr: 2 })];
+  await ask(w, `请 {Bob} 帮我 review 合入 ${PR1} ${PR2}`);
+  const conversation = w.surface.conversation(groupMessage("x").conversation);
+  for (const [i, turn] of w.started.entries()) {
+    turn.review.sessionId = `sess-aad-a-${String(i + 1)}`; // (each review's own session)
+    await w.service.afterTurn(
+      turn.review,
+      "这是高风险变更，需要 Bob 确认。\nVERDICT: CLEAN",
+      { moved: false, refusal: null, ranModel: "m", wrote: [], prSummary: "" },
+      conversation,
+    );
+  }
+  const sent = cards(w, "personal:aad-b");
+  assert.deepEqual(sent.map((c) => c.confirmationId).sort(), ["cf-1", "cf-2"]);
+  const rows = ["cf-1", "cf-2"].map((id) => w.store.githubConfirmations.getGithubConfirmation(id));
+  assert.deepEqual(
+    rows.map((r) => r?.pr),
+    [1, 2],
+  );
+  assert.notEqual(rows[0]?.sessionId, rows[1]?.sessionId); // each from its own review's session
 });

@@ -392,6 +392,28 @@ teams/tests/test_github_review.py::test_naming_oneself_needs_no_switch -> packag
 teams/tests/test_github_review.py::test_a_confirmation_can_be_opened_in_direct_mode_when_the_reviewer_has_no_chat_yet -> MERGED packages/core/test/review/confirmations.test.ts::a high risk merge sends one card to the reviewer alone and tells the group
 teams/tests/test_github_review.py::test_the_asker_key_is_the_model_key_and_never_the_credential -> MERGED packages/core/test/review/group-request.test.ts::a named reviewer with github gets a session of the askers that acts as them
 teams/tests/test_github_review.py::test_the_pull_request_the_session_is_bound_to_is_the_one_asked_for -> MERGED packages/core/test/review/group-request.test.ts::a named reviewer with github gets a session of the askers that acts as them
+teams/tests/test_review_items.py::test_a_review_of_oneself_is_followed_with_or_without_the_id_of_its_first_turn -> packages/core/test/review/items-follow.test.ts::a review of oneself is followed without the id of its first turn
+teams/tests/test_review_items.py::test_in_a_one_to_one_chat_the_card_comes_in_that_chat -> packages/core/test/review/items-follow.test.ts::in a one to one chat the card comes in that chat
+teams/tests/test_review_items.py::test_this_workers_memory_no_longer_decides_whether_claw_is_asked -> packages/core/test/review/items-follow.test.ts::this workers memory no longer decides whether claw is asked
+teams/tests/test_review_items.py::test_an_answer_the_client_cannot_follow_starts_nothing_here -> packages/core/test/review/items-follow.test.ts::an answer the client cannot follow starts nothing here (no-pull)
+teams/tests/test_review_items.py::test_a_review_of_oneself_without_its_session_is_not_followed_blind -> packages/core/test/review/items-follow.test.ts::a review of oneself without its session is not followed blind
+teams/tests/test_review_items.py::test_a_review_alice_asks_of_herself_closes_its_card_when_its_turn_ends -> packages/core/test/review/items-follow.test.ts::a review alice asks of herself closes its card when its turn ends
+teams/tests/test_review_items.py::test_the_conclusion_in_the_group_mentions_the_asker_and_nobody_else -> packages/core/test/review/items-follow.test.ts::the conclusion in the group mentions the asker and nobody else
+teams/tests/test_review_items.py::test_the_conclusion_in_a_one_to_one_chat_mentions_nobody -> packages/core/test/review/items-follow.test.ts::the conclusion in a one to one chat mentions nobody
+teams/tests/test_review_items.py::test_own_item_end_text_reads_what_the_turn_left_on_github -> packages/core/test/review/items-follow.test.ts::own item end text reads what the turn left on github
+teams/tests/test_review_items.py::test_help_says_how_a_review_is_stopped -> packages/core/test/review/items-follow.test.ts::help says how a review is stopped
+teams/tests/test_review_items.py::test_an_item_that_cannot_be_followed_is_said_once -> packages/core/test/review/items-follow.test.ts::an item that cannot be followed is said once
+teams/tests/test_review_items.py::test_a_review_asked_of_someone_else_never_starts_a_followed_turn -> packages/core/test/review/items-follow.test.ts::a review asked of someone else never starts a followed turn
+teams/tests/test_review_items.py::test_a_request_refused_as_a_whole_with_an_internal_message_says_only_a_reference -> packages/core/test/review/items-follow.test.ts::a request refused as a whole with an internal message says only a reference
+teams/tests/test_review_items.py::test_a_session_refused_mid_rollout_is_asked_again_as_the_reviewers_item -> packages/core/test/review/items-rollout.test.ts::a session refused mid rollout is asked again as the reviewers item
+teams/tests/test_review_items.py::test_a_session_refused_mid_rollout_is_asked_again_once_only -> packages/core/test/review/items-rollout.test.ts::a session refused mid rollout is asked again once only
+teams/tests/test_review_items.py::test_a_retry_that_does_not_start_gives_the_askers_review_count_back -> packages/core/test/review/items-rollout.test.ts::a retry that does not start gives the askers review count back (404-again)
+teams/tests/test_review_items.py::test_a_retry_that_starts_keeps_the_askers_review_count -> packages/core/test/review/items-rollout.test.ts::a retry that starts keeps the askers review count
+teams/tests/test_github_review_mode.py::test_in_their_own_chat_a_person_asks_in_their_own_words -> packages/core/test/review/mode-phrases.test.ts::in their own chat a person asks in their own words: 改成全自动合入
+teams/tests/test_github_review_many.py::test_each_pull_request_gets_its_own_confirmation_card -> packages/core/test/review/many-pulls.test.ts::each pull request gets its own confirmation card
+teams/tests/test_review_pr_summary.py::test_a_review_s_message_has_no_link_hidden_behind_the_sentence -> packages/core/test/review/review-pr-summary.test.ts::a review s message has no link hidden behind the sentence
+teams/tests/test_github_repo_scope.py::test_the_reconnect_line_never_holds_the_question_up -> packages/core/test/review/scope-hint.test.ts::the reconnect line never holds the question up
+teams/tests/test_github_repo_scope.py::test_repositories_are_read_from_links_and_names_next_to_a_github_word -> packages/core/test/review/github-connect.test.ts::repositories are read from links and names next to a github word
 
 # LATER: tests of another line's code, to be ported by that line (the checker skips comment lines; one per Python test).
 # LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out
@@ -485,3 +507,7 @@ teams/tests/test_github_review.py::test_the_pull_request_the_session_is_bound_to
 # LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_repo_scope.py::test_a_memory_switch_claw_refuses_is_said_and_points_to_the_page
 # LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_typed_answer.py::test_a_group_click_is_not_a_1on1_click
 # LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_a_member_with_no_key_who_asks_a_plain_question_gets_the_link_steps_even_with_the_exchange_on
+# LATER: W2 (HTTP client contract (ClawClient wire): REQUESTER_NOTE_MAX in runtime/claw/assistant.ts) teams/tests/test_review_items.py::test_the_requester_note_is_clipped_to_what_claw_takes
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_items.py::test_a_review_item_refused_for_want_of_an_apim_key_is_not_run_again_in_claws_session
+# LATER: W4 (routing: the active-turn registry, routing/turn-registry.ts, keys a review item's turn by its item) teams/tests/test_review_items.py::test_a_new_item_for_a_pull_request_whose_last_review_is_still_being_let_go_here_is_followed
+# LATER: W5 (assistant path: the agent's credential carried by the question asked again, agent.py _credential) teams/tests/test_github_connect.py::test_the_question_asked_again_uses_the_credential_it_was_asked_with_when_none_can_be_read_then

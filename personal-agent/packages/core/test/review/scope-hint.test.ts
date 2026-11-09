@@ -90,3 +90,25 @@ test("two messages in a row get the reconnect line once", async () => {
   await w.service.idle();
   assert.equal(hintLines(w).length, 1);
 });
+
+test("the reconnect line never holds the question up", async () => {
+  const w = world();
+  const settings = w.deps.claw.settings as { githubConnection: (key: string) => Promise<GithubConnection | null> };
+  const real = settings.githubConnection.bind(settings);
+  let open: () => void = () => undefined;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let looking = false;
+  settings.githubConnection = async (key) => {
+    looking = true;
+    await opened; // (a line looked up in the foreground would wait here for ever)
+    return real(key);
+  };
+  assert.equal(await ask(w, PRIVATE_Q), false); // (the question goes on at once)
+  assert.equal(looking, true, "the look is under way in the background");
+  assert.deepEqual(hintLines(w), []);
+  open();
+  await w.service.idle();
+  assert.equal(hintLines(w).length, 1); // (the line comes after, from the background)
+});

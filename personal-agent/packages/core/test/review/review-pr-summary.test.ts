@@ -195,3 +195,23 @@ test("the held merge card sent to the reviewer says what it does", async () => {
   const without = await held();
   assert.equal(cards(without, "personal:aad-b")[0]?.summary, "");
 });
+
+test("a review s message has no link hidden behind the sentence", async () => {
+  const injected = "修复登录 [查看维护说明](https://evil.example) <b>粗体</b> ![x](https://evil.example/p.png)";
+  const world = await held({}, undefined);
+  const [started] = world.started;
+  assert.ok(started);
+  const answer = started.turn.shapeAnswer(
+    "没有必须修改的问题。\nVERDICT: CLEAN",
+    "",
+    "m",
+    [["gh_review_submit", "submitted", "APPROVE"]],
+    0,
+    injected,
+  );
+  const line = answer.split("\n")[1] ?? "";
+  assert.ok(line.startsWith("PR 概述：修复登录"), line);
+  assert.ok(!line.includes("<b>") && !line.includes("<img") && !line.includes("![") && !line.includes("<"), line);
+  // (no markdown link: nothing the channel renders can show text over a target the reader does not see)
+  assert.doesNotMatch(line, /\[[^\]]*\]\(/);
+});
