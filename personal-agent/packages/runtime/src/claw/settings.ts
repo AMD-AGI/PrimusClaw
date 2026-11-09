@@ -37,7 +37,7 @@ export class HttpSettings implements ClawSettingsPort {
       .filter((m) => m["category"] !== "user_profile")
       .map((m) => ("content" in m ? pyStr(m["content"]) : ""));
     return {
-      enabled: Boolean(settings["enabled"]),
+      enabled: pyTruthy(settings["enabled"]),
       available: "available" in settings ? pyTruthy(settings["available"]) : true,
       items: texts.slice(0, limit),
     };
@@ -51,7 +51,7 @@ export class HttpSettings implements ClawSettingsPort {
       body: { enabled },
     });
     const data = dataOf(answer, "memory");
-    return { enabled: Boolean(data["enabled"]), available: "available" in data ? pyTruthy(data["available"]) : true };
+    return { enabled: pyTruthy(data["enabled"]), available: "available" in data ? pyTruthy(data["available"]) : true };
   }
 
   async models(key: ClawCredential): Promise<string[]> {
