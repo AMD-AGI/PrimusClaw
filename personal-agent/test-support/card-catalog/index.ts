@@ -8,13 +8,19 @@
 import { APPROVAL_CARDS } from "./approval.js";
 import { ASSISTANT_CARDS } from "./assistant.js";
 import type { CatalogEntry } from "./catalog.js";
+import { COMMAND_CARDS } from "./commands.js";
 import { PROACTIVE_CARDS } from "./proactive.js";
 import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...ASSISTANT_CARDS, ...PROACTIVE_CARDS, ...TURN];
+export const CATALOG: readonly CatalogEntry[] = [
+  ...APPROVAL_CARDS,
+  ...ASSISTANT_CARDS,
+  ...COMMAND_CARDS,
+  ...PROACTIVE_CARDS,
+  ...TURN,
+];
 
 const BY_LINE = {
-  W4: ["binding", "link", "onboarding", "repo", "session"],
   W6b: [
     "remote_agents",
     "remote_disconnect",

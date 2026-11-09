@@ -34,3 +34,4 @@ export * from "./public-error/public-errors.js";
 export * from "./inbound-text/index.js";
 export * as turn from "./turn/index.js";
 export * from "./note/note.js";
+export * from "./routing/index.js";
