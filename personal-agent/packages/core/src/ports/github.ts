@@ -18,6 +18,11 @@ export interface DeviceFlowFailed {
   readonly reason: "unavailable" | "expired" | "denied";
 }
 
+/** The wait was given up on (the person sent `/github unbind` meanwhile). */
+export interface DeviceFlowCancelled {
+  readonly kind: "device_flow_cancelled";
+}
+
 export interface DeviceCode {
   /** What the worker polls with; never shown. */
   readonly deviceCode: string;
@@ -31,8 +36,8 @@ export interface DeviceCode {
 /** RFC 8628 against github.com with a public client; the scope asked for is always `repo`. */
 export interface DeviceFlow {
   start(): Promise<Result<DeviceCode, DeviceFlowFailed>>;
-  /** Polls until the person approves: the token, or why not. */
-  waitForToken(code: DeviceCode): Promise<Result<string, DeviceFlowFailed>>;
+  /** Polls until the person approves: the token, or why not. An aborted `signal` ends the wait as `cancelled`. */
+  waitForToken(code: DeviceCode, signal?: AbortSignal): Promise<Result<string, DeviceFlowFailed | DeviceFlowCancelled>>;
 }
 
 /**
