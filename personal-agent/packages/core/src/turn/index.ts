@@ -70,7 +70,13 @@ export {
 export type { Step } from "./step.js";
 export { TurnState } from "./turn-state.js";
 export { type ChangesModel, type DeliveryModel, viewMessage } from "./views.js";
-export { type ReviewTurnOptions, type TurnApprovals, TurnEngine, type TurnEngineDeps } from "./runner.js";
+export {
+  type ReviewTurnOptions,
+  type ReviewTurnOutcome,
+  type TurnApprovals,
+  TurnEngine,
+  type TurnEngineDeps,
+} from "./runner.js";
 export {
   OFFER_KEEP_SECONDS,
   type Offer,
