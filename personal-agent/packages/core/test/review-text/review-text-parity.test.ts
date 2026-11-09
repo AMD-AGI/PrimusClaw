@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The reading of a review request against the Python worker's on 7671 seeded texts (random pieces of requests, and
+ * The reading of a review request against the Python worker's on 9,628 seeded texts (random pieces of requests, and
  * 3,000 shaped like "请 XX 帮我 review ..." with dotted and dotless i, full-width space and fictional names): bare numbers,
  * pull requests, the review-only ask, "review 合入", words, flattening, brackets, and where each of four members is
  * named. Every expected value is what the Python functions returned.
@@ -25,6 +25,8 @@ import {
   writtenRepos,
   type RosterMember,
 } from "../../src/index.js";
+import { MARK_CLOSE, MARK_OPEN } from "../../src/review-text/markers.js";
+import { hasFileLine, hiddenSpans, wordHashNumbers } from "../../src/review-text/text/scan.js";
 
 interface Row {
   readonly t: string;
@@ -39,6 +41,9 @@ interface Row {
   readonly paren: string;
   readonly wi: boolean[];
   readonly nin: string[][];
+  readonly h: Array<[number, number]>;
+  readonly f: boolean[];
+  readonly wh: Array<[string, string]>;
 }
 
 /** One JSON object per line: the members and their keys first, then one row per text. */
@@ -72,7 +77,7 @@ function differences(read: (row: Row) => unknown, expected: (row: Row) => unknow
 
 describe("review text parity with the Python worker", () => {
   it("covers asks, pull requests and bare numbers", () => {
-    assert.equal(corpus.rows.length, 7671);
+    assert.ok(corpus.rows.length > 9000);
     assert.ok(corpus.rows.filter((r) => r.ro !== null).length > 500);
     assert.ok(corpus.rows.filter((r) => r.p.length > 0).length > 1000);
     assert.ok(corpus.rows.filter((r) => r.g.length > 0).length > 500);
@@ -101,6 +106,18 @@ describe("review text parity with the Python worker", () => {
     };
     assert.deepEqual(
       differences(read, (r) => ({ ro: r.ro, rm: r.rm })),
+      [],
+    );
+  });
+
+  it("hidden parts, file:line references and word#N, scanned", () => {
+    const read = (r: Row): unknown => ({
+      h: hiddenSpans(r.t, MARK_OPEN, MARK_CLOSE).map(([a, b]) => [a, b]),
+      f: r.t.split("\n").map((line) => hasFileLine(line)),
+      wh: wordHashNumbers(r.t).map(([word, digits]) => [word, digits]),
+    });
+    assert.deepEqual(
+      differences(read, (r) => ({ h: r.h, f: r.f, wh: r.wh })),
       [],
     );
   });
