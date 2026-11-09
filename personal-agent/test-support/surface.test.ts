@@ -146,3 +146,32 @@ test("markSettled counts a message as settled without editing it", () => {
   assert.equal(c.edited.has("m7"), true);
   assert.deepEqual(surface.outbox, []);
 });
+
+test("without a hold, an update is recorded at the call, in the order of the calls", () => {
+  const surface = new FakeSurface();
+  const c = surface.conversation(testConversation());
+  void c.update("m1", textMessage("edited"));
+  void c.send(textMessage("after"));
+  assert.deepEqual(
+    surface.outbox.map((r) => r.op),
+    ["update", "send"],
+  );
+});
+
+test("an update aborted while it is held rejects at once, before the hold ends, and is never recorded", async () => {
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const surface = new FakeSurface({ beforeUpdate: () => held });
+  const controller = new AbortController();
+  const inFlight = surface.conversation(testConversation()).update("m1", textMessage("x"), {
+    signal: controller.signal,
+  });
+  controller.abort(new Error("stopped while held"));
+  await assert.rejects(inFlight, /stopped while held/);
+  release();
+  await held;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(surface.outbox, []);
+});
