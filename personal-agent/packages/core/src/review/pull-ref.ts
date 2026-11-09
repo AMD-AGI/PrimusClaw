@@ -5,7 +5,7 @@
 
 import type { PullRef } from "../claw/model.js";
 
-export { MARK_CLOSE, MARK_OPEN } from "../inbound-text/marked-text.js";
+export { MARK_CLOSE, MARK_OPEN } from "../review-text/markers.js";
 import { decimalInt } from "../text/py-text.js";
 
 export type { PullRef };

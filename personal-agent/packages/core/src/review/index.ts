@@ -14,8 +14,6 @@ export type {
   ReviewDeps,
   ReviewHost,
   StartReviewTurn,
-  RunningTurn,
-  ReviewSlots,
   Guard,
   Audit,
   FollowWire,

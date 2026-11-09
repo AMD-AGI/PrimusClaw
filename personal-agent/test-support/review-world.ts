@@ -359,6 +359,7 @@ export function groupMessage(
     links: [],
     quotes: [],
     files: [],
+    unreadableFiles: [],
     provenance: "typed",
   };
 }
