@@ -339,8 +339,7 @@ export class AskerFollow {
     }
     const [first] = told;
     try {
-      if (first !== undefined)
-        await this.sayToAsker(first[0].review, conversation, progressText(entries, told));
+      if (first !== undefined) await this.sayToAsker(first[0].review, conversation, progressText(entries, told));
     } catch (err) {
       for (const [entry] of told) {
         entry.said = before.get(followedItemId(entry)) ?? "";

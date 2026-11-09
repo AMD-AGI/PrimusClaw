@@ -12,6 +12,7 @@ import { test } from "node:test";
 
 import type { AskerView } from "../../src/index.js";
 import { PR_SUMMARY_MAX_CJK } from "../../src/claw/requester-view.js";
+import { cpLength } from "../../src/text/py-text.js";
 import { progressText, reviewerResultText, type Followed } from "../../src/review/progress.js";
 import { reviewAnswer } from "../../src/review/receipt.js";
 import { reviewTurn, type ReviewTurn } from "../../src/review/review-turn.js";
@@ -189,7 +190,7 @@ test("the held merge card sent to the reviewer says what it does", async () => {
   const world = await held({ pr_summary: `${ZH}${"很长".repeat(100)}` });
   const [card] = cards(world, "personal:aad-b");
   assert.ok(card?.summary.startsWith(ZH));
-  assert.equal([...(card?.summary ?? "")].length, PR_SUMMARY_MAX_CJK);
+  assert.equal(cpLength(card?.summary ?? ""), PR_SUMMARY_MAX_CJK);
   assert.equal(card?.title, "Change the release workflow"); // the rest of the card is still there
   const without = await held();
   assert.equal(cards(without, "personal:aad-b")[0]?.summary, "");

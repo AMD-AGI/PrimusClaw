@@ -149,10 +149,7 @@ function settledWords(review: ReviewTurn, view: AskerView): string {
  * One message for what is news of a request's reviews asked of someone else: one line for a request of one review; for
  * several, a count of how many have a conclusion and how many ended, then the news, then what the others are doing.
  */
-export function progressText(
-  entries: readonly Followed[],
-  told: readonly (readonly [Followed, AskerView])[],
-): string {
+export function progressText(entries: readonly Followed[], told: readonly (readonly [Followed, AskerView])[]): string {
   const [first] = told;
   if (entries.length === 1 && first !== undefined) {
     const [entry, view] = first;
