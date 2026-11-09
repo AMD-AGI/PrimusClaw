@@ -82,8 +82,9 @@ test("tasks are the chat turns, the attached agent's turn, prompts being sent an
   w.turns.claim(chatTurnKey(ALICE.id), new ActiveTurn());
   w.state.remoteRunning = true;
   assert.equal(w.admission.running(ALICE.id), 2);
-  const inside = await w.admission.reserve(ALICE.id, () => Promise.resolve(w.admission.running(ALICE.id)));
-  assert.equal(inside, 3);
+  w.admission.hold(ALICE.id);
+  assert.equal(w.admission.running(ALICE.id), 3);
+  w.admission.letGo(ALICE.id);
   assert.equal(w.admission.running(ALICE.id), 2);
   const slots = await w.admission.admitReviews(w.chat(), "a1", 2, "");
   assert.equal(slots.granted, 2);

@@ -185,12 +185,18 @@ export class PersonalText {
       await remote.prompt(request); // (refused by the agent's own rule: one remote turn at a time)
       return;
     }
-    const refused = await this.ctx.admission.lock.run(chat.sender.id, async () => {
-      if (await this.ctx.admission.overLimit(chat, message.id, "remote_agent", "", key)) return true;
-      return false;
+    // (the slot is taken under the person's lock, so a turn admitted meanwhile in another chat sees it)
+    const held = await this.ctx.admission.lock.run(chat.sender.id, async () => {
+      if (await this.ctx.admission.overLimit(chat, message.id, "remote_agent", "", key)) return false;
+      this.ctx.admission.hold(chat.sender.id);
+      return true;
     });
-    if (refused) return;
-    await this.ctx.admission.reserve(chat.sender.id, () => remote.prompt(request));
+    if (!held) return;
+    try {
+      await remote.prompt(request);
+    } finally {
+      this.ctx.admission.letGo(chat.sender.id);
+    }
   }
 
   /**
@@ -205,7 +211,8 @@ export class PersonalText {
     goOn: (message: InboundMessage, credential: string) => Promise<void>,
   ): Promise<void> {
     const { github } = this.ctx.deps;
-    if (github === undefined || message.files.length > 0) return; // (what a file link allows may not last until then)
+    // (a message with files is not asked again: what a file link allows may not last until the person connects)
+    if (github === undefined || hasFiles(message)) return;
     const again = async (): Promise<void> => {
       const fresh = (await this.ctx.credentials.credential(chat, false)) ?? key;
       const id = message.id || this.ctx.deps.random.hexId();
@@ -289,14 +296,19 @@ export class PersonalText {
  * A review request does not take the files sent with it, and the person is told so (a review reads the pull request):
  * what the review service calls after it took such a message.
  */
+/** The message came with files, whether the channel gave a way to fetch them or not (Python `any(inbound_files(activity))`). */
+export function hasFiles(message: InboundMessage): boolean {
+  return message.files.length > 0 || message.unreadableFiles.length > 0;
+}
+
 export async function filesNotReviewed(
   ctx: RouterContext,
   chat: Chat,
   message: InboundMessage,
   text: string,
 ): Promise<void> {
-  if (message.files.length === 0 && ctx.deps.messageText.unreadable(message) === undefined) return;
-  const count = message.files.length + (ctx.deps.messageText.unreadable(message)?.count ?? 0);
+  if (!hasFiles(message)) return;
+  const count = message.files.length + message.unreadableFiles.length;
   ctx.deps.metrics.filesDropped("review", count);
   await chat.say(
     hasCjk(text)

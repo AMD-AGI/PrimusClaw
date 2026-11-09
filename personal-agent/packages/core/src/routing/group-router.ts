@@ -17,7 +17,7 @@ import type { SessionCommands } from "./commands-session.js";
 import type { RouterContext } from "./context.js";
 import type { GroupRemote, GroupWords } from "./group-remote.js";
 import type { Onboarding } from "./onboarding.js";
-import type { PersonalText } from "./personal-text.js";
+import { hasFiles, type PersonalText } from "./personal-text.js";
 import type { TurnStarter } from "./turn-start.js";
 
 const STOP_SAID: Readonly<Record<string, readonly [string, string]>> = {
@@ -94,7 +94,7 @@ export class GroupRouter {
   /** Help, and the commands a group does not take (they are a 1:1 chat's). True when the message was answered. */
   private async groupOwn(message: InboundMessage, chat: Chat, words: GroupWords): Promise<boolean> {
     const { github, remote, config } = this.ctx.deps;
-    const empty = !words.sent && !words.quote && message.files.length === 0;
+    const empty = !words.sent && !words.quote && !hasFiles(message);
     const [first = ""] = pySplit(words.text);
     const word = pyLower(first);
     if (empty || word === "/help") {
