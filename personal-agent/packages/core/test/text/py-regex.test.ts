@@ -17,8 +17,9 @@ import {
 import { InvariantError } from "../../src/errors.js";
 
 /**
- * (pattern, flags, text, what Python 3's re.fullmatch said). `\\p{Lu}` was checked in Python with the class of the
- * capitals in the text, since Python's re has no \\p.
+ * (pattern, flags, text, what Python 3's re.fullmatch said). Two spellings are JavaScript's, accepted as extensions for
+ * hand-built patterns and checked in Python in Python's spelling: `(?<name>...)` as `(?P<name>...)`, and `\\p{Lu}` as
+ * the class of the capitals in the text (Python's re has no \\p).
  */
 const CASES: readonly (readonly [string, string, string, boolean])[] = [
   ["[a._-]", "i", "-", true],
@@ -204,6 +205,63 @@ test("what has no JavaScript form is refused when the pattern is built, never re
   // In Python a(?s:.)b matches "a\nb" and (?i:link) matches "LİNK": refusing is the only answer that is not wrong.
 });
 
+/** Round-3 review cases: (pattern, flags, text, how, what CPython 3 said). */
+const FOLLOW_UP: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["\\w", "i", "\u03b9", "full", true],
+  ["[\\w]", "i", "\u03b9", "full", true],
+  ["\\W", "i", "\u03b9", "full", false],
+  ["[^\\w]", "i", "\u03b9", "full", false],
+  ["\\bA", "i", "\u03b9A", "search", false],
+  ["\\w+", "i", "\u0399\u03b9a", "full", true],
+  ["\\123", "", "S", "full", true],
+  ["[\\w-]+", "i", "Ab-c", "full", true],
+  ["(?#c)(?i)a", "", "A", "full", true],
+  ["(?i)(?#c)(?m)^a$", "", "x\nA", "search", true],
+  ["(?im)^a", "", "b\nA", "search", true],
+];
+
+test("ι stays a word character under IGNORECASE and flag groups may follow a leading comment, as in Python", () => {
+  for (const [pattern, flags, text, how, python] of FOLLOW_UP) {
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.equal(regex.test(text), python, `${how} ${pattern} /${flags} ${JSON.stringify(text)}`);
+  }
+});
+
+test("a full match is the same on every call and Python's own errors are refused, never thrown raw", () => {
+  assert.throws(() => pyFullmatch("a", "g"), InvariantError); // g/y would make test() stateful
+  assert.throws(() => pyFullmatch("a", "y"), InvariantError);
+  const again = pyFullmatch("a");
+  const first = again.test("a");
+  const second = again.test("a"); // a second call on the same RegExp: no lastIndex carried over
+  assert.ok(first && second);
+  assert.equal(pyRegExp("a", "gi").flags, "giu"); // searching for every match keeps g
+  for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a", `${"()".repeat(400)}\\400`]) {
+    assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
+  }
+});
+
+test("the one kept difference: under IGNORECASE U+0345 counts as a word character, and Kelvin still folds beside \\b", () => {
+  // Python: re.fullmatch(r"\w", "\u0345", re.I) is None. JavaScript folds U+0345 to ι; leaving it out would need a
+  // scoped (?-i:...), which in V8 stops the Kelvin sign matching [A-Za-z] anywhere in the pattern (the case below).
+  assert.equal(pyFullmatch("\\w", "i").test("\u0345"), true);
+  assert.equal(pyFullmatch("\\w").test("\u0345"), false);
+  // Python: re.search(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", "Bearer \u212a" + "x" * 33) matches
+  assert.ok(pyRegExp(String.raw`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}`).test(`Bearer \u212a${"x".repeat(33)}`));
+});
+
+test("no translated pattern carries a scoped flag modifier, which in V8 turns off the case folding of every class", () => {
+  const modifier = /\(\?[a-z]*-[a-z]+:|\(\?[a-z]+:/;
+  const all = [...CASES, ...MORE, ...PYTHON_SYNTAX, ...FOLLOW_UP];
+  for (const [pattern, flags, ...rest] of all) {
+    const how = rest.length === 3 ? rest[1] : "full";
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.ok(!modifier.test(regex.source), `${pattern} -> ${regex.source}`);
+  }
+  for (const flags of ["", "i", "im", "is"]) {
+    assert.ok(!modifier.test(pyRegExp(String.raw`\w+\b\B\W[\w-]^$.`, flags).source), flags);
+  }
+});
+
 test("quantifier braces with an empty side are Python's: {,} is {0,}, {,n} is {0,n}, {m,} is {m,}", () => {
   // (pattern, text, what CPython 3's re.fullmatch said)
   for (const [pattern, text, python] of [
@@ -234,4 +292,35 @@ test("a backreference is refused: JavaScript matches one to a group that took no
   }
   // an escape that is octal stays a character, as in Python
   assert.equal(pyFullmatch("\\101").test("A"), true);
+});
+
+test("octal and backreference escapes meet as in Python: octal is a character, any group number is refused", () => {
+  // CPython 3: \01, [\01], \111 and (a)\111 are octal characters; \1, \8, \10, \18 are group references (errors
+  // without the group, matches with it) which this translation refuses either way; [\8] and \400 are errors.
+  for (const [pattern, text] of [
+    ["\\01", "\u0001"],
+    ["[\\01]", "\u0001"],
+    ["[\\1]", "\u0001"],
+    ["\\111", "I"],
+    ["(a)\\111", "aI"],
+  ] as const) {
+    assert.ok(pyFullmatch(pattern).test(text), pattern);
+  }
+  for (const pattern of ["\\1", "(a)\\1", "\\8", "(a)(b)(c)(d)(e)(f)(g)(h)\\8", "\\10", "\\18", "[\\8]", "\\400"]) {
+    assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
+  }
+});
+
+test("the escapes JavaScript reads as Python does are kept, and an unclosed property escape is refused", () => {
+  // CPython 3: each fullmatches its text; \p{Lu is a bad escape there.
+  for (const [pattern, text] of [
+    ["a\\tb", "a\tb"],
+    ["a\\nb", "a\nb"],
+    ["\\v\\f\\r", "\v\f\r"],
+    ["[\\t]", "\t"],
+    ["\\x41", "A"],
+  ] as const) {
+    assert.ok(pyFullmatch(pattern).test(text), pattern);
+  }
+  assert.throws(() => pyRegExp("\\p{Lu"), InvariantError);
 });

@@ -3,6 +3,8 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+
+import { InvariantError } from "../../src/errors.js";
 import {
   clipLine,
   decimalBigInt,
@@ -23,6 +25,7 @@ import {
   pyCasefold,
   pyJsonDumps,
   pyRepr,
+  pointAt,
   pyLower,
   pyLstrip,
   pyStr,
@@ -279,4 +282,46 @@ test("isupper, repr and str of containers, exact integers and fixed decimals of 
   assert.equal(decimalInt("9007199254740991"), 9007199254740991);
   assert.equal(fixedN(1.25, 101), `1.25${"0".repeat(99)}`);
   assert.equal(pyJsonDumps("\ud800x"), '"\ud800x"'); // a lone surrogate is written raw, as Python's ensure_ascii=False does
+});
+
+test("negative zero and big integers are written as Python writes them", () => {
+  // CPython 3: json.dumps(-0.0) and repr(-0.0) are -0.0; json.dumps(9007199254740993) is the integer.
+  assert.equal(pyJsonDumps(-0), "-0.0");
+  assert.equal(pyRepr(-0), "-0.0");
+  assert.equal(pyStr(-0), ""); // -0.0 is falsy
+  assert.equal(pyJsonDumps(9007199254740993n), "9007199254740993");
+  assert.equal(pyJsonDumps({ n: 1, z: -0 }), '{"n": 1, "z": -0.0}');
+});
+
+test("repr escapes what Python escapes and picks its quotes as Python does", () => {
+  // Each right-hand side is what CPython 3's repr() printed.
+  for (const [value, python] of [
+    ["a\nb\rc", "'a\\nb\\rc'"],
+    ["\u0000\u007f\u0085­", "'\\x00\\x7f\\x85\\xad'"],
+    ["\u{e0001}x", "'\\U000e0001x'"],
+    ["it's", `"it's"`],
+    [`say "hi" it's`, `'say "hi" it\\'s'`],
+    ["​\ud800", "'\\u200b\\ud800'"],
+  ] as const) {
+    assert.equal(pyRepr(value), python, JSON.stringify(value));
+  }
+  assert.equal(pyRepr(12345678901234567890n), "12345678901234567890");
+  assert.equal(pyRepr({ k: [null, false], gone: undefined }), "{'k': [None, False]}");
+  assert.equal(
+    pyRepr(() => 1),
+    "None",
+  ); // (no JSON value: what Python has none of)
+});
+
+test("json dumps sorts keys that prefix one another and writes the constants as Python does", () => {
+  // CPython 3: json.dumps({"ab": 1, "a": 2, "b": 3, "aa": 0}, sort_keys=True); json.dumps([True, False, None])
+  assert.equal(pyJsonDumps({ ab: 1, a: 2, b: 3, aa: 0 }, { sortKeys: true }), '{"a": 2, "aa": 0, "ab": 1, "b": 3}');
+  assert.equal(pyJsonDumps([true, false, null]), "[true, false, null]");
+  assert.equal(pyJsonDumps(Symbol("s")), "null");
+});
+
+test("a code point is read where there is one and refused where there is none", () => {
+  assert.equal(pointAt("😀x"), 0x1f600);
+  assert.equal(pointAt("a😀", 1), 0x1f600);
+  assert.throws(() => pointAt(""), InvariantError);
 });

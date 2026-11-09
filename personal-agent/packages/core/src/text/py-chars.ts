@@ -1,7 +1,16 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { InvariantError } from "../errors.js";
+
 /** The characters Python calls white space and printable (`str.isspace`, `str.isprintable`). */
+
+/** The code point at `at` of `text`, which must have one there (`ord(text[at])`). */
+export function pointAt(text: string, at = 0): number {
+  const point = text.codePointAt(at);
+  if (point === undefined) throw new InvariantError("no code point at that position");
+  return point;
+}
 
 /**
  * The characters Python's `str.isspace()` is true for, which is also what `\s` matches in a Python `str` pattern
