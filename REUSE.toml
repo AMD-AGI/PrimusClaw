@@ -43,3 +43,11 @@ path = "claw/packages/brain/src/config.ts"
 precedence = "override"
 SPDX-FileCopyrightText = ["Advanced Micro Devices, Inc.", "The Go Authors"]
 SPDX-License-Identifier = "MIT AND BSD-3-Clause"
+
+# The Fernet specification's test vectors, as pyca/cryptography redistributes them (vectors/cryptography_vectors/fernet),
+# copied unchanged so the TypeScript Fernet is checked against the same tokens as Python's.
+[[annotations]]
+path = "personal-agent/test-support/data/fernet-spec/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Individual contributors to cryptography"
+SPDX-License-Identifier = "Apache-2.0 OR BSD-3-Clause"

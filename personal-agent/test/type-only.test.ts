@@ -221,3 +221,19 @@ test("a package whose entry points or source files lie outside src is refused", 
   fs.rmSync(path.join(pkg, "lib"), { recursive: true });
   assert.deepEqual(codeOutsideSrc(packages, "core"), []);
 });
+
+test("a source extension in another case is refused anywhere in a package, node_modules aside", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  const pkg = path.join(packages, "core");
+  fs.mkdirSync(path.join(pkg, "src", "deep"), { recursive: true });
+  fs.mkdirSync(path.join(pkg, "node_modules", "x"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ exports: { ".": "./src/index.ts" } }));
+  for (const f of ["src/index.ts", "src/probe.JS", "src/deep/x.Ts", "src/notes.TXT", "node_modules/x/index.JS"]) {
+    fs.writeFileSync(path.join(pkg, f), "export const x = 1;\n");
+  }
+  assert.deepEqual(codeOutsideSrc(packages, "core").sort(), [
+    "packages/core/src/deep/x.Ts has a source extension in upper case (use lower case)",
+    "packages/core/src/probe.JS has a source extension in upper case (use lower case)",
+  ]);
+});

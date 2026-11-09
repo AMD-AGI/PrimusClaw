@@ -79,6 +79,20 @@ export function symlinksUnder(dir: string, base: string): string[] {
   });
 }
 
+/**
+ * Files under `dir` (recursively, `node_modules` aside) whose extension is a source extension in another case
+ * (`probe.JS`, `x.Ts`): Node can still load such a file, but nothing here would count it, so the gate refuses it.
+ */
+export function oddCaseSources(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) return entry.name === "node_modules" ? [] : oddCaseSources(full);
+    const extension = path.extname(entry.name);
+    const lower = extension.toLowerCase();
+    return extension !== lower && (SOURCE_EXTENSIONS as readonly string[]).includes(lower) ? [full] : [];
+  });
+}
+
 /** The source files under `dir` that are type-only, relative to `base`, sorted. */
 export function typeOnlyFiles(dir: string, base: string): string[] {
   return sourceFiles(dir)

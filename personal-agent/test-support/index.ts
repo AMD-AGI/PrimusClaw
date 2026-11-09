@@ -11,3 +11,5 @@ export * from "./http-server.js";
 export * from "./inbound.js";
 export * from "./random.js";
 export * from "./surface.js";
+export * from "./store.js";
+export * from "./store-structure.js";
