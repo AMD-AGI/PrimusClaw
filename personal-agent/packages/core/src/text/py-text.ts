@@ -9,29 +9,13 @@
  *  - there is no `str.isprintable`.
  */
 
-/**
- * The characters Python's `str.isspace()` is true for, which is also what `\s` matches in a Python `str` pattern
- * (JavaScript's `\s` lacks `\x1c`-`\x1f` and `\x85`, and has `\ufeff`). For a pattern: `new RegExp(`[${PY_SPACE}]`, "u")`.
- */
-export const PY_SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+import { PY_SPACE, isPySpace } from "./py-chars.js";
+
+export * from "./py-chars.js";
+export * from "./py-json.js";
+export * from "./py-number.js";
+
 const SPACE_RUN = new RegExp(`[${PY_SPACE}]+`, "u");
-/** The same set, as code points (what `isPySpace` looks up: one hash lookup per character). */
-const SPACE_POINTS: ReadonlySet<number> = new Set([
-  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003,
-  0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
-]);
-/** What `str.isprintable()` is false for: other (Cc, Cf, Cs, Co, Cn) and separators (Zl, Zp, Zs), except the space. */
-const UNPRINTABLE = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$/u;
-
-/** `ch.isspace()` for one code point. */
-export function isPySpace(ch: string): boolean {
-  return ch.length === 1 && SPACE_POINTS.has(ch.charCodeAt(0));
-}
-
-/** `ch.isprintable()` for one code point. */
-export function isPyPrintable(ch: string): boolean {
-  return ch === " " || !UNPRINTABLE.test(ch);
-}
 
 /** `text.split()`: the words between runs of white space, none empty. */
 export function pySplit(text: string): string[] {
@@ -146,53 +130,39 @@ export function isDigits(text: string): boolean {
 }
 
 /**
- * A number as Python writes it, for a value parsed from JSON: a safe integer as the int JSON gave (`1.0` was already
- * the number 1 once parsed), anything else as Python's float `repr` (`1e-07`, `1e+300`). `str` writes the non-finite
- * as `nan`/`inf`, `json.dumps` as `NaN`/`Infinity`. What JSON cannot tell apart once parsed is written the common way:
- * `-0.0` as `0`, an integer beyond 2^53 as a float.
+ * `int(text)` for a run of decimal digits of any script (`１２` is 12, `٣` is 3), exactly, of any size; undefined for
+ * anything else.
  */
-function pyNumber(value: number, how: "str" | "json"): string {
-  if (!Number.isFinite(value)) {
-    if (Number.isNaN(value)) return how === "str" ? "nan" : "NaN";
-    if (how === "str") return value > 0 ? "inf" : "-inf";
-    return value > 0 ? "Infinity" : "-Infinity";
-  }
-  if (Number.isSafeInteger(value)) return String(value);
-  return floatRepr(value);
-}
-
-/** Python's `repr(float)`: the shortest digits, positional for exponents -4..15, else `d.ddde±XX`. */
-function floatRepr(value: number): string {
-  const [mantissa = "", exponentText = "0"] = value.toExponential().split("e");
-  const exponent = Number(exponentText);
-  const negative = mantissa.startsWith("-");
-  const digits = mantissa.replace("-", "").replace(".", "");
-  const sign = negative ? "-" : "";
-  if (exponent < -4 || exponent >= 16) {
-    const fraction = digits.length > 1 ? `.${digits.slice(1)}` : "";
-    const exp = `${exponent < 0 ? "-" : "+"}${String(Math.abs(exponent)).padStart(2, "0")}`;
-    return `${sign}${digits.charAt(0)}${fraction}e${exp}`;
-  }
-  if (exponent < 0) return `${sign}0.${"0".repeat(-exponent - 1)}${digits}`;
-  const whole = digits.slice(0, exponent + 1).padEnd(exponent + 1, "0");
-  const fraction = digits.slice(exponent + 1) || "0";
-  return `${sign}${whole}.${fraction}`;
-}
-
-/**
- * `int(text)` for a run of decimal digits of any script (`１２` is 12, `٣` is 3); NaN for anything else. A number, so
- * exact up to 2^53 (the counts, hours and ids the rules read are far below it).
- */
-export function decimalInt(text: string): number {
-  if (!isDigits(text)) return Number.NaN;
-  let value = 0;
-  for (const ch of text) value = value * 10 + digitValue(ch);
+export function decimalBigInt(text: string): bigint | undefined {
+  if (!isDigits(text)) return undefined;
+  let value = 0n;
+  for (const ch of text) value = value * 10n + BigInt(digitValue(ch));
   return value;
 }
 
-/** `text.isupper()`: at least one cased character, and none in lower case. */
+/**
+ * `int(text)` as a number: exact up to 2^53, which the counts, hours and ids the rules read are far below; NaN for
+ * anything that is no run of decimal digits, and refused (RangeError) past 2^53 rather than rounded (use
+ * `decimalBigInt` for that).
+ */
+export function decimalInt(text: string): number {
+  const value = decimalBigInt(text);
+  if (value === undefined) return Number.NaN;
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("an integer past 2^53 (use decimalBigInt)");
+  return Number(value);
+}
+
+/**
+ * `text.isupper()`: at least one uppercase character, and none that is lowercase or titlecase (the Unicode properties
+ * Python reads: `ℂ` is upper though it has no lowercase form; `ĸ` and `ª` are lowercase though they have no uppercase).
+ */
 export function isUpper(text: string): boolean {
-  return text !== text.toLowerCase() && text === text.toUpperCase();
+  let cased = false;
+  for (const ch of text) {
+    if (/[\p{Lowercase}\p{Lt}]/u.test(ch)) return false;
+    if (/\p{Uppercase}/u.test(ch)) cased = true;
+  }
+  return cased;
 }
 
 /** `len(text)`: code points. */
@@ -246,103 +216,4 @@ export function clipLine(text: string, limit: number): string {
 /** `text[:limit]`, without splitting a string that is short enough. */
 export function cpHead(text: string, limit: number): string {
   return text.length <= limit ? text : cpSlice(text, 0, limit);
-}
-
-/**
- * `f"{value:.{digits}f}"`. `toFixed` rounds an exact tie (on the binary value) up, Python to even; the two agree on
- * everything else. A tie is told by the exact decimal expansion, which `toFixed` gives to 40 digits past the cut
- * (more than any double below 1e21 needs to show a non-tie's difference at these magnitudes).
- */
-export function fixedN(value: number, digits: number): string {
-  if (!Number.isFinite(value)) return pyNonFiniteFormat(value);
-  const sign = value < 0 || Object.is(value, -0) ? "-" : "";
-  const magnitude = Math.abs(value);
-  if (magnitude >= 1e21) return sign + BigInt(magnitude).toString() + (digits > 0 ? `.${"0".repeat(digits)}` : ""); // an integer
-  const exact = magnitude.toFixed(Math.min(100, digits + 40));
-  const point = exact.indexOf(".");
-  const cut = point + 1 + digits;
-  const rest = exact.slice(cut);
-  const tie = rest.startsWith("5") && /^50*$/.test(rest);
-  const truncated = digits === 0 ? exact.slice(0, point) : exact.slice(0, cut);
-  const lastDigit = Number(truncated.at(-1));
-  const shown = tie && lastDigit % 2 === 0 ? truncated : magnitude.toFixed(digits);
-  return sign + shown;
-}
-
-/** `f"{value:.1f}"`. */
-export function fixed1(value: number): string {
-  return fixedN(value, 1);
-}
-
-function pyNonFiniteFormat(value: number): string {
-  if (Number.isNaN(value)) return "nan";
-  return value > 0 ? "inf" : "-inf";
-}
-
-/**
- * `str(value or "")` for a value read from JSON: a missing or false value is "", a string is itself, a number is its
- * digits, `true` is "True". An object or a list is "" (the Python worker never shows one this way).
- */
-export function pyStr(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === true) return "True";
-  if (typeof value === "number") return value === 0 ? "" : pyNumber(value, "str");
-  if (typeof value === "bigint") return value === 0n ? "" : value.toString();
-  return "";
-}
-
-export interface JsonDumpsOptions {
-  /** `indent=`: each nesting level on its own lines, this many spaces deeper (items then end in "," alone). */
-  readonly indent?: number;
-  /** `sort_keys=True`: keys in code-point order, as Python sorts `str`. */
-  readonly sortKeys?: boolean;
-}
-
-/**
- * `json.dumps(value, ensure_ascii=False, ...)` for a value parsed from JSON: non-ASCII kept; `", "` and `": "` separators,
- * or `","` and newlines with `indent`. A key whose value is undefined is left out. (A float that JSON wrote with a zero
- * fraction, `1.0`, is the number 1 once parsed, so it comes out as `1`.)
- */
-export function pyJsonDumps(value: unknown, options: JsonDumpsOptions = {}): string {
-  return encode(value, options, 0);
-}
-
-function encode(value: unknown, options: JsonDumpsOptions, depth: number): string {
-  if (value === null || value === undefined) return "null";
-  if (Array.isArray(value))
-    return container(
-      "[",
-      "]",
-      value.map((v) => encode(v, options, depth + 1)),
-      options,
-      depth,
-    );
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).filter((k) => record[k] !== undefined);
-    if (options.sortKeys) keys.sort(byCodePoint);
-    const items = keys.map((k) => `${JSON.stringify(k)}: ${encode(record[k], options, depth + 1)}`);
-    return container("{", "}", items, options, depth);
-  }
-  if (typeof value === "number") return pyNumber(value, "json");
-  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  return "null";
-}
-
-function container(open: string, close: string, items: string[], options: JsonDumpsOptions, depth: number): string {
-  if (items.length === 0) return open + close;
-  if (options.indent === undefined) return `${open}${items.join(", ")}${close}`;
-  const inner = `\n${" ".repeat(options.indent * (depth + 1))}`;
-  return `${open}${inner}${items.join(`,${inner}`)}\n${" ".repeat(options.indent * depth)}${close}`;
-}
-
-/** Python orders `str` by code point; JavaScript's default sort compares UTF-16 units (they differ past U+FFFF). */
-function byCodePoint(a: string, b: string): number {
-  const x = Array.from(a);
-  const y = Array.from(b);
-  for (let i = 0; i < Math.min(x.length, y.length); i += 1) {
-    const d = (x[i]?.codePointAt(0) ?? 0) - (y[i]?.codePointAt(0) ?? 0);
-    if (d !== 0) return d;
-  }
-  return x.length - y.length;
 }
