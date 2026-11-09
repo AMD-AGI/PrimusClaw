@@ -145,3 +145,61 @@ for (const [name, text, starts] of [
     if (!starts) assert.ok(groupText(world).includes("只能请同一位 reviewer"), groupText(world));
   });
 }
+
+const QUOTE = (text: string) => ({
+  messageId: "q1",
+  author: "Dan",
+  text,
+  fromBot: false,
+  sentAt: "",
+  deleted: false,
+  source: "entity" as const,
+});
+
+for (const [name, answer] of [
+  ["named by the quote", reading({ reviewer: "Carol", prs: [H2], reviewers: ["Carol"] })],
+  ["named by the quote no list", reading({ reviewer: "Carol", prs: [H2], reviewers: [] })],
+] as const) {
+  test(`a quoted message may name the pull request never the reviewer (${name})`, async () => {
+    const world = setup(answer);
+    world.identity.know("aad-c", "u-carol", "carol-gh", true);
+    const message = {
+      ...groupMessage("麻烦把上面引用的这个 PR 合入", ALICE, []),
+      quotes: [QUOTE(`请 Carol review 合入 ${H2}`)],
+    };
+    await world.service.request({
+      message,
+      text: message.text,
+      sender: ALICE,
+      conversation: world.surface.conversation(message.conversation),
+      scope: CONV,
+      lang: () => "zh",
+    });
+    assert.equal(world.started.length, 0);
+    assert.deepEqual(world.identity.requests, []);
+    assert.ok(groupText(world).includes("没在你的消息里找到「Carol」"), groupText(world)); // (before anyone is looked up)
+  });
+}
+
+test("a reading that takes a name out of a longer word is not acted on", async () => {
+  const world = setup(reading({ reviewer: "Bob", prs: [H1] }));
+  await ask(world, `请 Bobby 帮我 review 合入 ${H1}`);
+  assert.equal(world.started.length, 0);
+  assert.ok(groupText(world).includes("没在你的消息里找到「Bob」"), groupText(world));
+  assert.deepEqual(world.identity.requests, []);
+});
+
+for (const [name, answer] of [
+  ["no answer", undefined], // no answer in time, or the gateway refused
+  ["not json", { intent: null }],
+  ["unknown intent", { intent: "maybe" }],
+  ["prs not a list", reading({ prs: H1 })], // a field of the wrong type
+  ["reviewer not text", reading({ reviewer: ["Bob"] })],
+  ["reviewers not a list", reading({ reviewers: "Bob" })],
+] as const) {
+  test(`without a reading the rules read the request (${name})`, async () => {
+    const world = setup(answer);
+    await ask(world, `请 {Bob} 帮我 review 合入 ${H1}`);
+    assert.deepEqual(numbers(world), [1], groupText(world));
+  });
+}
