@@ -117,7 +117,13 @@ export class ActionsWorld {
     this.exchange.token = token;
   }
 
-  constructor(options: { understands?: boolean; reachable?: boolean } = {}) {
+  constructor(
+    options: {
+      understands?: boolean;
+      reachable?: boolean;
+      reviewHandoff?: (userId: string, event: Readonly<Record<string, unknown>>) => "delivered" | "dropped";
+    } = {},
+  ) {
     this.actions = new AssistantActions({
       store: this.store,
       claw: { decideConfirmation: (token, id, decision) => this.decide(token, id, decision) },
@@ -128,6 +134,7 @@ export class ActionsWorld {
       understands: (user) => (options.understands ?? true) && user === ALICE,
       reachable: () => options.reachable ?? true,
       logger: this.logger(),
+      ...(options.reviewHandoff ? { reviewHandoff: options.reviewHandoff } : {}),
     });
   }
 

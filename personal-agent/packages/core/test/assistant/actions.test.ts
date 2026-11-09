@@ -87,12 +87,30 @@ it("an action the chat could not carry out is dropped and an event without an id
   assert.deepEqual(w.ran, ["/quiet off"]);
 });
 
-it("a review handoff is not carried out here", async () => {
-  // TODO(W7): the handoff (`review_for_other`, or any action that carries `review`) is the review line's `_review_handoff`.
+it("a review handoff is not carried out here and is dropped without the review service", async () => {
   const w = new ActionsWorld();
   const mid = w.message("act-1", ALICE, [...DECLARED, "review_for_other"]);
   assert.equal(await w.runAction(w.action(mid, "review_for_other")), "dropped");
   assert.equal(await w.runAction({ ...w.action(mid, "quiet", "off", "ev-2"), review: {} }), "dropped");
+  assert.deepEqual(w.ran, []);
+});
+
+it("a review handoff goes to the review service as it is and comes back with its outcome", async () => {
+  const handed: [string, unknown][] = [];
+  const w = new ActionsWorld({
+    reviewHandoff: (userId, event) => {
+      handed.push([userId, event["event_id"]]);
+      return event["event_id"] === "ev-2" ? "dropped" : "delivered";
+    },
+  });
+  const mid = w.message("act-1", ALICE, [...DECLARED, "review_for_other"]);
+  const handoff = w.action(mid, "review_for_other");
+  assert.equal(await w.runAction(handoff), "delivered");
+  assert.equal(await w.runAction({ ...w.action(mid, "quiet", "off", "ev-2"), review: {} }), "dropped");
+  assert.deepEqual(handed, [
+    [ALICE, handoff["event_id"]],
+    [ALICE, "ev-2"],
+  ]);
   assert.deepEqual(w.ran, []);
 });
 
