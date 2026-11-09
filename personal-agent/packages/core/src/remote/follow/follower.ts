@@ -85,7 +85,7 @@ export class Follower {
     readonly sessionId: string,
     private readonly deps: FollowerDeps,
   ) {
-    this.speaker = new BurstSpeaker(chatKey, sessionId, deps, deps.newTurn());
+    this.speaker = new BurstSpeaker(chatKey, sessionId, deps, deps.newTurn(), this.cancel.signal);
   }
 
   get alive(): boolean {
@@ -122,7 +122,10 @@ export class Follower {
     this.inbox?.push(STOP);
     const task = this.task;
     if (task === null) return;
-    const gone = await Promise.race([task.then(() => true), this.deps.clock.sleep(STOP_WAIT_MS).then(() => false)]);
+    const gone = await Promise.race([
+      task.then(() => true),
+      this.deps.clock.sleep(this.deps.timings.stopWaitMs ?? STOP_WAIT_MS).then(() => false),
+    ]);
     if (gone) return;
     this.drop();
     await task; // (the cancel lands, and what the reader was doing is over, before anything is judged)

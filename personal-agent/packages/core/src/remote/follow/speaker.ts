@@ -97,6 +97,8 @@ export class BurstSpeaker {
     private readonly sessionId: string,
     private readonly deps: SpeakerDeps,
     private readonly turn: RemoteTurnState,
+    /** Aborted when the reader is cancelled: a send still in flight is given up (Python's task cancel cuts it off). */
+    private readonly cutOff?: AbortSignal,
   ) {}
 
   /** Text of the agent's is waiting to be said. */
@@ -143,7 +145,7 @@ export class BurstSpeaker {
     if (text) {
       if (!(await this.say(text, how.force))) {
         if (!how.holdOnFailure) {
-          this.retryAt = this.deps.clock.monotonicMs() + RETRY_MS;
+          this.retryAt = this.deps.clock.monotonicMs() + (this.deps.timings.retryMs ?? RETRY_MS);
           return false;
         }
         this.hold(text);
@@ -194,7 +196,7 @@ export class BurstSpeaker {
     const to = this.deps.conversationFor(reference);
     try {
       for (let i = this.delivered(raw); i < messages.length; i += 1) {
-        await to.send(messages[i] ?? textMessage(""));
+        await unlessCutOff(to.send(messages[i] ?? textMessage("")), this.cutOff);
         this.sent = raw.slice(0, i + 1);
       }
     } catch (error) {
@@ -364,4 +366,19 @@ export class BurstSpeaker {
       this.deps.logger.warn(failed, { error: errorName(error) });
     }
   }
+}
+
+/** `work`, or a rejection as soon as `signal` aborts (the work itself is left to settle on its own). */
+function unlessCutOff<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  if (signal.aborted) return Promise.reject(new Error("cut off"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new Error("cut off"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
