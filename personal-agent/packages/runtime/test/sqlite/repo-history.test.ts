@@ -10,7 +10,13 @@ import { test } from "node:test";
 import { PENDING_REPO_TTL_SECONDS, RECENT_REPOS, SESSION_HISTORY_KEEP, SESSION_LIST } from "@primusclaw/personal-agent";
 import { Fernet, SqliteStore } from "@primusclaw/personal-agent-runtime";
 
-import { advanceSeconds, openFileTestStore, openTestStore, tempDir } from "../../../../test-support/index.js";
+import {
+  advanceSeconds,
+  openFileTestStore,
+  openTestStore,
+  tempDir,
+  ignoreEvents,
+} from "../../../../test-support/index.js";
 
 const repos = (store: SqliteStore, who = "aad-a"): string[] => store.repoHistory.recentRepos(who).map((r) => r.repo);
 const pick = (store: SqliteStore, repo: string, branch = "", who = "aad-a"): void => {
@@ -173,7 +179,7 @@ test("a database from before this feature gets the tables and keeps its session"
     );
     db.exec("INSERT INTO sessions VALUES ('aad-a', '', 's-old', 1, '', '')");
     db.close();
-    const store = new SqliteStore({ path, encryptionKeys: [Fernet.generateKey()] });
+    const store = new SqliteStore({ path, encryptionKeys: [Fernet.generateKey()], securityEvent: ignoreEvents });
     assert.equal(store.sessions.getSession("aad-a"), "s-old");
     assert.deepEqual(store.repoHistory.recentRepos("aad-a"), []);
     assert.deepEqual(store.repoHistory.sessionHistory("aad-a"), []);

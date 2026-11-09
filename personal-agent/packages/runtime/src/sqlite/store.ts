@@ -60,8 +60,11 @@ export interface SqliteStoreOptions {
   readonly clock?: Clock;
   readonly random?: Random;
   readonly linkLimits?: LinkLimits;
-  /** Where `link_attempt` / `link_lockout` go (the security-event log); none: dropped. */
-  readonly securityEvent?: SecurityEventSink;
+  /**
+   * Where `link_attempt` / `link_lockout` go: the security-event log, which filters the fields it logs. Required, so a
+   * worker cannot be assembled that links people without an audit trail (the Python store always logs them).
+   */
+  readonly securityEvent: SecurityEventSink;
 }
 
 export class SqliteStore implements StorePort {
@@ -97,11 +100,7 @@ export class SqliteStore implements StorePort {
     migrate(db);
     const ctx: StoreContext = { db, now: () => epochSeconds(clock), random, secrets };
     this.#ctx = ctx;
-    this.links = new SqliteLinkRepository(
-      ctx,
-      options.linkLimits ?? DEFAULT_LINK_LIMITS,
-      options.securityEvent ?? (() => undefined),
-    );
+    this.links = new SqliteLinkRepository(ctx, options.linkLimits ?? DEFAULT_LINK_LIMITS, options.securityEvent);
     this.references = new SqliteConversationRefRepository(ctx);
     this.prefs = new SqlitePrefsRepository(ctx);
     this.held = new SqliteHeldEventRepository(ctx);
