@@ -174,6 +174,9 @@ test("L5 SaFE's detail: a disrupted or node-lost pod is disrupted; a container t
     { conditions: [{ type: "AdminFailed", message: "Pod phase is Failed, details: [{\"pod\":\"p\",\"message\":\"NodeLost, Node v3-106 which was running pod p is unresponsive\"}]" }] },
     { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: TerminationByKubelet: Pod was terminated in response to imminent node shutdown." }] },
     { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: EvictionByEvictionAPI: Eviction API: evicting (node drain)" }] },
+    // Node pressure that names no container over its request is the node's.
+    { conditions: [{ type: "AdminFailed", message: "Evicted, The node was low on resource: memory. Threshold quantity: 100Mi, available: 80Mi." }] },
+    { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: TerminationByKubelet: The node was low on resource: ephemeral-storage." }] },
   ];
   for (const info of disrupted) assert.equal(workloadDisrupted(info), true, JSON.stringify(info));
   const own = [
