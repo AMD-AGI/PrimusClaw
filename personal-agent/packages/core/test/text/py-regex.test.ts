@@ -10,6 +10,11 @@ import { pyFullmatch } from "../../src/text/py-regex.js";
  * capitals in the text, since Python's re has no \\p.
  */
 const CASES: readonly (readonly [string, string, string, boolean])[] = [
+  ["[a._-]", "i", "-", true],
+  ["[a._-]", "i", "\u0131", false],
+  ["(?<m>[A-Za-z0-9][A-Za-z0-9._-]{0,62})", "i", "robin-dev-pod", true],
+  ["[^a._-]", "i", "-", false],
+  ["[^a-z-]", "i", "\u0130", false],
   ["a\\sb", "", "a\u001cb", true],
   ["a\\sb", "", "a\ufeffb", false],
   ["a\\sb", "", "a\u0085b", true],

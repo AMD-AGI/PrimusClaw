@@ -121,9 +121,9 @@ function digitValue(ch: string): number {
 }
 
 /**
- * `text.isdigit()` as the Python worker's rules use it: at least one character, each a decimal digit of any script
- * (what `\d` matches in Python's `re`). (Python's `isdigit` also takes superscripts and circled digits, which `int`
- * then refuses; no rule reads those.)
+ * At least one character, each a decimal digit of any script (`\p{Nd}`: what `\d` matches in Python's `re`, and what
+ * `int()` reads). NOT Python's `str.isdigit()`, which also takes
+ * superscripts and circled digits (every caller reads ASCII or `\d` input, where the two agree).
  */
 export function isDigits(text: string): boolean {
   return /^\p{Nd}+$/u.test(text);
