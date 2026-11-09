@@ -1,0 +1,12 @@
+{
+  "name": "@primusclaw/personal-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The personal agent's channel-neutral core: domain logic, ports and plugin interfaces.",
+  "license": "MIT",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}
