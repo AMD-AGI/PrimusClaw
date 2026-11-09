@@ -35,3 +35,25 @@ export function pyInt(digits: string): number {
   }
   return value;
 }
+
+/**
+ * `text.casefold()`, as near as JavaScript gets: upper case first folds the characters whose lower case is longer than
+ * one (`ß` to `ss`, `ﬁ` to `fi`), then lower case. (A final sigma stays `ς` here where Python folds it to `σ`.)
+ */
+export function pyCasefold(text: string): string {
+  return text.toUpperCase().toLowerCase();
+}
+
+const ALNUM = /^[\p{L}\p{N}]$/u;
+
+/** `ch.isalnum()` for one code point. */
+export function pyIsAlnum(ch: string): boolean {
+  return ALNUM.test(ch);
+}
+
+const ASCII_ALPHA = /^[A-Za-z]+$/;
+
+/** `word.isascii() and word.isalpha()`. */
+export function isAsciiAlpha(word: string): boolean {
+  return ASCII_ALPHA.test(word);
+}
