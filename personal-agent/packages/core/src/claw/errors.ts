@@ -99,13 +99,26 @@ export class CredentialMisuse extends Error {
   override readonly name: string = "CredentialMisuse";
 }
 
+/**
+ * How a call failed to reach Claw: `connect`, the request never went out (no connection could be made: refused, no such
+ * host, unreachable; Python's `httpx.ConnectError`); `timeout`, Claw did not answer in time; `network`, the connection
+ * broke after the request was sent.
+ */
+export type UnreachableKind = "connect" | "timeout" | "network";
+
+const UNREACHABLE_TEXT: Readonly<Record<UnreachableKind, string>> = {
+  connect: "could not be connected to",
+  timeout: "did not answer in time",
+  network: "dropped the connection",
+};
+
 /** Claw was not reached, or did not answer in time. `kind` says which; the cause's text is never kept. */
 export class ClawUnreachable extends Error {
   override readonly name: string = "ClawUnreachable";
-  readonly kind: "timeout" | "network";
+  readonly kind: UnreachableKind;
 
-  constructor(kind: "timeout" | "network", what: string) {
-    super(`Claw ${kind === "timeout" ? "did not answer in time" : "was not reached"}: ${what}`);
+  constructor(kind: UnreachableKind, what: string) {
+    super(`Claw ${UNREACHABLE_TEXT[kind]}: ${what}`);
     this.kind = kind;
   }
 }

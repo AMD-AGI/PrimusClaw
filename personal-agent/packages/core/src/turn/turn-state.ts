@@ -14,7 +14,12 @@ import { todosOf } from "./plan.js";
 import { type ModelRefusalPolicy, noModelRefusalPolicy } from "../plugins/model-refusal-policy.js";
 import { NOTHING, type Step } from "./step.js";
 import { isShell, skillInCommand } from "./step-labels.js";
-import { HISTORY_COMPLETE, looksLikeFailure, QUEUED_PREFIX, type SseEvent } from "./upstream.js";
+import type { SseEvent } from "../claw/model.js";
+import { HISTORY_COMPLETE_EVENT as HISTORY_COMPLETE } from "../protocol.js";
+import { looksLikeFailure } from "../public-error/classify.js";
+
+/** The message id of a turn Claw runs from its queue (api tasks/chat-run.ts): `claw-pending-<n>`. */
+export const QUEUED_PREFIX = "claw-pending-";
 
 /** Brain's setup steps before the first model call: never listed as steps, one "Preparing" line while it takes long. */
 export const PREPARATION_TOOLS: ReadonlySet<string> = new Set([

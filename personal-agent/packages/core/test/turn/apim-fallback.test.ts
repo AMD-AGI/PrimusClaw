@@ -245,16 +245,12 @@ it("test_when_claw_will_not_move_the_session_the_user_is_told_to_upload", async 
   }
 });
 
-it(
-  "test_when_claw_will_not_move_the_session_the_user_is_told_to_upload (refused connection)",
-  { todo: "ClawUnreachable does not tell a refused connection from a lost answer (W2)" },
-  async () => {
-    const chat = new Chat();
-    chat.claw.failModelCalls.set(1, new ClawUnreachable("network", "connection refused"));
-    await chat.say("hi", at0([...refused(RAW401), result("must not be shown", "m2")]));
-    assert.equal(chat.sessionModel, MODEL);
-  },
-);
+it("test_when_claw_will_not_move_the_session_the_user_is_told_to_upload (refused connection)", async () => {
+  const chat = new Chat();
+  chat.claw.failModelCalls.set(1, new ClawUnreachable("connect", "connection refused"));
+  await chat.say("hi", at0([...refused(RAW401), result("must not be shown", "m2")]));
+  assert.equal(chat.sessionModel, MODEL);
+});
 
 it("test_a_restore_that_fails_still_delivers_the_answer_and_the_next_message_pins_the_model_again", async () => {
   for (const failure of [400, 409, 500, new ClawUnreachable("network", "down")] as const) {
@@ -430,17 +426,13 @@ it("test_a_move_whose_answer_was_lost_may_have_happened_so_the_next_message_pins
   }
 });
 
-it(
-  "test_a_move_that_never_left_the_worker_is_not_recorded",
-  { todo: "ClawUnreachable does not tell a refused connection from a lost answer (W2)" },
-  async () => {
-    // A refused connection is a request that was not made: nothing to put back.
-    const chat = new Chat();
-    chat.claw.failModelCalls.set(1, new ClawUnreachable("network", "connection refused"));
-    await chat.say("hi", at0(refused(RAW401)));
-    assert.equal(chat.sessionModel, MODEL);
-  },
-);
+it("test_a_move_that_never_left_the_worker_is_not_recorded", async () => {
+  // A refused connection is a request that was not made: nothing to put back.
+  const chat = new Chat();
+  chat.claw.failModelCalls.set(1, new ClawUnreachable("connect", "connection refused"));
+  await chat.say("hi", at0(refused(RAW401)));
+  assert.equal(chat.sessionModel, MODEL);
+});
 
 it("test_the_fallback_answer_that_went_well_is_still_shown_with_its_line", async () => {
   // The failed flag belongs to the run it was read in: the first run's failure does not follow the second run's answer.

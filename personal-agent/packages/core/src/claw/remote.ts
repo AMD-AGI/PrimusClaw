@@ -9,20 +9,7 @@
  */
 import type { JsonObject } from "../json.js";
 import { z } from "zod";
-
-/** A value of the type `schema` accepts, else `undefined`: a field Claw sent wrong is read as one it did not send. */
-function lenient<T extends z.ZodType>(schema: T) {
-  return z.optional(
-    z.unknown().transform((value): z.output<T> | undefined => {
-      const parsed = schema.safeParse(value);
-      return parsed.success ? parsed.data : undefined;
-    }),
-  );
-}
-
-const text = lenient(z.string());
-const flag = lenient(z.boolean());
-const objectOf = lenient(z.record(z.string(), z.unknown()));
+import { anyText as text, flag, lenient, objectOf, rowsOf } from "./lenient.js";
 
 /** One agent a connector reports (`RemoteAgentDescriptor`, read leniently). */
 export const remoteAgentSchema = z.looseObject({
@@ -33,16 +20,6 @@ export const remoteAgentSchema = z.looseObject({
   capabilities: objectOf,
 });
 export type RemoteAgent = z.output<typeof remoteAgentSchema>;
-
-/** Rows of a list: the objects among them, each read with `schema`. */
-function rowsOf<T extends z.ZodType>(schema: T): z.ZodType<Array<z.output<T>>> {
-  return z.array(z.unknown()).transform((rows) =>
-    rows.flatMap((row) => {
-      const parsed = schema.safeParse(row);
-      return parsed.success ? [parsed.data] : [];
-    }),
-  );
-}
 
 /** One of the caller's connectors (`GET /v1/remote-agents/connectors`). */
 export const remoteConnectorSchema = z.looseObject({
@@ -93,6 +70,18 @@ export type RemoteEventRow = z.output<typeof remoteEventRowSchema>;
 export const remoteConnectorsSchema = rowsOf(remoteConnectorSchema);
 export const remoteSessionsSchema = rowsOf(remoteSessionSchema);
 export const remoteEventRowsSchema = rowsOf(remoteEventRowSchema);
+
+/**
+ * The answer of hiding conversations of a machine from the owner's lists, or showing them again
+ * (`POST /v1/remote-agents/connectors/:cid/hidden`): the refs that changed, and the ones refused (`live`: a process has
+ * it open; `unknown_conversation`: the machine does not report it now). Claw does not name this shape in
+ * `@claw/protocol` (AMD-AGI/PrimusClaw#576).
+ */
+export const remoteHiddenSchema = z.looseObject({
+  changed: lenient(z.array(z.string())),
+  refused: lenient(rowsOf(z.looseObject({ ref: z.string(), reason: z.string() }))),
+});
+export type RemoteHidden = z.output<typeof remoteHiddenSchema>;
 
 /** How to connect a machine (`GET /setup`): the connector's package and the exact commands, passed on as Claw wrote them. */
 export type RemoteSetup = JsonObject;

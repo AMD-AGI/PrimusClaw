@@ -8,7 +8,7 @@ import type { NewSession, SendOptions } from "../../ports/claw/sessions.js";
 import { failedFilesLine, filesNote, uploadFolder } from "../files.js";
 import { plainMessage } from "../progress/answer-messages.js";
 import { unlessAborted } from "../task.js";
-import { ClawError, errorKind } from "../upstream.js";
+import { ClawError, errorKind } from "../../claw/errors.js";
 import { isClawFailure, isClawOrNetwork, statusOrKind } from "./claw-errors.js";
 import { credential, messageOf, type TurnContext } from "./context.js";
 

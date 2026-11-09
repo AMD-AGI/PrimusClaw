@@ -11,7 +11,10 @@ import type { StatusMessage } from "../progress/status-message.js";
 import type { Step } from "../step.js";
 import type { TurnState } from "../turn-state.js";
 import { viewMessage } from "../views.js";
-import { ClawError, errorKind, HISTORY_COMPLETE, pickLang, type SseEvent } from "../upstream.js";
+import { ClawError, errorKind } from "../../claw/errors.js";
+import type { SseEvent } from "../../claw/model.js";
+import { pickLang } from "../../language/detect.js";
+import { HISTORY_COMPLETE_EVENT as HISTORY_COMPLETE } from "../../protocol.js";
 import { isClawOrNetwork } from "./claw-errors.js";
 import { credential, type TurnContext } from "./context.js";
 

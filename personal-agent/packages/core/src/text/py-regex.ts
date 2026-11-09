@@ -116,12 +116,19 @@ function anchorOrDot(ch: string, flags: Flags): string | undefined {
   return undefined;
 }
 
-/** A Python group spelling at `source[i]`: `(?P<name>` (JavaScript `(?<name>`) or `(?P=name)` (`\k<name>`). */
+/**
+ * A group's name or reference at `source[i]`, copied whole so that nothing in it is read as text to match: Python's
+ * `(?P<name>` (JavaScript `(?<name>`) and `(?P=name)` (`\k<name>`), and JavaScript's own `(?<name>` and `\k<name>`.
+ * A lookbehind `(?<=`/`(?<!` is no name and is read as the pattern it is.
+ */
 function groupAt(source: string, i: number): { text: string; length: number } | undefined {
-  if (!source.startsWith("(?P", i)) return undefined;
-  if (source.charAt(i + 3) === "<") return { text: "(?<", length: 4 };
-  const named = /^\(\?P=(\w+)\)/.exec(source.slice(i));
-  return named ? { text: `\\k<${named[1] ?? ""}>`, length: named[0].length } : undefined;
+  const rest = source.slice(i);
+  const python = /^\(\?P<(\w+)>/.exec(rest);
+  if (python) return { text: `(?<${python[1] ?? ""}>`, length: python[0].length };
+  const reference = /^\(\?P=(\w+)\)/.exec(rest);
+  if (reference) return { text: `\\k<${reference[1] ?? ""}>`, length: reference[0].length };
+  const own = /^(?:\(\?<(?![=!])|\\k<)\w+>/.exec(rest);
+  return own ? { text: own[0], length: own[0].length } : undefined;
 }
 
 function plainChar(source: string, i: number, state: State, flags: Flags): string {
@@ -129,7 +136,7 @@ function plainChar(source: string, i: number, state: State, flags: Flags): strin
   if (state.inClass) return ch;
   const special = anchorOrDot(ch, flags);
   if (special !== undefined) return special;
-  if (flags.ignoreCase && (ch === "i" || ch === "I") && !inGroupName(state.out)) return `[iI${DOTTED_I}]`;
+  if (flags.ignoreCase && (ch === "i" || ch === "I")) return `[iI${DOTTED_I}]`;
   return ch;
 }
 
@@ -159,14 +166,6 @@ function translate(source: string, flags: Flags): string {
     }
   }
   return state.out;
-}
-
-/** Whether what was written so far ends inside a group's name (`(?<name` or `\k<name`), which is not text to match. */
-function inGroupName(out: string): boolean {
-  const open = out.lastIndexOf("<");
-  if (open < 2) return false;
-  const lead = out.slice(open - 2, open);
-  return (lead === "(?" || lead === "\\k") && !out.slice(open).includes(">");
 }
 
 /** A leading `(?ims)` of the source as flags; the rest of the source. */

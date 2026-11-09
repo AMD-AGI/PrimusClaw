@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ClawAnswerInvalid, ClawError, ClawUnreachable, ReplayRefused } from "../upstream.js";
+import { ClawAnswerInvalid, ClawError, ClawUnreachable, ReplayRefused } from "../../claw/errors.js";
 
 /** A Claw call failed in a way the turn survives (an error status, no answer, an answer it could not read). */
 export function isClawFailure(err: unknown): boolean {

@@ -6,7 +6,7 @@
 import type { StatusMessage } from "../progress/status-message.js";
 import type { Step } from "../step.js";
 import { TurnState } from "../turn-state.js";
-import { ClawUnreachable } from "../upstream.js";
+import { ClawUnreachable } from "../../claw/errors.js";
 import { isClawOrNetwork, statusOrKind } from "./claw-errors.js";
 import { consume } from "./consume.js";
 import { credential, messageOf, type TurnContext } from "./context.js";
@@ -40,10 +40,10 @@ async function moveToFallback(
       session: sessionId,
       error: statusOrKind(err),
     });
-    if (err instanceof ClawUnreachable) {
+    if (err instanceof ClawUnreachable && err.kind !== "connect") {
       // No answer came, and the request may have: the session may be on the fallback now. The record says so, so the
-      // next message pins the worker's model again, which is no harm if the move never happened. (The port does not
-      // tell a refused connection from a lost answer; the Python worker skipped this only for the former.)
+      // next message pins the worker's model again, which is no harm if the move never happened. (A refused
+      // connection is a request that was never made: nothing is recorded.)
       ctx.record.sessionModel = fallback;
       onSession(sessionId);
     }
