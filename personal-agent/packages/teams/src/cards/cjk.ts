@@ -5,7 +5,7 @@
  * Chinese typography for card text: half-width , : ; ? ! ( ) next to Chinese become full-width, and the blanks around them go
  * (Chinese puts none there). Inline code, markdown links and bare URLs keep theirs.
  */
-import { collapse, codePoints, rstrip, str, strip } from "../text/pystr.js";
+import { cpLength, cpSlice, pyRstrip, pyStr, pyStrip, squashSpaces } from "@primusclaw/personal-agent";
 
 /** The CJK ranges the card kit treats as Chinese (CJK ideographs, compatibility ideographs, CJK punctuation, full-width forms). */
 export const CJK = "[\\u3400-\\u9fff\\uf900-\\ufaff\\u3000-\\u303f\\uff00-\\uffef]";
@@ -20,7 +20,7 @@ const HAS_CJK = new RegExp(CJK);
 const BETWEEN_CJK = new RegExp(`(?<=${CJK})(?=${CJK})`, "g");
 
 export function hasCjk(text: unknown): boolean {
-  return HAS_CJK.test(str(text));
+  return HAS_CJK.test(pyStr(text));
 }
 
 function full(half: string): string {
@@ -29,7 +29,7 @@ function full(half: string): string {
 
 /** `text` with the half-width punctuation next to Chinese made full-width. Text without Chinese is returned as is. */
 export function zh(text: unknown): string {
-  const value = str(text);
+  const value = pyStr(text);
   if (!hasCjk(value)) return value;
   const parts = value.split(CODE);
   for (let i = 0; i < parts.length; i += 2) {
@@ -37,16 +37,15 @@ export function zh(text: unknown): string {
     let part = parts[i] ?? "";
     part = part.replace(AFTER_CJK, (_m, half: string) => full(half));
     part = part.replace(BEFORE_CJK, (_m, half: string) => full(half));
-    parts[i] = part.replace(PARENS, (_m, inner: string) => `（${strip(inner)}）`);
+    parts[i] = part.replace(PARENS, (_m, inner: string) => `（${pyStrip(inner)}）`);
   }
   return parts.join("");
 }
 
 /** `text` on one line, at most `limit` characters (code points), an ellipsis marking a cut. */
 export function clip(text: unknown, limit: number): string {
-  const line = collapse(str(text));
-  const chars = codePoints(line);
-  return chars.length <= limit ? line : rstrip(chars.slice(0, limit - 1).join("")) + "…";
+  const line = squashSpaces(pyStr(text));
+  return cpLength(line) <= limit ? line : pyRstrip(cpSlice(line, 0, limit - 1)) + "…";
 }
 
 /** A word joiner between Chinese characters, so a FactSet's name column does not break "作者" one character to a line. */
