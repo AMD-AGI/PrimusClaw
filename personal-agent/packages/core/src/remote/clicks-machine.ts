@@ -99,7 +99,10 @@ export class MachineClicks {
     let connector: Connector | undefined;
     try {
       connector = connectorById((await this.p.lists.machines(click.key)).connectors, connectorId);
-      if (connector === undefined) return await this.settled(click, words.gone);
+      if (connector === undefined) {
+        await this.settled(click, words.gone);
+        return;
+      }
       await this.p.ctx.claw.revoke(click.key, connectorId);
     } catch (error) {
       return this.offRefused(click, error, connector?.name ?? "", lang);
