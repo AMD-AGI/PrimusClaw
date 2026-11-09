@@ -51,6 +51,9 @@
  *   S29 the stored calls of the run's own turns (the messages it knows by id): a person's turn in the same session is not one
  *   S30 a turn's reply is not its "on it" line: the wait after a turn's end goes on until another say of the turn, which the server
  *       says for a router that ended in plain text; the line is known by the id the server gives it
+ *   S35 the signed-in token is sent only with the person's text message, a card's `deny` and the check of whose it is: an allow, an
+ *       answer, a decision with more in it or any other route is refused; a turn's channel_context is sent beside its files, and a
+ *       case may name only what a channel sends
  */
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -71,6 +74,7 @@ import {
   ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
   cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards,
+  TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody,
 } from "./e2e/sa-eval-lib.js";
 import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
@@ -1079,4 +1083,51 @@ test("S34 a case's setup: triggers the runner makes before each attempt", () => 
   assert.match(bad({ triggers: [{ ...ok.triggers[1], action: "watch" }] }), /setup trigger action watch/);
   assert.match(bad({ triggers: [{ name: "x", schedule: "0 9 * * *", timezone: "UTC" }] }), /runs nothing: a run trigger needs a prompt/);
   assert.match(bad({ triggers: [{ ...ok.triggers[0], prompt: " " }] }), /empty prompt/);
+});
+
+test("S35 the signed-in token only says what the person may: their message, a deny, whose it is", () => {
+  const card = "/v1/assistant/confirmations/c1/decision";
+  const review = "/v1/github-review/confirmations/g1/decision";
+  const messages = "/v1/sessions/s1/messages";
+  for (const [method, path, body] of [
+    ["GET", "/v1/me", undefined],
+    ["POST", card, { decision: "deny" }],
+    ["POST", review, { decision: "deny" }],
+    ["POST", messages, { content: "q", messageType: "text" }],
+    ["POST", messages, turnMessageBody({ user: "q", channel_context: { channel: "teams" } }, [{ name: "a.txt" }])],
+  ] as const) {
+    assert.equal(tokenRequestRefusal(method, path, body), null, `${method} ${path}`);
+  }
+  for (const [method, path, body] of [
+    ["POST", card, { decision: "allow" }],
+    ["POST", review, { decision: "allow" }],
+    ["POST", card, { decision: "Deny" }],
+    ["POST", card, { decision: "deny", answers: ["x"] }],
+    ["POST", card, {}],
+    ["POST", messages, { messageType: "decision", extData: { tool_use_id: "t", action: "allow" } }],
+    ["POST", messages, { messageType: "decision", extData: { tool_use_id: "t", action: "deny" } }],
+    ["POST", messages, { messageType: "answer", extData: { tool_use_id: "t", answers: {} } }],
+    ["POST", messages, { content: "q", messageType: "text", extData: { action: "allow" } }],
+    ["POST", `${card}/../allow`, { decision: "deny" }],
+    ["POST", "/v1/triggers", { name: "x" }],
+    ["DELETE", "/v1/sessions/s1", undefined],
+    ["GET", "/v1/me?x=1", undefined],
+    ["GET", "/v1/me", { decision: "allow" }],
+  ] as const) {
+    assert.notEqual(tokenRequestRefusal(method, path, body), null, `${method} ${path} ${JSON.stringify(body)}`);
+  }
+});
+
+test("S35 a turn's channel_context goes with its message, beside its files; a case names only what a channel sends", () => {
+  assert.deepEqual(turnMessageBody({ user: "q" }, []), { content: "q", messageType: "text" });
+  assert.deepEqual(turnMessageBody({ user: "q" }, [{ name: "f" }]), { content: "q", messageType: "text", channel_context: { files: [{ name: "f" }] } });
+  assert.deepEqual(turnMessageBody({ user: "q", channel_context: { channel: "teams", via: "on_behalf" } }, [{ name: "f" }]),
+    { content: "q", messageType: "text", channel_context: { channel: "teams", via: "on_behalf", files: [{ name: "f" }] } });
+  assert.deepEqual(turnMessageBody({ user: "q", channel_context: { files: [{ name: "forged" }] } }, [{ name: "f" }]).channel_context, { files: [{ name: "f" }] });
+  assert.deepEqual(problemsOf(caseOf({ turns: [{ user: "q", channel_context: { channel: "teams", people: [] } }] })), []);
+  for (const bad of [{ files: [] }, { attended_via: "person" }]) {
+    assert.ok(problemsOf(caseOf({ turns: [{ user: "q", channel_context: bad }] })).some((p) => p.startsWith("channel_context.")), JSON.stringify(bad));
+  }
+  assert.ok(problemsOf(caseOf({ turns: [{ user: "q", channel_context: [] as unknown as Record<string, unknown> }] })).includes("channel_context must be an object"));
+  assert.ok(!TURN_CONTEXT_KEYS.includes("files"));
 });

@@ -107,7 +107,10 @@
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
  *                     turn may act for the person (`attendedTurn`: memory, settings, confirmations). Everything else uses the key.
- *                     The token must be the key's identity (`GET /v1/me`), or the run refuses; it is never printed
+ *                     The token must be the key's identity (`GET /v1/me`), or the run refuses; it is never printed. It may be a
+ *                     service's delegated token (an evaluation runner's client acting for the identity): the key goes beside it in
+ *                     `x-api-key`, so a turn runs on the identity's own keys. It is sent with nothing but the person's text message,
+ *                     a card's `deny` and that check (`tokenRequestRefusal`): the run never allows or answers anything with it
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
  *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
  *                     person, is using the identity. Each run going at the same time needs an identity of its own
@@ -151,7 +154,7 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody,
+  freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -306,6 +309,16 @@ function sendToken(): string {
   try { exp = Number(JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")).exp) * 1000; } catch { /* not a JWT: asked for each time */ }
   sendTokenCached = { token, until: Number.isFinite(exp) && exp > 0 ? exp - 60_000 : 0 };
   return token;
+}
+/**
+ * A request sent with the signed-in token, only one `tokenRequestRefusal` lets through (the person's message, a `deny`, whose token
+ * it is): anything else throws before it is sent. The key goes beside it in `x-api-key`, as a channel that may bring the person's own
+ * key sends it, so a turn started by a service's delegated token runs on the identity's own keys.
+ */
+function tokenApi(method: string, path: string, body?: unknown): ReturnType<typeof api> {
+  const refusal = tokenRequestRefusal(method, path, body);
+  if (refusal) throw new Error(`refusing to send with the signed-in token: ${refusal}`);
+  return api(method, path, body, sendToken(), { "x-api-key": KEY });
 }
 const GAP_MS = int("EVAL_GAP_S", 0, 0, 3_600) * 1000;
 const INFRA_RETRY = int("EVAL_INFRA_RETRY", 1, 0, 1) === 1;
@@ -730,9 +743,9 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
       const at = Date.now();
       // A message whose answer was lost (or a 5xx) may still have been taken: its turn is waited for at the end, unnamed.
       // Sent signed in when EVAL_SEND_TOKEN_CMD gives a token (the person's own message, `attendedTurn`), else with the key.
-      const r = await api("POST", `/v1/sessions/${sessionId}/messages`, {
-        content: t.user, messageType: "text", ...(files.length ? { channel_context: { files } } : {}),
-      }, SEND_TOKEN_CMD ? sendToken() : KEY)
+      const path = `/v1/sessions/${sessionId}/messages`;
+      const body = turnMessageBody(t, files);
+      const r = await (SEND_TOKEN_CMD ? tokenApi("POST", path, body) : api("POST", path, body, KEY))
         .catch((err) => { session.unknownSends++; throw err; });
       if (r.status >= 500) session.unknownSends++;
       const id = r.json?.message_id;
@@ -1281,11 +1294,10 @@ async function cardsNow(): Promise<WaitingCard[] | null> {
 async function closeCards(): Promise<WaitingCard[] | null> {
   const waiting = await cardsNow();
   if (!waiting?.length || !SEND_TOKEN_CMD) return waiting;
-  const token = sendToken();
   for (const w of waiting) {
     live();   // a stop sends no more decisions
     const route = w.source === "assistant" ? "/v1/assistant/confirmations" : "/v1/github-review/confirmations";
-    const r = await api("POST", `${route}/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }, token).catch(() => null);
+    const r = await tokenApi("POST", `${route}/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }).catch(() => null);
     log(`card ${w.source}:${w.kind || "?"} waiting before the attempt: deny answered ${r?.status ?? "nothing"}`);
   }
   return cardsNow();
@@ -1368,8 +1380,7 @@ async function main(): Promise<void> {
   log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K}`);
   // Messages go with a signed-in token when EVAL_SEND_TOKEN_CMD gives one: it must be the same identity's.
   if (SEND_TOKEN_CMD && LIVE && MODE === "assistant") {
-    const token = sendToken();
-    const tme = await apiClient(CLAW, token)("GET", "/v1/me");
+    const tme = await tokenApi("GET", "/v1/me");
     // The same account: `userId`, the one identifier `/v1/me` always has (a name or an email can be shared, or missing).
     const userId = me.json?.userId;
     if (tme.status !== 200 || typeof userId !== "string" || !userId || tme.json?.userId !== userId) {
