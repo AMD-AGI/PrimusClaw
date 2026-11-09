@@ -15,3 +15,4 @@ export * from "./surface.js";
 export * from "./claw/index.js";
 export * from "./metrics.js";
 export * from "./secret-source.js";
+export * from "./github.js";
