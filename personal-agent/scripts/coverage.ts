@@ -12,13 +12,47 @@
  * check, so the suite runs once in CI.
  */
 import { spawnSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { typeOnlyFiles } from "./type-only.js";
+import { SOURCE_EXTENSIONS, symlinksUnder, typeOnlyFiles } from "./type-only.js";
 
-/** Each package's floor, in percent. Lowering one is a change to this file that review sees. */
+/**
+ * Each package's floor, in percent. Lowering one is a change to this file that review sees. A package directory under
+ * packages/ without a floor here fails the gate (`packagesToCheck`), so a new package cannot go uncounted.
+ */
 export const FLOORS: Readonly<Record<string, number>> = { core: 90, runtime: 85, teams: 85 };
+
+/**
+ * The packages to hold to a floor: every directory under `packagesDir` that has a package.json. What is wrong (a
+ * package with no floor, a floor for no package, a symbolic link in a package's src) comes back in `errors`.
+ */
+export function packagesToCheck(
+  packagesDir: string,
+  floors: Readonly<Record<string, number>>,
+): { readonly packages: readonly [string, number][]; readonly errors: readonly string[] } {
+  const found = readdirSync(packagesDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(path.join(packagesDir, e.name, "package.json")))
+    .map((e) => e.name)
+    .sort();
+  const errors = [
+    ...found.filter((p) => floors[p] === undefined).map((p) => `packages/${p} has no coverage floor in FLOORS`),
+    ...Object.keys(floors)
+      .filter((p) => !found.includes(p))
+      .map((p) => `FLOORS names ${p}, which is not a package`),
+    ...found.flatMap((p) => {
+      const src = path.join(packagesDir, p, "src");
+      return existsSync(src)
+        ? symlinksUnder(src, path.dirname(packagesDir)).map((l) => `${l} is a symbolic link (not allowed in src)`)
+        : [];
+    }),
+  ];
+  const packages = found.flatMap((p): [string, number][] => {
+    const floor = floors[p];
+    return floor === undefined ? [] : [[p, floor]];
+  });
+  return { packages, errors };
+}
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temp = path.join(root, ".c8-tmp");
@@ -52,7 +86,9 @@ function checkPackage(pkg: string, floor: number): boolean {
     "--src",
     src,
     "--include",
-    `${src}/**/*.ts`,
+    `${src}/**/*.{${SOURCE_EXTENSIONS.map((e) => e.slice(1)).join(",")}}`,
+    // c8's own extension list leaves out .mts and .cts: without these, --all would not see such a file at all.
+    ...SOURCE_EXTENSIONS.flatMap((extension) => ["--extension", extension]),
     ...excluded.flatMap((file) => ["--exclude", file]),
     "--reporter=text",
     "--check-coverage",
@@ -65,6 +101,9 @@ function checkPackage(pkg: string, floor: number): boolean {
 function main(argv: readonly string[]): number {
   const at = argv.indexOf("--names");
   const names = at === -1 ? undefined : argv[at + 1];
+  const { packages, errors } = packagesToCheck(path.join(root, "packages"), FLOORS);
+  for (const error of errors) console.error(`coverage: ${error}`);
+  if (errors.length > 0) return 1;
   rmSync(temp, { recursive: true, force: true });
   const tests = run([
     "--temp-directory",
@@ -82,7 +121,7 @@ function main(argv: readonly string[]): number {
     console.error(`coverage: the test run failed (exit ${String(tests)})`);
     return tests;
   }
-  const results = Object.entries(FLOORS).map(([pkg, floor]) => checkPackage(pkg, floor));
+  const results = packages.map(([pkg, floor]) => checkPackage(pkg, floor));
   rmSync(temp, { recursive: true, force: true });
   return results.every(Boolean) ? 0 : 1;
 }

@@ -68,7 +68,7 @@ export class FakeSurface implements Surface {
   private readonly rosters: NonNullable<FakeSurfaceOptions["rosters"]>;
   private readonly reachable: ReadonlySet<string>;
   /** @internal */
-  readonly beforeUpdate: () => Promise<void>;
+  readonly beforeUpdate: (() => Promise<void>) | undefined;
   private nextId = 1;
 
   constructor(options: FakeSurfaceOptions = {}) {
@@ -76,7 +76,7 @@ export class FakeSurface implements Surface {
     this.files = options.files ?? {};
     this.rosters = options.rosters ?? {};
     this.reachable = new Set(options.reachable ?? []);
-    this.beforeUpdate = options.beforeUpdate ?? (() => Promise.resolve());
+    this.beforeUpdate = options.beforeUpdate;
   }
 
   openPersonal(
@@ -169,16 +169,35 @@ class FakeConversation implements Conversation {
 
   /**
    * Refused (rejects) when the channel cannot edit. With a signal: aborted before the edit is sent (before the call, or
-   * while `beforeUpdate` holds it), the edit is not recorded and the promise rejects with the signal's reason.
+   * while `beforeUpdate` holds it), the edit is not recorded and the promise rejects with the signal's reason. Without
+   * a `beforeUpdate` hook the edit is recorded at the call, so the outbox keeps the order of the calls.
    */
-  async update(id: MessageId, message: OutMessage, options: UpdateOptions = {}): Promise<void> {
+  update(id: MessageId, message: OutMessage, options: UpdateOptions = {}): Promise<void> {
     const { signal } = options;
-    if (!this.surface.caps.edit) throw new Error("FakeConversation.update: this channel cannot edit");
-    signal?.throwIfAborted();
+    if (!this.surface.caps.edit) return Promise.reject(new Error("FakeConversation.update: this channel cannot edit"));
+    if (signal?.aborted === true) return Promise.reject(signal.reason as Error);
     this.edited.add(id);
-    await this.surface.beforeUpdate();
-    signal?.throwIfAborted();
-    this.surface.record({ op: "update", conversation: this.ref.id, id, message });
+    const record = (): void => {
+      signal?.throwIfAborted();
+      this.surface.record({ op: "update", conversation: this.ref.id, id, message });
+    };
+    const hold = this.surface.beforeUpdate;
+    if (hold === undefined) {
+      record();
+      return Promise.resolve();
+    }
+    if (signal === undefined) return hold().then(record);
+    // Aborted while held: reject at once, and the edit is not recorded when the hold ends.
+    const aborted = new Promise<never>((_, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          reject(signal.reason as Error);
+        },
+        { once: true },
+      );
+    });
+    return Promise.race([hold().then(record), aborted]);
   }
 
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>> {

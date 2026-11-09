@@ -14,6 +14,8 @@ import ts from "typescript";
 
 /** Whether `source` compiles to nothing that runs. */
 export function isTypeOnly(source: string, fileName = "file.ts"): boolean {
+  // A declaration file (.d.ts, .d.mts, .d.cts) emits nothing by definition; the compiler refuses to transpile one.
+  if (/\.d\.[cm]?ts$/.test(fileName)) return true;
   const { outputText } = ts.transpileModule(source, {
     fileName,
     compilerOptions: {
@@ -23,21 +25,47 @@ export function isTypeOnly(source: string, fileName = "file.ts"): boolean {
       removeComments: true,
     },
   });
-  // A file with no import or export compiles as a script, which gains a "use strict" directive and nothing else.
-  const code = outputText.replace(/\s+/g, "").replace(/^["']usestrict["'];/, "");
+  // A file with no import or export compiles as a script, which gains a "use strict" directive and nothing else; a
+  // CommonJS module (.cts) gains the `__esModule` marker. Neither is code of the file's own.
+  const code = outputText
+    .replace(/\s+/g, "")
+    .replace(/^["']usestrict["'];/, "")
+    .replace(/^Object\.defineProperty\(exports,["']__esModule["'],\{value:true\}\);/, "");
   return code === "" || code === "export{};";
 }
 
-/** The `.ts` files under `dir` (recursively) that are type-only, relative to `base`, sorted. */
+/** Every extension a source file of the workspace can have: what the compiler or Node would load. */
+export const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
+
+/** Only TypeScript can be type-only: a JavaScript file always counts. */
+const TYPESCRIPT = new Set([".ts", ".tsx", ".mts", ".cts"]);
+
+/** The source files under `dir`, recursively, by any extension in `SOURCE_EXTENSIONS`. */
+export function sourceFiles(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) return sourceFiles(full);
+    return (SOURCE_EXTENSIONS as readonly string[]).includes(path.extname(entry.name)) ? [full] : [];
+  });
+}
+
+/**
+ * The symbolic links under `dir` (recursively, not followed), relative to `base`. The coverage gate refuses a source
+ * tree that has any: a linked directory is walked by neither this judgement nor reliably by c8, so a file in it could
+ * be counted wrongly or not at all.
+ */
+export function symlinksUnder(dir: string, base: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) return [path.relative(base, full)];
+    return entry.isDirectory() ? symlinksUnder(full, base) : [];
+  });
+}
+
+/** The source files under `dir` that are type-only, relative to `base`, sorted. */
 export function typeOnlyFiles(dir: string, base: string): string[] {
-  const walk = (d: string): string[] =>
-    fs.readdirSync(d, { withFileTypes: true }).flatMap((entry) => {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) return walk(full);
-      return entry.name.endsWith(".ts") ? [full] : [];
-    });
-  return walk(dir)
-    .filter((file) => isTypeOnly(fs.readFileSync(file, "utf8"), file))
+  return sourceFiles(dir)
+    .filter((file) => TYPESCRIPT.has(path.extname(file)) && isTypeOnly(fs.readFileSync(file, "utf8"), file))
     .map((file) => path.relative(base, file))
     .sort();
 }

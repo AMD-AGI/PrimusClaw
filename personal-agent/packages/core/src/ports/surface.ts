@@ -88,7 +88,11 @@ export interface InboundQuote {
   readonly fromBot: boolean;
   /** When it was written, as the channel said it ("" when not said). */
   readonly sentAt: string;
-  /** The quoted message was deleted (its text is then ""), as opposed to a quote whose text the channel did not give. */
+  /**
+   * The channel says the quoted message was deleted. Independent of `text`: a deleted quote may still carry a preview,
+   * which is shown as any quote's text; only when `text` is empty does `deleted` decide what is said instead ("the
+   * quoted message was deleted" rather than "its text is not available"), as Python `quote_block` does.
+   */
   readonly deleted: boolean;
   /**
    * Where the adapter read the quote (for a log line, never the text): a structured entity, the message's HTML, or a
@@ -146,6 +150,11 @@ export interface InboundMessage extends InboundBase {
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
   readonly files: readonly InboundFile[];
+  /**
+   * The names of attachments the channel gave no way to fetch (a file shared as a link), told back to the person
+   * (Python `inbound.inbound_files`' second result, said with `inbound.unreadable_line`).
+   */
+  readonly unreadableFiles: readonly string[];
   readonly provenance: Provenance;
 }
 
@@ -154,6 +163,16 @@ export interface InboundAction extends InboundBase {
   readonly type: "action";
   /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
   readonly verb: string;
+  /**
+   * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
+   * must replace (Python `activity.is_card_click`); false for an Action.Submit message.
+   */
+  readonly invoke: boolean;
+  /**
+   * The channel's own verb of the click, for a log line only: clipped to 40 characters, "unknown" when absent (Python
+   * `activity.card_verb`). It comes from the client: never dispatch on it.
+   */
+  readonly clickVerb: string;
   /** The data the card attached to the button: unvalidated, each handler reads it through its own schema. */
   readonly data: Readonly<Record<string, unknown>>;
   /** The message that holds the card, which the handler replaces to settle the click ("" when not said). */
