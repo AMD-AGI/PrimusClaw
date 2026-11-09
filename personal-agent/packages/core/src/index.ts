@@ -47,3 +47,7 @@ export * from "./claw/py-value.js";
 export * from "./observability/metrics-catalog.js";
 export * from "./language/detect.js";
 export * from "./inbound-text/index.js";
+export * from "./approvals/index.js";
+export * from "./assistant/work-items.js";
+export type * from "./assistant/views.js";
+export * from "./proactive/views.js";
