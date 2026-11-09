@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
-import { packagesToCheck } from "../scripts/coverage.js";
+import { missingFromReport, packagesToCheck } from "../scripts/coverage.js";
 import { isTypeOnly, sourceFiles, symlinksUnder, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -148,4 +148,26 @@ test("a package's src that is itself a link, and a package directory that is a l
     "packages/core/src is a symbolic link (not allowed: src must be the package's own directory)",
     "packages/teams/src is a symbolic link (not allowed: src must be the package's own directory)",
   ]);
+});
+
+test("a package without src is refused, not skipped", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  fs.mkdirSync(path.join(packages, "empty"), { recursive: true });
+  fs.writeFileSync(path.join(packages, "empty", "package.json"), "{}");
+  assert.deepEqual(packagesToCheck(packages, { empty: 85 }).errors, ["packages/empty has no src directory"]);
+});
+
+test("a file with runtime code that c8's report does not hold is named, wherever the report put its paths", () => {
+  const base = "/w";
+  const expected = ["packages/a/src/x.ts", "packages/a/src/test/y.ts", "packages/a/src/node_modules/z.ts"];
+  assert.deepEqual(missingFromReport(expected, ["/w/packages/a/src/x.ts"], base), [
+    "packages/a/src/test/y.ts",
+    "packages/a/src/node_modules/z.ts",
+  ]);
+  assert.deepEqual(
+    missingFromReport(expected, [...expected.map((f) => `/w/${f}`), "/w/packages/a/src/extra.ts"], base),
+    [],
+  );
+  assert.deepEqual(missingFromReport(expected, expected, base), []);
 });
