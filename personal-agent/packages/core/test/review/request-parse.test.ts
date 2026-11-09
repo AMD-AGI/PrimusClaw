@@ -104,3 +104,63 @@ test("a later line that names the same person in another way is that person", ()
   assert.ok(parsed);
   assert.deepEqual(otherReviewers(parsed), []);
 });
+
+// --- several pull requests in one request (`test_github_review_many`) -------------------------------------------------------
+
+const PR1 = "AMD-AGI/Hyperloom#1";
+const PR2 = "AMD-AGI/Hyperloom#2";
+const PR3 = "AMD-AGI/Primus#3";
+const URL2 = "https://github.com/AMD-AGI/Hyperloom/pull/2";
+
+for (const [name, rest, expected] of [
+  ["comma space", `${PR1}, ${PR2}`, [PR1, PR2]],
+  ["comma", `${PR1},${PR2}`, [PR1, PR2]],
+  ["fullwidth comma", `${PR1}，${PR2}`, [PR1, PR2]],
+  ["dun hao", `${PR1}、${PR2}、${PR3}`, [PR1, PR2, PR3]],
+  ["space", `${PR1} ${PR2}`, [PR1, PR2]],
+  ["newline", `${PR1}\n${PR2}\n${PR3}`, [PR1, PR2, PR3]],
+  ["he", `${PR1}和${PR2}`, [PR1, PR2]],
+  ["link then short", `${URL2} ${PR1}`, [PR2, PR1]], // a link and a short form, in the order written
+  ["mixed three", `${PR3}、${URL2}，${PR1}`, [PR3, PR2, PR1]],
+  ["duplicate", `${PR1}、${URL2}、amd-agi/hyperloom#1`, [PR1, PR2]], // the same one twice is one
+] as const) {
+  test(`several pull requests are read whatever separates them (${name})`, () => {
+    assert.deepEqual(read(`请 {Bob} 帮我 review 合入 ${rest}`)?.pulls.map(shortName), expected);
+  });
+}
+
+for (const [text, isRequest] of [
+  [`请 {Bob} 帮我 review 合入 ${PR1} ${PR2}`, true],
+  [`请 {Bob} review 并合入 ${PR1} ${PR2}`, true],
+  [`请 {Bob} 帮我 review 并合入 ${PR1}`, true],
+  [`请 {Bob} review 合入 ${PR1}`, true],
+  [`请 {Bob} 帮我 review ${PR1} ${PR2}`, true], // a review only, as Bob, never merged
+  [`review ${PR1}, ${PR2}`, false],
+  ["请问 review 合入的流程是什么？", false],
+  ["请 {Bob} review 并合入", false], // without 帮我 it is one only with a pull request
+  [`请 {Bob} review和合入 ${PR1}`, true],
+  [`请 {Bob} review、合入 ${PR1}`, true],
+  [`请 {Bob} review 然后合入 ${PR1}`, true],
+  [`请 {Bob} 帮 review 并合入 ${PR1}`, true],
+  [`{Bob} review 并合入 ${PR1}`, true], // nobody asked by 请: the group is asked who
+] as const) {
+  test(`review and merge is a request and review alone stays chat: ${text}`, () => {
+    assert.equal(read(text) !== undefined, isRequest);
+  });
+}
+
+for (const [name, text, models, who] of [
+  ["yong", `请 {Bob} 用 claude-opus-5.5 帮我 review 合入 ${PR1} ${PR2}`, ["claude-opus-5.5"], "⟦0⟧"],
+  ["model colon", `请 {Bob} 帮我 review 合入 ${PR1} model: gpt-6-luna`, ["gpt-6-luna"], "⟦0⟧"],
+  ["moxing colon", `请 {Bob} 帮我 review 合入 ${PR1} 模型：gpt-6-luna`, ["gpt-6-luna"], "⟦0⟧"],
+  ["model equals in name", `请 {Bob} model=gpt-6-luna 帮我 review 合入 ${PR1}`, ["gpt-6-luna"], "⟦0⟧"],
+  ["typed name", `请 Bob 用 claude-opus-5.5 帮我 review 合入 ${PR1}`, ["claude-opus-5.5"], "Bob"],
+  ["two", `请 {Bob} 用 a 帮我 review 合入 ${PR1} model: b`, ["b", "a"], "⟦0⟧"],
+  ["none", `请 {Bob} 帮我 review 合入 ${PR1}`, [], "⟦0⟧"],
+] as const) {
+  test(`the model is read from the request and never taken for the reviewer (${name})`, () => {
+    const parsed = read(text);
+    assert.deepEqual(parsed?.models, models);
+    assert.equal(parsed.who, who);
+  });
+}
