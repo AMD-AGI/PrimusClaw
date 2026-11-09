@@ -157,8 +157,7 @@ class FakeConversation implements Conversation {
     return Promise.resolve();
   }
 
-  update(id: MessageId, message: OutMessage, options: { readonly signal?: AbortSignal } = {}): Promise<void> {
-    if (options.signal?.aborted) return Promise.resolve(); // withdrawn before it went out
+  update(id: MessageId, message: OutMessage): Promise<void> {
     this.edited.add(id);
     this.surface.record({ op: "update", conversation: this.ref.id, id, message });
     return Promise.resolve();

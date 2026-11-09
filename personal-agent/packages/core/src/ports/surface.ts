@@ -261,11 +261,7 @@ export interface Conversation {
   send(message: OutMessage): Promise<void>;
   /** Post and return the new message's id; undefined when the channel never said it (keep sending, do not edit). */
   post(message: OutMessage): Promise<MessageId | undefined>;
-  /**
-   * Replace a message the bot posted. With `signal`: an edit whose sender is cancelled before the channel took the
-   * request is withdrawn (a cancelled turn's last progress edit never lands after it).
-   */
-  update(id: MessageId, message: OutMessage, options?: { readonly signal?: AbortSignal }): Promise<void>;
+  update(id: MessageId, message: OutMessage): Promise<void>;
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>>;
   /** The envelope `send` would publish for `message` (masked in a group), built without sending it. */
   outgoing(message: OutMessage): Envelope;
