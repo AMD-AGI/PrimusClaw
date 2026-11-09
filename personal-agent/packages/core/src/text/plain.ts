@@ -2,22 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The few text operations W5's features need on top of `py-text.ts` (which holds the Python semantics of lengths, cuts and white
- * space): the one-line clip with an ellipsis, a tail cut, and compact JSON as `json.dumps(..., separators=(",", ":"))` writes it.
+ * The two text operations W5's features need on top of `py-text.ts` that it does not have: the one-line clip (white space
+ * squashed, then `clipLine`), and JSON as `json.dumps(..., separators=(",", ":"))` writes it.
  */
-import { cpLength, cpSlice, pyJsonDumps, pyRstrip, squashSpaces } from "./py-text.js";
+import { clipLine, pyJsonDumps, squashSpaces } from "./py-text.js";
 
-/** `text[-n:]`: the last `n` code points. */
-export function cpTail(text: string, n: number): string {
-  if (n <= 0) return "";
-  const length = cpLength(text);
-  return cpSlice(text, Math.max(0, length - n));
-}
-
-/** `text` made one line and cut to `limit` code points, a cut one ending in "…" (render._clip, approval_view._clip). */
+/** `" ".join(text.split())` cut to `limit` code points, a cut one ending in "…" (render._clip, approval_view._clip). */
 export function clip(text: string, limit: number): string {
-  const line = squashSpaces(text);
-  return cpLength(line) <= limit ? line : `${pyRstrip(cpSlice(line, 0, limit - 1))}…`;
+  return clipLine(squashSpaces(text), limit);
 }
 
 /** `json.dumps(value, ensure_ascii=False)`, with `separators=(",", ":")` when `compact`. */
@@ -29,7 +21,7 @@ function compact(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(compact).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>);
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${compact(v)}`).join(",")}}`;
+    return `{${entries.map(([k, v]) => `${pyJsonDumps(k)}:${compact(v)}`).join(",")}}`;
   }
   return pyJsonDumps(value);
 }

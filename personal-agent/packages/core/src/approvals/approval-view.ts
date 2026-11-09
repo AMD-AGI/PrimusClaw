@@ -12,8 +12,8 @@
 import { pickLang } from "../language/detect.js";
 import type { Lang } from "../locales/lang.js";
 import { redactText } from "../security/redact.js";
-import { clip, cpTail, pyJson } from "../text/plain.js";
-import { cpHead, cpLength, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
+import { clip, pyJson } from "../text/plain.js";
+import { cpHead, cpLength, cpSlice, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { credentialValues, maskValue, scrub } from "./sensitive.js";
 
 export const TITLE_ID = "approval-title";
@@ -84,7 +84,7 @@ function show(value: unknown): string {
 export function clipCommand(text: string): string {
   const line = squashSpaces(text);
   if (cpLength(line) <= COMMAND_MAX) return line;
-  return `${pyRstrip(cpHead(line, COMMAND_EDGE))} … ${pyStrip(cpTail(line, COMMAND_EDGE))}`;
+  return `${pyRstrip(cpHead(line, COMMAND_EDGE))} … ${pyStrip(cpSlice(line, -COMMAND_EDGE))}`;
 }
 
 /** The call's key arguments, its reason and how many fields did not fit. A credential-named field shows as [hidden]. */
