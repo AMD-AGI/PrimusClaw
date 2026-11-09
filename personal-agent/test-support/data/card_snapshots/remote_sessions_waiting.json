@@ -1,202 +1,202 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "op": "switch",
-       "primusclaw": "remote",
-       "session_id": ""
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "op": "switch",
+              "primusclaw": "remote",
+              "session_id": ""
+            },
+            "title": "刷新",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_switch"
+          }
+        ],
+        "body": [
+          {
+            "items": [
+              {
+                "size": "Medium",
+                "text": "🗂️ 你的会话",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "type": "Container"
+          },
+          {
+            "color": "attention",
+            "id": "badge-waiting",
+            "text": "⚠️ 有 2 个会话在等你",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "color": "good",
+            "separator": true,
+            "text": "**robin-dev** (在线)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "row-agent-1",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "🟠 Claude Code",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "id": "row-session-1",
+                "spacing": "Small",
+                "text": "⚠️ **等你批准** · 1. /root/ws/active · 5 分钟前",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "actions": [
+                  {
+                    "data": {
+                      "op": "attach",
+                      "primusclaw": "remote",
+                      "session_id": "rs-1",
+                      "view": "sessions"
+                    },
+                    "style": "positive",
+                    "title": "切到它",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_attach"
+                  },
+                  {
+                    "data": {
+                      "op": "close",
+                      "primusclaw": "remote",
+                      "session_id": "rs-1",
+                      "view": "sessions"
+                    },
+                    "style": "destructive",
+                    "title": "关闭",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_close"
+                  }
+                ],
+                "type": "ActionSet"
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "row-agent-2",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "🤖 Claude Code (existing sessions)",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "id": "row-conv-1",
+                "spacing": "Small",
+                "text": "⚠️ **等你**（permission prompt） · 修 flaky 测试 · /root/ws/active · 2 分钟前",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "终端里正在用，暂时只能在终端操作",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "id": "row-conv-2",
+                "spacing": "Small",
+                "text": "⏳ 正在做 · 重构连接器 · /root/ws/conn · 刚刚",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "终端里正在用，暂时只能在终端操作",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "id": "row-conv-3",
+                "spacing": "Small",
+                "text": "写文档 · /root/ws/docs · 1 小时前",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "actions": [
+                  {
+                    "data": {
+                      "agent_id": "a1-sessions",
+                      "connector_id": "c1",
+                      "op": "new",
+                      "primusclaw": "remote",
+                      "resume": "r-3",
+                      "view": "sessions"
+                    },
+                    "title": "接管并切到它",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_new"
+                  }
+                ],
+                "type": "ActionSet"
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "separator": true,
+            "text": "**laptop** (离线)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "row-agent-3",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "⬛ Codex",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "没有会话",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "title": "刷新",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_switch"
-     }
-    ],
-    "body": [
-     {
-      "items": [
-       {
-        "size": "Medium",
-        "text": "🗂️ 你的会话",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       }
-      ],
-      "type": "Container"
-     },
-     {
-      "color": "attention",
-      "id": "badge-waiting",
-      "text": "⚠️ 有 2 个会话在等你",
-      "type": "TextBlock",
-      "weight": "Bolder",
-      "wrap": true
-     },
-     {
-      "color": "good",
-      "separator": true,
-      "text": "**robin-dev** (在线)",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "id": "row-agent-1",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "🟠 Claude Code",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "id": "row-session-1",
-        "spacing": "Small",
-        "text": "⚠️ **等你批准** · 1. /root/ws/active · 5 分钟前",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "actions": [
-         {
-          "data": {
-           "op": "attach",
-           "primusclaw": "remote",
-           "session_id": "rs-1",
-           "view": "sessions"
-          },
-          "style": "positive",
-          "title": "切到它",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_attach"
-         },
-         {
-          "data": {
-           "op": "close",
-           "primusclaw": "remote",
-           "session_id": "rs-1",
-           "view": "sessions"
-          },
-          "style": "destructive",
-          "title": "关闭",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_close"
-         }
-        ],
-        "type": "ActionSet"
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "id": "row-agent-2",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "🤖 Claude Code (existing sessions)",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "id": "row-conv-1",
-        "spacing": "Small",
-        "text": "⚠️ **等你**（permission prompt） · 修 flaky 测试 · /root/ws/active · 2 分钟前",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "终端里正在用，暂时只能在终端操作",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "id": "row-conv-2",
-        "spacing": "Small",
-        "text": "⏳ 正在做 · 重构连接器 · /root/ws/conn · 刚刚",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "终端里正在用，暂时只能在终端操作",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "id": "row-conv-3",
-        "spacing": "Small",
-        "text": "写文档 · /root/ws/docs · 1 小时前",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "actions": [
-         {
-          "data": {
-           "agent_id": "a1-sessions",
-           "connector_id": "c1",
-           "op": "new",
-           "primusclaw": "remote",
-           "resume": "r-3",
-           "view": "sessions"
-          },
-          "title": "接管并切到它",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_new"
-         }
-        ],
-        "type": "ActionSet"
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "isSubtle": true,
-      "separator": true,
-      "text": "**laptop** (离线)",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "id": "row-agent-3",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "⬛ Codex",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "没有会话",
-        "type": "TextBlock",
-        "wrap": true
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

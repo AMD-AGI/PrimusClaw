@@ -1,159 +1,157 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "action_id": "ac-1",
-       "option_id": "o1",
-       "primusclaw": "remote_decision",
-       "session_id": "rs-1"
-      },
-      "style": "positive",
-      "title": "Allow",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_decision"
-     },
-     {
-      "data": {
-       "action_id": "ac-1",
-       "option_id": "o2",
-       "primusclaw": "remote_decision",
-       "session_id": "rs-1"
-      },
-      "title": "Always",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_decision"
-     },
-     {
-      "data": {
-       "action_id": "ac-1",
-       "option_id": "o3",
-       "primusclaw": "remote_decision",
-       "session_id": "rs-1"
-      },
-      "title": "Reject",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_decision"
-     }
-    ],
-    "body": [
-     {
-      "columns": [
-       {
-        "items": [
-         {
-          "color": "Warning",
-          "size": "Large",
-          "text": "┃",
-          "type": "TextBlock",
-          "weight": "Bolder"
-         }
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "action_id": "ac-1",
+              "option_id": "o1",
+              "primusclaw": "remote_decision",
+              "session_id": "rs-1"
+            },
+            "style": "positive",
+            "title": "Allow",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_decision"
+          },
+          {
+            "data": {
+              "action_id": "ac-1",
+              "option_id": "o2",
+              "primusclaw": "remote_decision",
+              "session_id": "rs-1"
+            },
+            "title": "Always",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_decision"
+          },
+          {
+            "data": {
+              "action_id": "ac-1",
+              "option_id": "o3",
+              "primusclaw": "remote_decision",
+              "session_id": "rs-1"
+            },
+            "title": "Reject",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_decision"
+          }
         ],
-        "spacing": "None",
-        "type": "Column",
-        "width": "auto"
-       },
-       {
-        "items": [
-         {
-          "id": "approval-title",
-          "size": "Medium",
-          "text": "⚠️ Approval needed",
-          "type": "TextBlock",
-          "weight": "Bolder",
-          "wrap": true
-         },
-         {
-          "isSubtle": true,
-          "size": "Small",
-          "spacing": "None",
-          "text": "Claude Code on robin-dev asks permission (execute).",
-          "type": "TextBlock",
-          "wrap": true
-         }
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "id": "approval-title",
+                    "size": "Medium",
+                    "text": "⚠️ Approval needed",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "Claude Code on robin-dev asks permission (execute).",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "facts": [
+              {
+                "title": "Action",
+                "value": "Bash"
+              },
+              {
+                "title": "command",
+                "value": "npm test"
+              }
+            ],
+            "type": "FactSet"
+          },
+          {
+            "id": "approval-details-toggle",
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Small",
+                "text": "Details ▾",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "selectAction": {
+              "targetElements": ["approval-details"],
+              "title": "Details",
+              "type": "Action.ToggleVisibility"
+            },
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "approval-details",
+            "isVisible": false,
+            "items": [
+              {
+                "fontType": "Monospace",
+                "isSubtle": true,
+                "size": "Small",
+                "text": "Bash\n{\"command\": \"npm test\"}",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "Valid until 16:10 (Asia/Shanghai). After that it is refused.",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "An always option changes what this agent may do on your machine from now on, not only for this request.",
+            "type": "TextBlock",
+            "wrap": true
+          }
         ],
-        "spacing": "Small",
-        "type": "Column",
-        "verticalContentAlignment": "Center",
-        "width": "stretch"
-       }
-      ],
-      "type": "ColumnSet"
-     },
-     {
-      "facts": [
-       {
-        "title": "Action",
-        "value": "Bash"
-       },
-       {
-        "title": "command",
-        "value": "npm test"
-       }
-      ],
-      "type": "FactSet"
-     },
-     {
-      "id": "approval-details-toggle",
-      "items": [
-       {
-        "color": "Accent",
-        "size": "Small",
-        "text": "Details ▾",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       }
-      ],
-      "selectAction": {
-       "targetElements": [
-        "approval-details"
-       ],
-       "title": "Details",
-       "type": "Action.ToggleVisibility"
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "id": "approval-details",
-      "isVisible": false,
-      "items": [
-       {
-        "fontType": "Monospace",
-        "isSubtle": true,
-        "size": "Small",
-        "text": "Bash\n{\"command\": \"npm test\"}",
-        "type": "TextBlock",
-        "wrap": true
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "isSubtle": true,
-      "size": "Small",
-      "text": "Valid until 16:10 (Asia/Shanghai). After that it is refused.",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "isSubtle": true,
-      "size": "Small",
-      "text": "An always option changes what this agent may do on your machine from now on, not only for this request.",
-      "type": "TextBlock",
-      "wrap": true
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

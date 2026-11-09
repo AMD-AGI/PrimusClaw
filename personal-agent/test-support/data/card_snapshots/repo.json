@@ -1,48 +1,48 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "branch": "main",
-       "primusclaw": "repo",
-       "repo": "AMD-AGI/Primus-SaFE"
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "branch": "main",
+              "primusclaw": "repo",
+              "repo": "AMD-AGI/Primus-SaFE"
+            },
+            "style": "positive",
+            "title": "用这个仓库",
+            "type": "Action.Execute",
+            "verb": "primusclaw.repo"
+          }
+        ],
+        "body": [
+          {
+            "items": [
+              {
+                "size": "Medium",
+                "text": "📦 AMD-AGI/Primus-SaFE",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "分支：main",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "style": "positive",
-      "title": "用这个仓库",
-      "type": "Action.Execute",
-      "verb": "primusclaw.repo"
-     }
-    ],
-    "body": [
-     {
-      "items": [
-       {
-        "size": "Medium",
-        "text": "📦 AMD-AGI/Primus-SaFE",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "分支：main",
-        "type": "TextBlock",
-        "wrap": true
-       }
-      ],
-      "type": "Container"
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

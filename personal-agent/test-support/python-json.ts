@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * JSON written byte for byte as Python's `json.dumps(value, ensure_ascii=False, indent=1, sort_keys=True)` writes it: the format of
  * the snapshots the Python worker's tests keep, so a TS snapshot compares to the same file without a diff.
@@ -13,7 +16,7 @@ function encode(value: unknown, depth: number): string {
     if (value.length === 0) return "[]";
     return `[\n${value.map((v) => inner + encode(v, depth + 1)).join(",\n")}\n${outer}]`;
   }
-  const keys = Object.keys(value as object)
+  const keys = Object.keys(value)
     .filter((k) => (value as Record<string, unknown>)[k] !== undefined)
     .sort(byCodePoint);
   if (keys.length === 0) return "{}";

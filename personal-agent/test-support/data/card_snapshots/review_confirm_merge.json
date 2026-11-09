@@ -1,173 +1,171 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "confirmation": "conf-1",
-       "decision": "allow",
-       "primusclaw": "github_confirm"
-      },
-      "style": "positive",
-      "title": "确认合入",
-      "type": "Action.Execute",
-      "verb": "primusclaw.github_confirm"
-     },
-     {
-      "data": {
-       "confirmation": "conf-1",
-       "decision": "deny",
-       "primusclaw": "github_confirm"
-      },
-      "title": "不合入",
-      "type": "Action.Execute",
-      "verb": "primusclaw.github_confirm"
-     },
-     {
-      "title": "添加 Clawy",
-      "type": "Action.OpenUrl",
-      "url": "https://teams.microsoft.com/l/app/x"
-     }
-    ],
-    "body": [
-     {
-      "columns": [
-       {
-        "items": [
-         {
-          "color": "Warning",
-          "size": "Large",
-          "text": "┃",
-          "type": "TextBlock",
-          "weight": "Bolder"
-         }
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "confirmation": "conf-1",
+              "decision": "allow",
+              "primusclaw": "github_confirm"
+            },
+            "style": "positive",
+            "title": "确认合入",
+            "type": "Action.Execute",
+            "verb": "primusclaw.github_confirm"
+          },
+          {
+            "data": {
+              "confirmation": "conf-1",
+              "decision": "deny",
+              "primusclaw": "github_confirm"
+            },
+            "title": "不合入",
+            "type": "Action.Execute",
+            "verb": "primusclaw.github_confirm"
+          },
+          {
+            "title": "添加 Clawy",
+            "type": "Action.OpenUrl",
+            "url": "https://teams.microsoft.com/l/app/x"
+          }
         ],
-        "spacing": "None",
-        "type": "Column",
-        "width": "auto"
-       },
-       {
-        "items": [
-         {
-          "size": "Medium",
-          "text": "⚠️ 合入前需要你确认",
-          "type": "TextBlock",
-          "weight": "Bolder",
-          "wrap": true
-         },
-         {
-          "isSubtle": true,
-          "size": "Small",
-          "spacing": "None",
-          "text": "Robin Lang 在 Primus 运维群 请求，我以你的身份合入",
-          "type": "TextBlock",
-          "wrap": true
-         }
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚠️ 合入前需要你确认",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "Robin Lang 在 Primus 运维群 请求，我以你的身份合入",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "text": "确认后：把 AMD-AGI/Primus-SaFE#481 合入 `main`，用你的 GitHub 账号 @huirui-amd。",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "PR",
+                "value": "#481 safe-node: rotate node credentials on join"
+              },
+              {
+                "title": "作⁠者",
+                "value": "zhangsan"
+              },
+              {
+                "title": "分⁠支",
+                "value": "main"
+              },
+              {
+                "title": "检⁠查",
+                "value": "12/12 passed"
+              },
+              {
+                "title": "原⁠因",
+                "value": "改动了凭据轮换逻辑；修改了 CI 发布流程"
+              }
+            ],
+            "type": "FactSet"
+          },
+          {
+            "id": "confirm-more-toggle",
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Small",
+                "text": "更多信息 ▾",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "selectAction": {
+              "targetElements": ["confirm-more"],
+              "title": "更多信息",
+              "type": "Action.ToggleVisibility"
+            },
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "confirm-more",
+            "isVisible": false,
+            "items": [
+              {
+                "facts": [
+                  {
+                    "title": "仓⁠库",
+                    "value": "AMD-AGI/Primus-SaFE"
+                  },
+                  {
+                    "title": "Head",
+                    "value": "9f8e7d6c5b4…"
+                  },
+                  {
+                    "title": "模⁠型",
+                    "value": "claude-opus-4-8"
+                  },
+                  {
+                    "title": "账⁠号",
+                    "value": "你的 GitHub 账号 @huirui-amd"
+                  }
+                ],
+                "type": "FactSet"
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "按钮点不了时，直接回复「确认 #481」或「拒绝 #481」即可。",
+            "type": "TextBlock",
+            "wrap": true
+          }
         ],
-        "spacing": "Small",
-        "type": "Column",
-        "verticalContentAlignment": "Center",
-        "width": "stretch"
-       }
-      ],
-      "type": "ColumnSet"
-     },
-     {
-      "text": "确认后：把 AMD-AGI/Primus-SaFE#481 合入 `main`，用你的 GitHub 账号 @huirui-amd。",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "facts": [
-       {
-        "title": "PR",
-        "value": "#481 safe-node: rotate node credentials on join"
-       },
-       {
-        "title": "作⁠者",
-        "value": "zhangsan"
-       },
-       {
-        "title": "分⁠支",
-        "value": "main"
-       },
-       {
-        "title": "检⁠查",
-        "value": "12/12 passed"
-       },
-       {
-        "title": "原⁠因",
-        "value": "改动了凭据轮换逻辑；修改了 CI 发布流程"
-       }
-      ],
-      "type": "FactSet"
-     },
-     {
-      "id": "confirm-more-toggle",
-      "items": [
-       {
-        "color": "Accent",
-        "size": "Small",
-        "text": "更多信息 ▾",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       }
-      ],
-      "selectAction": {
-       "targetElements": [
-        "confirm-more"
-       ],
-       "title": "更多信息",
-       "type": "Action.ToggleVisibility"
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "id": "confirm-more",
-      "isVisible": false,
-      "items": [
-       {
-        "facts": [
-         {
-          "title": "仓⁠库",
-          "value": "AMD-AGI/Primus-SaFE"
-         },
-         {
-          "title": "Head",
-          "value": "9f8e7d6c5b4…"
-         },
-         {
-          "title": "模⁠型",
-          "value": "claude-opus-4-8"
-         },
-         {
-          "title": "账⁠号",
-          "value": "你的 GitHub 账号 @huirui-amd"
-         }
-        ],
-        "type": "FactSet"
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "isSubtle": true,
-      "size": "Small",
-      "text": "按钮点不了时，直接回复「确认 #481」或「拒绝 #481」即可。",
-      "type": "TextBlock",
-      "wrap": true
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

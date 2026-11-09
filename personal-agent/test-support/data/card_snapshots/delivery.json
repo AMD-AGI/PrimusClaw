@@ -1,48 +1,48 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "style": "positive",
-      "title": "Download",
-      "type": "Action.OpenUrl",
-      "url": "https://claw.example.com/x"
-     }
-    ],
-    "body": [
-     {
-      "items": [
-       {
-        "size": "Medium",
-        "text": "📎 safe-node-report.xlsx",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "47 KB",
-        "type": "TextBlock",
-        "wrap": true
-       }
-      ],
-      "type": "Container"
-     },
-     {
-      "text": "本周节点故障明细",
-      "type": "TextBlock",
-      "wrap": true
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "style": "positive",
+            "title": "Download",
+            "type": "Action.OpenUrl",
+            "url": "https://claw.example.com/x"
+          }
+        ],
+        "body": [
+          {
+            "items": [
+              {
+                "size": "Medium",
+                "text": "📎 safe-node-report.xlsx",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "47 KB",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "type": "Container"
+          },
+          {
+            "text": "本周节点故障明细",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

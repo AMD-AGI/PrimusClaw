@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Snapshots of every kind of card the personal agent sends (`test-support/card-catalog`), and the card kit's rules checked on each.
  * A card's JSON must equal `test-support/data/card_snapshots/<id>.json` byte for byte (the Python worker's snapshots).
@@ -18,8 +21,10 @@ const DATA = new URL("../../../test-support/data/", import.meta.url);
 const SNAPSHOTS = new URL("card_snapshots/", DATA);
 const schema = JSON.parse(readFileSync(new URL("adaptive-card-1.5.schema.json", DATA), "utf8")) as JsonObject;
 // (draft-06: Ajv validates it with the draft-07 vocabulary, which is a superset for every keyword this schema uses)
-const { $schema: _draft, id: schemaId, ...body } = schema;
-const validate = new Ajv({ strict: false, allErrors: false }).compile({ ...body, $id: String(schemaId) });
+const validate = new Ajv({ strict: false, allErrors: false }).compile({
+  ...omit(schema, "$schema", "id"),
+  $id: s(schema["id"]),
+});
 
 /** The cards whose buttons are someone else's whole set of choices, each of which must stay one tap away. */
 const FOUR_BUTTONS = new Set(["remote_permission", "remote_status", "remote_window", "remote_window_en"]);
@@ -31,6 +36,15 @@ let allowedEmoji = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI]);
 /** Lines that port cards with their own emoji (a remote agent's kind icons) add them here. */
 export function allowEmoji(...emoji: string[]): void {
   allowedEmoji = new Set([...allowedEmoji, ...emoji]);
+}
+
+/** A JSON value as the text it shows. */
+function s(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function omit(object: JsonObject, ...keys: string[]): JsonObject {
+  return Object.fromEntries(Object.entries(object).filter(([key]) => !keys.includes(key)));
 }
 
 function content(activity: JsonObject): JsonObject {
@@ -46,11 +60,11 @@ function content(activity: JsonObject): JsonObject {
 
 function* words(card: JsonObject): Generator<readonly ["text" | "fact" | "button", string]> {
   for (const node of walk(card)) {
-    const type = String(node["type"] ?? "");
-    if (type === "TextBlock") yield ["text", String(node["text"])];
+    const type = s(node["type"]);
+    if (type === "TextBlock") yield ["text", s(node["text"])];
     else if (type === "FactSet") {
-      for (const fact of node["facts"] as JsonObject[]) yield ["fact", String(fact["title"]) + String(fact["value"])];
-    } else if (type.startsWith("Action.") && "title" in node) yield ["button", String(node["title"])];
+      for (const fact of node["facts"] as JsonObject[]) yield ["fact", s(fact["title"]) + s(fact["value"])];
+    } else if (type.startsWith("Action.") && "title" in node) yield ["button", s(node["title"])];
   }
 }
 
@@ -65,8 +79,15 @@ test("no snapshot is left without a card", () => {
     .map((f) => f.slice(0, -".json".length));
   const ids = new Set(CATALOG.map((e) => e.id));
   assert.deepEqual(files.filter((id) => !ids.has(id) && !PENDING.has(id)).sort(), []);
-  assert.deepEqual([...ids].filter((id) => !files.includes(id)), []);
-  assert.deepEqual([...PENDING].filter((id) => ids.has(id)), [], "an entry that is ported is no longer pending");
+  assert.deepEqual(
+    [...ids].filter((id) => !files.includes(id)),
+    [],
+  );
+  assert.deepEqual(
+    [...PENDING].filter((id) => ids.has(id)),
+    [],
+    "an entry that is ported is no longer pending",
+  );
 });
 
 for (const entry of CATALOG) {
@@ -77,7 +98,7 @@ for (const entry of CATALOG) {
 
   test(`card keeps the kit rules: ${entry.id}`, () => {
     const card = content(entry.build());
-    const { msteams: _teams, ...checked } = card; // (msteams: Teams' own extension)
+    const checked = omit(card, "msteams"); // (msteams: Teams' own extension)
     assert.ok(validate(checked), JSON.stringify(validate.errors));
     assert.equal(card["version"], CARD_VERSION);
     const actions = (card["actions"] ?? []) as JsonObject[];
@@ -87,12 +108,13 @@ for (const entry of CATALOG) {
     for (const node of walk(card)) {
       if (node["type"] === "TextBlock") {
         assert.ok(node["wrap"] === true || node["text"] === "┃", "every text wraps on a phone");
-        if (node["text"] !== "┃") assert.ok(node["color"] !== "Good" && node["color"] !== "Warning", "no yellow or green");
-        assert.ok(!HALF_NEXT_TO_CJK.test(String(node["text"]).replace(/`[^`]*`/g, "")), String(node["text"]));
+        if (node["text"] !== "┃")
+          assert.ok(node["color"] !== "Good" && node["color"] !== "Warning", "no yellow or green");
+        assert.ok(!HALF_NEXT_TO_CJK.test(s(node["text"]).replace(/`[^`]*`/g, "")), s(node["text"]));
       }
       if (node["type"] === "FactSet") {
         for (const fact of node["facts"] as JsonObject[]) {
-          assert.ok(!HALF_NEXT_TO_CJK.test(String(fact["title"]) + String(fact["value"])));
+          assert.ok(!HALF_NEXT_TO_CJK.test(s(fact["title"]) + s(fact["value"])));
         }
       }
     }
@@ -118,8 +140,8 @@ for (const entry of CATALOG) {
     const head = (top["items"] ?? columns[columns.length - 1]?.["items"] ?? []) as JsonObject[];
     const title = head[0];
     if (title && title["type"] === "TextBlock" && title["size"] === "Medium" && title["weight"] === "Bolder") {
-      const lead = emojiIn(String(title["text"]))[0];
-      assert.ok(lead !== undefined && String(title["text"]).startsWith(lead), String(title["text"]));
+      const lead = emojiIn(s(title["text"]))[0];
+      assert.ok(lead !== undefined && s(title["text"]).startsWith(lead), s(title["text"]));
     }
   });
 }

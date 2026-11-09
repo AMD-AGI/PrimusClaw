@@ -1,109 +1,109 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "primusclaw": "answer",
-       "questions": [
-        {
-         "allow_multiple": false,
-         "id": "q1",
-         "options": [
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
           {
-           "id": "main",
-           "label": "main"
+            "data": {
+              "primusclaw": "answer",
+              "questions": [
+                {
+                  "allow_multiple": false,
+                  "id": "q1",
+                  "options": [
+                    {
+                      "id": "main",
+                      "label": "main"
+                    },
+                    {
+                      "id": "rel",
+                      "label": "release/1.4"
+                    }
+                  ],
+                  "question": "要把哪个分支作为基线？"
+                }
+              ],
+              "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+              "tool": "ask_user_question",
+              "tool_use_id": "tu-9"
+            },
+            "style": "positive",
+            "title": "发送回答",
+            "type": "Action.Execute",
+            "verb": "primusclaw.answer"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Accent",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "❓ 需要你回答",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
           },
           {
-           "id": "rel",
-           "label": "release/1.4"
+            "spacing": "Medium",
+            "text": "要把哪个分支作为基线？",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "choices": [
+              {
+                "title": "main",
+                "value": "main"
+              },
+              {
+                "title": "release/1.4",
+                "value": "rel"
+              }
+            ],
+            "id": "choice_0",
+            "isMultiSelect": false,
+            "style": "expanded",
+            "type": "Input.ChoiceSet"
+          },
+          {
+            "id": "text_0",
+            "maxLength": 1000,
+            "placeholder": "或者直接写你的回答",
+            "type": "Input.Text"
           }
-         ],
-         "question": "要把哪个分支作为基线？"
-        }
-       ],
-       "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
-       "tool": "ask_user_question",
-       "tool_use_id": "tu-9"
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "style": "positive",
-      "title": "发送回答",
-      "type": "Action.Execute",
-      "verb": "primusclaw.answer"
-     }
-    ],
-    "body": [
-     {
-      "columns": [
-       {
-        "items": [
-         {
-          "color": "Accent",
-          "size": "Large",
-          "text": "┃",
-          "type": "TextBlock",
-          "weight": "Bolder"
-         }
-        ],
-        "spacing": "None",
-        "type": "Column",
-        "width": "auto"
-       },
-       {
-        "items": [
-         {
-          "size": "Medium",
-          "text": "❓ 需要你回答",
-          "type": "TextBlock",
-          "weight": "Bolder",
-          "wrap": true
-         }
-        ],
-        "spacing": "Small",
-        "type": "Column",
-        "verticalContentAlignment": "Center",
-        "width": "stretch"
-       }
-      ],
-      "type": "ColumnSet"
-     },
-     {
-      "spacing": "Medium",
-      "text": "要把哪个分支作为基线？",
-      "type": "TextBlock",
-      "weight": "Bolder",
-      "wrap": true
-     },
-     {
-      "choices": [
-       {
-        "title": "main",
-        "value": "main"
-       },
-       {
-        "title": "release/1.4",
-        "value": "rel"
-       }
-      ],
-      "id": "choice_0",
-      "isMultiSelect": false,
-      "style": "expanded",
-      "type": "Input.ChoiceSet"
-     },
-     {
-      "id": "text_0",
-      "maxLength": 1000,
-      "placeholder": "或者直接写你的回答",
-      "type": "Input.Text"
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

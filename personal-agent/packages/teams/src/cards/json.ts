@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /** JSON values as they go on the wire: what a card, an activity or an envelope is made of. */
 export type Json = string | number | boolean | null | Json[] | JsonObject;
 export interface JsonObject {

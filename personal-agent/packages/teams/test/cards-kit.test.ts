@@ -1,8 +1,33 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { clip, zh } from "../src/cards/cjk.js";
-import { buttons, CardKitError, execute, header, facts, emojiIn, emojiBudget, message, row, band, badges, fold } from "../src/cards/kit.js";
+import { clip, hasCjk, zh } from "../src/cards/cjk.js";
+import type { CardElement } from "../src/cards/json.js";
+import { collapse, isSpace, lstrip, pyLen, pySlice, pySplit, rstrip, str, strip } from "../src/text/pystr.js";
+import {
+  buttons,
+  card,
+  CardKitError,
+  execute,
+  header,
+  facts,
+  emojiIn,
+  emojiBudget,
+  message,
+  row,
+  band,
+  badges,
+  fold,
+  headerItems,
+  icon,
+  note,
+  openUrl,
+  section,
+  text,
+} from "../src/cards/kit.js";
 
 test("full width punctuation next to chinese only", () => {
   assert.equal(zh("模型: claude, 分支(当前)"), "模型：claude，分支（当前）");
@@ -53,7 +78,14 @@ test("clip counts characters, not UTF-16 units, and marks a cut", () => {
 });
 
 test("facts leave out empty values and keep Chinese names on one line", () => {
-  assert.deepEqual(facts([["a", ""], ["b", "  "], ["c", null]]), []);
+  assert.deepEqual(
+    facts([
+      ["a", ""],
+      ["b", "  "],
+      ["c", null],
+    ]),
+    [],
+  );
   assert.deepEqual(facts([["作者", "张三: 李四"]]), [
     { type: "FactSet", facts: [{ title: "作⁠者", value: "张三：李四" }] },
   ]);
@@ -70,4 +102,112 @@ test("the emoji budget counts rows, bands and badges", () => {
   assert.ok(card && typeof card === "object" && !Array.isArray(card));
   assert.equal(emojiBudget(card), 3 + 4);
   assert.deepEqual(emojiIn("⚠️ a ✅ b"), ["⚠️", "✅"]);
+});
+
+test("a header has a bar in its tone, a plain one has none, and its items take one more line", () => {
+  const plain = header("标题: 一", { subtitle: "sub", titleId: "t1", emoji: "review" });
+  assert.deepEqual(plain, {
+    type: "Container",
+    items: [
+      { type: "TextBlock", text: "🔍 标题：一", wrap: true, size: "Medium", weight: "Bolder", id: "t1" },
+      { type: "TextBlock", text: "sub", wrap: true, isSubtle: true, size: "Small", spacing: "None" },
+    ],
+  });
+  assert.equal(headerItems(plain).length, 2);
+  const toned = header("x", { tone: "good" });
+  assert.equal(toned.type, "ColumnSet");
+  const columns = toned["columns"] as CardElement[];
+  assert.deepEqual(columns[0], {
+    type: "Column",
+    width: "auto",
+    spacing: "None",
+    items: [{ type: "TextBlock", text: "┃", color: "Good", size: "Large", weight: "Bolder" }],
+  });
+  assert.equal(headerItems(toned), columns[1]?.["items"]);
+  assert.throws(() => headerItems({ type: "ColumnSet", columns: [] }), CardKitError);
+});
+
+test("a section is a bold line, barred in a tone with a medium bar", () => {
+  assert.deepEqual(section("A"), {
+    type: "Container",
+    spacing: "Medium",
+    items: [{ type: "TextBlock", text: "A", wrap: true, weight: "Bolder" }],
+  });
+  const toned = section("A", "attention");
+  assert.equal(toned["spacing"], "Medium");
+  const bar = (toned["columns"] as CardElement[])[0];
+  assert.equal((bar?.["items"] as CardElement[])[0]?.["size"], "Medium");
+  assert.throws(() => section("A", "red" as unknown as "good"), CardKitError);
+  assert.throws(() => band("A", "red" as unknown as "good"), CardKitError);
+  assert.equal(band("A")["id"], "band-plain");
+  assert.equal(band("A")["style"], "emphasis");
+  assert.equal(band("A", "warning", "needs_you")["style"], "warning");
+});
+
+test("text options and notes", () => {
+  assert.deepEqual(
+    text("a", { subtle: true, size: "Small", weight: "Bolder", maxLines: 2, spacing: "None", mono: true }),
+    {
+      type: "TextBlock",
+      text: "a",
+      wrap: true,
+      isSubtle: true,
+      size: "Small",
+      weight: "Bolder",
+      maxLines: 2,
+      spacing: "None",
+      fontType: "Monospace",
+    },
+  );
+  assert.deepEqual(note("n", { id: "x" }), {
+    type: "TextBlock",
+    text: "n",
+    wrap: true,
+    isSubtle: true,
+    size: "Small",
+    id: "x",
+  });
+  assert.deepEqual(note("n"), { type: "TextBlock", text: "n", wrap: true, isSubtle: true, size: "Small" });
+  assert.equal(icon("", "w"), "w");
+  assert.equal(fold("f", []).length, 0);
+});
+
+test("buttons, links and the card around them", () => {
+  const go = openUrl("打开: 控制台", "https://example.com");
+  assert.deepEqual(go, { type: "Action.OpenUrl", title: "打开：控制台", url: "https://example.com" });
+  assert.deepEqual(buttons([null, go, undefined], "destructive"), [{ ...go, style: "destructive" }]);
+  const built = card([text("a")], [], 3, { msteams: { width: "Full" } });
+  assert.deepEqual(built, {
+    type: "AdaptiveCard",
+    version: "1.5",
+    $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+    body: [{ type: "TextBlock", text: "a", wrap: true }],
+    msteams: { width: "Full" },
+  });
+  assert.throws(() => card([], [go, go], 1), CardKitError);
+  assert.deepEqual(message([text("a")], [go])["attachments"][0]?.content, {
+    type: "AdaptiveCard",
+    version: "1.5",
+    $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+    body: [{ type: "TextBlock", text: "a", wrap: true }],
+    actions: [go],
+  });
+  assert.equal(hasCjk("中"), true);
+  assert.equal(hasCjk(null), false);
+});
+
+test("python string semantics: code points and Python's whitespace", () => {
+  assert.equal(pyLen("a😀"), 2);
+  assert.equal(pySlice("a😀b", 1, 2), "😀");
+  assert.equal(pySlice("a😀b", 1), "😀b");
+  assert.deepEqual(pySplit("\u001fa b﻿"), ["a", "b﻿"]);
+  assert.equal(collapse(" a 　 b "), "a b");
+  assert.equal(strip("\u0085 x  "), "x");
+  assert.equal(lstrip("  x "), "x ");
+  assert.equal(rstrip("  x "), "  x");
+  assert.equal(isSpace(""), false);
+  assert.deepEqual(
+    [str("s"), str(0), str(2), str(Number.NaN), str(0n), str(3n), str(true), str(false), str(null), str({})],
+    ["s", "", "2", "", "", "3", "True", "", "", ""],
+  );
 });

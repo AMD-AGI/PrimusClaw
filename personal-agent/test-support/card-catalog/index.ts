@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * The card catalog: every feature's entries. A line that ports a feature's cards adds its module here and takes its ids off
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).

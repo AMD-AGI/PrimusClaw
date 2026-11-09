@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Every kind of Adaptive Card the personal agent sends in Teams, built by the real builders with fixed, realistic inputs (the card
  * snapshot tests). Each feature line adds its entries in its own module under `test-support/card-catalog/` and lists it in

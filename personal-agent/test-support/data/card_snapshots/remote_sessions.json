@@ -1,123 +1,123 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "op": "row",
-       "primusclaw": "remote",
-       "session_id": "rs-1"
-      },
-      "title": "返回",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_row"
-     },
-     {
-      "data": {
-       "op": "switch",
-       "primusclaw": "remote",
-       "session_id": "rs-1"
-      },
-      "title": "刷新",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_switch"
-     }
-    ],
-    "body": [
-     {
-      "items": [
-       {
-        "size": "Medium",
-        "text": "🗂️ 你的会话",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       }
-      ],
-      "type": "Container"
-     },
-     {
-      "color": "good",
-      "separator": true,
-      "text": "**robin-dev** (在线)",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "id": "row-agent-1",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "🟠 Claude Code",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "id": "row-session-1",
-        "spacing": "Small",
-        "text": "1. /root/ws/active · 5 分钟前（当前）",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "actions": [
-         {
-          "data": {
-           "op": "close",
-           "primusclaw": "remote",
-           "session_id": "rs-1",
-           "view": "sessions"
+          {
+            "data": {
+              "op": "row",
+              "primusclaw": "remote",
+              "session_id": "rs-1"
+            },
+            "title": "返回",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_row"
           },
-          "style": "destructive",
-          "title": "关闭",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_close"
-         }
+          {
+            "data": {
+              "op": "switch",
+              "primusclaw": "remote",
+              "session_id": "rs-1"
+            },
+            "title": "刷新",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_switch"
+          }
         ],
-        "type": "ActionSet"
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     },
-     {
-      "isSubtle": true,
-      "separator": true,
-      "text": "**laptop** (离线)",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "id": "row-agent-2",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "⬛ Codex",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "没有会话",
-        "type": "TextBlock",
-        "wrap": true
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+        "body": [
+          {
+            "items": [
+              {
+                "size": "Medium",
+                "text": "🗂️ 你的会话",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "type": "Container"
+          },
+          {
+            "color": "good",
+            "separator": true,
+            "text": "**robin-dev** (在线)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "row-agent-1",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "🟠 Claude Code",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "id": "row-session-1",
+                "spacing": "Small",
+                "text": "1. /root/ws/active · 5 分钟前（当前）",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "actions": [
+                  {
+                    "data": {
+                      "op": "close",
+                      "primusclaw": "remote",
+                      "session_id": "rs-1",
+                      "view": "sessions"
+                    },
+                    "style": "destructive",
+                    "title": "关闭",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_close"
+                  }
+                ],
+                "type": "ActionSet"
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "separator": true,
+            "text": "**laptop** (离线)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "row-agent-2",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "⬛ Codex",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "没有会话",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

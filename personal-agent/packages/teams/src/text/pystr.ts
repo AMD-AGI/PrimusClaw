@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * String operations with Python's semantics, where a port must count and cut text exactly as the Python worker did:
  * lengths and slices in code points (not UTF-16 units), and Python's set of whitespace (`str.isspace`), which differs
@@ -22,9 +25,7 @@ export function codePoints(text: string): string[] {
 
 /** Python's `len(text)`. */
 export function pyLen(text: string): number {
-  let n = 0;
-  for (const _ of text) n += 1;
-  return n;
+  return codePoints(text).length;
 }
 
 /** Python's `text[start:end]` for non-negative bounds, in code points. */
@@ -74,9 +75,14 @@ export function strip(text: string): string {
   return lstrip(rstrip(text));
 }
 
-/** Python's `str(value or "")` for the values a card or a message is built from. */
+/**
+ * Python's `str(value or "")` for the scalar values a card or a message is built from: a falsy value is "", `true` is "True".
+ * An object or an array is never shown as text here, so it is "" too (Python would print its repr).
+ */
 export function str(value: unknown): string {
-  if (value === null || value === undefined || value === false || value === 0 || value === "") return "";
-  if (value === true) return "True";
-  return String(value);
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return value === 0 || Number.isNaN(value) ? "" : String(value);
+  if (typeof value === "bigint") return value === 0n ? "" : value.toString();
+  if (typeof value === "boolean") return value ? "True" : "";
+  return "";
 }

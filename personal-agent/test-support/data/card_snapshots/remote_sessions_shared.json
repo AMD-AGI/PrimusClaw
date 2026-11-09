@@ -1,127 +1,127 @@
 {
- "attachments": [
-  {
-   "content": {
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "actions": [
-     {
-      "data": {
-       "op": "switch",
-       "primusclaw": "remote",
-       "session_id": ""
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "op": "switch",
+              "primusclaw": "remote",
+              "session_id": ""
+            },
+            "title": "刷新",
+            "type": "Action.Execute",
+            "verb": "primusclaw.remote_switch"
+          }
+        ],
+        "body": [
+          {
+            "items": [
+              {
+                "size": "Medium",
+                "text": "🗂️ 你的会话",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "type": "Container"
+          },
+          {
+            "color": "good",
+            "separator": true,
+            "text": "**robin-dev** (在线)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "row-agent-1",
+            "items": [
+              {
+                "spacing": "Small",
+                "text": "🤖 Claude Code (existing sessions)",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "id": "row-conv-1",
+                "spacing": "Small",
+                "text": "hosting · /root/ws/active · 2 分钟前",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "终端里正在用：连上后，你在这里发的消息会作为输入打进那个终端，回复和终端里敲的内容都会出现在这里；终端照常用，随时可以断开",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "actions": [
+                  {
+                    "data": {
+                      "agent_id": "a1-sessions",
+                      "connector_id": "c1",
+                      "op": "new",
+                      "primusclaw": "remote",
+                      "resume": "r-1",
+                      "view": "sessions"
+                    },
+                    "style": "positive",
+                    "title": "连上（终端照常用）",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_new"
+                  }
+                ],
+                "type": "ActionSet"
+              },
+              {
+                "id": "row-conv-2",
+                "spacing": "Small",
+                "text": "不在 tmux 里 · /root/ws/conn · 刚刚",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "spacing": "None",
+                "text": "终端里正在用：这里发的消息现在打不进那个终端，只能看。要能发：在 tmux 里打开这个会话，并且只在这一个终端里开着它",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "actions": [
+                  {
+                    "data": {
+                      "agent_id": "a1-sessions",
+                      "connector_id": "c1",
+                      "op": "new",
+                      "primusclaw": "remote",
+                      "resume": "r-2",
+                      "view": "sessions"
+                    },
+                    "title": "只看（终端照常用）",
+                    "type": "Action.Execute",
+                    "verb": "primusclaw.remote_new"
+                  }
+                ],
+                "type": "ActionSet"
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
       },
-      "title": "刷新",
-      "type": "Action.Execute",
-      "verb": "primusclaw.remote_switch"
-     }
-    ],
-    "body": [
-     {
-      "items": [
-       {
-        "size": "Medium",
-        "text": "🗂️ 你的会话",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       }
-      ],
-      "type": "Container"
-     },
-     {
-      "color": "good",
-      "separator": true,
-      "text": "**robin-dev** (在线)",
-      "type": "TextBlock",
-      "wrap": true
-     },
-     {
-      "id": "row-agent-1",
-      "items": [
-       {
-        "spacing": "Small",
-        "text": "🤖 Claude Code (existing sessions)",
-        "type": "TextBlock",
-        "weight": "Bolder",
-        "wrap": true
-       },
-       {
-        "id": "row-conv-1",
-        "spacing": "Small",
-        "text": "hosting · /root/ws/active · 2 分钟前",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "终端里正在用：连上后，你在这里发的消息会作为输入打进那个终端，回复和终端里敲的内容都会出现在这里；终端照常用，随时可以断开",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "actions": [
-         {
-          "data": {
-           "agent_id": "a1-sessions",
-           "connector_id": "c1",
-           "op": "new",
-           "primusclaw": "remote",
-           "resume": "r-1",
-           "view": "sessions"
-          },
-          "style": "positive",
-          "title": "连上（终端照常用）",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_new"
-         }
-        ],
-        "type": "ActionSet"
-       },
-       {
-        "id": "row-conv-2",
-        "spacing": "Small",
-        "text": "不在 tmux 里 · /root/ws/conn · 刚刚",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "isSubtle": true,
-        "size": "Small",
-        "spacing": "None",
-        "text": "终端里正在用：这里发的消息现在打不进那个终端，只能看。要能发：在 tmux 里打开这个会话，并且只在这一个终端里开着它",
-        "type": "TextBlock",
-        "wrap": true
-       },
-       {
-        "actions": [
-         {
-          "data": {
-           "agent_id": "a1-sessions",
-           "connector_id": "c1",
-           "op": "new",
-           "primusclaw": "remote",
-           "resume": "r-2",
-           "view": "sessions"
-          },
-          "title": "只看（终端照常用）",
-          "type": "Action.Execute",
-          "verb": "primusclaw.remote_new"
-         }
-        ],
-        "type": "ActionSet"
-       }
-      ],
-      "spacing": "Small",
-      "type": "Container"
-     }
-    ],
-    "type": "AdaptiveCard",
-    "version": "1.5"
-   },
-   "contentType": "application/vnd.microsoft.card.adaptive"
-  }
- ],
- "type": "message"
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
 }

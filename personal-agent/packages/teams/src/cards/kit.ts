@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Clawy's card kit: the one look every Adaptive Card it sends in Teams has, as the few builders every card is made of.
  *
@@ -184,7 +187,12 @@ export function badges(counts: readonly Badge[]): CardElement {
       style: tone === "default" ? "emphasis" : tone,
       spacing: "Small",
       verticalContentAlignment: "Center",
-      items: [text(`${icon(meaning, `**${count}**`)} ${label}`, { size: "Small", extra: { horizontalAlignment: "Center" } })],
+      items: [
+        text(`${icon(meaning, `**${String(count)}**`)} ${label}`, {
+          size: "Small",
+          extra: { horizontalAlignment: "Center" },
+        }),
+      ],
     })),
   };
 }
@@ -259,11 +267,19 @@ export function fold(foldId: string, items: CardElement[], label = "详情"): Ca
 }
 
 /** The card's actions: the first is the primary one (`primary`), the others plain. At most BUTTONS_MAX; absent entries left out. */
-export function buttons(actions: ReadonlyArray<CardElement | null | undefined>, primary: ButtonStyle = "positive"): CardElement[] {
-  const kept = actions.filter((a): a is CardElement => Boolean(a)).map((a) => ({ ...a }));
-  if (kept.length > BUTTONS_MAX) throw new CardKitError(`a card has at most ${BUTTONS_MAX} buttons, not ${kept.length}`);
+function withoutStyle(action: CardElement): CardElement {
+  return Object.fromEntries(Object.entries(action).filter(([key]) => key !== "style")) as CardElement;
+}
+
+export function buttons(
+  actions: ReadonlyArray<CardElement | null | undefined>,
+  primary: ButtonStyle = "positive",
+): CardElement[] {
+  const kept = actions.filter((a): a is CardElement => Boolean(a));
+  if (kept.length > BUTTONS_MAX)
+    throw new CardKitError(`a card has at most ${String(BUTTONS_MAX)} buttons, not ${String(kept.length)}`);
   return kept.map((action, i) => {
-    const { style: _dropped, ...plain } = action;
+    const plain = withoutStyle(action);
     return i === 0 && primary ? { ...plain, style: primary } : plain;
   });
 }
@@ -291,10 +307,10 @@ export function card(
   buttonsMax: number = BUTTONS_MAX,
   extra: JsonObject = {},
 ): AdaptiveCard {
-  if (actions.length > buttonsMax) throw new CardKitError(`a card has at most ${buttonsMax} buttons`);
+  if (actions.length > buttonsMax) throw new CardKitError(`a card has at most ${String(buttonsMax)} buttons`);
   const out: AdaptiveCard = { type: "AdaptiveCard", version: CARD_VERSION, $schema: SCHEMA, body };
   if (actions.length) out["actions"] = actions;
-  return { ...out, ...extra } as AdaptiveCard;
+  return { ...out, ...extra };
 }
 
 export interface CardAttachment extends JsonObject {

@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Chinese typography for card text: half-width , : ; ? ! ( ) next to Chinese become full-width, and the blanks around them go
  * (Chinese puts none there). Inline code, markdown links and bare URLs keep theirs.
