@@ -362,7 +362,8 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
       // A running Claude Code whose registry row is unreadable: the conversations in its folder are shown as "cannot tell"
       // and cannot be taken over until it writes the row again.
       const configDir = path.resolve(env.CLAUDE_CONFIG_DIR?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".claude"));
-      for (const b of await blindHolders(configDir).catch(() => [])) {
+      // (a stalled disk gives no answer within FS_TIMEOUT_MS: nothing said, as for every other file the check reads)
+      for (const b of (await within(blindHolders(configDir).catch(() => []))) ?? []) {
         out.problems.push({ code: "claude_registry_row_unreadable", severity: "warn", agent: a.id,
           detail: `Claude Code process ${b.pid}${b.cwd ? ` (in ${b.cwd})` : ""} is running, but ${path.join(configDir, "sessions", `${b.pid}.json`)} cannot be read: the conversations in its folder are shown as "cannot tell" and are not offered to take over`,
           fix: "send anything in that Claude Code terminal (it writes the row again), or exit and restart it there" });

@@ -236,6 +236,8 @@ const MAX_WATCHED_PROJECT_DIRS = 200;
 const MAX_SCANNED_PROJECT_DIRS = 2000;
 /** A registry file that does not parse is ignored once it is this old; a younger one may be mid-write. */
 const UNREADABLE_GRACE_MS = 60_000;
+/** How long a check or a poll waits for the unreadable-row scan (`blindHolders`) before it counts as no answer. */
+const BLIND_CHECK_MS = 5_000;
 
 export interface AttachDeps {
   registry: ChildRegistry;
@@ -400,6 +402,17 @@ export class AttachSupport {
    * heartbeat for more than `capMs`.
    */
   private looking: Promise<LiveEntry[] | null> | null = null;
+  /**
+   * The scan for Claude Code processes with an unreadable registry row (`blindHolders`), shared as `looking` is: one at a time, so
+   * a scan stalled on a network disk holds one thread of the pool, never one more per heartbeat or per check (service.ts: once the
+   * pool is used up, the next heartbeat's DNS lookup starves and the machine drops off Claw).
+   */
+  private blindScan: Promise<BlindHolder[]> | null = null;
+
+  private scanBlind(): Promise<BlindHolder[]> {
+    this.blindScan ??= blindHolders(this.configDir).finally(() => { this.blindScan = null; });
+    return this.blindScan;
+  }
 
   async resumable(capMs = 3_000): Promise<Resumable[]> {
     if (!this.waitedOnce) {
@@ -414,7 +427,7 @@ export class AttachSupport {
     // A scan that did not answer in time is no evidence either way: every idle conversation is then "unknown", as it is when the
     // live list cannot be had. Its own adapters' processes (the groups this connector leads) are no holder.
     const own = new Set(this.d.registry.list().map((r) => r.pgid));
-    const scanned = await within(blindHolders(this.configDir).catch(() => null), capMs, null);
+    const scanned = await within(this.scanBlind().catch(() => null), capMs, null);
     const blind = scanned === null ? null : scanned.filter((b) => b.pgid === null || !own.has(b.pgid));
     const attached = this.d.attachedRefs();
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
@@ -473,7 +486,7 @@ export class AttachSupport {
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
     // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
     // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
-    const blind = (await blindHolders(this.configDir).catch(() => [] as BlindHolder[])).map((b) => b.pid).sort().join(".");
+    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? []).map((b) => b.pid).sort().join(".");
     const summary = (rows === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
       return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
@@ -557,13 +570,19 @@ export class AttachSupport {
     if (twin) {
       return { ok: false, reason: "session_live", detail: describeTwin(twin) };
     }
-    // Fails closed: a local Claude Code process whose registry row cannot be read, in the conversation's folder (or one
-    // whose folder cannot be read), may have it open, and a second writer is never started next to it.
-    const cwd = this.listed.find((l) => l.ref === want)?.cwd ?? null;
-    const own = new Set(this.d.registry.list().map((r) => r.pgid));
-    const blind = (await blindHolders(this.configDir).catch(() => [] as BlindHolder[]))
-      .find((b) => (b.pgid === null || (b.pgid !== o.ownPgid && !own.has(b.pgid))) && (cwd === null || mayHold(b, cwd)));
-    if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
+    // Fails closed before a second writer would start (an attach, a takeover, a session whose adapter is gone resuming it): a local
+    // Claude Code process whose registry row cannot be read, in the conversation's folder (or one whose folder cannot be read),
+    // may have it open. Not for a session this connector holds with its own adapter (`ownPgid`), checked before each prompt:
+    // another process's unreadable row is no reason to stop a session that is already the writer. A scan that does not answer
+    // in time cannot tell either way, and refuses.
+    if (o.ownPgid == null) {
+      const cwd = this.listed.find((l) => l.ref === want)?.cwd ?? null;
+      const own = new Set(this.d.registry.list().map((r) => r.pgid));
+      const scanned = await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null);
+      if (scanned === null) return { ok: false, reason: "twin_check_failed", detail: "the Claude Code session registry did not answer in time" };
+      const blind = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && (cwd === null || mayHold(b, cwd)));
+      if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
+    }
     if (o.transcript) {
       const file = this.transcriptFile(want);
       let age: number | null = null;

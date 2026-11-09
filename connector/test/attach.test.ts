@@ -296,6 +296,16 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true);
     assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "anyone else's: refused");
   });
+
+  test("a session this connector holds with its own adapter is not stopped by another process's unreadable row (each prompt checks)", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const unrelated = claudeNamed(os.tmpdir());   // (an unrelated terminal in the same folder, its row empty)
+    const mine = sleeper({ detached: true });     // (this connector's adapter, leading its own group)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, unrelated.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true, "the held session goes on");
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "a new writer is still refused");
+  });
 });
 
 describe("the terminal hooks' rows in the twin check", () => {
