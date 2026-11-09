@@ -10,7 +10,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { IntentReader } from "../../src/index.js";
-import type { ReviewModeView } from "../../src/review/views.js";
 import { ALICE, reviewWorld, saidIn, type ReviewWorld } from "../../../../test-support/review-world.js";
 
 const DM = `personal:${ALICE.id}`;
