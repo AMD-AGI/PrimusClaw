@@ -278,7 +278,7 @@ teams/tests/test_reply_style.py::test_a_status_message_without_a_stream_is_the_s
 # reassigned: test_rich_answer.py conversion/masking (:177 :192 :206 :211 :267 :287 :306 :317 :330 :356 :367) -> W3 (messenger.rich, richtext)
 # reassigned: test_rich_answer.py::test_show_here_sends_the_answer_as_xml -> W4 (show here click)
 
-# internal #458 (open when ported, after the baseline): stop_button.py and render.stop_card. Its agent, assistant and
+# A Python change after the baseline (ported ahead): stop_button.py and render.stop_card. Its agent, assistant and
 # remote tests (a press interrupts the turn, the card per kind of turn) are the router's, W5's and W6's.
 teams/tests/test_stop_button.py::test_a_turn_that_ends_before_the_delay_gets_no_card_and_one_that_runs_on_gets_it_and_loses_it_at_its_end -> packages/core/test/turn/stop-buttons.test.ts::test_a_turn_that_ends_before_the_delay_gets_no_card_and_one_that_runs_on_gets_it_and_loses_it_at_its_end
 teams/tests/test_stop_button.py::test_a_token_is_forgotten_after_its_time -> packages/core/test/turn/stop-buttons.test.ts::test_a_token_is_forgotten_after_its_time

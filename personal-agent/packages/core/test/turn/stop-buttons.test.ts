@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The Stop card of a turn from a phone (test_stop_button.py, the card on its own; internal #458): a quick turn gets no
+ * The Stop card of a turn from a phone (test_stop_button.py, the card on its own): a quick turn gets no
  * card, one that runs on gets it and loses it at its end; a token is forgotten after its time.
  */
 
