@@ -292,15 +292,15 @@ export class PersonalText {
   }
 }
 
-/**
- * A review request does not take the files sent with it, and the person is told so (a review reads the pull request):
- * what the review service calls after it took such a message.
- */
 /** The message came with files, whether the channel gave a way to fetch them or not (Python `any(inbound_files(activity))`). */
 export function hasFiles(message: InboundMessage): boolean {
   return message.files.length > 0 || message.unreadableFiles.length > 0;
 }
 
+/**
+ * A review request does not take the files sent with it, and the person is told so (a review reads the pull request):
+ * what the review service calls after it took such a message.
+ */
 export async function filesNotReviewed(
   ctx: RouterContext,
   chat: Chat,

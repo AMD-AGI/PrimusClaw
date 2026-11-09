@@ -21,7 +21,8 @@ export const accountText = defineCatalog({
       `Memory is **off**: I do not remember anything between sessions. Turn it on, or see what is stored, at ${p.page}`,
     nothingRemembered: "- (nothing remembered yet)",
     memoryOn: (p: { lines: string; page: string }) =>
-      `Memory is **on**. Latest items:\n${p.lines}\n\nSee all, turn off or delete at ${p.page}`,
+      'Memory is **on** (on by default; say "turn memory off" or send `/memory off` to turn it off). ' +
+      `Latest items:\n${p.lines}\n\nSee all or delete at ${p.page}`,
     memoryUsage: "Use `/memory on` to turn memory on, `/memory off` to turn it off, or `/memory` alone to see it.",
     memoryNotChanged: (p: { page: string }) =>
       `I could not change your memory setting just now. You can change it at ${p.page}`,
@@ -50,7 +51,8 @@ export const accountText = defineCatalog({
     memoryUnavailable: "这个部署没有记忆功能。",
     memoryOff: (p) => `记忆是**关**的：会话之间我什么都不记。打开它或查看存了什么：${p.page}`,
     nothingRemembered: "- （还没有记住什么）",
-    memoryOn: (p) => `记忆是**开**的。最近的条目：\n${p.lines}\n\n查看全部、关闭或删除：${p.page}`,
+    memoryOn: (p) =>
+      `记忆是**开**的（默认开启，说“关闭记忆”或发 \`/memory off\` 可关）。最近的条目：\n${p.lines}\n\n查看全部或删除：${p.page}`,
     memoryUsage: "用 `/memory on` 打开记忆、`/memory off` 关闭，只发 `/memory` 看现在的状态。",
     memoryNotChanged: (p) => `我现在没能改你的记忆设置。可以在这里改：${p.page}`,
     memoryTurnedOn: (p) => `记忆已**打开**：之后的会话里我会记住你让我记的、以及对你有用的事。查看或删除：${p.page}`,

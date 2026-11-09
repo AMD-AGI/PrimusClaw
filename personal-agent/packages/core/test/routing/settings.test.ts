@@ -286,3 +286,23 @@ test("the unlink word of the menu asks first; the typed /unlink unlinks", async 
   assert.ok(said(w)[0]?.startsWith("`unlink` 会断开这个聊天"));
   assert.notEqual(w.store.links.getKey(ALICE.id), null);
 });
+
+test("/memory with memory on says how to turn it off, in each language (internal #463)", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak");
+  w.claw.memory = new Map([["ak", { enabled: true, available: true, items: ["likes tabs"] }]]);
+  await w.router.handle(message("/memory"));
+  await w.router.handle(message("/memory", { locale: "zh-CN", user: { ...ALICE } }));
+  w.store.prefs.setLang(ALICE.id, "zh");
+  await w.router.handle(message("/memory"));
+  const page = "https://claw.example.com/primus-claw?memory=1";
+  assert.equal(
+    said(w)[0],
+    'Memory is **on** (on by default; say "turn memory off" or send `/memory off` to turn it off). ' +
+      `Latest items:\n- likes tabs\n\nSee all or delete at ${page}`,
+  );
+  assert.equal(
+    said(w).at(-1),
+    `记忆是**开**的（默认开启，说“关闭记忆”或发 \`/memory off\` 可关）。最近的条目：\n- likes tabs\n\n查看全部或删除：${page}`,
+  );
+});
