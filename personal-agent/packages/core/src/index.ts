@@ -31,3 +31,7 @@ export * from "./claw/started-review.js";
 export * from "./claw/work-item.js";
 export * from "./locales/claw.js";
 export * from "./text/py-text.js";
+export * from "./redact/index.js";
+export * from "./observability/ip-address.js";
+export * from "./observability/security-fields.js";
+export * from "./observability/security-log.js";
