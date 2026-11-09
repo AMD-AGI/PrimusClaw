@@ -40,6 +40,8 @@ export interface Refresh {
   readonly byPerson?: boolean;
   /** Post it again at the bottom whatever changed. */
   readonly repost?: boolean;
+  /** A scheduled edit's: aborted, it does nothing, even when it was already waiting for its turn (Python's task cancel). */
+  readonly signal?: AbortSignal;
 }
 
 export class StatusBoard {
@@ -109,6 +111,7 @@ export class StatusBoard {
     return this.locks.with(chatKey, async () => {
       const state = this.state.attached(chatKey);
       const stored = this.ctx.remoteState.getRemote(chatKey);
+      if (how.signal?.aborted === true) return false;
       if (state === null || stored === null || state.window !== "card") return false;
       const posted = await this.editOrRepost(chatKey, to, state, stored.statusCard, how);
       if (how.byPerson === true) await this.dropKept(chatKey, to);
@@ -189,7 +192,7 @@ export class StatusBoard {
     const task = new Task(
       async (signal) => {
         await (this.ctx.paceClock ?? this.ctx.clock).sleep(EDIT_SECONDS * 1000, signal);
-        await this.refreshWindow(chatKey, to, { streaming: true });
+        await this.refreshWindow(chatKey, to, { streaming: true, signal });
       },
       this.ctx.logger,
       "the session card could not be refreshed",
