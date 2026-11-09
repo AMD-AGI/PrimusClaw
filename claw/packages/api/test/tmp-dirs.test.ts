@@ -13,7 +13,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -24,26 +24,33 @@ const API_DIR = join(HERE, "..");
 
 interface Run { code: number | null; signal: NodeJS.Signals | null; out: string; err: string; dirs: string[] }
 
-/** Run `file` as its own process with TMPDIR set to a directory of this test's, as a person runs one test file. */
-function run(file: string, env: Record<string, string>, tmp: string, onDir?: (child: ChildProcess) => void): Promise<Run> {
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmp, ...env };
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Run `file` as its own process with TMPDIR set to a directory of this test's, as a person runs one test file. The
+ * fixture writes the directory it made to a report file outside TMPDIR; `onDir` is called once that file exists.
+ */
+async function run(file: string, env: Record<string, string>, tmp: string, onDir?: (child: ChildProcess) => void): Promise<Run> {
+  const report = join(tmpDir("tmp-dirs-report-"), "dir");
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmp, FIXTURE_REPORT: report, ...env };
   // This file runs under the test runner; the child is a test file of its own, not a part of this one's report.
   delete childEnv.NODE_TEST_CONTEXT;
   if (!("CLAW_TEST_KEEP_TMP" in env)) delete childEnv.CLAW_TEST_KEEP_TMP;
   const child = spawn(process.execPath, ["--import", "tsx", file], { cwd: API_DIR, env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   let err = "";
-  let told = false;
-  child.stdout!.on("data", (b) => {
-    out += String(b);
-    if (!told && /^DIR=/m.test(out)) { told = true; onDir?.(child); }
-  });
+  child.stdout!.on("data", (b) => { out += String(b); });
   child.stderr!.on("data", (b) => { err += String(b); });
   const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-  return new Promise((resolve) => child.on("exit", (code, signal) => {
-    clearTimeout(killer);
-    resolve({ code, signal, out, err, dirs: [...out.matchAll(/^DIR=(.+)$/gm)].map((m) => m[1]!) });
-  }));
+  let exited = false;
+  const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+    child.on("exit", (code, signal) => { exited = true; clearTimeout(killer); resolve({ code, signal }); }));
+  if (onDir) {
+    while (!exited && !existsSync(report)) await sleep(20);
+    if (!exited) onDir(child);
+  }
+  const { code, signal } = await done;
+  return { code, signal, out, err, dirs: existsSync(report) ? [readFileSync(report, "utf8")] : [] };
 }
 
 const fixture = (mode: string, tmp: string, onDir?: (child: ChildProcess) => void): Promise<Run> =>
@@ -82,9 +89,8 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
   test(`T4 a file stopped by ${signal} leaves none, and still ends by it`, async () => {
     const tmp = tmpDir("tmp-dirs-t4-");
     const r = await fixture("signal", tmp, (child) => child.kill(signal));
-    // Ended by the signal, not by the 60 s wait running out or the SIGKILL backstop.
-    assert.ok(r.signal === signal || (r.code !== null && r.code !== 0), `ended by ${String(r.signal ?? r.code)}`);
-    assert.notEqual(r.signal, "SIGKILL");
+    // Ended by the signal it was sent, not by the 60 s wait running out or the SIGKILL backstop.
+    assert.equal(r.signal, signal, `ended by ${String(r.signal ?? r.code)}\n${r.out}\n${r.err}`);
     gone(r, tmp);
   });
 }
