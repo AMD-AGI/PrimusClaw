@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The reading of a review request against the Python worker's on 9,628 seeded texts (random pieces of requests, and
+ * The reading of a review request against the Python worker's on the seeded texts (random pieces of requests, and
  * 3,000 shaped like "请 XX 帮我 review ..." with dotted and dotless i, full-width space and fictional names): bare numbers,
  * pull requests, the review-only ask, "review 合入", words, flattening, brackets, and where each of four members is
  * named. Every expected value is what the Python functions returned.
@@ -15,6 +15,7 @@ import {
   bareGroups,
   flat,
   memberKeys,
+  modelFieldPattern,
   namedIn,
   pullsIn,
   saysReviewAndMerge,
@@ -44,6 +45,7 @@ interface Row {
   readonly h: Array<[number, number]>;
   readonly f: boolean[];
   readonly wh: Array<[string, string]>;
+  readonly mf: string[];
 }
 
 /** One JSON object per line: the members and their keys first, then one row per text. */
@@ -99,13 +101,17 @@ describe("review text parity with the Python worker", () => {
     );
   });
 
-  it("the review-only ask and review and merge", () => {
+  it("the review-only ask, review and merge, and the models a text names", () => {
     const read = (r: Row): unknown => {
       const ask = asksReviewOnly(r.t);
-      return { ro: ask === undefined ? null : [ask.who, ask.rest], rm: saysReviewAndMerge(r.t) };
+      return {
+        ro: ask === undefined ? null : [ask.who, ask.rest],
+        rm: saysReviewAndMerge(r.t),
+        mf: [...r.t.matchAll(modelFieldPattern())].map((m) => m.groups?.["model"] ?? ""),
+      };
     };
     assert.deepEqual(
-      differences(read, (r) => ({ ro: r.ro, rm: r.rm })),
+      differences(read, (r) => ({ ro: r.ro, rm: r.rm, mf: r.mf })),
       [],
     );
   });

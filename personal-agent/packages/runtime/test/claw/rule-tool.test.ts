@@ -221,3 +221,26 @@ describe("a rule archive that lies about its size", () => {
     assert.throws(() => ruleText(short), ClawAnswerInvalid);
   });
 });
+
+describe("a rule download larger than a rule can be", () => {
+  it("is refused while it is read, never held whole, and the message goes on", async () => {
+    let handed = 0;
+    const endless = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          handed += 65536;
+          controller.enqueue(new Uint8Array(65536));
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const wire = new Wire((sent) =>
+      sent.rawPath.endsWith("/download") ? new Response(endless) : json(200, { ok: true, message_id: "m" }),
+    );
+    const logger = new RecordingLogger();
+    await wire.client({ ruleToolId: 17, logger }).sessions.sendMessage("ak-a", "s", "hi");
+    assert.ok(handed <= 4 * RULE_MAX_BYTES + 2 * 65536, String(handed));
+    assert.equal(logger.lines[0]?.fields["error"], "ReplayRefused");
+    assert.equal((wire.sent.at(-1)?.body as Record<string, unknown>)["content"], `hi\n\n${CHANGE}`);
+  });
+});

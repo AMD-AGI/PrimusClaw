@@ -12,8 +12,11 @@ import {
   type Clock,
   type Logger,
 } from "@primusclaw/personal-agent";
-import { segment, type ClawHttp, head, readText } from "./http.js";
+import { segment, type ClawHttp, head } from "./http.js";
 import { readZip } from "./zip.js";
+
+/** A rule download is a zip of one file of at most RULE_MAX_BYTES; a larger answer is refused before it is held. */
+export const RULE_DOWNLOAD_MAX_BYTES = 4 * RULE_MAX_BYTES;
 
 /** The text of a rule tool as `GET /v1/tools/<id>/download` returns it: a zip holding one small markdown file. */
 export function ruleText(download: Uint8Array): string {
@@ -69,8 +72,8 @@ export class StyleRule {
 
   private async download(key: ClawCredential): Promise<string> {
     const path = `/v1/tools/${segment(this.toolId)}/download`;
-    const response = await this.http.send({ method: "GET", path, key });
-    if (response.status >= 400) throw new ClawError(response.status, head(await readText(response, path)));
-    return ruleText(new Uint8Array(await response.arrayBuffer()));
+    const { status, bytes } = await this.http.boundedBytes({ method: "GET", path, key }, RULE_DOWNLOAD_MAX_BYTES);
+    if (status >= 400) throw new ClawError(status, head(new TextDecoder().decode(bytes)));
+    return ruleText(bytes);
   }
 }

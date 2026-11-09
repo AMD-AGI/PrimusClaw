@@ -53,7 +53,8 @@ async function jsonOf(response: Response): Promise<Record<string, unknown>> {
 /** Only the status and the OAuth error code are kept: the body may carry a token, and is not ours to log or show. */
 function failed(what: string, status: number, body: Record<string, unknown>): ExchangeFailed {
   const code = body["error"];
-  const word = typeof code === "string" ? Array.from(code).slice(0, 40).join("") : "";
+  // Only an OAuth error word ("invalid_client"): anything else in that field may be what it should not be (a token).
+  const word = typeof code === "string" && /^[a-z][a-z0-9_]{0,39}$/.test(code) ? code : "";
   return { kind: "exchange_failed", reason: `${what} failed: ${String(status)} ${word}` };
 }
 

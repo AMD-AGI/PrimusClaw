@@ -84,6 +84,8 @@ describe("settings", () => {
     refused({ PORT: "" }, "PORT must be a whole number");
     assert.equal(settings({ PORT: "8_000" }).listenPort, 8000);
     refused({ PORT: "8__000" }, "PORT must be a whole number");
+    assert.equal(settings({ METRICS_PORT: "\u0669\u0664\u0666\u0664" }).metricsPort, 9464); // Arabic-Indic digits, as Python's isdigit/int
+    assert.equal(settings({ PORT: "\uff18\uff10\uff10\uff10" }).listenPort, 8000);
   });
 
   it("setting is read from the environment", () => {
