@@ -224,3 +224,21 @@ test("teams' own thumbs on the desktop become a vote on the answer they were giv
   const other = toInboundEvent(thumb("meh", ""));
   assert.ok(other.ok && other.value === undefined);
 });
+
+test("a card press names the card it was on by replyToId, a number as its digits", () => {
+  // (Python's Agent._close_card edits `activity.get("replyToId")` whatever its type: 7 is edited as "7")
+  const press = (replyToId: unknown) => ({
+    type: "invoke",
+    name: "adaptiveCard/action",
+    id: "inv-2",
+    replyToId,
+    serviceUrl: "https://smba.trafficmanager.net/amer/",
+    from: { id: "29:a", aadObjectId: "aad-a", name: "Lin Mei" },
+    recipient: { id: "28:bot" },
+    conversation: { id: "a:1", conversationType: "personal" },
+    value: { action: { type: "Action.Execute", verb: "x", data: { primusclaw: "decision" } } },
+  });
+  assert.equal(action(press(7)).cardMessageId, "7");
+  assert.equal(action(press("card-3")).cardMessageId, "card-3");
+  assert.equal(action(press(undefined)).cardMessageId, "");
+});
