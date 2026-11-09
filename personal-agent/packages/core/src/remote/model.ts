@@ -11,15 +11,15 @@
 import type { RemoteAgent, RemoteConnector, RemoteSession } from "../claw/remote.js";
 
 /** An agent a machine reports. */
-export interface Agent {
+export type Agent = {
   readonly agentId: string;
   readonly kind: string;
   readonly name: string;
   readonly capabilities: Readonly<Record<string, unknown>>;
-}
+};
 
 /** One of the user's machines: its connector, whether it is online now, and the agents it reports. */
-export interface Connector {
+export type Connector = {
   readonly connectorId: string;
   readonly name: string;
   readonly online: boolean;
@@ -33,10 +33,10 @@ export interface Connector {
   /** Joined with a pairing code (`claw-connector pair`) rather than a sign-in. */
   readonly paired: boolean;
   readonly agents: readonly Agent[];
-}
+};
 
 /** One of the user's remote sessions. */
-export interface Session {
+export type Session = {
   readonly sessionId: string;
   readonly connectorId: string;
   readonly agentId: string;
@@ -47,7 +47,7 @@ export interface Session {
   readonly readOnly: boolean | null;
   /** When it last changed, as Claw wrote it ("" not said): the newest is the one an agent's name attaches to. */
   readonly updatedAt: string;
-}
+};
 
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 
