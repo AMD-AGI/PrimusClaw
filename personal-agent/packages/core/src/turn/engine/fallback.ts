@@ -4,6 +4,7 @@
 /** A turn refused for want of the user's model key, run once more on a model that needs none. */
 
 import type { StatusMessage } from "../progress/status-message.js";
+import type { Step } from "../step.js";
 import { TurnState } from "../turn-state.js";
 import { ClawUnreachable } from "../upstream.js";
 import { isClawOrNetwork, statusOrKind } from "./claw-errors.js";
@@ -79,7 +80,7 @@ async function moveBack(ctx: TurnContext, sessionId: string, onSession: (session
 export async function rerunOnFallback(
   ctx: TurnContext,
   sessionId: string,
-  status: StatusMessage,
+  status: StatusMessage<Step>,
   onSession: (sessionId: string) => void,
   running: { called: boolean },
 ): Promise<Rerun | undefined> {

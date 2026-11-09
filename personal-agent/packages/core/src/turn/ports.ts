@@ -8,7 +8,7 @@
 
 import type { Clock } from "../ports/clock.js";
 import type { ClawSessionsPort } from "../ports/claw/sessions.js";
-import type { Conversation, OutMessage } from "../ports/surface.js";
+import type { Conversation } from "../ports/surface.js";
 
 /** Monotonic seconds of `clock`: the unit the turn's intervals are written in. */
 export function nowSeconds(clock: Clock): number {
@@ -20,18 +20,11 @@ export function sleepSeconds(clock: Clock, seconds: number, signal?: AbortSignal
   return clock.sleep(seconds * 1000, signal);
 }
 
-/**
- * The conversation the turn answers in: the calls of the Conversation port it makes. INTERIM (until W0-b adds it to the
- * port): `update` may be given the signal of the edit's sender, and an edit whose sender is cancelled before the channel
- * took it is withdrawn (a cancelled turn's last progress edit never lands after it). A Conversation without the option
- * fits this type and sends such an edit anyway.
- */
+/** The conversation the turn answers in: the calls of the Conversation port it makes. */
 export type TurnSurface = Pick<
   Conversation,
-  "typing" | "send" | "post" | "delete" | "openStream" | "outgoing" | "deliver"
-> & {
-  update(id: string, message: OutMessage, options?: { readonly signal?: AbortSignal }): Promise<void>;
-};
+  "typing" | "send" | "post" | "update" | "delete" | "openStream" | "outgoing" | "deliver"
+>;
 
 /** The calls of Claw's sessions port a turn makes. */
 export type TurnClaw = Pick<

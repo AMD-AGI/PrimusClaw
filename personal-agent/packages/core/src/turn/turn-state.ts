@@ -6,21 +6,15 @@
  * what the runner should do, so the mapping is testable without any network.
  */
 
-import { collapseSpaces, pySlice, pyStrip } from "../text/python-str.js";
+import { cpSlice, pyStrip, squashSpaces } from "../text/py-text.js";
 import { type Delivery, deliveryOf } from "./deliveries.js";
 import { type GithubOutcome, githubPrSummary, githubResult, githubWrite, reviewComments } from "./github-outcome.js";
 import { isObject, type JsonObject, objectOr, textOf, truthy } from "./json.js";
 import { todosOf } from "./plan.js";
 import { type ModelRefusalPolicy, noModelRefusalPolicy } from "../plugins/model-refusal-policy.js";
 import { NOTHING, type Step } from "./step.js";
-import {
-  HISTORY_COMPLETE,
-  isShell,
-  looksLikeFailure,
-  QUEUED_PREFIX,
-  skillInCommand,
-  type SseEvent,
-} from "./upstream.js";
+import { isShell, skillInCommand } from "./step-labels.js";
+import { HISTORY_COMPLETE, looksLikeFailure, QUEUED_PREFIX, type SseEvent } from "./upstream.js";
 
 /** Brain's setup steps before the first model call: never listed as steps, one "Preparing" line while it takes long. */
 export const PREPARATION_TOOLS: ReadonlySet<string> = new Set([
@@ -179,7 +173,7 @@ export class TurnState {
   /** One model turn. Earlier ones are narration between tool calls, so only the last one with text is the answer. */
   private assistantMessage(data: JsonObject): Step {
     const routed = data["routed_model"];
-    if (typeof routed === "string" && pyStrip(routed)) this.routedModel = pySlice(collapseSpaces(routed), 0, 100);
+    if (typeof routed === "string" && pyStrip(routed)) this.routedModel = cpSlice(squashSpaces(routed), 0, 100);
     const text = textOfBlocks(objectOr(data["data"])["content"]);
     this.partial = "";
     if (!pyStrip(text)) return NOTHING;

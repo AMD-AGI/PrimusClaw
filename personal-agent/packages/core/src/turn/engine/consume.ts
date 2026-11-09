@@ -44,7 +44,7 @@ export function noteRunning(ctx: TurnContext, state: TurnState, once: { called: 
 }
 
 /** A review's result, shown at the top of the progress message as it arrives (best effort: it never fails the turn). */
-function showResults(ctx: TurnContext, status: StatusMessage, state: TurnState, told: number): number {
+function showResults(ctx: TurnContext, status: StatusMessage<Step>, state: TurnState, told: number): number {
   const shown = ctx.hooks.onGithubResult;
   if (!shown || state.results.length <= told) return told;
   for (const outcome of state.results.slice(told)) {
@@ -142,7 +142,7 @@ interface Cursor {
 export interface ConsumeArgs {
   readonly sessionId: string;
   readonly state: TurnState;
-  readonly status: StatusMessage;
+  readonly status: StatusMessage<Step>;
   readonly running: { called: boolean };
   readonly signal?: AbortSignal | undefined;
 }

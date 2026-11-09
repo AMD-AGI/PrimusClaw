@@ -19,10 +19,11 @@
 
 import { type Lang, toLang } from "../locales/lang.js";
 import { turnEnglish, turnText } from "../locales/turn.js";
-import { collapseSpaces, pyLen, pyLstrip, pyRstrip, pySlice, pyStrip } from "../text/python-str.js";
+import { cpLength, cpSlice, pyLstrip, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { planHead, planText, type Todo } from "./plan.js";
 import type { Step } from "./step.js";
-import { failedLine, type Label, labelFor } from "./upstream.js";
+import { type Integrations, noIntegrations } from "../plugins/integrations.js";
+import { failedLine, type Label, labelFor } from "./step-labels.js";
 
 export const LIVE_HEADER = turnText.in("en").liveHeader;
 /** The progress message's first line, in the person's language. */
@@ -80,7 +81,11 @@ export class LiveView {
   /** The newest step, and how often in a row it has started. */
   private group: { label: Label; count: number } | undefined;
 
-  constructor(readonly lang: string = "en") {
+  constructor(
+    readonly lang: string = "en",
+    /** A deployment's MCP servers, whose steps read as "Querying <name>". */
+    private readonly integrations: Integrations = noIntegrations,
+  ) {
     this.header = turnText.in(toLang(lang)).liveHeader;
   }
 
@@ -93,7 +98,7 @@ export class LiveView {
       this.running = []; // the agent speaks once its tools are done; a finish that never came must not pin a line
       this.group = undefined;
     } else if (step.tool) {
-      const name = pySlice(collapseSpaces(step.tool[0]) || "tool", 0, LIVE_TOOL_NAME_MAX);
+      const name = cpSlice(squashSpaces(step.tool[0]) || "tool", 0, LIVE_TOOL_NAME_MAX);
       const status = step.tool[1];
       if (step.preparation) this.loadFailed(name);
       else if (TOOL_DONE.has(status)) this.finish(step, name, status);
@@ -111,7 +116,7 @@ export class LiveView {
   }
 
   private start(step: Step, name: string): void {
-    const label = labelFor(name, step.skill, this.lang);
+    const label = labelFor(name, step.skill, this.lang, this.integrations);
     const again = step.actionId ? this.running.find((e) => e.actionId === step.actionId) : undefined;
     if (again) {
       // the same step reported again: its label may now be better known, it is not a repeat
@@ -131,7 +136,7 @@ export class LiveView {
       : findLast(this.running, (e) => e.name === name);
     if (ended) this.running.splice(this.running.indexOf(ended), 1);
     if (status !== "error") return; // a step that went well leaves no line
-    const label = ended ? ended.label : labelFor(name, undefined, this.lang);
+    const label = ended ? ended.label : labelFor(name, undefined, this.lang, this.integrations);
     const last = this.blocks.at(-1);
     if (last && last.kind === "failed" && last.label.one === label.one) last.count += 1;
     else this.blocks.push({ kind: "failed", label, count: 1 });
@@ -189,9 +194,9 @@ export class LiveView {
     }
     const said = findLast(this.blocks, (b) => b.kind === "text");
     if (said && said.kind === "text") {
-      const flat = collapseSpaces(said.body.replaceAll("**", "").replaceAll("`", ""));
+      const flat = squashSpaces(said.body.replaceAll("**", "").replaceAll("`", ""));
       lines.push(
-        pyLen(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(pySlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`,
+        cpLength(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(cpSlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`,
       );
     }
     return lines;
@@ -199,17 +204,17 @@ export class LiveView {
 
   render(): string {
     const plan = planText(this.todos, this.lang);
-    const budget = LIVE_MAX_CHARS - (plan ? pyLen(plan) + 2 : 0); // the plan keeps its place; the lines get the rest
+    const budget = LIVE_MAX_CHARS - (plan ? cpLength(plan) + 2 : 0); // the plan keeps its place; the lines get the rest
     let body = "";
     let clipped = false;
     for (const paragraph of this.paragraphs().reverse()) {
       const joined = body ? `${paragraph}\n\n${body}` : paragraph;
-      if (pyLen(joined) <= budget) {
+      if (cpLength(joined) <= budget) {
         body = joined;
         continue;
       }
       clipped = true;
-      if (!body) body = pyLstrip(pySlice(paragraph, -budget)); // the newest paragraph alone is too long: keep its end
+      if (!body) body = pyLstrip(cpSlice(paragraph, -budget)); // the newest paragraph alone is too long: keep its end
       break;
     }
     if (clipped) body = `...\n\n${body}`;

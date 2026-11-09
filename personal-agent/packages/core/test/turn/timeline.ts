@@ -58,11 +58,16 @@ export class Timeline implements Clock {
     return this.now - this.start;
   }
 
-  private async step(): Promise<boolean> {
+  /** Wake the earliest sleeper (none due by `until`: move the clock to `until` and wake nobody). */
+  private async step(until = Number.POSITIVE_INFINITY): Promise<boolean> {
     await settle();
     this.sleepers = this.sleepers.filter((s) => !s.done);
     if (this.sleepers.length === 0) return false;
     const next = this.sleepers.reduce((a, b) => (b.when < a.when || (b.when === a.when && b.seq < a.seq) ? b : a));
+    if (next.when > until) {
+      this.now = Math.max(this.now, until);
+      return false;
+    }
     this.sleepers = this.sleepers.filter((s) => s !== next);
     next.done = true;
     this.now = Math.max(this.now, next.when);
@@ -93,7 +98,7 @@ export class Timeline implements Clock {
   async advanceTo(when: number): Promise<void> {
     for (let i = 0; i < 4000; i += 1) {
       if (this.now >= when) return;
-      if (!(await this.step())) {
+      if (!(await this.step(when))) {
         this.now = when;
         return;
       }

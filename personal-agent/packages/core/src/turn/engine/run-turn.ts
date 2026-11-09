@@ -8,12 +8,14 @@
  */
 
 import { errorName } from "../../errors.js";
+import type { SuggestedReply } from "../../ports/surface.js";
 import { SUGGESTED_REPLIES, turnEnglish, turnText } from "../../locales/turn.js";
-import { pyStrip } from "../../text/python-str.js";
+import { pyStrip } from "../../text/py-text.js";
 import { deepLink } from "../answer-parts.js";
 import { sleepSeconds } from "../ports.js";
 import { plainMessage } from "../progress/answer-messages.js";
-import { StatusMessage } from "../progress/status-message.js";
+import { type StatusMessage, turnStatusMessage } from "../progress/status-message.js";
+import type { Step } from "../step.js";
 import { detach, Task } from "../task.js";
 import { TurnState } from "../turn-state.js";
 import { ClawError, ClawUnreachable, errorKind, splitErrorTail } from "../upstream.js";
@@ -80,7 +82,7 @@ class TurnRun {
   constructor(
     private readonly ctx: TurnContext,
     private readonly controls: TurnControls,
-    private readonly status: StatusMessage,
+    private readonly status: StatusMessage<Step>,
   ) {
     this.sessionId = ctx.record.sessionId;
   }
@@ -192,7 +194,7 @@ class TurnRun {
   }
 
   /** Suggested replies: in a 1:1 chat, under an answer that went well, never under a review's one message. */
-  private replies(thumbs: boolean): ReadonlyArray<readonly [string, string]> | undefined {
+  private replies(thumbs: boolean): readonly SuggestedReply[] | undefined {
     const { ctx } = this;
     const offered = thumbs && !ctx.request.group && !ctx.hooks.shapeAnswer && ctx.deps.style.suggestedReplies;
     return offered ? SUGGESTED_REPLIES[langOf(ctx)] : undefined;
@@ -303,7 +305,7 @@ class TurnRun {
 export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise<void> {
   const replyTo = streamReplyTo(ctx);
   if (!replyTo) detach(() => typing(ctx)); // (a stream shows its own status at once: no bare typing indicator before it)
-  const status = new StatusMessage(ctx.deps.surface, {
+  const status = turnStatusMessage(ctx.deps.surface, {
     clock: ctx.deps.clock,
     log: ctx.deps.log,
     lang: langOf(ctx),
@@ -311,6 +313,7 @@ export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise
     streamReplyTo: replyTo,
     group: ctx.request.group ?? false,
     streamText: ctx.deps.style.streamText && !ctx.request.group,
+    ...(ctx.deps.integrations ? { integrations: ctx.deps.integrations } : {}),
   });
   status.begin();
   const run = new TurnRun(ctx, controls, status);

@@ -7,6 +7,7 @@
  */
 
 import { defineCatalog } from "./catalog.js";
+import type { SuggestedReply } from "../ports/surface.js";
 import type { Lang } from "./lang.js";
 
 /** Said in the person's language. */
@@ -56,17 +57,17 @@ export const turnText = defineCatalog({
   },
 });
 
-/** Suggested replies under a finished answer in a 1:1 chat: (what the button says, what it sends). */
-export const SUGGESTED_REPLIES: Readonly<Record<Lang, ReadonlyArray<readonly [string, string]>>> = {
+/** Suggested replies under a finished answer in a 1:1 chat: what the button says, and what it sends. */
+export const SUGGESTED_REPLIES: Readonly<Record<Lang, readonly SuggestedReply[]>> = {
   en: [
-    ["Continue", "Continue"],
-    ["Tell me more", "Tell me more"],
-    ["New session", "/new"],
+    { title: "Continue", value: "Continue" },
+    { title: "Tell me more", value: "Tell me more" },
+    { title: "New session", value: "/new" },
   ],
   zh: [
-    ["继续", "继续"],
-    ["详细说说", "详细说说"],
-    ["开个新会话", "/new"],
+    { title: "继续", value: "继续" },
+    { title: "详细说说", value: "详细说说" },
+    { title: "开个新会话", value: "/new" },
   ],
 };
 
@@ -100,3 +101,21 @@ export const turnEnglish = {
   deliveryLine: (name: string, size: string, caption: string, url: string) =>
     `File **${name}** (${size})${caption}: [Download](${url}) (only the person who asked can open it)`,
 } as const;
+
+/** The Stop card of a turn from a phone, and what a press of it is answered with (stop_button.py). */
+export const stopText = defineCatalog({
+  en: {
+    card: "Working on your message. Tap Stop to stop it.",
+    button: "Stop",
+    turnOver: "That turn has already ended, so nothing was stopped.",
+    pressed: "Stop was pressed.",
+    notChecked: "I could not check whether that turn is still running, so nothing was stopped. Send /stop to stop it.",
+  },
+  zh: {
+    card: "正在处理这条消息。要停下，点「停止」。",
+    button: "停止",
+    turnOver: "这一轮已经结束了，没有停止任何东西。",
+    pressed: "已按下「停止」。",
+    notChecked: "现在确认不了这一轮是否还在进行，所以没有停止任何东西。要停下请发 /stop。",
+  },
+});

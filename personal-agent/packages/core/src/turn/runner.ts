@@ -7,6 +7,7 @@
  * review service fills in.
  */
 
+import type { Integrations } from "../plugins/integrations.js";
 import type { ModelRefusalPolicy } from "../plugins/model-refusal-policy.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
@@ -86,6 +87,8 @@ export interface TurnEngineDeps {
   /** Fetches the files a person sent (undefined: this worker takes none). */
   readonly fetchFiles?: TurnHooks["fetchFiles"];
   readonly onFilesDropped?: TurnHooks["onFilesDropped"];
+  /** A deployment's MCP servers, named in progress lines. */
+  readonly integrations?: Integrations;
 }
 
 function reviewRequest(review: ReviewTurnOptions): Partial<TurnRequest> {
@@ -164,11 +167,20 @@ export class TurnEngine implements TurnRunner {
   }
 
   async run(run: TurnRun, hooks: RouterHooks): Promise<TurnOutcome> {
-    const { claw, clock, log, refusals, errors, style } = this.deps;
+    const { claw, clock, log, refusals, errors, style, integrations } = this.deps;
     const ctx: TurnContext = {
       request: this.request(run),
       hooks: this.hooks(run, hooks),
-      deps: { claw, surface: run.conversation, clock, log, refusals, errors, style },
+      deps: {
+        claw,
+        surface: run.conversation,
+        clock,
+        log,
+        refusals,
+        errors,
+        style,
+        ...(integrations ? { integrations } : {}),
+      },
       record: newRecord(run.sessionId ?? undefined, run.sessionModel),
     };
     const report = hooks.reportView();

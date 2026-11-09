@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { OutMessage, UserRef } from "../../ports/surface.js";
+import type { OutMessage, SuggestedReply, UserRef } from "../../ports/surface.js";
 
 export interface FinishOptions {
   /** The parts are an answer: rich text with the markdown converted (the live edits stay plain markdown). */
@@ -12,19 +12,13 @@ export interface FinishOptions {
   readonly mention?: UserRef | undefined;
   /** What the agent wrote: the chat's AI label. */
   readonly ai?: boolean;
-  /** Suggested replies under the last part: (what the button says, what it sends). */
-  readonly replies?: ReadonlyArray<readonly [string, string]> | undefined;
+  /** Suggested replies under the last part. */
+  readonly replies?: readonly SuggestedReply[] | undefined;
 }
 
 /** A plain markdown message. */
 export function plainMessage(text: string, ai = false): OutMessage {
   return { body: { type: "text", text }, ...(ai ? { aiGenerated: true } : {}) };
-}
-
-/** What a finished message's text is, whatever its body. */
-export function textOfMessage(message: OutMessage): string {
-  const body = message.body;
-  return body.type === "text" ? body.text : body.type === "rich" ? body.markdown : body.fallbackText;
 }
 
 /**
@@ -37,9 +31,7 @@ export function answerMessages(parts: readonly string[], options: FinishOptions)
     body: options.rich ? { type: "rich", markdown: text, lead: n === 0 } : { type: "text", text },
     ...(options.ai ? { aiGenerated: true } : {}),
     ...(n === last && options.feedback ? { feedback: true } : {}),
-    ...(n === last && options.replies?.length
-      ? { suggestions: options.replies.map(([title, value]) => ({ title, value })) }
-      : {}),
+    ...(n === last && options.replies?.length ? { suggestions: options.replies } : {}),
     ...(n === 0 && options.mention ? { mentions: [options.mention] } : {}),
   }));
 }
