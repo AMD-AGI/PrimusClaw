@@ -9,6 +9,7 @@ import { approvalRenderers } from "./approval/index.js";
 import { assistantRenderers } from "./assistant/index.js";
 import { COMMAND_RENDERERS } from "./commands/index.js";
 import { FEEDBACK_RENDERERS } from "./feedback/index.js";
+import { OBSERVE_RENDERERS } from "./observe/index.js";
 import { proactiveRenderers } from "./proactive/index.js";
 import type { Renderers } from "./registry.js";
 import { REVIEW_RENDERERS } from "./review/index.js";
@@ -19,6 +20,7 @@ export const RENDERERS: Renderers = {
   ...assistantRenderers,
   ...COMMAND_RENDERERS,
   ...FEEDBACK_RENDERERS,
+  ...OBSERVE_RENDERERS,
   ...proactiveRenderers,
   ...TURN_RENDERERS,
   ...REVIEW_RENDERERS,
