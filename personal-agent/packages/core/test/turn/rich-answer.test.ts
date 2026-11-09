@@ -127,7 +127,8 @@ it("test_the_xml_answer_is_a_new_message_even_when_every_edit_is_refused", async
   status.begin();
   await clock.pump(status.finish([ANSWER], { rich: true }));
   const answers = bus.sent.filter((s) => textOf(s.message) === ANSWER);
-  assert.equal(answers.length, 1);
-  assert.equal(answers[0]?.operation, "send");
-  assert.deepEqual(answers[0]?.message, { body: { type: "rich", markdown: ANSWER, lead: true } });
+  const [answer] = answers;
+  assert.ok(answer && answers.length === 1);
+  assert.equal(answer.operation, "send");
+  assert.deepEqual(answer.message, { body: { type: "rich", markdown: ANSWER, lead: true } });
 });
