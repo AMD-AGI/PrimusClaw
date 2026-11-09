@@ -10,7 +10,9 @@
 
 import { collapseSpaces, pySlice, pyRstrip } from "../text/python-str.js";
 import { isObject, objectOr } from "./json.js";
-import type { TurnClaw, TurnLog } from "./ports.js";
+import { errorName } from "../errors.js";
+import type { Logger } from "../ports/logger.js";
+import type { TurnClaw } from "./ports.js";
 import { ClawError, errorKind } from "./upstream.js";
 
 /** One try, then nothing: the answer is already in the chat. */
@@ -85,7 +87,10 @@ function fileOf(raw: unknown): FileChange | undefined {
 
 function repoOf(raw: unknown): RepoChanges | undefined {
   if (!isObject(raw) || !Array.isArray(raw["files"])) return undefined;
-  const files = raw["files"].slice(0, MAX_FILES_READ).map(fileOf).filter((f): f is FileChange => f !== undefined);
+  const files = raw["files"]
+    .slice(0, MAX_FILES_READ)
+    .map(fileOf)
+    .filter((f): f is FileChange => f !== undefined);
   const totals = objectOr(raw["totals"]);
   return {
     path: text(raw["path"], 200) || "/workspace",
@@ -114,14 +119,24 @@ export function parseChanges(reply: unknown): Changes | undefined {
 }
 
 /** The session's changes, or undefined for anything that means there is nothing to show. Never rejects. */
-export async function fetchChanges(claw: TurnClaw, key: string, sessionId: string, log: TurnLog): Promise<Changes | undefined> {
+export async function fetchChanges(
+  claw: TurnClaw,
+  key: string,
+  sessionId: string,
+  log: Logger,
+): Promise<Changes | undefined> {
   let reply: unknown;
   try {
     reply = await claw.sessionChanges(key, sessionId, CHANGES_TIMEOUT_SECONDS);
   } catch (err) {
     // 409 sandbox_not_running and 404 are the contract's ordinary answers; anything else is worth a line in the log
-    const ordinary = err instanceof ClawError && (err.status === 404 || err.status === 409);
-    (ordinary ? log.info : log.warn).call(log, "changes for a session not shown", { error: errorKind(err) });
+    if (err instanceof ClawError && (err.status === 404 || err.status === 409)) {
+      log.info("changes for a session not shown", { status: err.status });
+    } else {
+      log.warn("changes for a session not shown", {
+        error: err instanceof ClawError ? errorKind(err) : errorName(err),
+      });
+    }
     return undefined;
   }
   return parseChanges(reply);

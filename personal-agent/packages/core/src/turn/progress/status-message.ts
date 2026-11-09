@@ -23,7 +23,7 @@ import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
 import type { OutMessage, StreamRefused } from "../../ports/surface.js";
 import type { Result } from "../../result.js";
-import { pyStrip } from "../../text/python-str.js";
+import { pyLen, pyStrip } from "../../text/python-str.js";
 import { LiveView } from "../live-view.js";
 import { nowSeconds, sleepSeconds, type TurnSurface } from "../ports.js";
 import type { Step } from "../step.js";
@@ -144,7 +144,10 @@ export class StatusMessage {
 
   /** The chat did not take the stream: the turn is shown by the progress message from here on. */
   private fallBack(err: StreamRefused): void {
-    this.log.warn("live stream not used; showing progress as an edited message", { reason: err.reason, status: err.status });
+    this.log.warn("live stream not used; showing progress as an edited message", {
+      reason: err.reason,
+      status: err.status,
+    });
     this.stream = undefined;
     if (!this.closed) {
       this.posted = new Task(() => this.surface.post(plainMessage(this.render())));
@@ -168,8 +171,11 @@ export class StatusMessage {
     this.streamOver = true;
     const line = turnText.in(this.lang).stillWorking;
     const closed = await live.final(plainMessage(live.streamed ? `${live.streamed}\n\n${line}` : line));
-    if (!closed.ok) this.log.warn("the turn's stream could not be closed before the chat's limit; the answer follows as a message");
-    this.log.info("the turn's stream was closed; the answer follows as a message of its own", { age: Math.round(live.age()) });
+    if (!closed.ok)
+      this.log.warn("the turn's stream could not be closed before the chat's limit; the answer follows as a message");
+    this.log.info("the turn's stream was closed; the answer follows as a message of its own", {
+      age: Math.round(live.age()),
+    });
   }
 
   /** The chat's id of the posted message; undefined when the post failed or its id never came (nothing is edited then). */
@@ -255,15 +261,20 @@ export class StatusMessage {
   private streamable(): string {
     if (!this.streamText || !this.stream) return "";
     const text = [...this.said, ...(this.partial ? [this.partial] : [])].join("\n\n");
-    if ([...text].length > STREAM_TEXT_MAX || !text.startsWith(this.stream.streamed)) return this.stream.streamed;
+    if (pyLen(text) > STREAM_TEXT_MAX || !text.startsWith(this.stream.streamed)) return this.stream.streamed;
     return text;
+  }
+
+  /** Whether the turn is still shown by its stream (a refusal hands it to the progress message). */
+  private streaming(): boolean {
+    return this.stream !== undefined;
   }
 
   private async flush(signal: AbortSignal): Promise<void> {
     if (this.opening && !this.opening.done) await unlessAborted(this.opening.settled(), signal);
     if (this.stream) {
       await this.flushStream(signal);
-      if (this.stream) return;
+      if (this.streaming()) return; // (else the stream was refused on the way: the progress message took over)
     }
     const messageId = await this.messageId(signal);
     while (messageId && !this.closed) {
@@ -314,7 +325,9 @@ export class StatusMessage {
         this.fallBack(sent.error);
         return;
       }
-      this.log.info("a status update of the turn's stream was not taken; the next one follows", { status: sent.error.status });
+      this.log.info("a status update of the turn's stream was not taken; the next one follows", {
+        status: sent.error.status,
+      });
       this.lastText = ""; // (sent again after the interval)
     }
   }
@@ -348,7 +361,8 @@ export class StatusMessage {
 
   private async interrupt(stream: StreamHandle): Promise<void> {
     const closed = await stream.final(plainMessage(turnText.in(this.lang).interrupted));
-    if (!closed.ok) this.log.warn("the stream of a cancelled turn could not be closed; the chat closes it at its limit");
+    if (!closed.ok)
+      this.log.warn("the stream of a cancelled turn could not be closed; the chat closes it at its limit");
   }
 
   /**
@@ -357,11 +371,7 @@ export class StatusMessage {
    * The thumbs (`feedback`) and suggested replies go under the LAST part, and nowhere else.
    */
   async finish(parts: readonly string[], options: FinishOptions = {}): Promise<void> {
-    this.close();
-    if (this.expiry && !this.expiry.done && !this.expiring) this.expiry.cancel();
-    for (const task of [this.opening, this.flusher, this.expiring ? this.expiry : undefined]) {
-      if (task) await task.settled();
-    }
+    await this.quiesce();
     const messages = answerMessages(parts, options);
     if (this.stream && this.stream.open && !this.streamOver) {
       await this.finishStream(this.stream, messages, parts, options);
@@ -374,11 +384,23 @@ export class StatusMessage {
     if (messageId) await this.retire(messageId);
   }
 
+  /** Stop the live view and wait for what is still on its way: the stream's opening, the last edit, a closing stream. */
+  private async quiesce(): Promise<void> {
+    this.close();
+    if (this.expiry && !this.expiry.done && !this.expiring) this.expiry.cancel();
+    for (const task of [this.opening, this.flusher, this.expiring ? this.expiry : undefined]) {
+      if (task) await task.settled();
+    }
+  }
+
   /**
    * The stream opened and the chat later refused an update of it, so the progress message took over: the stream is still
    * closed, with the first part of the answer when the chat takes that. Returns what is left to send as messages.
    */
-  private async closeRefusedStream(live: StreamHandle, messages: readonly OutMessage[]): Promise<readonly OutMessage[]> {
+  private async closeRefusedStream(
+    live: StreamHandle,
+    messages: readonly OutMessage[],
+  ): Promise<readonly OutMessage[]> {
     let final: OutMessage;
     let rest: readonly OutMessage[];
     const [first, ...others] = messages;
@@ -387,7 +409,9 @@ export class StatusMessage {
     else [final, rest] = [plainMessage(turnText.in(this.lang).doneShort), []];
     const closed = await live.final(final);
     if (closed.ok) return rest;
-    this.log.warn("the refused stream could not be closed either; the chat closes it at its limit", { reason: closed.error.reason });
+    this.log.warn("the refused stream could not be closed either; the chat closes it at its limit", {
+      reason: closed.error.reason,
+    });
     return messages;
   }
 
@@ -410,12 +434,15 @@ export class StatusMessage {
       const whole = parts.length > 0 && text.endsWith(pyStrip(parts.join("\n\n")));
       final = plainMessage(text, options.ai ?? false);
       const suggestions = messages.at(-1)?.suggestions;
-      if (whole) final = { ...final, ...(options.feedback ? { feedback: true } : {}), ...(suggestions ? { suggestions } : {}) };
+      if (whole)
+        final = { ...final, ...(options.feedback ? { feedback: true } : {}), ...(suggestions ? { suggestions } : {}) };
       rest = whole ? [] : messages;
     }
     const closed = await stream.final(final);
     if (!closed.ok) {
-      this.log.warn("the stream's final message was refused; the answer is sent as a message", { reason: closed.error.reason });
+      this.log.warn("the stream's final message was refused; the answer is sent as a message", {
+        reason: closed.error.reason,
+      });
       rest = messages;
     }
     for (const message of rest) await this.surface.send(message);

@@ -17,17 +17,19 @@ export function isPySpace(char: string): boolean {
   return PY_SPACE_SET.has(char);
 }
 
+/** The code points of `text`: what Python indexes and counts a string by. */
+export function codePoints(text: string): string[] {
+  return Array.from(text);
+}
+
 /** `len(text)`: code points. */
 export function pyLen(text: string): number {
-  let count = 0;
-  for (const _ of text) count += 1;
-  return count;
+  return codePoints(text).length;
 }
 
 /** `text[start:end]` in code points (negative indices count from the end, as in Python). */
 export function pySlice(text: string, start: number, end?: number): string {
-  const points = Array.from(text);
-  return points.slice(start, end).join("");
+  return codePoints(text).slice(start, end).join("");
 }
 
 /** `text.split()`: the words between runs of whitespace, none empty. */

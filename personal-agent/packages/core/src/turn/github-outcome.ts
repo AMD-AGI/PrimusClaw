@@ -26,8 +26,10 @@ function writeToolOf(tool: string): string | undefined {
   return GITHUB_WRITE_TOOLS.has(name) ? name : undefined;
 }
 
+/** Python's `str(description or "")` for the answers Claw sends (a string, or a number at most). */
 function described(description: unknown): string {
-  return typeof description === "string" ? description : description ? String(description) : "";
+  if (typeof description === "string") return description;
+  return typeof description === "number" && description !== 0 ? String(description) : "";
 }
 
 /**

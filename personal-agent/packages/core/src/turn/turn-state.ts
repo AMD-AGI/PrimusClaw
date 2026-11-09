@@ -11,9 +11,16 @@ import { type Delivery, deliveryOf } from "./deliveries.js";
 import { type GithubOutcome, githubPrSummary, githubResult, githubWrite, reviewComments } from "./github-outcome.js";
 import { isObject, type JsonObject, objectOr, textOf, truthy } from "./json.js";
 import { todosOf } from "./plan.js";
-import type { RefusalReader } from "./ports.js";
+import { type ModelRefusalPolicy, noModelRefusalPolicy } from "../plugins/model-refusal-policy.js";
 import { NOTHING, type Step } from "./step.js";
-import { HISTORY_COMPLETE, isShell, looksLikeFailure, QUEUED_PREFIX, skillInCommand, type SseEvent } from "./upstream.js";
+import {
+  HISTORY_COMPLETE,
+  isShell,
+  looksLikeFailure,
+  QUEUED_PREFIX,
+  skillInCommand,
+  type SseEvent,
+} from "./upstream.js";
 
 /** Brain's setup steps before the first model call: never listed as steps, one "Preparing" line while it takes long. */
 export const PREPARATION_TOOLS: ReadonlySet<string> = new Set([
@@ -25,6 +32,8 @@ export const PREPARATION_TOOLS: ReadonlySet<string> = new Set([
 ]);
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["stopped", "failed"]);
 const TOOL_DONE: ReadonlySet<string> = new Set(["success", "error"]);
+/** Events only the main agent's count: a subagent's text, deltas and result are not the turn's. */
+const MAIN_AGENT_ONLY: ReadonlySet<string> = new Set(["AssistantMessage", "chatDelta", "ResultMessage"]);
 
 /** Which turn an event belongs to: `data.message_id`, else `data.data.message_id` (undefined: none said). */
 export function messageIdOf(data: JsonObject): unknown {
@@ -86,9 +95,9 @@ export class TurnState {
    */
   constructor(
     public messageId: string | undefined,
-    readonly behind: string | undefined = undefined,
+    readonly behind?: string,
     readonly first = false,
-    private readonly refusals: RefusalReader = { isRefusal: () => false },
+    private readonly refusals: ModelRefusalPolicy = noModelRefusalPolicy,
   ) {}
 
   get answer(): string {
@@ -139,19 +148,24 @@ export class TurnState {
     const data = event.data;
     if (!this.mine(data)) return NOTHING;
     const mainAgent = !truthy(data["subagent_id"]);
-    switch (event.name) {
+    if (MAIN_AGENT_ONLY.has(event.name) && !mainAgent) return NOTHING;
+    return this.step(event.name, data, mainAgent);
+  }
+
+  private step(name: string, data: JsonObject, mainAgent: boolean): Step {
+    switch (name) {
       case "AssistantMessage":
-        return mainAgent ? this.assistantMessage(data) : NOTHING;
+        return this.assistantMessage(data);
       case "toolUsed":
         return this.toolUsed(data, mainAgent);
       case "chatDelta":
-        return mainAgent ? this.chatDelta(data) : NOTHING;
+        return this.chatDelta(data);
       case "permissionRequest":
-        return { approval: data };
+        return truthy(data) ? { approval: data } : NOTHING;
       case "userQuestion":
-        return { question: data };
+        return truthy(data) ? { question: data } : NOTHING;
       case "ResultMessage":
-        return mainAgent ? this.resultMessage(data) : NOTHING;
+        return this.resultMessage(data);
       case "statusUpdate":
         return this.statusUpdate(data);
       case "error":
@@ -171,7 +185,7 @@ export class TurnState {
     if (!pyStrip(text)) return NOTHING;
     this.text = text;
     // (the proxy's raw error, or Brain's for a failed model call, is no progress: never shown)
-    if (this.refusals.isRefusal(text) || looksLikeFailure(text)) return NOTHING;
+    if (this.refusals.classify(text, undefined) !== undefined || looksLikeFailure(text)) return NOTHING;
     return { narration: pyStrip(text) };
   }
 

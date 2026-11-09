@@ -97,11 +97,12 @@ export function assistantDeliveries(event: JsonObject): Array<readonly [string, 
 
 /** A size as a file manager says it: "512 B", "1.5 KB", "12 MB". */
 export function sizeText(size: number): string {
-  if (size < 1024) return `${size} B`;
+  if (size < 1024) return `${String(size)} B`;
   let scaled = size;
   for (const unit of ["KB", "MB", "GB"]) {
     scaled /= 1024;
-    if (scaled < 1024 || unit === "GB") return scaled < 10 ? `${pyFixed(scaled, 1)} ${unit}` : `${pyFixed(scaled, 0)} ${unit}`;
+    if (scaled < 1024 || unit === "GB")
+      return scaled < 10 ? `${pyFixed(scaled, 1)} ${unit}` : `${pyFixed(scaled, 0)} ${unit}`;
   }
   return "";
 }

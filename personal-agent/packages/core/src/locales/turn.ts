@@ -15,9 +15,10 @@ export const turnText = defineCatalog({
     /** The progress message's first line. */
     liveHeader: "Working on it...",
     preparing: "Preparing…",
-    planHead: (p: { done: number; total: number }) => `**Plan: ${p.done} of ${p.total} done**`,
-    planAllDone: (p: { total: number }) => `**Plan: all ${p.total} steps done** ✅`,
-    planMore: (p: { n: number; done: number; todo: number }) => `...and ${p.n} more (${p.done} done, ${p.todo} to do)`,
+    planHead: (p: { done: number; total: number }) => `**Plan: ${String(p.done)} of ${String(p.total)} done**`,
+    planAllDone: (p: { total: number }) => `**Plan: all ${String(p.total)} steps done** ✅`,
+    planMore: (p: { n: number; done: number; todo: number }) =>
+      `...and ${String(p.n)} more (${String(p.done)} done, ${String(p.todo)} to do)`,
     /** A floating status before anything happened. */
     thinking: "Thinking…",
     /** A turn still running when its stream has to close: the answer follows as a message of its own. */
@@ -32,16 +33,16 @@ export const turnText = defineCatalog({
       "PrimusClaw is still finishing earlier work on this session, so your message is queued and will " +
       "run as soon as that finishes. I will reply here when it is done.",
     stillRunning: (p: { minutes: number }) =>
-      `This task is still running in PrimusClaw; I stopped following it here after ${p.minutes} minutes.`,
+      `This task is still running in PrimusClaw; I stopped following it here after ${String(p.minutes)} minutes.`,
     stillRunningNotify: " I will message you here when it finishes or needs your approval.",
     stillRunningOpen: " Open the session to follow it.",
   },
   zh: {
     liveHeader: "正在处理…",
     preparing: "准备中…",
-    planHead: (p) => `**计划：已完成 ${p.done}/${p.total}**`,
-    planAllDone: (p) => `**计划：${p.total} 项已全部完成** ✅`,
-    planMore: (p) => `……另有 ${p.n} 项（${p.done} 项已完成，${p.todo} 项待办）`,
+    planHead: (p) => `**计划：已完成 ${String(p.done)}/${String(p.total)}**`,
+    planAllDone: (p) => `**计划：${String(p.total)} 项已全部完成** ✅`,
+    planMore: (p) => `……另有 ${String(p.n)} 项（${String(p.done)} 项已完成，${String(p.todo)} 项待办）`,
     thinking: "思考中…",
     stillWorking: "仍在处理，完成后另发结果。",
     interrupted: "已中断。",
@@ -49,7 +50,7 @@ export const turnText = defineCatalog({
     taskFailed: "任务出错了，没有完成。可以回复 /feedback 告诉 PrimusClaw 团队。",
     openSession: "打开会话",
     queuedNotice: "PrimusClaw 还在这个会话上完成之前的工作，你的消息已排队，它一结束就运行。完成后我在这里回复你。",
-    stillRunning: (p) => `任务仍在 PrimusClaw 中运行；我已在 ${p.minutes} 分钟后停止在这里跟踪它。`,
+    stillRunning: (p) => `任务仍在 PrimusClaw 中运行；我已在 ${String(p.minutes)} 分钟后停止在这里跟踪它。`,
     stillRunningNotify: " 完成或需要你批准时，我会在这里通知你。",
     stillRunningOpen: " 请打开会话查看进展。",
   },
@@ -78,13 +79,15 @@ export const turnEnglish = {
   openFullAnswer: "Open the full answer",
   onlyTheAsker: " (only the person who asked can open it)",
   wholeCutNote: "\n\n… (the rest did not fit in three messages)",
-  couldNotLoad: (name: string, count: number) => `Could not load ${name}${count > 1 ? ` (x${count})` : ""}`,
+  couldNotLoad: (name: string, count: number) => `Could not load ${name}${count > 1 ? ` (x${String(count)})` : ""}`,
   stopped: "Stopped.",
   lostConnection: "I lost the connection to PrimusClaw before the task finished.",
   openSessionLink: "Open the session",
-  keyRejected: "PrimusClaw rejected your linked key (it may have expired or been deleted). Send /unlink, then link again.",
+  keyRejected:
+    "PrimusClaw rejected your linked key (it may have expired or been deleted). Send /unlink, then link again.",
   clawBusy: "PrimusClaw is busy right now. Please try again in a minute.",
-  clawRequestFailed: (status: number, ref: string) => `PrimusClaw could not take that request (error ${status}, ref ${ref}).`,
+  clawRequestFailed: (status: number, ref: string) =>
+    `PrimusClaw could not take that request (error ${String(status)}, ref ${ref}).`,
   nothingStarted: "Nothing was started.",
   /** Both languages in one line: the group of a review is told, whatever its language. */
   reviewRefused:

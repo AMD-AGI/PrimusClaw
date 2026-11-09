@@ -37,7 +37,9 @@ export function answerMessages(parts: readonly string[], options: FinishOptions)
     body: options.rich ? { type: "rich", markdown: text, lead: n === 0 } : { type: "text", text },
     ...(options.ai ? { aiGenerated: true } : {}),
     ...(n === last && options.feedback ? { feedback: true } : {}),
-    ...(n === last && options.replies?.length ? { suggestions: options.replies.map(([title, value]) => ({ title, value })) } : {}),
+    ...(n === last && options.replies?.length
+      ? { suggestions: options.replies.map(([title, value]) => ({ title, value })) }
+      : {}),
     ...(n === 0 && options.mention ? { mentions: [options.mention] } : {}),
   }));
 }

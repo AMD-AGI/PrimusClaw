@@ -79,7 +79,8 @@ export class StreamHandle {
   async emit(text: string): Promise<Result<void, StreamRefused>> {
     const stream = this.usable(false);
     if (!stream) return err(OVER);
-    if (!text.startsWith(this.streamed)) return err({ ...OVER, reason: "streamed text must grow from what was streamed" });
+    if (!text.startsWith(this.streamed))
+      return err({ ...OVER, reason: "streamed text must grow from what was streamed" });
     const sent = this.refused(await stream.emit(text));
     if (sent.ok) this.streamed = text;
     return sent;

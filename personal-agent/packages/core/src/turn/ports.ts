@@ -7,7 +7,7 @@
  */
 
 import type { Clock } from "../ports/clock.js";
-import type { Conversation, FetchedFile, OutMessage } from "../ports/surface.js";
+import type { Conversation, FetchedFile } from "../ports/surface.js";
 import type { SseEvent } from "./upstream.js";
 
 /** Monotonic seconds of `clock`: the unit the turn's intervals are written in. */
@@ -20,19 +20,11 @@ export function sleepSeconds(clock: Clock, seconds: number, signal?: AbortSignal
   return clock.sleep(seconds * 1000, signal);
 }
 
-/** A message as it will be published, built before the publish so it can be recorded first (an approval card). */
-export interface Envelope {
-  readonly body: Readonly<Record<string, unknown>>;
-}
-
-/**
- * The conversation the turn answers in: the Conversation port, and the two calls that let an approval card be recorded
- * (as published, byte for byte) before it is sent. INTERIM until W0 adds them to Conversation.
- */
-export interface TurnSurface extends Pick<Conversation, "typing" | "send" | "post" | "update" | "delete" | "openStream"> {
-  outgoing(message: OutMessage): Envelope;
-  deliver(envelope: Envelope): Promise<void>;
-}
+/** The conversation the turn answers in: the calls of the Conversation port it makes. */
+export type TurnSurface = Pick<
+  Conversation,
+  "typing" | "send" | "post" | "update" | "delete" | "openStream" | "outgoing" | "deliver"
+>;
 
 // --- Claw (the turn's subset of W2's ClawPort) ----------------------------------------------------------------------
 
@@ -59,11 +51,6 @@ export interface ReplayRow {
   readonly data?: unknown;
 }
 
-/** A file as Claw takes it: its name, bytes and media type. */
-export interface UploadFile extends FetchedFile {
-  readonly mediaType: string;
-}
-
 /** The turn's subset of the Claw port. Errors: ClawError (an error status), ClawUnreachable, ClawReplyInvalid. */
 export interface TurnClaw {
   createSession(
@@ -86,7 +73,7 @@ export interface TurnClaw {
     key: string,
     sessionId: string,
     folder: string,
-    files: readonly UploadFile[],
+    files: readonly FetchedFile[],
   ): Promise<readonly [string[], string[]]>;
   /** The session's stored events, oldest first; `tail`: only the last ones; refused past `maxBytes`. */
   sessionEvents(

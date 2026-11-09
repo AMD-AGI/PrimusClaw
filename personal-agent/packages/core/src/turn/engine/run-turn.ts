@@ -7,12 +7,14 @@
  * problem" view; one that went well gets thumbs under its answer instead. A group chat runs the same turn as a 1:1 chat.
  */
 
-import { deepLink } from "../answer-parts.js";
+import { errorName } from "../../errors.js";
+import { SUGGESTED_REPLIES, turnEnglish, turnText } from "../../locales/turn.js";
 import { pyStrip } from "../../text/python-str.js";
-import type { LiveStream } from "../ports.js";
+import { deepLink } from "../answer-parts.js";
+import { sleepSeconds } from "../ports.js";
+import { plainMessage } from "../progress/answer-messages.js";
 import { StatusMessage } from "../progress/status-message.js";
 import { detach, Task } from "../task.js";
-import { LOST_CONNECTION, QUEUED_NOTICE, QUEUED_NOTICE_ZH, SUGGESTED_REPLIES } from "../text.js";
 import { TurnState } from "../turn-state.js";
 import { ClawError, ClawUnreachable, errorKind, splitErrorTail, withhold } from "../upstream.js";
 import { consume, noteRunning, StreamKeptDropping } from "./consume.js";
@@ -48,14 +50,14 @@ export interface TurnControls {
 }
 
 /**
- * The live stream this turn is shown by, or undefined: the progress message. A review keeps its progress message (its
- * acknowledgement and result are shown at the top of it, and it ends as that one message), and so does a turn that only
- * follows a session Claw made.
+ * The person's message a live stream answers, or undefined: the turn is shown by the progress message. A review keeps
+ * its progress message (its acknowledgement and result are shown at the top of it, and it ends as that one message), and
+ * so does a turn that only follows a session Claw made.
  */
-function turnStream(ctx: TurnContext): LiveStream | undefined {
+function streamReplyTo(ctx: TurnContext): string | undefined {
   const { lead, attach, actingAs } = ctx.request;
   if (lead || ctx.hooks.onGithubResult || ctx.hooks.shapeAnswer || attach || actingAs) return undefined;
-  return ctx.deps.surface.openStream(ctx.deps.clock);
+  return ctx.request.streamReplyTo || undefined;
 }
 
 /** The typing indicator is a courtesy: one that fails or is slow neither delays the status post nor fails the turn. */
@@ -63,7 +65,7 @@ async function typing(ctx: TurnContext): Promise<void> {
   try {
     await ctx.deps.surface.typing();
   } catch (err) {
-    ctx.deps.log.warn("typing indicator failed; the turn goes on", { error: String(err) });
+    ctx.deps.log.warn("typing indicator failed; the turn goes on", { error: errorName(err) });
   }
 }
 
@@ -88,7 +90,8 @@ class TurnRun {
     try {
       this.ctx.hooks.onTurn(this.sessionId, what, messageId ?? "");
     } catch (err) {
-      this.ctx.deps.log.warn("recording the turn failed", { error: String(err) }); // losing the record only costs a duplicate card
+      // losing the record only costs a duplicate card
+      this.ctx.deps.log.warn("recording the turn failed", { error: errorName(err) });
     }
   }
 
@@ -96,7 +99,7 @@ class TurnRun {
   async follow(): Promise<boolean> {
     const deadline = new AbortController();
     const timer = new Task(async (signal) => {
-      await this.ctx.deps.clock.sleep(TURN_DEADLINE_SECONDS, signal);
+      await sleepSeconds(this.ctx.deps.clock, TURN_DEADLINE_SECONDS, signal);
       this.expired = true;
       deadline.abort(new DeadlineExpired());
     });
@@ -121,7 +124,7 @@ class TurnRun {
     this.state = state;
     noteRunning(ctx, state, this.running);
     if (messageId === undefined && !ctx.request.attach) {
-      await ctx.deps.surface.send({ kind: "text", text: langOf(ctx) === "zh" ? QUEUED_NOTICE_ZH : QUEUED_NOTICE });
+      await ctx.deps.surface.send(plainMessage(turnText.in(langOf(ctx)).queuedNotice));
     }
     return consume(ctx, { sessionId, state, status: this.status, running: this.running, signal });
   }
@@ -135,20 +138,23 @@ class TurnRun {
     let stopped = this.controls.stopRequested();
     let lead = "";
     let fallbackFailed = false;
-    const refusal = stopped ? "" : ctx.deps.refusals.refusalOf(state.answer, state.failed);
+    const refusal = stopped ? undefined : ctx.deps.refusals.classify(state.answer, state.failed);
     if (refusal) {
       const rerun = await rerunOnFallback(ctx, sessionId, this.status, this.controls.onSession, this.running);
       if (rerun) {
         ({ state, ok } = rerun);
         this.state = state;
         stopped = this.controls.stopRequested();
-        lead = ctx.deps.refusals.fallbackLine(ctx.request.publicBaseUrl, langOf(ctx), refusal);
+        lead = ctx.deps.refusals.fallbackLead(refusal, langOf(ctx));
         fallbackFailed = Boolean(state.failed);
-        if (fallbackFailed && !stopped) ctx.deps.log.warn("the fallback model failed too; the user is told to upload the key");
+        if (fallbackFailed && !stopped)
+          ctx.deps.log.warn("the fallback model failed too; the user is told to upload the key");
       }
     }
-    if (!stopped && (fallbackFailed || ctx.deps.refusals.isRefusal(state.answer, state.failed))) {
-      await this.status.finish([ctx.deps.refusals.guidance(ctx.request.publicBaseUrl, langOf(ctx), refusal)], { rich: true });
+    const refused = fallbackFailed ? refusal : ctx.deps.refusals.classify(state.answer, state.failed);
+    if (!stopped && refused) {
+      // no fallback, or it failed too: tell the user what to do, not a raw error
+      await this.status.finish([ctx.deps.refusals.guidance(refusal ?? refused, langOf(ctx))], { rich: true });
       this.tell("failed");
       return;
     }
@@ -166,25 +172,40 @@ class TurnRun {
     return [answer, error ? false : ok]; // (told as the failure it is: no thumbs, the Report a problem card)
   }
 
+  /** What the turn ran on and ended with, for whoever runs something after it. */
+  private recordEnd(state: TurnState, answer: string, lead: string): void {
+    const record = this.ctx.record;
+    record.finalAnswer = answer;
+    record.ranModel = state.routedModel || (lead ? (this.ctx.request.fallbackModel ?? "") : record.sessionModel);
+    record.prSummary = state.prSummary || record.prSummary;
+  }
+
+  /** The answer as the chat shows it: a review's one message (its result line and summary), else the answer itself. */
+  private shown(state: TurnState, answer: string, link: string): string {
+    const shape = this.ctx.hooks.shapeAnswer;
+    if (!shape || (!answer && state.results.length === 0)) return answer;
+    const record = this.ctx.record;
+    return shape(answer, link, record.ranModel, [...state.results], state.comments, record.prSummary);
+  }
+
+  /** Suggested replies: in a 1:1 chat, under an answer that went well, never under a review's one message. */
+  private replies(thumbs: boolean): ReadonlyArray<readonly [string, string]> | undefined {
+    const { ctx } = this;
+    const offered = thumbs && !ctx.request.group && !ctx.hooks.shapeAnswer && ctx.deps.style.suggestedReplies;
+    return offered ? SUGGESTED_REPLIES[langOf(ctx)] : undefined;
+  }
+
   private async deliver(state: TurnState, firstOk: boolean, stopped: boolean, lead: string): Promise<void> {
     const { ctx } = this;
     const sessionId = this.sessionId ?? "";
     const link = deepLink(ctx.request.publicBaseUrl, sessionId);
     const [answer, ok] = this.cutFailure(state, firstOk);
-    const record = ctx.record;
-    record.finalAnswer = answer;
-    record.ranModel = state.routedModel || (lead ? (ctx.request.fallbackModel ?? "") : record.sessionModel);
-    record.prSummary = state.prSummary || record.prSummary;
-    const shape = ctx.hooks.shapeAnswer;
-    const shown =
-      shape && (answer || state.results.length)
-        ? shape(answer, link, record.ranModel, [...state.results], state.comments, record.prSummary)
-        : answer;
+    this.recordEnd(state, answer, lead);
+    const shown = this.shown(state, answer, link);
     const confirmed = stopped && (this.controls.stopConfirmed?.() ?? false);
     const parts = endingParts(ctx, { answer, shown, link, ok, stopped, confirmed, lead });
     const thumbs = ok && !stopped; // thumbs only under a final answer
-    // (suggested replies: in a 1:1 chat, under an answer that went well, never under a review's one message)
-    const replies = thumbs && !ctx.request.group && !shape && ctx.deps.style.suggestedReplies ? SUGGESTED_REPLIES[langOf(ctx)] : undefined;
+    const replies = this.replies(thumbs);
     await this.status.finish(parts, {
       rich: true,
       feedback: thumbs && !ctx.request.ownThumbs,
@@ -197,7 +218,13 @@ class TurnRun {
     await this.extras(state, sessionId, ok, stopped, thumbs);
   }
 
-  private async extras(state: TurnState, sessionId: string, ok: boolean, stopped: boolean, thumbs: boolean): Promise<void> {
+  private async extras(
+    state: TurnState,
+    sessionId: string,
+    ok: boolean,
+    stopped: boolean,
+    thumbs: boolean,
+  ): Promise<void> {
     const { ctx } = this;
     if (state.deliveries.length) await offerDeliveries(ctx, sessionId, state.deliveries); // whatever the end, a file is the user's
     if (thumbs && ctx.request.ownThumbs) await offerThumbs(ctx);
@@ -243,7 +270,9 @@ class TurnRun {
     try {
       ctx.record.moved = await asItem();
     } catch (err) {
-      ctx.deps.log.warn("asking for the review as the reviewer's item after the session was refused failed", { error: errorKind(err) });
+      ctx.deps.log.warn("asking for the review as the reviewer's item after the session was refused failed", {
+        error: errorKind(err),
+      });
       ctx.record.moved = false;
     }
     return ctx.record.moved;
@@ -253,28 +282,30 @@ class TurnRun {
   private async lost(): Promise<void> {
     const { ctx } = this;
     this.tell("failed");
-    const link = this.sessionId ? `\n\n[Open the session](${deepLink(ctx.request.publicBaseUrl, this.sessionId)})` : "";
+    const link = this.sessionId
+      ? `\n\n[${turnEnglish.openSessionLink}](${deepLink(ctx.request.publicBaseUrl, this.sessionId)})`
+      : "";
     const lead = resultLead(ctx, this.state);
     if (this.submitted && this.expired) {
       // Not a lost connection and not a failure: say so, and promise a push only when Claw will send one
       await this.status.finish([lead + stillRunningText(ctx) + link]);
       return;
     }
-    await this.status.finish([lead + LOST_CONNECTION + link]);
+    await this.status.finish([lead + turnEnglish.lostConnection + link]);
     await offerReport(ctx);
   }
 }
 
 /** Runs the turn and always leaves the user a message; `controls.onSession` records the session id. */
 export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise<void> {
-  const stream = turnStream(ctx);
-  if (!stream) detach(() => typing(ctx)); // (a stream shows its own status at once: no bare typing indicator before it)
+  const replyTo = streamReplyTo(ctx);
+  if (!replyTo) detach(() => typing(ctx)); // (a stream shows its own status at once: no bare typing indicator before it)
   const status = new StatusMessage(ctx.deps.surface, {
     clock: ctx.deps.clock,
     log: ctx.deps.log,
     lang: langOf(ctx),
     lead: ctx.request.lead ?? "",
-    stream,
+    streamReplyTo: replyTo,
     group: ctx.request.group ?? false,
     streamText: ctx.deps.style.streamText && !ctx.request.group,
   });

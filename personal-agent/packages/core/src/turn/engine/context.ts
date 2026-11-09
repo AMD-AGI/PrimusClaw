@@ -3,17 +3,14 @@
 
 /** Everything one turn runs with: who it acts for, what it sends, where it answers, and what it reports back. */
 
-import type { Lang } from "../../text/lang.js";
+import type { Lang } from "../../locales/lang.js";
+import type { ModelRefusalPolicy } from "../../plugins/model-refusal-policy.js";
+import type { Clock } from "../../ports/clock.js";
+import type { Logger } from "../../ports/logger.js";
+import type { Envelope, FetchedFile, InboundFile, OutMessage, UserRef } from "../../ports/surface.js";
 import type { GithubOutcome } from "../github-outcome.js";
-import type { FetchedFile } from "../files.js";
-import type { Envelope, ModelRefusals, TurnClaw, TurnClock, TurnLog, TurnSurface, View } from "../ports.js";
+import type { TurnClaw, TurnSurface } from "../ports.js";
 import { type ClawError, pickLang } from "../upstream.js";
-
-/** A file the user sent with the message, as the chat gave it (fetched by `TurnHooks.fetchFiles`). */
-export interface InboundFile {
-  /** '' for a pasted image, which has no name. */
-  readonly name: string;
-}
 
 /** What the turn is and whom it acts for. Read only by the turn. */
 export interface TurnRequest {
@@ -23,6 +20,8 @@ export interface TurnRequest {
   readonly text: string;
   readonly idempotencyKey: string;
   readonly publicBaseUrl: string;
+  /** The person's message: a live stream answers it (undefined: the turn is shown by an edited message). */
+  readonly streamReplyTo?: string;
   /** A group chat: no tool input on cards, approvals are recorded and owner-only. */
   readonly group?: boolean;
   readonly ownerName?: string;
@@ -51,7 +50,7 @@ export interface TurnRequest {
   /** Shown at the top of the progress message from its first post on (a review's acknowledgement). */
   readonly lead?: string;
   /** A review asked in a group: the asker, whom its answer @mentions (nobody else). */
-  readonly mention?: { readonly id: string; readonly name: string };
+  readonly mention?: UserRef;
   /** (url, branch) a NEW session is bound to; undefined: no repository. */
   readonly repo?: readonly [string, string];
   /** A card with what the session changed follows a finished answer (1:1 chats). */
@@ -60,8 +59,8 @@ export interface TurnRequest {
   readonly quote?: string;
   /** `text` with the address behind each of its links; '' when it is `text` itself. */
   readonly sent?: string;
-  /** The language the person is answered in ('' : the language of `text`). */
-  readonly lang?: Lang | "";
+  /** The language the person is answered in (undefined: the language of `text`). */
+  readonly lang?: Lang;
   /** What the user sent with the message. */
   readonly files?: readonly InboundFile[];
 }
@@ -74,26 +73,41 @@ export interface TurnHooks {
    * An approval or question is about to be shown, as `envelope`: false when a card for it is already in a chat (the
    * notification got there first), and the turn then shows none. `expiresIn`: the seconds Brain waits for the answer.
    */
-  readonly onApproval?: (sessionId: string, toolUseId: string, tool: string, expiresIn: number | undefined, envelope: Envelope) => boolean | undefined;
+  readonly onApproval?: (
+    sessionId: string,
+    toolUseId: string,
+    tool: string,
+    expiresIn: number | undefined,
+    envelope: Envelope,
+  ) => boolean | undefined;
   readonly onApprovalSent?: (sessionId: string, toolUseId: string) => void;
   readonly onApprovalUnsent?: (sessionId: string, toolUseId: string) => void;
   /** (session, "started" | "delivered" | "failed", Claw message id or ''). */
   readonly onTurn?: (sessionId: string, what: "started" | "delivered" | "failed", messageId: string) => void;
   /** Once, when Claw is running this turn's message. */
   readonly onRunning?: () => void;
-  /** The "Report a problem" view for a turn that went wrong. */
-  readonly reportView?: () => View;
+  /** The "Report a problem" message for a turn that went wrong. */
+  readonly reportMessage?: () => OutMessage;
   /**
    * A review turn: (answer, link to the session, model, the GitHub results, inline comments, the PR's one sentence) ->
    * the text posted, the review's one message.
    */
-  readonly shapeAnswer?: (answer: string, link: string, model: string, results: GithubOutcome[], comments: number, prSummary: string) => string;
+  readonly shapeAnswer?: (
+    answer: string,
+    link: string,
+    model: string,
+    results: GithubOutcome[],
+    comments: number,
+    prSummary: string,
+  ) => string;
   /** A review turn: each finished GitHub write as it arrives; the line it returns is shown at the top of the progress. */
   readonly onGithubResult?: (outcome: GithubOutcome, model: string) => string | undefined;
   /** A review asked of someone else that Claw refused as `acting_as_must_be_self`: true when the asker was told. */
   readonly asItem?: () => Promise<boolean>;
   /** Fetches the files the user sent: (the files fetched, [(name, why not)]). */
-  readonly fetchFiles?: (files: readonly InboundFile[]) => Promise<readonly [FetchedFile[], Array<readonly [string, string]>]>;
+  readonly fetchFiles?: (
+    files: readonly InboundFile[],
+  ) => Promise<readonly [FetchedFile[], Array<readonly [string, string]>]>;
   /** (how many) of the message's files did not reach Claw. */
   readonly onFilesDropped?: (count: number) => void;
 }
@@ -109,9 +123,9 @@ export interface TurnStyle {
 export interface TurnDeps {
   readonly claw: TurnClaw;
   readonly surface: TurnSurface;
-  readonly clock: TurnClock;
-  readonly log: TurnLog;
-  readonly refusals: ModelRefusals;
+  readonly clock: Clock;
+  readonly log: Logger;
+  readonly refusals: ModelRefusalPolicy;
   readonly style: TurnStyle;
 }
 
@@ -170,7 +184,7 @@ export async function credential(ctx: TurnContext): Promise<string> {
 
 /** The language the turn's own lines are said in: the person's, else that of what they wrote. */
 export function langOf(ctx: TurnContext): Lang {
-  return ctx.request.lang || pickLang(ctx.request.text);
+  return ctx.request.lang ?? pickLang(ctx.request.text);
 }
 
 /** The message(s) the user quoted, marked as quotes, then what the user wrote (`activity.with_quote`). */

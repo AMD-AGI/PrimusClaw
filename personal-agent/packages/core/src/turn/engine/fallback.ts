@@ -19,11 +19,17 @@ export interface Rerun {
 /** Nothing to run it on: no fallback configured, no model to put the session back on, or a session that is Claw's. */
 function noFallback(ctx: TurnContext): boolean {
   const { fallbackModel = "", model = "", attach } = ctx.request;
-  return !fallbackModel || !model || fallbackModel === model || fallbackModel === ctx.record.sessionModel || Boolean(attach);
+  return (
+    !fallbackModel || !model || fallbackModel === model || fallbackModel === ctx.record.sessionModel || Boolean(attach)
+  );
 }
 
 /** Moves the session to the fallback model; false when Claw would not (the user is then told to upload the key). */
-async function moveToFallback(ctx: TurnContext, sessionId: string, onSession: (sessionId: string) => void): Promise<boolean> {
+async function moveToFallback(
+  ctx: TurnContext,
+  sessionId: string,
+  onSession: (sessionId: string) => void,
+): Promise<boolean> {
   const fallback = ctx.request.fallbackModel ?? "";
   try {
     await ctx.deps.claw.setSessionModel(await credential(ctx), sessionId, fallback);
@@ -53,10 +59,13 @@ async function moveBack(ctx: TurnContext, sessionId: string, onSession: (session
     ctx.record.sessionModel = model;
   } catch (err) {
     if (!isClawOrNetwork(err)) throw err;
-    ctx.deps.log.warn("could not put the session back on its model after the fallback turn; the next message pins it again", {
-      session: sessionId,
-      error: statusOrKind(err),
-    });
+    ctx.deps.log.warn(
+      "could not put the session back on its model after the fallback turn; the next message pins it again",
+      {
+        session: sessionId,
+        error: statusOrKind(err),
+      },
+    );
   }
   onSession(sessionId); // records the model the session really has now
 }
@@ -77,7 +86,12 @@ export async function rerunOnFallback(
   try {
     ctx.record.streamAfter = await turnStart(ctx, sessionId);
     const behind = await turnInFront(ctx, sessionId);
-    const messageId = await ctx.deps.claw.sendMessage(await credential(ctx), sessionId, messageOf(ctx), sendOptions(ctx));
+    const messageId = await ctx.deps.claw.sendMessage(
+      await credential(ctx),
+      sessionId,
+      messageOf(ctx),
+      sendOptions(ctx),
+    );
     const state = new TurnState(messageId, behind, false, ctx.deps.refusals);
     state.writes = ctx.record.wrote; // (one list for the turn: what the first run wrote is not forgotten by the second)
     const ok = await consume(ctx, { sessionId, state, status, running });

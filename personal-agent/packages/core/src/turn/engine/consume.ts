@@ -3,12 +3,14 @@
 
 /** Reading a turn's stream until it ends: progress, approvals and questions, and reconnects. */
 
+import { errorName } from "../../errors.js";
+import type { Envelope } from "../../ports/surface.js";
+import { cardQuestions } from "../interim-views.js";
 import { isObject, type JsonObject, textOf, truthy } from "../json.js";
-import type { Envelope } from "../ports.js";
 import type { StatusMessage } from "../progress/status-message.js";
 import type { Step } from "../step.js";
 import type { TurnState } from "../turn-state.js";
-import { type ApprovalView, QUESTION_TOOL, type QuestionView } from "../views.js";
+import { viewMessage } from "../views.js";
 import { ClawError, errorKind, HISTORY_COMPLETE, pickLang, type SseEvent } from "../upstream.js";
 import { isClawOrNetwork } from "./claw-errors.js";
 import { credential, type TurnContext } from "./context.js";
@@ -16,6 +18,8 @@ import { credential, type TurnContext } from "./context.js";
 export const STREAM_ATTEMPTS = 4;
 /** A wait longer than this in a request is not believed. */
 export const MAX_APPROVAL_WAIT_SECONDS = 24 * 3600;
+/** The tool whose call waits for the answer to a question card (Brain's userQuestion event). */
+export const QUESTION_TOOL = "ask_user_question";
 
 /** The stream dropped STREAM_ATTEMPTS times before the turn ended. */
 export class StreamKeptDropping extends Error {
@@ -27,7 +31,9 @@ export class StreamKeptDropping extends Error {
 
 /** The wait Brain announces in a permissionRequest (`timeout_ms`) in seconds; undefined for anything not a sane number. */
 export function waitSeconds(milliseconds: unknown): number | undefined {
-  return typeof milliseconds === "number" && milliseconds > 0 ? Math.min(milliseconds / 1000, MAX_APPROVAL_WAIT_SECONDS) : undefined;
+  return typeof milliseconds === "number" && milliseconds > 0
+    ? Math.min(milliseconds / 1000, MAX_APPROVAL_WAIT_SECONDS)
+    : undefined;
 }
 
 export function noteRunning(ctx: TurnContext, state: TurnState, once: { called: boolean }): void {
@@ -46,7 +52,9 @@ function showResults(ctx: TurnContext, status: StatusMessage, state: TurnState, 
       const line = shown(outcome, state.routedModel || ctx.record.sessionModel);
       if (line) status.headline(line);
     } catch (err) {
-      ctx.deps.log.warn("the review's result line could not be shown; the answer follows as usual", { error: String(err) });
+      ctx.deps.log.warn("the review's result line could not be shown; the answer follows as usual", {
+        error: errorName(err),
+      });
     }
   }
   return state.results.length;
@@ -62,8 +70,7 @@ interface Asked {
 function approvalOf(ctx: TurnContext, sessionId: string, approval: JsonObject): Asked {
   const tool = textOf(approval["tool"]) || "tool";
   const toolUseId = textOf(approval["tool_use_id"]);
-  const view: ApprovalView = {
-    kind: "approval",
+  const model = {
     tool,
     input: approval["input"],
     sessionId,
@@ -71,23 +78,29 @@ function approvalOf(ctx: TurnContext, sessionId: string, approval: JsonObject): 
     group: ctx.request.group ?? false,
     ownerName: ctx.request.ownerName ?? "",
     event: approval,
-    lang: ctx.request.lang || pickLang(approval["summary"], approval["intent"], ctx.request.text),
+    lang: ctx.request.lang ?? pickLang(approval["summary"], approval["intent"], ctx.request.text),
   };
-  return { tool, toolUseId, request: approval, envelope: ctx.deps.surface.outgoing(view) };
+  return {
+    tool,
+    toolUseId,
+    request: approval,
+    envelope: ctx.deps.surface.outgoing(viewMessage("approval", model, tool)),
+  };
 }
 
 /** A question of the agent: it waits for the answer the way a held call waits for a decision. */
 function questionOf(ctx: TurnContext, sessionId: string, question: JsonObject): Asked {
   const toolUseId = textOf(question["actionId"]);
-  const view: QuestionView = {
-    kind: "question",
-    questions: question["questions"],
+  const model = {
+    questions: cardQuestions(question["questions"]),
     sessionId,
     toolUseId,
     group: ctx.request.group ?? false,
     ownerName: ctx.request.ownerName ?? "",
+    note: "",
   };
-  return { tool: QUESTION_TOOL, toolUseId, request: question, envelope: ctx.deps.surface.outgoing(view) };
+  const envelope = ctx.deps.surface.outgoing(viewMessage("question", model, QUESTION_TOOL));
+  return { tool: QUESTION_TOOL, toolUseId, request: question, envelope };
 }
 
 /**
@@ -96,12 +109,17 @@ function questionOf(ctx: TurnContext, sessionId: string, question: JsonObject): 
  * the send does not lose it. A request with no id cannot be told from another: shown.
  */
 async function ask(ctx: TurnContext, sessionId: string, step: Step): Promise<void> {
-  const asked = isObject(step.approval) && truthy(step.approval)
-    ? approvalOf(ctx, sessionId, step.approval)
-    : questionOf(ctx, sessionId, step.question ?? {});
+  const asked =
+    isObject(step.approval) && truthy(step.approval)
+      ? approvalOf(ctx, sessionId, step.approval)
+      : questionOf(ctx, sessionId, step.question ?? {});
   const { tool, toolUseId, request, envelope } = asked;
   const hooks = ctx.hooks;
-  if (toolUseId && hooks.onApproval?.(sessionId, toolUseId, tool, waitSeconds(request["timeout_ms"]), envelope) === false) return;
+  if (
+    toolUseId &&
+    hooks.onApproval?.(sessionId, toolUseId, tool, waitSeconds(request["timeout_ms"]), envelope) === false
+  )
+    return;
   try {
     await ctx.deps.surface.deliver(envelope);
   } catch (err) {
@@ -135,14 +153,17 @@ type Read = "finished-ok" | "finished-error" | "again" | "dropped";
 async function readOnce(ctx: TurnContext, args: ConsumeArgs, cursor: Cursor, told: { n: number }): Promise<Read> {
   const { sessionId, state, status, signal } = args;
   const after = cursor.legacy ? undefined : cursor.lastId || cursor.start;
-  const events: AsyncIterable<SseEvent> = ctx.deps.claw.stream(await credential(ctx), sessionId, { after, ...(signal ? { signal } : {}) });
+  const options = { ...(after === undefined ? {} : { after }), ...(signal ? { signal } : {}) };
+  const events: AsyncIterable<SseEvent> = ctx.deps.claw.stream(await credential(ctx), sessionId, options);
   for await (const event of events) {
     signal?.throwIfAborted();
     if (event.name === HISTORY_COMPLETE && !cursor.known) {
       cursor.known = true;
       cursor.legacy = !("has_more" in event.data);
       if (cursor.legacy && after !== undefined) {
-        ctx.deps.log.info("Claw compares the stream's `after` as text: the turn is read from the session's history instead");
+        ctx.deps.log.info(
+          "Claw compares the stream's `after` as text: the turn is read from the session's history instead",
+        );
         return "again";
       }
     }
@@ -150,15 +171,22 @@ async function readOnce(ctx: TurnContext, args: ConsumeArgs, cursor: Cursor, tol
     const step = state.feed(event);
     noteRunning(ctx, state, args.running);
     told.n = showResults(ctx, status, state, told.n);
-    status.note(step);
-    status.progress(step);
-    if (truthy(step.approval) || truthy(step.question)) {
-      await ask(ctx, sessionId, step);
-      continue;
-    }
-    if (step.finished) return step.error ? "finished-error" : "finished-ok";
+    const read = await take(ctx, args, step);
+    if (read) return read;
   }
   return "dropped";
+}
+
+/** One event's step: shown, asked about, or the end of the turn. */
+async function take(ctx: TurnContext, args: ConsumeArgs, step: Step): Promise<Read | undefined> {
+  args.status.note(step);
+  args.status.progress(step);
+  if (truthy(step.approval) || truthy(step.question)) {
+    await ask(ctx, args.sessionId, step);
+    return undefined;
+  }
+  if (!step.finished) return undefined;
+  return step.error ? "finished-error" : "finished-ok";
 }
 
 /**

@@ -3,21 +3,10 @@
 
 /** What the chat is told when a turn ends: the answer, or why there is none. */
 
+import { errorName } from "../../errors.js";
+import { turnEnglish, turnText } from "../../locales/turn.js";
 import { answerParts } from "../answer-parts.js";
 import type { TurnState } from "../turn-state.js";
-import {
-  CLAW_BUSY,
-  clawRequestFailed,
-  KEY_REJECTED,
-  NOTHING_STARTED,
-  OPEN_SESSION,
-  REVIEW_REFUSED,
-  STILL_RUNNING,
-  STILL_RUNNING_NOTIFY,
-  STILL_RUNNING_OPEN,
-  STOPPED,
-  TASK_FAILED,
-} from "../text.js";
 import { type ClawError, errorKind, SERVICE_REFUSAL_REASONS, serviceRefusal, withhold } from "../upstream.js";
 import { langOf, type TurnContext } from "./context.js";
 
@@ -26,19 +15,21 @@ export const TURN_DEADLINE_SECONDS = 30 * 60;
 
 /** What the chat says when the turn's time is up and the run is still going. */
 export function stillRunningText(ctx: TurnContext): string {
-  const lang = langOf(ctx);
-  const follow = ctx.request.notifies && !ctx.request.group ? STILL_RUNNING_NOTIFY : STILL_RUNNING_OPEN;
-  return STILL_RUNNING[lang](Math.round(TURN_DEADLINE_SECONDS / 60)) + follow[lang];
+  const text = turnText.in(langOf(ctx));
+  const follow = ctx.request.notifies && !ctx.request.group ? text.stillRunningNotify : text.stillRunningOpen;
+  return text.stillRunning({ minutes: Math.round(TURN_DEADLINE_SECONDS / 60) }) + follow;
 }
 
 /** What a Claw refusal before the turn ran is said as. The log gets the status and Claw's error word only, never the body. */
 export function clawFailure(err: ClawError, review = false): string {
-  if (err.status === 403 && Object.hasOwn(SERVICE_REFUSAL_REASONS, err.code)) return serviceRefusal(err, NOTHING_STARTED);
+  if (err.status === 403 && Object.hasOwn(SERVICE_REFUSAL_REASONS, err.code)) {
+    return serviceRefusal(err, turnEnglish.nothingStarted);
+  }
   // (the group is not told to /unlink and link again: that is for the asker alone, who is messaged)
-  if (review && err.status === 401) return REVIEW_REFUSED;
-  if (err.status === 401 || err.status === 403) return KEY_REJECTED;
-  if (err.status === 429) return CLAW_BUSY;
-  return clawRequestFailed(err.status, withhold("claw_request", errorKind(err), { status: err.status }));
+  if (review && err.status === 401) return turnEnglish.reviewRefused;
+  if (err.status === 401 || err.status === 403) return turnEnglish.keyRejected;
+  if (err.status === 429) return turnEnglish.clawBusy;
+  return turnEnglish.clawRequestFailed(err.status, withhold("claw_request", errorKind(err), { status: err.status }));
 }
 
 /**
@@ -51,7 +42,7 @@ export function resultLead(ctx: TurnContext, state: TurnState | undefined): stri
   try {
     return `${shape("", "", state.routedModel || ctx.record.sessionModel, [...state.results], state.comments, state.prSummary)}\n\n`;
   } catch (err) {
-    ctx.deps.log.warn("the review's result line could not be kept", { error: String(err) });
+    ctx.deps.log.warn("the review's result line could not be kept", { error: errorName(err) });
     return "";
   }
 }
@@ -76,14 +67,14 @@ export interface Ending {
  */
 export function endingParts(ctx: TurnContext, ending: Ending): string[] {
   const { answer, shown, link, ok, stopped, confirmed, lead } = ending;
-  const lang = langOf(ctx);
-  const errorLine = `${TASK_FAILED[lang]} [${OPEN_SESSION[lang]}](${link})`;
+  const text = turnText.in(langOf(ctx));
+  const errorLine = `${text.taskFailed} [${text.openSession}](${link})`;
   if (stopped && !answer) {
-    const stop = shown ? `${shown}\n\n${STOPPED}` : STOPPED;
+    const stop = shown ? `${shown}\n\n${turnEnglish.stopped}` : turnEnglish.stopped;
     return [!ok && !confirmed ? `${stop}\n\n${errorLine}` : stop];
   }
   if (!ok && !answer) return [shown ? `${shown}\n\n${errorLine}` : errorLine];
   const parts = answerParts(shown, link, ctx.request.group ?? false, lead);
-  if (!ok && !confirmed) parts[parts.length - 1] += `\n\n${errorLine}`;
-  return parts;
+  if (ok || confirmed) return parts;
+  return parts.map((part, n) => (n === parts.length - 1 ? `${part}\n\n${errorLine}` : part));
 }

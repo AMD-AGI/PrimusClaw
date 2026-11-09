@@ -71,7 +71,9 @@ export async function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal 
   signal.throwIfAborted();
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
-    onAbort = () => reject(signal.reason);
+    onAbort = () => {
+      reject(signal.reason instanceof Error ? signal.reason : new Cancelled());
+    };
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {

@@ -4,8 +4,10 @@
 /** The answer of a session's last finished turn, read from its history ("Show here", a turn lost with its worker). */
 
 import { isObject, textOf, truthy } from "./json.js";
-import type { TurnClaw, TurnClock, TurnLog } from "./ports.js";
-import { TASK_FAILED } from "./text.js";
+import { turnText } from "../locales/turn.js";
+import type { Clock } from "../ports/clock.js";
+import type { Logger } from "../ports/logger.js";
+import { sleepSeconds, type TurnClaw } from "./ports.js";
 import { TurnState, messageIdOf } from "./turn-state.js";
 import { ClawError, errorKind, pickLang, type SseEvent, splitErrorTail, withhold } from "./upstream.js";
 import { isClawFailure } from "./engine/claw-errors.js";
@@ -51,23 +53,28 @@ export class Turns {
 }
 
 /** Replay rows `{event_id, event_type, data}` as the events the stream would have sent for them. */
-export function replayed(rows: ReadonlyArray<{ event_id?: unknown; event_type?: unknown; data?: unknown }>): SseEvent[] {
+export function replayed(
+  rows: ReadonlyArray<{ event_id?: unknown; event_type?: unknown; data?: unknown }>,
+): SseEvent[] {
   const events: SseEvent[] = [];
   for (const row of rows) {
     if (!isObject(row.data)) continue;
     const data = row.data;
     const name = typeof data["type"] === "string" && data["type"] ? data["type"] : row.event_type;
-    if (typeof name === "string" && name && !NOT_EVENTS.has(name)) events.push({ id: textOf(row.event_id), name, data });
+    if (typeof name === "string" && name && !NOT_EVENTS.has(name))
+      events.push({ id: textOf(row.event_id), name, data });
   }
   return events;
 }
 
 /** The stream's history, read until it goes quiet after a finished turn, or READ_OVERALL_SECONDS at most. */
-async function streamedTurns(claw: TurnClaw, clock: TurnClock, key: string, sessionId: string): Promise<Turns> {
+async function streamedTurns(claw: TurnClaw, clock: Clock, key: string, sessionId: string): Promise<Turns> {
   const turns = new Turns();
   const overall = new AbortController();
-  const timer = clock.sleep(READ_OVERALL_SECONDS, overall.signal).then(
-    () => overall.abort(new Error("read overall")),
+  const timer = sleepSeconds(clock, READ_OVERALL_SECONDS, overall.signal).then(
+    () => {
+      overall.abort(new Error("read overall"));
+    },
     () => undefined,
   );
   const iterator = claw.stream(key, sessionId, { signal: overall.signal })[Symbol.asyncIterator]();
@@ -85,17 +92,31 @@ async function streamedTurns(claw: TurnClaw, clock: TurnClock, key: string, sess
   return turns;
 }
 
+function nothing(): undefined {
+  return undefined;
+}
+
 /** The iterator's next event, or undefined when it ended, went quiet for `idle` seconds, or the read is over. */
 async function nextWithin(
   iterator: AsyncIterator<SseEvent>,
-  clock: TurnClock,
+  clock: Clock,
   idle: number | undefined,
   signal: AbortSignal,
 ): Promise<SseEvent | undefined> {
   const quiet = new AbortController();
   const waits: Array<Promise<IteratorResult<SseEvent> | undefined>> = [iterator.next()];
-  if (idle !== undefined) waits.push(clock.sleep(idle, quiet.signal).then(() => undefined, () => undefined));
-  waits.push(new Promise((resolve) => signal.addEventListener("abort", () => resolve(undefined), { once: true })));
+  if (idle !== undefined) waits.push(sleepSeconds(clock, idle, quiet.signal).then(nothing, nothing));
+  waits.push(
+    new Promise((resolve) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          resolve(undefined);
+        },
+        { once: true },
+      );
+    }),
+  );
   try {
     const result = await Promise.race(waits);
     return result && !result.done ? result.value : undefined;
@@ -107,7 +128,7 @@ async function nextWithin(
   }
 }
 
-function answerOf(lastDone: TurnState | undefined, sessionId: string, log: TurnLog): string | undefined {
+function answerOf(lastDone: TurnState | undefined, sessionId: string, log: Logger): string | undefined {
   if (!lastDone) return undefined;
   const answer = lastDone.answer;
   if (!lastDone.failed) return answer;
@@ -116,7 +137,7 @@ function answerOf(lastDone: TurnState | undefined, sessionId: string, log: TurnL
   if (!error) return answer;
   const ref = withhold("last_answer_failed", error, { session: sessionId });
   log.info("the user is told the task failed", { ref });
-  const told = TASK_FAILED[pickLang(words)];
+  const told = turnText.in(pickLang(words)).taskFailed;
   return words ? `${words}\n\n${told}` : told;
 }
 
@@ -127,13 +148,16 @@ function answerOf(lastDone: TurnState | undefined, sessionId: string, log: TurnL
  * own, which is what stops anybody reading somebody else's session.
  */
 export async function lastAnswer(
-  deps: { readonly claw: TurnClaw; readonly clock: TurnClock; readonly log: TurnLog },
+  deps: { readonly claw: TurnClaw; readonly clock: Clock; readonly log: Logger },
   key: string,
   sessionId: string,
 ): Promise<string | undefined> {
   let turns: Turns;
   try {
-    const rows = await deps.claw.sessionEvents(key, sessionId, { tail: LAST_ANSWER_TAIL, maxBytes: LAST_ANSWER_MAX_BYTES });
+    const rows = await deps.claw.sessionEvents(key, sessionId, {
+      tail: LAST_ANSWER_TAIL,
+      maxBytes: LAST_ANSWER_MAX_BYTES,
+    });
     turns = new Turns();
     for (const event of replayed(rows)) turns.feed(event);
   } catch (err) {
@@ -144,4 +168,3 @@ export async function lastAnswer(
   }
   return answerOf(turns.lastDone, sessionId, deps.log);
 }
-

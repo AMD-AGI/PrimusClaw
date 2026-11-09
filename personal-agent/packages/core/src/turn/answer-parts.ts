@@ -47,10 +47,10 @@ export function answerParts(text: string, link: string, group = false, lead = ""
   if (lead) whole = `${lead}\n\n${whole}`;
   const chunks = splitAtParagraphs(whole, MAX_ANSWER_CHARS);
   if (chunks.length <= MAX_ANSWER_MESSAGES) return chunks;
-  const kept = chunks.slice(0, MAX_ANSWER_MESSAGES);
+  const kept = chunks.slice(0, MAX_ANSWER_MESSAGES - 1);
+  const last = chunks[MAX_ANSWER_MESSAGES - 1] ?? "";
   const label = turnEnglish.openFullAnswer + (group ? turnEnglish.onlyTheAsker : "");
-  kept[kept.length - 1] += `\n\n${turnEnglish.shortened}\n\n[${label}](${link})`;
-  return kept;
+  return [...kept, `${last}\n\n${turnEnglish.shortened}\n\n[${label}](${link})`];
 }
 
 /**

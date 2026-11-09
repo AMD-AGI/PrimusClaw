@@ -4,7 +4,9 @@
 /** Getting the user's message to Claw: the session it goes to, its files, the model, and where its stream starts. */
 
 import { filesNote, failedFilesLine, uploadFolder } from "../files.js";
-import { textMessage, type CreateSessionOptions, type SendOptions } from "../ports.js";
+import { turnEnglish } from "../../locales/turn.js";
+import type { CreateSessionOptions, SendOptions } from "../ports.js";
+import { plainMessage } from "../progress/answer-messages.js";
 import { unlessAborted } from "../task.js";
 import { ClawError, errorKind } from "../upstream.js";
 import { isClawFailure, isClawOrNetwork, statusOrKind } from "./claw-errors.js";
@@ -17,7 +19,11 @@ const MODEL_REFUSALS = new Set<string>();
  * The id of the newest event the session holds, read just before the message is sent: the turn's events come after it, so
  * its stream starts there and not with the session's history. Best effort: undefined starts where Claw starts it.
  */
-export async function turnStart(ctx: TurnContext, sessionId: string, signal?: AbortSignal): Promise<string | undefined> {
+export async function turnStart(
+  ctx: TurnContext,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
     return await unlessAborted(ctx.deps.claw.lastEventId(await credential(ctx), sessionId), signal);
   } catch (err) {
@@ -33,7 +39,11 @@ export async function turnStart(ctx: TurnContext, sessionId: string, signal?: Ab
  * The turn Claw is running on the session just before this message is sent, if any: a message sent now is queued behind
  * it, and the queued turn is told from older ones by starting after it. Best effort.
  */
-export async function turnInFront(ctx: TurnContext, sessionId: string, signal?: AbortSignal): Promise<string | undefined> {
+export async function turnInFront(
+  ctx: TurnContext,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
     const [running, gate] = await unlessAborted(ctx.deps.claw.sessionTurn(await credential(ctx), sessionId), signal);
     return running ? gate : undefined;
@@ -95,7 +105,7 @@ async function fetchOnce(ctx: TurnContext): Promise<Failed> {
   const files = ctx.request.files ?? [];
   if (!ctx.hooks.fetchFiles) {
     ctx.record.fetched = [];
-    return files.map((f) => [f.name || "an image", "this worker does not take files"] as const);
+    return files.map((f) => [f.name || turnEnglish.anImage, turnEnglish.filesNotTaken] as const);
   }
   const [fetched, failed] = await ctx.hooks.fetchFiles(files);
   ctx.record.fetched = fetched;
@@ -103,7 +113,11 @@ async function fetchOnce(ctx: TurnContext): Promise<Failed> {
 }
 
 /** Uploads the fetched files to `sessionId` (made here when there is none, or when it was deleted); the session they went to. */
-async function upload(ctx: TurnContext, sessionId: string | undefined, signal?: AbortSignal): Promise<readonly [string, string[], string[]]> {
+async function upload(
+  ctx: TurnContext,
+  sessionId: string | undefined,
+  signal?: AbortSignal,
+): Promise<readonly [string, string[], string[]]> {
   const fetched = ctx.record.fetched ?? [];
   const folder = uploadFolder(ctx.request.idempotencyKey);
   let target = sessionId;
@@ -111,13 +125,21 @@ async function upload(ctx: TurnContext, sessionId: string | undefined, signal?: 
     if (!target) {
       const options = { ...createOptions(ctx), withMessage: false };
       [target] = await unlessAborted(
-        ctx.deps.claw.createSession(await credential(ctx), ctx.request.text || "Files", ctx.request.idempotencyKey, options),
+        ctx.deps.claw.createSession(
+          await credential(ctx),
+          ctx.request.text || "Files",
+          ctx.request.idempotencyKey,
+          options,
+        ),
         signal,
       );
       ctx.record.sessionModel = ctx.request.model ?? ""; // sent with the create
     }
     try {
-      const [paths, refused] = await unlessAborted(ctx.deps.claw.uploadFiles(await credential(ctx), target, folder, fetched), signal);
+      const [paths, refused] = await unlessAborted(
+        ctx.deps.claw.uploadFiles(await credential(ctx), target, folder, fetched),
+        signal,
+      );
       return [target, paths, refused];
     } catch (err) {
       if (err instanceof ClawError && err.status === 404 && target === sessionId) {
@@ -125,7 +147,9 @@ async function upload(ctx: TurnContext, sessionId: string | undefined, signal?: 
         continue;
       }
       if (!isClawOrNetwork(err)) throw err;
-      ctx.deps.log.warn("Claw did not take the files of a message; the message goes without them", { error: errorKind(err) });
+      ctx.deps.log.warn("Claw did not take the files of a message; the message goes without them", {
+        error: errorKind(err),
+      });
       return [target, [], fetched.map((f) => f.name)];
     }
   }
@@ -136,7 +160,11 @@ async function upload(ctx: TurnContext, sessionId: string | undefined, signal?: 
  * reads the message. With no session, or when it was deleted, one is made without a message. A file that could not be
  * fetched or that Claw did not take is named to the user, and the message still goes. Returns the session.
  */
-export async function putFiles(ctx: TurnContext, sessionId: string | undefined, signal?: AbortSignal): Promise<string | undefined> {
+export async function putFiles(
+  ctx: TurnContext,
+  sessionId: string | undefined,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   const failed = await fetchOnce(ctx);
   ctx.record.filesNote = "";
   let target = sessionId;
@@ -144,17 +172,21 @@ export async function putFiles(ctx: TurnContext, sessionId: string | undefined, 
     const [session, paths, refused] = await upload(ctx, sessionId, signal);
     target = session;
     ctx.record.filesNote = filesNote(paths);
-    failed.push(...refused.map((name) => [name, "Claw did not take it"] as const));
+    failed.push(...refused.map((name) => [name, turnEnglish.clawDidNotTake] as const));
   }
   if (failed.length) {
     ctx.hooks.onFilesDropped?.(failed.length);
-    await ctx.deps.surface.send(textMessage(failedFilesLine(failed)));
+    await ctx.deps.surface.send(plainMessage(failedFilesLine(failed)));
   }
   return target;
 }
 
 /** Sends the message to an existing session: (message id, turn in front). */
-async function sendTo(ctx: TurnContext, sessionId: string, signal?: AbortSignal): Promise<readonly [string | undefined, string | undefined]> {
+async function sendTo(
+  ctx: TurnContext,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<readonly [string | undefined, string | undefined]> {
   await pinModel(ctx, sessionId, signal);
   ctx.record.streamAfter = await turnStart(ctx, sessionId, signal);
   const behind = await turnInFront(ctx, sessionId, signal);
@@ -163,7 +195,10 @@ async function sendTo(ctx: TurnContext, sessionId: string, signal?: AbortSignal)
 }
 
 /** (session, message id, turn in front); the message id is undefined when Claw queued the message behind a running turn. */
-export async function submit(ctx: TurnContext, signal?: AbortSignal): Promise<readonly [string, string | undefined, string | undefined]> {
+export async function submit(
+  ctx: TurnContext,
+  signal?: AbortSignal,
+): Promise<readonly [string, string | undefined, string | undefined]> {
   const existing = ctx.record.sessionId;
   if (existing && ctx.request.attach) return [existing, ctx.request.attachMessageId || undefined, undefined];
   const sessionId = ctx.request.files?.length ? await putFiles(ctx, existing, signal) : existing;
@@ -183,7 +218,12 @@ export async function submit(ctx: TurnContext, signal?: AbortSignal): Promise<re
       return [fresh, await unlessAborted(sent, signal), undefined];
     }
   }
-  const created = ctx.deps.claw.createSession(await credential(ctx), messageOf(ctx), ctx.request.idempotencyKey, createOptions(ctx));
+  const created = ctx.deps.claw.createSession(
+    await credential(ctx),
+    messageOf(ctx),
+    ctx.request.idempotencyKey,
+    createOptions(ctx),
+  );
   const [newSession, messageId] = await unlessAborted(created, signal);
   ctx.record.sessionModel = ctx.request.model ?? ""; // sent with the create (a review's model is `model` too)
   return [newSession, messageId, undefined];

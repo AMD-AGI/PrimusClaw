@@ -10,7 +10,7 @@
  * - `pickLang`: W5 (approval view).
  */
 
-import { clipWithEllipsis, collapseSpaces, pyLen, pySlice, pyStrip } from "../text/python-str.js";
+import { clipWithEllipsis, collapseSpaces, pySlice, pyStrip } from "../text/python-str.js";
 import type { JsonObject } from "./json.js";
 
 // --- Claw (W2) -------------------------------------------------------------------------------------------------------
@@ -33,7 +33,7 @@ export class ClawError extends Error {
     readonly status: number,
     readonly code = "",
   ) {
-    super(code ? `HTTP ${status} ${code}` : `HTTP ${status}`);
+    super(code ? `HTTP ${String(status)} ${code}` : `HTTP ${String(status)}`);
     this.name = "ClawError";
   }
 }
@@ -111,7 +111,7 @@ export class Label {
   ) {}
 
   text(count = 1): string {
-    return count > 1 ? `${this.many ?? this.one} (${count})` : this.one;
+    return count > 1 ? `${this.many ?? this.one} (${String(count)})` : this.one;
   }
 }
 
@@ -215,13 +215,12 @@ export function splitErrorTail(text: unknown): [string, string] {
   return [text, ""];
 }
 
-/** Log `detail` under a new reference id and return the id for the user's sentence. */
+/** A new reference id for the user's sentence (interim: W2's `withhold` also logs the detail under it). */
 export function withhold(where: string, detail: unknown = "", ids: Record<string, unknown> = {}): string {
   const ref = globalThis.crypto.randomUUID().replaceAll("-", "").slice(0, 8);
-  const line = collapseSpaces(typeof detail === "string" ? detail : String(detail ?? ""));
-  const kept = pyLen(line) > 500 ? `${pySlice(line, 0, 500)}…` : line;
-  void where;
-  void kept;
-  void ids;
+  WITHHELD.push({ ref, where, detail, ids });
   return ref;
 }
+
+/** What `withhold` was given (interim, for tests: W2's logs it). */
+export const WITHHELD: Array<{ ref: string; where: string; detail: unknown; ids: Record<string, unknown> }> = [];

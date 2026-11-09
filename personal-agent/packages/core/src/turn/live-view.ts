@@ -146,7 +146,7 @@ export class LiveView {
   }
 
   private failedText(block: { label: Label; count: number }): string {
-    return failedLine(block.label, this.lang) + (block.count > 1 ? ` (${block.count})` : "");
+    return failedLine(block.label, this.lang) + (block.count > 1 ? ` (${String(block.count)})` : "");
   }
 
   private preparingLine(): string {
@@ -190,7 +190,9 @@ export class LiveView {
     const said = findLast(this.blocks, (b) => b.kind === "text");
     if (said && said.kind === "text") {
       const flat = collapseSpaces(said.body.replaceAll("**", "").replaceAll("`", ""));
-      lines.push(pyLen(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(pySlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`);
+      lines.push(
+        pyLen(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(pySlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`,
+      );
     }
     return lines;
   }
