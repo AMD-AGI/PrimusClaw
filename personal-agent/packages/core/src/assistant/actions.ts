@@ -43,6 +43,8 @@ export interface AssistantActionDeps {
   /** The person's assistant can answer them. */
   readonly reachable: (userId: string) => boolean;
   readonly logger: Logger;
+  /** Takes a review handed back to this chat (the review service's `ReviewHandoffAction.take`); dropped without it. */
+  readonly reviewHandoff?: (userId: string, event: Readonly<Record<string, unknown>>) => "delivered" | "dropped";
 }
 
 type Event = Readonly<Record<string, unknown>>;
@@ -78,7 +80,7 @@ export class AssistantActions {
 
   /**
    * An `assistant.action` event for `userId`: carried out by `run` (the command exactly as typed, as the person) only for a message
-   * this worker sent for them that declared it, and once per event id. A review handoff is the review line's (W7) and is dropped.
+   * this worker sent for them that declared it, and once per event id. A review handoff goes to the review service.
    */
   async runAction(
     userId: string,
@@ -88,8 +90,7 @@ export class AssistantActions {
     const action = record(event["action"]);
     const name = pyStr(action["name"]);
     const args = pySplit(pyStr(action["args"])).join(" ");
-    // TODO(W7): `review_for_other` (or any event that carries `review`) is the review handoff (`_review_handoff`).
-    if (name === REVIEW_HANDOFF || "review" in event) return "dropped";
+    if (name === REVIEW_HANDOFF || "review" in event) return this.deps.reviewHandoff?.(userId, event) ?? "dropped";
     const declared =
       this.declared(userId, pyStr(event["channel_message_id"]), name, args) &&
       cpLength(args) <= CONTEXT_TEXT_MAX &&

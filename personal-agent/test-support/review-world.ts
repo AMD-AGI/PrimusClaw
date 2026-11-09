@@ -28,6 +28,8 @@ import { GithubApi } from "../packages/runtime/src/github/api.js";
 import { IdentityCredentialClient } from "../packages/runtime/src/github/credential-client.js";
 import { GithubDeviceFlow } from "../packages/runtime/src/github/device-flow.js";
 import { PublicPullReader } from "../packages/runtime/src/github/pull-reader.js";
+import { Receipts } from "../packages/core/src/assistant/receipts.js";
+import { ReviewHandoffAction, REVIEW_HANDOFF } from "../packages/core/src/review/index.js";
 import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 import { openTestStore } from "./store.js";
@@ -171,8 +173,8 @@ export class ReviewClaw {
   connection: JsonObject | null = null;
   /** Refusals by pull request ("owner/repo#n", lower case): [status, error, data]. */
   refuse = new Map<string, [number, string, Record<string, unknown>]>();
-  /** What the asker's view of each item says. */
-  views = new Map<string, Record<string, unknown>>();
+  /** What the asker's view of each item says: one view, or what each read says in turn (the last one stays). */
+  views = new Map<string, Record<string, unknown> | Record<string, unknown>[]>();
   /** A whole request refused, or not answered. */
   refuseAll: Error | undefined;
 
@@ -232,7 +234,8 @@ export class ReviewClaw {
         get: fail,
         requesterView: (token: string, itemId: string) => {
           this.calls.push(["view", token, itemId]);
-          const view = this.views.get(itemId);
+          const seen = this.views.get(itemId);
+          const view = Array.isArray(seen) ? (seen.length > 1 ? seen.shift() : seen[0]) : seen;
           if (view === undefined) return Promise.reject(new ClawError(404));
           return Promise.resolve({
             itemId,
@@ -420,3 +423,120 @@ export function saidIn(surface: FakeSurface, conversation: string): string {
 }
 
 export type { Conversation };
+
+/** What Claw's fake items say beyond their pull request (`items_world`'s `item_model`, `queue_after`, `queue_reason`). */
+export interface ItemOptions {
+  /** The limit a pull request's item waits on ("" it starts). */
+  readonly queued?: (n: number) => string;
+  /** Items after the first `queueAfter` of a request wait on `queueReason`. */
+  readonly queueAfter?: number;
+  readonly queueReason?: string;
+  /** The first item's board number. */
+  readonly seqFrom?: number;
+  readonly model?: Partial<Pick<ReviewStart, "mergeNeedsConfirmation" | "mergeByRequester" | "model" | "ignored">>;
+}
+
+/** Claw's items for every pull request of a request: item-1, item-2, ... with board numbers from 7 (`items_world`). */
+export function withItems(world: ReviewWorld, options: ItemOptions = {}): void {
+  const seqFrom = options.seqFrom ?? 7;
+  world.claw.starts = (_token, request) =>
+    (request.prs as { pull: ReviewStart["target"] }[]).map((p, i) => ({
+      target: p.pull,
+      itemId: `item-${String(i + 1)}`,
+      seq: seqFrom + i,
+      title: "",
+      sessionId: request.actingToken ? "" : `s-${String(i + 1)}`,
+      messageId: "",
+      model: null,
+      fellBackFrom: "",
+      ignored: [],
+      mergeNeedsConfirmation: null,
+      queued:
+        options.queueAfter !== undefined && i >= options.queueAfter
+          ? (options.queueReason ?? "")
+          : (options.queued?.(p.pull.number) ?? ""),
+      mergeByRequester: false,
+      ...options.model,
+    }));
+}
+
+export const ALICE_DM = "personal:aad-a";
+
+/**
+ * The review world where Alice's assistant understands her and hands reviews back (`test_review_handoff.world`): her 1:1 chat
+ * is known, Bob's link recorded his Claw user id, and the message `act-1` this worker sent for her declared the handoff.
+ */
+export function handoffWorld(items: ItemOptions = { seqFrom: 1 }) {
+  const world = reviewWorld();
+  withItems(world, items);
+  world.store.references.saveReference("aad-a", { conversation: { id: ALICE_DM } });
+  world.store.links.setClawUserId("aad-b", "u-bob");
+  world.store.assistantMessages.noteAssistantMessage("act-1", "aad-a", ["board", "quiet", REVIEW_HANDOFF], ["u-bob"]);
+  const receipts = new Receipts(world.clock, silentLogger);
+  const action = new ReviewHandoffAction(world.deps, {
+    review: world.service,
+    receipts,
+    understands: (userId) => userId === "aad-a",
+    reachable: (userId) => userId === "aad-a",
+  });
+  return { ...world, receipts, action };
+}
+
+export type HandoffWorld = ReturnType<typeof handoffWorld>;
+
+const target = (pr: string) => {
+  const [repo = "", number = "0"] = pr.split("#");
+  const [owner = "", name = ""] = repo.split("/");
+  return { owner, repo: name, number: Number(number) };
+};
+
+/** Claw's `assistant.action` handing back the review of `prs` asked of Bob (`test_review_handoff.handoff`). */
+export function handoffEvent(
+  options: {
+    eventId?: string;
+    messageId?: string;
+    reviewer?: string;
+    name?: string;
+    prs?: readonly string[];
+    merge?: boolean;
+    note?: string;
+    handoffId?: string | null;
+    extra?: Record<string, unknown>;
+  } = {},
+): Record<string, unknown> {
+  const review: Record<string, unknown> = {
+    reviewer: { user_id: options.reviewer ?? "u-bob", name: options.name ?? "Bob" },
+    prs: (options.prs ?? [PR]).map(target),
+    merge: options.merge ?? true,
+    requester_note: options.note ?? `请 @Bob review 合入 ${PR}`,
+  };
+  if (options.handoffId !== null) review.handoff_id = options.handoffId ?? "h-1";
+  return {
+    type: "assistant.action",
+    event_id: options.eventId ?? "ev-h1",
+    occurred_at: "2026-11-05T00:00:00Z",
+    user_id: "u-alice",
+    message_id: "claw-pending-1",
+    channel_message_id: options.messageId ?? "act-1",
+    action: { name: REVIEW_HANDOFF, args: "" },
+    review,
+    ...options.extra,
+  };
+}
+
+/**
+ * Lets the follows run: time passes a read at a time until nothing sleeps, or for `rounds` reads (a follow of an item that has
+ * not ended goes on, as it does in the worker; the test ends with it still waiting).
+ */
+export async function settleFollows(world: ReviewWorld, rounds = 20, stepMs = 30_000): Promise<void> {
+  for (let i = 0; i < rounds && world.clock.pending > 0; i += 1) await world.clock.advance(stepMs);
+  if (world.clock.pending === 0) await world.service.idle();
+}
+
+/** Claw posts each event to the chat's endpoint; the reviews start in the background and are followed (`hand_back`). */
+export async function handBack(world: HandoffWorld, ...events: Record<string, unknown>[]): Promise<string[]> {
+  const outcomes = events.map((e) => world.action.take("aad-a", e));
+  await world.action.idle();
+  await settleFollows(world);
+  return outcomes;
+}

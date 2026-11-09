@@ -59,7 +59,7 @@ test("several pull requests go to claw in one request and no session is made her
   assert.deepEqual(world.started, []);
   assert.equal(starts(world).length, 1);
   assert.equal(request?.actingToken, "tok-aad-b");
-  assert.ok(typeof request === "object");
+  assert.ok(request);
   assert.equal(request.actingKey, "ak-bob-linked");
   assert.ok(!JSON.stringify(request).includes("ak-alice-linked"));
   assert.deepEqual(
