@@ -39,3 +39,11 @@ export async function oneTurn(srv: FakeRemote, sid: string, _cmd: FakeCommand, t
 
 /** A time `secondsAgo` before now, as Claw writes it. */
 export const seen = (secondsAgo: number): string => new Date(Date.now() - secondsAgo * 1000).toISOString();
+
+/** The worker's own books of the turns it watches, for a test that puts one there that never ends. */
+export function turnsOf(w: RemoteWorld): Map<string, unknown> {
+  return (w.remote as unknown as { chats: { turns: Map<string, unknown> } }).chats.turns;
+}
+
+/** A turn in the worker's books that nothing runs. */
+export const idleTurn = (): unknown => ({ task: null, stopRequested: false, waitsForTerminal: false });
