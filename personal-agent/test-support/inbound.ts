@@ -48,7 +48,7 @@ export function inboundAction(fields: Partial<InboundAction> = {}): InboundActio
     verb: "decision",
     invoke: true,
     clickVerb: "decision",
-    data: {},
+    data: { primusclaw: "decision" },
     cardMessageId: "m1",
     ...fields,
   };
