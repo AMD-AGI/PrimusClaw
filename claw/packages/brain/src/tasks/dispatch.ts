@@ -32,7 +32,7 @@ import {
 import { activeAbort, forgetRunAddresses, registerRunAddressesFor } from "./abort-registry.js";
 import { markSessionDeleted } from "../infra/deleted-sessions.js";
 import {
-  pickLockKey, acquireTaskLock, gateBindingError, lockContentionNakMs, readTaskLock,
+  pickLockKey, acquireTaskLock, bindLockRun, gateBindingError, lockContentionNakMs, readTaskLock,
 } from "./lock.js";
 import { releasePreGateLease, runHandleTask, resolvePoisonedTask } from "./runner.js";
 import { claimRun, failClaimedRun, type ClaimedRun } from "../clients/run-claim.js";
@@ -644,17 +644,20 @@ async function handleResolvedRequest(
     });
     return;
   }
+  // Before any await: the release of this run has to name this acquisition, not
+  // whichever one holds the key by the time it runs.
+  const abortCtrl = new AbortController();
+  bindLockRun(lockKey, abortCtrl);
   logger.info({ sessionId, lockKey, messageId }, "task.lock_acquired");
   await clearRetryPending(kv, sessionId, lockKey).catch((err) =>
     logger.warn({ err, sessionId, messageId }, "retry_pending.clear_failed"),
   );
 
-  const abortCtrl = new AbortController();
   activeAbort.set(lockKey, abortCtrl);
   // The names this run can be interrupted by, taken from the same request the
   // gate key was computed from. Nobody publishes to a gate key: the stop
   // button, cancelTask and the sweeper all address a session or a DAG root.
-  registerRunAddressesFor(lockKey, request);
+  registerRunAddressesFor(lockKey, request, abortCtrl);
   // Track promise for graceful drain.
   const taskPromise = runHandleTask(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl,
@@ -663,8 +666,10 @@ async function handleResolvedRequest(
   trackInflight(taskPromise, () => {
     // The one place every dispatched run passes through on its way out. The
     // controller itself is cleared on several paths inside the run, and
-    // spreading this over those is how the two got out of step before.
-    forgetRunAddresses(lockKey);
+    // spreading this over those is how the two got out of step before. Only
+    // this run's: a Stop may have force-released it and a later run of the key
+    // registered its own names since.
+    forgetRunAddresses(lockKey, abortCtrl);
   });
   await taskPromise;
 }
