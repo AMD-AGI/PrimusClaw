@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { redactText } from "../redact/index.js";
+import { redactText } from "../security/redact.js";
 import { cpHead, cpLength, cpSlice, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { isObject } from "./lenient.js";
 import type { AskerView } from "./model.js";

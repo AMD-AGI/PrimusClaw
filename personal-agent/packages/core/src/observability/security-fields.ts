@@ -7,7 +7,7 @@
  * they fit a shape. So message text, link codes, keys and tokens cannot reach the log through a security event.
  */
 import { pyStrip } from "../text/py-text.js";
-import { B_END, S } from "../redact/py-regex.js";
+import { B_END, S } from "../security/py-regex.js";
 import { parseIpAddress } from "./ip-address.js";
 
 /** A field's check: the value to log, or undefined when it must not be logged. */

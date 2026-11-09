@@ -11,6 +11,12 @@ import { B_END, B_START, S, W } from "./py-regex.js";
 /** What a masked value is replaced with. */
 export const MASK = "[hidden]";
 
+/**
+ * The one line a channel adds to a message it masked (the Python worker's text, byte for byte). Masking an outbound
+ * activity or card is the channel's (the Teams package's), with `redactText` and this note.
+ */
+export const NOTE = "Some sensitive-looking values were hidden. Ask me in a 1:1 chat if you need them.";
+
 const B64 = "[A-Za-z0-9+/=_\\-]";
 
 /** A rule: the pattern (global, Unicode) and whether only its last group is masked (else the whole match). */
