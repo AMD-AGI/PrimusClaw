@@ -66,6 +66,6 @@ export type * from "./people.js";
 export type * from "./remote.js";
 export type * from "./sessions.js";
 export type * from "./turns.js";
-export type { JsonObject } from "./json.js";
+
 export { isJsonObject } from "./json.js";
 export * from "./policy.js";

@@ -8,9 +8,7 @@
 
 /** Length in code points. */
 export function cpLen(text: string): number {
-  let n = 0;
-  for (const _ of text) n += 1;
-  return n;
+  return Array.from(text).length;
 }
 
 /** The first `n` code points (Python's `text[:n]`; a negative `n` counts from the end, as Python's does). */
@@ -58,7 +56,7 @@ function dump(value: unknown, item: string, key: string): string {
     const entries = Object.entries(value as Record<string, unknown>);
     return `{${entries.map(([k, v]) => `${JSON.stringify(k)}${key}${dump(v, item, key)}`).join(item)}}`;
   }
-  return JSON.stringify(String(value));
+  return JSON.stringify(typeof value === "bigint" || typeof value === "symbol" ? value.toString() : "");
 }
 
 function pyNumber(value: number): string {

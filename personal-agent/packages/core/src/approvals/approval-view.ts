@@ -48,7 +48,11 @@ export function humanizeTool(tool: string): string {
     server = match[1] ?? "";
     name = match[2] ?? "";
   }
-  const spaced = name.split(/[_\-\s]+/).join(" ").trim() || name;
+  const spaced =
+    name
+      .split(/[_\-\s]+/)
+      .join(" ")
+      .trim() || name;
   return server ? `${spaced} (${server})` : spaced;
 }
 
@@ -90,13 +94,20 @@ export function argumentLines(tool: string, toolInput: unknown): ArgumentLines {
   let reason: ArgumentLine | undefined;
   for (const [name, value] of Object.entries(masked)) {
     const lower = name.toLowerCase();
-    const pair: ArgumentLine = [clip(name, NAME_MAX), lower === "command" ? clipCommand(show(value)) : clip(show(value), VALUE_MAX)];
+    const pair: ArgumentLine = [
+      clip(name, NAME_MAX),
+      lower === "command" ? clipCommand(show(value)) : clip(show(value), VALUE_MAX),
+    ];
     if (lower === "reason") reason ??= pair;
     else if (bare.includes(`_${lower}_`)) about.push(pair);
     else others.push(pair);
   }
   about.sort((a, b) => bare.indexOf(`_${a[0].toLowerCase()}_`) - bare.indexOf(`_${b[0].toLowerCase()}_`));
-  return { lines: [...about, ...others.slice(0, MAX_OTHER_ARGS)], reason, more: Math.max(0, others.length - MAX_OTHER_ARGS) };
+  return {
+    lines: [...about, ...others.slice(0, MAX_OTHER_ARGS)],
+    reason,
+    more: Math.max(0, others.length - MAX_OTHER_ARGS),
+  };
 }
 
 /** The call as JSON for the collapsed section: credential-named fields and secret shapes already masked. */
@@ -139,7 +150,12 @@ export interface ApprovalRequest {
 }
 
 /** One line from text Claw or the model wrote: scrubbed of typed credentials, masked by shape, then clipped (in that order). */
-function eventField(event: Readonly<Record<string, unknown>>, name: string, limit: number, secrets: readonly string[]): string {
+function eventField(
+  event: Readonly<Record<string, unknown>>,
+  name: string,
+  limit: number,
+  secrets: readonly string[],
+): string {
   const value = event[name];
   if (typeof value !== "string") return "";
   return clip(redactText(flat(scrub(flat(value), secrets))).text, limit);
@@ -161,7 +177,17 @@ export function approvalView(request: ApprovalRequest): ApprovalView {
     ruleLabel: eventField(event, "approval_label", INTENT_MAX, secrets),
   };
   if (request.group) {
-    return { ...base, intent: "", action: name, description: "", args: [], reason: undefined, moreFields: 0, details: "", ruleLabel: "" };
+    return {
+      ...base,
+      intent: "",
+      action: name,
+      description: "",
+      args: [],
+      reason: undefined,
+      moreFields: 0,
+      details: "",
+      ruleLabel: "",
+    };
   }
   const { lines, reason, more } = argumentLines(request.tool, request.toolInput);
   return {

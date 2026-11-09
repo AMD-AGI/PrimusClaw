@@ -54,7 +54,9 @@ export function agentHead(label: string, host: string): string {
 /** The first line of the second and later messages of one answer: the agent's icon and where it is in the answer. */
 export function continuedHead(label: string, n: number, total: number, lang: string): string {
   const icon = agentHead(label, "").split(" ", 1)[0] ?? NEUTRAL_ICON;
-  return lang === "zh" ? `${icon} （续 ${n}/${total}）` : `${icon} (cont. ${n}/${total})`;
+  return lang === "zh"
+    ? `${icon} （续 ${String(n)}/${String(total)}）`
+    : `${icon} (cont. ${String(n)}/${String(total)})`;
 }
 
 /** The agent's words with every line that would read as a head escaped (its bold shown as asterisks). */
@@ -71,7 +73,13 @@ export function signed(head: string, text: string): string {
 }
 
 /** The messages of one thing an agent said, each headed: the first with who said it (and `suffix`), the others with where they are. */
-export function signedParts(label: string, host: string, parts: readonly string[], lang: string, suffix = ""): string[] {
+export function signedParts(
+  label: string,
+  host: string,
+  parts: readonly string[],
+  lang: string,
+  suffix = "",
+): string[] {
   return parts.map((part, i) =>
     signed(i === 0 ? agentHead(label, host) + suffix : continuedHead(label, i + 1, parts.length, lang), part),
   );
@@ -82,7 +90,10 @@ export const TYPED_SUFFIX: Readonly<Record<Lang, string>> = {
   zh: "（回复终端里的输入）",
   en: " (replying to what was typed in the terminal)",
 };
-export const BACK: Readonly<Record<Lang, SuggestedReply>> = { zh: ["回到 Clawy", "回到 Clawy"], en: ["Back to Clawy", "back to Clawy"] };
+export const BACK: Readonly<Record<Lang, SuggestedReply>> = {
+  zh: ["回到 Clawy", "回到 Clawy"],
+  en: ["Back to Clawy", "back to Clawy"],
+};
 const GO_ON: Readonly<Record<Lang, SuggestedReply>> = { zh: ["继续", "继续"], en: ["Continue", "Continue"] };
 
 function lang2(lang: string): Lang {
@@ -124,9 +135,10 @@ export function enteredLine(entered: EnteredLine): string {
   const zh = entered.lang === "zh";
   const where = `${neutral(entered.host, 80)} · ${neutral(entered.label, 80)}`;
   const mode = neutral(entered.mode, 40);
-  const extra = [entered.cwd ? `\`${neutral(entered.cwd, 120)}\`` : "", entered.mode ? (zh ? `${mode} 模式` : `${mode} mode`) : ""].filter(
-    Boolean,
-  );
+  const extra = [
+    entered.cwd ? `\`${neutral(entered.cwd, 120)}\`` : "",
+    entered.mode ? (zh ? `${mode} 模式` : `${mode} mode`) : "",
+  ].filter(Boolean);
   const detail = extra.length ? (zh ? `（${extra.join("，")}）` : ` (${extra.join(", ")})`) : "";
   const lines = [
     zh
@@ -191,7 +203,7 @@ export class DirectChat {
 
   describe(): string {
     if (this.users === undefined) return "off";
-    return this.users.size === 0 ? "on for everybody" : `on for ${this.users.size} people`;
+    return this.users.size === 0 ? "on for everybody" : `on for ${String(this.users.size)} people`;
   }
 
   /**
