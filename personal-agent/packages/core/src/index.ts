@@ -11,6 +11,7 @@
 export * from "./approvals/index.js";
 export type * from "./assistant/views.js";
 export * from "./assistant/work-items.js";
+export * from "./brief/index.js";
 export * from "./errors.js";
 export * from "./feedback/index.js";
 export * from "./json.js";
