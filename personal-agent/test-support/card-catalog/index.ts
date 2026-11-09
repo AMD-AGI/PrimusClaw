@@ -6,9 +6,8 @@
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).
  */
 import type { CatalogEntry } from "./catalog.js";
-import { FEEDBACK_CARDS } from "./feedback.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...FEEDBACK_CARDS];
+export const CATALOG: readonly CatalogEntry[] = [];
 
 const BY_LINE = {
   W4: ["binding", "link", "onboarding", "repo"],
@@ -48,6 +47,7 @@ const BY_LINE = {
   ],
   W3: ["remote_window", "remote_window_en"],
   W7: ["github_connect", "review_confirm_merge", "review_confirm_post", "review_end", "review_mode", "review_start"],
+  W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;
 
 /** Snapshot ids whose builders are not ported yet. Each line removes its own as it registers them. */
