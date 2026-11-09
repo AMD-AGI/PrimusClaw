@@ -230,3 +230,40 @@ for (const ends of [false, true]) {
       assert.ok(!w.operations().some((o) => o.op === "send" && o.text.includes("BG-DONE-3")));
     }, CARD));
 }
+
+// --- a cancelled edit (found by the port: a turn's end cancelled an edit already waiting for the chat, which then posted the card
+// a second time) ---------------------------------------------------------------------------------------------------------------
+
+interface Board {
+  refreshWindow(chatKey: string, to: unknown, how?: { byPerson?: boolean }): Promise<boolean>;
+  scheduleWindow(chatKey: string, to: unknown): void;
+  cancelWindowEdit(chatKey: string): void;
+  settled(): Promise<void>;
+}
+
+test("an edit of the card cancelled while it waits for the chat does nothing", () =>
+  remoteWorld(async (w) => {
+    await windowed(w);
+    const board = (w.remote as unknown as { board: Board }).board;
+    const to = w.conversationOf();
+    let release = (): void => undefined;
+    w.gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const mark = w.operations().length;
+    const first = board.refreshWindow(AAD, to, { byPerson: true }); // (holds the chat while its edit is in flight)
+    board.scheduleWindow(AAD, to);
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve)); // (its pause is over: it waits for the chat)
+    board.cancelWindowEdit(AAD);
+    w.gate = null;
+    release();
+    await first;
+    await board.settled();
+    assert.deepEqual(
+      w
+        .operations()
+        .slice(mark)
+        .map((o) => o.op),
+      ["update"],
+    ); // the first refresh's edit, and nothing from the cancelled one
+  }, CARD));

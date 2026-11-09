@@ -125,6 +125,8 @@ export class RemoteWorld {
   readonly claw: ClawRemoteAgentsPort;
   /** A message the channel refuses to post (Teams said no), when this says so. */
   refuse: ((message: OutMessage) => boolean) | null = null;
+  /** While set, every edit waits for it first (a test holds an edit in flight, then lets it go). */
+  gate: Promise<void> | null = null;
   /** A message a test says Teams never answers for: its send hangs (until the test ends). */
   hang: ((message: OutMessage) => boolean) | null = null;
   /** The credential the remote agents read with for a person (their linked key here; a test may make it fail). */
@@ -228,7 +230,11 @@ export class RemoteWorld {
       typing: () => to.typing(),
       send: (message) => refused(message) ?? to.send(message),
       post: (message) => refused(message) ?? to.post(message),
-      update: (id, message, options) => refused(message) ?? to.update(id, message, options),
+      update: (id, message, options) => {
+        const gate = this.gate;
+        if (gate !== null) return gate.then(() => refused(message) ?? to.update(id, message, options));
+        return refused(message) ?? to.update(id, message, options);
+      },
       delete: (id) => to.delete(id),
       outgoing: (message) => to.outgoing(message),
       deliver: (envelope) => to.deliver(envelope),
