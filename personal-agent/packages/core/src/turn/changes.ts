@@ -13,7 +13,7 @@ import { isObject, objectOr } from "./json.js";
 import { errorName } from "../errors.js";
 import type { Logger } from "../ports/logger.js";
 import type { TurnClaw } from "./ports.js";
-import { ClawError, errorKind } from "./upstream.js";
+import { ClawError, errorKind } from "../claw/errors.js";
 
 /** One try, then nothing: the answer is already in the chat. */
 export const CHANGES_TIMEOUT_SECONDS = 5.0;

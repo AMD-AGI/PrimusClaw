@@ -13,7 +13,8 @@ import type { PublicErrors } from "../../public-error/public-errors.js";
 import type { Envelope, FetchedFile, InboundFile, OutMessage, UserRef } from "../../ports/surface.js";
 import type { GithubOutcome } from "../github-outcome.js";
 import type { TurnClaw, TurnSurface } from "../ports.js";
-import { type ClawError, pickLang } from "../upstream.js";
+import type { ClawError } from "../../claw/errors.js";
+import { pickLang } from "../../language/detect.js";
 
 /** What the turn is and whom it acts for. Read only by the turn. */
 export interface TurnRequest {

@@ -18,7 +18,8 @@ import { type StatusMessage, turnStatusMessage } from "../progress/status-messag
 import type { Step } from "../step.js";
 import { detach, Task } from "../task.js";
 import { TurnState } from "../turn-state.js";
-import { ClawError, ClawUnreachable, errorKind, splitErrorTail } from "../upstream.js";
+import { ClawError, ClawUnreachable, errorKind } from "../../claw/errors.js";
+import { splitErrorTail } from "../../public-error/classify.js";
 import { consume, noteRunning, StreamKeptDropping } from "./consume.js";
 import { langOf, type TurnContext } from "./context.js";
 import { offerChanges, offerDeliveries, offerReport, offerThumbs } from "./extras.js";
@@ -166,7 +167,7 @@ class TurnRun {
   /** The answer with its failure cut off and withheld; whether the turn still counts as ok. */
   private cutFailure(state: TurnState, ok: boolean): readonly [string, boolean] {
     if (ok && !state.failed) return [state.answer, ok];
-    const [answer, error] = splitErrorTail(state.answer);
+    const { kept: answer, tail: error } = splitErrorTail(state.answer);
     if (error || !ok) {
       const ref = this.ctx.deps.errors.withhold("turn_failed", error, {
         session: this.sessionId,

@@ -68,10 +68,39 @@ export interface ReviewTurnOptions {
   readonly asItem?: () => Promise<boolean>;
 }
 
+/** What a review turn tells the review service once it is over (agent.py's reading of the turn's context after it). */
+export interface ReviewTurnOutcome {
+  /** The review was asked for again as the reviewer's item, and the asker told (`asItem`). */
+  readonly moved: boolean;
+  /** Claw refused the asker's credentials (401): its status and error word; null when it did not. */
+  readonly refusal: { readonly status: number; readonly code: string } | null;
+  /** The model the turn ran on. */
+  readonly ranModel: string;
+  /** What the turn wrote to GitHub (a review posted, a merge, a place in the queue); not every call it made. */
+  readonly wrote: readonly GithubOutcome[];
+  /** The sentence of what the pull request does that a review or merge call gave. */
+  readonly prSummary: string;
+}
+
 declare module "../routing/turn-runner.js" {
   interface ReviewRunFields {
     readonly turn: ReviewTurnOptions;
   }
+  interface TurnOutcome {
+    /** A review turn only. */
+    readonly review?: ReviewTurnOutcome;
+  }
+}
+
+function reviewOutcome(record: TurnContext["record"]): ReviewTurnOutcome {
+  const refusal = record.refusal ? { status: record.refusal.status, code: record.refusal.code } : null;
+  return {
+    moved: record.moved,
+    refusal,
+    ranModel: record.ranModel,
+    wrote: [...record.wrote],
+    prSummary: record.prSummary,
+  };
 }
 
 export interface TurnEngineDeps {
@@ -192,6 +221,7 @@ export class TurnEngine implements TurnRunner {
       toolDenied: () => hooks.toolDenied(),
       stopConfirmed: () => hooks.stopConfirmed(),
     });
-    return { finalAnswer: ctx.record.finalAnswer };
+    const finalAnswer = ctx.record.finalAnswer;
+    return run.review ? { finalAnswer, review: reviewOutcome(ctx.record) } : { finalAnswer };
   }
 }

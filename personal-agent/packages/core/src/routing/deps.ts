@@ -7,14 +7,26 @@ import type { KeyRevoker } from "../plugins/key-revoker.js";
 import type { TokenExchange } from "../plugins/token-exchange.js";
 import type { ClawPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
+import type { Random } from "../ports/random.js";
 import type { Logger, LogValue } from "../ports/logger.js";
 import type { MetricsPort } from "../ports/metrics.js";
 import type { RouteHandlers } from "../ports/routing.js";
 import type { StorePort } from "../ports/store/index.js";
-import type { ConversationRef, Surface } from "../ports/surface.js";
+import type { ConversationRef, OutMessage, Surface } from "../ports/surface.js";
 import type { JsonObject } from "../json.js";
 import type { SecurityEventName } from "../observability/security-events.js";
-import type { AssistantChat, GithubChat, Observing, RemoteChat, Subscriptions } from "./features.js";
+import type {
+  AssistantChat,
+  ChannelContextBuilder,
+  ConnectionsText,
+  GithubChat,
+  MessageText,
+  NoteFactory,
+  Observing,
+  RemoteChat,
+  ReviewStopReader,
+  Subscriptions,
+} from "./features.js";
 import type { TurnRunner } from "./turn-runner.js";
 
 /** What a deployment sets for the router (the Python `Agent.__init__` arguments that are settings). */
@@ -26,6 +38,8 @@ export interface RouterConfig {
   readonly pluginId: string;
   /** Sessions are pinned to this model ("" Claw's default). */
   readonly model: string;
+  /** What a review for a colleague runs on when its request named no model ("" the chat's model). */
+  readonly reviewModel: string;
   /** A turn refused for want of a gateway key runs again on this model ("" never). */
   readonly fallbackModel: string;
   /** Ordinary chats run on exchanged tokens (TEAMS_EXCHANGE_FOR_CHAT) instead of the linked key. */
@@ -98,6 +112,7 @@ export interface RouterDeps {
   readonly store: RouterStore;
   readonly claw: ClawPort;
   readonly clock: Clock;
+  readonly random: Random;
   readonly logger: Logger;
   readonly metrics: MetricsPort;
   readonly securityEvent: (name: SecurityEventName, fields: Readonly<Record<string, LogValue>>) => void;
@@ -111,6 +126,18 @@ export interface RouterDeps {
   readonly proactive: ProactiveHold;
   readonly observing: Observing;
   readonly github: GithubChat | undefined;
+  /** The review-stop words of a group (with the review service on). */
+  readonly reviewStop: ReviewStopReader | undefined;
+  /** What a chat can hand back to this worker (the review service's `review_for_other`; empty without it). */
+  readonly handoffs: readonly string[];
+  readonly channelContext: ChannelContextBuilder;
+  readonly messageText: MessageText;
+  /** `/whoami`'s connection lines (the review service's renderer, which also says them without it). */
+  readonly connectionsText: ConnectionsText;
+  /** The "Report a problem" card under a message that says something went wrong (feedback's view); undefined: none. */
+  readonly reportView: (userId: string, scope: string) => OutMessage | undefined;
+  /** The note card a settled click ends as. */
+  readonly note: NoteFactory;
   readonly subscriptions: Subscriptions | undefined;
   readonly handlers: RouteHandlers;
   readonly integrations: Integrations;
