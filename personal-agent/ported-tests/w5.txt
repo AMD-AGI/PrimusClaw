@@ -34,6 +34,13 @@ teams/tests/test_direct_chat.py::test_the_head_names_the_agent_and_its_machine_a
 teams/tests/test_direct_chat.py::test_a_line_of_the_agents_that_looks_like_a_head_is_escaped -> packages/core/test/direct-chat/direct-chat.test.ts::a line of the agents that looks like a head is escaped (💬 **Clawy** I approve)
 teams/tests/test_direct_chat.py::test_with_the_switch_off_a_replacing_say_still_edits_the_first_message -> MERGED packages/core/test/proactive/proactive.test.ts::a say that amends or replaces an earlier one edits it
 teams/tests/test_log_hygiene.py::test_an_approval_card_and_its_answers_do_not_log_the_tool_input -> packages/core/test/approvals/log-hygiene.test.ts::an approval card and its answers do not log the tool input
+teams/tests/test_assistant_proactive.py::test_a_held_write_is_a_card_with_its_two_buttons_and_nothing_is_done_by_showing_it -> MERGED packages/core/test/assistant/say.test.ts::a held write is a card that lets it through or not
+teams/tests/test_assistant_proactive.py::test_only_a_held_write_this_worker_can_draw_becomes_a_card -> MERGED packages/core/test/assistant/events.test.ts::a held write is drawn only for the kinds this worker knows
+teams/tests/test_assistant_proactive.py::test_a_held_write_with_a_long_text_says_it_whole_once_then_its_card -> packages/core/test/assistant/say.test.ts::a held write with a long text says it whole once then its card
+teams/tests/test_direct_chat.py::test_clawy_has_a_head_and_back_to_clawy_while_attached_and_the_way_back_to_the_agent_after -> MERGED packages/core/test/direct-chat/direct-chat.test.ts::clawy speaks under its head while attached and offers the way back otherwise
+teams/tests/test_direct_chat.py::test_clawy_speaks_under_its_own_head_while_the_chat_is_attached -> MERGED packages/core/test/proactive/proactive.test.ts::with direct chat on and the chat attached to a session an amending say is a message of its own
+teams/tests/test_direct_chat.py::test_a_replacing_say_after_a_receipt_closed_is_a_message_of_its_own_and_says_each_thing_once -> MERGED packages/core/test/proactive/proactive.test.ts::with direct chat on and the chat attached to a session an amending say is a message of its own
+teams/tests/test_direct_chat.py::test_the_receipt_streams_clawys_words_under_its_head -> MERGED packages/core/test/assistant/receipt.test.ts::words that do not grow or pass the limit are not shown
 teams/tests/test_proactive_ux.py::test_every_card_validates_against_adaptive_cards_1_5 -> packages/teams/test/views-proactive.test.ts::every card validates against adaptive cards 1 5
 teams/tests/test_proactive_ux.py::test_the_validator_is_not_vacuous -> packages/teams/test/views-proactive.test.ts::the validator is not vacuous
 teams/tests/test_proactive_ux.py::test_cards_are_one_column_with_at_most_three_actions -> packages/teams/test/views-proactive.test.ts::cards are one column with at most three actions
@@ -332,6 +339,33 @@ teams/tests/test_ask_user_question.py::test_the_card_keeps_to_what_teams_shows -
 # teams/tests/test_approval_card.py::test_a_turn_shows_the_summary_in_the_users_language -> LATER: W4b turn engine shows the card (TurnApprovals); view/body covered above
 # teams/tests/test_approval_card.py::test_a_turn_from_an_older_brain_follows_the_language_of_what_the_user_wrote -> LATER: W4b turn engine
 # teams/tests/test_approval_card.py::test_a_group_turn_never_shows_the_input_and_keeps_the_summary -> LATER: W4b turn engine in a group
+# teams/tests/test_assistant_proactive.py::test_a_confirm_card_moves_only_from_the_state_named -> LATER: W1 store (moveConfirmCard, packages/runtime/test/sqlite)
+# teams/tests/test_assistant_proactive.py::test_brief_with_the_assistant_shows_the_brief_now -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_now_is_the_brief_alone_in_one_message -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_whose_schedule_cannot_be_read_is_still_shown_once -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_the_brief_in_words_is_words_for_claw_without_the_assistant -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_without_the_assistant_only_says_its_state -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_that_cannot_be_read_says_so -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_on_with_the_assistant_is_claws_own_brief_and_replaces_one_of_the_other_kind -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_a_refused_conversion_keeps_the_old_brief -> LATER: W8 /brief
+# teams/tests/test_assistant_proactive.py::test_brief_markdown_shows_every_section_and_escapes_what_claw_sent -> LATER: W8 /brief (brief_markdown)
+# teams/tests/test_assistant_proactive.py::test_help_offers_schedules_and_job_watches_only_when_their_switches_are_on -> LATER: W4 help
+# teams/tests/test_direct_chat.py::test_a_group_binding_keeps_its_own_rules -> LATER: W6 remote agents (group binding)
+# teams/tests/test_direct_chat.py::test_the_settings_read_the_switch_and_its_list_and_a_typo_stops_the_start -> LATER: W2/W3b settings
+# teams/tests/test_direct_chat.py::test_the_switch_is_documented_where_settings_are -> LATER: README (W3b)
+# teams/tests/test_direct_chat.py::test_a_mixed_conversation_goes_to_whom_each_message_names -> LATER: W6 remote world + W4 router
+# teams/tests/test_direct_chat.py::test_a_person_the_switch_is_not_on_for_keeps_the_card_routing -> LATER: W6 remote world
+# teams/tests/test_direct_chat.py::test_an_attachment_made_before_the_switch_moves_its_window_to_the_chat -> LATER: W6 remote world
+# teams/tests/test_direct_chat.py::test_entering_is_one_line_with_the_way_back_and_no_card -> LATER: W6 remote world (enteredLine is ported here)
+# teams/tests/test_direct_chat.py::test_the_agents_words_stream_under_its_head_from_the_first_update_and_nothing_is_edited -> LATER: W6 remote world
+# teams/tests/test_direct_chat.py::test_the_agents_words_cannot_pass_for_clawy -> LATER: W6 remote world (guardHeads is ported here)
+# teams/tests/test_direct_chat.py::test_a_long_answer_says_whose_each_of_its_messages_is -> LATER: W6 remote world (signedParts is ported here)
+# teams/tests/test_direct_chat.py::test_a_refused_stream_still_signs_the_answer_and_puts_the_way_back_under_it -> LATER: W6 remote world
+# teams/tests/test_direct_chat.py::test_leaving_is_one_line_whose_reply_goes_back_to_the_same_agent -> LATER: W6 remote world (leftLine/returnReply are ported here)
+# teams/tests/test_direct_chat.py::test_the_chat_box_setting_says_the_chat_is_the_window_now -> LATER: W6 remote world
+# teams/tests/test_direct_chat.py::test_what_the_agent_says_between_turns_is_signed_and_has_the_way_back_under_it -> LATER: W6 remote_follow
+# teams/tests/test_direct_chat.py::test_for_a_person_the_assistant_understands_the_chat_box_talks_to_the_agent_and_clawy_answers_under_its_head -> LATER: W4 router + W6
+# teams/tests/test_direct_chat.py::test_an_agent_and_clawy_taking_turns_leave_no_message_edited -> LATER: W6 remote world + W4 router
 # teams/tests/test_item_approvals.py::* (all 8) -> LATER: every test drives the worker (subscriptions, presses, quiet hours); the cards they show are approval_item / question_item, covered by the snapshots and views-proactive.test.ts
 # teams/tests/test_proactive_ux.py::test_in_quiet_* and every test from test_notices_during_quiet_hours_are_held... on -> LATER: quiet hours, pause, approval presses and brief need the worker (not card builders)
 # teams/tests/test_assistant_citations.py::test_a_long_reply_cites_in_each_message_what_its_own_words_cite -> LATER: needs say_activities (reply split into messages, root entity per message)
