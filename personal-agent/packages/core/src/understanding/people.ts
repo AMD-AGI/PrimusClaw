@@ -8,7 +8,7 @@ import { flat } from "../review-text/text/unicode.js";
 import { rosterOf, textOf, type PersonRecord } from "./record.js";
 import { isAsciiAlpha } from "../text/py-regex.js";
 import { cpLength, pyCasefold } from "../text/py-text.js";
-import { similarity } from "../text/sequence-matcher.js";
+import { similarity } from "./sequence-matcher.js";
 import { CONTEXT_ITEMS_MAX, CONTEXT_TEXT_MAX, clip } from "./limits.js";
 
 /** One person the message names, as the channel context carries them. */
