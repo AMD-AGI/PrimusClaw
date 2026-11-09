@@ -77,18 +77,22 @@ export function menuCommand(text: string, group = false): string {
 
 /** The code of a `/link CODE` message, else null. */
 export function parseLinkCode(text: string): string | null {
-  const parts = pySplit(pyStrip(text));
-  const [head, code] = parts;
-  if (parts.length === 2 && head !== undefined && pyLower(head) === "/link" && code !== undefined) return code;
-  return null;
+  const [head = "", code, ...more] = pySplit(pyStrip(text));
+  return pyLower(head) === "/link" && code !== undefined && more.length === 0 ? code : null;
 }
 
 /** Whether `text` is a /timezone message, and its argument: null for none, "" for more than one word. */
 export function parseTimezone(text: string): { isTimezone: boolean; arg: string | null } {
-  const parts = pySplit(pyStrip(text));
-  if (pyLower(parts[0] ?? "") !== "/timezone") return { isTimezone: false, arg: null };
-  if (parts.length === 2) return { isTimezone: true, arg: parts[1] ?? null };
-  return { isTimezone: true, arg: parts.length === 1 ? null : "" };
+  const [head = "", arg, ...more] = pySplit(pyStrip(text));
+  if (pyLower(head) !== "/timezone") return { isTimezone: false, arg: null };
+  if (arg === undefined) return { isTimezone: true, arg: null };
+  return { isTimezone: true, arg: more.length === 0 ? arg : "" };
+}
+
+/** The groups of a whole match, "" for one that took part in none (a Python `m[i]` that the pattern always fills). */
+function groupsOf(pattern: RegExp, text: string): string[] | null {
+  const found = pattern.exec(pyStrip(text));
+  return found === null ? null : found.slice(1).map((group) => group || "");
 }
 
 const QUIET = pyFullmatch(String.raw`(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})`);
@@ -99,28 +103,26 @@ const UNIT_SECONDS: Readonly<Record<string, number>> = { m: 60, h: 3600, d: 8640
 
 /** '8:30' to '08:30'; null unless it is a real 24-hour time. */
 export function parseClock(text: string): string | null {
-  const found = CLOCK.exec(pyStrip(text));
-  if (found === null) return null;
-  const hour = decimalInt(found[1] ?? "");
-  const minute = decimalInt(found[2] ?? "");
-  if (hour > 23 || minute > 59) return null;
+  const [hours = "", minutes = ""] = groupsOf(CLOCK, text) ?? [];
+  const hour = decimalInt(hours);
+  if (!hours || hour > 23 || decimalInt(minutes) > 59) return null;
   // (the minutes as written, as the Python worker gives them: "８:３０" is "08:３０")
-  return `${String(hour).padStart(2, "0")}:${found[2] ?? ""}`;
+  return `${String(hour).padStart(2, "0")}:${minutes}`;
 }
 
 /** '22:00-08:00' to ['22:00', '08:00']; null when malformed or empty (start equals end). */
 export function parseQuietWindow(text: string): readonly [string, string] | null {
-  const found = QUIET.exec(pyStrip(text));
+  const found = groupsOf(QUIET, text);
   if (found === null) return null;
-  const start = parseClock(`${found[1] ?? ""}:${found[2] ?? ""}`);
-  const end = parseClock(`${found[3] ?? ""}:${found[4] ?? ""}`);
+  const [h1, m1, h2, m2] = found;
+  const start = parseClock(`${String(h1)}:${String(m1)}`);
+  const end = parseClock(`${String(h2)}:${String(m2)}`);
   return start !== null && end !== null && start !== end ? [start, end] : null;
 }
 
 /** '2h', '30m', '1d' to seconds, at most 30 days; null when malformed. */
 export function parseDurationSeconds(text: string): number | null {
-  const found = DURATION.exec(pyStrip(text));
-  if (found === null) return null;
-  const seconds = decimalInt(found[1] ?? "") * (UNIT_SECONDS[pyLower(found[2] ?? "")] ?? 0);
+  const [count = "", unit = ""] = groupsOf(DURATION, text) ?? [];
+  const seconds = decimalInt(count) * (UNIT_SECONDS[pyLower(unit)] ?? 0);
   return seconds > 0 && seconds <= MAX_PAUSE_SECONDS ? seconds : null;
 }
