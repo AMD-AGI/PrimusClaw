@@ -3,8 +3,9 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { markedText, MARK_CLOSE, MARK_OPEN, type InboundMessage } from "@primusclaw/personal-agent";
-import { toInboundEvent, wireReferenceOf, type TeamsInboundAction } from "../../src/activity/inbound/index.js";
+import { markedText, MARK_CLOSE, MARK_OPEN, type InboundAction, type InboundMessage } from "@primusclaw/personal-agent";
+
+import { toInboundEvent, wireReferenceOf } from "../../src/activity/inbound/index.js";
 import { BOT, CONV, dm, grp, htmlAttachment, replyEntity, replyHtml, USER_A, WHEN_MS } from "./fixtures.js";
 
 function message(raw: unknown, botName?: string): InboundMessage {
@@ -13,7 +14,7 @@ function message(raw: unknown, botName?: string): InboundMessage {
   return event.value;
 }
 
-function action(raw: unknown): TeamsInboundAction {
+function action(raw: unknown): InboundAction {
   const event = toInboundEvent(raw);
   assert.ok(event.ok && event.value?.type === "action");
   return event.value;
@@ -160,4 +161,34 @@ test("no sender identity and invalid input are refused", () => {
 test("unknown fields are kept", () => {
   const event = message({ ...dm("hi"), conversation: { id: "c", conversationType: "personal", custom: [1] } });
   assert.deepEqual(event.conversation.wire["conversation"], { id: "c", conversationType: "personal", custom: [1] });
+});
+
+test("the files of a message: what can be fetched, and the names of what cannot", () => {
+  const event = message({
+    type: "message",
+    id: "m-f",
+    text: "see these",
+    serviceUrl: "https://smba.trafficmanager.net/amer/",
+    from: { id: "29:a", aadObjectId: "aad-a", name: "Lin Mei" },
+    recipient: { id: "28:bot" },
+    conversation: { id: "a:1", conversationType: "personal" },
+    attachments: [
+      { contentType: "image/png", contentUrl: "https://smba.trafficmanager.net/amer/v3/attachments/1/views/original" },
+      {
+        contentType: "application/vnd.microsoft.teams.file.download.info",
+        name: "plan.md",
+        content: { downloadUrl: "https://x.sharepoint.example/d", fileType: "md" },
+      },
+      { contentType: "application/vnd.microsoft.teams.file.download.info", name: "no-link.pdf", content: {} },
+      { contentType: "text/html", content: "<p>see these</p>" },
+    ],
+  });
+  assert.deepEqual(
+    event.files.map((f) => [f.name, f.type]),
+    [
+      ["", ""],
+      ["plan.md", "md"],
+    ],
+  );
+  assert.deepEqual(event.unreadableFiles, ["no-link.pdf"]);
 });

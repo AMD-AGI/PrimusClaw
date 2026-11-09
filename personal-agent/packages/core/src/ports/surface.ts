@@ -150,6 +150,11 @@ export interface InboundMessage extends InboundBase {
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
   readonly files: readonly InboundFile[];
+  /**
+   * The names of attachments the channel gave no way to fetch (a file shared as a link), told back to the person
+   * (Python `inbound.inbound_files`' second result, said with `inbound.unreadable_line`).
+   */
+  readonly unreadableFiles: readonly string[];
   readonly provenance: Provenance;
 }
 
@@ -158,6 +163,16 @@ export interface InboundAction extends InboundBase {
   readonly type: "action";
   /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
   readonly verb: string;
+  /**
+   * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
+   * must replace (Python `activity.is_card_click`); false for an Action.Submit message.
+   */
+  readonly invoke: boolean;
+  /**
+   * The channel's own verb of the click, for a log line only: clipped to 40 characters, "unknown" when absent (Python
+   * `activity.card_verb`). It comes from the client: never dispatch on it.
+   */
+  readonly clickVerb: string;
   /** The data the card attached to the button: unvalidated, each handler reads it through its own schema. */
   readonly data: Readonly<Record<string, unknown>>;
   /** The message that holds the card, which the handler replaces to settle the click ("" when not said). */

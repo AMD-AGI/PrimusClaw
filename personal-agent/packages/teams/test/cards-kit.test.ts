@@ -210,3 +210,11 @@ test("core's view buttons become the kit's actions, with their emphasis", () => 
     style: "destructive",
   });
 });
+
+test("full width parentheses take linear time on a run that never closes", () => {
+  const started = performance.now();
+  zh("(" + "中".repeat(50000));
+  zh("中(" + "中 ".repeat(30000) + "\n)");
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(zh("(中) (a) (中\n) ((中))"), "（中） (a) (中\n) (（中）)"); // (as the Python worker writes it)
+});
