@@ -15,4 +15,6 @@ export * from "./plugins/index.js";
 export * from "./ports/index.js";
 export * from "./protocol.js";
 export * from "./result.js";
+export * from "./text/py-regex.js";
+export * from "./text/py-text.js";
 export * from "./validate.js";
