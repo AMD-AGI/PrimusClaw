@@ -37,6 +37,7 @@ export function neutralPlugins(overrides: Partial<Plugins> = {}): Plugins {
 
 export * from "./feedback-sink.js";
 export * from "./identity-lookup.js";
+export * from "./integrations.js";
 export * from "./key-revoker.js";
 export * from "./model-refusal-policy.js";
 export * from "./route-extension.js";

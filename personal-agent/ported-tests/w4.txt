@@ -1,0 +1,26 @@
+# W4: routing and commands (agent.py's routing, commands.py, capabilities.py, transparency.py, integrations.py, branding.py).
+# Work in progress: the router and the command handlers follow; this ledger grows with them.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+
+teams/tests/test_commands_render.py::test_parse_command -> packages/core/test/commands.test.ts::parse_command
+
+teams/tests/test_capabilities.py::test_the_registry_is_well_formed -> packages/core/test/help.test.ts::test_the_registry_is_well_formed
+teams/tests/test_capabilities.py::test_ways_of_saying_the_same -> packages/core/test/capabilities-natural.test.ts::test_ways_of_saying_the_same
+teams/tests/test_capabilities.py::test_anything_else_is_a_request_for_claw -> packages/core/test/capabilities-natural.test.ts::test_anything_else_is_a_request_for_claw
+teams/tests/test_capabilities.py::test_a_group_reads_only_what_a_group_may_do -> packages/core/test/capabilities-natural.test.ts::test_a_group_reads_only_what_a_group_may_do
+teams/tests/test_capabilities.py::test_a_sentence_for_what_this_chat_does_not_have_stays_words_for_claw -> packages/core/test/capabilities-natural.test.ts::test_a_sentence_for_what_this_chat_does_not_have_stays_words_for_claw
+teams/tests/test_capabilities.py::test_every_command_a_sentence_means_is_one_the_worker_handles -> packages/core/test/capabilities-natural.test.ts::test_every_command_a_sentence_means_is_one_the_worker_handles
+teams/tests/test_capabilities.py::test_short_generic_words_are_no_longer_triggers -> packages/core/test/capabilities-natural.test.ts::test_short_generic_words_are_no_longer_triggers
+teams/tests/test_capabilities.py::test_help_lists_no_commands_and_every_category_in_order -> packages/core/test/help.test.ts::test_help_lists_no_commands_and_every_category_in_order
+teams/tests/test_capabilities.py::test_each_line_is_short_enough_for_a_phone -> packages/core/test/help.test.ts::test_each_line_is_short_enough_for_a_phone
+teams/tests/test_capabilities.py::test_settings_show_their_current_value_and_a_group_never_does -> packages/core/test/help.test.ts::test_settings_show_their_current_value_and_a_group_never_does
+teams/tests/test_capabilities.py::test_menu_buttons_are_mentioned_once_at_the_end -> packages/core/test/help.test.ts::test_menu_buttons_are_mentioned_once_at_the_end
+teams/tests/test_capabilities.py::test_parts_that_are_off_are_not_offered -> packages/core/test/help.test.ts::test_parts_that_are_off_are_not_offered
+teams/tests/test_capabilities.py::test_with_the_assistant_help_says_it_looks_up_github_and_the_web_itself -> packages/core/test/help.test.ts::test_with_the_assistant_help_says_it_looks_up_github_and_the_web_itself
+teams/tests/test_capabilities.py::test_review_entries_say_what_the_worker_does -> packages/core/test/help.test.ts::test_review_entries_say_what_the_worker_does
+teams/tests/test_capabilities.py::test_whether_a_merge_waits_for_a_tap_is_said_without_a_fixed_list -> packages/core/test/help.test.ts::test_whether_a_merge_waits_for_a_tap_is_said_without_a_fixed_list
+
+teams/tests/test_transparency.py::test_every_help_says_answers_are_ai_generated_and_carries_the_data_statement -> packages/core/test/transparency.test.ts::test_every_help_says_answers_are_ai_generated_and_carries_the_data_statement
+teams/tests/test_transparency.py::test_where_remote_agents_are_on_a_1to1_help_says_an_attached_chat_goes_to_the_agent -> packages/core/test/transparency.test.ts::test_where_remote_agents_are_on_a_1to1_help_says_an_attached_chat_goes_to_the_agent
+teams/tests/test_transparency.py::test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_to_stop -> packages/core/test/transparency.test.ts::test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_to_stop
+teams/tests/test_transparency.py::test_the_stop_word_help_teaches_is_the_stop_command -> packages/core/test/transparency.test.ts::test_the_stop_word_help_teaches_is_the_stop_command
