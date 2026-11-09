@@ -117,15 +117,17 @@ export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
 }
 
 /**
- * A closed development environment item (`kind = 'remote'`) whose machine is no longer one of the user's (its connector was revoked:
- * `/agent off`, a logout, a re-registration) is not listed. Its name would be the only trace of that machine in the router's context,
- * and an answer about the user's machines took it for one of theirs: "之前的 dev-box-1 已离线" with no machine connected
- * (DM21-zms-a, 2026-11-07). The machines the user has are what `devenv_list` reads, nothing else. Only where remote agents are on:
- * their tables exist only then.
+ * A closed development environment item (`kind = 'remote'`) whose machine is no longer one of the user's is not listed. A machine is
+ * the user's while a connector of theirs that is not revoked has its name (a machine set up again under its name is theirs: the old
+ * row is revoked, and the new one has the name), which is exactly what `devenv_list` names. The name of one that is not was the only
+ * trace of it in the router's context, and an answer about the user's machines took it for one of theirs: "之前的 dev-box-1 已离线"
+ * with no machine connected (DM21-zms-a, 2026-11-07). Only where remote agents are on: their tables exist only then.
  */
 const CLOSED_ITEM_OF_REMOVED_MACHINE = `AND NOT (w.kind = 'remote' AND NOT EXISTS (
            SELECT 1 FROM claw_remote_connectors c
-            WHERE c.owner_user_id = w.user_id AND c.connector_id::text = w.params->>'connector_id' AND c.revoked_at IS NULL))`;
+            WHERE c.owner_user_id = w.user_id AND c.revoked_at IS NULL
+              AND (c.connector_id::text = w.params->>'connector_id'
+                   OR left(btrim(regexp_replace(c.name, '[[:cntrl:][:space:]]+', ' ', 'g')), 60) = w.params->>'machine')))`;
 
 /**
  * The router's item list: every open item, and the newest items closed in the last day. Open items are never cut: the

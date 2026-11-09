@@ -781,8 +781,9 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
 
 /**
  * What the router's item list says of a remote item beside its row: where it runs, and whether that machine is online now. `removed`:
- * its machine is no longer one of the user's (its connector was revoked), so it names none (`machine` is empty and `title` is the
- * item's without it): the machines the user has are what `devenv_list` reads, and a name from anywhere else was said as one of them.
+ * its machine is no longer one of the user's (no connector of theirs that is not revoked has its name), so it names none (`machine` is
+ * empty and `title` is the item's without it): the machines the user has are what `devenv_list` reads, and a name from anywhere else
+ * was said as one of them.
  */
 export interface RemoteManifest { machine: string; agent: string; session: string; online: boolean; removed?: true; title?: string }
 
@@ -793,22 +794,29 @@ export async function remoteManifest(
   const out = new Map<string, RemoteManifest>();
   const remote = items.filter((i) => i.kind === "remote");
   if (!remote.length || !CLAW_REMOTE_AGENTS_ENABLED) return out;
-  // The user's machines now: their connectors that are not revoked, each with whether it is online.
-  const live = new Map(((await db.query(
-    `SELECT c.connector_id::text AS connector_id, ${onlineSql(2)} AS online FROM claw_remote_connectors c
+  // The user's machines now: their connectors that are not revoked, each with whether it is online, by id and by name (a machine set
+  // up again under its name is a new row: the items of the old one are still those of a machine of theirs).
+  const rows = (await db.query(
+    `SELECT c.connector_id::text AS connector_id, c.name, ${onlineSql(2)} AS online FROM claw_remote_connectors c
       WHERE c.owner_user_id = $1 AND c.revoked_at IS NULL`,
     [userId, onlineWindowMs / 1000],
-  )).rows as Array<{ connector_id: string; online: boolean }>).map((r) => [r.connector_id, r.online === true]));
+  )).rows as Array<{ connector_id: string; name: string; online: boolean }>;
+  const byId = new Map(rows.map((r) => [r.connector_id, r.online === true]));
+  const byName = new Map<string, boolean>();
+  for (const r of rows) {
+    const name = flat(r.name, 60);
+    byName.set(name, (byName.get(name) ?? false) || r.online === true);
+  }
   for (const i of remote) {
     const p = (i.params ?? {}) as Partial<RemoteParams>;
     const connectorId = String(p.connector_id ?? "");
-    if (!live.has(connectorId)) {
+    const machine = String(p.machine ?? "");
+    const online = byId.has(connectorId) ? byId.get(connectorId) : machine && byName.has(machine) ? byName.get(machine) : undefined;
+    if (online === undefined) {
       out.set(i.item_id, { machine: "", agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: false, removed: true, title: remoteTitleWithoutMachine(p) });
       continue;
     }
-    out.set(i.item_id, {
-      machine: String(p.machine ?? ""), agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: live.get(connectorId) === true,
-    });
+    out.set(i.item_id, { machine, agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: online === true });
   }
   return out;
 }

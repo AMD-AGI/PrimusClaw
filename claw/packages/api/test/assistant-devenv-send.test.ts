@@ -1640,6 +1640,40 @@ describe("development environment items and devenv_send", { skip }, () => {
     for (const name of ["dev-box-1", "spare-box", "old-box"]) assert.doesNotMatch(none, new RegExp(name), name);
   });
 
+  test("F38 a machine set up again under its name is still the user's: the items of its old registration stay named, until it is removed", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const sid = await chatSession("alice", laptop);
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid })).status, "done");
+    const item = await remoteItem(sid);
+    // The laptop closed with the prompt never collected, and came back with its local state lost: a new row under the same name. The
+    // old row is revoked and its item closed (dropped) with it.
+    await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+    const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    const fresh = String(again.body.data.connector_id);
+    assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at, "the old row was replaced");
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).outcome], ["done", "dropped"]);
+    // The machine is the user's (devenv_list names it): its closed item is listed, naming it.
+    const line = (await role.routerManifest("alice")).find((m) => m.itemId === item.item_id);
+    assert.ok(line, "the closed item of a machine that is still the user's is listed");
+    assert.match(prompts.formatManifestLine(line), /machine: "laptop"/);
+    assert.match(prompts.formatManifestLine(line), /title: "laptop claude：跑 lint"/);
+    // So is an item still open on the old row (its close not applied): named, as a machine of theirs, not "removed".
+    await w.q("UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL WHERE item_id = $1", [item.item_id]);
+    const open = (await role.routerManifest("alice")).find((m) => m.itemId === item.item_id);
+    assert.ok(open && !open.remote?.removed);
+    assert.match(prompts.formatManifestLine(open), /machine: "laptop"/);
+    await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'dropped', closed_at = NOW() WHERE item_id = $1", [item.item_id]);
+    // Removed for good (no row of that name left): the item is gone from the list, and nothing names the machine.
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${fresh}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200);
+    const gone = await role.routerManifest("alice");
+    assert.equal(gone.find((m) => m.itemId === item.item_id), undefined);
+    assert.doesNotMatch(prompts.renderRouterItems(gone), /laptop/);
+  });
+
   test("F37 with no machine at all devenv_list and devenv_send say to name none, and name none themselves", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
