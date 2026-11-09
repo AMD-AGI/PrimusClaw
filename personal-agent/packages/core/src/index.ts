@@ -34,7 +34,6 @@ export * from "./claw/model.js";
 export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
-export * from "./public-error/public-errors.js";
 export * as remoteView from "./remote-view/index.js";
 export * from "./inbound-text/index.js";
 export * as turn from "./turn/index.js";

@@ -323,7 +323,9 @@ export class RemoteWorld {
   /** The cards of some recorded operations, as Teams is sent them. */
   renderedCards(records: readonly Recorded[]): Json[] {
     return records.flatMap((r) =>
-      "message" in r ? cardsOf(activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json) : [],
+      "message" in r
+        ? cardsOf(activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json)
+        : [],
     );
   }
 
@@ -373,7 +375,13 @@ export class RemoteWorld {
     await new Promise((resolve) => setTimeout(resolve, 50));
     this.remote.shutdown();
     this.remote.cancelAll();
+    // A cancelled turn hands its chat back to a reader as it ends (Python's loop dies with the test; here the reader would not):
+    // once the turns are gone, the readers they started go too.
+    for (let i = 0; i < 40 && this.remote.busyChats().length > 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
+    this.remote.shutdown();
     await this.server.stop();
   }
 }

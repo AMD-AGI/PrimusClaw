@@ -12,8 +12,10 @@
  * click handler of the remote-agent cards; the parts are assembled here and nowhere else.
  */
 import type { JsonObject } from "../json.js";
+import type { Lang } from "../locales/lang.js";
 import type { ClickHandler, ClickRoute } from "../ports/routing.js";
 import type { Conversation, InboundMessage, UserRef } from "../ports/surface.js";
+import { neutral } from "../remote-view/inert.js";
 import { RemoteLiveView, remoteText } from "../remote-view/index.js";
 import type { Attachment, RemoteAgentCommand, RemoteChat, RemotePrompt } from "../routing/features.js";
 import { StatusBoard } from "./board.js";
@@ -41,6 +43,7 @@ import { WindowTurn } from "./turns/window-turn.js";
 import { Watches } from "./watches.js";
 import { windowCloser } from "./window/closer.js";
 import { quotesWindow } from "./window/index.js";
+import { chatBoxLine } from "./window/output.js";
 
 /** How long the assistant's context waits for a session's watch marker to be read back. */
 export const CHAT_CONTEXT_WATCH_SECONDS = 2.0;
@@ -172,9 +175,16 @@ export class RemoteAgents implements RemoteChat {
     );
   }
 
-  attachment(chatKey: string): Attachment | undefined {
+  /** What help says this chat is attached to (agent.py's help lead): each part made safe to show. */
+  attachment(chatKey: string, lang: Lang): Attachment | undefined {
     const state = this.enabled ? this.state.attached(chatKey) : null;
-    return state ? { label: state.agentLabel, host: state.host, cwd: state.cwd } : undefined;
+    if (state === null) return undefined;
+    return {
+      label: neutral(state.agentLabel, 80),
+      host: neutral(state.host, 80),
+      cwd: state.cwd ? neutral(state.cwd, 120) : "",
+      cardWindowLine: chatBoxLine("card", lang, this.ctx.settings.botName),
+    };
   }
 
   groupChatKey(userId: string, scope: string): string {

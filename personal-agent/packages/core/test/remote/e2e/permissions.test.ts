@@ -65,8 +65,14 @@ class AskingAgent extends Script {
 }
 
 /** A world where the agent has just asked for permission and the card is on screen. */
-async function asked(w: RemoteWorld, options: readonly PermissionOption[], agent = "codex", actionId = "act-1", timeoutMs: unknown = 600_000) {
-  w.server.addConnector(ALICE, "dev-pod", [[agent, agent, agent[0]?.toUpperCase() + agent.slice(1)]]);
+async function asked(
+  w: RemoteWorld,
+  options: readonly PermissionOption[],
+  agent = "codex",
+  actionId = "act-1",
+  timeoutMs: unknown = 600_000,
+) {
+  w.server.addConnector(ALICE, "dev-pod", [[agent, agent, agent.charAt(0).toUpperCase() + agent.slice(1)]]);
   const script = new AskingAgent(options, actionId, timeoutMs);
   w.server.onCommand = script.hook;
   await w.say(`/agent new ${agent} /home/me/repo`);
@@ -79,7 +85,8 @@ async function asked(w: RemoteWorld, options: readonly PermissionOption[], agent
 
 const actionsOf = (card: Json): Json[] => (card["actions"] ?? []) as Json[];
 const dataOf = (action: Json | undefined): Json => (action?.["data"] ?? {}) as Json;
-const button = (card: Json, optionId: string): Json => dataOf(actionsOf(card).find((a) => dataOf(a)["option_id"] === optionId));
+const button = (card: Json, optionId: string): Json =>
+  dataOf(actionsOf(card).find((a) => dataOf(a)["option_id"] === optionId));
 const perm = (w: RemoteWorld, sid: string) => w.test.store.remotePermissions.getRemotePermission(sid, "act-1");
 
 /** Every text of a card in reading order, a fact as `name: value` (the header's bar left out). */
@@ -112,9 +119,15 @@ test("each option the adapter offered can be chosen and its own id is what claw 
         await w.idle();
         const decisions = w.server.commandsOf("decision");
         assert.equal(decisions.length, 1);
-        assert.deepEqual(decisions[0]?.body, { action_id: "act-1", option_id: option.optionId }, `${name} ${option.optionId}`);
-        assert.equal(decisions[0]?.user, ALICE);
-        const expected = option.kind.startsWith("allow") ? "The README now has the line." : "You declined, so I changed nothing.";
+        assert.deepEqual(
+          decisions[0]?.body,
+          { action_id: "act-1", option_id: option.optionId },
+          `${name} ${option.optionId}`,
+        );
+        assert.equal(decisions[0].user, ALICE);
+        const expected = option.kind.startsWith("allow")
+          ? "The README now has the line."
+          : "You declined, so I changed nothing.";
         assert.equal(w.answer(), expected, `${name} ${option.optionId}`);
         assert.equal(perm(w, sid)?.state, "decided");
       });
@@ -152,11 +165,16 @@ test("a double click sends one decision and the second is told it was answered",
     const data = button(card, "allow_once");
     await Promise.all([w.click(data), w.click(data)]);
     assert.equal(w.server.commandsOf("decision").length, 1);
-    const texts = w.said().filter((t) => t === APPROVAL_ANSWERED || t.startsWith("Allowed once") || t.startsWith("✅ Allowed once"));
+    const texts = w
+      .said()
+      .filter((t) => t === APPROVAL_ANSWERED || t.startsWith("Allowed once") || t.startsWith("✅ Allowed once"));
     // each click is an edit of its card and a line in a new message: the winner's card says "Allowed once (you, ...)" and its line
     // "Allowed once: Edit README.md.", the loser's both say it was answered
     const card1 = texts.find((t) => t.startsWith("✅ Allowed once ("));
-    assert.deepEqual([...texts].sort(), [APPROVAL_ANSWERED, APPROVAL_ANSWERED, card1, "Allowed once: Edit README.md."].sort());
+    assert.deepEqual(
+      [...texts].sort(),
+      [APPROVAL_ANSWERED, APPROVAL_ANSWERED, card1, "Allowed once: Edit README.md."].sort(),
+    );
   }));
 
 test("a click that loses the race to close the request sends nothing", () =>
@@ -165,7 +183,8 @@ test("a click that loses the race to close the request sends nothing", () =>
     const repo = w.test.store.remotePermissions;
     const real = repo.closeRemotePermission.bind(repo);
     const patched = repo as { closeRemotePermission: typeof real };
-    patched.closeRemotePermission = (sid, action, state, options) => (state === "sending" ? false : real(sid, action, state, options));
+    patched.closeRemotePermission = (sid, action, state, options) =>
+      state === "sending" ? false : real(sid, action, state, options);
     await w.click(button(card, "allow_once"));
     assert.equal(w.last(), APPROVAL_ANSWERED);
     assert.equal(w.server.commandsOf("decision").length, 0);
@@ -249,7 +268,10 @@ test("how long a request lives follows what the agent said within sense", async 
     await remoteWorld(async (w) => {
       const { sid } = await asked(w, CODEX_OPTIONS, "codex", "act-1", timeoutMs);
       const expires = perm(w, sid)?.expiresAt ?? 0;
-      assert.ok(Math.abs(expires - w.test.clock.epochMs() / 1000 - lives) <= 1, `${String(timeoutMs)}: ${String(expires)}`);
+      assert.ok(
+        Math.abs(expires - w.test.clock.epochMs() / 1000 - lives) <= 1,
+        `${String(timeoutMs)}: ${String(expires)}`,
+      );
     });
   }
 });
@@ -302,7 +324,10 @@ test("a request the connector sends again after a reconnect gets one card", () =
     const { sid } = await asked(w, CODEX_OPTIONS);
     await w.server.ask(sid, "act-1", "Edit README.md", CODEX_OPTIONS, { input: { path: "README.md" } });
     await w.server.ask(sid, "act-1", "Edit README.md", CODEX_OPTIONS, { input: { path: "README.md" } });
-    await w.server.ask(sid, "act-2", "Run the tests", CODEX_OPTIONS, { kind: "execute", input: { command: "npm test" } });
+    await w.server.ask(sid, "act-2", "Run the tests", CODEX_OPTIONS, {
+      kind: "execute",
+      input: { command: "npm test" },
+    });
     await w.until(() => w.permissionCards().length === 2);
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(
@@ -330,7 +355,10 @@ test("a request that cannot be answered says so instead of showing dead buttons"
       await w.say("/agent new codex /repo");
       await w.say("go");
       assert.equal(w.permissionCards().length, 0, label);
-      assert.ok(w.said().some((t) => t.includes("offered no answer I can pass on")), label);
+      assert.ok(
+        w.said().some((t) => t.includes("offered no answer I can pass on")),
+        label,
+      );
     });
   }
 });
@@ -376,7 +404,13 @@ test("the stored row has what the click is checked against", () =>
     assert.ok(row);
     assert.deepEqual([row.userId, row.tool, row.state], [AAD, "Edit README.md", "pending"]);
     const options = row.options as Json[];
-    assert.deepEqual(options.map((o) => o["optionId"]), ["allow-once", "allow-with-updates", "reject"]);
-    assert.deepEqual(options.map((o) => o["kind"]), ["allow_once", "allow_always", "reject_once"]);
+    assert.deepEqual(
+      options.map((o) => o["optionId"]),
+      ["allow-once", "allow-with-updates", "reject"],
+    );
+    assert.deepEqual(
+      options.map((o) => o["kind"]),
+      ["allow_once", "allow_always", "reject_once"],
+    );
     assert.ok(Math.abs(row.expiresAt - (w.test.clock.epochMs() / 1000 + 600)) <= 1);
   }));
