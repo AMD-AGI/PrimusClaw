@@ -7,6 +7,7 @@
  */
 
 import { defineCatalog } from "./catalog.js";
+import type { SuggestedReply } from "../ports/surface.js";
 import type { Lang } from "./lang.js";
 
 /** Said in the person's language. */
@@ -56,17 +57,17 @@ export const turnText = defineCatalog({
   },
 });
 
-/** Suggested replies under a finished answer in a 1:1 chat: (what the button says, what it sends). */
-export const SUGGESTED_REPLIES: Readonly<Record<Lang, ReadonlyArray<readonly [string, string]>>> = {
+/** Suggested replies under a finished answer in a 1:1 chat: what the button says, and what it sends. */
+export const SUGGESTED_REPLIES: Readonly<Record<Lang, readonly SuggestedReply[]>> = {
   en: [
-    ["Continue", "Continue"],
-    ["Tell me more", "Tell me more"],
-    ["New session", "/new"],
+    { title: "Continue", value: "Continue" },
+    { title: "Tell me more", value: "Tell me more" },
+    { title: "New session", value: "/new" },
   ],
   zh: [
-    ["继续", "继续"],
-    ["详细说说", "详细说说"],
-    ["开个新会话", "/new"],
+    { title: "继续", value: "继续" },
+    { title: "详细说说", value: "详细说说" },
+    { title: "开个新会话", value: "/new" },
   ],
 };
 

@@ -13,7 +13,7 @@ import { it } from "node:test";
 import type { OutMessage } from "../../src/ports/surface.js";
 import { answerParts } from "../../src/turn/answer-parts.js";
 import { LIVE_HEADER } from "../../src/turn/live-view.js";
-import { StatusMessage } from "../../src/turn/progress/status-message.js";
+import { turnStatusMessage } from "../../src/turn/progress/status-message.js";
 import { play } from "./play.js";
 import { Timeline } from "./timeline.js";
 import { Bus, end, RecordingLogger, result, said, type Script, type Sent, textOf, tool } from "./world.js";
@@ -123,7 +123,7 @@ it("test_failure_notices_and_command_replies_stay_markdown", async () => {
 it("test_the_xml_answer_is_a_new_message_even_when_every_edit_is_refused", async () => {
   const clock = new Timeline();
   const bus = new Bus(clock, { fail: (s) => s.operation === "update", ackTimeout: 1 });
-  const status = new StatusMessage(bus, { clock, log: new RecordingLogger() });
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger() });
   status.begin();
   await clock.pump(status.finish([ANSWER], { rich: true }));
   const answers = bus.sent.filter((s) => textOf(s.message) === ANSWER);

@@ -22,7 +22,8 @@ import { turnEnglish, turnText } from "../locales/turn.js";
 import { collapseSpaces, pyLen, pyLstrip, pyRstrip, pySlice, pyStrip } from "../text/python-str.js";
 import { planHead, planText, type Todo } from "./plan.js";
 import type { Step } from "./step.js";
-import { failedLine, type Label, labelFor } from "./upstream.js";
+import { type Integrations, noIntegrations } from "../plugins/integrations.js";
+import { failedLine, type Label, labelFor } from "./step-labels.js";
 
 export const LIVE_HEADER = turnText.in("en").liveHeader;
 /** The progress message's first line, in the person's language. */
@@ -80,7 +81,11 @@ export class LiveView {
   /** The newest step, and how often in a row it has started. */
   private group: { label: Label; count: number } | undefined;
 
-  constructor(readonly lang: string = "en") {
+  constructor(
+    readonly lang: string = "en",
+    /** A deployment's MCP servers, whose steps read as "Querying <name>". */
+    private readonly integrations: Integrations = noIntegrations,
+  ) {
     this.header = turnText.in(toLang(lang)).liveHeader;
   }
 
@@ -111,7 +116,7 @@ export class LiveView {
   }
 
   private start(step: Step, name: string): void {
-    const label = labelFor(name, step.skill, this.lang);
+    const label = labelFor(name, step.skill, this.lang, this.integrations);
     const again = step.actionId ? this.running.find((e) => e.actionId === step.actionId) : undefined;
     if (again) {
       // the same step reported again: its label may now be better known, it is not a repeat
@@ -131,7 +136,7 @@ export class LiveView {
       : findLast(this.running, (e) => e.name === name);
     if (ended) this.running.splice(this.running.indexOf(ended), 1);
     if (status !== "error") return; // a step that went well leaves no line
-    const label = ended ? ended.label : labelFor(name, undefined, this.lang);
+    const label = ended ? ended.label : labelFor(name, undefined, this.lang, this.integrations);
     const last = this.blocks.at(-1);
     if (last && last.kind === "failed" && last.label.one === label.one) last.count += 1;
     else this.blocks.push({ kind: "failed", label, count: 1 });

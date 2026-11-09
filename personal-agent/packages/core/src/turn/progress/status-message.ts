@@ -23,12 +23,28 @@ import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
 import type { OutMessage, StreamRefused } from "../../ports/surface.js";
 import type { Result } from "../../result.js";
-import { pyLen, pyStrip } from "../../text/python-str.js";
+import { type Integrations, noIntegrations } from "../../plugins/integrations.js";
 import { LiveView } from "../live-view.js";
 import { nowSeconds, sleepSeconds, type TurnSurface } from "../ports.js";
 import type { Step } from "../step.js";
 import { detach, Task, unlessAborted } from "../task.js";
 import { answerMessages, type FinishOptions, plainMessage } from "./answer-messages.js";
+import { defaultStreamFinish, type StatusPolicy, TurnStatusPolicy } from "./status-policy.js";
+
+/** A Claw turn's status options: its view is a LiveView in the turn's language. */
+export interface TurnStatusOptions extends Omit<StatusOptions<Step>, "policy"> {
+  /** The agent's text is streamed into the answer's bubble. */
+  readonly streamText?: boolean;
+  /** A deployment's MCP servers, named in progress lines. */
+  readonly integrations?: Integrations;
+}
+
+/** The status message of a Claw turn (`TurnStatusPolicy`). */
+export function turnStatusMessage(surface: TurnSurface, options: TurnStatusOptions): StatusMessage<Step> {
+  const view = new LiveView(options.lang ?? "en", options.integrations ?? noIntegrations);
+  const policy = new TurnStatusPolicy(view, options.streamText ?? false);
+  return new StatusMessage(surface, { ...options, policy });
+}
 import { statusText } from "./status-text.js";
 import { isPassing, StreamHandle } from "./stream-handle.js";
 
@@ -40,36 +56,31 @@ export const PREPARING_AFTER_SECONDS = 1.5;
 export const FINAL_SETTLE_SECONDS = 1.0;
 /** ... and one that is late anyway is covered by sending DONE_LINE once more this long afterwards. */
 export const REASSERT_SECONDS = 6.0;
-/** The agent's text streamed into a bubble stops growing here; the answer still comes whole. */
-export const STREAM_TEXT_MAX = 6000;
 /** The chat closes a stream this long after it opened; this one is closed by its final message before that. */
 export const STREAM_CLOSE_SECONDS = 9 * 60;
 
-export interface StatusOptions {
+export interface StatusOptions<S> {
   readonly clock: Clock;
   readonly log: Logger;
   readonly lang?: string;
-  /** A remote agent's turn brings its own view. */
-  readonly view?: LiveView;
+  /** What is shown of the turn's steps and words (a Claw turn's: `TurnStatusPolicy`, see `turnStatusMessage`). */
+  readonly policy: StatusPolicy<S>;
   /** Shown at the top from the first post on (a review's acknowledgement). */
   readonly lead?: string;
   /** The person's message a live stream answers; undefined: no stream here (the progress message). */
   readonly streamReplyTo?: string | undefined;
   /** Every member sees the floating status: it carries no words of the agent's. */
   readonly group?: boolean;
-  /** The agent's text is streamed into the answer's bubble. */
-  readonly streamText?: boolean;
 }
 
-export class StatusMessage {
+export class StatusMessage<S> {
   private readonly surface: TurnSurface;
   private readonly clock: Clock;
   private readonly log: Logger;
   private readonly lang: Lang;
-  private readonly view: LiveView;
+  private readonly policy: StatusPolicy<S>;
   private readonly lead: string;
   private readonly group: boolean;
-  private readonly streamText: boolean;
   /** undefined: the progress message (no stream here, or the chat refused it). */
   private stream: StreamHandle | undefined;
   /** The stream itself, kept after a refusal: it is still closed when it can be. */
@@ -97,21 +108,17 @@ export class StatusMessage {
   private streamOver = false;
   /** The turn was cancelled (`close(true)`). */
   private hard = false;
-  /** The agent's whole model turns so far, and the one being written. */
-  private readonly said: string[] = [];
-  private partial = "";
 
-  constructor(surface: TurnSurface, options: StatusOptions) {
+  constructor(surface: TurnSurface, options: StatusOptions<S>) {
     this.surface = surface;
     this.clock = options.clock;
     this.log = options.log;
     this.lang = toLang(options.lang);
-    this.view = options.view ?? new LiveView(options.lang ?? "en");
+    this.policy = options.policy;
     this.lead = options.lead ?? "";
     this.stream = options.streamReplyTo ? new StreamHandle(surface, options.streamReplyTo, options.clock) : undefined;
     this.live = this.stream;
     this.group = options.group ?? false;
-    this.streamText = options.streamText ?? false;
   }
 
   begin(): void {
@@ -120,7 +127,8 @@ export class StatusMessage {
       this.opening = new Task(() => this.openStream());
       return;
     }
-    const first = this.lead ? `${this.lead}\n\n${this.view.header}` : this.view.header;
+    const header = this.policy.view.header;
+    const first = this.lead ? `${this.lead}\n\n${header}` : header;
     this.posted = new Task(() => this.surface.post(plainMessage(first))); // no thumbs here
   }
 
@@ -156,7 +164,7 @@ export class StatusMessage {
   }
 
   private statusLines(): string[] {
-    const lines = this.view.statusLines(!this.group);
+    const lines = this.policy.view.statusLines(!this.group);
     return lines.length ? lines : [turnText.in(this.lang).thinking];
   }
 
@@ -203,8 +211,8 @@ export class StatusMessage {
     if (this.preparing && real) {
       this.preparing = false;
       this.stopPreparingTimer();
-      if (this.view.preparing) {
-        this.view.preparing = false;
+      if (this.policy.view.preparing) {
+        this.policy.view.preparing = false;
         this.kick();
       }
     }
@@ -218,7 +226,7 @@ export class StatusMessage {
   private async announcePreparing(signal: AbortSignal): Promise<void> {
     await sleepSeconds(this.clock, PREPARING_AFTER_SECONDS, signal);
     if (this.closed) return;
-    this.view.preparing = true;
+    this.policy.view.preparing = true;
     this.kick();
   }
 
@@ -236,33 +244,18 @@ export class StatusMessage {
   }
 
   private render(): string {
-    return [this.lead, this.headlineText, this.view.render()].filter((part) => part).join("\n\n");
+    return [this.lead, this.headlineText, this.policy.view.render()].filter((part) => part).join("\n\n");
   }
 
-  /** Fold the step into the live view and make sure the newest view gets sent. */
-  progress(step: Step): void {
+  /** Fold the step into what is shown and make sure the newest of it gets sent. */
+  progress(step: S): void {
     if (this.closed) return;
-    let changed = this.view.apply(step);
-    if (this.streamText && step.narration) {
-      this.said.push(step.narration);
-      this.partial = "";
-      changed = true;
-    } else if (this.streamText && step.partial) {
-      this.partial = step.partial;
-      changed = true;
-    }
-    if (changed) this.kick();
+    if (this.policy.applyStep(step)) this.kick();
   }
 
-  /**
-   * The agent's text so far, for the answer's bubble: its whole model turns and the one being written, up to
-   * STREAM_TEXT_MAX. '' when there is none, or when it no longer grows from what was streamed (the chat would refuse it).
-   */
+  /** The text for the answer's bubble ('' when there is none); what was streamed when it no longer grows from that. */
   private streamable(): string {
-    if (!this.streamText || !this.stream) return "";
-    const text = [...this.said, ...(this.partial ? [this.partial] : [])].join("\n\n");
-    if (pyLen(text) > STREAM_TEXT_MAX || !text.startsWith(this.stream.streamed)) return this.stream.streamed;
-    return text;
+    return this.stream ? this.policy.streamable(this.stream.streamed) : "";
   }
 
   /** Whether the turn is still shown by its stream (a refusal hands it to the progress message). */
@@ -428,15 +421,8 @@ export class StatusMessage {
     let rest: readonly OutMessage[] = messages.slice(1);
     let final = messages[0] ?? plainMessage(turnText.in(this.lang).doneShort);
     if (stream.streamed) {
-      // the bubble holds the agent's text, and the final keeps all of it (the chat refuses a stream whose content
-      // shrinks): when it ends with the answer, that is the whole of it; otherwise the answer follows as messages
-      const text = this.streamable() || stream.streamed;
-      const whole = parts.length > 0 && text.endsWith(pyStrip(parts.join("\n\n")));
-      final = plainMessage(text, options.ai ?? false);
-      const suggestions = messages.at(-1)?.suggestions;
-      if (whole)
-        final = { ...final, ...(options.feedback ? { feedback: true } : {}), ...(suggestions ? { suggestions } : {}) };
-      rest = whole ? [] : messages;
+      const input = { streamed: stream.streamed, streamable: this.streamable(), messages, parts, options };
+      ({ final, rest } = this.policy.finishStream?.(input) ?? defaultStreamFinish(input));
     }
     const closed = await stream.final(final);
     if (!closed.ok) {

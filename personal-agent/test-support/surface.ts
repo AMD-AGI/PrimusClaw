@@ -129,6 +129,10 @@ class FakeConversation implements Conversation {
     readonly ref: ConversationRef,
   ) {}
 
+  markSettled(id: MessageId): void {
+    this.edited.add(id);
+  }
+
   typing(): Promise<void> {
     this.surface.record({ op: "typing", conversation: this.ref.id });
     return Promise.resolve();

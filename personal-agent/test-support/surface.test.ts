@@ -137,3 +137,12 @@ test("a channel that cannot edit refuses the update", async () => {
   await assert.rejects(surface.conversation(testConversation()).update("m1", textMessage("x")), /cannot edit/);
   assert.deepEqual(surface.outbox, []);
 });
+
+test("markSettled counts a message as settled without editing it", () => {
+  const surface = new FakeSurface();
+  const c = surface.conversation(testConversation());
+  assert.equal(c.edited.has("m7"), false);
+  c.markSettled("m7");
+  assert.equal(c.edited.has("m7"), true);
+  assert.deepEqual(surface.outbox, []);
+});
