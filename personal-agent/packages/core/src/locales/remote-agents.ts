@@ -111,6 +111,24 @@ export const remoteAgentText = defineCatalog({
       "I lost the connection to PrimusClaw while the agent was working. It may still be running: send a message to see where it stands, or /stop.",
     watchFailed: (p: { ref: string }) =>
       `Something went wrong on my side while watching the agent (ref ${p.ref}). Send a message to see where it stands.`,
+    noModeSays: (p: { which: string }) =>
+      ` The agent does not say which of its modes ${p.which}, so I left its mode as it is.`,
+    doNotAsk: "do not ask",
+    ask: "ask",
+    limitAsks: (p: { refused: string }) => ` ${p.refused} It runs in a mode that asks for approval.`,
+    switchFailed: " I could not switch its mode just now. Tap Mode to try again.",
+    switchUnconfirmed: " I asked it to switch its mode, but it has not confirmed yet. Tap Mode to see where it stands.",
+    switchedTo: (p: { mode: string }) => ` Switched to \`${p.mode}\`.`,
+    watchingHead: (p: { label: string; host: string }) =>
+      `${p.label} on ${p.host} is open in a terminal: watching it read-only.`,
+    readyMode: (p: { mode: string }) => ` Mode: \`${p.mode}\`.`,
+    readyUnattended: (p: { note: string }) => ` ⚠️ ${p.note}.`,
+    ready: (p: { label: string; host: string; mode: string; unattended: string; switched: string }) =>
+      `${p.label} is ready on ${p.host}.${p.mode}${p.unattended}${p.switched} Send your first message.`,
+    notReportedLead: "The agent has not reported in yet. You can send your message anyway.",
+    modeNow: (p: { mode: string }) => `Mode is now \`${p.mode}\`.`,
+    modeUnconfirmed: (p: { mode: string }) =>
+      `I asked the agent to switch to \`${p.mode}\`; it has not confirmed yet. \`/agent mode\` shows what it is.`,
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -201,6 +219,21 @@ export const remoteAgentText = defineCatalog({
     lostConnection:
       "I lost the connection to PrimusClaw while the agent was working. It may still be running: send a message to see where it stands, or /stop.",
     watchFailed: (p) => `我这边跟进 agent 时出错了（参考号 ${p.ref}）。发一条消息看看它进行到哪了。`,
+    // (the worker said these in English whatever the chat's language)
+    noModeSays: (p) => ` The agent does not say which of its modes ${p.which}, so I left its mode as it is.`,
+    doNotAsk: "do not ask",
+    ask: "ask",
+    limitAsks: (p) => ` ${p.refused} It runs in a mode that asks for approval.`,
+    switchFailed: " I could not switch its mode just now. Tap Mode to try again.",
+    switchUnconfirmed: " I asked it to switch its mode, but it has not confirmed yet. Tap Mode to see where it stands.",
+    switchedTo: (p) => ` Switched to \`${p.mode}\`.`,
+    watchingHead: (p) => `${p.label}（${p.host}）正在终端里打开着：只读旁观。`,
+    readyMode: (p) => `模式：\`${p.mode}\`。`,
+    readyUnattended: (p) => `${p.note}。`,
+    ready: (p) => `${p.label} 已在 ${p.host} 上就绪。${p.mode}${p.unattended}${p.switched}直接发消息就行。`,
+    notReportedLead: "agent 还没有报到。可以直接发消息，它会在启动后收到。",
+    modeNow: (p) => `模式已切换为 \`${p.mode}\`。`,
+    modeUnconfirmed: (p) => `已请 agent 切换到 \`${p.mode}\`，它还没有确认。发 \`/agent mode\` 看当前模式。`,
   },
 });
 
