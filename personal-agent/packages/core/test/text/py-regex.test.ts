@@ -81,6 +81,12 @@ test("pyFullmatch keeps groups and refuses a negated class escape inside a class
 
 /** (pattern, flags, text, "search" or "full", what Python 3's re.search / re.fullmatch said). */
 const MORE: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["(?i)\\bis\\b", "", "x \u0130s y", "search", true], // \b's lookbehind is no group name: the i after it still folds
+  ["(?i)k", "", "\u212a", "search", true],
+  ["(?<=i)x", "i", "\u0130x", "search", true],
+  ["(?<!i)x", "i", "\u0130x", "search", false],
+  ["(?P<n>i)(?P=n)", "i", "iI", "search", true],
+  ["(?<id>i+)", "i", "\u0131I", "search", true],
   ["a", "", "a\n", "full", false],
   ["a$", "", "a\n", "search", true],
   ["a", "m", "x\na", "full", false],
