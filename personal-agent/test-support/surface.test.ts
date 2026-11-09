@@ -157,3 +157,21 @@ test("without a hold, an update is recorded at the call, in the order of the cal
     ["update", "send"],
   );
 });
+
+test("an update aborted while it is held rejects at once, before the hold ends, and is never recorded", async () => {
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const surface = new FakeSurface({ beforeUpdate: () => held });
+  const controller = new AbortController();
+  const inFlight = surface.conversation(testConversation()).update("m1", textMessage("x"), {
+    signal: controller.signal,
+  });
+  controller.abort(new Error("stopped while held"));
+  await assert.rejects(inFlight, /stopped while held/);
+  release();
+  await held;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(surface.outbox, []);
+});
