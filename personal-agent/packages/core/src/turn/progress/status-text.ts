@@ -30,8 +30,7 @@ export function statusText(lines: readonly string[]): string {
   const budgetBytes = STATUS_MAX_BYTES - bytes("…");
   const kept: string[] = [];
   let used = 0;
-  for (let i = chars.length - 1; i >= 0; i -= 1) {
-    const char = chars[i] ?? "";
+  for (const char of [...chars].reverse()) {
     const size = bytes(char);
     if (kept.length + 1 > budgetChars || used + size > budgetBytes) break;
     kept.push(char);
