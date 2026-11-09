@@ -10,3 +10,15 @@ tests/test_connector_reasons.py::test_a_fixed_connector_is_not_told_to_upgrade -
 tests/test_connector_reasons.py::test_an_unknown_code_gets_a_generic_sentence_that_names_it_and_words_stay_as_they_are -> packages/core/test/remote/connector-reasons.test.ts::an unknown code gets a generic sentence that names it and words stay as they are
 tests/test_connector_reasons.py::test_ended_puts_the_lead_first_in_the_language -> packages/core/test/remote/connector-reasons.test.ts::ended puts the lead first in the language
 tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
+tests/test_remote_agents.py::test_an_offline_machine_is_told_as_reconnecting_only_when_it_was_heard_from_moments_ago -> packages/core/test/remote/machines.test.ts::an offline machine is told as reconnecting only when it was heard from moments ago
+tests/test_remote_agents.py::test_resolve_agent_prefers_the_one_online_machine_and_asks_when_it_cannot_choose -> packages/core/test/remote/machines.test.ts::resolve agent prefers the one online machine and asks when it cannot choose
+tests/test_remote_agents.py::test_resolve_agent_says_why_not_in_the_chat_language -> packages/core/test/remote/machines.test.ts::resolve agent says why not in the chat language
+tests/test_remote_agents.py::test_what_a_refusal_from_claw_means_for_a_person -> packages/core/test/remote/refusals.test.ts::what a refusal from claw means for a person
+tests/test_remote_agents.py::test_claw_error_code_reads_the_error_word_and_nothing_else -> packages/core/test/remote/refusals.test.ts::claw error code reads the error word and nothing else
+tests/test_remote_agents.py::test_a_refusal_cut_short_still_names_its_error -> packages/core/test/remote/refusals.test.ts::a refusal cut short still names its error
+tests/test_remote_agents.py::test_a_stopped_review_never_repeats_an_error_that_is_not_a_plain_word -> packages/core/test/remote/refusals.test.ts::a stopped review never repeats an error that is not a plain word
+tests/test_remote_agents.py::test_every_refusal_is_said_in_the_chat_language -> packages/core/test/remote/refusals.test.ts::every refusal is said in the chat language
+tests/test_remote_agents.py::test_every_table_sentence_and_fixed_reply_has_its_chinese -> packages/core/test/remote/refusals.test.ts::every table sentence and fixed reply has its chinese
+tests/test_remote_agents.py::test_one_message_makes_one_idempotency_key_that_claw_accepts -> packages/core/test/remote/refusals.test.ts::one message makes one idempotency key that claw accepts
+tests/test_session_window.py::test_the_repost_rule -> packages/core/test/remote/window.test.ts::the repost rule
+tests/test_session_window.py::test_full_output_parts_are_bounded_and_masked -> packages/core/test/remote/window.test.ts::full output parts are bounded and masked
