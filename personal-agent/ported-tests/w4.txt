@@ -164,6 +164,21 @@ teams/tests/test_group_binds_agent_session.py::test_the_other_agent_commands_sta
 teams/tests/test_queued_messages.py::test_stop_when_the_session_cannot_be_read -> packages/core/test/routing/small-ports.test.ts::test_stop_when_the_session_cannot_be_read 500
 teams/tests/test_clawy_model.py::test_a_new_chat_is_created_with_the_model_and_never_patched -> packages/core/test/routing/small-ports.test.ts::test_a_new_chat_is_created_with_the_model_and_never_patched (the router's part: the model and what the session has)
 teams/tests/test_clawy_model.py::test_new_starts_a_session_that_is_created_with_the_model -> MERGED packages/core/test/routing/small-ports.test.ts::test_a_new_chat_is_created_with_the_model_and_never_patched (the router's part: the model and what the session has)
+
+# The router in front of the real remote agents (W6's tests that need the router; W6's ledger lists them as the router's)
+teams/tests/test_remote_agents.py::test_a_message_that_quotes_goes_to_the_attached_agent_with_the_quote -> packages/core/test/routing/e2e/remote-routing.test.ts::test_a_message_that_quotes_goes_to_the_attached_agent_with_the_quote
+teams/tests/test_remote_agents.py::test_a_plain_message_goes_to_claw_until_the_chat_is_attached_and_to_the_agent_after -> packages/core/test/routing/e2e/remote-routing.test.ts::test_a_plain_message_goes_to_claw_until_the_chat_is_attached_and_to_the_agent_after
+teams/tests/test_remote_agents.py::test_detach_sends_messages_to_claw_again_and_leaves_the_session_where_it_is -> packages/core/test/routing/e2e/remote-routing.test.ts::test_detach_sends_messages_to_claw_again_and_leaves_the_session_where_it_is
+teams/tests/test_remote_agents.py::test_new_while_attached_says_how_to_get_back_to_claw -> packages/core/test/routing/e2e/remote-routing.test.ts::test_new_while_attached_says_how_to_get_back_to_claw
+teams/tests/test_remote_agents.py::test_a_group_chat_gets_no_agent_commands_and_calls_nothing -> packages/core/test/routing/e2e/remote-routing.test.ts::test_a_group_chat_gets_no_agent_commands_and_calls_nothing
+teams/tests/test_remote_agents.py::test_a_group_message_never_goes_to_the_remote_agent_the_1on1_chat_is_attached_to -> packages/core/test/routing/e2e/remote-routing.test.ts::test_a_group_message_never_goes_to_the_remote_agent_the_1on1_chat_is_attached_to
+teams/tests/test_remote_agents.py::test_a_remote_button_clicked_in_a_group_is_not_active_there -> packages/core/test/routing/e2e/remote-routing.test.ts::test_a_remote_button_clicked_in_a_group_is_not_active_there
+teams/tests/test_remote_agents.py::test_unlinking_stops_everything_that_reads_with_the_key -> packages/core/test/routing/e2e/remote-routing.test.ts::test_unlinking_stops_everything_that_reads_with_the_key
+teams/tests/test_remote_menu.py::test_a_user_who_is_not_connected_or_in_a_group_gets_no_remote_buttons -> packages/core/test/routing/e2e/remote-routing-more.test.ts::test_a_user_who_is_not_connected_or_in_a_group_gets_no_remote_buttons
+teams/tests/test_remote_follow.py::test_link_with_a_code_and_no_slash_links_the_chat -> packages/core/test/routing/e2e/remote-routing-more.test.ts::test_link_with_a_code_and_no_slash_links_the_chat
+teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent -> packages/core/test/routing/e2e/remote-routing-more.test.ts::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent
+teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do -> packages/core/test/routing/e2e/remote-routing-more.test.ts::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do
+
 # Waiting for the real implementation of another line (ported once it is on this branch):
 #   test_every_button_replaces_card.py::test_a_click_ends_with_the_card_replaced (every kind) and ::test_a_card_pressed_again_after_a_failure_still_works: W5/W6/W6b/W7/W8 click handlers; W4's own kinds (repo, create_pr, bind, onboard) are covered in settings/create-pr/features/onboarding tests
 #   test_every_button_replaces_card.py::test_show_here_posts_the_answer_before_it_replaces_the_card: W4b (Show here)

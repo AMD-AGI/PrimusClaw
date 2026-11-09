@@ -28,7 +28,7 @@ import { SeededRandom } from "../../../../test-support/random.js";
 import { openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
 import type { RouterConfig, RouterDeps, RouterLimits } from "../../src/routing/deps.js";
-import type { AssistantChat, RemoteChat } from "../../src/routing/features.js";
+import type { AssistantChat, MessageText, RemoteChat } from "../../src/routing/features.js";
 import { Router } from "../../src/routing/router.js";
 import { StopButtons } from "../../src/turn/stop-buttons.js";
 import type { TurnHooks, TurnOutcome, TurnRun, TurnRunner } from "../../src/routing/turn-runner.js";
@@ -159,6 +159,13 @@ export interface WorldOptions {
   readonly config?: Partial<RouterConfig>;
   readonly assistant?: Partial<AssistantChat>;
   readonly remote?: Partial<RemoteChat>;
+  /** A whole remote-agent feature, used as it is (a class's methods do not survive a spread). */
+  readonly remoteChat?: RemoteChat;
+  /** The surface to post to (a remote-agent world's, so that one outbox holds everything). */
+  readonly surface?: FakeSurface;
+  readonly messageText?: Partial<MessageText>;
+  /** The store (and its clock) to use: a remote-agent world's, so that both read one store as the worker does. */
+  readonly testStore?: ReturnType<typeof openTestStore>;
   readonly handlers?: Partial<RouteHandlers>;
   readonly limits?: Partial<RouterLimits>;
   readonly reachable?: readonly string[];
@@ -183,8 +190,9 @@ function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
 }
 
 export function world(options: WorldOptions = {}) {
-  const { store, clock } = openTestStore(options.linkLimits ? { linkLimits: options.linkLimits } : {});
-  const surface = new FakeSurface({ reachable: options.reachable ?? [] });
+  const { store, clock } =
+    options.testStore ?? openTestStore(options.linkLimits ? { linkLimits: options.linkLimits } : {});
+  const surface = options.surface ?? new FakeSurface({ reachable: options.reachable ?? [] });
   const claw = new FakeClaw();
   const turns = new FakeTurns();
   const exchange = new FakeExchange();
@@ -226,7 +234,7 @@ export function world(options: WorldOptions = {}) {
     exchange,
     limits,
     assistant: { ...OFF_ASSISTANT, ...options.assistant },
-    remote: { ...OFF_REMOTE, ...options.remote },
+    remote: options.remoteChat ?? { ...OFF_REMOTE, ...options.remote },
     turns,
     stopCards: new StopButtons({ clock, random: new SeededRandom(5), log: silent }),
     proactive: { muted: () => null, release: () => Promise.resolve() },
@@ -242,6 +250,7 @@ export function world(options: WorldOptions = {}) {
       withLinks: (text) => text,
       withQuote: (text, quote) => (quote ? `${quote}\n\n${text}` : text),
       unreadable: () => undefined,
+      ...options.messageText,
     },
     reportView: () => undefined,
     note,
