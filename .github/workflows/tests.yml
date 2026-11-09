@@ -387,7 +387,18 @@ jobs:
 
       # Python with `cryptography`, for the cross-language Fernet test (tokens made here must decrypt in Python, as the
       # Python worker reads the same database). Without it that test fails in CI rather than skipping.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+      # Retried once after 90 s: a GitHub release download can fail for minutes during an incident.
+      - id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        continue-on-error: true
+        with:
+          python-version: "3.12"
+      - name: Wait before retrying setup-python
+        if: steps.python.outcome == 'failure'
+        run: sleep 90
+      - name: Set up Python (retry)
+        if: steps.python.outcome == 'failure'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
 
