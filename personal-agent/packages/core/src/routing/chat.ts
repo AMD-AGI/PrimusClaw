@@ -16,20 +16,7 @@ import {
 } from "../ports/surface.js";
 import { pyLstrip } from "../text/py-text.js";
 import type { RouterStore } from "./deps.js";
-
-/** A button on a note card: what it says and what pressing it sends back (the card data's verb and fields). */
-export interface NoteButton {
-  readonly title: string;
-  readonly verb: string;
-  readonly data: Readonly<Record<string, string>>;
-  readonly style?: "positive" | "destructive";
-}
-
-/** The note card a settled click ends as (rendered by the channel; the Python `render.note_card`). */
-export type NoteFactory = (
-  text: string,
-  options?: { readonly title?: string; readonly tone?: string; readonly buttons?: readonly NoteButton[] },
-) => OutMessage;
+import type { NoteFactory } from "./features.js";
 
 /**
  * The language a person is answered in (the Python `Agent._lang_of`): what they said (`/lang`), else the language of

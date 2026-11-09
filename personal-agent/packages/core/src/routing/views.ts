@@ -4,7 +4,7 @@
 import { AI_NOTICE } from "../locales/transparency.js";
 import type { Lang } from "../locales/lang.js";
 import type { OutMessage } from "../ports/surface.js";
-import type { NoteButton, NoteFactory } from "./chat.js";
+import type { NoteButton, NoteFactory } from "./features.js";
 
 /**
  * The cards of connecting and of the chat's own commands (the Python `render.link_card`, `binding_request_card`,
