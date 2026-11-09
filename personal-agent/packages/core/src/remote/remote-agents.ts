@@ -20,7 +20,7 @@ import { RemoteLiveView, remoteText } from "../remote-view/index.js";
 import type { Attachment, RemoteAgentCommand, RemoteChat, RemotePrompt } from "../routing/features.js";
 import { StatusBoard } from "./board.js";
 import { groupChatKey, personOf } from "./chat-key.js";
-import { ChatRegistry } from "./chats.js";
+import { ChatRegistry, type RemoteTurn } from "./chats.js";
 import { StartClicks } from "./clicks-start.js";
 import { MachineClicks } from "./clicks-machine.js";
 import { type Click, SessionClicks, isClickOp } from "./clicks.js";
@@ -235,8 +235,20 @@ export class RemoteAgents implements RemoteChat {
     });
   }
 
-  stop(chat: UserRef, credential: string, conversation: Conversation): Promise<boolean> {
-    return this.prompts.stop(chat.id, credential, conversation);
+  /** `only`: a Stop card's turn; the press stops nothing once that turn is not the one running (see Prompts.stop). */
+  stop(chat: UserRef, credential: string, conversation: Conversation, only?: RemoteTurn): Promise<boolean> {
+    return this.prompts.stop(chat.id, credential, conversation, only);
+  }
+
+  /** The turn this worker is watching for the chat now, if any (what a phone's Stop card is sent for). */
+  currentTurn(chatKey: string): RemoteTurn | undefined {
+    return this.chats.turns.get(chatKey);
+  }
+
+  /** The chat's session card is its window (`/agent mode card`, not a direct chat): a turn is shown there, with its own Stop. */
+  windowed(chatKey: string): boolean {
+    const state = this.enabled ? this.state.attached(chatKey) : null;
+    return state !== null && state.window === "card" && !this.state.direct(chatKey);
   }
 
   agents(sender: UserRef, credential: string, conversation: Conversation): Promise<void> {

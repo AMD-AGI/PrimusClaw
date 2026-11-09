@@ -12,6 +12,7 @@ import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, textMessage } from "../ports/surface.js";
 import { READ_ONLY_REASONS, readOnlyRefused, sessionTitle, terminalClosedLine } from "../remote-view/index.js";
 import type { StatusBoard } from "./board.js";
+import type { RemoteTurn } from "./chats.js";
 import type { RemoteContext } from "./context.js";
 import type { Provider } from "./ended.js";
 import type { FollowControl } from "./follow/control.js";
@@ -185,8 +186,12 @@ export class Prompts {
     }
   }
 
-  /** `/stop` for a chat that is attached: the agent is told to cancel. False when the chat is not attached. */
-  async stop(chatKey: string, key: string, to: Conversation): Promise<boolean> {
+  /**
+   * `/stop` for a chat that is attached: the agent is told to cancel. False when the chat is not attached. `only`: cancel only while
+   * that turn is the one this worker watches, checked with no wait before the cancel goes (a Stop card's turn); false, with nothing
+   * said or sent, when it is not.
+   */
+  async stop(chatKey: string, key: string, to: Conversation, only?: RemoteTurn): Promise<boolean> {
     const state = this.ctx.settings.enabled ? this.state.attached(chatKey) : null;
     if (state === null) return false;
     const lang = this.state.lang(chatKey);
@@ -195,6 +200,7 @@ export class Prompts {
       return true;
     }
     const turn = this.state.chats.turns.get(chatKey);
+    if (only !== undefined && !this.stillOn(chatKey, turn, only)) return false;
     const busy = this.state.chats.followers.get(chatKey)?.busy() ?? false;
     if (turn === undefined && !state.turnOpen && !busy) {
       await this.say(to, saidIn(lang, "nothingRunning"));
@@ -211,6 +217,11 @@ export class Prompts {
     else this.closeTurn(chatKey, state); // (nothing reads this turn: nothing would ever end it)
     await this.cancel(chatKey, key, state, to);
     return true;
+  }
+
+  /** The Stop card's turn is still the one running for the chat, and the chat is still attached. */
+  private stillOn(chatKey: string, turn: RemoteTurn | undefined, only: RemoteTurn): boolean {
+    return turn === only && turn.task?.running === true && this.ctx.remoteState.attachedRemote(chatKey) !== null;
   }
 
   private async cancel(chatKey: string, key: string, state: RemoteState, to: Conversation): Promise<void> {
