@@ -77,27 +77,14 @@ export class GithubConnect {
   async offer(request: ConnectRequest): Promise<boolean> {
     const userId = request.sender.id;
     const now = this.now();
-    const repos = repositoriesNamed(request.text);
-    if (
-      !this.hinting.has(userId) &&
-      (this.narrowHint.get(userId) ?? 0) <= now &&
-      (this.wide.get(userId) ?? 0) <= now &&
-      repos.length
-    ) {
-      // (in the background: the message goes on at once; one look at a time per person)
-      this.hinting.add(userId);
-      const task: Promise<void> = this.maybeHint(request, repos).finally(() => {
-        this.hints.delete(task);
-        this.hinting.delete(userId);
-      });
-      this.hints.add(task);
-    }
+    this.startHint(request, now);
     if (
       !asksAboutOwnGithub(request.text) ||
-      (this.connected.get(userId) ?? 0) > now ||
-      (this.quiet.get(userId) ?? 0) > now
-    )
+      this.until(this.connected, userId) > now ||
+      this.until(this.quiet, userId) > now
+    ) {
       return false;
+    }
     let connection;
     try {
       connection = await this.deps.claw.settings.githubConnection(request.credential);
