@@ -25,7 +25,7 @@ const withheld: string[] = [];
 const errors: RefusalErrors = {
   looksInternal: (text) => /gateway|brain/u.test(text),
   withhold: (where, detail) => {
-    withheld.push(`${where}:${detail}`);
+    withheld.push(`${where}:${String(detail)}`);
     return "0123abcd";
   },
 };

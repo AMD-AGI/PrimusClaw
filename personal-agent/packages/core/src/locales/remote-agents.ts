@@ -301,3 +301,28 @@ export type RemoteSentence = {
     ? K
     : never;
 }[keyof ReturnType<typeof remoteAgentText.in>];
+
+/**
+ * The sentences the Python worker said in English whatever the chat's language: their Chinese entry is the English text, kept so
+ * (a port that changes what a person reads is a change of its own).
+ */
+export const SAID_IN_ENGLISH: ReadonlySet<string> = new Set([
+  "decisionNotAccepted",
+  "lostConnection",
+  "noModeSays",
+  "doNotAsk",
+  "ask",
+  "limitAsks",
+  "switchFailed",
+  "switchUnconfirmed",
+  "switchedTo",
+  "notAModeId",
+  "notOffered",
+  "newUsage",
+  "modeIs",
+  "modesOffered",
+  "whichMachine",
+  "whichMachineNone",
+  "whichConversation",
+  "startsUnattendedRefused",
+]);
