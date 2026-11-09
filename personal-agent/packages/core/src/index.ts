@@ -25,3 +25,6 @@ export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
 export * from "./redact/index.js";
 export * from "./text/py-text.js";
+export * from "./observability/ip-address.js";
+export * from "./observability/security-fields.js";
+export * from "./observability/security-log.js";
