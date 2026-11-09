@@ -11,7 +11,13 @@ import { test } from "node:test";
 import type { RemoteAttachment, StorePort } from "@primusclaw/personal-agent";
 import { Fernet, SqliteStore } from "@primusclaw/personal-agent-runtime";
 
-import { advanceSeconds, openFileTestStore, openTestStore, tempDir } from "../../../../test-support/index.js";
+import {
+  advanceSeconds,
+  openFileTestStore,
+  openTestStore,
+  tempDir,
+  ignoreEvents,
+} from "../../../../test-support/index.js";
 
 const BASE: RemoteAttachment = {
   sessionId: "s1",
@@ -212,11 +218,11 @@ test("a database made before remote agents gets the tables on start, and keeps t
     );
     db.close();
     const key = Fernet.generateKey();
-    const store = new SqliteStore({ path, encryptionKeys: [key] });
+    const store = new SqliteStore({ path, encryptionKeys: [key], securityEvent: ignoreEvents });
     attach(store);
     assert.equal(store.remoteState.attachedRemote("aad-a")?.sessionId, "s1");
     store.close();
-    const again = new SqliteStore({ path, encryptionKeys: [key] });
+    const again = new SqliteStore({ path, encryptionKeys: [key], securityEvent: ignoreEvents });
     assert.equal(again.remoteState.attachedRemote("aad-a")?.sessionId, "s1");
     again.close();
   } finally {

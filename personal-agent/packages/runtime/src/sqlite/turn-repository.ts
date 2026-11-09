@@ -7,7 +7,7 @@ import {
   ANSWERED_MESSAGE_KEEP_SECONDS,
   type AnsweredInChat,
   type TurnAnswerRepository,
-  type TurnRun,
+  type FinishedRun,
 } from "@primusclaw/personal-agent";
 
 import type { StoreContext } from "./context.js";
@@ -70,7 +70,7 @@ export class SqliteTurnAnswerRepository implements TurnAnswerRepository {
     );
   }
 
-  answeredInChat(sessionId: string, run: TurnRun): AnsweredInChat | null {
+  answeredInChat(sessionId: string, run: FinishedRun): AnsweredInChat | null {
     const messageId = run.messageId ?? "";
     if (
       messageId &&
@@ -90,7 +90,7 @@ export class SqliteTurnAnswerRepository implements TurnAnswerRepository {
   }
 
   /** The two message ids decide when both are known; else the clock does (see the port's description). */
-  private judge(row: Row, run: TurnRun, messageId: string): AnsweredInChat | null {
+  private judge(row: Row, run: FinishedRun, messageId: string): AnsweredInChat | null {
     const rowMessage = col.str(row, "message_id");
     const known = messageId !== "" && rowMessage !== "";
     if (known && rowMessage !== messageId) return null; // the run of another message

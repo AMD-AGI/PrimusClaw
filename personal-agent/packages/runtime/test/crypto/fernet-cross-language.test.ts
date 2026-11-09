@@ -83,9 +83,8 @@ function tsSamples(): Sample[] {
 /** Python with `cryptography`, or why there is none. In CI its absence is a failure, never a skip. */
 function python(): string | undefined {
   const probe = spawnSync("python3", ["-c", "import cryptography"], { encoding: "utf8" });
-  return probe.status === 0
-    ? undefined
-    : `python3 with cryptography is not available (${probe.stderr.trim() || String(probe.error)})`;
+  if (probe.error !== undefined) return `python3 is not available (${probe.error.message})`;
+  return probe.status === 0 ? undefined : `python3 has no cryptography (${probe.stderr.trim()})`;
 }
 
 const missing = python();
