@@ -16,6 +16,7 @@ function live(refuse = false): LiveStream & { calls: string[] } {
   const answer = () => Promise.resolve(refuse ? err(refused) : ok(undefined));
   return {
     calls,
+    id: "stream-1",
     inform: (t) => (calls.push(`inform ${t}`), answer()),
     emit: (t) => (calls.push(`emit ${t}`), answer()),
     finish: () => (calls.push("finish"), answer()),

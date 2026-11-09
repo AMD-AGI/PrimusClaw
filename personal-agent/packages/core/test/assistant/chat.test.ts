@@ -120,6 +120,7 @@ it("a message goes to the assistant as typed and nothing waits for the answer", 
   );
   assert.deepEqual(w.surface.outbox[0], {
     op: "stream.open",
+    id: "m1",
     conversation: `c-${ALICE}`,
     replyTo: "act-1",
     text: "收到，正在处理…",

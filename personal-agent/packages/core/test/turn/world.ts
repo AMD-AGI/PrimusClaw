@@ -210,7 +210,12 @@ export class Bus implements TurnSurface {
       const refused = this.streamRequest(op);
       return Promise.resolve(refused ? err(refused) : ok(undefined));
     };
+    const ops = this.streamOps;
     return {
+      // As Teams: the id the first accepted stream request was answered with, "" before that.
+      get id() {
+        return ops.length > 0 ? "stream-1" : "";
+      },
       inform: (text) => answer({ op: "inform", text, at: this.clock.elapsed }),
       emit: (text) => answer({ op: "emit", text, at: this.clock.elapsed }),
       finish: (message) => answer({ op: "finish", text: textOf(message), message, at: this.clock.elapsed }),
