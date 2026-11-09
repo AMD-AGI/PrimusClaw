@@ -826,23 +826,28 @@ async function readIndexValidity(
 }
 
 /**
- * Whether another backend is building the index `name` right now, read from `pg_stat_progress_create_index`.
- * Exported for tests.
+ * Whether another backend may be building the index `name` right now, read from `pg_stat_progress_create_index`.
+ * Exported for tests. Asked only on the deferred path (`deferToBuildsElsewhere`), never for a required index.
  *
  * Asked only about an index that exists and is not valid, which a concurrent build has already entered in the
  * catalog and reported as its `index_relid` (both happen in its first transaction, before anyone else can see the
- * entry). A row whose details are hidden -- a build by a role whose progress this one may not read shows NULLs --
- * counts as in progress too: leaving a leftover until the next start costs a slower query, dropping a live build
- * costs the whole build.
+ * entry), so a build this role can read counts only when it is that index, on that index's table. A build by a
+ * role whose progress this one may not read shows NULL for both, so nothing says which index it is: it counts
+ * (leaving a performance index's leftover until the next start costs a slower query, dropping a live build of it
+ * costs the whole build), which is exactly why no required index asks this.
  */
 export async function indexBuildInProgress(q: StatementRunner, name: string): Promise<boolean> {
   const r = await q.query(
-    `SELECT 1 FROM pg_stat_progress_create_index p
+    `WITH target AS (
+       SELECT c.oid, i.indrelid FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = $1 AND n.nspname = CURRENT_SCHEMA())
+     SELECT 1 FROM pg_stat_progress_create_index p, target t
       WHERE p.pid <> pg_backend_pid()
         AND p.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
-        AND (p.index_relid IS NULL OR p.index_relid = (
-          SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE c.relname = $1 AND n.nspname = CURRENT_SCHEMA()))`,
+        AND ((p.index_relid IS NULL AND p.relid IS NULL)
+          OR (p.index_relid = t.oid AND p.relid = t.indrelid))`,
     [name],
   );
   return (r.rowCount ?? 0) > 0;
@@ -874,8 +879,9 @@ export const APP_EVENT_DEDUP_SQL = `DELETE FROM claw_session_events a
     AND a.id > b.id`;
 
 /** The app-event unique index, repairing stored repeats first if they are what stops it. */
-export function buildAppEventIndex(client: pg.ClientBase): Promise<void> {
+export function buildAppEventIndex(client: pg.ClientBase, opts: ConcurrentIndexOptions = {}): Promise<void> {
   return ensureConcurrentIndexOrWarn(client, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL, {
+    ...opts,
     onUniqueViolation: async () => { await client.query(APP_EVENT_DEDUP_SQL); },
   });
 }
@@ -1061,6 +1067,13 @@ function queueAccrualSql(out: string[]): void {
 /** `onUniqueViolation` repairs the rows that stop a UNIQUE build (23505); the build is then tried once more. */
 export interface ConcurrentIndexOptions {
   onUniqueViolation?: () => Promise<void>;
+  /**
+   * Leave an INVALID index alone while another backend may be building it (`indexBuildInProgress`), instead of
+   * dropping and rebuilding it. Only for the performance-only indexes {@link buildDeferredIndexes} builds, where a
+   * leftover kept until the next start costs a slower query. Never for an index `assertSchema` requires: there a
+   * leftover kept is a replica that refuses to serve, so those keep the drop and rebuild.
+   */
+  deferToBuildsElsewhere?: boolean;
 }
 
 async function ensureConcurrentIndex(
@@ -1075,7 +1088,7 @@ async function ensureConcurrentIndex(
   const readValidity = () => readIndexValidity(client, name);
   let existing = await readValidity();
   if (existing.rowCount && existing.rows[0].indisvalid) return;
-  if (existing.rowCount && await indexBuildInProgress(client, name)) {
+  if (existing.rowCount && opts.deferToBuildsElsewhere && await indexBuildInProgress(client, name)) {
     // Not a leftover: another backend is building it right now (a replica, a release job, an operator). Dropping
     // it would throw that build away, and building it here would only wait behind it; the next start finds it
     // valid, or a real leftover if that build died.
@@ -2715,6 +2728,7 @@ export async function buildDeferredIndexes(): Promise<"built" | "held_elsewhere"
 }
 
 async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
+  const DEFERRED: ConcurrentIndexOptions = { deferToBuildsElsewhere: true };
     // An application's progress event is forwarded at least once (hosting design
     // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
     //
@@ -2728,7 +2742,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
     // app event is stored twice, which is the degraded mode and not an outage.
     // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
     // skips; dropping only that leftover lets the next boot retry.
-    await buildAppEventIndex(client);
+    await buildAppEventIndex(client, DEFERRED);
 
     // The retention purge's walk over deleted sessions (sessions/retention.ts),
     // in exactly its keyset order, so each page is an index range read from the
@@ -2738,6 +2752,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
       "idx_sessions_deleted_walk",
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
          ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+      DEFERRED,
     );
 
     // Per-session recency lookup. The sweeper's stuck-session reaper asks
@@ -2754,6 +2769,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
       client,
       "idx_events_session_recent",
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
+      DEFERRED,
     );
 
     // The chat notices of saved memories, by memory id: deleting or undoing an entry removes the title from the
@@ -2767,6 +2783,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
       "idx_events_memory_saved",
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_memory_saved
          ON claw_session_events ((data->>'memory_id')) WHERE event = 'memory_saved'`,
+      DEFERRED,
     );
 
     await ensureConcurrentIndexOrWarn(
@@ -2786,6 +2803,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
            'sandbox_start_timeout'
          )
          AND platform_facts_resolved_at IS NULL`,
+      DEFERRED,
     );
     // The names this one replaced, removed once the replacement is provably
     // there. Safe to remove at all because each version strictly widens the one
@@ -2819,6 +2837,7 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
          ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
        WHERE status IN ('completed','failed','cancelled')`,
+      DEFERRED,
     );
     // Older variants are intentionally retained during this rolling upgrade.
     // The hazard is specifically an *unguarded* drop: the create above is
