@@ -4,22 +4,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { LogFields, Logger } from "../../src/ports/logger.js";
-import {
-  NAME_CHARS,
-  QUOTE_CHARS,
-  QUOTE_COUNT,
-  quoteBlock,
-  withQuote,
-  type QuoteForText,
-} from "../../src/inbound-text/quote-block.js";
+import type { InboundQuote } from "../../src/ports/surface.js";
+import { NAME_CHARS, QUOTE_CHARS, QUOTE_COUNT, quoteBlock, withQuote } from "../../src/inbound-text/quote-block.js";
 
 const WHEN_MS = "1793695000000";
 const WHEN = "2026-11-03 08:36 UTC";
 const SECRET = "ghp_" + "A1b2C3d4E5".repeat(4);
 const mask = (text: string): string => text.replace(/ghp_[A-Za-z0-9]+/g, "[hidden]");
 
-function quote(fields: Partial<QuoteForText> = {}): QuoteForText {
+function quote(fields: Partial<InboundQuote> = {}): InboundQuote {
   return {
+    messageId: "m-100",
     author: "Bob",
     text: "The deploy failed on node 3",
     fromBot: false,

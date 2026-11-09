@@ -21,18 +21,6 @@ export const QUOTE_COUNT = 5;
 /** The longest author name shown. */
 export const NAME_CHARS = 80;
 
-/** Where a channel read a quote from: for a log line, never its text. */
-export type QuoteSource = "entity" | "html" | "placeholder";
-
-/**
- * A quote with what the text needs beyond core's `InboundQuote` (to be folded into it): whether the quoted message
- * was deleted (its text then says so), and where it was read from.
- */
-export type QuoteForText = InboundQuote & {
-  readonly deleted: boolean;
-  readonly source: QuoteSource;
-};
-
 export interface QuoteBlockOptions {
   /** A group conversation: names and texts are masked. */
   readonly group?: boolean;
@@ -52,7 +40,7 @@ function pySplitlines(text: string): string[] {
   return lines;
 }
 
-function headOf(quote: QuoteForText, group: boolean, redact: Redact): string {
+function headOf(quote: InboundQuote, group: boolean, redact: Redact): string {
   let head: string;
   if (quote.fromBot) {
     head = "Quoted your earlier reply";
@@ -65,7 +53,7 @@ function headOf(quote: QuoteForText, group: boolean, redact: Redact): string {
   return head + (when ? ` (${when}):` : ":");
 }
 
-function bodyOf(quote: QuoteForText, group: boolean, redact: Redact, budget: number): string {
+function bodyOf(quote: InboundQuote, group: boolean, redact: Redact, budget: number): string {
   let text = quote.text.replace(AT_TAG, "");
   text = group ? redact(text) : text;
   text = pySplitlines(pyStrip(text))
@@ -78,7 +66,7 @@ function bodyOf(quote: QuoteForText, group: boolean, redact: Redact, budget: num
 }
 
 /** `activity.quote_block`: the quotes as text for the model, "" when there are none. */
-export function quoteBlock(quotes: readonly QuoteForText[], options: QuoteBlockOptions = {}): string {
+export function quoteBlock(quotes: readonly InboundQuote[], options: QuoteBlockOptions = {}): string {
   if (quotes.length === 0) return "";
   const group = options.group ?? false;
   const redact = options.redact ?? noRedact;

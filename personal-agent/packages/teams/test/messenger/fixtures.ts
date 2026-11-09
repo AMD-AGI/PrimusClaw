@@ -13,7 +13,7 @@ import type { Masker } from "../../src/messenger/masker.js";
 import type { Outbox } from "../../src/outbound/outbox.js";
 import { BusyConversations } from "../../src/stream/busy.js";
 import type { Renderers } from "../../src/views/registry.js";
-import { RecordingLogger } from "../helpers/recording-logger.js";
+import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 
 export function ref(id = "conv", conversationType = "personal"): ConversationRef {
   return {

@@ -60,11 +60,10 @@ function bodyActivity(message: OutMessage, context: RenderContext): JsonObject {
 }
 
 /** A citation as Teams' Claim entity; its position is the `[n]` the text cites it by. */
-export function claimOf(citation: Citation, index: number): JsonObject {
-  const position = (citation as Citation & { readonly position?: number }).position ?? index + 1;
+export function claimOf(citation: Citation): JsonObject {
   return {
     "@type": "Claim",
-    position,
+    position: citation.position,
     appearance: {
       "@type": "DigitalDocument",
       name: citation.title,

@@ -9,7 +9,7 @@ import { FakeClock, flushMicrotasks } from "../../../../test-support/clock.js";
 import { DeleteUnsupportedError } from "../../src/outbound/outbox.js";
 import { InboundConsumer, isIdleTimeout, queueLagMs } from "../../src/servicebus/consumer.js";
 import { IDLE_REOPEN_MS, ServiceBusOutbox } from "../../src/servicebus/outbox.js";
-import { RecordingLogger } from "../helpers/recording-logger.js";
+import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { FakeBus, FakeReceiver, received } from "./fakes.js";
 
 const envelope = {
