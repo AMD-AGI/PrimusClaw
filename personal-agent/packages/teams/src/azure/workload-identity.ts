@@ -19,6 +19,7 @@ import { TokenError } from "../connector/errors.js";
 import { reasonOf } from "../connector/timer.js";
 import { loadAssertionKey } from "../connector/tokens/assertion.js";
 import { FederatedTokenProvider } from "../connector/tokens/federated.js";
+import { stripTrailing } from "../text/trim.js";
 
 /** An Azure SDK access token: the bearer token and when it expires (milliseconds since the epoch). */
 export interface AccessToken {
@@ -72,7 +73,7 @@ export function workerIdentityFromEnv(env: Readonly<Record<string, string | unde
   return {
     clientId: get(SETTINGS.clientId),
     tenantId: get(SETTINGS.tenantId),
-    issuer: issuer.replace(/\/+$/, ""),
+    issuer: stripTrailing(issuer, "/"),
     subject: get(SETTINGS.subject),
     keyFile: get(SETTINGS.keyFile),
   };
