@@ -33,10 +33,3 @@ function compact(value: unknown): string {
   }
   return pyJsonDumps(value);
 }
-
-/** `text` without the run of `char` at its end (`text.rstrip(char)`), in one linear pass. */
-export function trimEndOf(text: string, char: string): string {
-  let end = text.length;
-  while (end > 0 && text[end - 1] === char) end -= 1;
-  return text.slice(0, end);
-}

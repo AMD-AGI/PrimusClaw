@@ -25,7 +25,7 @@ import { clawFailure, refusal, unreachable } from "./failures.js";
 import { finish } from "./finish.js";
 import { failureText } from "./work-clicks.js";
 import { itemLabel } from "./work-items.js";
-import { trimEndOf } from "../text/plain.js";
+import { pyRstrip } from "../text/py-text.js";
 
 export interface WatchClickDeps {
   readonly store: Pick<StorePort, "assistantCards">;
@@ -152,8 +152,8 @@ export class WatchClicks {
       if (!clawFailure(error)) throw error;
       return false;
     }
-    const same = trimEndOf(pull, "/").toLowerCase();
-    return watches.some((w) => answersUnasked(w) && trimEndOf(str(w["url"]), "/").toLowerCase() === same);
+    const same = pyRstrip(pull, "/").toLowerCase();
+    return watches.some((w) => answersUnasked(w) && pyRstrip(str(w["url"]), "/").toLowerCase() === same);
   }
 
   async unwatch(click: CardClick, key: string): Promise<void> {
