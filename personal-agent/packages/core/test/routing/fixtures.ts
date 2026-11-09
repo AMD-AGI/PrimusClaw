@@ -15,6 +15,7 @@ import {
   type UserRef,
 } from "@primusclaw/personal-agent";
 
+import { inboundAction } from "../../../../test-support/inbound.js";
 import type { NoteFactory } from "../../src/routing/features.js";
 
 export const ALICE: UserRef = { id: "aad-a", channelUserId: "29:a", name: "Alice", email: "" };
@@ -35,17 +36,17 @@ export const note: NoteFactory = (text, options = {}) => {
 };
 
 export function click(verb: string, data: Record<string, unknown> = {}, cardMessageId = "card-1"): InboundAction {
-  return {
-    type: "action",
+  return inboundAction({
     id: `act-${verb}`,
     sender: ALICE,
     conversation: personal(),
     locale: "",
     clientPlatform: "",
     verb,
+    clickVerb: verb,
     data,
     cardMessageId,
-  };
+  });
 }
 
 /** An identity service that answers as the test sets it. */

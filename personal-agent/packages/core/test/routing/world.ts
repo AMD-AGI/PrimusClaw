@@ -23,6 +23,7 @@ import {
   type UserRef,
 } from "@primusclaw/personal-agent";
 
+import { inboundAction, inboundMessage } from "../../../../test-support/inbound.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
@@ -266,8 +267,7 @@ export function message(
   const kind = options.kind ?? "personal";
   const id = options.conversation ?? (kind === "personal" ? `dm-${user.id}` : "g-1");
   next += 1;
-  return {
-    type: "message",
+  return inboundMessage({
     id: options.id ?? `act-${String(next)}`,
     sender: user,
     conversation: {
@@ -280,15 +280,7 @@ export function message(
     clientPlatform: "",
     text,
     mentioned: kind !== "personal",
-    targeted: false,
-    namesBotFirst: false,
-    conversationName: "",
-    mentions: [],
-    links: [],
-    quotes: [],
-    files: [],
-    provenance: "typed",
-  };
+  });
 }
 
 export function clickOf(
@@ -299,8 +291,7 @@ export function clickOf(
   const user = options.user ?? ALICE;
   const id = options.group === true ? "g-1" : `dm-${user.id}`;
   next += 1;
-  return {
-    type: "action",
+  return inboundAction({
     id: `click-${String(next)}`,
     sender: user,
     conversation: {
@@ -312,9 +303,10 @@ export function clickOf(
     locale: "",
     clientPlatform: "",
     verb,
+    clickVerb: verb,
     data,
     cardMessageId: options.card ?? "card-1",
-  };
+  });
 }
 
 /** What was said, in order: each text message's text, and "<view:name>" for a view. */
