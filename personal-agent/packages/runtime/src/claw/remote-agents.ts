@@ -3,6 +3,7 @@
 
 import {
   ClawAnswerInvalid,
+  REMOTE_HIDDEN_INCLUDE,
   remoteConnectorsSchema,
   remoteEventRowsSchema,
   remoteHiddenSchema,
@@ -38,7 +39,7 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   }
 
   async connectors(key: ClawCredential, options: { includeHidden?: boolean } = {}): Promise<RemoteConnector[]> {
-    const path = options.includeHidden === true ? "/connectors?hidden=include" : "/connectors";
+    const path = options.includeHidden === true ? `/connectors?hidden=${REMOTE_HIDDEN_INCLUDE}` : "/connectors";
     return read(remoteConnectorsSchema, anyDataOf(await this.#call("GET", path, key), "connectors"), "connectors");
   }
 

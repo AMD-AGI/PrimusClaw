@@ -11,11 +11,11 @@ import { bareName } from "./text/unicode.js";
 
 /** A model id as a request writes it. */
 export const MODEL_ID = "[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,99}";
-const MODEL_FIELD_SOURCE = `(?<![A-Za-z0-9_])(?:model|模型)\\s*[:：=]\\s*(?<model>${MODEL_ID})`;
+const MODEL_FIELD_SOURCE = `(?<![A-Za-z0-9_])(?:model|模型)\\s*[:：=]\\s*(?P<model>${MODEL_ID})`;
 
-/** "model: X" (or 模型：X) anywhere in a text; a new global pattern each call. */
+/** "model: X" (or 模型：X) anywhere in a text, read as Python's `re.I` pattern (İ and ı fold to i); a new pattern each call. */
 export function modelFieldPattern(): RegExp {
-  return new RegExp(MODEL_FIELD_SOURCE, "giu");
+  return pyRegExp(MODEL_FIELD_SOURCE, "gi");
 }
 
 /** "review 合入", and the same with 并 / 并且 / 和 / 与 / 、 / 然后 between (Python's `re.I`, so `İ` and `ı` fold to i). */

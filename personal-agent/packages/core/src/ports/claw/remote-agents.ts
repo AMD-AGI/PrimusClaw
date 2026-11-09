@@ -2,16 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import type { JsonObject } from "../../json.js";
+import type { RemoteHidden } from "../../protocol.js";
 import type { ClawCredential } from "../../claw/credential.js";
 import type { SseEvent } from "../../claw/model.js";
-import type {
-  RemoteConnector,
-  RemoteEventRow,
-  RemoteHidden,
-  RemotePairing,
-  RemoteSession,
-  RemoteSetup,
-} from "../../claw/remote.js";
+import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
 
 /** What a remote session starts with. */
 export interface NewRemoteSession {
