@@ -56,7 +56,7 @@ export const TURN = entries(
   ],
   ["inactive_note", () => noteCard({ text: "This button is no longer active." })],
   ["show_here_note", () => noteCard({ text: "回答在下面的聊天里。你的下一条消息会接着这个会话。", buttons: [SHOW] })],
-  // (internal #458, not yet in the port's Python baseline)
+  // (a Python change after the port's baseline)
   ["turn_stop", () => stopCard({ token: "turn-1", lang: "zh" })],
   ["turn_stop_en", () => stopCard({ token: "turn-1", lang: "en" })],
 );
