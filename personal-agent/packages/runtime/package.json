@@ -1,0 +1,14 @@
+{
+  "name": "@primusclaw/personal-agent-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node adapters for the personal agent's ports: clock, randomness, logging (and, as the port lands, storage, Claw, metrics, HTTP).",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@primusclaw/personal-agent": "0.0.0"
+  }
+}
