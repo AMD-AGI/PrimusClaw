@@ -8,6 +8,7 @@
  */
 
 import type { Lang } from "../locales/lang.js";
+import { pyStrip } from "../text/py-text.js";
 
 export type { Lang };
 
@@ -50,7 +51,7 @@ export function writtenLang(text: unknown): Lang | undefined {
 /** Chinese when the first text that has any non-space character has Chinese in it, else English. */
 export function pickLang(...texts: unknown[]): Lang {
   for (const text of texts) {
-    if (asText(text).trim()) return hasCjk(text) ? "zh" : "en";
+    if (pyStrip(asText(text))) return hasCjk(text) ? "zh" : "en";
   }
   return "en";
 }

@@ -7,7 +7,8 @@
  */
 import { z } from "zod";
 
-import { clip, cpHead } from "../text/plain.js";
+import { clip } from "../text/plain.js";
+import { cpHead, pyStrip } from "../text/py-text.js";
 
 /** The tool whose call waits for the answer to a question card. */
 export const QUESTION_TOOL = "ask_user_question";
@@ -50,7 +51,7 @@ function optionsOf(raw: unknown): QuestionOption[] {
     const option = rawOption.safeParse(item);
     if (!option.success || typeof item !== "object" || Array.isArray(item)) continue;
     const id = scalarText(option.data.id);
-    if (!id.trim()) continue;
+    if (!pyStrip(id)) continue;
     out.push({ id, label: clip(scalarText(option.data.label) || id, OPTION_MAX) });
   }
   return out.slice(0, OPTIONS_MAX);
@@ -67,7 +68,7 @@ export function cardQuestions(raw: unknown): CardQuestion[] {
     if (!question.success || typeof item !== "object" || Array.isArray(item)) continue;
     const id = scalarText(question.data.id);
     const text = scalarText(question.data.question);
-    if (!id.trim() || !text.trim()) continue;
+    if (!pyStrip(id) || !pyStrip(text)) continue;
     out.push({
       id,
       question: clip(text, QUESTION_MAX),
@@ -110,7 +111,7 @@ export function answersOf(data: Readonly<Record<string, unknown>>): Answers {
         const label = labels.get(c);
         return label === undefined ? [] : [label];
       });
-    const typed = cpHead(scalarText(data[`text_${String(i)}`]).trim(), ANSWER_MAX);
+    const typed = cpHead(pyStrip(scalarText(data[`text_${String(i)}`])), ANSWER_MAX);
     const answer = [chosen.join(", "), typed].filter(Boolean).join(". ");
     if (answer) answers.set(q.id, answer);
     else skipped.push(q.id);

@@ -3,3 +3,4 @@
 
 export * from "./catalog.js";
 export * from "./lang.js";
+export * from "./approval.js";

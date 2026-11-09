@@ -11,6 +11,7 @@
 
 import type { Lang } from "../locales/lang.js";
 import { neutral } from "../text/neutral.js";
+import { pyStrip } from "../text/py-text.js";
 
 /** A suggested reply: (what the button says, what it sends). */
 export type SuggestedReply = readonly [title: string, value: string];
@@ -30,11 +31,11 @@ function escapeRegExp(text: string): string {
 
 /** `text` with nothing markdown reads as markup: a name inside the bold of a head. */
 function plain(text: string, limit: number): string {
-  return neutral(text, limit).replace(MARKUP, "").trim();
+  return pyStrip(neutral(text, limit).replace(MARKUP, ""));
 }
 
 function splitLabel(label: string): [icon: string, name: string] {
-  const trimmed = label.trim();
+  const trimmed = pyStrip(label);
   const space = trimmed.indexOf(" ");
   return space < 0 ? [trimmed, ""] : [trimmed.slice(0, space), trimmed.slice(space + 1)];
 }
@@ -111,11 +112,11 @@ export function backReply(lang: string): SuggestedReply {
 
 /** The reply that attaches the chat to the agent it last talked to again (`/agent attach MACHINE/AGENT`); undefined when none. */
 export function returnReply(label: string, host: string, agentId: string, lang: string): SuggestedReply | undefined {
-  const id = agentId.trim();
+  const id = pyStrip(agentId);
   if (!id || /\s/u.test(id)) return undefined;
   const [, rest] = splitLabel(label);
   const name = plain(rest || label, 24) || "agent";
-  const machine = host.trim();
+  const machine = pyStrip(host);
   const ref = machine && !/\s/u.test(machine) ? `${machine}/${id}` : id;
   return [lang === "zh" ? `切回 ${name}` : `Back to ${name}`, `/agent attach ${ref}`];
 }
@@ -191,13 +192,13 @@ export class DirectChat {
   private readonly users: ReadonlySet<string> | undefined;
 
   constructor(on: boolean, users: Iterable<string> = []) {
-    this.users = on ? new Set([...users].map((u) => u.trim().toLowerCase()).filter(Boolean)) : undefined;
+    this.users = on ? new Set([...users].map((u) => pyStrip(u).toLowerCase()).filter(Boolean)) : undefined;
   }
 
   /** Whether the chat of this person (or a group binding of theirs: the part before '|') is an agent's window when attached. */
   on(aadId: string): boolean {
     if (this.users === undefined) return false;
-    const person = (aadId.split("|", 1)[0] ?? "").trim().toLowerCase();
+    const person = pyStrip(aadId.split("|", 1)[0] ?? "").toLowerCase();
     return this.users.size === 0 || this.users.has(person);
   }
 

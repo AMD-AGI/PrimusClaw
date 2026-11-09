@@ -8,16 +8,17 @@
  */
 
 import { redactText } from "../security/redact.js";
-import { cpHead, cpLen, flat } from "./plain.js";
+import { clip } from "./plain.js";
+import { squashSpaces } from "./py-text.js";
 
 // eslint-disable-next-line no-control-regex -- the control characters are what this removes
 const CONTROL = /[\u0000-\u001f\u007f]/g;
 
 export function neutral(text: string, limit = 200): string {
-  const line = redactText(flat(text.replace(CONTROL, " ")))
+  const line = redactText(squashSpaces(text.replace(CONTROL, " ")))
     .text.replaceAll("[", "(")
     .replaceAll("]", ")")
     .replaceAll("<", "‹")
     .replaceAll(">", "›");
-  return cpLen(line) <= limit ? line : `${cpHead(line, limit - 1).trimEnd()}…`;
+  return clip(line, limit);
 }
