@@ -217,7 +217,10 @@ export class GroupRouter {
       if (!(failure instanceof ClawError)) throw failure;
       error = failure.status === 409 && isErrorWord(failure.code) ? failure.code : `error ${String(failure.status)}`;
     }
-    const said = STOP_SAID[error] ?? [`没能停下（${error}）。`, `it could not be stopped (${error}).`];
+    const said = (Object.hasOwn(STOP_SAID, error) ? STOP_SAID[error] : undefined) ?? [
+      `没能停下（${error}）。`,
+      `it could not be stopped (${error}).`,
+    ];
     return zh ? `${short}：${said[0]}` : `${short}: ${said[1]}`;
   }
 }

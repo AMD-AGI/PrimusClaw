@@ -192,8 +192,9 @@ function settingCommand(flat: string): string | null {
   const zone = firstMatch(flat, TIMEZONE_PATTERNS);
   if (zone !== null) return `/timezone ${zone["z"] ?? ""}`;
   const lang = firstMatch(flat, LANG_PATTERNS);
-  if (lang !== null) return `/lang ${LANG_WORDS[pyLower(lang["l"] ?? "")] ?? ""}`;
-  return null;
+  if (lang === null) return null;
+  const word = pyLower(lang["l"] ?? "");
+  return `/lang ${Object.hasOwn(LANG_WORDS, word) ? (LANG_WORDS[word] ?? "") : ""}`;
 }
 
 function repoCommand(flat: string): string | null {

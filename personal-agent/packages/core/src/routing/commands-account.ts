@@ -182,7 +182,7 @@ export class AccountCommands {
   async lang(chat: Chat, arg: string): Promise<void> {
     const { prefs } = this.ctx.deps.store;
     const word = pyLower(pyStrip(arg));
-    const choice = LANG_WORDS[word];
+    const choice = Object.hasOwn(LANG_WORDS, word) ? LANG_WORDS[word] : undefined;
     if (choice !== undefined) {
       prefs.setLang(chat.sender.id, choice);
       await chat.say(accountText.in(choice).langChosen({ lang: choice }));

@@ -67,7 +67,7 @@ function looksLikeACode(word: string): boolean {
 export function menuCommand(text: string, group = false): string {
   const said = squashSpaces(text);
   const lower = pyLower(said);
-  const command = MENU_COMMANDS[lower];
+  const command = Object.hasOwn(MENU_COMMANDS, lower) ? MENU_COMMANDS[lower] : undefined;
   if (command !== undefined && (!group || (GROUP_MENU_COMMANDS as readonly string[]).includes(lower))) return command;
   const found = group ? null : LINK_WITH_CODE.exec(said);
   const code = found?.[1];

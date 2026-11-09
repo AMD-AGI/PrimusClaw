@@ -48,17 +48,22 @@ export function flatten(text: string): string {
   return pyStrip(pyRstrip(pyStrip(text), TRAILING));
 }
 
+/** A Chinese digit's value; undefined for anything else (a name every object inherits included). */
+function digitOf(word: string): number | undefined {
+  return Object.hasOwn(CN_DIGITS, word) ? CN_DIGITS[word] : undefined;
+}
+
 /** A number as written ("12", "十二", "两"); null when it is none. */
 export function spokenNumber(text: string): number | null {
   if (isDigits(text)) return decimalInt(text);
-  const single = CN_DIGITS[text];
+  const single = digitOf(text);
   if (single !== undefined) return single;
   const ten = text.indexOf("十");
   if (ten < 0) return null;
   const tens = text.slice(0, ten);
   const ones = text.slice(ten + 1);
-  const high = tens === "" ? 1 : CN_DIGITS[tens];
-  const low = ones === "" ? 0 : CN_DIGITS[ones];
+  const high = tens === "" ? 1 : digitOf(tens);
+  const low = ones === "" ? 0 : digitOf(ones);
   return high === undefined || low === undefined ? null : high * 10 + low;
 }
 
@@ -101,6 +106,6 @@ export function spokenDuration(count: string, unit: string): string | null {
   if (lower.startsWith("minute") || lower.startsWith("hour") || lower.startsWith("day")) {
     return `${String(value)}${lower.charAt(0)}`;
   }
-  const short = UNITS[lower];
+  const short = Object.hasOwn(UNITS, lower) ? UNITS[lower] : undefined;
   return short === undefined ? null : `${String(value)}${short}`;
 }
