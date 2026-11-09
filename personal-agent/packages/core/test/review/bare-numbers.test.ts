@@ -26,10 +26,10 @@ test("the forms a bare number is written in", () => {
 });
 
 const TEN = [248, 232, 243, 241, 238, 236, 233, 234, 237, 235];
-const ROHAN_TEN = "请 linmei 帮我review并合入PrimusClaw PR 248 232 243 241 238 236 233 234 237 235";
+const ROBIN_TEN = "请 linmei 帮我review并合入PrimusClaw PR 248 232 243 241 238 236 233 234 237 235";
 
 const ENDS: readonly [string, number[], number[]][] = [
-  [ROHAN_TEN, TEN, []],
+  [ROBIN_TEN, TEN, []],
   ["PR 248 10 分钟内", [248], []],
   ["PR 248 10分钟内", [248], []],
   ["PR 248\n1. 修复", [248], []],
