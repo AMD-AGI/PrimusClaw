@@ -101,7 +101,7 @@ function leadOf(match: RegExpExecArray): Lead {
 /** Whether the numbers at `start` are no pull requests: no keyword and no repository, or a word and a number run together. */
 function notPulls(blank: string, lead: Lead, start: number, repoEnd: number | undefined): boolean {
   const explicit = Boolean(lead.kw) || blank[start] === "#";
-  if (!explicit && !lead.repo) return true; // ("huirui0120", "opus-5.5": no number)
+  if (!explicit && !lead.repo) return true; // ("linmei0120", "opus-5.5": no number)
   if (lead.repo && !lead.kw && repoEnd === start) return true;
   return !lead.kw && !lead.repo && start > 0 && isAsciiWordish(blank.charAt(start - 1));
 }

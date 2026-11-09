@@ -152,7 +152,7 @@ function personKeys(who: string, mentions: readonly Mention[]): { ids: Set<strin
     ? [normName(refs.map((r) => pyStrip(mentions[r]?.name ?? "")).join(" "))]
     : [normName(bareName(withoutMarkers(who)))];
   const keys = new Set<string>();
-  // (a name's words in any order, run together or not: "Hui, Rui", "Rui Hui" and "huirui" are one name)
+  // (a name's words in any order, run together or not: "Lin, Mei", "Mei Lin" and "linmei" are one name)
   for (const n of names) {
     for (const v of [n, withoutParens(n)]) if (tokens(v).length) keys.add(sortedCp(tokens(v)).join(""));
   }

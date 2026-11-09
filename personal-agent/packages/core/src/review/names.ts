@@ -83,7 +83,7 @@ function compareCp(a: string, b: string): number {
 
 /**
  * The words of a text, case left out: split at spaces, punctuation and "_", and where Chinese meets a letter or a digit
- * ("帮我请huirui" is two words, never one that hides the name).
+ * ("帮我请linmei" is two words, never one that hides the name).
  */
 export function tokens(text: string): string[] {
   return casefold(text)
