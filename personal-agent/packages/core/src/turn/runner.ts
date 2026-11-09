@@ -26,8 +26,12 @@ import type { TurnClaw } from "./ports.js";
  * clicked, and Claw's notification for the same approval then sends no second card. W5 implements it over the store.
  */
 export interface TurnApprovals {
-  /** False when a card for this approval is already in a chat: the turn then shows none. */
+  /**
+   * False when a card for this approval is already in a chat: the turn then shows none. `userId`: the person the turn is for,
+   * whose approval it is (Python `store.save_approval(sender.aad_id, ...)`).
+   */
   record(
+    userId: string,
     sessionId: string,
     toolUseId: string,
     tool: string,
@@ -179,7 +183,7 @@ export class TurnEngine implements TurnRunner {
     return {
       ...(run.provider ? { keyProvider: run.provider } : {}),
       onApproval: (sid, toolUseId, tool, expiresIn, envelope) =>
-        approvals.record(sid, toolUseId, tool, expiresIn, envelope),
+        approvals.record(run.userId, sid, toolUseId, tool, expiresIn, envelope),
       onApprovalSent: (sid, toolUseId) => {
         approvals.sent(sid, toolUseId);
       },

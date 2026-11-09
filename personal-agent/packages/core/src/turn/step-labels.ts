@@ -128,7 +128,7 @@ export function labelFor(
   const t = stepText.in(key);
   const raw = squashSpaces(tool);
   if (skill) return new Label(t.skill({ skill }));
-  const kind = PLAIN[raw.toLowerCase()];
+  const kind = own(PLAIN, raw.toLowerCase());
   if (kind) return plainLabel(kind, key);
   const [server, verb] = mcpParts(raw);
   const known = serverLabel(server, verb, key, integrations);
@@ -151,12 +151,17 @@ export function lookupLabel(tool: string, lang = "en", integrations: Integration
 /** A lookup's own words: the assistant's tools, what a SaFE read reads, a known server's name; undefined for none. */
 function lookupOf(server: string, verb: string, zh: boolean, integrations: Integrations): string | undefined {
   const t = stepText.in(zh ? "zh" : "en");
-  const own = server === "assistant" ? ASSISTANT_STEPS[verb] : undefined;
-  if (own) return own[zh ? 1 : 0];
-  const objects = server === "safe" ? SAFE_OBJECTS[verb.split("_", 1)[0] ?? ""] : undefined;
+  const mine = server === "assistant" ? own(ASSISTANT_STEPS, verb) : undefined;
+  if (mine) return mine[zh ? 1 : 0];
+  const objects = server === "safe" ? own(SAFE_OBJECTS, verb.split("_", 1)[0] ?? "") : undefined;
   if (objects) return t.safeQuery({ what: objects[zh ? 1 : 0] });
-  const shown = SERVERS[server] ?? integrations.mcpServers.get(server);
+  const shown = own(SERVERS, server) ?? integrations.mcpServers.get(server);
   return shown ? t.query({ server: shown }) : undefined;
+}
+
+/** `table`'s own entry for `key` (a tool name is Claw's to choose: what every object inherits is no entry). */
+function own<V>(table: Readonly<Record<string, V>>, key: string): V | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
 export function failedLine(label: Label, lang = "en"): string {

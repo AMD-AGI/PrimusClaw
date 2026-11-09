@@ -11,7 +11,7 @@ import type { Part } from "../../src/capabilities/registry.js";
 import { parseAgentCommand } from "../../src/commands/agent-args.js";
 import { GROUP_COMMANDS, isKnownCommand } from "../../src/commands/names.js";
 import { AGENT_USAGE } from "../../src/locales/commands.js";
-import { ALICE } from "./fixtures.js";
+import { ALICE, BOB } from "./fixtures.js";
 import { link, message, said, world } from "./world.js";
 
 test("test_agent_commands_parse_to_a_subcommand_and_its_rest", () => {
@@ -133,4 +133,20 @@ test("test_a_new_chat_is_created_with_the_model_and_never_patched (the router's 
   await w.router.handle(message("fresh"));
   await w.router.settled();
   assert.deepEqual(w.turns.runs.at(-1)?.sessionId, null);
+});
+
+test("a turn is for the person who wrote: their id goes with it, for the approvals its cards record", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak-a");
+  link(w, BOB.id, "ak-b");
+  await w.router.handle(message("hello", { user: ALICE }));
+  await w.router.handle(message("hi", { user: BOB }));
+  await w.router.settled();
+  assert.deepEqual(
+    w.turns.runs.map((r) => [r.userId, r.credential]),
+    [
+      [ALICE.id, "ak-a"],
+      [BOB.id, "ak-b"],
+    ],
+  );
 });

@@ -47,8 +47,8 @@ interface Recorded {
 
 function approvals(recorded: Recorded, take: boolean, fail = false): TurnApprovals {
   return {
-    record: (...args: [string, string, string, number | undefined, Envelope]) => {
-      recorded.approvals.push(["record", ...args.slice(0, 4)]);
+    record: (...args: [string, string, string, string, number | undefined, Envelope]) => {
+      recorded.approvals.push(["record", ...args.slice(0, 5)]);
       if (fail) throw new Error("the store is gone");
       return take;
     },
@@ -115,6 +115,7 @@ async function go(setup: Setup) {
   });
   const run: TurnRun = {
     conversation: chat,
+    userId: "aad-run",
     credential: "ak-run",
     provider: undefined,
     sessionId: null,
@@ -177,12 +178,12 @@ it("an approval is recorded before its card goes, and marked sent; one already s
   ];
   const shown = await go({ script });
   assert.deepEqual(shown.recorded.approvals, [
-    ["record", "sess-ak-run", "tu-1", "bash", 90],
+    ["record", "aad-run", "sess-ak-run", "tu-1", "bash", 90],
     ["sent", "sess-ak-run", "tu-1"],
   ]);
   assert.equal(shown.chat.sent.filter((s) => s.message?.body.type === "view").length, 1);
   const elsewhere = await go({ script, take: false });
-  assert.deepEqual(elsewhere.recorded.approvals, [["record", "sess-ak-run", "tu-1", "bash", 90]]);
+  assert.deepEqual(elsewhere.recorded.approvals, [["record", "aad-run", "sess-ak-run", "tu-1", "bash", 90]]);
   assert.equal(elsewhere.chat.sent.filter((s) => s.message?.body.type === "view").length, 0);
 });
 
@@ -194,7 +195,7 @@ it("an approval card the chat did not take is marked unsent and the turn fails",
     /the queue is down/,
   );
   assert.deepEqual(recorded.approvals, [
-    ["record", "sess-ak-run", "tu-1", "bash", undefined],
+    ["record", "aad-run", "sess-ak-run", "tu-1", "bash", undefined],
     ["unsent", "sess-ak-run", "tu-1"],
   ]);
   assert.deepEqual(recorded.hooks.at(-1), ["turn", "sess-ak-run", "failed", ""]);

@@ -18,6 +18,8 @@ export interface ReviewRunFields {}
 
 export interface TurnRun {
   readonly conversation: Conversation;
+  /** The person the turn is for (whose approvals its cards are; Python `sender.aad_id`). */
+  readonly userId: string;
   /** The person this turn acts for: their key, or an exchanged token. */
   readonly credential: string;
   readonly provider: CredentialProvider;

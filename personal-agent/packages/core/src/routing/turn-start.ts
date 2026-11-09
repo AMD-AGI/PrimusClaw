@@ -198,6 +198,7 @@ export class TurnStarter {
       text: request.text,
       messageId: request.messageId,
       group,
+      userId: chat.sender.id,
       ownerName: chat.sender.name,
       model: review ? review.model || config.reviewModel || config.model : config.model,
       fallbackModel: config.fallbackModel,
