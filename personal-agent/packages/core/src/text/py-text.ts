@@ -9,8 +9,11 @@
  *  - there is no `str.isprintable`.
  */
 
-/** The characters Python's `str.isspace()` is true for. */
-const PY_SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+/**
+ * The characters Python's `str.isspace()` is true for, which is also what `\s` matches in a Python `str` pattern
+ * (JavaScript's `\s` lacks `\x1c`-`\x1f` and `\x85`, and has `\ufeff`). For a pattern: `new RegExp(`[${PY_SPACE}]`, "u")`.
+ */
+export const PY_SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const SPACE_RUN = new RegExp(`[${PY_SPACE}]+`, "u");
 const SPACE_ONE = new RegExp(`^[${PY_SPACE}]$`, "u");
 const LEADING = new RegExp(`^[${PY_SPACE}]+`, "u");
@@ -66,6 +69,35 @@ export function pyLstrip(text: string, chars?: string): string {
 /** `text.rstrip()`, or `text.rstrip(chars)`. */
 export function pyRstrip(text: string, chars?: string): string {
   return chars === undefined ? text.replace(TRAILING, "") : stripEnds(text, chars, false, true);
+}
+
+/**
+ * `text.lower()`. JavaScript's `toLowerCase()` is the same full, context-sensitive mapping (final sigma, `İ` to `i̇`),
+ * locale-independent as Python's; checked over every code point (they differ only where Node's Unicode is newer).
+ */
+export function pyLower(text: string): string {
+  return text.toLowerCase();
+}
+
+const CHEROKEE_CAPITALS: readonly [number, number] = [0x13a0, 0x13f5];
+
+/** One code point's `casefold()`: Python's full case folding, which differs from upper-then-lower in four places. */
+function foldPoint(ch: string): string {
+  const c = ch.codePointAt(0) ?? 0;
+  if (c === 0x131) return ch; // dotless i folds to itself, not to "i"
+  if (c === 0x1e9e) return "ss"; // capital sharp s folds like "ß"
+  if (c >= CHEROKEE_CAPITALS[0] && c <= CHEROKEE_CAPITALS[1]) return ch; // Cherokee folds to its capitals
+  if (c >= 0xab70 && c <= 0xabbf) return String.fromCodePoint(0x13a0 + (c - 0xab70));
+  if (c >= 0x13f8 && c <= 0x13fd) return String.fromCodePoint(c - 8);
+  return ch.toUpperCase().toLowerCase();
+}
+
+/**
+ * `text.casefold()`: for comparing without case (`ß` and `ss`, `ſ` and `s` fold together; `ı` stays apart from `i`;
+ * no final-sigma context, every `σ`/`ς`/`Σ` folds to `σ`). Per code point, as Python folds.
+ */
+export function pyCasefold(text: string): string {
+  return Array.from(text, foldPoint).join("");
 }
 
 /** `len(text)`: code points. */

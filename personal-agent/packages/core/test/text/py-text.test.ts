@@ -13,7 +13,10 @@ import {
   cpSlice,
   fixed1,
   isPyPrintable,
+  PY_SPACE,
+  pyCasefold,
   pyJsonDumps,
+  pyLower,
   pyLstrip,
   pyStr,
   pySplit,
@@ -136,4 +139,26 @@ test("json dumps with indent and sorted keys is json.dumps(indent=1, sort_keys=T
   );
   assert.equal(pyJsonDumps({ b: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "b": 1}');
   assert.equal(pyJsonDumps({ ab: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "ab": 1}');
+});
+
+test("the white space class is Python's str.isspace, x1c to x1f and x85 included", () => {
+  const space = new RegExp(`^[${PY_SPACE}]+$`, "u");
+  for (const ch of ["\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0", "\u2028", "\u3000", " ", "\t"]) {
+    assert.ok(space.test(ch), JSON.stringify(ch));
+    assert.equal(pyStrip(`${ch}a${ch}`), "a");
+  }
+  for (const ch of ["\ufeff", "\u200b", "a"]) assert.ok(!space.test(ch), JSON.stringify(ch));
+});
+
+test("lower and casefold are Python's", () => {
+  // Python 3: each right-hand side is what str.lower() / str.casefold() returned.
+  assert.equal(pyLower("ΑΣ Α"), "ας α");
+  assert.equal(pyLower("ΌΣΟΣ"), "όσος");
+  assert.equal(pyLower("İSTANBUL"), "i\u0307stanbul");
+  assert.equal(pyCasefold("ΌΣΟΣ"), "όσοσ");
+  assert.equal(pyCasefold("İSTANBUL"), "i\u0307stanbul");
+  assert.equal(pyCasefold("ı"), "ı");
+  assert.equal(pyCasefold("Straße ẞ ſ"), "strasse ss s");
+  assert.equal(pyCasefold("ꭰᏸᎠ"), "ᎠᏰᎠ");
+  assert.equal(pyCasefold("ABC"), "abc");
 });
