@@ -25,7 +25,7 @@ import pino from "pino";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
-  parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
+  REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -376,7 +376,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!owner) return;
     const policy = connectorVersionPolicy();
     // `?hidden=include`: the conversations the owner hid are listed too, marked `hidden: true` (to show them again).
-    const includeHidden = (req.query as { hidden?: string } | undefined)?.hidden === "include";
+    const includeHidden = (req.query as { hidden?: string } | undefined)?.hidden === REMOTE_HIDDEN_INCLUDE;
     const rows = await store.listConnectors(owner, onlineWindowMs, { includeHidden });
     return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
   });
@@ -390,13 +390,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!owner) return;
     const id = parseRemoteId((req.params as { cid?: string }).cid);
     if (!id) return notFound(reply);
-    const body = (req.body ?? {}) as { refs?: unknown; hidden?: unknown };
-    if (typeof body.hidden !== "boolean") return fail(reply, 400, "hidden_must_be_boolean");
-    const refs = Array.isArray(body.refs) ? body.refs : null;
-    if (!refs || refs.length === 0 || refs.length > 50 || !refs.every((r) => typeof r === "string" && /^[\x21-\x7e]{1,128}$/.test(r))) {
-      return fail(reply, 400, "invalid_refs");
-    }
-    const out = await store.setHidden(owner, id, (refs as string[]).map((ref) => ({ ref })), body.hidden);
+    const body = parseHiddenRequest(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    const out = await store.setHidden(owner, id, body.value.refs.map((ref) => ({ ref })), body.value.hidden);
     if (!out) return notFound(reply);
     return reply.send({ ok: true, data: out });
   });
