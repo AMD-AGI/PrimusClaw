@@ -14,6 +14,7 @@ import type { StatusBoard } from "../board.js";
 import type { RemoteContext } from "../context.js";
 import type { Settle } from "../permissions.js";
 import type { ChatState } from "../state.js";
+import { noteCard } from "../views.js";
 import { INPUT_ID, INPUT_MAX, markEdited } from "./view.js";
 
 /** The tap a settle answers: the card it was on, and the data it carried. */
@@ -43,7 +44,7 @@ export function windowCloser(
     if (tap.data["op"] !== "send" && typeof typed === "string") view.draft = typed.slice(0, INPUT_MAX);
     const said = Boolean(text) && options.announce !== false; // (the line reaches the phone as the card itself, again at the bottom)
     if (tap.tapped === stored.statusCard) return onTheWindow({ ctx, state, board, tap, settle }, text, said);
-    const note = ctx.views.note(text || remoteAgentText.in(state.lang(tap.chatKey)).changedElsewhere);
+    const note = noteCard(text || remoteAgentText.in(state.lang(tap.chatKey)).changedElsewhere);
     const done = await settle(note, { announce: false });
     if (!(await board.refreshWindow(tap.chatKey, tap.to, { byPerson: true, repost: said })) && said) {
       await tap.to.send(textMessage(text));

@@ -12,9 +12,10 @@ import { errorName } from "../errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type MessageId, type OutMessage, textMessage } from "../ports/surface.js";
-import { type ButtonFields, switchedLine } from "../remote-view/index.js";
+import { type ButtonFields, optionButtons, parseOptions, switchedLine } from "../remote-view/index.js";
 import type { StatusPhase } from "../remote-view/status-view.js";
 import { statusMessage } from "./cards.js";
+import { noteCard, windowCard } from "./views.js";
 import { isGroupKey } from "./chat-key.js";
 import type { RemoteContext } from "./context.js";
 import type { ChatState } from "./state.js";
@@ -82,9 +83,12 @@ export class StatusBoard {
         actionId: p.actionId,
         tool: p.tool,
         expiresAt: p.expiresAt,
-        options: p.options as never,
+        buttons: optionButtons(parseOptions(p.options), p.sessionId, p.actionId, lang).map((b) => ({
+          ...b,
+          inWindow: true,
+        })),
       }));
-      return this.ctx.views.window({
+      return windowCard({
         ...input,
         view: this.state.view(chatKey, state),
         approvals,
@@ -265,7 +269,7 @@ export class StatusBoard {
 
   async retireStatus(to: Conversation, cardId: MessageId, chatKey: string): Promise<void> {
     try {
-      await to.update(cardId, this.ctx.views.note(remoteAgentText.in(this.state.lang(chatKey)).changedElsewhere));
+      await to.update(cardId, noteCard(remoteAgentText.in(this.state.lang(chatKey)).changedElsewhere));
     } catch (error) {
       this.ctx.logger.info("an earlier status card could not be closed down", { error: errorName(error) });
     }

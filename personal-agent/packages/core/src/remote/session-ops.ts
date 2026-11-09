@@ -91,6 +91,15 @@ export class SessionOps {
     return true;
   }
 
+  /** The chat leaves its session for good (its machine went): nothing reads it any more. */
+  leave(chatKey: string): void {
+    this.runner.cancel(chatKey);
+    const watcher = this.state.chats.watchers.get(chatKey);
+    this.state.chats.watchers.delete(chatKey);
+    watcher?.cancel();
+    this.follow.detach(chatKey);
+  }
+
   /** The agent (as its machine reports it now) a chat is attached to; null when it cannot be read: what depends on it is not shown. */
   async agentOf(key: string, state: RemoteState): Promise<Agent | null> {
     try {

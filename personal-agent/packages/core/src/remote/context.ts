@@ -21,7 +21,6 @@ import type { ConnectorSetup } from "./connector/setup.js";
 import type { FollowReach } from "./follow/speaker.js";
 import type { FollowTimings } from "./follow/timings.js";
 import type { RefusalErrors } from "./refusals.js";
-import type { RemoteViews } from "./views.js";
 import type { WindowMode } from "./window/view.js";
 
 /** The per-person limits of what a remote agent may do without asking (`guardrails`). */
@@ -85,7 +84,6 @@ export interface RemoteContext {
   readonly guard: RemoteGuard;
   /** One security event (`approval_answered`). */
   audit(event: "approval_answered", fields: Readonly<Record<string, string | number | null>>): void;
-  readonly views: RemoteViews;
   readonly errors: RemoteErrors;
   readonly clock: Clock;
   readonly random: Random;

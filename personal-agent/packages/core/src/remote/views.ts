@@ -2,47 +2,70 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The cards of remote agents the domain cannot build from `remote-view` alone: the generic note that replaces a tapped card (and
- * the note that brings a card's buttons back), and the session card as the window. The assembly implements them with the note
- * view and the window view; everything else is built in `cards.ts`.
+ * The cards the domain builds beside `cards.ts`: the note that replaces a tapped card (and the notes that bring a card's buttons
+ * back), and the session card as the window. Built from the note view and the remote views; nothing here talks to a channel.
  */
 import type { Lang } from "../locales/lang.js";
-import type { OutMessage } from "../ports/surface.js";
-import type { PermissionOption } from "../remote-view/options.js";
-import type { StatusInput } from "../remote-view/status-view.js";
-import type { WindowView } from "./window/view.js";
+import { remoteText } from "../locales/remote.js";
+import { noteMessage } from "../note/note.js";
+import type { OutMessage, ViewButton } from "../ports/surface.js";
+import {
+  type DecisionButton,
+  type PermissionOption,
+  type WindowInput,
+  decisionData,
+  disconnectData,
+  optionButtons,
+  windowView,
+} from "../remote-view/index.js";
+import { viewMessage } from "./cards.js";
 
-/** An approval the session card offers as buttons. */
-export interface WindowApproval {
-  readonly actionId: string;
-  readonly tool: string;
-  readonly expiresAt: number;
-  readonly options: readonly PermissionOption[];
+/** A short note that replaces a tapped card (under `title` when there is one). */
+export function noteCard(text: string, title?: string, buttons?: readonly ViewButton[]): OutMessage {
+  return noteMessage({
+    text,
+    ...(title === undefined ? {} : { title }),
+    ...(buttons === undefined ? {} : { buttons }),
+  });
 }
 
-export interface WindowInput extends StatusInput {
-  readonly view: WindowView;
-  readonly approvals: readonly WindowApproval[];
-  /** The person's time zone (IANA). */
-  readonly zone: string;
-  /** A group chat bound to a session (its approvals go to the binder's 1:1 chat). */
-  readonly group: boolean;
+function decisionButton(button: DecisionButton): ViewButton {
+  return {
+    title: button.title,
+    verb: "primusclaw.remote_decision",
+    data: decisionData(button),
+    ...(button.primary ? { style: "positive" as const } : {}),
+  };
 }
 
-export interface RemoteViews {
-  /** A short note that replaces a tapped card (under `title` when there is one). */
-  note(text: string, title?: string): OutMessage;
-  /** The permission card's buttons again under `text`, titled with the request. */
-  reopened(
-    options: readonly PermissionOption[],
-    sessionId: string,
-    actionId: string,
-    title: string,
-    text: string,
-    lang: Lang,
-  ): OutMessage;
-  /** The disconnect buttons again under `text`. */
-  disconnectAgain(text: string, connectorId: string, title: string, lang: Lang): OutMessage;
-  /** The session card; `takesInput`: it has the text box. */
-  window(input: WindowInput): { readonly message: OutMessage; readonly takesInput: boolean };
+/** The permission card's buttons again under `text`, titled with the request: the decision did not go through. */
+export function reopenedCard(
+  options: readonly PermissionOption[],
+  ids: { readonly sessionId: string; readonly actionId: string },
+  title: string,
+  text: string,
+  lang: Lang,
+): OutMessage {
+  return noteCard(text, title, optionButtons(options, ids.sessionId, ids.actionId, lang).map(decisionButton));
+}
+
+/** The disconnect buttons again under `text`: pressing again can help. */
+export function disconnectAgainCard(text: string, connectorId: string, title: string, lang: Lang): OutMessage {
+  const words = remoteText.in(lang);
+  const buttons: ViewButton[] = [
+    {
+      title: words.disconnect,
+      verb: "primusclaw.remote_off",
+      data: disconnectData(connectorId, true),
+      style: "destructive",
+    },
+    { title: words.keepIt, verb: "primusclaw.remote_off", data: disconnectData(connectorId, false) },
+  ];
+  return noteCard(text, title, buttons);
+}
+
+/** The session card; `takesInput`: it has the text box. */
+export function windowCard(input: WindowInput): { readonly message: OutMessage; readonly takesInput: boolean } {
+  const model = windowView(input);
+  return { message: viewMessage({ name: "remoteWindow", model }, model.title), takesInput: model.box !== null };
 }

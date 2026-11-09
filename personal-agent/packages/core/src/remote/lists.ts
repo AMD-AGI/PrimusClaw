@@ -56,8 +56,12 @@ export class Lists {
     return this.ctx.clock.epochMs() / 1000;
   }
 
-  async machines(key: string): Promise<Machines> {
-    const raw = await orOff(() => this.ctx.claw.connectors(key));
+  /** The person's machines; `includeHidden`: the conversations they hid are listed too, marked hidden. */
+  async machines(key: string, includeHidden = false): Promise<Machines> {
+    // (the list with hidden ones is a newer route's: a 404 there is a refusal, not remote agents being off)
+    const raw = includeHidden
+      ? await this.ctx.claw.connectors(key, { includeHidden: true })
+      : await orOff(() => this.ctx.claw.connectors(key));
     return { raw, connectors: raw.map(connectorFrom) };
   }
 

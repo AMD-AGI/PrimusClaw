@@ -21,6 +21,7 @@ import {
 } from "../remote-view/index.js";
 import { neutral } from "../text/neutral.js";
 import { decidedMessage, permissionMessage } from "./cards.js";
+import { noteCard, reopenedCard } from "./views.js";
 import { isGroupKey, personOf } from "./chat-key.js";
 import type { GuardedOperation, RemoteContext } from "./context.js";
 import { textOf } from "./fields.js";
@@ -122,7 +123,7 @@ export class Permissions {
   /** The card again with its buttons and `text` on it: the decision did not go through. */
   private reopened(perm: RemotePermission, text: string, lang: Lang): OutMessage {
     const title = remoteText.in(lang).approvalNeeded({ tool: neutral(perm.tool, 100) });
-    return this.ctx.views.reopened(parseOptions(perm.options), perm.sessionId, perm.actionId, title, text, lang);
+    return reopenedCard(parseOptions(perm.options), perm, title, text, lang);
   }
 
   /** A click on an option of a permission card (see the module). */
@@ -156,7 +157,7 @@ export class Permissions {
   private async ranOut(click: Decision, perm: RemotePermission, lang: Lang): Promise<void> {
     this.ctx.permissions.closeRemotePermission(perm.sessionId, perm.actionId, "expired");
     const words = remoteAgentText.in(lang);
-    const card = this.ctx.views.note(words.ranOutRefused({ tool: neutral(perm.tool, 100) }), words.expiredTitle);
+    const card = noteCard(words.ranOutRefused({ tool: neutral(perm.tool, 100) }), words.expiredTitle);
     await click.settle(card, { fallback: saidIn(lang, "approvalRanOut") });
   }
 
