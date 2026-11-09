@@ -115,8 +115,9 @@ export class Deliveries {
     const reader = { remoteState: (u: string) => this.attached(u) };
     const { head, replies } = this.deps.directChat.clawyExtras(reader, userId, lang);
     if (words && head) words = `${head}\n\n${words}`;
-    // (in a chat that is an agent's window nothing said earlier is edited: an addition comes as a message of its own)
-    if (!this.deps.directChat.on(userId)) {
+    // (in a chat that is an agent's window, attached to its session, nothing said earlier is edited: an addition comes as a
+    // message of its own; a chat that is not attached edits as any other)
+    if (!this.agentsWindow(userId)) {
       const options = { head, replies };
       if (
         (await this.amend(userId, conversation, event, options)) ||
@@ -126,6 +127,11 @@ export class Deliveries {
     }
     await this.closeReceiptWith(userId, conversation, event, { words, head, replies });
     return true;
+  }
+
+  /** The chat is an agent's window now: direct chat is on for the person and the chat is attached to a session. */
+  private agentsWindow(userId: string): boolean {
+    return this.deps.directChat.on(userId) && this.deps.store.remoteState.attachedRemote(userId) !== null;
   }
 
   private attached(userId: string) {
