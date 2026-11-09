@@ -35,10 +35,9 @@ documentation builds without installing the full runtime environment.
 
 ## Scope
 
-Only the three Python distributions are covered here: `claw_memory`
-(`memory/memory-service`), `knowledge_worker` (`memory/knowledge-worker`) and
-`agent_sandbox` (`sandbox/sdk-python`). The TypeScript and Go trees are the
-larger part of the repository and are documented in Markdown beside the code.
+Only the Python distribution `agent_sandbox` (`sandbox/sdk-python`) is covered
+here. The TypeScript and Go trees are the larger part of the repository and are
+documented in Markdown beside the code.
 
 ## Adding another package
 
@@ -46,6 +45,6 @@ larger part of the repository and are documented in Markdown beside the code.
    `docs/conf.py`; autodoc has to import a module to document it.
 2. Add any new third-party top-level imports to `autodoc_mock_imports`, so the
    build does not need the runtime environment installed.
-3. Create a page under `docs/api/` using `automodule` directives (see the three
-   existing pages for the pattern) and add it to the toctree in
+3. Create a page under `docs/api/` using `automodule` directives (see the
+   existing page for the pattern) and add it to the toctree in
    `docs/api/index.md`.

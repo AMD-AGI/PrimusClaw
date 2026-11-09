@@ -1,8 +1,7 @@
 # PrimusClaw Python API reference
 
-**Scope: the Python packages only.** This site covers `claw_memory`,
-`knowledge_worker` and the `agent_sandbox` SDK — roughly the `memory/` tree and
-`sandbox/sdk-python/`. It is not a guide to PrimusClaw as a whole.
+**Scope: the Python packages only.** This site covers the `agent_sandbox` SDK
+under `sandbox/sdk-python/`. It is not a guide to PrimusClaw as a whole.
 
 The bulk of the system is TypeScript (the Claw harness under `claw/`) and Go
 (the sandbox control plane under `sandbox/`). Those are documented in Markdown

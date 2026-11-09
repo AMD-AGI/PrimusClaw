@@ -11,8 +11,6 @@
  * deleting: the row goes, and the audit trail keeps only that it existed.
  *
  * Rows with `kind` set belong to the knowledge base, not to the user, and are never read or written here.
- * The optional remote backend (`MEMORY_BACKEND=remote`) is frozen at v1 and does not serve this model, so
- * with it memory is off.
  */
 import pino from "pino";
 
@@ -32,12 +30,9 @@ import { citedBy, linkDerived, relinkEntry, resolveNames, unlinkErased } from ".
 
 const logger = pino({ name: "memory-service" });
 
-const REMOTE_BACKEND = process.env.MEMORY_BACKEND === "remote";
-if (REMOTE_BACKEND && CLAW_MEMORY_ENABLED) logger.warn("memory.remote_backend_frozen: long-term memory is off with MEMORY_BACKEND=remote");
-
 /** The deployment has memory at all. */
 export function memoryAvailable(): boolean {
-  return CLAW_MEMORY_ENABLED && !REMOTE_BACKEND;
+  return CLAW_MEMORY_ENABLED;
 }
 
 /** What a user-memory row is: not the knowledge base's, not the legacy profile. */

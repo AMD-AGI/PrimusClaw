@@ -46,7 +46,7 @@ help:
 	@echo
 	@echo "  make verify-claw        Claw workspaces: build + test + hands-mcp example"
 	@echo "  make verify-sandbox     Sandbox: go build + vet + test"
-	@echo "  make verify-python      memory/ pytest suites"
+	@echo "  make verify-python      Python unit suites (deploy/litellm)"
 	@echo "  make verify-docs        Sphinx build with warnings as errors"
 	@echo "  make verify-lint        repo lint scripts, gofmt, public tree scan, REUSE"
 	@echo
@@ -107,24 +107,17 @@ verify-sandbox:
 
 # --- Python ------------------------------------------------------------------
 
-# The e2e suites need a cluster and are excluded from CI too; this is the unit
-# scope only.
+# The same suites tests-coverage.yml runs, without the coverage floors.
 .PHONY: verify-python
 verify-python:
 	$(call require,PY,python3)
-	@echo "==> memory/: pytest"
-	@# Both pytest and the packages under test are checked: with pytest present
-	@# but the packages uninstalled, the run dies in collection with a wall of
-	@# import errors instead of saying what to install.
-	@if ! python3 -c "import pytest" >/dev/null 2>&1 \
-	   || ! python3 -c "import claw_memory, knowledge_worker" >/dev/null 2>&1; then \
-		echo "error: test dependencies missing. Install the same set CI uses:" >&2; \
-		echo "  pip install pytest pytest-cov pytest-asyncio coverage" >&2; \
-		echo "  pip install -e 'memory/memory-service/.[dev,storage]'" >&2; \
-		echo "  pip install -e 'memory/knowledge-worker/.[dev]'" >&2; \
+	@echo "==> Python: pytest"
+	@if ! python3 -c "import pytest" >/dev/null 2>&1; then \
+		echo "error: pytest not installed. Install the same set CI uses:" >&2; \
+		echo "  pip install pytest pytest-cov coverage" >&2; \
 		exit 1; \
 	fi
-	@python3 -m pytest memory/memory-service/tests memory/knowledge-worker/tests
+	@python3 -m pytest deploy/litellm/tests
 
 # --- Docs --------------------------------------------------------------------
 
@@ -139,8 +132,8 @@ verify-docs:
 	@python3 -m sphinx -b html -W --keep-going docs docs/_build/html
 	@modules=$$(grep -ro 'id="module-' docs/_build/html/api | wc -l); \
 	echo "    documented modules: $$modules"; \
-	if [ "$$modules" -lt 20 ]; then \
-		echo "error: API reference collapsed to $$modules modules (expected >= 20)" >&2; \
+	if [ "$$modules" -lt 10 ]; then \
+		echo "error: API reference collapsed to $$modules modules (expected >= 10)" >&2; \
 		exit 1; \
 	fi
 

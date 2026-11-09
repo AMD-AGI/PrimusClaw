@@ -79,7 +79,6 @@ jobs:
           echo "Release tag: rebuilding every image in this workflow"
           echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
           echo "claw_changed=true" >> "$GITHUB_OUTPUT"
-          echo "memory_service_changed=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -117,22 +116,12 @@ jobs:
           echo "claw_changed=false" >> $GITHUB_OUTPUT
         fi
 
-        # claw-memory-service: owned memory API + Postgres-backed service
-        if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(memory/memory-service/)'; then
-          echo "memory_service_changed=true" >> $GITHUB_OUTPUT
-        else
-          echo "memory_service_changed=false" >> $GITHUB_OUTPUT
-        fi
-
     - name: Generate matrix
       id: generate-matrix
       run: |
         MATRIX='{"include":['
         if [[ "${{ steps.detect-changes.outputs.claw_changed }}" == "true" ]]; then
           MATRIX+='{"name":"claw","context_path":"claw","dockerfile_path":"claw/Dockerfile"},'
-        fi
-        if [[ "${{ steps.detect-changes.outputs.memory_service_changed }}" == "true" ]]; then
-          MATRIX+='{"name":"claw-memory-service","context_path":"memory/memory-service","dockerfile_path":"memory/memory-service/deploy/Dockerfile"},'
         fi
         MATRIX=${MATRIX%,}
         MATRIX+=']}'

@@ -20,16 +20,12 @@ import sys
 # -- Package source roots ----------------------------------------------------
 
 # autodoc imports the modules it documents, so every documented package needs to
-# be importable. These are the three Python distributions in the repository;
-# paths are relative to this file so the build works from any directory.
+# be importable. This is the repository's Python distribution; paths are
+# relative to this file so the build works from any directory.
 _DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_DOCS_DIR)
 
-for _src in (
-    "memory/memory-service/src",
-    "memory/knowledge-worker/src",
-    "sandbox/sdk-python",
-):
+for _src in ("sandbox/sdk-python",):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _src))
 
 # -- Project information -----------------------------------------------------
@@ -78,18 +74,12 @@ autodoc_typehints = "description"
 
 # Third-party runtime dependencies that need not be installed to build the
 # docs. autodoc replaces them with mock objects during import. This list is the
-# set of non-stdlib top-level imports actually reachable from the three
-# documented packages; entries for libraries the code does not import would be
+# set of non-stdlib top-level imports actually reachable from the documented
+# package; entries for libraries the code does not import would be
 # silently useless, so keep it in step with the source.
 autodoc_mock_imports = [
-    "asyncpg",
-    "fastapi",
-    "httpx",
-    "prometheus_client",
-    "pydantic",
     "requests",
     "urllib3",
-    "uvicorn",
     "websockets",
 ]
 

@@ -11,7 +11,7 @@ name: Tests with Coverage
 #
 # Single workflow for test + coverage: one pytest run (--cov=.) produces one
 # .coverage file. The job Summary lists a whole-repo total plus per-tree totals
-# for the three Python trees exercised in CI (see CONTRIBUTING.md).
+# for the Python trees exercised in CI (see CONTRIBUTING.md).
 on:
   push:
     # main and the deploy/* branches only: every other branch reaches CI as a
@@ -98,17 +98,13 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            memory/memory-service/pyproject.toml
-            memory/knowledge-worker/pyproject.toml
 
+      # The LiteLLM hook's tests stub litellm for the import, so the suite needs
+      # nothing beyond the test runner itself.
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install pytest pytest-cov pytest-asyncio coverage
-          pip install -e "memory/memory-service/.[dev,storage]"
-          pip install -e "memory/knowledge-worker/.[dev]"
+          pip install pytest pytest-cov coverage
 
       # continue-on-error so the Summary step always runs; "Enforce test success"
       # restores a failing job when pytest fails.
@@ -118,19 +114,19 @@ jobs:
       # lower one to make a red build green.
       #
       # Measured with .coveragerc (source only, tests excluded):
-      #   combined 55.8%, memory-service 46%, knowledge-worker 85%.
+      #   combined 93%, deploy/litellm 93%.
       #
-      # The combined floor is the loosest of the three because `--cov=.` measures
-      # whatever the run happens to import, so it drifts for reasons unrelated to
-      # test quality. The per-tree floors below are the precise ones.
+      # The combined floor is set no tighter than the per-tree one because
+      # `--cov=.` measures whatever the run happens to import, so it drifts for
+      # reasons unrelated to test quality. The per-tree floors below are the
+      # precise ones.
       - name: Run tests with coverage
         id: pytest
         continue-on-error: true
         run: |
           pytest --cov=. --cov-report=xml --cov-report=term \
-            --cov-fail-under=54 \
-            memory/memory-service/tests \
-            memory/knowledge-worker/tests
+            --cov-fail-under=92 \
+            deploy/litellm/tests
 
       - name: Coverage summary
         if: always()
@@ -163,8 +159,7 @@ jobs:
             coverage report --skip-empty > /tmp/coverage-full.txt
             echo "=== Full coverage report (step log) ==="
             cat /tmp/coverage-full.txt
-            narrow_report "memory/memory-service/*" /tmp/cov-ms.txt
-            narrow_report "memory/knowledge-worker/*" /tmp/cov-kw.txt
+            narrow_report "deploy/litellm/*" /tmp/cov-litellm.txt
           fi
 
           {
@@ -180,8 +175,7 @@ jobs:
               echo "### CI Python trees (narrow; same trees as previous \`--cov=\` targets)";
               echo "| Tree | Line coverage (TOTAL) |";
               echo "|------|----------------------|";
-              echo "| \`memory/memory-service\` | $(extract_total /tmp/cov-ms.txt) |";
-              echo "| \`memory/knowledge-worker\` | $(extract_total /tmp/cov-kw.txt) |";
+              echo "| \`deploy/litellm\` | $(extract_total /tmp/cov-litellm.txt) |";
             else
               echo "No \`.coverage\` file; coverage cannot be summarized.";
             fi
@@ -192,8 +186,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Per-tree floors as well as the combined one. A single aggregate lets a
-      # well-covered tree carry a poorly covered one: knowledge-worker at 85%
-      # would keep the total green while memory-service, at 46%, slid further.
+      # well-covered tree carry a poorly covered one, so every tree added to the
+      # run above gets its own floor here.
       - name: Enforce per-tree coverage floors
         if: always()
         run: |
@@ -212,8 +206,7 @@ jobs:
               rc=1
             fi
           }
-          check "memory/memory-service" "memory/memory-service/*" 45
-          check "memory/knowledge-worker" "memory/knowledge-worker/*" 84
+          check "deploy/litellm" "deploy/litellm/*" 92
           exit "$rc"
 
       - name: Enforce test success

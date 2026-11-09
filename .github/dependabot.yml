@@ -23,11 +23,9 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # Python services
+  # Python packages
   - package-ecosystem: "pip"
     directories:
-      - "/memory/memory-service"
-      - "/memory/knowledge-worker"
       - "/sandbox/sdk-python"
     schedule:
       interval: "monthly"
@@ -36,8 +34,6 @@ updates:
       pip-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-        # One PR per dependency name across memory-service, knowledge-worker, and sdk-python.
-        group-by: dependency-name
 
   # Go module (Sandbox)
   - package-ecosystem: "gomod"
@@ -54,8 +50,6 @@ updates:
     directories:
       - "/claw"
       - "/deploy/litellm"
-      - "/memory/knowledge-worker"
-      - "/memory/memory-service/deploy"
       - "/sandbox/docker"
     schedule:
       interval: "monthly"
