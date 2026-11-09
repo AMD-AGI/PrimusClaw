@@ -19,6 +19,7 @@ import { isGroupKey } from "./chat-key.js";
 import type { RemoteContext } from "./context.js";
 import type { ChatState } from "./state.js";
 import { ChatLocks, Task } from "./tasks.js";
+import { Signer } from "./turns/signer.js";
 import { EDIT_SECONDS, markEdited, markPosted, shouldRepost } from "./window/view.js";
 
 /** A status card, and whether it carries the window's text box. */
@@ -386,8 +387,10 @@ export class StatusBoard {
     await to.send({ ...textMessage(line), suggestions: [{ title, value }] });
   }
 
-  /** The suggested replies under what the agent wrote in a chat that is its window. */
-  agentReplies(chatKey: string): { title: string; value: string }[] {
-    return agentReplies(this.state.lang(chatKey)).map(([title, value]) => ({ title, value }));
+  /** How a chat that is the agent's window signs what it wrote: its head, and the way on and back under the last message. */
+  signerOf(chatKey: string, state: RemoteState): Signer {
+    const lang = this.state.lang(chatKey);
+    const replies = agentReplies(lang).map(([title, value]) => ({ title, value }));
+    return new Signer(state.agentLabel, state.host, lang, replies);
   }
 }

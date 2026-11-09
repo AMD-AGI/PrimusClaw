@@ -6,6 +6,7 @@ import type { DirectChat } from "../direct-chat/direct-chat.js";
 import type { ClawRemoteAgentsPort } from "../ports/claw/remote-agents.js";
 import type { JsonObject } from "../json.js";
 import type { Lang } from "../locales/lang.js";
+import type { PublicErrors } from "../public-error/public-errors.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { Random } from "../ports/random.js";
@@ -42,13 +43,12 @@ export interface RemoteGuard {
   giveBack(person: string, operation: GuardedOperation, ticket: object | null): void;
 }
 
-/** The public-error helpers the domain uses beside the refusal ones. */
-export interface RemoteErrors extends RefusalErrors {
+/** What a person is told of a failure and what goes to the log instead (`public-error`). */
+export interface RemoteErrors extends PublicErrors, RefusalErrors {
   /** The text with a raw error at its end cut off: what may be shown, and the cut error (for the log). */
   splitErrorTail(text: string): { readonly kept: string; readonly tail: string };
   /** A fresh reference id for a sentence about a failure. */
   newRef(): string;
-  withheldAs(where: string, detail: string, ids: Readonly<Record<string, string>>): string;
 }
 
 export interface RemoteSettings {
@@ -90,7 +90,8 @@ export interface RemoteContext {
   readonly clock: Clock;
   readonly random: Random;
   readonly logger: Logger;
-  sha1Hex(text: string): string;
+  /** The hex digest of `text` (UTF-8): an idempotency key, a correlation id. */
+  digestHex(algorithm: "sha1" | "sha256", text: string): string;
   /** The language a person is answered in. */
   langOf(person: string): Lang;
   /** TEAMS_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */

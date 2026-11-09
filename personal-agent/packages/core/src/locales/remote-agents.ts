@@ -95,6 +95,22 @@ export const remoteAgentText = defineCatalog({
     noMachineYet: "You have no machine connected yet.",
     changedElsewhere: "(Switched: see the status card below)",
     listBelow: "(Updated: see the card below)",
+    endedFollowTail: " Your messages go to PrimusClaw again. Start a new session with `/agent new AGENT PATH`.",
+    endedTail: " Start a new one with `/agent new AGENT PATH`.",
+    approvalInPersonal: (p: { who: string }) =>
+      `${p.who} is waiting for your approval. I sent the card to our 1:1 chat, so the group does not see what it asks.`,
+    ranOutRefused: (p: { tool: string }) =>
+      `${p.tool}: this request ran out and was refused. Ask the agent to run it again if you still want it.`,
+    expiredTitle: "Expired",
+    decisionNotAccepted: (p: { status: number }) =>
+      `PrimusClaw did not accept the answer (error ${String(p.status)}). Press a button again in a moment.`,
+    pressAgain: " Press a button again.",
+    turnFailed: (p: { ref: string }) => `The agent's turn failed (ref ${p.ref}).`,
+    turnEnded: (p: { reason: string }) => `The turn ended (${p.reason})`,
+    lostConnection:
+      "I lost the connection to PrimusClaw while the agent was working. It may still be running: send a message to see where it stands, or /stop.",
+    watchFailed: (p: { ref: string }) =>
+      `Something went wrong on my side while watching the agent (ref ${p.ref}). Send a message to see where it stands.`,
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -170,6 +186,21 @@ export const remoteAgentText = defineCatalog({
     noMachineYet: "你还没有连接任何机器。",
     changedElsewhere: "（已切换，见下方的新状态卡）",
     listBelow: "（已更新，见下方的新卡片）",
+    endedFollowTail: " 你的消息会重新发给 PrimusClaw。用 `/agent new AGENT PATH` 开新会话。",
+    endedTail: " 用 `/agent new AGENT PATH` 开新会话。",
+    approvalInPersonal: (p) => `${p.who} 在等你批准。审批卡发到了你和我的 1:1 聊天里，群里看不到它要做什么。`,
+    ranOutRefused: (p) => `${p.tool}：这个请求已经过期，已自动拒绝。还需要的话，让 agent 再执行一次。`,
+    expiredTitle: "已过期",
+    // (said in English, as the worker did)
+    decisionNotAccepted: (p) =>
+      `PrimusClaw did not accept the answer (error ${String(p.status)}). Press a button again in a moment.`,
+    pressAgain: " 再按一次按钮。",
+    turnFailed: (p) => `agent 这一轮失败了（参考号 ${p.ref}）。`,
+    turnEnded: (p) => `这一轮结束了（${p.reason}）`,
+    // (said in English, as the worker did)
+    lostConnection:
+      "I lost the connection to PrimusClaw while the agent was working. It may still be running: send a message to see where it stands, or /stop.",
+    watchFailed: (p) => `我这边跟进 agent 时出错了（参考号 ${p.ref}）。发一条消息看看它进行到哪了。`,
   },
 });
 

@@ -8,6 +8,7 @@
  */
 import { ClawError } from "../claw/errors.js";
 import type { Lang } from "../locales/lang.js";
+import type { PublicErrors } from "../public-error/public-errors.js";
 import { type RemoteSentence, remoteAgentText } from "../locales/remote-agents.js";
 import { offlineText } from "./machines.js";
 import type { Connector } from "./model.js";
@@ -16,10 +17,8 @@ import type { Connector } from "./model.js";
  * How a detail that may be internal is kept from a person (`public-error`): whether text looks internal, and logging it under
  * a new reference that the person is given instead.
  */
-export interface RefusalErrors {
+export interface RefusalErrors extends Pick<PublicErrors, "withhold"> {
   looksInternal(text: string): boolean;
-  /** Log `detail` under a new reference and return the reference. `where` is a fixed word of the caller's. */
-  withhold(where: string, detail: string): string;
 }
 
 /** A new session refused as offline twice while the machine was reconnecting: said as that, never as "restart it". */
