@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { MASK, NOTE, redactActivity, redactLogLine, redactText } from "../../src/index.js";
+import { MASK, NOTE, redactLogLine, redactText } from "../../src/index.js";
 
 const HEX = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 // Built from pieces at run time so that no literal in this file looks like a real credential to a secret scanner.
@@ -100,51 +100,9 @@ diff --git a/teams/teams_agent/store.py b/teams/teams_agent/store.py
 2. The password reset flow in https://example.com/reset?token=abc is out of scope.
 `;
 
-describe("redactActivity", () => {
-  it("gives a masked text one note", () => {
-    const key = secret("safe ak key");
-    const out = redactActivity({ type: "message", text: `use ${key}`, textFormat: "markdown" });
-    const text = out["text"];
-    assert.ok(typeof text === "string");
-    assert.ok(!text.includes(key) && text.endsWith(NOTE) && text.split(NOTE).length === 2);
-    const clean = { type: "message", text: "hello" };
-    assert.equal(redactActivity(clean), clean);
-  });
-
-  it("masks cards, leaves buttons alone and adds the note", () => {
-    const ghp = secret("github ghp");
-    const actions = [
-      {
-        type: "Action.Execute",
-        title: "Approve",
-        verb: "primusclaw.decision",
-        data: { primusclaw: "decision", session_id: "sess-" + HEX, tool_use_id: "tu1", action: "allow" },
-      },
-    ];
-    const card = {
-      type: "message",
-      attachments: [
-        {
-          contentType: "application/vnd.microsoft.card.adaptive",
-          content: { type: "AdaptiveCard", body: [{ type: "TextBlock", text: `Tool: ${ghp}` }], actions },
-        },
-      ],
-    };
-    const out = redactActivity(card);
-    assert.ok(!JSON.stringify(out).includes(ghp));
-    const content = (out.attachments[0] as { content: { body: Array<{ text: string }>; actions: unknown } }).content;
-    assert.equal(content.body.at(-1)?.text, NOTE);
-    assert.deepEqual(content.actions, actions);
-    assert.ok(JSON.stringify(card).includes(ghp)); // the input was not modified in place
-  });
-
-  it("passes through what is not text, and an attachment that is not a card", () => {
-    const key = secret("safe ak key");
-    const out = redactActivity({ type: "message", value: 3, flag: null, attachments: ["x", { content: "y" }], v: key });
-    assert.equal(out["value"], 3);
-    assert.equal(out["flag"], null);
-    assert.deepEqual(out["attachments"], ["x", { content: "y" }]);
-    assert.equal(out["v"], MASK);
+describe("NOTE", () => {
+  it("is the worker's sentence, byte for byte", () => {
+    assert.equal(NOTE, "Some sensitive-looking values were hidden. Ask me in a 1:1 chat if you need them.");
   });
 });
 

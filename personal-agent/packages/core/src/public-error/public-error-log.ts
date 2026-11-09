@@ -3,7 +3,7 @@
 
 import type { Logger } from "../ports/logger.js";
 import type { Random } from "../ports/random.js";
-import { redactText } from "../redact/index.js";
+import { redactText } from "../security/redact.js";
 import { cpHead, cpLength, squashSpaces } from "../text/py-text.js";
 import { looksInternal, looksLikeServiceError } from "./classify.js";
 import { USERINFO } from "./patterns.js";

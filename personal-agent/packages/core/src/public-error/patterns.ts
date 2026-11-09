@@ -5,7 +5,7 @@
  * The shapes of internal detail in text the worker did not write (the Python worker's `public_error.py` patterns, read
  * with Python's semantics through `pyRegExp`).
  */
-import { pyRegExp } from "../text/py-regex.js";
+import { pyRegExp } from "../security/py-regex.js";
 
 /** File extensions of code and config: "test-user.py" is a file the model talks about, not a host. */
 const CODE_EXT = String.raw`py|pyi|js|mjs|ts|tsx|jsx|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|sh|md|rst|txt|json|yaml|yml|toml|ini|cfg|conf|lock|html|css|sql|ipynb|csv|log`;

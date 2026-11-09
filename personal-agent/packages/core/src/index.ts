@@ -23,7 +23,7 @@ export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./public-error/index.js";
-export * from "./redact/index.js";
+export * from "./security/redact.js";
 export * from "./text/py-text.js";
 export * from "./observability/ip-address.js";
 export * from "./observability/security-fields.js";
