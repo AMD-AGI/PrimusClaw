@@ -70,18 +70,29 @@ export function objectOf(value: unknown): Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/** ISO 8601's fraction of a second, which `Date.parse` cuts to milliseconds and Python keeps to microseconds. */
-const FRACTION = /^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$/;
+/**
+ * ISO 8601 text without its fraction of a second, and that fraction: `Date.parse` cuts it to milliseconds, Python keeps
+ * microseconds. Read by position, not by a pattern (no backtracking on a long input).
+ */
+function splitFraction(value: string): { readonly base: string; readonly fraction: number } {
+  const dot = value.indexOf(".", value.indexOf("T"));
+  if (dot === -1 || value.indexOf("T") === -1) return { base: value, fraction: 0 };
+  let end = dot + 1;
+  while (end < value.length && value.charCodeAt(end) >= 48 && value.charCodeAt(end) <= 57) end += 1;
+  if (end === dot + 1) return { base: value, fraction: 0 };
+  return {
+    base: value.slice(0, dot) + value.slice(end),
+    fraction: Number(`0.${value.slice(dot + 1, Math.min(end, dot + 7))}`),
+  };
+}
 
 /** A timestamp as Claw writes it (epoch seconds or milliseconds, or ISO 8601 to the microsecond), in seconds. */
 export function secondsOf(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value > 1e11 ? value / 1000 : value;
   if (typeof value !== "string" || !value) return undefined;
-  const parts = FRACTION.exec(value);
-  const ms = Date.parse(parts ? `${parts[1] ?? ""}${parts[3] ?? ""}` : value);
-  if (Number.isNaN(ms)) return undefined;
-  const fraction = parts ? Number(`0.${(parts[2] ?? "").slice(0, 6)}`) : 0;
-  return ms / 1000 + fraction;
+  const { base, fraction } = splitFraction(value);
+  const ms = Date.parse(base);
+  return Number.isNaN(ms) ? undefined : ms / 1000 + fraction;
 }
 
 function eventOf(row: HistoryRow): TurnEvent {

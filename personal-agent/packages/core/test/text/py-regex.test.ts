@@ -233,7 +233,9 @@ test("a full match is the same on every call and Python's own errors are refused
   assert.throws(() => pyFullmatch("a", "g"), InvariantError); // g/y would make test() stateful
   assert.throws(() => pyFullmatch("a", "y"), InvariantError);
   const again = pyFullmatch("a");
-  assert.ok(again.test("a") && again.test("a"));
+  const first = again.test("a");
+  const second = again.test("a"); // a second call on the same RegExp: no lastIndex carried over
+  assert.ok(first && second);
   assert.equal(pyRegExp("a", "gi").flags, "giu"); // searching for every match keeps g
   for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a"]) {
     assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
