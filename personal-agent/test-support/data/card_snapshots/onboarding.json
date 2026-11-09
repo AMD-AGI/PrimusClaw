@@ -1,0 +1,78 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "onboard",
+       "prompt": "pr-1"
+      },
+      "style": "positive",
+      "title": "Connect Clawy",
+      "type": "Action.Execute",
+      "verb": "primusclaw.onboard"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔌 <at>Lin Mei</at>, connect Clawy once to use it here.",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "Press Connect Clawy and I will send you the steps. Your request waits 15 minutes, and I run it here as soon as you are connected.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "msteams": {
+     "entities": [
+      {
+       "mentioned": {
+        "id": "29:abc",
+        "name": "Lin Mei"
+       },
+       "text": "<at>Lin Mei</at>",
+       "type": "mention"
+      }
+     ]
+    },
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

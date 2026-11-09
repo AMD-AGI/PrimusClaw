@@ -1,0 +1,117 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "answer",
+       "questions": [
+        {
+         "allow_multiple": false,
+         "id": "q1",
+         "options": [
+          {
+           "id": "o1",
+           "label": "Primus 运维"
+          },
+          {
+           "id": "o2",
+           "label": "FleetPilot 值班"
+          }
+         ],
+         "question": "告警发到哪个 Teams 频道？"
+        }
+       ],
+       "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+       "tool": "ask_user_question",
+       "tool_use_id": "tu-3"
+      },
+      "style": "positive",
+      "title": "发送回答",
+      "type": "Action.Execute",
+      "verb": "primusclaw.answer"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "❓ 需要你回答",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "任务 #11：给 fleetpilot 加超时告警 需要你回答",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "spacing": "Medium",
+      "text": "告警发到哪个 Teams 频道？",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "choices": [
+       {
+        "title": "Primus 运维",
+        "value": "o1"
+       },
+       {
+        "title": "FleetPilot 值班",
+        "value": "o2"
+       }
+      ],
+      "id": "choice_0",
+      "isMultiSelect": false,
+      "style": "expanded",
+      "type": "Input.ChoiceSet"
+     },
+     {
+      "id": "text_0",
+      "maxLength": 1000,
+      "placeholder": "或者直接写你的回答",
+      "type": "Input.Text"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

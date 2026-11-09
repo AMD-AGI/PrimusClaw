@@ -68,6 +68,7 @@ export class Guardrails {
     const merged = new Map<SensitiveOperation, Limit>(
       Object.entries(DEFAULT_LIMITS) as Array<[SensitiveOperation, Limit]>,
     );
+    // (own keys only: `in` would take "constructor" or "toString" from Object.prototype for an operation)
     const unknown = [...limits.keys()].filter((op) => !Object.hasOwn(SENSITIVE_OPERATIONS, op)).sort();
     if (unknown.length) throw new RangeError(`no such sensitive operation: ${unknown.join(", ")}`);
     for (const [op, limit] of limits) merged.set(op as SensitiveOperation, limit);
@@ -78,8 +79,11 @@ export class Guardrails {
     return this.clock.epochMs() / 1000;
   }
 
+  /** The operation's limit; an operation that is not one refuses (Python's KeyError), never a property of Object.prototype. */
   private limitOf(operation: SensitiveOperation): Limit {
-    return this.limits.get(operation) ?? DEFAULT_LIMITS[operation];
+    const limit = this.limits.get(operation);
+    if (limit === undefined) throw new RangeError(`no such sensitive operation: ${operation}`);
+    return limit;
   }
 
   /**
