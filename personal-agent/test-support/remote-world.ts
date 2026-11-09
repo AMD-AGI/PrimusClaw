@@ -92,6 +92,13 @@ export function* wordsOf(blocks: unknown): Generator<string> {
   }
 }
 
+/** One operation on a message, as `RemoteWorld.operations` lists it. */
+export interface Operation {
+  readonly op: Recorded["op"];
+  readonly id: string;
+  readonly card: Json | undefined;
+}
+
 export interface WorldOptions {
   readonly enabled?: boolean;
   readonly watchSeconds?: { readonly start: number; readonly mode: number };
@@ -213,9 +220,11 @@ export class RemoteWorld {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
-    const words = text.trim();
-    if (words === "/agents") return this.remote.agents(sender, key, to);
-    if (words === "/agent" || words.startsWith("/agent ")) {
+    const trimmed = text.trim();
+    const command = (trimmed.split(/\s/u)[0] ?? "").toLowerCase(); // (the router reads a command's word in any case)
+    const words = command + trimmed.slice(command.length);
+    if (command === "/agents") return this.remote.agents(sender, key, to);
+    if (command === "/agent") {
       return this.remote.agent({
         chat: sender,
         credential: key,
@@ -225,7 +234,7 @@ export class RemoteWorld {
         provider: undefined,
       });
     }
-    if (words === "/stop") {
+    if (command === "/stop") {
       await this.remote.stop(sender, key, to);
       return;
     }
@@ -304,6 +313,19 @@ export class RemoteWorld {
         ];
       }
       return [];
+    });
+  }
+
+  /**
+   * Every operation on a message, in order, as Teams is sent it: `id` the message an update or delete changes, or the id a post was
+   * given ("" for a plain send); `card` the card it carries, if any.
+   */
+  operations(): Operation[] {
+    return this.surface.outbox.flatMap((r): Operation[] => {
+      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined }];
+      if (r.op !== "send" && r.op !== "post" && r.op !== "update") return [];
+      const activity = activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json;
+      return [{ op: r.op, id: r.op === "send" ? "" : r.id, card: cardsOf(activity)[0] }];
     });
   }
 
