@@ -82,6 +82,8 @@ describe("settings", () => {
     refused({ TEAMS_DIRECT_CHAT: "maybe" }, "TEAMS_DIRECT_CHAT must be on or off, not 'maybe'");
     refused({ CLAW_PLUGIN_ID: "three" }, "CLAW_PLUGIN_ID must be a whole number");
     refused({ PORT: "" }, "PORT must be a whole number");
+    assert.equal(settings({ PORT: "8_000" }).listenPort, 8000);
+    refused({ PORT: "8__000" }, "PORT must be a whole number");
   });
 
   it("setting is read from the environment", () => {

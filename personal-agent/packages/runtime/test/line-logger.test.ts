@@ -47,3 +47,13 @@ test("a child's fields come first, and a call's own fields override them", () =>
     "2026-11-09T12:00:00.000Z DEBUG d module=turn conv=c1 user=u1",
   ]);
 });
+
+test("a message with line breaks is one line: a text from outside cannot forge a log line", () => {
+  const { log, lines } = capture("debug");
+  log.warn("unknown card verb\nINFO forged line\r\nERROR another", { verb: "a\nb" });
+  const [line] = lines;
+  assert.ok(line !== undefined && lines.length === 1);
+  assert.equal(line.split("\n").length, 1);
+  assert.ok(line.includes("unknown card verb\\nINFO forged line\\r\\nERROR another"));
+  assert.ok(line.includes('verb="a\\nb"'));
+});

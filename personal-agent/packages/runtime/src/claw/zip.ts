@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { inflateRawSync } from "node:zlib";
+import { crc32, inflateRawSync } from "node:zlib";
 
 /** One file of a zip archive, as its central directory lists it. */
 export interface ZipEntry {
@@ -47,23 +47,52 @@ export function readZip(bytes: Uint8Array): ZipEntry[] {
     const nameLength = view.getUint16(at + 28, true);
     const skip = nameLength + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
     const local = view.getUint32(at + 42, true);
+    const crc = view.getUint32(at + 16, true);
     const name = new TextDecoder().decode(bytes.subarray(at + 46, at + 46 + nameLength));
     entries.push({
       name,
       isDirectory: name.endsWith("/"),
       size,
-      read: () => readLocal(bytes, view, local, method, compressed),
+      read: () => checked(readLocal(bytes, view, local, method, compressed, size), crc),
     });
     at += 46 + skip;
   }
   return entries;
 }
 
-function readLocal(bytes: Uint8Array, view: DataView, at: number, method: number, compressed: number): Uint8Array {
+/**
+ * One file's bytes, exactly as large as the archive declares: a file that inflates to more is refused before more than
+ * that is produced (the declared size is what a caller's limit was checked against), and one that is shorter as well.
+ */
+function readLocal(
+  bytes: Uint8Array,
+  view: DataView,
+  at: number,
+  method: number,
+  compressed: number,
+  size: number,
+): Uint8Array {
   if (at + 30 > bytes.byteLength || view.getUint32(at, true) !== LOCAL) throw new NotAZip("bad local header");
   const start = at + 30 + view.getUint16(at + 26, true) + view.getUint16(at + 28, true);
   const data = bytes.subarray(start, start + compressed);
-  if (method === 0) return data;
-  if (method === 8) return new Uint8Array(inflateRawSync(data));
-  throw new NotAZip(`compression method ${String(method)}`);
+  let out: Uint8Array;
+  if (method === 0) out = data;
+  else if (method === 8) out = inflateAtMost(data, size);
+  else throw new NotAZip(`compression method ${String(method)}`);
+  if (out.byteLength !== size) throw new NotAZip("a file that is not the size the archive declares");
+  return out;
+}
+
+/** The bytes, when their CRC-32 is the one the archive records (Python's `zipfile` checks it too). */
+function checked(data: Uint8Array, crc: number): Uint8Array {
+  if (crc32(data) >>> 0 !== crc >>> 0) throw new NotAZip("a file whose checksum is not the one the archive records");
+  return data;
+}
+
+function inflateAtMost(data: Uint8Array, size: number): Uint8Array {
+  try {
+    return new Uint8Array(inflateRawSync(data, { maxOutputLength: Math.max(size, 1) }));
+  } catch {
+    throw new NotAZip("a file that inflates past its declared size, or not at all");
+  }
 }

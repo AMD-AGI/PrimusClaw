@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { pyStrip } from "../../text/py-text.js";
+import { pyCasefold, pyStrip } from "../../text/py-text.js";
 
 /**
  * Text helpers that keep the Python worker's string semantics where a review request depends on them: lengths and slices count
@@ -18,7 +18,7 @@ export function codePoints(text: string): string[] {
 
 /** Case left out, as names and repositories are compared. */
 export function casefold(text: string): string {
-  return text.toLowerCase();
+  return pyCasefold(text);
 }
 
 /** Python's `str.isalnum()` for one character. */

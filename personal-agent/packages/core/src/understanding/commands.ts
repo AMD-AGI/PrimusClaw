@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { pySplit } from "../text/py-text.js";
+import { pyLower, pySplit } from "../text/py-text.js";
 
 /** Commands the worker reads in a 1:1 chat that are not in the command module's lists. */
 export const WORDS_OF_A_CHAT = ["github", "board"] as const;
@@ -21,6 +21,6 @@ export interface CommandBook {
 export function exactCommand(text: string, commands: CommandBook): boolean {
   const [first] = pySplit(commands.menuCommand(text));
   if (first === undefined || !first.startsWith("/")) return false;
-  const name = first.slice(1).toLowerCase();
+  const name = pyLower(first.slice(1));
   return commands.isKnownCommand(name) || (WORDS_OF_A_CHAT as readonly string[]).includes(name);
 }

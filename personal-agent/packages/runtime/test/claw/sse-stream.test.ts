@@ -109,6 +109,11 @@ describe("a Claw event stream that ends badly", () => {
     assert.deepEqual(seen, ["a"]);
     assert.ok(err instanceof ClawUnreachable);
     assert.equal(err.kind, "network");
+    const early = new Wire(() => new Response("", { headers: { "content-type": "text/event-stream" } }));
+    const aborted = new AbortController();
+    aborted.abort();
+    assert.deepEqual(await all(early.client().sessions.stream("ak-a", "s1", undefined, aborted.signal)), []);
+    assert.deepEqual(early.sent, []);
     const bodiless = new Wire(() => new Response(null, { status: 204 }));
     assert.deepEqual(await all(bodiless.client().sessions.stream("ak-a", "s1")), []);
   });

@@ -12,43 +12,55 @@ const CODE_EXT = String.raw`py|pyi|js|mjs|ts|tsx|jsx|go|rs|java|kt|c|h|cc|cpp|hp
 
 const INFRA = String.raw`gateway|proxy|api|svc|service|server|db|database|redis|postgres|pg|mysql|mongo|kafka|nats|broker|brain|backend|worker|controller|ingress|litellm|vault|etcd|minio|registry`;
 
-/** A hyphenated name with a segment that names a piece of infrastructure (brain-gateway, primus-brain, claw-api). */
-const SERVICE_NAME = String.raw`(?i:\b(?:[A-Za-z0-9]+-)+(?:${INFRA})\b|\b(?:litellm|primus|claw|brain)(?:-[A-Za-z0-9]+)+\b)`;
+/**
+ * A hyphenated name with a segment that names a piece of infrastructure (brain-gateway, primus-brain, claw-api). This
+ * and the other case-free parts are Python's scoped `(?i:...)` groups; here they are a pattern of their own compiled with
+ * the `i` flag (`anyOf` below), since the translator takes inline flags only at the start of a pattern.
+ */
+const SERVICE_NAME = String.raw`\b(?:[A-Za-z0-9]+-)+(?:${INFRA})\b|\b(?:litellm|primus|claw|brain)(?:-[A-Za-z0-9]+)+\b`;
 
 /** The same names written with underscores (litellm_proxy, brain_gateway): only in INTERNAL, never in ADDRESS. */
-const SERVICE_NAME_UNDERSCORE = String.raw`(?i:\b(?:[A-Za-z0-9]+_)+(?:${INFRA})\b|\b(?:litellm|primus|claw|brain)(?:_[A-Za-z0-9]+)+\b)`;
+const SERVICE_NAME_UNDERSCORE = String.raw`\b(?:[A-Za-z0-9]+_)+(?:${INFRA})\b|\b(?:litellm|primus|claw|brain)(?:_[A-Za-z0-9]+)+\b`;
 
 const URL_SCHEME = String.raw`[A-Za-z][A-Za-z0-9+.-]{1,15}://`;
 const IPV4 = String.raw`\b\d{1,3}(?:\.\d{1,3}){3}\b`;
 const IPV6 = String.raw`\b(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b|\b[0-9A-Fa-f]{0,4}::[0-9A-Fa-f]{1,4}\b`;
 const HOST_PORT = String.raw`\b[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*:\d{2,5}\b`;
 const HOST_NAMES =
-  String.raw`(?i:\blocalhost\b` +
+  String.raw`\blocalhost\b` +
   String.raw`|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:svc|cluster\.local|local|internal|corp|lan|intra|prod|production|stg|stage|staging|int|priv|private|home)\b` +
   String.raw`|\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+(?:\.[A-Za-z0-9-]+)*\.(?!(?:${CODE_EXT})\b)[A-Za-z][A-Za-z0-9-]*\b` +
-  String.raw`|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|net|org|io|ai|us|cloud|dev)\b)`;
+  String.raw`|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|net|org|io|ai|us|cloud|dev)\b`;
 const STACK = String.raw`Traceback \(most recent call last\)|\bFile "[^"]+", line \d+|\bat [\w.$<>]+\([\w.]*:\d+\)`;
 
+/** A test that holds when any of its patterns is found in the text (Python's one pattern with scoped `(?i:...)` parts). */
+export interface AnyOf {
+  test(text: string): boolean;
+}
+
+function anyOf(caseSensitive: readonly string[], caseFree: readonly string[]): AnyOf {
+  const patterns = [pyRegExp(caseSensitive.join("|")), pyRegExp(caseFree.join("|"), "i")];
+  return { test: (text) => patterns.some((pattern) => pattern.test(text)) };
+}
+
 /** Shapes of internal detail. Any one of them is enough to keep the text back from the chat. */
-export const INTERNAL = pyRegExp(
+export const INTERNAL = anyOf(
   [
     URL_SCHEME,
     IPV4,
     IPV6,
     HOST_PORT, // a bare service name too: redis:6379
-    HOST_NAMES,
     String.raw`(?:^|[\s'"(=:])(?:~|\.{1,2})?/[A-Za-z0-9._-]+/[^\s]*`, // a POSIX path with two segments or more
-    SERVICE_NAME,
-    SERVICE_NAME_UNDERSCORE,
     String.raw`\b[A-Za-z]:\\`, // a Windows path
     STACK,
     String.raw`\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\b`, // an exception class name
     "[{}]", // JSON
-  ].join("|"),
+  ],
+  [HOST_NAMES, SERVICE_NAME, SERVICE_NAME_UNDERSCORE],
 );
 
 /** The subset of INTERNAL that is an address or a crash, not just words a person writes. */
-export const ADDRESS = pyRegExp([URL_SCHEME, IPV4, IPV6, HOST_PORT, HOST_NAMES, STACK, SERVICE_NAME].join("|"));
+export const ADDRESS = anyOf([URL_SCHEME, IPV4, IPV6, HOST_PORT, STACK], [HOST_NAMES, SERVICE_NAME]);
 
 /** Words of a failure: live narration that has internal detail and one of these is held back. */
 export const FAILURE_WORDS = pyRegExp(
