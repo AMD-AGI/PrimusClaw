@@ -651,8 +651,10 @@ describe("development environment items and devenv_send", { skip }, () => {
     const laptopRef = prompts.confirmationRef(String(toLaptop.confirmation_id));
     const voidedLine = voidedPart.split("\n").find((l) => l.startsWith(`- ref #${laptopRef} `));
     assert.ok(voidedLine, voidedPart);
-    assert.match(voidedLine, /on the machine "laptop": "跑 make test"/);
-    assert.match(voidedLine, /voided_reason: connector_revoked \(the machine "laptop" was revoked/);
+    assert.match(voidedLine, /on a machine that was removed: "跑 make test"/);
+    assert.match(voidedLine, /voided_reason: connector_revoked \(its machine was revoked/);
+    // The revoked machine is no longer theirs: its name is nowhere in what the router is shown (DM21-zms-a).
+    assert.doesNotMatch(voidedPart, /laptop/);
     assert.match(voidedLine, /never pressed: nothing was sent/);
     assert.match(voidedPart, /asked what waits for them, leave these out\. Do not bring one up on your own\./);
     assert.match(voidedPart, /never say you cannot tell whether it was pressed or lapsed/);
