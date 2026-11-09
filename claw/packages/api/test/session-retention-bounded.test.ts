@@ -78,6 +78,7 @@ describe("session retention: bounded statements and holds", { skip }, () => {
     const named = (await dbModule.db.query("SELECT current_database() AS name")).rows[0] as { name: string };
     assert.equal(named.name, cluster!.schema);
     await dbModule.initDb();
+    await dbModule.buildDeferredIndexes(); // the walk's index, which index.ts builds after listen
     retention = await import("../src/sessions/retention.js");
   });
   after(async () => {
