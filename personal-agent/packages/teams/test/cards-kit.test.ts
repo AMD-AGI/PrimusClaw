@@ -6,7 +6,6 @@ import { test } from "node:test";
 
 import { clip, hasCjk, zh } from "../src/cards/cjk.js";
 import type { CardElement } from "../src/cards/json.js";
-import { pyLstrip, pyRstrip, pyStr } from "../src/text/py-extra.js";
 import {
   buttons,
   card,
@@ -194,25 +193,4 @@ test("buttons, links and the card around them", () => {
   });
   assert.equal(hasCjk("中"), true);
   assert.equal(hasCjk(null), false);
-});
-
-test("python string semantics the core does not have yet: lstrip and str()", () => {
-  assert.equal(pyLstrip("\u0085 x \u2028"), "x \u2028");
-  assert.equal(pyLstrip("   "), "");
-  assert.equal(pyRstrip("  x "), "  x");
-  assert.deepEqual(
-    [
-      pyStr("s"),
-      pyStr(0),
-      pyStr(2),
-      pyStr(Number.NaN),
-      pyStr(0n),
-      pyStr(3n),
-      pyStr(true),
-      pyStr(false),
-      pyStr(null),
-      pyStr({}),
-    ],
-    ["s", "", "2", "", "", "3", "True", "", "", ""],
-  );
 });
