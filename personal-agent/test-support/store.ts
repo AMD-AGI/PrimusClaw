@@ -89,7 +89,15 @@ export function openFileTestStore(options: Omit<TestStoreOptions, "path"> = {}):
     dir: dir.path,
     raw,
     reopen: (more = {}) => {
-      const other = openTestStore({ clock: opened.clock, encryptionKeys: opened.encryptionKeys, ...more, path }).store;
+      // Another process draws other random values (its boot id, its codes) than the first.
+      const random = new SeededRandom(100 + others.length);
+      const other = openTestStore({
+        clock: opened.clock,
+        encryptionKeys: opened.encryptionKeys,
+        random,
+        ...more,
+        path,
+      }).store;
       others.push(other);
       return other;
     },
