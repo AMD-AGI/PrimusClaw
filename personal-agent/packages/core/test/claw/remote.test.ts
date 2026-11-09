@@ -36,7 +36,14 @@ describe("remote-agents answers", () => {
   });
 
   it("keeps fields it does not read", () => {
-    const session = remoteSessionSchema.parse({ session_id: "s1", status: "running", read_only: false, extra: 1 });
+    const session = remoteSessionSchema.parse({
+      session_id: "s1",
+      status: "running",
+      read_only: false,
+      updated_at: "2026-11-09T12:00:00.000Z",
+      extra: 1,
+    });
+    assert.equal(session.updated_at, "2026-11-09T12:00:00.000Z");
     assert.equal(session.session_id, "s1");
     assert.equal(session.read_only, false);
     assert.equal(session["extra"], 1);
@@ -45,8 +52,9 @@ describe("remote-agents answers", () => {
 
   it("reads event rows with a numeric or text id", () => {
     const rows = remoteEventRowsSchema.parse([
-      { id: 12, seq: 3, type: "chatDelta", ts: "t", data: { text: "x" } },
-      { id: "e2", data: [] },
+      { id: 12, seq: 3, type: "chatDelta", ts: 1_762_000_000_123, data: { text: "x" } },
+      { id: "e2", ts: "1762000000456", data: [] },
+      { id: "e3", ts: "yesterday" },
     ]);
     const [numbered, named] = rows;
     assert.ok(numbered && named);
@@ -54,6 +62,9 @@ describe("remote-agents answers", () => {
     assert.deepEqual(numbered.data, { text: "x" });
     assert.equal(named.id, "e2");
     assert.equal(named.data, undefined);
+    assert.equal(numbered.ts, 1_762_000_000_123);
+    assert.equal(named.ts, 1_762_000_000_456);
+    assert.equal(rows[2]?.ts, undefined);
   });
 
   it("reads a pairing", () => {
