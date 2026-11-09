@@ -125,7 +125,9 @@ function oneOf<T extends string>(env: Env, name: string, allowed: readonly T[], 
 function httpsIssuer(env: Env): string {
   const issuer = required(env, "BOT_ASSERTION_ISSUER").replace(/\/+$/, "");
   if (!issuer.startsWith("https://")) {
-    throw new TeamsConfigError("BOT_ASSERTION_ISSUER must be the https issuer URL registered in the federated credential");
+    throw new TeamsConfigError(
+      "BOT_ASSERTION_ISSUER must be the https issuer URL registered in the federated credential",
+    );
   }
   return issuer;
 }
@@ -165,7 +167,8 @@ function botFromEnv(env: Env, mode: OutboundMode): BotSettings {
   const tokenSource = oneOf<BotTokenSource>(env, "BOT_TOKEN_SOURCE", ["imds", "federated"], "imds");
   const federated = tokenSource === "federated";
   // (only direct mode holds a bot token; set alone it would do nothing)
-  if (federated && mode !== "direct") throw new TeamsConfigError("BOT_TOKEN_SOURCE=federated needs OUTBOUND_MODE=direct");
+  if (federated && mode !== "direct")
+    throw new TeamsConfigError("BOT_TOKEN_SOURCE=federated needs OUTBOUND_MODE=direct");
   return {
     tokenSource,
     msiClientId: get(env, "BOT_MSI_CLIENT_ID"),

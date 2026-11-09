@@ -88,7 +88,11 @@ export class TeamsSurface implements Surface {
       acks: parts.acks,
       clock: parts.clock,
       random: parts.random,
-      render: { style: parts.style, renderers: parts.renderers, masker: ref.kind === "personal" ? undefined : parts.masker },
+      render: {
+        style: parts.style,
+        renderers: parts.renderers,
+        masker: ref.kind === "personal" ? undefined : parts.masker,
+      },
       stream: { style: parts.style, clock: parts.clock, busy: this.busy, logger: this.logger },
       logger: this.logger,
       ...(parts.ackTimeoutMs === undefined ? {} : { ackTimeoutMs: parts.ackTimeoutMs }),

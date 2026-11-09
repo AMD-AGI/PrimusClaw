@@ -63,12 +63,24 @@ export class Recorder {
 
   private record(op: string, conversation: string, activity: Json, activityId: string | undefined, streamId?: string) {
     const copy = JSON.parse(JSON.stringify(activity)) as Json;
-    this.records.push({ t: this.now(), op, conversation, activity: copy, activityId, ...(streamId ? { streamId } : {}) });
+    this.records.push({
+      t: this.now(),
+      op,
+      conversation,
+      activity: copy,
+      activityId,
+      ...(streamId ? { streamId } : {}),
+    });
   }
 
   /** A message, an edit or a delete: the id Teams would answer with (undefined for a typing indicator). */
   take(op: string, conversation: string, activity: Json, activityId?: string): string | undefined {
-    const id = op === "update" || op === "delete" ? (activityId ?? "") : activity["type"] === "typing" ? undefined : this.nextId();
+    const id =
+      op === "update" || op === "delete"
+        ? (activityId ?? "")
+        : activity["type"] === "typing"
+          ? undefined
+          : this.nextId();
     this.record(op, conversation, activity, id);
     return id;
   }
@@ -94,9 +106,9 @@ export class Recorder {
       answer = sid;
     } else {
       if (current?.id !== sid) return refuse(`a request for stream ${sid}, which is not open`);
-      if (now - current.last < 0.9) this.refusals.push({ t: now, conversation, why: "more than one request a second", text: "" });
+      if (now - current.last < 0.9)
+        this.refusals.push({ t: now, conversation, why: "more than one request a second", text: "" });
     }
-    if (current === undefined) return refuse("no stream");
     if (kind === "streaming") {
       if (!text.startsWith(current.text)) refuse("streamed text that does not start with what was streamed before");
       current.text = text;
@@ -148,7 +160,8 @@ export class RecordingConnector {
   private post(request: ReceivedRequest): Reply {
     const match = ACTIVITIES.exec(request.path);
     const activity = request.json;
-    if (!match || !isJson(activity)) return { status: 400, json: { error: { code: "BadArgument", message: "not an activity" } } };
+    if (!match || !isJson(activity))
+      return { status: 400, json: { error: { code: "BadArgument", message: "not an activity" } } };
     const conversation = decodeURIComponent(match[1] ?? "");
     const op = match[2] === undefined ? "send" : "reply";
     try {
@@ -165,7 +178,8 @@ export class RecordingConnector {
   private edit(request: ReceivedRequest, op: "update" | "delete"): Reply {
     const match = ACTIVITIES.exec(request.path);
     const activity = op === "delete" ? {} : request.json;
-    if (!match?.[2] || !isJson(activity)) return { status: 400, json: { error: { code: "BadArgument", message: "not an activity" } } };
+    if (!match?.[2] || !isJson(activity))
+      return { status: 400, json: { error: { code: "BadArgument", message: "not an activity" } } };
     const id = decodeURIComponent(match[2]);
     this.recorder.take(op, decodeURIComponent(match[1] ?? ""), activity, id);
     return { status: 200, json: op === "delete" ? {} : { id } };

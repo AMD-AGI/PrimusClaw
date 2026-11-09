@@ -107,7 +107,9 @@ test("the made-up token goes to the recording connector only: any other serviceU
   const { connector, surface } = await world();
   try {
     const elsewhere = referenceOf(activity("https://smba.trafficmanager.net/emea/", "x"));
-    await surface.conversation({ id: "a:1on1", kind: "personal", tenantId: "t", wire: elsewhere }).send(textMessage("x"));
+    await surface
+      .conversation({ id: "a:1on1", kind: "personal", tenantId: "t", wire: elsewhere })
+      .send(textMessage("x"));
     assert.deepEqual(connector.server.requests, []);
   } finally {
     await connector.close();
@@ -141,17 +143,22 @@ test("the gate links its made-up people, reads their state and their sessions", 
   const base = `http://127.0.0.1:${String(await listen(app, "127.0.0.1", 0))}/gate/v1/people`;
   try {
     const put = (aad: string, body: unknown) => fetch(`${base}/${aad}`, { method: "PUT", body: JSON.stringify(body) });
-    const linked = await put("AAD-G", { name: "Gate Person", key: "ak-gate", claw_user_id: "u-gate", subscribe: false });
+    const linked = await put("AAD-G", {
+      name: "Gate Person",
+      key: "ak-gate",
+      claw_user_id: "u-gate",
+      subscribe: false,
+    });
     assert.deepEqual([linked.status, await linked.json()], [200, { status: "linked" }]);
     assert.equal(store.links.getKey("aad-g"), "ak-gate");
     assert.equal(store.links.clawUserIdOf("aad-g"), "u-gate");
     assert.equal(store.notifySubs.claimNotifyAttempt("aad-g", 1), false); // (no subscription of its own for a day)
     assert.equal((await put("aad-x", { name: "x" })).status, 400);
-    const state = await (await fetch(`${base}/aad-g?scope=group:1`)).json();
+    const state: unknown = await (await fetch(`${base}/aad-g?scope=group:1`)).json();
     assert.deepEqual(state, { session_id: null, signed_in: true, subscription: null });
-    const made = await (await fetch(`${base}/aad-g/subscription`, { method: "POST" })).json();
+    const made: unknown = await (await fetch(`${base}/aad-g/subscription`, { method: "POST" })).json();
     assert.deepEqual(made, { session_id: null, signed_in: true, subscription: { id: "sub-1", assistant_types: true } });
-    const removed = await (await fetch(`${base}/aad-g/subscription`, { method: "DELETE" })).json();
+    const removed: unknown = await (await fetch(`${base}/aad-g/subscription`, { method: "DELETE" })).json();
     assert.deepEqual(removed, { removed: "sub-1" });
     assert.equal(store.notifySubs.getNotifySub("aad-g"), null);
   } finally {
@@ -165,10 +172,15 @@ test("a stream through the recording connector keeps Teams' rules", async () => 
   const { connector, surface } = await world(systemClock);
   try {
     const wire = referenceOf(activity(`${connector.url}/`, "x"));
-    const opened = await surface.conversation({ id: "a:1on1", kind: "personal", tenantId: "t", wire }).openStream("m-1", "…");
+    const opened = await surface
+      .conversation({ id: "a:1on1", kind: "personal", tenantId: "t", wire })
+      .openStream("m-1", "…");
     assert.ok(opened.ok);
     assert.ok((await opened.value.finish(textMessage("All green"))).ok);
-    assert.deepEqual(connector.recorder.refusals.filter((r) => !r.why.includes("one request a second")), []);
+    assert.deepEqual(
+      connector.recorder.refusals.filter((r) => !r.why.includes("one request a second")),
+      [],
+    );
     assert.deepEqual(
       connector.recorder.records.map((r) => [r.op, r.activityId]),
       [

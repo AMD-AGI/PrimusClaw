@@ -58,7 +58,9 @@ export function gateEntryFromEnv(env: Readonly<Record<string, string | undefined
   if (raw !== "1") throw new GateEntryRefused(`TEAMS_GATE_ENTRY must be unset or 1, not '${raw}'`);
   const runId = (env["GATE_RUN_ID"] ?? "").trim();
   if (!runId) {
-    throw new GateEntryRefused("TEAMS_GATE_ENTRY=1 needs GATE_RUN_ID: the test entry runs only in a release gate's Job");
+    throw new GateEntryRefused(
+      "TEAMS_GATE_ENTRY=1 needs GATE_RUN_ID: the test entry runs only in a release gate's Job",
+    );
   }
   const connectorUrl = loopbackUrl(env["TEAMS_GATE_CONNECTOR_URL"] ?? "");
   return { connectorUrl, runId, filesPrefix: connectorUrl + FILES };

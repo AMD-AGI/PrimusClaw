@@ -19,7 +19,14 @@ function events(markup: string): Event[] {
 
 // Each expectation below is what CPython's HTMLParser(convert_charrefs=True) reported for the same markup.
 const MEASURED: readonly [string, Event[]][] = [
-  ["<p>a &amp; b</p>", [["start", "p", []], ["data", "a & b"], ["end", "p"]]],
+  [
+    "<p>a &amp; b</p>",
+    [
+      ["start", "p", []],
+      ["data", "a & b"],
+      ["end", "p"],
+    ],
+  ],
   [
     `<A HREF="x" Title='y>z' bare=v checked>t</A>`,
     [
@@ -49,9 +56,22 @@ const MEASURED: readonly [string, Event[]][] = [
   ["<!DOCTYPE html><?php x ?>t", [["data", "t"]]],
   [
     "<script>a<b>&amp;</script>&amp;",
-    [["start", "script", []], ["data", "a<b>&amp;"], ["end", "script"], ["data", "&"]],
+    [
+      ["start", "script", []],
+      ["data", "a<b>&amp;"],
+      ["end", "script"],
+      ["data", "&"],
+    ],
   ],
-  ["<style>p{}</StYlE >x", [["start", "style", []], ["data", "p{}"], ["end", "style"], ["data", "x"]]],
+  [
+    "<style>p{}</StYlE >x",
+    [
+      ["start", "style", []],
+      ["data", "p{}"],
+      ["end", "style"],
+      ["data", "x"],
+    ],
+  ],
   ["</>x</ y>z", [["data", "xz"]]],
   [
     "&amp &ampx &notit; &notin; &#65;&#x41;&#0;&#128;&#xD800;&#1114112;&#1; &copy &COPY; &unknown; &#9999999999;",
@@ -59,7 +79,11 @@ const MEASURED: readonly [string, Event[]][] = [
   ],
   [
     `<a href="https://e.test/?a=1&amp;b=2&lt">w</a>`,
-    [["start", "a", [["href", "https://e.test/?a=1&b=2<"]]], ["data", "w"], ["end", "a"]],
+    [
+      ["start", "a", [["href", "https://e.test/?a=1&b=2<"]]],
+      ["data", "w"],
+      ["end", "a"],
+    ],
   ],
   [
     `<p\nclass="c"\tid=d>x</p\n>`,
@@ -76,7 +100,13 @@ const MEASURED: readonly [string, Event[]][] = [
       ["end", "p"],
     ],
   ],
-  ["<b>x</b", [["start", "b", []], ["data", "x"]]],
+  [
+    "<b>x</b",
+    [
+      ["start", "b", []],
+      ["data", "x"],
+    ],
+  ],
   [`<a href="x`, []],
   ["x&", [["data", "x&"]]],
   [
@@ -148,7 +178,11 @@ test("a slash inside a tag separates attributes", () => {
 });
 
 test("a reference is decoded on its own side of a tag or a comment", () => {
-  assert.deepEqual(events("&am<b>p;"), [["data", "&am"], ["start", "b", []], ["data", "p;"]]);
+  assert.deepEqual(events("&am<b>p;"), [
+    ["data", "&am"],
+    ["start", "b", []],
+    ["data", "p;"],
+  ]);
   assert.deepEqual(events("&amp<!-- -->;"), [["data", "&;"]]);
 });
 

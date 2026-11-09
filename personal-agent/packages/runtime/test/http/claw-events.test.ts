@@ -48,7 +48,9 @@ test("two replicas on one store send a say once", async () => {
     const both = Promise.all([ra.handle(signed(file.clock, say())), rb.handle(signed(file.clock, say()))]);
     await flushMicrotasks();
     await file.clock.runAll();
-    const together = (await both).map((r) => [r.status, bodyOf(r)]).sort((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y)));
+    const together = (await both)
+      .map((r) => [r.status, bodyOf(r)])
+      .sort((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y)));
     assert.deepEqual(together, [
       [200, { status: "delivered" }],
       [200, { status: "duplicate" }],
@@ -206,7 +208,10 @@ test("a turn still running is retried later, a held event counts as taken, and a
   assert.deepEqual(bodyOf(await r.handle(signed(clock, say("e-1")))), { status: "duplicate" });
   sink.outcome = "delivered";
   await r.handle(signed(clock, say("e-2")));
-  assert.deepEqual(measured.map((m) => m[0]), ["assistant.say"]);
+  assert.deepEqual(
+    measured.map((m) => m[0]),
+    ["assistant.say"],
+  );
   assert.equal(sinceOccurred("2026-11-07T08:53:00Z", Date.UTC(2026, 10, 7, 8, 53, 10) / 1000), 10);
   assert.equal(sinceOccurred("2026-11-07T08:53:00", 0), null);
   assert.equal(sinceOccurred(undefined, 0), null);

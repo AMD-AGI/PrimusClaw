@@ -105,6 +105,8 @@ test("an edit names the message, is remembered, and a cancelled one sends nothin
     activity_id: "m-1",
   });
   assert.ok(conversation.edited.has("m-1"));
+  conversation.markSettled("m-0");
+  assert.ok(conversation.edited.has("m-0"));
   const cancelled = new AbortController();
   cancelled.abort(new Error("the turn was cancelled"));
   await assert.rejects(conversation.update("m-2", textMessage("y"), { signal: cancelled.signal }), /cancelled/);

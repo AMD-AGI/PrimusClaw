@@ -19,7 +19,13 @@ import type {
   TokenExchange,
 } from "@primusclaw/personal-agent";
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
-import { bodyJson, json, type HttpRequest, type HttpResponse, type HttpRoute } from "@primusclaw/personal-agent-runtime";
+import {
+  bodyJson,
+  json,
+  type HttpRequest,
+  type HttpResponse,
+  type HttpRoute,
+} from "@primusclaw/personal-agent-runtime";
 import { z } from "zod";
 
 import type { JsonObject } from "../cards/json.js";

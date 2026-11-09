@@ -20,12 +20,13 @@ import type {
   LinkRepository,
   Logger,
   MetricsPort,
+  NotifyRoute,
   NotifySubscriptionRepository,
 } from "@primusclaw/personal-agent";
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { bodyJson, json, type HttpResponse, type HttpRoute } from "./routes.js";
+import { bodyJson, json, type HttpRequest, type HttpResponse, type HttpRoute } from "./routes.js";
 
 /** The largest event Claw posts, with room (a say of 9000 characters with its sources, or an image carried inline). */
 export const MAX_BODY_BYTES = 128 * 1024;
@@ -94,30 +95,49 @@ export function clawEventsRoute(deps: ClawEventsDeps): HttpRoute {
   };
 }
 
-async function handleEvent(deps: ClawEventsDeps, request: Parameters<HttpRoute["handle"]>[0]): Promise<HttpResponse> {
-  const started = deps.clock.monotonicMs();
-  const nowSeconds = deps.clock.epochMs() / 1000;
+/** The subscription whose route and signature the request carries, or the answer that refuses it. */
+function verified(deps: ClawEventsDeps, request: HttpRequest): NotifyRoute | HttpResponse {
   const stamp = request.headers["x-claw-timestamp"] ?? "";
   const found = deps.notifySubs.notifySubByRoute(request.params["route"] ?? "");
   // An unknown route is answered exactly like a wrong signature, and costs the same HMAC.
   const secret = found?.secret ?? randomBytes(16).toString("hex");
   const given = request.headers["x-claw-signature"] ?? "";
   if (!sameText(given, sign(secret, stamp, request.body)) || !found) return json(401, { error: "bad_signature" });
-  if (!isFresh(stamp, nowSeconds)) return json(401, { error: "stale_timestamp" });
+  if (!isFresh(stamp, deps.clock.epochMs() / 1000)) return json(401, { error: "stale_timestamp" });
+  return found;
+}
+
+interface ParsedEvent {
+  readonly event: JsonObject;
+  readonly eventId: string;
+  readonly userId: string;
+}
+
+/** The event the body is, with its ids; undefined when it is not one (or the event id header disagrees with it). */
+function parsedEvent(request: HttpRequest): ParsedEvent | undefined {
   const raw = bodyJson(request);
   const parsed = ClawEvent.safeParse(raw);
-  const eventId = parsed.success ? idText(parsed.data.event_id) : undefined;
-  const userId = parsed.success ? idText(parsed.data.user_id) : undefined;
-  if (!parsed.success || !isEvent(raw) || eventId === undefined || userId === undefined) {
-    return json(400, { error: "bad_event" });
-  }
+  if (!parsed.success || !isEvent(raw)) return undefined;
+  const eventId = idText(parsed.data.event_id);
+  const userId = idText(parsed.data.user_id);
+  if (eventId === undefined || userId === undefined) return undefined;
   // (the header is not signed: the signed body's id is the one used, and a header that disagrees is refused)
-  if ((request.headers["x-claw-event-id"] ?? eventId) !== eventId) return json(400, { error: "bad_event" });
-  const owner = deps.links.clawUserIdOf(found.userId) === userId ? found.userId : undefined;
+  if ((request.headers["x-claw-event-id"] ?? eventId) !== eventId) return undefined;
+  return { event: raw, eventId, userId };
+}
+
+async function handleEvent(deps: ClawEventsDeps, request: HttpRequest): Promise<HttpResponse> {
+  const started = deps.clock.monotonicMs();
+  const route = verified(deps, request);
+  if ("status" in route) return route;
+  const parsed = parsedEvent(request);
+  if (parsed === undefined) return json(400, { error: "bad_event" });
+  // (a person's secret speaks only for that person)
+  const owner = deps.links.clawUserIdOf(route.userId) === parsed.userId ? route.userId : undefined;
   const reference = owner === undefined ? null : deps.references.getReference(owner);
   if (owner === undefined || reference === null) return dropped(deps, owner !== undefined);
   // (the event as it came, keys in Claw's order: a held event is stored as JSON and read back by either worker)
-  return deliverOnce(deps, owner, reference, raw, eventId, { started });
+  return deliverOnce(deps, owner, reference, parsed.event, parsed.eventId, { started });
 }
 
 function isEvent(value: unknown): value is JsonObject {
