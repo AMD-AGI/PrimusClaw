@@ -5,3 +5,4 @@ dist/
 package-lock.json
 ported-tests/
 test-names.jsonl
+test-support/data/
