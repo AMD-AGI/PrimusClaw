@@ -121,12 +121,23 @@ function digitValue(ch: string): number {
 }
 
 /**
- * `text.isdigit()` as the Python worker's rules use it: at least one character, each a decimal digit of any script
- * (what `\d` matches in Python's `re`). (Python's `isdigit` also takes superscripts and circled digits, which `int`
- * then refuses; no rule reads those.)
+ * At least one character, each a decimal digit of any script (`\p{Nd}`: what `\d` matches in Python's `re`, and what
+ * `int()` reads). NOT Python's `str.isdigit()`, which also takes superscripts and circled digits (`pyIsdigit`).
  */
 export function isDigits(text: string): boolean {
   return /^\p{Nd}+$/u.test(text);
+}
+
+/** Numeric_Type=Digit (superscripts, circled and parenthesized digits, ...): the Unicode 16 table of the worker's Python. */
+const DIGIT_NOT_DECIMAL =
+  "\\u{b2}-\\u{b3}\\u{b9}\\u{1369}-\\u{1371}\\u{19da}\\u{2070}\\u{2074}-\\u{2079}\\u{2080}-\\u{2089}\\u{2460}-\\u{2468}" +
+  "\\u{2474}-\\u{247c}\\u{2488}-\\u{2490}\\u{24ea}\\u{24f5}-\\u{24fd}\\u{24ff}\\u{2776}-\\u{277e}\\u{2780}-\\u{2788}" +
+  "\\u{278a}-\\u{2792}\\u{10a40}-\\u{10a43}\\u{10e60}-\\u{10e68}\\u{11052}-\\u{1105a}\\u{1f100}-\\u{1f10a}";
+const PY_DIGITS = new RegExp(`^[\\p{Nd}${DIGIT_NOT_DECIMAL}]+$`, "u");
+
+/** `text.isdigit()`: at least one character, each of Numeric_Type Decimal or Digit (`²` and `①` are digits). */
+export function pyIsdigit(text: string): boolean {
+  return PY_DIGITS.test(text);
 }
 
 /** `int(text)` for a run of decimal digits of any script (`１２` is 12, `٣` is 3); NaN for anything else. */
