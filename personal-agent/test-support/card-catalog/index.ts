@@ -42,8 +42,9 @@ const BY_LINE = {
     "remote_sessions_waiting",
     "remote_sessions_watch",
     "remote_status",
+    "remote_window",
+    "remote_window_en",
   ],
-  W3: ["remote_window", "remote_window_en"],
   W7: ["github_connect", "review_confirm_merge", "review_confirm_post", "review_end", "review_mode", "review_start"],
   W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;
