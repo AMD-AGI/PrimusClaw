@@ -1222,6 +1222,11 @@ record it.
   Code's input box is refused in 30 s as `terminal_screen_unknown` (#555). In a container, `claw-connector service install`
   restarts a running supervisor so an edited agents.toml or environment takes effect, and an ended supervisor that PID 1 never
   reaps is no longer taken for a running one (#549).
+- `@primusclaw/connector` 0.1.15: a running Claude Code whose registry row (`sessions/<pid>.json`) cannot be read (an empty file a
+  lost write left) no longer makes the conversations in its folder look free: they are reported `unknown`, not `idle`, so no
+  client offers to take one over, and a takeover or new attach there is refused (`twin_check_failed`, naming the process and the
+  file); a session this connector already holds goes on. The scan is shared and time-limited, and `doctor` warns
+  (`claude_registry_row_unreadable`) with the fix: send anything in that terminal (#572).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
