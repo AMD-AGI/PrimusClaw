@@ -20,7 +20,7 @@
     "format": "prettier --write .",
     "depcruise": "depcruise --config .dependency-cruiser.cjs packages test-support",
     "test": "node --import tsx --test --test-concurrency=2 \"packages/*/test/**/*.test.ts\" \"test-support/**/*.test.ts\" \"test/**/*.test.ts\"",
-    "coverage": "node --import tsx scripts/coverage.ts --names test-names.jsonl",
+    "coverage": "node scripts/coverage.mjs --names test-names.jsonl",
     "ported-tests": "node --import tsx scripts/check-ported-tests.ts --names test-names.jsonl",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run depcruise && npm run coverage && npm run ported-tests"
   },
