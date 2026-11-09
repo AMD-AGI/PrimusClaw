@@ -12,10 +12,10 @@
  * check, so the suite runs once in CI.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOURCE_EXTENSIONS, symlinksUnder, typeOnlyFiles } from "./type-only.js";
+import { SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
 
 /**
  * Each package's floor, in percent. Lowering one is a change to this file that review sees. A package directory under
@@ -23,12 +23,12 @@ import { SOURCE_EXTENSIONS, symlinksUnder, typeOnlyFiles } from "./type-only.js"
  */
 export const FLOORS: Readonly<Record<string, number>> = { core: 90, runtime: 85, teams: 85 };
 
-/** Why a package's `src` cannot be judged, if it cannot: it is itself a link, or has links inside. */
+/** Why a package's `src` cannot be judged, if it cannot: it is missing, it is itself a link, or has links inside. */
 function srcLinks(packagesDir: string, pkg: string): string[] {
   const src = path.join(packagesDir, pkg, "src");
   const shown = `packages/${pkg}/src`;
-  if (!existsSync(src) && !isLink(src)) return [];
   if (isLink(src)) return [`${shown} is a symbolic link (not allowed: src must be the package's own directory)`];
+  if (!existsSync(src)) return [`packages/${pkg} has no src directory`];
   return symlinksUnder(src, path.dirname(packagesDir)).map((l) => `${l} is a symbolic link (not allowed in src)`);
 }
 
@@ -90,9 +90,29 @@ function reporters(names: string | undefined): string[] {
   ];
 }
 
+/**
+ * The files the report should hold but does not: every file c8 left out on a default of its own (a name with "test",
+ * a directory called test or __tests__ or node_modules, ...) is a file the floor would not see. Relative to `base`.
+ */
+export function missingFromReport(expected: readonly string[], reported: readonly string[], base: string): string[] {
+  const seen = new Set(reported.map((f) => path.resolve(base, f)));
+  return expected
+    .filter((f) => !seen.has(path.resolve(base, f)))
+    .map((f) => path.relative(base, path.resolve(base, f)));
+}
+
+function reportedFiles(summary: string): string[] {
+  const parsed = JSON.parse(readFileSync(summary, "utf8")) as Record<string, unknown>;
+  return Object.keys(parsed).filter((key) => key !== "total");
+}
+
 function checkPackage(pkg: string, floor: number): boolean {
   const src = path.join("packages", pkg, "src");
   const excluded = typeOnlyFiles(path.join(root, src), root);
+  const expected = sourceFiles(path.join(root, src))
+    .map((f) => path.relative(root, f))
+    .filter((f) => !excluded.includes(f));
+  const reportDir = path.join(temp, "report", pkg);
   console.log(`\n== ${pkg}: floor ${String(floor)}% (lines, statements, functions, branches)`);
   console.log(`   type-only, not counted: ${excluded.length === 0 ? "none" : excluded.join(", ")}`);
   const status = run([
@@ -106,13 +126,21 @@ function checkPackage(pkg: string, floor: number): boolean {
     `${src}/**/*.{${SOURCE_EXTENSIONS.map((e) => e.slice(1)).join(",")}}`,
     // c8's own extension list leaves out .mts and .cts: without these, --all would not see such a file at all.
     ...SOURCE_EXTENSIONS.flatMap((extension) => ["--extension", extension]),
-    ...excluded.flatMap((file) => ["--exclude", file]),
+    // Our --exclude list replaces c8's defaults (which drop "test" names and directories): it always has an entry.
+    ...[...excluded, "(no other file is excluded)"].flatMap((file) => ["--exclude", file]),
+    "--exclude-node-modules=false",
     "--reporter=text",
+    "--reporter=json-summary",
+    "--report-dir",
+    reportDir,
     "--check-coverage",
     ...["lines", "statements", "functions", "branches"].map((metric) => `--${metric}=${String(floor)}`),
   ]);
   if (status !== 0) console.error(`coverage: ${pkg} is below its floor of ${String(floor)}%`);
-  return status === 0;
+  const summary = path.join(reportDir, "coverage-summary.json");
+  const missing = existsSync(summary) ? missingFromReport(expected, reportedFiles(summary), root) : expected;
+  for (const file of missing) console.error(`coverage: ${file} has runtime code but is not in c8's report`);
+  return status === 0 && missing.length === 0;
 }
 
 function main(argv: readonly string[]): number {
