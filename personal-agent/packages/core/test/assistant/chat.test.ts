@@ -123,6 +123,7 @@ it("a message goes to the assistant as typed and nothing waits for the answer", 
     conversation: `c-${ALICE}`,
     replyTo: "act-1",
     text: "收到，正在处理…",
+    id: "m1",
   });
   assert.equal(await route(w, "and another thing"), true);
   assert.equal(w.claw.heard.length, 2);
