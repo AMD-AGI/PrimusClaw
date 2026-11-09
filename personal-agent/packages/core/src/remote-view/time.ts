@@ -8,21 +8,37 @@ import { remoteText } from "../locales/remote.js";
 const ISO =
   /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2})(?::(\d{2})(?::(\d{2})(?:[.,](\d{1,6}))?)?)?)?(?:(Z)|([+-])(\d{2}):?(\d{2})(?::?(\d{2}))?)?$/;
 
+interface IsoParts {
+  readonly date: readonly [number, number, number];
+  readonly time: readonly [number, number, number];
+  readonly fraction: number;
+  /** Seconds east of UTC. */
+  readonly offset: number;
+}
+
+function isoParts(m: RegExpExecArray): IsoParts {
+  const n = (i: number): number => Number(m[i] ?? "0");
+  const sign = m[9] === "-" ? -1 : 1;
+  return {
+    date: [n(1), n(2), n(3)],
+    time: [n(4), n(5), n(6)],
+    fraction: Number(`0.${m[7] ?? "0"}`),
+    offset: m[9] ? sign * (n(10) * 3600 + n(11) * 60 + n(12)) : 0,
+  };
+}
+
 /** Seconds since the epoch of an ISO 8601 time as Claw writes it (`2026-10-29T05:00:00Z`, an offset, or fractional seconds), or
  * null when it is none. A time without an offset is read as UTC. */
 export function parseIsoSeconds(value: unknown): number | null {
-  if (typeof value !== "string") return null;
-  const m = ISO.exec(value);
+  const m = typeof value === "string" ? ISO.exec(value) : null;
   if (!m) return null;
-  const [, y, mo, d, h = "0", mi = "0", s = "0", frac = "", , sign, oh = "0", om = "0", os = "0"] = m;
-  const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
-  const date = new Date(ms);
-  if (date.getUTCMonth() !== Number(mo) - 1 || date.getUTCDate() !== Number(d) || Number(h) > 23 || Number(mi) > 59) {
-    return null;
-  }
-  if (Number(s) > 59) return null;
-  const offset = sign ? (sign === "-" ? -1 : 1) * (Number(oh) * 3600 + Number(om) * 60 + Number(os)) : 0;
-  return ms / 1000 + Number(`0.${frac || "0"}`) - offset;
+  const { date, time, fraction, offset } = isoParts(m);
+  const [y, mo, d] = date;
+  const [h, mi, s] = time;
+  const ms = Date.UTC(y, mo - 1, d, h, mi, s);
+  const check = new Date(ms);
+  const valid = check.getUTCMonth() === mo - 1 && check.getUTCDate() === d && h <= 23 && mi <= 59 && s <= 59;
+  return valid ? ms / 1000 + fraction - offset : null;
 }
 
 /** "just now", "3 h ago": how long before `now` (seconds since the epoch) the ISO time `when` was; "" when it is no time. */

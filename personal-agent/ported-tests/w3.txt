@@ -1,0 +1,9 @@
+# W3: the Teams adapter (activities, Bot Connector, messenger, streams, richtext, the card kit, inbound files, the session
+# window, Service Bus, workload identity) and the HTTP entry (/claw-events, /link, /healthz, /metrics, the gate's test entry).
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+teams/tests/test_card_snapshots.py::test_the_catalog_names_each_card_once -> packages/teams/test/card-snapshots.test.ts::the catalog names each card once
+teams/tests/test_card_snapshots.py::test_no_snapshot_is_left_without_a_card -> packages/teams/test/card-snapshots.test.ts::no snapshot is left without a card
+teams/tests/test_card_snapshots.py::test_full_width_punctuation_next_to_chinese_only -> packages/teams/test/cards-kit.test.ts::full width punctuation next to chinese only
+teams/tests/test_card_snapshots.py::test_the_kit_refuses_a_fourth_button_and_an_unknown_tone -> packages/teams/test/cards-kit.test.ts::the kit refuses a fourth button and an unknown tone
+teams/tests/test_card_snapshots.py::test_only_the_first_button_is_primary -> packages/teams/test/cards-kit.test.ts::only the first button is primary
+teams/tests/test_card_snapshots.py::test_full_width_punctuation_takes_linear_time_on_any_text -> packages/teams/test/cards-kit.test.ts::full width punctuation takes linear time on any text: brackets

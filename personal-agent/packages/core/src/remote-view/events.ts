@@ -8,24 +8,12 @@
  */
 import { z } from "zod";
 
+import type { SseEvent } from "../claw/model.js";
+import type { PublicErrors } from "../public-error/public-errors.js";
+
 import { neutral } from "./inert.js";
 import { strip } from "./py-text.js";
 import { RESUME_REF_MAX } from "./limits.js";
-
-/** An SSE frame of a remote session as the Claw client hands it over (the frame's own data is {type, session_id, seq, ts, data}). */
-export interface SseEvent {
-  readonly id: string;
-  readonly name: string;
-  readonly data: Readonly<Record<string, unknown>>;
-}
-
-/** What is said in place of a reason that has the shape of internal detail (the detail goes to the log under a reference). */
-export interface PublicErrors {
-  /** `reason` as it may be shown, or a generic stand-in with a reference id; "" stays "". */
-  publicReason(reason: string, where: string): string;
-  /** Log `detail` under a new reference id and return the id. */
-  withhold(where: string, detail: string): string;
-}
 
 export interface ToolUpdate {
   readonly id: string;
@@ -194,7 +182,7 @@ function planLine(payload: Json): string | null {
   if (items.length === 0) return null;
   const done = items.filter((e) => e["status"] === "completed").length;
   const current = items.find((e) => e["status"] === "in_progress") ?? items.find((e) => e["status"] !== "completed");
-  let line = `\u{1f4cb} Plan: ${done} of ${items.length} done`;
+  let line = `\u{1f4cb} Plan: ${String(done)} of ${String(items.length)} done`;
   if (current && str(current["content"])) line += `, now: ${neutral(current["content"], PLAN_ITEM_MAX)}`;
   return line;
 }

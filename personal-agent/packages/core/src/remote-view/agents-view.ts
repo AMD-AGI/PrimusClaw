@@ -9,15 +9,15 @@
 import type { Lang } from "../locales/lang.js";
 import { remoteText } from "../locales/remote.js";
 import { type RemoteButton, remoteButton } from "./actions.js";
-import { type Approval, agentRoots, approvalChoice, kindLabel, startsUnattended } from "./agents.js";
+import { agentRoots, kindLabel, startsUnattended } from "./agents.js";
+import { type ApprovalInput, approvalInput } from "./machine-views.js";
 import { type ConversationItem, conversationItems } from "./conversations-view.js";
 import { healthLines } from "./health.js";
 import { lit, neutral, plain } from "./inert.js";
 import { AGENT_BLOCKS_MAX, ROOT_MAX, SUBFOLDER_MAX } from "./limits.js";
 import { byConnector, offlineSince, sessionFacts, shownSessions } from "./listing.js";
 import { placeOf } from "./lines.js";
-import { pyStr } from "./py-text.js";
-import { type Reported, agentsOf } from "./reported.js";
+import type { Agent, Connector, Session } from "../remote/model.js";
 import type { ConnectorSetupWords } from "./setup.js";
 
 /** Where a new session starts: a choice of the roots the agent reported and a subfolder, or (none reported) the whole folder. */
@@ -36,14 +36,6 @@ export interface FolderInput {
   readonly maxLength: number;
 }
 
-/** The choice between asking for approval and not, for an agent that reports modes of both kinds. */
-export interface ApprovalChoice {
-  readonly label: string;
-  readonly value: Approval;
-  readonly ask: string;
-  readonly unattended: string;
-}
-
 /** One online agent's block. Input ids carry the slot: a card's inputs all come back with every button. */
 export interface AgentBlock {
   readonly kind: "agent";
@@ -54,7 +46,7 @@ export interface AgentBlock {
   /** null for an agent of kind `attach`, which starts no conversation of its own. */
   readonly start: {
     readonly folder: StartFolder;
-    readonly approval: ApprovalChoice | null;
+    readonly approval: ApprovalInput | null;
     readonly button: RemoteButton;
   } | null;
   readonly conversations: readonly ConversationItem[];
@@ -92,8 +84,8 @@ export interface AgentsView {
 }
 
 export interface AgentsInput {
-  readonly connectors: readonly Reported[];
-  readonly sessions: readonly Reported[];
+  readonly connectors: readonly Connector[];
+  readonly sessions: readonly Session[];
   /** The session the chat is attached to. */
   readonly attached: string | null;
   readonly now: number;
@@ -108,8 +100,8 @@ export interface AgentsInput {
   readonly setup: ConnectorSetupWords;
 }
 
-function startOf(connector: Reported, agent: Reported, slot: number, lang: Lang): AgentBlock["start"] {
-  if (pyStr(agent["kind"]) === "attach") return null;
+function startOf(connector: Connector, agent: Agent, slot: number, lang: Lang): AgentBlock["start"] {
+  if (agent.kind === "attach") return null;
   const words = remoteText.in(lang);
   const roots = agentRoots(agent);
   const folder: StartFolder =
@@ -121,13 +113,10 @@ function startOf(connector: Reported, agent: Reported, slot: number, lang: Lang)
           subfolder: { label: words.subfolder, placeholder: words.subfolderExample, maxLength: SUBFOLDER_MAX },
         }
       : { kind: "folder", input: { label: words.folderOnMachine, placeholder: "/home/me/repo", maxLength: ROOT_MAX } };
-  const choice = approvalChoice(agent);
-  const approval = choice
-    ? { label: words.approval, value: choice.default, ask: words.askMe, unattended: words.noApproval }
-    : null;
+  const approval = approvalInput(agent, slot, lang);
   const button = remoteButton(words.newSession, "new", "positive", {
-    connector_id: pyStr(connector["connector_id"]),
-    agent_id: pyStr(agent["agent_id"]),
+    connector_id: connector.connectorId,
+    agent_id: agent.agentId,
     slot,
   });
   return { folder, approval, button };
@@ -140,34 +129,42 @@ interface Joined {
   readonly mine: ReadonlySet<string>;
 }
 
-function agentBlock(
-  connector: Reported,
-  agent: Reported,
-  slot: number,
-  input: AgentsInput,
-  joined: Joined,
-): AgentBlock {
+function agentBlock(connector: Connector, agent: Agent, slot: number, input: AgentsInput, joined: Joined): AgentBlock {
   const lang = input.lang ?? "en";
-  const { icon, label } = kindLabel(agent["kind"]);
+  const { icon, label } = kindLabel(agent.kind);
   const conversations = conversationItems(connector, agent, input.now, lang, joined);
   return {
     kind: "agent",
     slot,
-    title: `${icon} ${lit(agent["name"], 60) || label}`,
+    title: `${icon} ${lit(agent.name, 60) || label}`,
     unattendedNote: startsUnattended(agent) ? remoteText.in(lang).unattendedNote : null,
     start: startOf(connector, agent, slot, lang),
     conversations,
     nothingToTakeOver:
-      pyStr(agent["kind"]) === "attach" && conversations.length === 0 ? remoteText.in(lang).nothingToTakeOver : null,
+      agent.kind === "attach" && conversations.length === 0 ? remoteText.in(lang).nothingToTakeOver : null,
   };
 }
 
-function offlineAgent(agent: Reported, lang: Lang): AgentsItem {
-  const { icon, label } = kindLabel(agent["kind"]);
-  const name = `${icon} ${lit(agent["name"], 60) || label}`;
+function offlineAgent(agent: Agent, lang: Lang): AgentsItem {
+  const { icon, label } = kindLabel(agent.kind);
+  const name = `${icon} ${lit(agent.name, 60) || label}`;
   const words = remoteText.in(lang);
   const text = startsUnattended(agent) ? words.agentOfflineUnattended({ name }) : words.agentOffline({ name });
   return { kind: "subtle", text };
+}
+
+/** What a machine's heading says: its name, online or since when it is offline, its connector's version and health. */
+function machineHeading(connector: Connector, input: AgentsInput, separator: boolean): AgentsItem[] {
+  const lang = input.lang ?? "en";
+  const words = remoteText.in(lang);
+  const state = connector.online ? words.online : offlineSince(connector, lang);
+  const items: AgentsItem[] = [{ kind: "machine", text: `**${lit(connector.name, 80)}** (${state})`, separator }];
+  const note = input.setup.versionNote(connector, lang);
+  if (note) items.push({ kind: "versionNote", text: note });
+  const problems = healthLines(connector, lang);
+  if (problems.length > 0) items.push({ kind: "problems", lines: problems });
+  if (connector.agents.length === 0) items.push({ kind: "subtle", text: words.noAgentReported });
+  return items;
 }
 
 function machineItems(input: AgentsInput, joined: Joined): AgentsItem[] {
@@ -177,24 +174,12 @@ function machineItems(input: AgentsInput, joined: Joined): AgentsItem[] {
   let slot = 0;
   let more = 0;
   for (const connector of input.connectors) {
-    const online = Boolean(connector["online"]);
-    const state = online ? words.online : offlineSince(connector, lang);
-    items.push({
-      kind: "machine",
-      text: `**${lit(connector["name"], 80)}** (${state})`,
-      separator: slot > 0 || items.length > 0 || Boolean(input.lead),
-    });
-    const note = input.setup.versionNote(connector, lang);
-    if (note) items.push({ kind: "versionNote", text: note });
-    const problems = healthLines(connector, lang);
-    if (problems.length > 0) items.push({ kind: "problems", lines: problems });
-    const agents = agentsOf(connector);
-    if (agents.length === 0) items.push({ kind: "subtle", text: words.noAgentReported });
-    for (const agent of agents) {
-      if (online && connector["connector_id"] && slot < AGENT_BLOCKS_MAX) {
+    items.push(...machineHeading(connector, input, slot > 0 || items.length > 0 || Boolean(input.lead)));
+    for (const agent of connector.agents) {
+      if (connector.online && connector.connectorId && slot < AGENT_BLOCKS_MAX) {
         items.push(agentBlock(connector, agent, slot, input, joined));
         slot += 1;
-      } else if (online) more += 1;
+      } else if (connector.online) more += 1;
       else items.push(offlineAgent(agent, lang));
     }
   }
@@ -216,19 +201,19 @@ function sessionButtons(sid: string, attached: string | null, ref: string, lang:
   return [first, close];
 }
 
-function sessionRows(input: AgentsInput, shown: readonly Reported[]): SessionRow[] {
+function sessionRows(input: AgentsInput, shown: readonly Session[]): SessionRow[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
   const index = byConnector(input.connectors);
   return shown.map((session, i) => {
-    const sid = pyStr(session["session_id"]);
+    const sid = session.sessionId;
     const { who, host, facts } = sessionFacts(session, index, input.attached, input.now, lang);
     const { title, ref } = input.names?.get(sid) ?? { title: "", ref: "" };
     const line = words.sessionLine({
       n: i + 1,
       name: lit(title, 40) || words.newConversation,
       who: plain(who),
-      place: placeOf(session["cwd"], lit),
+      place: placeOf(session.cwd, lit),
       host: plain(host),
       facts,
     });
@@ -236,9 +221,9 @@ function sessionRows(input: AgentsInput, shown: readonly Reported[]): SessionRow
   });
 }
 
-function joinedOf(input: AgentsInput, shown: readonly Reported[]): Joined {
+function joinedOf(input: AgentsInput, shown: readonly Session[]): Joined {
   const names = input.names ?? new Map<string, { title: string; ref: string }>();
-  const shownIds = shown.map((s) => pyStr(s["session_id"]));
+  const shownIds = shown.map((s) => s.sessionId);
   const mine = new Set<string>();
   for (const [sid, acp] of input.own ?? new Map<string, string>()) {
     if (shownIds.includes(sid) && !names.get(sid)?.ref) mine.add(acp);
@@ -272,6 +257,6 @@ export function agentsView(input: AgentsInput): AgentsView {
     title: machines ? words.yourAgents : words.yourSessions,
     items,
     actions,
-    listing: shown.map((s) => pyStr(s["session_id"])),
+    listing: shown.map((s) => s.sessionId),
   };
 }

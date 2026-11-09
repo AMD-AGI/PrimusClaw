@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { JsonObject } from "../../src/json.js";
 import { NOTHING, decode, remoteStep } from "../../src/remote-view/events.js";
 import { RemoteTurnState } from "../../src/remote-view/turn-state.js";
 import { PLAIN_ERRORS, acp, frame } from "./frames.js";
@@ -74,7 +75,7 @@ test("a plan is one line saying where it stands", () => {
 });
 
 test("session started says the mode and the modes", () => {
-  const cases: [string, Record<string, unknown>, string | null, string[] | null][] = [
+  const cases: [string, JsonObject, string | null, string[] | null][] = [
     [
       "object modes",
       { currentMode: "default", modes: [{ id: "default" }, { id: "plan", name: "Plan" }] },

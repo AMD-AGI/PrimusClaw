@@ -8,11 +8,10 @@
 import { neutral } from "./inert.js";
 import type { Lang } from "../locales/lang.js";
 import { BUTTON_TITLE_MAX, OPTION_BUTTONS_MAX, OPTION_ID_MAX } from "./limits.js";
-import { length } from "./py-text.js";
+import { hasControl, length } from "./py-text.js";
 import { objOrNull, str } from "./reported.js";
 import { remoteText } from "../locales/remote.js";
 
-const CONTROL = /[\u0000-\u001f\u007f]/;
 const OPTIONS_READ_MAX = 12;
 
 export interface PermissionOption {
@@ -48,7 +47,7 @@ const KIND_VERDICT: Readonly<Record<string, VerdictWord>> = {
 };
 
 function usableId(id: unknown, seen: ReadonlySet<string>): id is string {
-  return typeof id === "string" && id !== "" && length(id) <= OPTION_ID_MAX && !seen.has(id) && !CONTROL.test(id);
+  return typeof id === "string" && id !== "" && length(id) <= OPTION_ID_MAX && !seen.has(id) && !hasControl(id);
 }
 
 /** The options an agent offered, as strings and nothing else: an entry without a usable `optionId` is dropped, a repeated id is

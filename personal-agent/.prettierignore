@@ -6,4 +6,4 @@ package-lock.json
 ported-tests/
 test-names.jsonl
 # Generated test data, kept byte for byte as its generator wrote it (test-support/python/fernet_golden.py).
-test-support/data/fernet-golden.json
+test-support/data/

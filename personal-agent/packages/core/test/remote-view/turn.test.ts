@@ -40,7 +40,7 @@ test("a turn that never ends holds a bounded amount of text and ids", () => {
   const state = turn();
   for (let n = 0; n < 5000; n += 1) {
     state.feed(acp("agent_message_chunk", String(n + 1), { content: { text: "w".repeat(1000) } }));
-    if (n % 100 === 0) state.feed(acp("tool_call", `tc${n}`, { toolCallId: "t", title: "x" }));
+    if (n % 100 === 0) state.feed(acp("tool_call", `tc${String(n)}`, { toolCallId: "t", title: "x" }));
   }
   assert.ok(state.segments.every((seg) => seg.length <= 12_000) && state.segments.length <= 4);
   assert.ok(state.seen.size <= 2000 && state.answer.startsWith("w"));
@@ -87,7 +87,9 @@ test("an empty answer still says something", () => {
 });
 
 test("a long answer is split and then cut with a line that says so", () => {
-  const parts = answerParts(Array.from({ length: 12 }, (_, n) => `paragraph ${n} ` + "w".repeat(1500)).join("\n\n"));
+  const parts = answerParts(
+    Array.from({ length: 12 }, (_, n) => `paragraph ${String(n)} ` + "w".repeat(1500)).join("\n\n"),
+  );
   assert.equal(parts.length, 3);
   assert.ok(parts.every((p) => p.length <= 3200));
   assert.ok(parts.at(-1)?.endsWith("(shortened: ask the agent to continue, or read the rest on your machine)"));

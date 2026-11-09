@@ -4,7 +4,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { type SseEvent, decode, remoteStep } from "../../src/remote-view/events.js";
+import type { SseEvent } from "../../src/claw/model.js";
+import { decode, remoteStep } from "../../src/remote-view/events.js";
 import { RemoteLiveView } from "../../src/remote-view/live-view.js";
 import { PLAIN_ERRORS, acp, frame } from "./frames.js";
 
@@ -114,9 +115,9 @@ test("a long turn shows only the newest part", () => {
   for (let n = 0; n < 60; n += 1) {
     feed(
       v,
-      acp("tool_call", "1", { toolCallId: `t${n}`, title: `step ${n}` }),
-      acp("tool_call_update", "1", { toolCallId: `t${n}`, status: "completed" }),
-      acp("agent_message_chunk", "1", { content: { text: `paragraph ${n} ` + "w".repeat(200) } }),
+      acp("tool_call", "1", { toolCallId: `t${String(n)}`, title: `step ${String(n)}` }),
+      acp("tool_call_update", "1", { toolCallId: `t${String(n)}`, status: "completed" }),
+      acp("agent_message_chunk", "1", { content: { text: `paragraph ${String(n)} ` + "w".repeat(200) } }),
     );
   }
   const text = v.render();
@@ -145,10 +146,10 @@ for (const kind of ["agent_message_chunk", "agent_thought_chunk"]) {
 test("steps that never end cannot grow the running list without bound", () => {
   const v = view();
   for (let n = 0; n < 500; n += 1)
-    v.apply(decode(acp("tool_call", "1", { toolCallId: `t${n}`, title: `step ${n}` }), PLAIN_ERRORS));
+    v.apply(decode(acp("tool_call", "1", { toolCallId: `t${String(n)}`, title: `step ${String(n)}` }), PLAIN_ERRORS));
   assert.ok(v.render().includes("step 499") && !v.render().includes("step 0"));
   for (let n = 499; n >= 460; n -= 1)
-    v.apply(decode(acp("tool_call_update", "1", { toolCallId: `t${n}`, status: "completed" }), PLAIN_ERRORS));
+    v.apply(decode(acp("tool_call_update", "1", { toolCallId: `t${String(n)}`, status: "completed" }), PLAIN_ERRORS));
   assert.equal(v.render(), v.header); // (forty were in flight; none older is left)
 });
 
@@ -168,10 +169,10 @@ test("a note is a line of its own", () => {
 test("the live view of a remote turn says its step in the floating status and never its words", () => {
   const v = new RemoteLiveView("⬛ Codex on dev-pod");
   v.apply(remoteStep({ chunk: { kind: "message", text: "I will run the tests" } }));
-  assert.deepEqual(v.statusLines(true), []);
+  assert.deepEqual(v.statusLines(), []);
   v.apply(remoteStep({ tool: { id: "t1", title: "make test", status: "in_progress" } }));
   v.apply(remoteStep({ plan: "\u{1f4cb} Plan: 1 of 3 done" }));
-  assert.deepEqual(v.statusLines(true), ["\u{1f4cb} Plan: 1 of 3 done", "⏳ make test"]);
+  assert.deepEqual(v.statusLines(), ["\u{1f4cb} Plan: 1 of 3 done", "⏳ make test"]);
   v.apply(remoteStep({ tool: { id: "t1", title: "make test", status: "failed" } }));
-  assert.equal(v.statusLines(true).at(-1), "⚠️ make test failed, continuing");
+  assert.equal(v.statusLines().at(-1), "⚠️ make test failed, continuing");
 });

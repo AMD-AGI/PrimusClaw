@@ -4,10 +4,9 @@
 /** The one-line messages of a chat attached to a remote session: where it is, what happened, what a refusal means. */
 import type { Lang } from "../locales/lang.js";
 import { remoteQueuedText, remoteStopText, remoteText } from "../locales/remote.js";
-import { neutral } from "./inert.js";
+import { neutral, masked as redactText } from "./inert.js";
 import { TYPED_LINES_MAX } from "./limits.js";
 import { pyStr, rstrip, slice, splitlines, squash, strip } from "./py-text.js";
-import { redactText } from "./pending-redact.js";
 
 /** What Claw writes for an instruction or a start its machine never got (a reason code, said by the connector reasons). */
 export const NOT_DELIVERED = "not_delivered";

@@ -1,0 +1,83 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "card": "card-4",
+              "op": "run",
+              "primusclaw": "assistant_action"
+            },
+            "style": "positive",
+            "title": "执行",
+            "type": "Action.Execute",
+            "verb": "primusclaw.assistant_action_run"
+          },
+          {
+            "data": {
+              "card": "card-4",
+              "op": "cancel",
+              "primusclaw": "assistant_action"
+            },
+            "title": "取消",
+            "type": "Action.Execute",
+            "verb": "primusclaw.assistant_action_cancel"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Accent",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚠️ 要执行这个命令吗？",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "text": "要我把这个 PR 交给 Lin Mei 代审吗？会以他的身份 review，通过后合入。",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "size": "Small",
+            "text": "`/review AMD-AGI/Primus-SaFE#481 @Lin Mei`",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

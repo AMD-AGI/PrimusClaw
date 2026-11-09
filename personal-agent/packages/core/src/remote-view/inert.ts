@@ -6,10 +6,9 @@
  * line of it (credential shapes masked before the cut, so a cut cannot leave half a credential; no link or tag can be built
  * from it); `defang` keeps a JSON value whole but inert; `lit` is `neutral` for a card TextBlock, which reads markdown.
  */
-import { redactText } from "./pending-redact.js";
-import { clipWithEllipsis, orEmpty, pyStr, squash } from "./py-text.js";
+import { redactText as redact } from "../security/redact.js";
+import { controlsToBlanks, length, orEmpty, pyStr, rstrip, slice, squash } from "./py-text.js";
 
-const CONTROL = /[\u0000-\u001f\u007f]/g;
 const MARKDOWN = /([\\`*_[\]<])/g;
 
 /** `text` for a card TextBlock, which reads markdown: its markup characters escaped, so that `__init__.py` is not bold. */
@@ -17,15 +16,15 @@ export function plain(text: string): string {
   return text.replace(MARKDOWN, "\\$1");
 }
 
-/** One short line of untrusted text, safe in a card or a list: control characters gone, credentials masked, `[`/`]`/`<`/`>`
- * swapped for look-alikes, then clipped to `limit` characters with an ellipsis. */
+/** One short line of untrusted text, safe in a card or a list (`text/neutral`), from whatever a connector reported: a value that
+ * is not text is read as Python's `str(value or "")` would. */
 export function neutral(text: unknown, limit = 200): string {
-  const flat = redactText(squash(orEmpty(text).replace(CONTROL, " ")))
-    .replaceAll("[", "(")
+  const flat = redact(squash(controlsToBlanks(orEmpty(text))))
+    .text.replaceAll("[", "(")
     .replaceAll("]", ")")
-    .replaceAll("<", "‹")
-    .replaceAll(">", "›");
-  return clipWithEllipsis(flat, limit);
+    .replaceAll("<", "\u{2039}")
+    .replaceAll(">", "\u{203a}");
+  return length(flat) <= limit ? flat : rstrip(slice(flat, 0, limit - 1)) + "…";
 }
 
 /** `neutral`, then markup escaped: text supplied by an agent, a machine or a session as it goes into a card TextBlock. */
@@ -44,4 +43,9 @@ export function defang(value: unknown): unknown {
     return Object.fromEntries(Object.entries(value).map(([k, v]) => [defang(pyStr(k)) as string, defang(v)]));
   }
   return value;
+}
+
+/** `text` with credential-shaped values masked. */
+export function masked(text: string): string {
+  return redact(text).text;
 }

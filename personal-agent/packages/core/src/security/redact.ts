@@ -9,7 +9,10 @@ export const MASK = "[hidden]";
 const B64 = "[A-Za-z0-9+/=_-]";
 /** (pattern, group to mask; 0 = the whole match) */
 const RULES: readonly (readonly [RegExp, number])[] = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$(?![\s\S]))/g, 0],
+  [
+    /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$(?![\s\S]))/g,
+    0,
+  ],
   [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, 0],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, 0],
   [/\bak-[A-Za-z0-9_-]{16,}/g, 0],

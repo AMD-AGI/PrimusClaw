@@ -1,0 +1,181 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "mode": "high_risk_confirm",
+              "primusclaw": "github_mode"
+            },
+            "style": "positive",
+            "title": "高风险再问我",
+            "type": "Action.Execute",
+            "verb": "primusclaw.github_mode"
+          },
+          {
+            "data": {
+              "mode": "fully_auto",
+              "primusclaw": "github_mode"
+            },
+            "title": "全自动合入",
+            "type": "Action.Execute",
+            "verb": "primusclaw.github_mode"
+          },
+          {
+            "title": "添加 Clawy",
+            "type": "Action.OpenUrl",
+            "url": "https://teams.microsoft.com/l/app/x"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Accent",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚙️ 选择代审合入的确认方式",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "当前：高风险再问我",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "items": [
+              {
+                "text": "高风险人工再确认一次（默认）（当前）",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "spacing": "Small",
+                "text": "审完没有问题、检查全部通过时直接批准并合入；模型判断为高风险的变更（安全、凭据、CI/发布、权限、数据迁移等）以及仓库要求确认的变更，先发卡片请你本人确认。",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Medium",
+            "type": "Container"
+          },
+          {
+            "items": [
+              {
+                "text": "全自动合入，无需人工确认",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "spacing": "Small",
+                "text": "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/clawy.yml 的 confirm_merge: always 等）仍会先问你。",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Medium",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "这个设置对你自己让 Clawy 审 PR、以及同事请你代审都生效。是否允许同事以你的名义请我审并合入，是另一个开关：`/github auto-merge on|off`。",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "review-mode-en-toggle",
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Small",
+                "text": "English ▾",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "selectAction": {
+              "targetElements": ["review-mode-en"],
+              "title": "English",
+              "type": "Action.ToggleVisibility"
+            },
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "review-mode-en",
+            "isVisible": false,
+            "items": [
+              {
+                "size": "Small",
+                "text": "**A person confirms high-risk changes (default)** (current): Approved and merged when nothing needs fixing and every check passes; a change the reviewing model judges high risk (security, credentials, CI/release, permissions, data migrations, ...) or one the repository asks to confirm waits for your own click on a card.",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "size": "Small",
+                "text": "**Fully automatic merge, nobody is asked to confirm**: Approved and merged when nothing needs fixing and every check passes, without asking you; only a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
+                "type": "TextBlock",
+                "wrap": true
+              },
+              {
+                "size": "Small",
+                "text": "This applies when you ask Clawy to review a pull request and when a colleague asks Clawy to review one as you. Whether colleagues may ask at all is the other switch, `/github auto-merge on|off`.",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "按钮点不了时，直接回复「确认全自动」或「确认高风险再问我」即可。",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

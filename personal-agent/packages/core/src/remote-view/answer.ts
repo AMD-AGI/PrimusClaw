@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { redactText } from "./pending-redact.js";
+import { masked as redactText } from "./inert.js";
 import type { Lang } from "../locales/lang.js";
 import { ANSWER_CHARS_MAX, ANSWER_MESSAGES_MAX } from "./limits.js";
 import { length, lstripChars, rstrip, slice, strip } from "./py-text.js";
@@ -35,8 +35,8 @@ export function answerParts(text: string, lang: Lang = "en"): string[] {
   const body = redactText(strip(text)) || remoteText.in(lang).noTextOutput;
   const chunks = splitAtParagraphs(body, ANSWER_CHARS_MAX);
   if (chunks.length <= ANSWER_MESSAGES_MAX) return chunks;
-  const kept = chunks.slice(0, ANSWER_MESSAGES_MAX);
-  kept[kept.length - 1] += remoteText.in(lang).answerShortened;
+  const kept = chunks.slice(0, ANSWER_MESSAGES_MAX - 1);
+  kept.push(`${chunks[ANSWER_MESSAGES_MAX - 1] ?? ""}${remoteText.in(lang).answerShortened}`);
   return kept;
 }
 

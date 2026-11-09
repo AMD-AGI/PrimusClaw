@@ -13,8 +13,7 @@ import { canTypeIntoTerminals, typesInto, watchesLive } from "./agents.js";
 import { type Conversation, WATCH_STATE, resumableOf } from "./conversations.js";
 import { lit } from "./inert.js";
 import { IDLE_SHOWN, RESUMABLE_SHOWN } from "./limits.js";
-import { pyStr } from "./py-text.js";
-import type { Reported } from "./reported.js";
+import type { Agent, Connector } from "../remote/model.js";
 import { agoEpoch } from "./time.js";
 
 export type ConversationItem =
@@ -31,7 +30,7 @@ const UNKNOWN_SHOWN = 2;
 
 /** The line under a conversation open in a terminal: what connecting to it does, and when the phone can only watch, why and
  * what to change. */
-export function shareNote(agent: Reported, entry: Conversation, lang: Lang): string {
+export function shareNote(agent: Agent, entry: Conversation, lang: Lang): string {
   const words = remoteText.in(lang);
   if (typesInto(agent, entry)) return words.shareNoteTyped;
   return canTypeIntoTerminals(agent) ? words.shareNoteNoTmux : words.shareNoteOld;
@@ -39,7 +38,7 @@ export function shareNote(agent: Reported, entry: Conversation, lang: Lang): str
 
 /** The one button a conversation open in a terminal offers: connect, when what is sent is typed into that terminal; else watch. */
 export function shareButton(
-  agent: Reported,
+  agent: Agent,
   entry: Conversation,
   lang: Lang,
 ): { title: string; style: "positive" | null } {
@@ -74,7 +73,7 @@ function resume(title: string, style: "positive" | null, entry: Conversation, pl
 }
 
 function liveItems(
-  agent: Reported,
+  agent: Agent,
   entry: Conversation,
   place: Place,
   connected: ReadonlyMap<string, { readonly number: number; readonly sessionId: string }>,
@@ -101,8 +100,8 @@ function liveItems(
 
 /** The conversations of one online agent on the agents card. */
 export function conversationItems(
-  connector: Reported,
-  agent: Reported,
+  connector: Connector,
+  agent: Agent,
   now: number,
   lang: Lang,
   joined: {
@@ -111,7 +110,7 @@ export function conversationItems(
   },
 ): ConversationItem[] {
   const words = remoteText.in(lang);
-  const place = { connectorId: pyStr(connector["connector_id"]), agentId: pyStr(agent["agent_id"]), now, lang };
+  const place = { connectorId: connector.connectorId, agentId: agent.agentId, now, lang };
   const entries = resumableOf(agent).filter((e) => e.state !== "attached" && !joined.mine.has(e.ref));
   const live = entries.filter((e) => e.state === WATCH_STATE);
   const idle = entries.filter((e) => e.state === "idle");
