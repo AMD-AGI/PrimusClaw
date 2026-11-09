@@ -23,3 +23,5 @@ export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
+export * from "./redact/index.js";
+export * from "./text/py-text.js";
