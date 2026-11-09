@@ -288,7 +288,7 @@ export class StatusMessage {
       this.lastText = text;
       this.sending = true;
       try {
-        await unlessAborted(this.update(messageId, plainMessage(text)), signal);
+        await unlessAborted(this.update(messageId, plainMessage(text), signal), signal);
       } finally {
         this.sending = false;
         this.lastAt = this.editedAt = nowSeconds(this.clock); // counted from when the edit left, not from when it began
@@ -332,9 +332,9 @@ export class StatusMessage {
     }
   }
 
-  private async update(messageId: string, message: OutMessage): Promise<void> {
+  private async update(messageId: string, message: OutMessage, signal?: AbortSignal): Promise<void> {
     try {
-      await this.surface.update(messageId, message);
+      await this.surface.update(messageId, message, signal ? { signal } : {});
     } catch (err) {
       this.log.warn("status edit failed; the turn goes on", { error: errorName(err) });
     }
