@@ -21,11 +21,11 @@ const code = {
 };
 
 async function drive<T>(clock: FakeClock, run: Promise<T>): Promise<T> {
-  let done = false;
+  const state = { done: false };
   const out = run.finally(() => {
-    done = true;
+    state.done = true;
   });
-  for (let i = 0; i < 400 && !done; i += 1) await clock.advance(5000);
+  for (let i = 0; i < 400 && !state.done; i += 1) await clock.advance(5000);
   return out;
 }
 
@@ -125,7 +125,7 @@ test("the pull request read names the pull request and sends no credential", asy
     title: "a fix",
   });
   assert.equal(seen[0]?.url, "https://api.github.com/repos/AMD-AGI/Hyperloom/pulls/12");
-  assert.equal(seen[0]?.auth, null);
+  assert.equal(seen.at(0)?.auth, null);
   assert.deepEqual(await reader(403, {}).read(pull), { author: undefined, title: "" });
   assert.equal(await reader(200, { base: { ref: "main" } }).base(pull), "main");
   assert.equal(await reader(404, {}).repo("AMD-AGI", "nope"), "");
