@@ -73,5 +73,6 @@ test("the binding card says its lead; the repo and session cards in English", ()
     }),
   );
   assert.ok(current.includes("This chat's session now · Last used today 12:40") && current.includes("Open in Claw"));
-  assert.ok(current.includes("https://claw.example.com/primus-claw/s"));
+  const urls = [...current.matchAll(/"url":"([^"]*)"/gu)].map((m) => m[1]);
+  assert.deepEqual(urls, ["https://claw.example.com/primus-claw/s"]);
 });
