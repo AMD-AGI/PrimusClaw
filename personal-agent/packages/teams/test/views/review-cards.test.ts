@@ -82,7 +82,7 @@ test("the confirmation card is clipped and carries only the id and the choice", 
     }),
   );
   assert.ok(
-    texts(card).every((t) => [...t].length <= 400),
+    texts(card).every((t) => Array.from(t).length <= 400),
     texts(card)
       .map((t) => t.length)
       .join(","),
@@ -106,7 +106,7 @@ test("the card of a held review names its event and clips its text", () => {
   assert.equal(f["结论"], "APPROVE");
   assert.ok(!texts(card).some((t) => t.includes("行内评论")));
   const preview = f["内容"] ?? "";
-  assert.ok([...preview].length <= 200 && preview.endsWith("…"), preview);
+  assert.ok(Array.from(preview).length <= 200 && preview.endsWith("…"), preview);
   assert.deepEqual(
     actions(card).map((a) => a.title),
     ["确认发布", "不发布"],
