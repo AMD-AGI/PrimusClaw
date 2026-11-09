@@ -8,27 +8,16 @@ import { test } from "node:test";
 import { remoteView } from "@primusclaw/personal-agent";
 
 import { assertValidCard, cardOf } from "../../../../test-support/adaptive-card.js";
-import { WindowView } from "../../../core/src/remote/window/view.js";
+import { windowState as windowOf } from "../../../../test-support/card-catalog/remote.js";
 import { windowCard } from "../../src/views/remote/index.js";
 import { status } from "./fixtures.js";
 
 type Json = Record<string, unknown>;
 const data = (b: Json): Json => b["data"] as Json;
 
-function windowOf(fields: Partial<Pick<WindowView, "text" | "step" | "sent" | "queued" | "note">> = {}): WindowView {
-  const view = new WindowView();
-  view.reset("rs-1");
-  view.setText(fields.text ?? "");
-  view.step = fields.step ?? "";
-  view.sent = fields.sent ?? "";
-  view.queued = fields.queued ?? "";
-  view.note = fields.note ?? "";
-  return view;
-}
-
 function card(
   lang: "en" | "zh",
-  view: WindowView,
+  view: ReturnType<typeof windowOf>,
   approvals: remoteView.WindowApproval[] = [],
   phase: remoteView.StatusPhase = "working",
   extra: Partial<remoteView.WindowInput> = {},

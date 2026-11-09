@@ -77,14 +77,17 @@ const sessions = (
     remoteView.sessionsView({ connectors, sessions: list, attached, now: NOW, lang: "zh", setup: SETUP, waiting }),
   );
 
-/** A window's view as the Python catalog builds it. */
-function windowState(fields: Partial<Pick<WindowView, "text" | "step" | "sent" | "queued">>): WindowView {
+/** A window's view of session rs-1 as the Python tests build it (`WindowView(session_id="rs-1", ...)`). */
+export function windowState(
+  fields: Partial<Pick<WindowView, "text" | "step" | "sent" | "queued" | "note">> = {},
+): WindowView {
   const view = new WindowView();
   view.reset("rs-1");
   view.setText(fields.text ?? "");
   view.step = fields.step ?? "";
   view.sent = fields.sent ?? "";
   view.queued = fields.queued ?? "";
+  view.note = fields.note ?? "";
   return view;
 }
 
