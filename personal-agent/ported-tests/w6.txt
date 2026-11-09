@@ -3,13 +3,6 @@
 # #461 (/agents lists terminal sessions first), which are in the baseline. Work in progress: tests are added as they are ported.
 python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
 
-tests/test_connector_reasons.py::test_the_closed_set_is_all_known -> packages/core/test/remote/connector-reasons.test.ts::the closed set is all known
-tests/test_connector_reasons.py::test_every_code_is_said_in_words_not_as_the_code -> packages/core/test/remote/connector-reasons.test.ts::every code is said in words not as the code
-tests/test_connector_reasons.py::test_an_old_or_unknown_connector_is_told_to_upgrade_and_how_to_get_by -> packages/core/test/remote/connector-reasons.test.ts::an old or unknown connector is told to upgrade and how to get by
-tests/test_connector_reasons.py::test_a_fixed_connector_is_not_told_to_upgrade -> packages/core/test/remote/connector-reasons.test.ts::a fixed connector is not told to upgrade
-tests/test_connector_reasons.py::test_an_unknown_code_gets_a_generic_sentence_that_names_it_and_words_stay_as_they_are -> packages/core/test/remote/connector-reasons.test.ts::an unknown code gets a generic sentence that names it and words stay as they are
-tests/test_connector_reasons.py::test_ended_puts_the_lead_first_in_the_language -> packages/core/test/remote/connector-reasons.test.ts::ended puts the lead first in the language
-tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
 tests/test_remote_agents.py::test_with_the_flag_off_the_commands_say_so_and_nothing_is_called -> packages/core/test/remote/e2e/agents.test.ts::with the flag off the commands say so and nothing is called
 tests/test_remote_agents.py::test_a_claw_without_remote_agents_is_told_apart_from_a_missing_session -> packages/core/test/remote/e2e/agents.test.ts::a claw without remote agents is told apart from a missing session
 tests/test_remote_agents.py::test_agents_lists_my_machines_and_nobody_elses -> packages/core/test/remote/e2e/agents.test.ts::agents lists my machines and nobody elses
@@ -79,6 +72,32 @@ tests/test_remote_agents.py::test_a_stopped_review_never_repeats_an_error_that_i
 tests/test_remote_agents.py::test_every_refusal_is_said_in_the_chat_language -> packages/core/test/remote/refusals.test.ts::every refusal is said in the chat language
 tests/test_remote_agents.py::test_every_table_sentence_and_fixed_reply_has_its_chinese -> packages/core/test/remote/refusals.test.ts::every table sentence and fixed reply has its chinese
 tests/test_remote_agents.py::test_resolve_agent_says_why_not_in_the_chat_language -> packages/core/test/remote/machines.test.ts::resolve agent says why not in the chat language
+tests/test_remote_permissions.py::test_each_option_the_adapter_offered_can_be_chosen_and_its_own_id_is_what_claw_receives -> packages/core/test/remote/e2e/permissions.test.ts::each option the adapter offered can be chosen and its own id is what claw receives
+tests/test_remote_permissions.py::test_the_click_replaces_the_card_with_what_was_chosen_and_by_whom -> packages/core/test/remote/e2e/permissions.test.ts::the click replaces the card with what was chosen and by whom
+tests/test_remote_permissions.py::test_the_card_names_whose_agent_asks_and_what_it_wants_to_do -> packages/core/test/remote/e2e/permissions.test.ts::the card names whose agent asks and what it wants to do
+tests/test_remote_permissions.py::test_a_double_click_sends_one_decision_and_the_second_is_told_it_was_answered -> packages/core/test/remote/e2e/permissions.test.ts::a double click sends one decision and the second is told it was answered
+tests/test_remote_permissions.py::test_a_click_that_loses_the_race_to_close_the_request_sends_nothing -> packages/core/test/remote/e2e/permissions.test.ts::a click that loses the race to close the request sends nothing
+tests/test_remote_permissions.py::test_a_second_click_after_the_first_finished_is_told_it_was_answered -> packages/core/test/remote/e2e/permissions.test.ts::a second click after the first finished is told it was answered
+tests/test_remote_permissions.py::test_someone_elses_click_does_nothing_and_does_not_use_their_key_for_it -> packages/core/test/remote/e2e/permissions.test.ts::someone elses click does nothing and does not use their key for it
+tests/test_remote_permissions.py::test_a_card_edited_to_carry_an_option_the_agent_never_offered_is_refused_here -> packages/core/test/remote/e2e/permissions.test.ts::a card edited to carry an option the agent never offered is refused here
+tests/test_remote_permissions.py::test_a_click_on_nothing_this_worker_showed_is_not_active -> packages/core/test/remote/e2e/permissions.test.ts::a click on nothing this worker showed is not active
+tests/test_remote_permissions.py::test_a_request_that_ran_out_is_refused_whatever_the_button_says -> packages/core/test/remote/e2e/permissions.test.ts::a request that ran out is refused whatever the button says
+tests/test_remote_permissions.py::test_how_long_a_request_lives_follows_what_the_agent_said_within_sense -> packages/core/test/remote/e2e/permissions.test.ts::how long a request lives follows what the agent said within sense
+tests/test_remote_permissions.py::test_a_refusal_from_claw_brings_the_card_back_and_a_second_press_goes_through -> packages/core/test/remote/e2e/permissions.test.ts::a refusal from claw brings the card back and a second press goes through
+tests/test_remote_permissions.py::test_a_request_claw_no_longer_holds_is_told_as_answered_or_ran_out -> packages/core/test/remote/e2e/permissions.test.ts::a request claw no longer holds is told as answered or ran out
+tests/test_remote_permissions.py::test_a_request_answered_somewhere_else_closes_the_card_here -> packages/core/test/remote/e2e/permissions.test.ts::a request answered somewhere else closes the card here
+tests/test_remote_permissions.py::test_a_request_the_connector_sends_again_after_a_reconnect_gets_one_card -> packages/core/test/remote/e2e/permissions.test.ts::a request the connector sends again after a reconnect gets one card
+tests/test_remote_permissions.py::test_a_request_that_cannot_be_answered_says_so_instead_of_showing_dead_buttons -> packages/core/test/remote/e2e/permissions.test.ts::a request that cannot be answered says so instead of showing dead buttons
+tests/test_remote_permissions.py::test_a_card_that_could_not_be_sent_can_be_shown_when_the_connector_asks_again -> packages/core/test/remote/e2e/permissions.test.ts::a card that could not be sent can be shown when the connector asks again
+tests/test_remote_permissions.py::test_a_card_is_not_held_back_by_quiet_hours_because_the_user_just_asked_for_the_work -> packages/core/test/remote/e2e/permissions.test.ts::a card is not held back by quiet hours because the user just asked for the work
+tests/test_remote_permissions.py::test_the_stored_row_has_what_the_click_is_checked_against -> packages/core/test/remote/e2e/permissions.test.ts::the stored row has what the click is checked against
+tests/test_connector_reasons.py::test_the_closed_set_is_all_known -> packages/core/test/remote/connector-reasons.test.ts::the closed set is all known
+tests/test_connector_reasons.py::test_every_code_is_said_in_words_not_as_the_code -> packages/core/test/remote/connector-reasons.test.ts::every code is said in words not as the code
+tests/test_connector_reasons.py::test_an_old_or_unknown_connector_is_told_to_upgrade_and_how_to_get_by -> packages/core/test/remote/connector-reasons.test.ts::an old or unknown connector is told to upgrade and how to get by
+tests/test_connector_reasons.py::test_a_fixed_connector_is_not_told_to_upgrade -> packages/core/test/remote/connector-reasons.test.ts::a fixed connector is not told to upgrade
+tests/test_connector_reasons.py::test_an_unknown_code_gets_a_generic_sentence_that_names_it_and_words_stay_as_they_are -> packages/core/test/remote/connector-reasons.test.ts::an unknown code gets a generic sentence that names it and words stay as they are
+tests/test_connector_reasons.py::test_ended_puts_the_lead_first_in_the_language -> packages/core/test/remote/connector-reasons.test.ts::ended puts the lead first in the language
+tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
 tests/test_session_window.py::test_the_repost_rule -> packages/core/test/remote/window.test.ts::the repost rule
 tests/test_session_window.py::test_full_output_parts_are_bounded_and_masked -> packages/core/test/remote/window.test.ts::full output parts are bounded and masked
 tests/test_deployment_defaults.py::test_the_connector_commands_come_from_the_configured_claw_address -> MERGED packages/core/test/remote/connector-setup.test.ts::the connector commands come from the configured claw address
