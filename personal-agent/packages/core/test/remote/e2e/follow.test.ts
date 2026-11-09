@@ -9,6 +9,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
 
 import type { FollowTimings } from "../../../src/remote/follow/timings.js";
+import { RemoteTurnState } from "../../../src/remote-view/turn-state.js";
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
 import {
   ALICE,
@@ -17,6 +18,7 @@ import {
   USER_A,
   USER_B,
   TEST_TIMINGS,
+  WORLD_ERRORS,
   remoteWorld,
 } from "../../../../../test-support/remote-world.js";
 import { AAD, BOB, TWO_AGENTS } from "./helpers.js";
@@ -342,4 +344,140 @@ test("a worker that starts follows the chats that are attached and says what it 
     const told = onItsOwn(w);
     assert.equal(told.length, 2, told.join(" | "));
     assert.ok(told[1]?.includes("while the worker was down") && !told[1].includes("before the restart"), told[1] ?? "");
+  }));
+
+// --- more of the same: restarts, errors, holding, the unlink race --------------------------------------------------------------
+
+test("text that was read but not yet said when the worker stops is said once by the next one", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    refollow(w, { quietMs: 30_000, toolQuietMs: 30_000, maxAgeMs: 60_000 });
+    const marker = await w.server.say(sid, "Said by nobody yet.");
+    await sleep(400); // read, and waiting for the pause
+    assert.deepEqual(onItsOwn(w), []);
+    w.remote.shutdown(); // the worker stops with the text unsaid
+    await sleep(100);
+    // the read position did not pass it
+    assert.ok(Number(w.test.store.remoteState.attachedRemote(AAD)?.cursor || 0) < marker);
+    w.settings.timings = TEST_TIMINGS;
+    w.remote.resume();
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+    assert.ok(onItsOwn(w)[0]?.includes("Said by nobody yet."));
+    w.remote.shutdown();
+    w.remote.resume();
+    await settle();
+    assert.equal(onItsOwn(w).length, 1); // and not again
+  }));
+
+test("an unlink while a turn is open leaves nothing reading", () =>
+  remoteWorld(async (w) => {
+    const { sid, script } = await attachedClaude(w);
+    script.onPrompt = async (srv, session) => {
+      await srv.say(session, "Working, and not done."); // no turn end: the turn stays open
+    };
+    let opens = streams(w, sid).length;
+    await w.send("a long task");
+    await w.until(() => streams(w, sid).length > opens); // (the turn is reading)
+    opens = streams(w, sid).length;
+    w.remote.forgetPerson(AAD); // (what /unlink asks of the remote agents)
+    await settle();
+    assert.equal(followers(w).size, 0);
+    assert.deepEqual(w.remote.busyChats(), []);
+    assert.equal(streams(w, sid).length, opens);
+  }));
+
+test("a stream that is refused is not read again and one that fails is read again later", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const reads = () => w.server.calls.filter(([, path]) => path.endsWith("/events")).length;
+    follow(w).drop(AAD);
+    w.server.failOn("GET", "/events", 401); // the key no longer works
+    follow(w).ensure(AAD);
+    await settle();
+    const refused = reads();
+    await settle();
+    assert.equal(reads(), refused); // no retry loop
+    assert.equal((followers(w).get(AAD) as { alive: boolean } | undefined)?.alive, false);
+    assert.deepEqual(onItsOwn(w), []);
+    follow(w).drop(AAD);
+    w.server.failOn("GET", "/events", 500); // Claw is down for a moment
+    follow(w).ensure(AAD);
+    await sleep(300);
+    w.server.fail.delete("GET /events");
+    await w.server.say(sid, "Back after the outage.");
+    await settle(1600);
+    assert.equal(onItsOwn(w).length, 1, w.said().join(" | "));
+    assert.ok(onItsOwn(w)[0]?.includes("Back after the outage."));
+  }));
+
+test("the answer so far is taken once and the ids already seen stay seen", () => {
+  const state = new RemoteTurnState(WORLD_ERRORS);
+  const chunk = (n: number, text: string) => ({
+    id: String(n),
+    name: "agent_message_chunk",
+    data: { data: { update: { content: { text } } } },
+  });
+  state.feed(chunk(1, "one "));
+  state.feed(chunk(2, "two"));
+  assert.equal(state.answer, "one two");
+  assert.equal(state.takeAnswer(), "one two");
+  assert.equal(state.answer, "");
+  assert.equal(state.takeAnswer(), "");
+  state.feed(chunk(2, "two")); // the same event again: not folded twice
+  assert.equal(state.answer, "");
+  state.feed(chunk(3, "three"));
+  assert.equal(state.takeAnswer(), "three");
+});
+
+test("the text waits for a step no longer than max age and messages come at most once per gap", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    refollow(w, { quietMs: 200, toolQuietMs: 60_000, gapMs: 1500, maxAgeMs: 800 });
+    await w.server.say(sid, "First text, a step still open.");
+    await w.server.tool(sid, "b1", "make all", "pending");
+    const start = performance.now();
+    await w.until(() => onItsOwn(w).length > 0, 5000);
+    const waited = performance.now() - start;
+    assert.ok(waited > 500 && waited < 2000, String(waited)); // maxAge (800 ms), not toolQuiet (a minute)
+    const firstAt = performance.now();
+    await w.server.tool(sid, "b1", "make all", "completed");
+    await w.server.say(sid, "Second text, soon after the first.");
+    await sleep(600);
+    assert.equal(onItsOwn(w).length, 1); // the gap (1.5 s) has not passed
+    await w.until(() => onItsOwn(w).length === 2, 5000);
+    assert.ok(performance.now() - firstAt >= 1400);
+  }));
+
+test("an event for a chat that has left the session says nothing", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const follower = followers(w).get(AAD) as { alive: boolean } | undefined;
+    assert.ok(follower);
+    w.test.store.remoteState.detachRemote(AAD); // (the state changed without the follower being told)
+    await w.server.say(sid, "Nobody is listening.");
+    await settle();
+    assert.deepEqual(onItsOwn(w), []);
+    assert.deepEqual(w.held, []);
+    assert.equal(follower.alive, false); // it saw that the chat had left the session, and went
+  }));
+
+test("a message that is refused leaves the chat followed", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const machine = w.server.connector([...w.server.connectors.keys()][0] ?? "");
+    machine.online = false;
+    await w.say("anyone there?");
+    assert.ok(w.last().includes("offline"), w.last()); // nothing was sent, so no turn reads the session
+    await w.server.say(sid, "It came back by itself and finished.");
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+    machine.online = true;
+    w.server.failOn("POST", "/commands", 500);
+    await w.say("and now?");
+    w.server.fail.delete("POST /commands");
+    await w.server.say(sid, "Second thing it finished.");
+    await settle();
+    assert.equal(onItsOwn(w).length, 2);
+    assert.deepEqual(prompts(w), []);
   }));

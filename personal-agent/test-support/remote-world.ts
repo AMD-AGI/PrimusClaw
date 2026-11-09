@@ -127,6 +127,8 @@ export class RemoteWorld {
   refuse: ((message: OutMessage) => boolean) | null = null;
   /** Whether the chat may be told something now (false: muted hours, as a test says). */
   reachable = true;
+  /** What the follower held for later, since the chat could not be told (the assistant's quiet hours keep it). */
+  readonly held: { chatKey: string; label: string; text: string }[] = [];
   /** The worker's settings, which a test may change (remote agents turned off under a card). */
   readonly settings: { -readonly [K in keyof RemoteSettings]: RemoteSettings[K] };
   private n = 0;
@@ -161,7 +163,13 @@ export class RemoteWorld {
       references: store.references,
       conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
       credentialFor: (person) => Promise.resolve(KEY_OF[person] ?? null),
-      reach: { reachable: () => this.reachable, muted: () => null, holdRemote: () => undefined },
+      reach: {
+        reachable: () => this.reachable,
+        muted: () => null,
+        holdRemote: (chatKey, label, text) => {
+          this.held.push({ chatKey, label, text });
+        },
+      },
       guard: guardOf(new Guardrails(systemClock, () => undefined)),
       audit: () => undefined,
       errors: WORLD_ERRORS,
