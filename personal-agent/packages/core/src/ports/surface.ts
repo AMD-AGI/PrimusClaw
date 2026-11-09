@@ -238,8 +238,11 @@ export type ViewButton =
   | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
   | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
 
-/** How a button is emphasised (Teams: the action's `style`); none is the channel's default look. */
-export type ButtonStyle = "positive" | "destructive";
+/**
+ * How a button is emphasised (Teams: the action's `style`), carried as written so card JSON matches the Python worker
+ * byte for byte: an explicit "default" (the feedback offer's No) is not the same JSON as no style at all.
+ */
+export type ButtonStyle = "default" | "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
