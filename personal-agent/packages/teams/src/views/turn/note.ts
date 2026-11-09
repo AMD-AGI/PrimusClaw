@@ -16,8 +16,10 @@ const MEANING: Readonly<Partial<Record<NoteTone, Meaning>>> = {
 /** A view's button as a card action. */
 export function action(button: ViewButton): CardElement {
   // (the click data is core's read-only JSON; the card holds its own copy)
-  const data = (): JsonObject => structuredClone(button.data) as JsonObject;
-  const built = "url" in button ? openUrl(button.title, button.url) : execute(button.title, button.verb, data());
+  const built =
+    "url" in button
+      ? openUrl(button.title, button.url)
+      : execute(button.title, button.verb, structuredClone(button.data) as JsonObject);
   return button.style ? { ...built, style: button.style } : built;
 }
 
