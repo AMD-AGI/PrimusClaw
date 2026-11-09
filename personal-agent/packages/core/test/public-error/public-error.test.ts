@@ -3,6 +3,8 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+// The PublicErrors interface module declares types only; loading it is what the coverage of `--all` counts.
+import "../../src/public-error/public-errors.js";
 import {
   PublicErrorLog,
   SCAN_MAX,
