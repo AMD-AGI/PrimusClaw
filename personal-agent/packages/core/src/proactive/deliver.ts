@@ -348,7 +348,14 @@ export class Deliveries {
     const sessionId = str(event["session_id"]);
     const key = this.deps.store.links.getKey(userId);
     if (this.deps.runs === undefined || !sessionId || key === null) return;
-    await this.deps.runs.offerChanges(key, sessionId, conversation);
+    try {
+      await this.deps.runs.offerChanges(key, sessionId, conversation);
+    } catch (error) {
+      // (best effort: the notification's sender waits for the answer, and the run's card is out already)
+      this.deps.logger.warn("the changes card of a finished run could not be shown", {
+        error: error instanceof Error ? error.name : typeof error,
+      });
+    }
   }
 }
 

@@ -18,6 +18,7 @@ import { ClawAnswerInvalid, ClawError } from "../claw/errors.js";
 import { ASSISTANT_TYPES_VERSION, RUN_SOURCES, wantedTypes, type WantedTypes } from "./event-types.js";
 import type { ClawSubscription } from "../ports/claw/index.js";
 import type { ClawSubscriptions, SubscriptionStore } from "./ports.js";
+import { pyRstrip } from "../text/py-text.js";
 
 /** Notifications off on Claw, or Claw unreachable: a subscription is tried again at most daily. */
 export const RETRY_SECONDS = 24 * 3600;
@@ -49,7 +50,7 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
-    .replace(/=+$/, "");
+    .replaceAll("=", "");
 }
 
 export class Subscriptions {
@@ -68,7 +69,7 @@ export class Subscriptions {
     this.claw = options.claw;
     this.random = options.random;
     this.log = options.logger;
-    this.base = options.baseUrl.replace(/\/+$/, "");
+    this.base = pyRstrip(options.baseUrl, "/");
     this.assistant = options.assistant ?? false;
     this.understood = options.understood ?? (() => false);
     this.assistantFor = options.assistantFor ?? (() => true);

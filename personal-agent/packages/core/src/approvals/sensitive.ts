@@ -82,8 +82,38 @@ const MIN_SECRET = 4;
 const MAX_DEPTH = 6;
 const MAX_CHILDREN = 100;
 
-function words(name: string): string[] {
-  const spaced = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+const UPPER = /^[A-Z]$/;
+const LOWER = /^[a-z]$/;
+
+/**
+ * `re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)` in one pass: a run of capitals followed by a lower-case letter is split
+ * before its last capital (`APIKey` -> `API Key`); scanning goes on after the lower-case letter, as the regex's does.
+ */
+function splitCapitalRuns(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    if (!UPPER.test(text[i] ?? "")) {
+      out += text[i] ?? "";
+      i += 1;
+      continue;
+    }
+    let end = i;
+    while (end < text.length && UPPER.test(text[end] ?? "")) end += 1;
+    if (end - i >= 2 && LOWER.test(text[end] ?? "")) {
+      out += `${text.slice(i, end - 1)} ${text.slice(end - 1, end + 1)}`;
+      i = end + 1;
+    } else {
+      out += text.slice(i, end);
+      i = end;
+    }
+  }
+  return out;
+}
+
+/** The words of an argument name, as the credential rule reads them (camelCase and ALLCaps split, lower case). */
+export function nameWords(name: string): string[] {
+  const spaced = splitCapitalRuns(name.replace(/([a-z0-9])([A-Z])/g, "$1 $2"));
   return spaced
     .split(/[^A-Za-z0-9]+/)
     .filter(Boolean)
@@ -98,7 +128,7 @@ function singular(word: string): string {
 
 /** Whether a value stored under this argument name must not be shown. */
 export function isSensitiveName(name: unknown): boolean {
-  const parts = words(String(name));
+  const parts = nameWords(String(name));
   if (parts.length === 0 || COUNTERS.has(parts.join(" "))) return false;
   return parts.some((word, i) => {
     if (WORDS.has(word)) return true;

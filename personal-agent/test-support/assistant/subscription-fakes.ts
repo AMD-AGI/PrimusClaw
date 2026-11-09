@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 /** In-memory stand-ins for the store slices and Claw's subscription endpoints the subscription keeper uses. */
-import type { NotifySubscription } from "../../src/ports/store/index.js";
-import type { ClawSubscription } from "../../src/ports/claw/index.js";
-import type { ClawSubscriptions, SubscriptionStore } from "../../src/subscriptions/ports.js";
+import type { NotifySubscription } from "../../packages/core/src/ports/store/index.js";
+import type { ClawSubscription } from "../../packages/core/src/ports/claw/index.js";
+import type { ClawSubscriptions, SubscriptionStore } from "../../packages/core/src/subscriptions/ports.js";
 
-export { ClawError as ClawStatusError } from "../../src/claw/errors.js";
-import { ClawError as ClawStatusError } from "../../src/claw/errors.js";
+export { ClawError as ClawStatusError } from "../../packages/core/src/claw/errors.js";
+import { ClawError as ClawStatusError } from "../../packages/core/src/claw/errors.js";
 
 interface Row {
   subscription_id: string;
@@ -148,7 +148,10 @@ export class FakeSubscriptionStore implements SubscriptionStore {
         const sub = this.subs.get(u);
         return sub ? { route: sub.route, subscriptionId: sub.subscriptionId } : null;
       },
-      forgetNotifySub: (u) => void this.subs.delete(u),
+      forgetNotifySub: (u) => {
+        this.subs.delete(u);
+        this.attempts.delete(u); // (as the store does: a forgotten subscription is made again at once)
+      },
       claimNotifyAttempt: (u, minInterval) => {
         const last = this.attempts.get(u);
         if (last !== undefined && this.now - last < minInterval) return false;

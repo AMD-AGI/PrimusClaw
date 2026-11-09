@@ -17,7 +17,7 @@ import type { ActionCard, ConfirmCard } from "../ports/store/assistant.js";
 import type { StorePort } from "../ports/store/index.js";
 import type { TokenExchange } from "../plugins/token-exchange.js";
 import { cpLength, pySplit, pyStr, pyStrip } from "../text/py-text.js";
-import { serviceRefusal } from "../turn/upstream.js";
+import { serviceRefusal } from "../claw/service-refusal.js";
 import { CONTEXT_TEXT_MAX } from "./chat.js";
 import { confirmOutcome } from "./confirm-outcome.js";
 import { refusal, unreachable } from "./failures.js";
@@ -211,7 +211,7 @@ export class AssistantActions {
     logger.warn("a held write's card could not be answered", { error: errorName(error), status: refused?.status });
     if (refused !== undefined && (refused.status === 403 || refused.status === 404)) {
       store.assistantButtons.moveConfirmCard(card.cardId, "done");
-      await finish(click, refused.status === 404 ? t.confirmGone : serviceRefusal(refused.code, said.nothingDone));
+      await finish(click, refused.status === 404 ? t.confirmGone : serviceRefusal(refused, said.nothingDone));
       return;
     }
     store.assistantButtons.moveConfirmCard(card.cardId, "open");

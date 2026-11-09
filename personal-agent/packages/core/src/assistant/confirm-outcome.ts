@@ -13,6 +13,7 @@ import {
   assistantActionText,
 } from "../locales/assistant-actions.js";
 import type { Lang } from "../locales/lang.js";
+import { devenvHideOutcome } from "./devenv-hide-outcome.js";
 
 type Fields = Readonly<Record<string, unknown>>;
 
@@ -159,6 +160,7 @@ export function confirmOutcome(kind: string, out: Fields, lang: Lang): string {
   const status = or(out["status"], "");
   const create = kind === "trigger_create";
   if (kind === "devenv_send") return devenvSendOutcome(status, out, lang);
+  if (kind === "devenv_hide") return devenvHideOutcome(status, out, lang);
   const comment = kind === "github_comment" ? commentOutcome(out, lang) : undefined;
   if (comment !== undefined) return comment;
   if (status === "done" && truthy(out["answered_now"])) return triggerDone(create, out, lang);
