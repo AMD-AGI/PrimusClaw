@@ -192,3 +192,33 @@ test("the files of a message: what can be fetched, and the names of what cannot"
   );
   assert.deepEqual(event.unreadableFiles, ["no-link.pdf"]);
 });
+
+test("teams' own thumbs on the desktop become a vote on the answer they were given on", () => {
+  const thumb = (reaction: string, feedback: unknown) => ({
+    type: "invoke",
+    name: "message/submitAction",
+    id: "inv-1",
+    replyToId: "answer-7",
+    serviceUrl: "https://smba.trafficmanager.net/amer/",
+    from: { id: "29:a", aadObjectId: "aad-a", name: "Lin Mei" },
+    recipient: { id: "28:bot" },
+    conversation: { id: "a:1", conversationType: "personal" },
+    value: { actionName: "feedback", actionValue: { reaction, feedback } },
+  });
+  const liked = toInboundEvent(thumb("like", JSON.stringify({ feedbackText: " spot on " })));
+  assert.ok(liked.ok && liked.value?.type === "vote");
+  assert.deepEqual(
+    [
+      liked.value.messageId,
+      liked.value.reaction,
+      liked.value.comment,
+      liked.value.sender.id,
+      liked.value.conversation.id,
+    ],
+    ["answer-7", "like", "spot on", "aad-a", "a:1"],
+  );
+  const disliked = toInboundEvent(thumb("dislike", "wrong repo"));
+  assert.ok(disliked.ok && disliked.value?.type === "vote" && disliked.value.comment === "wrong repo");
+  const other = toInboundEvent(thumb("meh", ""));
+  assert.ok(other.ok && other.value === undefined);
+});

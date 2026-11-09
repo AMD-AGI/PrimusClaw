@@ -7,8 +7,8 @@ import { pyNumber } from "./py-number.js";
 /** Values parsed from JSON as Python writes them: `str(value or "")`, `repr(value)`, `json.dumps(value, ...)`. */
 
 function isEmpty(value: unknown): boolean {
-  if (Array.isArray(value)) return value.length === 0;
-  return typeof value === "object" && value !== null && Object.keys(value).length === 0;
+  if (value === null || typeof value !== "object") return false;
+  return Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0;
 }
 
 /**

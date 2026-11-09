@@ -6,6 +6,7 @@
  * they mention, the links behind the words, the messages they quote) or a card press. Everything else Teams delivers
  * (typing, installs, conversation updates) is not an event core acts on.
  */
+import { voteOf } from "../../feedback/vote.js";
 import { inboundFiles } from "../../inbound/attachments.js";
 import {
   err,
@@ -15,6 +16,7 @@ import {
   type ConversationRef,
   type InboundAction,
   type InboundMessage,
+  type InboundVote,
   type InvalidInput,
   type Logger,
   type Result,
@@ -27,8 +29,8 @@ import { addressedToBot, DEFAULT_BOT_NAME, isMentioned, isTargeted, mentionsOf, 
 import { isBotQuote, logPlaceholderQuotes, quotesOf } from "./quotes.js";
 import { parseActivity, partOf, truthy, type Activity } from "./schema.js";
 
-/** The events a Teams activity can be (a vote of Teams' own thumbs is added by the feedback feature's reader). */
-export type TeamsInboundEvent = InboundMessage | InboundAction;
+/** The events a Teams activity can be. */
+export type TeamsInboundEvent = InboundMessage | InboundAction | InboundVote;
 
 /** The activity has no Entra identity behind it: nobody to act for. */
 export interface NoSender {
@@ -145,6 +147,11 @@ export function toInboundEvent(
   };
   if (isCardClick(activity) || (activity.type === "message" && cardKindOf(activity))) {
     return ok(actionOf(activity, sender));
+  }
+  const vote = voteOf(activity);
+  if (vote !== undefined) {
+    // (the answer the thumb is on: Teams names it as the invoke's replyToId)
+    return ok({ type: "vote", ...base(activity, sender), messageId: pyStr(activity["replyToId"]), ...vote });
   }
   return ok(activity.type === "message" ? messageOf(activity, sender, options) : undefined);
 }
