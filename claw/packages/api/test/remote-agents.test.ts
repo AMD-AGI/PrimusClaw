@@ -124,6 +124,8 @@ describe("remote agents", { skip }, () => {
   const post = (user: string, cid: string, events: unknown[], batch = "b1") =>
     as(user).post(`/v1/remote-agents/connectors/${cid}/events`, { batch_id: batch, events });
   const online1 = async () => { nextSeq = new Map(); return online(); };
+  /** Any frame but a `: keepalive` comment, which a stream writes on its own clock between events. */
+  const notKeepalive = (f: { comment?: boolean }): boolean => !f.comment;
   /** A frame's `issued_at`, checked to be when Claw queued it (its clock, ms; the database and this test share a host). */
   const issuedAt = (frame: { issued_at?: unknown }): number => {
     assert.ok(typeof frame.issued_at === "number" && Math.abs(Date.now() - frame.issued_at) < 60_000, `issued_at ${String(frame.issued_at)}`);
@@ -1041,7 +1043,8 @@ describe("remote agents", { skip }, () => {
       const marker = await s.next();
       assert.deepEqual([marker.event, marker.id, marker.json()], ["historyComplete", undefined, { type: "historyComplete", count: 2 }]);
       await post("u1", cid, [ev(sid, "turn_end", { stopReason: "end_turn" })], "b2");
-      const live = await s.next();
+      // A keepalive may come first (one every 150 ms here): the next frame that is not one is the event.
+      const live = await s.next(notKeepalive);
       assert.equal(live.event, "turn_end");
       assert.equal((await s.next((f) => !!f.comment, 1500)).comment, true, "a keepalive follows while idle");
     });
@@ -1056,7 +1059,8 @@ describe("remote agents", { skip }, () => {
       const sent = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`,
         { type: "prompt", text: "what is 2+2? use Authorization: Bearer supersecretvalue123456" }, { "idempotency-key": "teams-1", "x-claw-client": "teams" });
       assert.equal(sent.status, 202);
-      const live = (await reader.next(undefined, 1000)).json();
+      // A keepalive is due every 150 ms, so one may land before it on a slow runner: the next frame that is not one.
+      const live = (await reader.next(notKeepalive, 1000)).json();
       assert.deepEqual([live.type, live.data.cmd_id, live.data.cmd_seq, live.data.client, live.data.by], ["user_prompt", "k:teams-1", sent.body.data.cmd_seq, "teams", "claw"]);
       assert.match(live.data.text, /^what is 2\+2\? use .*<redacted>$/);
       assert.ok(!JSON.stringify(live).includes("supersecretvalue"), "masked as the agent's output is");
