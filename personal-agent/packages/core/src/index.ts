@@ -9,6 +9,9 @@
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
 export * from "./approvals/index.js";
+export * from "./assistant/deliveries.js";
+export type * from "./assistant/views.js";
+export * from "./assistant/work-items.js";
 export * from "./errors.js";
 export * from "./feedback/index.js";
 export * from "./json.js";
@@ -19,6 +22,7 @@ export * from "./typed-answer/index.js";
 export * from "./understanding/index.js";
 export * from "./locales/index.js";
 export * from "./plugins/index.js";
+export * from "./proactive/views.js";
 export * from "./ports/index.js";
 export * from "./protocol.js";
 export * from "./result.js";
@@ -32,7 +36,10 @@ export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./routing/index.js";
+export * as turn from "./turn/index.js";
+export * from "./note/note.js";
 export * from "./branding.js";
+export * from "./inbound-text/index.js";
 export * from "./claw/message-text.js";
 export * from "./claw/requester-view.js";
 export * from "./claw/service-refusal.js";

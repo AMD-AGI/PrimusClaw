@@ -330,3 +330,17 @@ test("a later caller waits for the exchange in flight and then asks again when i
   assert.equal(safe.requests.length, 2); // one at a time, each its own try (an asyncio.Lock, not a shared result)
   assert.equal(c.enabled, true);
 });
+
+test("a stalled exchange or binding request ends at its deadline, as an error", async () => {
+  const stalled = (_url: URL | RequestInfo, init?: RequestInit): Promise<Response> =>
+    new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        reject(new DOMException("timed out", "TimeoutError"));
+      });
+    });
+  const c = new HttpTokenExchange(CFG, new FakeClock(), stalled, 50);
+  const token = await c.tokenFor("aad-a");
+  assert.ok(!token.ok && token.error.kind === "exchange_failed");
+  const binding = await c.bindingRequest("aad-a", "");
+  assert.equal(binding.ok, false);
+});

@@ -27,6 +27,7 @@ import {
   section,
   text,
 } from "../src/cards/kit.js";
+import { viewButton } from "../src/cards/view-buttons.js";
 
 test("full width punctuation next to chinese only", () => {
   assert.equal(zh("模型: claude, 分支(当前)"), "模型：claude，分支（当前）");
@@ -193,4 +194,27 @@ test("buttons, links and the card around them", () => {
   });
   assert.equal(hasCjk("中"), true);
   assert.equal(hasCjk(null), false);
+});
+
+test("core's view buttons become the kit's actions, with their emphasis", () => {
+  assert.deepEqual(viewButton({ title: "打开: 控制台", url: "https://example.com" }), {
+    type: "Action.OpenUrl",
+    title: "打开：控制台",
+    url: "https://example.com",
+  });
+  assert.deepEqual(viewButton({ title: "Stop", verb: "primusclaw.stop", data: { id: "x" }, style: "destructive" }), {
+    type: "Action.Execute",
+    title: "Stop",
+    verb: "primusclaw.stop",
+    data: { id: "x" },
+    style: "destructive",
+  });
+});
+
+test("full width parentheses take linear time on a run that never closes", () => {
+  const started = performance.now();
+  zh("(" + "中".repeat(50000));
+  zh("中(" + "中 ".repeat(30000) + "\n)");
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(zh("(中) (a) (中\n) ((中))"), "（中） (a) (中\n) (（中）)"); // (as the Python worker writes it)
 });
