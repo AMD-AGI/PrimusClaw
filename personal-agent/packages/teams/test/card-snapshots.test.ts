@@ -9,13 +9,24 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
+import { pyJsonDumps } from "@primusclaw/personal-agent";
 import { Ajv } from "ajv";
 
 import { CJK } from "../src/cards/cjk.js";
 import { isObject, walk, type JsonObject } from "../src/cards/json.js";
-import { ADAPTIVE_CARD, BUTTONS_MAX, CARD_VERSION, emojiBudget, emojiIn, ICONS } from "../src/cards/kit.js";
+import {
+  ADAPTIVE_CARD,
+  BUTTONS_MAX,
+  CARD_VERSION,
+  emojiBudget,
+  emojiIn,
+  execute,
+  facts,
+  ICONS,
+  message,
+  text,
+} from "../src/cards/kit.js";
 import { CATALOG, PENDING } from "../../../test-support/card-catalog/index.js";
-import { pythonJson } from "../../../test-support/python-json.js";
 
 const DATA = new URL("../../../test-support/data/", import.meta.url);
 const SNAPSHOTS = new URL("card_snapshots/", DATA);
@@ -38,9 +49,15 @@ export function allowEmoji(...emoji: string[]): void {
   allowedEmoji = new Set([...allowedEmoji, ...emoji]);
 }
 
-/** A JSON value as the text it shows. */
+/** A JSON value as the text it shows (Python's `str(node.get(key, ""))`: an absent value is ""). */
 function s(value: unknown): string {
+  if (value === undefined) return "";
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/** What Python's `json.dumps(value, ensure_ascii=False, indent=1, sort_keys=True)` writes, with the file's final newline. */
+function pythonJson(value: unknown): string {
+  return pyJsonDumps(value, { indent: 1, sortKeys: true }) + "\n";
 }
 
 function omit(object: JsonObject, ...keys: string[]): JsonObject {
@@ -68,6 +85,21 @@ function* words(card: JsonObject): Generator<readonly ["text" | "fact" | "button
   }
 }
 
+test("the words of a card skip nodes without a type (a button's data) and read texts, facts and buttons", () => {
+  const built = message(
+    [text("✅ done"), ...facts([["作者", "林"]])],
+    [execute("🔍 Review", "primusclaw.review", { pr: { number: 7, repo: "o/r" } })],
+  );
+  assert.deepEqual(
+    [...words(content(built))],
+    [
+      ["text", "✅ done"],
+      ["fact", "作\u2060者林"],
+      ["button", "🔍 Review"],
+    ],
+  );
+});
+
 test("the catalog names each card once", () => {
   const ids = CATALOG.map((e) => e.id);
   assert.equal(ids.length, new Set(ids).size);
@@ -88,6 +120,15 @@ test("no snapshot is left without a card", () => {
     [],
     "an entry that is ported is no longer pending",
   );
+});
+
+test("every snapshot file is written as Python writes it (indent 1, sorted keys), so a formatter cannot rewrite one unseen", () => {
+  const files = readdirSync(SNAPSHOTS).filter((f) => f.endsWith(".json"));
+  assert.ok(files.length >= 50);
+  for (const file of files) {
+    const written = readFileSync(new URL(file, SNAPSHOTS), "utf8");
+    assert.equal(pythonJson(JSON.parse(written)), written, file);
+  }
 });
 
 for (const entry of CATALOG) {
