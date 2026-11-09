@@ -28,12 +28,15 @@ export function lit(text: unknown, limit: number): string {
   return plain(neutral(text, limit));
 }
 
+/** `text` whole, but unable to make a markdown link or image (`](` gets a zero-width space inside) or a tag (`<`/`>` look-alikes). */
+export function inertLinks(text: string): string {
+  return text.replaceAll("](", "]\u{200b}(").replaceAll("<", "\u{2039}").replaceAll(">", "\u{203a}");
+}
+
 /** A copy of an agent's JSON with every string unable to make a link or a tag: `](` gets a zero-width space inside, and
  * `<`/`>` become look-alikes. Unlike `neutral` it keeps the text whole. */
 export function defang(value: unknown): unknown {
-  if (typeof value === "string") {
-    return value.replaceAll("](", "]\u{200b}(").replaceAll("<", "\u{2039}").replaceAll(">", "\u{203a}");
-  }
+  if (typeof value === "string") return inertLinks(value);
   if (Array.isArray(value)) return value.map(defang);
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([k, v]) => [defang(pyStr(k)) as string, defang(v)]));

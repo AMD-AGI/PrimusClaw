@@ -209,3 +209,9 @@ test("the lines of an attached chat in either language", () => {
   const parts = unsolicitedParts("cx", "done.", "en", true);
   assert.equal(parts[0], "**cx**, replying to what was typed in the terminal:\n\ndone.");
 });
+
+test("what was typed at the terminal cannot make a link or a tag in the chat", () => {
+  const line = typedLine("[Open](https://attacker.example) ![x](https://e/p.png) <a href=x>y</a>", "en");
+  for (const bad of ["](", "<a", "</"]) assert.ok(!line.includes(bad), bad);
+  assert.ok(line.includes("Open") && line.includes("https://attacker.example")); // (shown, only inert)
+});

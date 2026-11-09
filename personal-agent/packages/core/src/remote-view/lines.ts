@@ -4,7 +4,7 @@
 /** The one-line messages of a chat attached to a remote session: where it is, what happened, what a refusal means. */
 import type { Lang } from "../locales/lang.js";
 import { remoteQueuedText, remoteStopText, remoteText } from "../locales/remote.js";
-import { neutral, masked as redactText } from "./inert.js";
+import { inertLinks, neutral, masked as redactText } from "./inert.js";
 import { TYPED_LINES_MAX } from "./limits.js";
 import { pyStr, rstrip, slice, splitlines, squash, strip } from "./py-text.js";
 
@@ -65,9 +65,10 @@ export function placeOf(cwd: unknown, lit: (text: unknown, limit: number) => str
   return lit(tail || path, 40);
 }
 
-/** How a prompt typed at the terminal shows in the chat: said as the terminal's, quoted, credentials masked. */
+/** How a prompt typed at the terminal shows in the chat: said as the terminal's, quoted, credentials masked, and unable to make a
+ * link or a tag (the text reaches the chat through the connector: it is shown, never followed). */
 export function typedLine(text: string, lang: Lang): string {
-  const quoted = splitlines(redactText(strip(text)))
+  const quoted = splitlines(inertLinks(redactText(strip(text))))
     .slice(0, TYPED_LINES_MAX)
     .map((line) => (strip(line) ? `> ${line}` : ">"))
     .join("\n");
