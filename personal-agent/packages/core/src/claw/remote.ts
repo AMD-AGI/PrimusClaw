@@ -9,20 +9,7 @@
  */
 import type { JsonObject } from "../json.js";
 import { z } from "zod";
-
-/** A value of the type `schema` accepts, else `undefined`: a field Claw sent wrong is read as one it did not send. */
-function lenient<T extends z.ZodType>(schema: T) {
-  return z.optional(
-    z.unknown().transform((value): z.output<T> | undefined => {
-      const parsed = schema.safeParse(value);
-      return parsed.success ? parsed.data : undefined;
-    }),
-  );
-}
-
-const text = lenient(z.string());
-const flag = lenient(z.boolean());
-const objectOf = lenient(z.record(z.string(), z.unknown()));
+import { anyText as text, flag, lenient, objectOf, rowsOf } from "./lenient.js";
 
 /** One agent a connector reports (`RemoteAgentDescriptor`, read leniently). */
 export const remoteAgentSchema = z.looseObject({
@@ -33,16 +20,6 @@ export const remoteAgentSchema = z.looseObject({
   capabilities: objectOf,
 });
 export type RemoteAgent = z.output<typeof remoteAgentSchema>;
-
-/** Rows of a list: the objects among them, each read with `schema`. */
-function rowsOf<T extends z.ZodType>(schema: T): z.ZodType<Array<z.output<T>>> {
-  return z.array(z.unknown()).transform((rows) =>
-    rows.flatMap((row) => {
-      const parsed = schema.safeParse(row);
-      return parsed.success ? [parsed.data] : [];
-    }),
-  );
-}
 
 /** One of the caller's connectors (`GET /v1/remote-agents/connectors`). */
 export const remoteConnectorSchema = z.looseObject({
