@@ -56,7 +56,7 @@ function encodedList(v: unknown): unknown {
   const asked = citeSourcesAsked(v);
   return asked.length === 1 && asked[0] === v ? v : asked;
 }
-import { devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
+import { devenvHide, devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -495,6 +495,23 @@ export function createAssistantMcpServer(
           new_session: z.boolean().optional().describe("true only when they asked for a new session (新开一个会话, a fresh session): never continue one."),
         },
         (args) => answer(claims, "devenv_send", () => devenvSend(claims, args)),
+      );
+      mcp.tool(
+        "devenv_hide",
+        "Hide conversations on one of the user's development environments from their lists (隐藏会话, 别再显示, 'hide all but X and Y'), "
+        + "show hidden ones again (undo: 显示隐藏的会话), and disconnect the chat's own sessions there (disconnect: the phone's sessions "
+        + "close; every terminal keeps running). Nothing on the machine is deleted. It only shows the user a card listing exactly what "
+        + "will be hidden, shown and disconnected; it is done when they press it. A conversation a process has open is never hidden "
+        + "(the card says so). Call it directly with the names as the user said them (titles or parts of titles), never after "
+        + "devenv_list. Only the user's own words, in a turn answering their own message.",
+        {
+          machine: z.string().max(200).optional().describe("The machine they named; left out when they have one machine."),
+          targets: z.array(z.string().max(200)).max(30).optional().describe("The conversations to hide (or, with undo, to show again), by the names they said."),
+          keep: z.array(z.string().max(200)).max(30).optional().describe("'All but these': every other conversation there is hidden."),
+          undo: z.boolean().optional().describe("true: show hidden conversations again (all of them on that machine, or only targets)."),
+          disconnect: z.boolean().optional().describe("true: also disconnect the chat's own sessions on that machine (断开)."),
+        },
+        (args) => answer(claims, "devenv_hide", () => devenvHide(claims, args)),
       );
       mcp.tool(
         "devenv_pair",

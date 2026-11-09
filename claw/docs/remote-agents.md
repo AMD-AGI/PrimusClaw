@@ -327,7 +327,8 @@ told again once (`claw_remote_terminal_waits`).
 | Route | Purpose |
 |---|---|
 | `GET /v1/remote-agents/setup` | How to connect a machine to this server: the npm package, the exact commands with this deployment's addresses, the minimum and recommended connector versions, and the same as a short text in English and Chinese (`remote-agents/setup.ts`). |
-| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason`, `version_status` (and `upgrade_command` below the recommended version) and their agents. |
+| `GET /v1/remote-agents/connectors` | The caller's connectors, with `online`, `last_seen_at`, `offline_since`, `offline_reason`, `version_status` (and `upgrade_command` below the recommended version) and their agents. The conversations the caller hid are left out of each agent's `capabilities.resumable` and counted in `capabilities.hidden_count`; `?hidden=include` lists them too, marked `hidden: true`. |
+| `POST .../connectors/:cid/hidden` | `{refs: [...], hidden: true\|false}` (1–50 conversation refs): hide conversations of that machine from the caller's lists, or show them again. Nothing on the machine changes. Only a conversation the machine reports now may be hidden, never one a process has open (`live`) or a session holds (`attached`): those come back in `refused` (`live`, `unknown_conversation`) and stay listed; a hidden conversation a process opens again is listed while it is open. Answers `{changed, refused}`; 404 for a machine that is not the caller's or was revoked. |
 | `DELETE .../connectors/:cid` | Revoke: drops its queued commands and closes its sessions, each with a `session_closed {reason: "connector_revoked", by: "claw"}` of Claw's own (`"machine_reconnected"` when a row is replaced by registering again under its name), so whatever waited on them ends. |
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online; `409 connector_outdated` (with `data.version`, `data.upgrade_command`) when its connector is below the minimum version. |
 | `GET .../sessions`, `GET .../sessions/:id` | List (each active session with `waiting`: the permission requests it waits on its user for now, asked since its last turn ended and not answered, so a client lists those first), and read one with `connector_online`. |
@@ -526,6 +527,14 @@ data, but not the item's summary or question: those are the agent's own words (i
 `work_recall(item, "worker_tail")` reads the end of the agent's answer, and the turn that does has read
 untrusted text. `work_send` refuses these items; `work_stop` and the item's stop button
 (`POST /v1/work-items/:id/stop`) close one and cancel the agent's turn.
+
+### Hiding conversations (`devenv_hide`)
+
+`devenv_hide` hides conversations of one of the user's machines from their lists ("除了 autopilot重构 和 blog 都隐藏": `keep`; or
+`targets`, by the names the user said), shows hidden ones again (`undo`), and disconnects the chat's own sessions there
+(`disconnect`: a `close` for each; the terminals keep running). It is never done from the turn: a card lists exactly what will be
+hidden, shown and disconnected, and what is not hidden because a process has it open, and it is done when the user presses it (a
+`devenv_hide` confirmation). Only the user's own message can ask for it.
 
 ### Sending an instruction (`devenv_send`)
 

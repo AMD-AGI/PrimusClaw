@@ -66,7 +66,7 @@ export const ROUTER_PROMPT_MAX = 1500;
  */
 export type ScheduleKind = "trigger_create" | "trigger_cancel" | "github_comment";
 /** Every write a card holds: those above, and an instruction for an agent on the user's machine (`devenv-tools.ts`). */
-export type ConfirmKind = ScheduleKind | "devenv_send";
+export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide";
 /** The longest comment the router puts on a card: the card shows all of it, since the user approves exactly what is posted. */
 export const ROUTER_COMMENT_MAX = 4000;
 
@@ -454,6 +454,12 @@ export async function decideConfirmation(input: {
       const sent = await sendConfirmed(input.userId, String(row.confirmation_id), row.params as Record<string, unknown>);
       return outcome(await close(sent.ok ? "done" : "failed", sent), true);
     }
+    if (row.kind === "devenv_hide") {
+      // Conversations hidden or shown again in the lists, and the chat's sessions disconnected, as the card showed them.
+      const { hideConfirmed } = await import("./devenv-tools.js");
+      const done = await hideConfirmed(input.userId, String(row.confirmation_id), row.params as Record<string, unknown>);
+      return outcome(await close(done.ok ? "done" : "failed", done), true);
+    }
     if (row.kind === "trigger_cancel") {
       const gone = await deleteTrigger(input.userId, String(row.params.trigger_id), q);
       return outcome(await close(gone ? "done" : "failed", gone ? { trigger_id: row.params.trigger_id } : { error: "not_found" }), true);
@@ -606,6 +612,10 @@ export function describeCard(kind: string, params: Record<string, unknown> | nul
       return `post a comment as the user's GitHub account on ${oneLine(p.repo, 100)}#${String(p.number ?? "")} (no scheduled task): ${JSON.stringify(oneLine(p.body, 120))}`;
     case "devenv_send":
       return `send to ${JSON.stringify(oneLine(p.agent_id, 40))} on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${JSON.stringify(oneLine(p.text, 120))}`;
+    case "devenv_hide": {
+      const n = (k: string) => (Array.isArray(p[k]) ? (p[k] as unknown[]).length : 0);
+      return `on the machine ${JSON.stringify(oneLine(p.machine, 60))}: hide ${n("hide")} conversation(s) from the lists, show ${n("show")} again, disconnect ${n("close")} session(s)`;
+    }
     default:
       return `a ${JSON.stringify(kind)} card`;
   }
