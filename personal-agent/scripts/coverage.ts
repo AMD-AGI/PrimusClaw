@@ -15,7 +15,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
+import { oddCaseSources, SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
 
 /**
  * Each package's floor, in percent. Lowering one is a change to this file that review sees. A package directory under
@@ -38,6 +38,38 @@ function isLink(file: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Every string under `value` (a package.json `exports` map nests them under conditions and subpaths). */
+function strings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(strings);
+  if (typeof value === "object" && value !== null) return Object.values(value).flatMap(strings);
+  return [];
+}
+
+/**
+ * Why a package's runtime could load code the floor does not see, if it could: an entry point of its package.json
+ * (`exports`, `main`, `module`, `browser`, `bin`) outside its src, or a source file of the package outside src/ and
+ * test/ (which src could import by a relative path).
+ */
+export function codeOutsideSrc(packagesDir: string, pkg: string): string[] {
+  const dir = path.join(packagesDir, pkg);
+  const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as Record<string, unknown>;
+  const entries = ["exports", "main", "module", "browser", "bin"].flatMap((field) => strings(manifest[field]));
+  const src = path.join(dir, "src") + path.sep;
+  const badEntries = entries
+    .filter((target) => !path.resolve(dir, target).startsWith(src))
+    .map((target) => `packages/${pkg}/package.json points at ${target}, outside src (the floor would not see it)`);
+  const stray = readdirSync(dir, { withFileTypes: true })
+    .filter((e) => !["src", "test", "node_modules"].includes(e.name))
+    .flatMap((e) => (e.isDirectory() ? sourceFiles(path.join(dir, e.name)) : [path.join(dir, e.name)]))
+    .filter((file) => (SOURCE_EXTENSIONS as readonly string[]).includes(path.extname(file)))
+    .map((file) => `${path.relative(path.dirname(packagesDir), file)} is source outside src/ and test/`);
+  const oddCase = oddCaseSources(dir).map(
+    (file) => `${path.relative(path.dirname(packagesDir), file)} has a source extension in upper case (use lower case)`,
+  );
+  return [...badEntries, ...stray, ...oddCase];
 }
 
 /**
@@ -63,6 +95,7 @@ export function packagesToCheck(
       .filter((p) => !found.includes(p))
       .map((p) => `FLOORS names ${p}, which is not a package`),
     ...found.flatMap((p) => srcLinks(packagesDir, p)),
+    ...found.flatMap((p) => codeOutsideSrc(packagesDir, p)),
   ];
   const packages = found.flatMap((p): [string, number][] => {
     const floor = floors[p];

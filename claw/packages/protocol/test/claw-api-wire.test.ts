@@ -19,16 +19,19 @@ import {
   type HistoryCompleteData, type NotificationPayload, type NotificationSubscription, type OutboundPayload,
   type RequesterView, type RetryRefusal, type StartedReview, type StartedReviewForRequester, type WorkItemDecisionError,
   type WorkItemDetail, type WorkItemEvent, type WorkItemNeedsYouPayload, type WorkItemView,
+  type RemoteHidden, type RemoteHiddenCapabilities, type RemoteResumableListed,
 } from "../src/index.js";
 // Runtime imports of the API's serializers: pure functions over a row, no database or network.
 import { itemView } from "../../api/src/assistant/work-items.js";
 import { asRequesterAnswer } from "../../api/src/assistant/review-items.js";
 import { frozenRequesterView, routerView } from "../../api/src/assistant/requester-view.js";
 import { historyCompleteFrame } from "../../api/src/routes/events.js";
+import { withHidden } from "../../api/src/remote-agents/hidden.js";
 import type { DecisionResult, recentEvents } from "../../api/src/assistant/work-items.js";
 import type { RetryResult } from "../../api/src/assistant/retry.js";
 import type { askedOfOthers, requesterViewOf } from "../../api/src/assistant/requester-view.js";
 import type { CreatedReview, startReviews } from "../../api/src/assistant/review-items.js";
+import type { HideOutcome, setHidden } from "../../api/src/remote-agents/store.js";
 import type { NotificationPayload as ApiNotificationPayload, OutboundPayload as ApiOutboundPayload } from "../../api/src/notifications/outbox.js";
 
 // ------------------------------------------------------------------------------------------- compile-time
@@ -54,6 +57,8 @@ const WORK_ITEM_KEYS = keysOf<WorkItemView>()([
 const REQUESTER_VIEW_KEYS = keysOf<RequesterView>()([
   "status", "pr_url", "verdict", "merged", "waiting_for", "findings", "note", "pr_summary",
 ]);
+const REMOTE_HIDDEN_KEYS = keysOf<RemoteHidden>()(["changed", "refused"]);
+const HIDDEN_CAPABILITY_KEYS = keysOf<RemoteHiddenCapabilities>()(["resumable", "hidden_count"]);
 const STARTED_REVIEW_KEYS = keysOf<StartedReview>()([
   "item_id", "seq", "title", "session_id", "pr", "message_id", "ignored", "review_only", "merge_needs_confirmation",
   "merge_by_requester", "model", "fell_back_from", "queued",
@@ -87,6 +92,13 @@ export type WireAssertions = [
   // Every field the protocol says is always there.
   Expect<Equal<RequiredKeys<WorkItemView>, (typeof WORK_ITEM_KEYS)[number]>>,
   Expect<Equal<RequiredKeys<RequesterView>, (typeof REQUESTER_VIEW_KEYS)[number]>>,
+  // Remote agents: what a hide or show of a machine's conversations answers (`POST .../connectors/:cid/hidden`).
+  Expect<Equal<Awaited<ReturnType<typeof setHidden>>, RemoteHidden | null>>,
+  Expect<Equal<HideOutcome, RemoteHidden>>,
+  Expect<Equal<RequiredKeys<RemoteHidden>, (typeof REMOTE_HIDDEN_KEYS)[number]>>,
+  Expect<Equal<RequiredKeys<RemoteHiddenCapabilities>, (typeof HIDDEN_CAPABILITY_KEYS)[number]>>,
+  // The mark on a hidden conversation is a named field, not the open rest of the entry: renamed, this reads `unknown`.
+  Expect<Equal<RemoteResumableListed["hidden"], true | undefined>>,
 ];
 
 // ------------------------------------------------------------------------------------------- runtime
@@ -205,4 +217,29 @@ test("representative payloads of each event type round-trip unchanged", () => {
     sources: ["trigger"], enabled: true, consecutive_failures: 0, created_at: new Date("2026-11-09T10:00:00Z"),
   };
   assert.equal((wire(subscription) as NotificationSubscription).created_at, "2026-11-09T10:00:00.000Z");
+});
+
+test("a listing with hidden conversations has the protocol's capability fields, the hidden ones marked when included", () => {
+  const agent = {
+    agent_id: "a1", kind: "claude", name: "Claude",
+    capabilities: { unattended: true, resumable: [
+      { ref: "r-live", title: "open", state: "live" }, { ref: "r-old", title: "old", state: "idle" }, { ref: "r-kept", title: "kept" },
+    ] },
+  };
+  const hidden = new Set(["r-live", "r-old"]);
+  const left = wire(withHidden(agent, hidden, false)) as { capabilities: Record<string, unknown> };
+  for (const key of HIDDEN_CAPABILITY_KEYS) assert.ok(key in left.capabilities, key);
+  assert.deepEqual(left.capabilities, {
+    unattended: true, resumable: [{ ref: "r-live", title: "open", state: "live" }, { ref: "r-kept", title: "kept" }], hidden_count: 1,
+  });
+  const all = wire(withHidden(agent, hidden, true)) as { capabilities: RemoteHiddenCapabilities };
+  assert.deepEqual(all.capabilities.resumable.map((r) => [r.ref, r.hidden ?? false]), [["r-live", false], ["r-old", true], ["r-kept", false]]);
+  assert.equal(all.capabilities.hidden_count, 1);
+  // Nothing hidden: the row as it was, with no count.
+  assert.equal(withHidden(agent, undefined, true), agent);
+});
+
+test("a hide's answer has exactly the protocol's fields", () => {
+  const answer: RemoteHidden = { changed: ["r-old"], refused: [{ ref: "r-live", reason: "live" }] };
+  assert.deepEqual(Object.keys(wire(answer) as object).sort(), [...REMOTE_HIDDEN_KEYS].sort());
 });

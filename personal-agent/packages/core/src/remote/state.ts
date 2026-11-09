@@ -158,3 +158,11 @@ export function validZone(zone: string): string {
 export function isTransport(error: unknown): boolean {
   return error instanceof ClawUnreachable;
 }
+
+/**
+ * What the session said of `mode` (`true`: it does not ask, `false`: it asks), or undefined when it said nothing. Its own keys only:
+ * a mode called `constructor` or `__proto__` is no flag (Python's `dict.get`).
+ */
+export function modeFlagOf(flags: Readonly<Record<string, boolean>>, mode: string): boolean | undefined {
+  return Object.hasOwn(flags, mode) ? flags[mode] : undefined;
+}

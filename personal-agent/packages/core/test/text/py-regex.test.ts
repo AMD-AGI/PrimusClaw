@@ -100,7 +100,6 @@ const MORE: readonly (readonly [string, string, string, string, boolean])[] = [
   ["a.b", "s", "a\nb", "full", true],
   ["a.b", "", "a\rb", "full", true],
   ["(?P<id>i+)", "i", "II", "full", true],
-  ["(?P<x>a)(?P=x)", "", "aa", "full", true],
   ["k+", "i", "\u212a\u212a", "full", true],
   ["s", "i", "\u017f", "full", true],
   ["i", "i", "\u0131", "full", true],
@@ -171,8 +170,6 @@ const PYTHON_SYNTAX: readonly (readonly [string, string, string, string, boolean
   ["\\x69", "i", "\u0131", "full", true],
   ["[^\u0131]", "i", "i", "full", false],
   ["(?P<\u540d>\\w+)", "", "\u4e2d\u6587", "full", true],
-  ["(a)\\1", "", "aa", "full", true],
-  ["(a)\\1", "", "ab", "full", false],
   ["[\\b]", "", "\b", "full", true],
 ];
 
@@ -205,4 +202,36 @@ test("what has no JavaScript form is refused when the pattern is built, never re
     assert.throws(() => pyRegExp(pattern, flags), InvariantError, pattern);
   }
   // In Python a(?s:.)b matches "a\nb" and (?i:link) matches "LİNK": refusing is the only answer that is not wrong.
+});
+
+test("quantifier braces with an empty side are Python's: {,} is {0,}, {,n} is {0,n}, {m,} is {m,}", () => {
+  // (pattern, text, what CPython 3's re.fullmatch said)
+  for (const [pattern, text, python] of [
+    ["a{,}", "aaa", true],
+    ["a{,}", "", true],
+    ["a{,2}", "aa", true],
+    ["a{,2}", "aaa", false],
+    ["a{2,}", "a", false],
+    ["a{2,}", "aaa", true],
+    ["x{,}y", "x{,}y", false],
+    ["x{}y", "x{}y", true],
+  ] as const) {
+    assert.equal(pyFullmatch(pattern).test(text), python, `${pattern} ${text}`);
+  }
+  assert.equal(pyRegExp("a{,}").exec("aaa")?.[0], "aaa");
+});
+
+test("a backreference is refused: JavaScript matches one to a group that took no part as empty, Python fails", () => {
+  // CPython 3: re.search(r"(a)?\1b", "b") and re.search(r"(?P<x>a)?(?P=x)b", "b") are None; JavaScript finds "b".
+  for (const pattern of [
+    "(a)?\\1b",
+    "(a)\\1",
+    "(?P<x>a)?(?P=x)b",
+    "(?<x>a)\\k<x>",
+    "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\\10",
+  ]) {
+    assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
+  }
+  // an escape that is octal stays a character, as in Python
+  assert.equal(pyFullmatch("\\101").test("A"), true);
 });

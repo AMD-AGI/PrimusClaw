@@ -4,6 +4,7 @@
 // The session card as the window: when it is posted again, and the output it holds (`remote/window/`).
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { modeFlagOf } from "../../src/remote/state.js";
 
 import {
   FULL_PARTS_MAX,
@@ -110,4 +111,12 @@ test("where typed text goes is said in the chat's language", () => {
     modeSetLine("card", "zh", false, "Clawy"),
     "好的：接入会话后，聊天框留给 Clawy，发给会话用会话卡片上的输入框。",
   );
+});
+
+test("a mode named like an object's own property has no flag", () => {
+  const flags = { default: false, bypassPermissions: true };
+  assert.equal(modeFlagOf(flags, "default"), false);
+  assert.equal(modeFlagOf(flags, "bypassPermissions"), true);
+  for (const mode of ["constructor", "__proto__", "toString", "hasOwnProperty"])
+    assert.equal(modeFlagOf(flags, mode), undefined);
 });

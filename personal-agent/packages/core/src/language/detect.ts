@@ -10,8 +10,6 @@
 import type { Lang } from "../locales/lang.js";
 import { isPySpace, pyStrip } from "../text/py-text.js";
 
-export type { Lang };
-
 const CJK = /[㐀-䶿一-鿿豈-﫿]/u;
 
 export function hasCjk(text: unknown): boolean {

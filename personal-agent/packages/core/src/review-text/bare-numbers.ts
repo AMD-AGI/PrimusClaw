@@ -158,7 +158,7 @@ export function strayNumbers(text: string, groups: readonly BareGroup[]): number
   const blank = blanked(text);
   const held = new Set(groups.flatMap((g) => g.spans.map(([a, b]) => `${String(a)}:${String(b)}`)));
   const loose: number[] = [];
-  for (const m of blank.matchAll(new RegExp(LONE_NUMBER_SOURCE, "gud"))) {
+  for (const m of blank.matchAll(withIndices(pyRegExp(LONE_NUMBER_SOURCE, "g")))) {
     const span = m.indices?.[1];
     if (span === undefined || held.has(`${String(span[0])}:${String(span[1])}`)) continue;
     loose.push(decimalInt(m[1] ?? ""));

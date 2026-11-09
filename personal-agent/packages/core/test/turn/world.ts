@@ -211,6 +211,7 @@ export class Bus implements TurnSurface {
       return Promise.resolve(refused ? err(refused) : ok(undefined));
     };
     return {
+      id: "",
       inform: (text) => answer({ op: "inform", text, at: this.clock.elapsed }),
       emit: (text) => answer({ op: "emit", text, at: this.clock.elapsed }),
       finish: (message) => answer({ op: "finish", text: textOf(message), message, at: this.clock.elapsed }),
