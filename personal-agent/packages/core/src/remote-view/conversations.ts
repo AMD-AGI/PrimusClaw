@@ -8,7 +8,8 @@
 import { neutral } from "./inert.js";
 import { RESUMABLE_READ_MAX, RESUME_REF_MAX, ROOT_MAX, SUBFOLDER_MAX, WAITING_FOR_MAX } from "./limits.js";
 import { length, strip } from "./py-text.js";
-import { type Reported, capabilitiesOf, list, objOrNull } from "./reported.js";
+import type { RemoteAgent } from "./pending-model.js";
+import { type Reported, list, objOrNull } from "./reported.js";
 
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
@@ -64,9 +65,9 @@ function terminalFacts(item: Reported, state: ConversationState): Partial<Conver
 
 /** The conversations an agent offers (newest first, as reported), at most twelve. An entry without a usable `ref` or `cwd` is
  * dropped, a repeated ref is kept once, and a state that is none of the four is "unknown". */
-export function resumableOf(agent: Reported): Conversation[] {
+export function resumableOf(agent: RemoteAgent): Conversation[] {
   const entries: Conversation[] = [];
-  for (const raw of list(capabilitiesOf(agent)["resumable"])) {
+  for (const raw of list(agent.capabilities["resumable"])) {
     const item = objOrNull(raw);
     if (!item) continue;
     const { ref, cwd } = item;
