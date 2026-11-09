@@ -38,6 +38,9 @@ const bindingAnswer = z.looseObject({
 type Fetch = typeof fetch;
 
 /** The JSON object of an answer ({} when it is not one). */
+/** How long an exchange or a binding request may take, answer included. */
+export const EXCHANGE_TIMEOUT_MS = 30_000;
+
 async function jsonOf(response: Response): Promise<Record<string, unknown>> {
   try {
     const body: unknown = await response.json();
@@ -81,6 +84,8 @@ export class HttpTokenExchange implements TokenExchange {
     private readonly settings: ExchangeSettings,
     private readonly clock: Clock,
     private readonly fetchFn: Fetch = fetch,
+    /** The whole call, answer included (the Python worker's HTTP client had 30 s). */
+    private readonly timeoutMs: number = EXCHANGE_TIMEOUT_MS,
   ) {
     this.authorization = `Basic ${Buffer.from(`${settings.clientId}:${settings.clientSecret}`).toString("base64")}`;
   }
@@ -126,6 +131,7 @@ export class HttpTokenExchange implements TokenExchange {
         method: "POST",
         body: form,
         headers: { authorization: this.authorization },
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
       return err(unreachable("token", error));
@@ -180,6 +186,7 @@ export class HttpTokenExchange implements TokenExchange {
         method: "POST",
         body: JSON.stringify(payload),
         headers: { authorization: this.authorization, "content-type": "application/json" },
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
       return err(unreachable("binding", error));

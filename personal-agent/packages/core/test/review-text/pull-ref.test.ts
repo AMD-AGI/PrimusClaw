@@ -48,6 +48,7 @@ test("pull requests are found in the order the text names them, each once", () =
 test("text helpers keep Python's string semantics", () => {
   assert.deepEqual(codePoints("a😀"), ["a", "😀"]);
   assert.equal(casefold("ÀB"), "àb");
+  assert.equal(casefold("Straße"), casefold("STRASSE"));
   assert.equal(isAlnum("瑞"), true);
   assert.equal(isAlnum("_"), false);
   assert.equal(isWordChar("_"), true);
