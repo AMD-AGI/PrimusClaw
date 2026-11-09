@@ -138,3 +138,12 @@ teams/tests/test_remote_live_view.py::test_the_plain_sentences_of_switching -> p
 teams/tests/test_link_code_hardening.py::test_the_lockout_answer_names_the_configured_window -> packages/core/test/routing/small-ports.test.ts::test_the_lockout_answer_names_the_configured_window
 teams/tests/test_link_code_hardening.py::test_link_from_teams_logs_the_activity_and_answers_the_global_limit -> packages/core/test/routing/small-ports.test.ts::test_link_from_teams_logs_the_activity_and_answers_the_global_limit (the chat's part)
 teams/tests/test_turn_deadline.py::test_a_message_after_the_deadline_starts_a_turn_again -> packages/core/test/routing/small-ports.test.ts::test_a_message_after_the_deadline_starts_a_turn_again
+teams/tests/test_transparency.py::test_help_through_the_worker_in_a_1to1_chat_and_in_a_group -> packages/core/test/routing/transparency-router.test.ts::test_help_through_the_worker_in_a_1to1_chat_and_in_a_group
+teams/tests/test_transparency.py::test_the_link_steps_an_unconnected_chat_gets_say_answers_are_ai_generated -> packages/core/test/routing/transparency-router.test.ts::test_the_link_steps_an_unconnected_chat_gets_say_answers_are_ai_generated
+teams/tests/test_transparency.py::test_the_identity_binding_card_says_answers_are_ai_generated -> packages/core/test/routing/transparency-router.test.ts::test_the_identity_binding_card_says_answers_are_ai_generated
+teams/tests/test_transparency.py::test_the_connect_card_used_when_the_identity_service_does_not_answer_says_it_too -> packages/core/test/routing/transparency-router.test.ts::test_the_connect_card_used_when_the_identity_service_does_not_answer_says_it_too
+teams/tests/test_transparency.py::test_the_proactive_message_after_a_group_mention_says_it_too -> packages/core/test/routing/transparency-router.test.ts::test_the_proactive_message_after_a_group_mention_says_it_too
+teams/tests/test_transparency.py::test_both_connect_cards_render_the_notice -> MERGED packages/teams/test/views/commands.test.ts::the binding card says its lead; the repo and session cards in English
+teams/tests/test_transparency.py::test_the_app_description_says_the_same -> INTERNAL
+teams/tests/test_transparency.py::test_the_readme_quotes_the_statement_word_for_word -> INTERNAL
+teams/tests/test_transparency.py::test_a_delivered_report_is_gone_30_days_after_it_was_filed_without_another_report -> DROPPED: the store's retention of feedback reports is W1's (FeedbackRepository), tested there
