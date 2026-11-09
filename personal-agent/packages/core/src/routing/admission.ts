@@ -242,15 +242,14 @@ export class TaskAdmission {
     });
   }
 
-  /** A remote-agent prompt being sent holds a slot until it counts as running. */
-  async reserve<T>(userId: string, work: () => Promise<T>): Promise<T> {
+  /** A remote-agent prompt being sent holds a slot until it counts as running (taken under the person's lock). */
+  hold(userId: string): void {
     this.reserved.set(userId, (this.reserved.get(userId) ?? 0) + 1);
-    try {
-      return await work();
-    } finally {
-      const left = (this.reserved.get(userId) ?? 1) - 1;
-      if (left <= 0) this.reserved.delete(userId);
-      else this.reserved.set(userId, left);
-    }
+  }
+
+  letGo(userId: string): void {
+    const left = (this.reserved.get(userId) ?? 1) - 1;
+    if (left <= 0) this.reserved.delete(userId);
+    else this.reserved.set(userId, left);
   }
 }

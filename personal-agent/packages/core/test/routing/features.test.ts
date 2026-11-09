@@ -351,3 +351,52 @@ test("a vote goes to the feedback handler, and is dropped when there is none", a
   await world().router.handle({ ...vote, id: "v2" });
   assert.deepEqual(votes, ["like"]);
 });
+
+test("two prompts for the attached agent at the same time: one takes the last task slot, the other is refused", async () => {
+  let release = (): void => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const prompts: string[] = [];
+  const w = world({
+    limits: { maxConcurrentTasks: 1 },
+    remote: {
+      enabled: true,
+      attached: () => true,
+      prompt: async (p) => {
+        prompts.push(p.prompt);
+        await gate;
+      },
+    },
+  });
+  link(w, ALICE.id, "ak");
+  const first = w.router.handle(message("one"));
+  const second = w.router.handle(message("two"));
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  await Promise.all([first, second]);
+  assert.equal(prompts.length, 1);
+  assert.ok(said(w).includes("en: 1 running"));
+});
+
+test("files the channel gave no way to fetch count as files: no GitHub offer is asked again, and a group message is not empty", async () => {
+  const offers: string[] = [];
+  const w = world();
+  Object.assign(w.deps, {
+    github: {
+      remember: () => undefined,
+      helpValues: () => Promise.resolve({}),
+      offerConnect: (r: { text: string }) => (offers.push(r.text), Promise.resolve()),
+      pendingConfirmations: () => [],
+      connectionState: () => Promise.resolve(undefined),
+    },
+  });
+  link(w, ALICE.id, "ak");
+  await w.router.handle({ ...message("my PRs?"), unreadableFiles: ["report.pdf"] });
+  await w.router.handle(message("my PRs?"));
+  await w.router.settled();
+  assert.deepEqual(offers, ["my PRs?"]);
+  await w.router.handle({ ...message("", { kind: "group", conversation: "g-1" }), unreadableFiles: ["a.png"] });
+  await w.router.settled();
+  assert.ok(!said(w).some((t) => t.startsWith("**What Clawy can do for you**")));
+});
