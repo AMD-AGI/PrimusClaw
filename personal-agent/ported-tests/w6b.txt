@@ -1,0 +1,129 @@
+# W6b: what a person sees of a remote agent (Python teams_agent/remote_view.py, and session_window.window_card): reading a
+# session's events, a turn folded, the live view, the lines of an attached chat, and the views and cards of the agents, sessions,
+# status, permission, window, hidden, disconnect, takeover, machine-choice and mode cards. Includes #454 and #461 (in the baseline)
+# and the view side of internal #467 (hiding conversations, at bfc208e4). Work in progress.
+#
+# Not yet ported, waiting for the worker they run through (the remote world of W6, the router of W4):
+#   teams/tests/test_remote_view.py::test_a_pressed_instruction_card_on_a_connector_too_old_says_how_to_upgrade_it
+#   teams/tests/test_remote_live_view.py::test_saying_switch_to_the_machines_claude_attaches_the_chat_with_one_status_card_and_nothing_else
+#   teams/tests/test_remote_live_view.py::test_the_same_sentence_from_someone_the_assistant_understands_switches_at_once_without_the_assistant
+#   teams/tests/test_remote_live_view.py::test_three_messages_each_answer_streams_into_its_own_bubble_with_nothing_under_it_and_the_card_is_not_sent_again
+#   teams/tests/test_remote_live_view.py::test_an_answer_longer_than_the_bubble_streams_its_start_and_the_rest_follows_without_saying_anything_twice
+#   teams/tests/test_remote_live_view.py::test_a_stream_teams_refuses_falls_back_to_the_edited_progress_message_and_the_answer_still_comes_with_nothing_under_it
+#   teams/tests/test_remote_live_view.py::test_a_turn_longer_than_the_stream_may_stay_open_closes_it_and_the_answer_follows_as_a_message_of_its_own
+#   teams/tests/test_remote_live_view.py::test_switching_to_another_session_edits_the_card_in_place_and_leaves_one_line_between_the_two
+#   teams/tests/test_remote_live_view.py::test_back_to_the_assistant_detaches_edits_the_card_and_what_is_said_next_goes_to_the_assistant_again
+#   teams/tests/test_remote_live_view.py::test_the_session_list_has_every_session_and_switch_to_it_turns_the_list_into_the_status_card
+#   teams/tests/test_remote_live_view.py::test_an_agent_with_no_session_takes_over_its_idle_conversation_or_starts_one_in_its_first_folder
+#   teams/tests/test_remote_live_view.py::test_a_name_that_is_no_agent_of_theirs_says_so_and_attaches_nothing
+#   teams/tests/test_remote_live_view.py::test_the_assistant_may_ask_for_a_switch_back_or_the_list_and_nothing_else_of_agent
+#   teams/tests/test_remote_live_view.py::test_the_plain_sentences_of_switching
+#   teams/tests/test_remote_cards_zh.py::test_every_sentence_of_the_worker_has_its_chinese
+#   teams/tests/test_remote_cards_zh.py::test_agents_in_a_chinese_chat_is_chinese_end_to_end
+#   teams/tests/test_remote_cards_zh.py::test_a_tap_that_cannot_go_through_says_why_in_a_chinese_chat
+#   teams/tests/test_remote_own_window.py::test_attaching_sends_the_status_card_with_no_link_to_a_web_page
+#   teams/tests/test_remote_own_window.py::test_the_sessions_and_agents_cards_link_no_web_page
+#   teams/tests/test_machine_health.py::test_the_agents_card_says_under_the_machine_what_is_wrong_and_how_to_fix_it
+#   teams/tests/test_machine_health.py::test_a_connector_without_health_shows_the_card_as_before
+#   teams/tests/test_agents_card_refresh.py::test_every_op_on_the_card_is_classified
+#   teams/tests/test_agents_card_refresh.py::test_a_tap_that_stays_brings_the_whole_list_back
+#   teams/tests/test_agents_card_refresh.py::test_close_then_attach_from_the_card_that_came_back
+#   teams/tests/test_agents_card_refresh.py::test_the_close_line_speaks_chinese_in_a_chinese_chat
+#   teams/tests/test_agents_card_refresh.py::test_where_teams_refuses_the_delete_the_old_card_points_at_the_new_one
+#   teams/tests/test_agents_card_refresh.py::test_a_tap_on_the_status_card_that_ends_on_the_list_is_answered_in_place
+#   teams/tests/test_agents_card_refresh.py::test_connect_a_new_machine_says_how_and_brings_the_whole_list_back_under_it
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+
+teams/tests/test_remote_view.py::test_chunks_are_read_in_either_shape -> packages/core/test/remote-view/events.test.ts::chunks are read in either shape
+teams/tests/test_remote_view.py::test_tool_calls_are_read_with_their_id_title_and_status -> packages/core/test/remote-view/events.test.ts::tool calls are read with their id title and status
+teams/tests/test_remote_view.py::test_a_plan_is_one_line_saying_where_it_stands -> packages/core/test/remote-view/events.test.ts::a plan is one line saying where it stands
+teams/tests/test_remote_view.py::test_session_started_says_the_mode_and_the_modes -> packages/core/test/remote-view/events.test.ts::session started says the mode and the modes
+teams/tests/test_remote_view.py::test_mode_update_says_the_new_mode_in_either_spelling -> packages/core/test/remote-view/events.test.ts::mode update says the new mode in either spelling
+teams/tests/test_remote_view.py::test_how_a_turn_or_session_ends -> packages/core/test/remote-view/events.test.ts::how a turn or session ends
+teams/tests/test_remote_view.py::test_events_the_agent_replayed_are_never_new -> packages/core/test/remote-view/events.test.ts::events the agent replayed are never new
+teams/tests/test_remote_view.py::test_a_permission_request_and_its_answer_are_passed_on_whole -> packages/core/test/remote-view/events.test.ts::a permission request and its answer are passed on whole
+teams/tests/test_remote_view.py::test_the_answer_is_the_agents_last_piece_of_text_not_its_narration -> packages/core/test/remote-view/turn.test.ts::the answer is the agents last piece of text not its narration
+teams/tests/test_remote_view.py::test_a_turn_that_ends_on_a_tool_still_has_its_last_text_as_the_answer -> packages/core/test/remote-view/turn.test.ts::a turn that ends on a tool still has its last text as the answer
+teams/tests/test_remote_view.py::test_a_turn_that_never_ends_holds_a_bounded_amount_of_text_and_ids -> packages/core/test/remote-view/turn.test.ts::a turn that never ends holds a bounded amount of text and ids
+teams/tests/test_remote_view.py::test_a_repeat_of_a_recent_event_is_dropped_even_after_many_others -> packages/core/test/remote-view/turn.test.ts::a repeat of a recent event is dropped even after many others
+teams/tests/test_remote_view.py::test_an_event_seen_twice_counts_once -> packages/core/test/remote-view/turn.test.ts::an event seen twice counts once
+teams/tests/test_remote_view.py::test_the_session_closing_is_noted_with_its_reason -> packages/core/test/remote-view/turn.test.ts::the session closing is noted with its reason
+teams/tests/test_remote_view.py::test_the_view_says_who_is_working -> packages/core/test/remote-view/live-view.test.ts::the view says who is working
+teams/tests/test_remote_view.py::test_text_streams_into_one_block_and_a_tool_starts_a_new_one -> packages/core/test/remote-view/live-view.test.ts::text streams into one block and a tool starts a new one
+teams/tests/test_remote_view.py::test_thoughts_are_dim_italic_lines_without_markup_of_their_own -> packages/core/test/remote-view/live-view.test.ts::thoughts are dim italic lines without markup of their own
+teams/tests/test_remote_view.py::test_a_long_thought_keeps_its_end -> packages/core/test/remote-view/live-view.test.ts::a long thought keeps its end
+teams/tests/test_remote_view.py::test_the_running_step_is_one_line_and_leaves_nothing_when_it_goes_well -> packages/core/test/remote-view/live-view.test.ts::the running step is one line and leaves nothing when it goes well
+teams/tests/test_remote_view.py::test_a_step_that_failed_leaves_one_line_under_the_title_it_started_with -> packages/core/test/remote-view/live-view.test.ts::a step that failed leaves one line under the title it started with
+teams/tests/test_remote_view.py::test_a_tool_title_is_untrusted_text -> packages/core/test/remote-view/live-view.test.ts::a tool title is untrusted text
+teams/tests/test_remote_view.py::test_the_plan_is_one_line_updated_in_place -> packages/core/test/remote-view/live-view.test.ts::the plan is one line updated in place
+teams/tests/test_remote_view.py::test_a_credential_split_across_two_chunks_is_still_masked -> packages/core/test/remote-view/live-view.test.ts::a credential split across two chunks is still masked
+teams/tests/test_remote_view.py::test_a_long_turn_shows_only_the_newest_part -> packages/core/test/remote-view/live-view.test.ts::a long turn shows only the newest part
+teams/tests/test_remote_view.py::test_one_endless_block_does_not_grow_the_view_without_bound -> MERGED packages/core/test/remote-view/live-view.test.ts::one endless block does not grow the view without bound [agent_message_chunk]
+teams/tests/test_remote_view.py::test_steps_that_never_end_cannot_grow_the_running_list_without_bound -> packages/core/test/remote-view/live-view.test.ts::steps that never end cannot grow the running list without bound
+teams/tests/test_remote_view.py::test_apply_says_whether_the_view_changed -> packages/core/test/remote-view/live-view.test.ts::apply says whether the view changed
+teams/tests/test_remote_view.py::test_a_note_is_a_line_of_its_own -> packages/core/test/remote-view/live-view.test.ts::a note is a line of its own
+teams/tests/test_remote_view.py::test_an_empty_answer_still_says_something -> packages/core/test/remote-view/turn.test.ts::an empty answer still says something
+teams/tests/test_remote_view.py::test_a_long_answer_is_split_and_then_cut_with_a_line_that_says_so -> packages/core/test/remote-view/turn.test.ts::a long answer is split and then cut with a line that says so
+teams/tests/test_remote_view.py::test_a_credential_in_the_answer_is_masked -> packages/core/test/remote-view/turn.test.ts::a credential in the answer is masked
+teams/tests/test_remote_view.py::test_the_buttons_are_the_options_the_adapter_offered_with_their_own_ids -> packages/teams/test/remote/permission.test.ts::the buttons are the options the adapter offered with their own ids
+teams/tests/test_remote_view.py::test_the_allow_always_option_is_shown_labelled_and_explained -> packages/teams/test/remote/permission.test.ts::the allow always option is shown labelled and explained
+teams/tests/test_remote_view.py::test_buttons_come_in_a_fixed_order_whatever_order_the_agent_sent -> packages/teams/test/remote/permission.test.ts::buttons come in a fixed order whatever order the agent sent
+teams/tests/test_remote_view.py::test_no_more_than_four_buttons_and_the_allow_and_reject_ones_survive -> packages/teams/test/remote/permission.test.ts::no more than four buttons and the allow and reject ones survive
+teams/tests/test_remote_view.py::test_an_option_with_an_unknown_kind_is_still_a_button_with_its_own_name -> packages/teams/test/remote/permission.test.ts::an option with an unknown kind is still a button with its own name
+teams/tests/test_remote_view.py::test_only_usable_options_are_kept_and_each_once -> packages/teams/test/remote/permission.test.ts::only usable options are kept and each once
+teams/tests/test_remote_view.py::test_option_ids_are_passed_through_untouched -> packages/teams/test/remote/permission.test.ts::option ids are passed through untouched
+teams/tests/test_remote_view.py::test_a_button_without_a_name_says_what_its_kind_means -> packages/teams/test/remote/permission.test.ts::a button without a name says what its kind means
+teams/tests/test_remote_view.py::test_the_card_says_whose_agent_what_it_wants_and_until_when -> packages/teams/test/remote/permission.test.ts::the card says whose agent what it wants and until when
+teams/tests/test_remote_view.py::test_the_raw_input_is_collapsed_and_credentials_in_it_are_masked -> packages/teams/test/remote/permission.test.ts::the raw input is collapsed and credentials in it are masked
+teams/tests/test_remote_view.py::test_the_title_the_agent_wrote_cannot_make_a_link_or_leak_a_secret -> packages/teams/test/remote/permission.test.ts::the title the agent wrote cannot make a link or leak a secret
+teams/tests/test_remote_view.py::test_arguments_and_raw_details_the_agent_supplied_cannot_make_a_link_or_a_tag -> packages/teams/test/remote/permission.test.ts::arguments and raw details the agent supplied cannot make a link or a tag
+teams/tests/test_remote_view.py::test_defang_keeps_text_whole_and_leaves_other_values_alone -> packages/teams/test/remote/permission.test.ts::defang keeps text whole and leaves other values alone
+teams/tests/test_remote_view.py::test_a_request_with_no_input_is_still_a_card -> packages/teams/test/remote/permission.test.ts::a request with no input is still a card
+teams/tests/test_remote_view.py::test_the_kind_picks_a_label_and_an_icon -> packages/core/test/remote-view/agents.test.ts::the kind picks a label and an icon
+teams/tests/test_remote_view.py::test_untrusted_text_is_one_masked_clipped_line -> packages/core/test/remote-view/agents.test.ts::untrusted text is one masked clipped line
+teams/tests/test_remote_view.py::test_agents_are_listed_per_machine_with_their_state_and_a_way_to_start_one -> packages/core/test/remote-view/lines.test.ts::agents are listed per machine with their state and a way to start one
+teams/tests/test_remote_view.py::test_nothing_connected_says_how_to_connect_a_machine -> packages/core/test/remote-view/lines.test.ts::nothing connected says how to connect a machine
+teams/tests/test_remote_view.py::test_setup_comes_from_claw_else_from_the_address_claw_is_reached_at -> MERGED packages/core/test/remote/connector-setup.test.ts::setup comes from claw else from the address claw is reached at
+teams/tests/test_remote_view.py::test_an_old_connector_is_shown_with_the_command_that_upgrades_it -> packages/core/test/remote-view/lines.test.ts::an old connector is shown with the command that upgrades it
+teams/tests/test_remote_view.py::test_a_machine_name_cannot_make_markup -> packages/core/test/remote-view/lines.test.ts::a machine name cannot make markup
+teams/tests/test_remote_view.py::test_sessions_are_numbered_newest_first_with_the_attached_one_marked -> packages/core/test/remote-view/lines.test.ts::sessions are numbered newest first with the attached one marked
+teams/tests/test_remote_view.py::test_a_typed_subfolder_stays_below_its_root -> packages/core/test/remote-view/agents.test.ts::a typed subfolder stays below its root
+teams/tests/test_remote_view.py::test_a_subfolder_is_joined_with_the_separator_its_root_uses -> packages/core/test/remote-view/agents.test.ts::a subfolder is joined with the separator its root uses
+teams/tests/test_remote_view.py::test_the_folders_an_agent_reports_are_strings_each_once_at_most_eight -> packages/core/test/remote-view/agents.test.ts::the folders an agent reports are strings each once at most eight
+teams/tests/test_remote_view.py::test_unattended_is_read_from_the_documented_keys_and_absent_is_unknown -> packages/core/test/remote-view/agents.test.ts::unattended is read from the documented keys and absent is unknown
+teams/tests/test_remote_view.py::test_an_agent_without_capabilities_at_all_is_read_as_knowing_nothing -> packages/core/test/remote-view/agents.test.ts::an agent without capabilities at all is read as knowing nothing
+teams/tests/test_remote_view.py::test_what_a_connector_says_about_unattended_is_read_from_its_events -> packages/core/test/remote-view/events.test.ts::what a connector says about unattended is read from its events
+teams/tests/test_remote_view.py::test_the_agents_card_validates_against_adaptive_cards_1_5_and_its_ids_and_buttons_are_sound -> packages/teams/test/remote/cards.test.ts::the agents card validates against adaptive cards 1 5 and its ids and buttons are sound
+teams/tests/test_remote_view.py::test_the_smaller_cards_validate_too -> packages/teams/test/remote/cards.test.ts::the smaller cards validate too
+teams/tests/test_remote_view.py::test_the_status_card_says_where_the_chat_is_and_its_buttons_are_the_system_operations -> packages/teams/test/remote/cards.test.ts::the status card says where the chat is and its buttons are the system operations
+teams/tests/test_remote_view.py::test_the_unattended_note_on_the_status_card_follows_the_users_language -> packages/teams/test/remote/cards.test.ts::the unattended note on the status card follows the users language
+teams/tests/test_remote_view.py::test_the_status_card_back_at_the_assistant_offers_to_go_back_and_one_that_ended_does_not -> packages/teams/test/remote/cards.test.ts::the status card back at the assistant offers to go back and one that ended does not
+teams/tests/test_remote_view.py::test_the_sessions_card_lists_every_machine_and_session_and_what_a_terminal_has_open -> packages/teams/test/remote/sessions-card.test.ts::the sessions card lists every machine and session and what a terminal has open
+teams/tests/test_remote_view.py::test_the_sessions_card_puts_what_waits_for_the_user_first_and_says_so -> packages/teams/test/remote/sessions-card.test.ts::the sessions card puts what waits for the user first and says so
+teams/tests/test_remote_view.py::test_what_a_terminal_is_doing_is_read_only_for_one_it_has_open -> packages/core/test/remote-view/agents.test.ts::what a terminal is doing is read only for one it has open
+teams/tests/test_remote_view.py::test_the_live_view_of_a_remote_turn_says_its_step_in_the_floating_status_and_never_its_words -> packages/core/test/remote-view/live-view.test.ts::the live view of a remote turn says its step in the floating status and never its words
+teams/tests/test_remote_view.py::test_the_conversations_an_agent_offers_to_take_over_are_read_defensively -> packages/core/test/remote-view/agents.test.ts::the conversations an agent offers to take over are read defensively
+teams/tests/test_remote_view.py::test_at_most_twelve_conversations_are_read_and_the_card_with_them_validates -> packages/teams/test/remote/cards.test.ts::at most twelve conversations are read and the card with them validates
+teams/tests/test_remote_view.py::test_pair_text_puts_the_command_alone_in_a_code_block_in_the_users_language -> packages/core/test/remote-view/lines.test.ts::pair text puts the command alone in a code block in the users language
+teams/tests/test_remote_view.py::test_the_sessions_card_with_no_machine_gives_each_command_as_a_line_to_copy -> packages/teams/test/remote/sessions-card.test.ts::the sessions card with no machine gives each command as a line to copy
+teams/tests/test_remote_view.py::test_what_claw_writes_for_an_instruction_its_machine_never_got_is_read_as_that -> packages/core/test/remote-view/lines.test.ts::what claw writes for an instruction its machine never got is read as that
+teams/tests/test_remote_cards_zh.py::test_the_word_list_comes_from_the_tables_and_is_not_trivial -> packages/teams/test/remote/cards-zh.test.ts::the word list comes from the tables and is not trivial
+teams/tests/test_remote_cards_zh.py::test_every_table_sentence_has_the_same_fields_in_both_languages -> packages/teams/test/remote/cards-zh.test.ts::every table sentence has the same fields in both languages
+teams/tests/test_remote_cards_zh.py::test_a_card_in_a_chinese_chat_has_no_english_ui_word_left -> packages/teams/test/remote/cards-zh.test.ts::a card in a chinese chat has no english ui word left
+teams/tests/test_remote_cards_zh.py::test_the_fixtures_say_every_sentence_of_the_table -> packages/teams/test/remote/cards-zh.test.ts::the fixtures say every sentence of the table
+teams/tests/test_remote_cards_zh.py::test_english_is_unchanged_in_shape -> packages/teams/test/remote/cards-zh.test.ts::english is unchanged in shape
+teams/tests/test_remote_cards_zh.py::test_agent_refs_are_inert_in_a_list_of_names -> packages/core/test/remote-view/agents.test.ts::agent refs are inert in a list of names
+teams/tests/test_remote_cards_zh.py::test_an_always_option_named_in_chinese_keeps_its_english_title -> packages/teams/test/remote/cards-zh.test.ts::an always option named in chinese keeps its english title
+teams/tests/test_remote_own_window.py::test_the_page_of_a_session_and_of_the_list_are_under_the_console -> packages/teams/test/remote/cards.test.ts::the page of a session and of the list are under the console
+teams/tests/test_remote_own_window.py::test_the_status_card_links_its_session_page_only_while_the_chat_is_in_the_session -> packages/teams/test/remote/cards.test.ts::the status card links its session page only while the chat is in the session
+teams/tests/test_machine_health.py::test_each_problem_once_failures_first_with_the_fix_in_the_users_language -> packages/core/test/remote-view/health.test.ts::each problem once failures first with the fix in the users language
+teams/tests/test_machine_health.py::test_no_health_is_unknown_and_no_problems_is_nothing_to_say -> packages/core/test/remote-view/health.test.ts::no health is unknown and no problems is nothing to say
+teams/tests/test_machine_health.py::test_what_the_connector_wrote_is_inert_and_an_unknown_code_shows_its_detail -> packages/core/test/remote-view/health.test.ts::what the connector wrote is inert and an unknown code shows its detail
+teams/tests/test_machine_health.py::test_more_than_four_problems_points_at_doctor -> packages/core/test/remote-view/health.test.ts::more than four problems points at doctor
+teams/tests/test_machine_health.py::test_a_malformed_report_never_breaks_the_card -> packages/core/test/remote-view/health.test.ts::a malformed report never breaks the card
+teams/tests/test_machine_health.py::test_a_fix_in_words_is_not_put_as_a_command_to_run -> packages/core/test/remote-view/health.test.ts::a fix in words is not put as a command to run
+teams/tests/test_session_window.py::test_the_card_in_both_languages -> packages/teams/test/remote/window-card.test.ts::the card in both languages
+teams/tests/test_session_window.py::test_the_output_is_bounded_with_more_behind_a_toggle_and_made_inert -> packages/teams/test/remote/window-card.test.ts::the output is bounded with more behind a toggle and made inert
+teams/tests/test_session_window.py::test_the_agents_words_outside_the_output_are_inert_too -> packages/teams/test/remote/window-card.test.ts::the agents words outside the output are inert too
+teams/tests/test_session_window.py::test_a_waiting_approval_and_a_busy_terminal_are_its_state -> packages/teams/test/remote/window-card.test.ts::a waiting approval and a busy terminal are its state
+teams/tests/test_session_window.py::test_stop_says_it_interrupts_the_terminal_where_messages_are_typed_into_one -> packages/teams/test/remote/window-card.test.ts::stop says it interrupts the terminal where messages are typed into one

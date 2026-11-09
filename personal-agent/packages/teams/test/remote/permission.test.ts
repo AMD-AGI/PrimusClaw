@@ -209,3 +209,63 @@ test("what a permission card becomes once answered says who and when", () => {
   const odd = cardOf(decidedCard(remoteView.decidedView({ optionId: "o", name: "Later", kind: "snooze" }, 0, "UTC")));
   assert.ok(textsOf(odd).includes("🚫 Later (you, 00:00)"));
 });
+
+/** The card's text in reading order, each fact as `name: value` (the approval card tests' reading). */
+function linesOf(node: unknown): string[] {
+  if (Array.isArray(node)) return node.flatMap(linesOf);
+  if (!node || typeof node !== "object") return [];
+  const n = node as Json;
+  const own: string[] = [];
+  if (n["type"] === "TextBlock" && n["text"] !== "┃") own.push(String(n["text"]));
+  if (n["type"] === "FactSet") {
+    for (const fact of n["facts"] as Json[])
+      own.push(`${String(fact["title"]).replaceAll("⁠", "")}: ${String(fact["value"])}`);
+  }
+  return [...own, ...linesOf(n["items"] ?? []), ...linesOf(n["columns"] ?? [])];
+}
+
+test("the card says whose agent what it wants and until when", () => {
+  const card = cardFor(CODEX_OPTIONS);
+  const lines = linesOf(card["body"]);
+  assert.equal(lines[0], "⚠️ Approval needed");
+  assert.equal(lines[1], "Codex on dev-pod asks permission (edit).");
+  assert.ok(lines.includes("Action: Edit README.md") && lines.includes("path: README.md"), lines.join(" | "));
+});
+
+test("the raw input is collapsed and credentials in it are masked", () => {
+  const request = {
+    actionId: "a1",
+    tool: "Run curl",
+    kind: "execute",
+    input: {
+      command: "curl -H 'Authorization: Bearer sk-EXAMPLE-abcdef0123456789abcdef0123456789' https://x.example",
+      api_key: "hunter2-hunter2",
+    },
+  };
+  const card = cardFor(CODEX_OPTIONS, request);
+  const blob = JSON.stringify(card);
+  assert.ok(!blob.includes("sk-EXAMPLE-abcdef0123456789abcdef0123456789") && !blob.includes("hunter2"));
+  assert.ok((card["body"] as Json[]).some((b) => b["isVisible"] === false));
+});
+
+test("arguments and raw details the agent supplied cannot make a link or a tag", () => {
+  const request = {
+    actionId: "a1",
+    tool: "Run",
+    kind: "execute",
+    input: {
+      command: "echo [Sign in](https://attacker.example) ![x](https://attacker.example/p.png) <a href=x>y</a>",
+      "[evil](http://e) key": "v",
+      nested: ["[a](http://b)", { k: "<b>x</b>" }],
+    },
+  };
+  const blob = JSON.stringify(cardFor(CODEX_OPTIONS, request));
+  for (const bad of ["](", "<a", "<b>", "</"]) assert.ok(!blob.includes(bad), bad);
+  assert.ok(blob.includes("echo") && blob.includes("Sign in")); // still readable: only inert
+});
+
+test("a request with no input is still a card", () => {
+  const lines = linesOf(cardFor(CODEX_OPTIONS, { actionId: "a1", tool: "Think hard", kind: "" })["body"]);
+  assert.equal(lines[1], "Codex on dev-pod asks permission.");
+  assert.ok(lines.includes("Action: Think hard"), lines.join(" | "));
+});

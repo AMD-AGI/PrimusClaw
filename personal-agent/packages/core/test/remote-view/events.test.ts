@@ -158,3 +158,91 @@ test("an unknown type is nothing", () => {
   assert.equal(read(frame("constructor")), NOTHING);
   assert.equal(read(frame("history_complete")), NOTHING);
 });
+
+// Events as claw/docs/remote-agents.md describes them: `data.unattended` on session_started, session_resumed and mode_update, and
+// `data.modes[].unattended` on session_started and session_resumed.
+const MODES_WITH_FLAGS = [
+  { id: "default", name: "Default", unattended: false },
+  { id: "plan", name: "Plan", unattended: false },
+  { id: "bypassPermissions", name: "Bypass", unattended: true },
+];
+const FLAGS = { default: false, plan: false, bypassPermissions: true };
+
+test("what a connector says about unattended is read from its events", () => {
+  const cases: [string, string, JsonObject, string, boolean | null, Record<string, boolean> | null][] = [
+    [
+      "session_started",
+      "starts unattended",
+      { currentMode: "bypassPermissions", unattended: true, modes: MODES_WITH_FLAGS },
+      "bypassPermissions",
+      true,
+      FLAGS,
+    ],
+    [
+      "session_started",
+      "starts asking",
+      { currentMode: "default", unattended: false, modes: MODES_WITH_FLAGS },
+      "default",
+      false,
+      FLAGS,
+    ],
+    [
+      "session_resumed",
+      "resumed asking",
+      { currentMode: "plan", unattended: false, modes: MODES_WITH_FLAGS },
+      "plan",
+      false,
+      FLAGS,
+    ],
+    [
+      "mode_update",
+      "switched",
+      { currentMode: "bypassPermissions", unattended: true },
+      "bypassPermissions",
+      true,
+      null,
+    ],
+    [
+      "session_started",
+      "a connector from before the keys",
+      { currentMode: "default", modes: [{ id: "default" }, { id: "plan" }] },
+      "default",
+      null,
+      null,
+    ],
+    [
+      "session_started",
+      "keys that are not booleans",
+      {
+        currentMode: "default",
+        unattended: "no",
+        modes: [
+          { id: "a", unattended: 1 },
+          { id: "b", unattended: null },
+        ],
+      },
+      "default",
+      null,
+      null,
+    ],
+    [
+      "session_started",
+      "one mode that says and others that do not",
+      { currentMode: "a", modes: [{ id: "a", unattended: true }, { id: "b" }, { name: "x", unattended: true }] },
+      "a",
+      null,
+      { a: true },
+    ],
+  ];
+  for (const [name, label, data, mode, unattended, flags] of cases) {
+    const step = read(frame(name, data));
+    assert.deepEqual([step.mode, step.unattended, step.modeFlags], [mode, unattended, flags], label);
+    const modes = data["modes"];
+    if (Array.isArray(modes)) {
+      const ids = modes.flatMap((m) =>
+        m && typeof m === "object" && !Array.isArray(m) && typeof m["id"] === "string" ? [m["id"]] : [],
+      );
+      assert.deepEqual(step.modes, ids, label);
+    }
+  }
+});
