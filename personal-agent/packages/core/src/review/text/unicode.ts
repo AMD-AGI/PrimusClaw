@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { pyStrip } from "../../text/py-text.js";
+
 /**
  * Text helpers that keep the Python worker's string semantics where a review request depends on them: lengths and slices count
  * code points (not UTF-16 units), "alphanumeric" and "word" are Unicode-aware, and whitespace runs collapse as `str.split()` does.
@@ -71,4 +73,12 @@ export const NAME_PADDING = " \t,，、:：@";
 /** `who` with the padding a request leaves around a name taken off ('' when nothing is left). */
 export function bareName(who: string): string {
   return stripChars(who, NAME_PADDING);
+}
+
+const PICK_CJK = /[㐀-䶿一-鿿豈-﫿]/u;
+
+/** The language of the first text that has anything in it: Chinese when it has Chinese, else English. */
+export function pickLang(...texts: readonly string[]): "zh" | "en" {
+  for (const text of texts) if (pyStrip(text)) return PICK_CJK.test(text) ? "zh" : "en";
+  return "en";
 }
