@@ -8,7 +8,7 @@
  * chunks is still caught.
  */
 import type { RemoteStep } from "./events.js";
-import { splitErrorTail } from "./pending-public-error.js";
+import { splitErrorTail } from "../public-error/classify.js";
 import { masked as redactText, neutral } from "./inert.js";
 import type { Lang } from "../locales/lang.js";
 import { ACTIVE_STEPS_MAX, BLOCK_KEEP_CHARS, THOUGHT_MAX, TOOL_TITLE_MAX } from "./limits.js";

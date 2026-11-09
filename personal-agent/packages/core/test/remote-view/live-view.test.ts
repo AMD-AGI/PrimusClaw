@@ -176,3 +176,24 @@ test("the live view of a remote turn says its step in the floating status and ne
   v.apply(remoteStep({ tool: { id: "t1", title: "make test", status: "failed" } }));
   assert.equal(v.statusLines().at(-1), "⚠️ make test failed, continuing");
 });
+
+test("the remote live view cuts off a raw error while the turn still runs", () => {
+  const host = "llm-gw.cluster.internal";
+  const brainError =
+    `API Error: 502 {"error":{"message":"upstream connect error to http://${host}:4000/v1/chat/completions ` +
+    `(10.1.2.3:4000): connection refused","type":"None","param":"None","code":"502"}}\n` +
+    "No fallback model group found for original model_group=claude-sonnet-5.5. Fallbacks=[]";
+  const v = view();
+  v.apply(remoteStep({ chunk: { kind: "message", text: "I edited the loader.\n\n" } }));
+  v.apply(remoteStep({ chunk: { kind: "message", text: brainError } }));
+  const shown = v.render();
+  assert.ok(shown.includes("I edited the loader."), shown);
+  for (const leak of [host, "10.1.2.3", "model_group", "API Error"]) assert.ok(!shown.includes(leak), leak);
+  v.apply(remoteStep({ tool: { id: "t1", title: "Run tests", status: "in_progress" } }));
+  v.apply(
+    remoteStep({
+      chunk: { kind: "message", text: "Still going.\n\ndial tcp redis:6379 (10.1.2.3): connection reset by peer" },
+    }),
+  );
+  assert.ok(!v.render().includes("10.1.2.3") && v.render().includes("Still going."), v.render());
+});
