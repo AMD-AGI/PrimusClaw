@@ -1418,7 +1418,7 @@ export class GithubReview {
    */
   private confirmedMergesOnly(ctx: Ctx, risk: RiskResult): RiskResult {
     if (!ctx.actor.mergeNeedsConfirmation) return risk;
-    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or 批准 #<ref>)`;
+    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese)`;
     return { ...risk, level: "high", reasons: [...risk.reasons, reason] };
   }
 

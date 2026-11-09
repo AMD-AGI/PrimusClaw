@@ -48,6 +48,7 @@ import {
   reviewItemsEnabled, REVIEWS_STARTED_AT_ONCE, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
+import { commandLanguageOf, typedCommand } from "./typed-commands.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { attachRefOf, ownAttachRef } from "./devenv-tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
@@ -941,7 +942,9 @@ export async function confirmationAnswer(
     const { userId, message, via } = await attendedTurn(q, claims);
     const pending = await pendingConfirmationsFor(q, userId);
     if (!pending.length) throw new ToolRefused("no_pending_confirmation", "nothing waits for the user's answer");
-    const replies = pending.map((c) => `批准 #${confirmationRef(c.id)} for ${c.repo}#${c.pr}`).join("; ");
+    // (each command in the language of the user's message, as the router repeats it to them: `typed-commands.ts`)
+    const lang = await commandLanguageOf(message.content);
+    const replies = pending.map((c) => `${typedCommand("approve", confirmationRef(c.id), lang)} for ${c.repo}#${c.pr}`).join("; ");
     let pick: PendingConfirmation | undefined;
     if (args.decision === "allow") {
       // Saying yes is one exact command carrying the id of the write the person was shown (`approvalCommand`), or the card's

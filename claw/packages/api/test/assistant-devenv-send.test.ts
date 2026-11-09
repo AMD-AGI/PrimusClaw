@@ -656,7 +656,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(voidedLine, /never pressed: nothing was sent/);
     assert.match(voidedPart, /asked what waits for them, leave these out\. Do not bring one up on your own\./);
     assert.match(voidedPart, /never say you cannot tell whether it was pressed or lapsed/);
-    assert.doesNotMatch(voidedPart, new RegExp(`批准 #${laptopRef}`), "a void card is never put to them to approve");
+    assert.doesNotMatch(voidedPart, new RegExp(`(?:批准|approve) #${laptopRef}`), "a void card is never put to them to approve");
     assert.equal((await schedules.renderScheduleState("bob")), "", "another user is shown nothing of alice's void card");
     // A day on, it is no longer shown at all.
     await w.q("UPDATE claw_assistant_confirmations SET decided_at = NOW() - INTERVAL '25 hours' WHERE confirmation_id = $1", [toLaptop.confirmation_id]);
@@ -1755,7 +1755,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v12");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v13");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

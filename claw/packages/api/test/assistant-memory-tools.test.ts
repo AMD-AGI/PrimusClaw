@@ -15,6 +15,7 @@
  *   N1  a natural "forget" acts on an entry whose number is in the person's message
  *   N2  ... or in what the assistant said to them just before ("forget the second one" after a list)
  *   N3  a natural "undo" of what was just saved, by the number the assistant announced
+ *   N3e the undo command a save answers is in the language of the message that asked for it (undo #N, 撤销 #N), and undo #N works
  *   G1  a report's turn (not the person) cannot save, change, forget or undo, whatever the report says; nothing changes
  *   G2  an entry named neither in the message nor in what was just shown is refused, and so is one shown too long
  *       before the message, or only after it
@@ -202,6 +203,29 @@ describe("assistant memory tools", { skip }, () => {
     const undo = await message(alice, "撤销刚才那条");
     assert.deepEqual(await mt.memoryUndo(undo, { id: String(saved.id) }), { ok: true, id: saved.id, op: "deleted" });
     assert.equal((await entries()).length, 0);
+  });
+
+  test("N3e the undo command a save answers is in the language the person asked in, and the English one undoes it", async () => {
+    // 2026-11-09 (English conversation): "Remembered (#1343) … Say 撤销 #1343 to undo it". The note is repeated to the person word
+    // for word, so its command is theirs: English for an English message, Chinese for a Chinese one (`typed-commands.ts`).
+    const zh = await message(alice, "记住：以后回复都用中文，说人话");
+    const savedZh = await mt.memorySave(zh, { type: "user", title: "回复用中文，说人话", body: "回复都用中文，说人话", evidence_quote: "以后回复都用中文，说人话" });
+    assert.equal(savedZh.undo, `撤销 #${savedZh.id}`);
+    assert.match(String(savedZh.note), new RegExp(`say 撤销 #${savedZh.id} to undo it`));
+    await w.closeRun(zh.task_id);
+    const en = await message(alice, "remember: I mainly work on ROCm GEMM kernel optimization, keep answers short");
+    const savedEn = await mt.memorySave(en, {
+      type: "user", title: "Works on ROCm GEMM kernels; short answers", body: "Mainly works on ROCm GEMM kernel optimization; keep answers short",
+      evidence_quote: "I mainly work on ROCm GEMM kernel optimization, keep answers short",
+    });
+    assert.equal(savedEn.ok, true);
+    assert.equal(savedEn.undo, `undo #${savedEn.id}`);
+    assert.match(String(savedEn.note), new RegExp(`say undo #${savedEn.id} to undo it`));
+    assert.doesNotMatch(String(savedEn.note), /\p{Script=Han}/u, "no Chinese command in what an English conversation is told");
+    await w.closeRun(en.task_id);
+    const undo = await message(alice, `undo #${savedEn.id}`);
+    assert.deepEqual(await mt.memoryUndo(undo, { id: String(savedEn.id) }), { ok: true, id: savedEn.id, op: "deleted" });
+    assert.deepEqual((await entries()).map((e) => e.id), [savedZh.id]);
   });
 
   test("G1 a report's turn cannot save, change, forget or undo, whatever the report says", async () => {

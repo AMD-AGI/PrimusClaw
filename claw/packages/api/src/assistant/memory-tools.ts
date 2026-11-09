@@ -34,6 +34,7 @@ import {
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import { commandLanguageOf, typedCommand, type CommandLanguage } from "./typed-commands.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-memory" });
@@ -157,11 +158,13 @@ async function announce(sessionId: string, r: Extract<WriteResult, { ok: true }>
   }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "assistant.memory_notice_publish_failed"));
 }
 
-function written(r: Extract<WriteResult, { ok: true }>): Record<string, unknown> {
+/** What a save or an update answers: the undo command in the language of the message that asked for it (`typed-commands.ts`). */
+function written(r: Extract<WriteResult, { ok: true }>, lang: CommandLanguage): Record<string, unknown> {
   if (r.op === "existing") return { ok: true, id: r.id, op: r.op, title: r.title, note: `already remembered as #${r.id}; nothing new was stored` };
+  const undo = typedCommand("undo", r.id, lang);
   return {
-    ok: true, id: r.id, op: r.op, title: r.title,
-    note: `${r.op === "update" ? "updated" : "remembered"} as #${r.id}: tell the user in one line, with #${r.id}, and that they can say 撤销 #${r.id} to undo it`,
+    ok: true, id: r.id, op: r.op, title: r.title, undo,
+    note: `${r.op === "update" ? "updated" : "remembered"} as #${r.id}: tell the user in one line, with #${r.id}, and that they can say ${undo} to undo it`,
   };
 }
 
@@ -243,7 +246,7 @@ export async function memorySave(claims: AssistantTokenClaims, args: Record<stri
   const r = await writeMemory(userId, args, actorOf(claims, message, args.evidence_quote), { workItemId, guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r);
+  return written(r, await commandLanguageOf(message.content));
 }
 
 export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -253,7 +256,7 @@ export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<st
   const r = await updateMemory(userId, id, args, actorOf(claims, message, args.evidence_quote), { guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r);
+  return written(r, await commandLanguageOf(message.content));
 }
 
 export async function memoryForget(claims: AssistantTokenClaims, args: { id?: unknown }): Promise<Record<string, unknown>> {

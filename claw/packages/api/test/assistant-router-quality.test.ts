@@ -306,9 +306,9 @@ describe("router quality, the prompt", () => {
     // request pr_state says is not_found said not to exist; v26: v25 on router-v20); router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v20");
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v21");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v16");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v26");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v27");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -381,10 +381,10 @@ describe("router quality, the prompt", () => {
 
   test("Q7m router-memory-v2: a request to remember is saved even when a setting fits, and a correction or undo is done with its tool", async () => {
     const p = await import("../src/assistant/prompts.js");
-    assert.equal(p.ROUTER_MEMORY_PROMPT_VERSION, "router-memory-v2");
+    assert.equal(p.ROUTER_MEMORY_PROMPT_VERSION, "router-memory-v3");
     // 2026-11-06 nightly: cat-memory-wr-001 and wr-003 called model_default_set for 记住：我审 PR 默认用 opus; wr-005 only said the undo.
     assert.match(p.ROUTER_MEMORY_PROMPT, /记住 \/ remember \/ 以后都… is memory_save, even when a setting also fits it \(记住：我审 PR 默认用 opus is an entry, not model_default_set or review_mode_set\)/);
-    assert.match(p.ROUTER_MEMORY_PROMPT, /A correction right after a save \(不对，改成 sonnet\) is memory_update of the entry just saved, and 撤销刚才那条 is memory_undo of it: call the tool, never only say it\./);
+    assert.match(p.ROUTER_MEMORY_PROMPT, /A correction right after a save \(不对，改成 sonnet\) is memory_update of the entry just saved, and 撤销刚才那条 or undo that is memory_undo of it: call the tool, never only say it\./);
   });
 
   test("Q8 what the router can do comes from the tool catalog, and no system failure is a limit", async () => {

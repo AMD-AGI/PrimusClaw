@@ -110,6 +110,7 @@ describe("assistant schedules", { skip }, () => {
     assert.equal(out.ok, true);
     assert.equal(out.done, false);
     assert.match(out.note, /never say it is done/);
+    assert.equal(out.approve, `批准 #${out.ref}`, "a Chinese request is told the Chinese command");
     assert.equal(await count("claw_triggers"), 0, "nothing is scheduled by the call");
     const [c] = await w.q("SELECT * FROM claw_assistant_confirmations");
     assert.equal(c.kind, "trigger_create");
@@ -137,6 +138,19 @@ describe("assistant schedules", { skip }, () => {
     const again = await sch.triggerCreateTool(turn, DAILY) as Record<string, any>;
     assert.equal(again.confirmation_id, out.confirmation_id);
     assert.equal(await count("claw_assistant_says"), 1);
+  });
+
+  test("S1e an English request gets the card, the note and the command to type in English", async () => {
+    // 2026-11-09 (English conversation): "Check the card and press it, or reply 批准 #5ec155." The note is what the router repeats.
+    await w.subscribe(alice.userId);
+    const turn = await userTurn(alice, "remind me this Friday at 3 pm to read the ROCm 7.1 release notes");
+    const out = await sch.triggerCreateTool(turn, { ...DAILY, name: "Read ROCm 7.1 release notes" }) as Record<string, any>;
+    assert.equal(out.approve, `approve #${out.ref}`);
+    assert.match(out.note, new RegExp(`or reply exactly approve #${out.ref}\\.`));
+    assert.doesNotMatch(JSON.stringify(out), /\p{Script=Han}/u, "no Chinese in what an English turn is answered");
+    const [say] = await w.q("SELECT * FROM claw_assistant_says");
+    assert.match(say.text, new RegExp(`Press "Create" below to confirm, or reply approve #${out.ref}\\.$`));
+    assert.doesNotMatch(say.text, /\p{Script=Han}/u);
   });
 
   test("S2 the button creates it once, as shown, on the key of the press; deny creates nothing; another user's press is a 404", async () => {
@@ -266,6 +280,10 @@ describe("assistant schedules", { skip }, () => {
     const state = await sch.renderScheduleState("alice");
     assert.match(state, new RegExp(`ref #${out.ref} .*create scheduled task "PR 早报" \\(0 9 \\* \\* \\*, Asia/Shanghai\\)`));
     assert.equal(await sch.renderScheduleState("bob"), "", "nothing for a user with no card");
+    // The command each card is let through with, in the language of the turn the router answers (`typed-commands.ts`).
+    assert.match(state, new RegExp(`or: approve #${out.ref}( \\| told: .*)?$`, "m"));
+    assert.doesNotMatch(state, /批准/, "an English turn is shown the English command only");
+    assert.match(await sch.renderScheduleState("alice", "zh"), new RegExp(`or: 批准 #${out.ref}( \\| told: .*)?$`, "m"));
     await press("alice", out.confirmation_id, "allow");
     const after = await sch.triggerListTool(await userTurn(alice, "现在呢")) as Record<string, any>;
     assert.equal(after.triggers.length, 1);
