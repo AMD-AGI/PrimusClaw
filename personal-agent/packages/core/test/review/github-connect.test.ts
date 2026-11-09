@@ -55,7 +55,7 @@ test("anything else is not", () => {
 
 test("the repositories a question names, each once", () => {
   assert.deepEqual(repositoriesNamed("my PRs in AMD-AGI/secret and https://github.com/amd-agi/SECRET.git and CI/CD"), [
-    ["AMD-AGI", "secret"],
+    ["amd-agi", "SECRET"], // (links first, as Python reads them)
   ]);
   assert.deepEqual(repositoriesNamed("and/or"), []);
 });
