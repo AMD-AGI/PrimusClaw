@@ -155,6 +155,8 @@ export class HttpSessions implements ClawSessionsPort {
 
   deliveryLink(sessionId: string, deliveryId: string): string | null {
     if (!this.http.baseUrl.startsWith("https://")) return null;
+    // A dot segment would be resolved by the browser to another path of Claw's (the Python worker wrote it as it was).
+    if ([sessionId, deliveryId].some((id) => id === "" || id === "." || id === "..")) return null;
     return `${this.http.baseUrl}/v1/sessions/${pyQuote(sessionId)}/deliveries/${pyQuote(deliveryId)}`;
   }
 

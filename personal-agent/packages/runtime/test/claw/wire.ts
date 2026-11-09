@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { deflateRawSync } from "node:zlib";
+import { crc32, deflateRawSync } from "node:zlib";
 import type { Clock, LogFields, Logger } from "@primusclaw/personal-agent";
 import { createClawClient, type ClawClientOptions, type Fetch } from "../../src/index.js";
 
@@ -27,6 +27,8 @@ export function json(status: number, body: unknown, headers: Record<string, stri
 /** A Claw on the wire: records every request and answers it with `answer`. */
 export class Wire {
   readonly sent: Sent[] = [];
+  /** What each call was given, as `fetch` received it. */
+  readonly inits: RequestInit[] = [];
   answer: Answer;
 
   constructor(answer: Answer = () => json(200, { ok: true, data: {} })) {
@@ -34,6 +36,7 @@ export class Wire {
   }
 
   readonly fetch: Fetch = async (url, init) => {
+    this.inits.push(init);
     const parsed = new URL(url);
     const body = init.body;
     const sent: Sent = {
@@ -100,12 +103,14 @@ export function zip(files: Record<string, string | Uint8Array>, stored = false):
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(stored ? 0 : 8, 8);
+    local.writeUInt32LE(crc32(raw) >>> 0, 14);
     local.writeUInt32LE(data.length, 18);
     local.writeUInt32LE(raw.length, 22);
     local.writeUInt16LE(nameBytes.length, 26);
     const central = Buffer.alloc(46);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(stored ? 0 : 8, 10);
+    central.writeUInt32LE(crc32(raw) >>> 0, 16);
     central.writeUInt32LE(data.length, 20);
     central.writeUInt32LE(raw.length, 24);
     central.writeUInt16LE(nameBytes.length, 28);
