@@ -29,6 +29,7 @@ export const remoteAgentSchema = z.looseObject({
   agent_id: text,
   kind: text,
   name: text,
+  /** Opaque: whatever the connector reported, passed on unread. */
   capabilities: objectOf,
 });
 export type RemoteAgent = z.output<typeof remoteAgentSchema>;
@@ -49,6 +50,9 @@ export const remoteConnectorSchema = z.looseObject({
   name: text,
   online: flag,
   version: text,
+  /** As Claw wrote them (ISO 8601): ages are computed from the text, never parsed here. */
+  last_seen_at: text,
+  heartbeat_at: text,
   agents: lenient(rowsOf(remoteAgentSchema)),
 });
 export type RemoteConnector = z.output<typeof remoteConnectorSchema>;
@@ -61,6 +65,8 @@ export const remoteSessionSchema = z.looseObject({
   agent_id: text,
   cwd: text,
   read_only: flag,
+  /** As Claw wrote it (ISO 8601), never parsed here. */
+  updated_at: text,
 });
 export type RemoteSession = z.output<typeof remoteSessionSchema>;
 
@@ -69,7 +75,16 @@ export const remoteEventRowSchema = z.looseObject({
   id: lenient(z.union([z.string(), z.number()]).transform(String)),
   seq: lenient(z.number()),
   type: text,
-  ts: text,
+  /** Milliseconds since the epoch (`RemoteEventIn.ts`); a numeric string (a bigint column) is read as its number. */
+  ts: lenient(
+    z.union([
+      z.number(),
+      z
+        .string()
+        .regex(/^\d{1,16}$/)
+        .transform(Number),
+    ]),
+  ),
   data: objectOf,
 });
 export type RemoteEventRow = z.output<typeof remoteEventRowSchema>;
