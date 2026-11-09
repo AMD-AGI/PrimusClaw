@@ -4,10 +4,11 @@
 /** The status card of a chat attached to a remote session, as an Adaptive Card. */
 import type { remoteView } from "@primusclaw/personal-agent";
 
-import { block, remoteAction } from "./elements.js";
-import { type Block, header, message, text } from "./pending-card-kit.js";
+import type { CardElement } from "../../cards/json.js";
+import { type CardMessage, header, message, text } from "../../cards/kit.js";
+import { block, remoteAction, warningNote } from "./elements.js";
 
-function line(item: remoteView.StatusLine): Block {
+function line(item: remoteView.StatusLine): CardElement {
   switch (item.kind) {
     case "lead":
       return block(item.text);
@@ -16,7 +17,7 @@ function line(item: remoteView.StatusLine): Block {
     case "phase":
       return block(item.text, { spacing: "Small" });
     case "unattended":
-      return { type: "Container", style: "warning", items: [text(item.text, { size: "Small" })] };
+      return warningNote(item.text, (value) => text(value, { size: "Small" }));
     case "assistant":
       return block(item.text, { isSubtle: true, size: "Small", spacing: "Small" });
     case "window":
@@ -29,8 +30,8 @@ function line(item: remoteView.StatusLine): Block {
 }
 
 /** The status card: the lead (when there is one) above the header, then its lines, then the system operations. */
-export function statusCard(view: remoteView.StatusView): Block {
-  const top = header(view.title, view.tone, "connect");
+export function statusCard(view: remoteView.StatusView): CardMessage {
+  const top = header(view.title, { tone: view.tone, emoji: "connect" });
   const lines = view.lines.map(line);
   const lead = view.lines[0]?.kind === "lead" ? lines.splice(0, 1) : [];
   return message([...lead, top, ...lines], view.buttons.map(remoteAction), view.buttonsMax);
