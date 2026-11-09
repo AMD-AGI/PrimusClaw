@@ -99,20 +99,31 @@ export class SayPlanner {
     const before = inCard ? [] : said;
     if (item?.canAccept) return [...before, this.workCard(userId, item, text, inCard, lang), ...linked];
     if (held !== undefined) {
-      const cardId = this.deps.store.assistantButtons.addConfirmCard(userId, held.confirmationId, held.kind, held.allowLabel);
+      const cardId = this.deps.store.assistantButtons.addConfirmCard(
+        userId,
+        held.confirmationId,
+        held.kind,
+        held.allowLabel,
+      );
       const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, lang };
       return [...before, view({ name: "confirmWrite", model }), ...linked];
     }
     const { channelMessageId, name, args } = confirm as NonNullable<typeof confirm>;
     const command = `/${name} ${args}`.trim();
     const cardId = this.deps.store.assistantButtons.addActionCard(userId, channelMessageId, name, args);
-    return [...before, view({ name: "actionCard", model: { text: inCard || command, cardId, command, lang } }), ...linked];
+    return [
+      ...before,
+      view({ name: "actionCard", model: { text: inCard || command, cardId, command, lang } }),
+      ...linked,
+    ];
   }
 
   /** What was said, as AI answers with thumbs, each with the citations its own words cite (when the whole text cites at all). */
   private said(event: Event, text: string, parts: readonly string[]): OutMessage[] {
     const cites =
-      this.deps.style().citations && event["type"] === "assistant.say" && citationsFromSources(text, event["sources"]).length > 0;
+      this.deps.style().citations &&
+      event["type"] === "assistant.say" &&
+      citationsFromSources(text, event["sources"]).length > 0;
     return parts.map((part) => {
       const citations: readonly Citation[] = cites ? citationsFromSources(part, event["sources"]) : [];
       return {
@@ -136,7 +147,9 @@ export class SayPlanner {
 
 /** A file's name as it is said back in a message: inside a code span, one line, its backticks turned to quotes (inbound.shown_name). */
 function shownName(name: string): string {
-  const flat = squashSpaces(Array.from(name, (ch) => ((ch.codePointAt(0) ?? 0) <= 0x1f || ch === "\u007f" ? " " : ch)).join("")).replaceAll("`", "'");
+  const flat = squashSpaces(
+    Array.from(name, (ch) => ((ch.codePointAt(0) ?? 0) <= 0x1f || ch === "\u007f" ? " " : ch)).join(""),
+  ).replaceAll("`", "'");
   const cut = Array.from(flat).slice(0, SHOWN_NAME_MAX).join("");
   return cut ? `\`${cut}\`` : "a file";
 }

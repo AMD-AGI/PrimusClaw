@@ -89,7 +89,9 @@ export class Proactive {
     if (answered === "running") answered = await this.settled(event);
     if (answered === "delivered") return "dropped";
     if (answered === "running") {
-      this.deps.logger.info("a run's notification came while its chat turn was still answering; Claw is asked to send it again");
+      this.deps.logger.info(
+        "a run's notification came while its chat turn was still answering; Claw is asked to send it again",
+      );
       return "retry";
     }
     return this.pushOrHold(userId, reference, event);
@@ -118,7 +120,10 @@ export class Proactive {
    */
   private approval(event: JsonObject, now: number): JsonObject | Outcome {
     const approval = event["approval"];
-    const record = typeof approval === "object" && approval !== null && !Array.isArray(approval) ? (approval as JsonObject) : undefined;
+    const record =
+      typeof approval === "object" && approval !== null && !Array.isArray(approval)
+        ? (approval as JsonObject)
+        : undefined;
     if (record === undefined || !record["tool_use_id"] || !event["session_id"]) return "dropped";
     const expires = approvalExpiry(event, now);
     if (expires <= now) return "dropped";

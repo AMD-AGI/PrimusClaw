@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 
 import { ApprovalDecisions, type ApprovalAudit, type DecisionDeps } from "../../src/approvals/decide.js";
-import type { CardClick, SettleOptions } from "../../src/approvals/click.js";
+import type { CardClick } from "../../src/approvals/click.js";
+import type { SettleOptions } from "../../src/ports/routing.js";
 import { ClawError, ClawUnreachable } from "../../src/claw/errors.js";
 import type { Lang } from "../../src/locales/lang.js";
 import { silentLogger } from "../../src/ports/logger.js";

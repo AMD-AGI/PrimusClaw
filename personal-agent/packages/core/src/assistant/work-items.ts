@@ -77,7 +77,7 @@ function pyLines(text: string): string[] {
 /** `text` with every line its own paragraph (a card runs lines that are separated by one newline together). */
 export function cardParagraphs(text: string): string {
   return pyLines(text)
-    .map(pyStrip)
+    .map((line) => pyStrip(line))
     .filter((line) => line !== "")
     .join("\n\n");
 }

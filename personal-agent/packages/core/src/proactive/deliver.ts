@@ -54,7 +54,8 @@ export class Deliveries {
     }
     const type = event["type"];
     if (type === "approval.requested") return this.sendApproval(userId, conversation, event);
-    if (typeof type === "string" && ASSISTANT_SAID_TYPES.includes(type)) return this.sendSaid(userId, conversation, event);
+    if (typeof type === "string" && ASSISTANT_SAID_TYPES.includes(type))
+      return this.sendSaid(userId, conversation, event);
     if (type === REMOTE_SAID) {
       for (const part of this.deps.remote.saidParts(str(event["label"]) || "A remote agent", str(event["text"]))) {
         await conversation.send({ body: { type: "rich", markdown: part, lead: false }, aiGenerated: true });
@@ -66,7 +67,9 @@ export class Deliveries {
       return true;
     }
     const shown = this.deps.publicEvent(this.namedByPrompt(event));
-    await conversation.send(view({ name: "runEvent", model: { event: shown, publicBaseUrl: this.deps.publicBaseUrl } }));
+    await conversation.send(
+      view({ name: "runEvent", model: { event: shown, publicBaseUrl: this.deps.publicBaseUrl } }),
+    );
     if (type === "run.completed") await this.offerChanges(userId, conversation, event);
     return true;
   }
@@ -115,7 +118,11 @@ export class Deliveries {
     // (in a chat that is an agent's window nothing said earlier is edited: an addition comes as a message of its own)
     if (!this.deps.directChat.on(userId)) {
       const options = { head, replies };
-      if ((await this.amend(userId, conversation, event, options)) || (await this.replace(userId, conversation, event, options))) return true;
+      if (
+        (await this.amend(userId, conversation, event, options)) ||
+        (await this.replace(userId, conversation, event, options))
+      )
+        return true;
     }
     await this.closeReceiptWith(userId, conversation, event, { words, head, replies });
     return true;
@@ -160,7 +167,11 @@ export class Deliveries {
   }
 
   /** The one text message of `event` as an edit can carry it; undefined when it is more than that (several, or a card). */
-  private oneText(userId: string, event: JsonObject, options: { head: string; replies: readonly (readonly [string, string])[] }) {
+  private oneText(
+    userId: string,
+    event: JsonObject,
+    options: { head: string; replies: readonly (readonly [string, string])[] },
+  ) {
     const said = this.deps.say.messages(userId, event, { linkFor: this.deps.deliveryLink, ...options });
     const [only] = said;
     return said.length === 1 && only !== undefined && only.body.type !== "view" ? only : undefined;
@@ -170,7 +181,12 @@ export class Deliveries {
    * A say that adds to an earlier one of the same turn (`amends`): that message is edited to hold both. False when it is not
    * one, this process no longer has that message, or the edit was not taken: it is then sent as a message of its own.
    */
-  private async amend(userId: string, conversation: Conversation, event: JsonObject, options: { head: string; replies: readonly (readonly [string, string])[] }) {
+  private async amend(
+    userId: string,
+    conversation: Conversation,
+    event: JsonObject,
+    options: { head: string; replies: readonly (readonly [string, string])[] },
+  ) {
     const amends = event["amends"];
     if (event["type"] !== "assistant.say" || typeof amends !== "string" || !amends) return false;
     const earlier = this.deps.said.get(amends);
@@ -178,7 +194,15 @@ export class Deliveries {
     if (earlier === undefined || !text) return false;
     const both = { ...earlier.event, text: `${pyRstrip(str(earlier.event["text"]))}\n\n${text}` };
     const message = this.oneText(userId, both, options);
-    if (message === undefined || !(await this.edit(conversation, earlier.messageId, message, "an assistant message could not be added to the one it amends; sent as its own"))) {
+    if (
+      message === undefined ||
+      !(await this.edit(
+        conversation,
+        earlier.messageId,
+        message,
+        "an assistant message could not be added to the one it amends; sent as its own",
+      ))
+    ) {
       return false;
     }
     this.deps.said.remember(both, earlier.messageId);
@@ -186,13 +210,26 @@ export class Deliveries {
   }
 
   /** A say that takes the place of the first one of its turn (`replaces`): that message is edited into this one. */
-  private async replace(userId: string, conversation: Conversation, event: JsonObject, options: { head: string; replies: readonly (readonly [string, string])[] }) {
+  private async replace(
+    userId: string,
+    conversation: Conversation,
+    event: JsonObject,
+    options: { head: string; replies: readonly (readonly [string, string])[] },
+  ) {
     const replaces = event["replaces"];
     if (event["type"] !== "assistant.say" || typeof replaces !== "string" || !replaces) return false;
     const earlier = this.deps.said.get(replaces);
     if (earlier === undefined || !pyStrip(str(event["text"]))) return false;
     const message = this.oneText(userId, event, options);
-    if (message === undefined || !(await this.edit(conversation, earlier.messageId, message, "an assistant message could not take the place of its turn's first one; sent as its own"))) {
+    if (
+      message === undefined ||
+      !(await this.edit(
+        conversation,
+        earlier.messageId,
+        message,
+        "an assistant message could not take the place of its turn's first one; sent as its own",
+      ))
+    ) {
       return false;
     }
     this.deps.said.set(replaces, { messageId: earlier.messageId, event: { ...event, event_id: replaces } });
@@ -213,7 +250,12 @@ export class Deliveries {
    * The approval card of a pushed permission request: true when sent, false when not needed (a card for it is in a chat already,
    * or it ran out while held), undefined when it offers nothing that can be answered (its words go as they are).
    */
-  private async sendRemoteAsk(userId: string, conversation: Conversation, event: JsonObject, remote: RemoteNotice): Promise<boolean | undefined> {
+  private async sendRemoteAsk(
+    userId: string,
+    conversation: Conversation,
+    event: JsonObject,
+    remote: RemoteNotice,
+  ): Promise<boolean | undefined> {
     const { store } = this.deps;
     const ask = remote.ask ?? {};
     const actionId = str(ask["action_id"]);
@@ -223,7 +265,16 @@ export class Deliveries {
     const expiresAt = remoteAskExpiry(ask, now);
     if (expiresAt <= now) return false;
     const tool = str(ask["tool"]) || "an action";
-    if (!store.remotePermissions.saveRemotePermission({ userId, sessionId: remote.sessionId, actionId, tool, options, expiresAt })) {
+    if (
+      !store.remotePermissions.saveRemotePermission({
+        userId,
+        sessionId: remote.sessionId,
+        actionId,
+        tool,
+        options,
+        expiresAt,
+      })
+    ) {
       return false; // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it)
     }
     const item = parseWorkItem(event["item"]);
@@ -268,7 +319,9 @@ export class Deliveries {
     if (event["type"] !== "run.completed" || runs === undefined || !sessionId || key === null) return false;
     if (this.answeredInChat(event, store.now()) !== "lost") return false;
     const prompt = store.turns.turnPrompt(sessionId, finishedAt(event, store.now()));
-    const lead = proactiveLines.in(pickLang(prompt)).lostTurnLead({ bot: this.deps.botName, prompt: clip(prompt, PROMPT_TITLE_MAX) });
+    const lead = proactiveLines
+      .in(pickLang(prompt))
+      .lostTurnLead({ bot: this.deps.botName, prompt: clip(prompt, PROMPT_TITLE_MAX) });
     let parts: readonly string[] | undefined;
     try {
       parts = await runs.lostAnswer(key, sessionId, lead);
@@ -279,7 +332,8 @@ export class Deliveries {
       return false;
     }
     if (parts === undefined) return false;
-    for (const part of parts) await conversation.send({ body: { type: "rich", markdown: part, lead: false }, aiGenerated: true });
+    for (const part of parts)
+      await conversation.send({ body: { type: "rich", markdown: part, lead: false }, aiGenerated: true });
     store.turns.turnDelivered(sessionId); // (answered: a retry of the same notification is dropped)
     return true;
   }

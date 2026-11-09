@@ -73,7 +73,9 @@ export class Release {
       live: approvals.filter((e) => Number(e[EXPIRES_KEY]) > now),
       expired: approvals.filter((e) => Number(e[EXPIRES_KEY]) <= now).length,
       // (answered in the chat while it was held: not shown again)
-      notices: others.filter((e) => e["type"] !== "approval.requested" && this.proactive.answeredInChat(e, now) !== "delivered"),
+      notices: others.filter(
+        (e) => e["type"] !== "approval.requested" && this.proactive.answeredInChat(e, now) !== "delivered",
+      ),
     };
   }
 
@@ -113,7 +115,10 @@ export class Release {
     const { store, logger } = this.deps;
     let sent = 0;
     for (const card of store.approvals.claimUnsentApprovals()) {
-      logger.info("sending an approval card again: it was recorded and never sent", { session: card.sessionId, toolUse: card.toolUseId });
+      logger.info("sending an approval card again: it was recorded and never sent", {
+        session: card.sessionId,
+        toolUse: card.toolUseId,
+      });
       const reference = store.references.getReference(card.userId);
       try {
         if (reference === null) throw new Error("no conversation to send to");
