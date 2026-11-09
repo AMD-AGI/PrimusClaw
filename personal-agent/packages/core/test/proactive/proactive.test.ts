@@ -8,6 +8,7 @@ import { ASSISTANT_RELEASE_MAX, REMOTE_RELEASE_MAX } from "../../src/proactive/r
 import { FakeClock } from "../../../../test-support/clock.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openFileTestStore } from "../../../../test-support/store.js";
+import { DirectChat } from "../../src/direct-chat/direct-chat.js";
 import { ALICE, at, event, link, shown, world } from "./world.js";
 
 const APPROVAL = (id = "tu-1", extra: Record<string, unknown> = {}) =>
@@ -237,4 +238,31 @@ it("approval cards recorded and never sent are sent again by the next worker", a
   } finally {
     file.close();
   }
+});
+
+it("with direct chat on but the chat not attached an amending say still edits the message", async () => {
+  const w = world({ direct: new DirectChat(true, [ALICE]) });
+  await w.proactive.handle(ALICE, w.reference, SAY("e1", "收到，我查一下"));
+  await w.proactive.handle(ALICE, w.reference, SAY("e2", "查好了：都正常。", { replaces: "e1" }));
+  assert.deepEqual(shown(w.surface.outbox), ["post 收到，我查一下", "update 查好了：都正常。"]);
+});
+
+it("with direct chat on and the chat attached to a session an amending say is a message of its own", async () => {
+  const w = world({ direct: new DirectChat(true, [ALICE]) });
+  w.store.remoteState.attachRemote(ALICE, {
+    sessionId: "rs-1",
+    connectorId: "c1",
+    agentId: "claude",
+    agentLabel: "\u{1F7E0} Claude Code",
+    host: "robin-dev",
+    cwd: "/repo",
+  });
+  await w.proactive.handle(ALICE, w.reference, SAY("e1", "收到，我查一下"));
+  await w.proactive.handle(ALICE, w.reference, SAY("e2", "查好了：都正常。", { replaces: "e1" }));
+  const out = shown(w.surface.outbox);
+  assert.equal(out.length, 2);
+  assert.ok(
+    out.every((line) => line.startsWith("post 💬 **Clawy**")),
+    out.join("\n"),
+  );
 });
