@@ -1,0 +1,90 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+import { ConfigError, pyStrip } from "@primusclaw/personal-agent";
+
+/** The process environment, or a test's. */
+export type Env = Readonly<Record<string, string | undefined>>;
+
+const ON = ["1", "true", "yes", "on"];
+const OFF = ["0", "false", "no", "off"];
+
+/** Reads settings out of an environment, with the worker's rules: a typo stops the worker, it never picks a value. */
+export class EnvReader {
+  constructor(readonly env: Env) {}
+
+  /** The raw value ("" unset). */
+  raw(name: string, fallback = ""): string {
+    return this.env[name] ?? fallback;
+  }
+
+  /** The value without surrounding white space ("" unset). */
+  text(name: string, fallback = ""): string {
+    return pyStrip(this.raw(name, fallback));
+  }
+
+  /** A value that must be set and not blank. */
+  required(name: string): string {
+    const value = this.text(name);
+    if (value === "") throw new ConfigError(`environment variable ${name} is required`);
+    return value;
+  }
+
+  /** On or off; `fallback` when unset or empty; anything else stops the worker. */
+  switch(name: string, fallback: boolean): boolean {
+    const value = this.text(name).toLowerCase();
+    if (value === "") return fallback;
+    if (!ON.includes(value) && !OFF.includes(value)) {
+      throw new ConfigError(`${name} must be on or off, not ${pyRepr(value)}`);
+    }
+    return ON.includes(value);
+  }
+
+  /** On only for the words that mean on (the older switches, which read anything else as off). */
+  isOn(name: string): boolean {
+    return ON.includes(this.text(name).toLowerCase());
+  }
+
+  /** A positive whole number; `fallback` when unset or empty; anything else stops the worker. */
+  positiveInt(name: string, fallback: number): number {
+    const value = this.text(name);
+    if (value === "") return fallback;
+    if (!/^[0-9]+$/.test(value) || Number(value) <= 0) {
+      throw new ConfigError(`${name} must be a positive whole number, not ${pyRepr(value)}`);
+    }
+    return Number(value);
+  }
+
+  /** A whole number (Python's `int()` of the value, which allows a sign and surrounding space). */
+  int(name: string, fallback: string): number {
+    const value = pyStrip(this.raw(name, fallback));
+    if (!/^[+-]?[0-9]+$/.test(value)) throw new ConfigError(`${name} must be a whole number, not ${pyRepr(value)}`);
+    return Number(value);
+  }
+
+  /** A whole number, or null when unset or blank. */
+  optionalInt(name: string): number | null {
+    return this.text(name) === "" ? null : this.int(name, "");
+  }
+
+  /** A comma separated list, blank entries dropped; `lower` lower-cases each entry. */
+  list(name: string, lower = false): string[] {
+    return this.raw(name)
+      .split(",")
+      .map((entry) => pyStrip(entry))
+      .filter((entry) => entry !== "")
+      .map((entry) => (lower ? entry.toLowerCase() : entry));
+  }
+}
+
+/** Python's `repr()` of a string, for an error message that quotes a value the way the Python worker did. */
+export function pyRepr(value: string): string {
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  const escaped = value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+  return quote + (quote === "'" ? escaped.replace(/'/g, "\\'") : escaped) + quote;
+}
+
+/** `value` without a trailing slash (Python's `rstrip("/")`). */
+export function withoutTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}

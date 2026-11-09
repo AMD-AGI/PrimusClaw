@@ -45,6 +45,11 @@ export interface AppLastExit {
    * start injects the new keys. Cleared once the process is gone.
    */
   grant_restart?: true;
+  /**
+   * Sandboxes the platform took from the run (node lost, no node to run on), which
+   * do not spend `max_restarts`. Absent means none.
+   */
+  platform_losses?: number;
 }
 
 /**

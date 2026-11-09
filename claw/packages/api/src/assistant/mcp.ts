@@ -186,7 +186,7 @@ function registerScheduleTools(mcp: McpServer, claims: AssistantTokenClaims, ans
   if (answersConfirmations) {
     mcp.tool(
       "confirmation_answer",
-      "Answer a card listed under Scheduled tasks waiting for the user's confirmation.",
+      "Answer a card listed under Cards waiting for the user's confirmation.",
       { decision: z.enum(["allow", "deny"]), confirmation_id: z.string().optional().describe("The id of the card.") },
       (args) => answer(claims, "confirmation_answer", async () => {
         const out = await scheduleConfirmationAnswer(claims, args);
