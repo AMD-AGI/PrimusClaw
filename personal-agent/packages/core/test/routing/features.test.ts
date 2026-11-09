@@ -400,3 +400,14 @@ test("files the channel gave no way to fetch count as files: no GitHub offer is 
   await w.router.settled();
   assert.ok(!said(w).some((t) => t.startsWith("**What Clawy can do for you**")));
 });
+
+test("test_the_net_leaves_alone_what_it_must", async () => {
+  const w = world({
+    handlers: { clicks: [{ verbs: ["done"], withCredential: (c) => c.settle("handled").then(() => undefined) }] },
+  });
+  link(w, ALICE.id, "ak");
+  await w.router.handle({ ...clickOf("gone", {}), invoke: false }); // (an Action.Submit message: no placeholder to replace)
+  await w.router.handle(clickOf("done", {})); // (settled by its handler: the net leaves it)
+  assert.deepEqual(w.surface.outbox.filter((r) => r.op === "update").length, 1);
+  assert.ok(!said(w).some((t) => t.includes("not active any more")));
+});

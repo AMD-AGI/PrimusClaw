@@ -184,11 +184,25 @@ test("a keyed lock runs one at a time per key, in order", async () => {
 
 test("a remote prompt's slot is taken before the person's lock is let go: the next admission sees it", async () => {
   const w = setup(2);
-  // the next task asks the lock while the prompt's check is still under it; what it sees is what a turn in another chat would
-  const admitted = w.admission.admitRemote(w.chat(), "p1", "");
-  const seen = w.admission.lock.run(ALICE.id, () => Promise.resolve(w.admission.running(ALICE.id)));
-  assert.equal(await admitted, true);
-  assert.equal(await seen, 1);
+  // What the person's tasks are at the moment their lock is let go: what a turn admitted next, in another chat, sees.
+  const inner = w.admission.lock;
+  const atRelease: number[] = [];
+  Object.assign(w.admission, {
+    lock: {
+      run: <T>(key: string, work: () => Promise<T>) =>
+        inner.run(key, async () => {
+          const result = await work();
+          atRelease.push(w.admission.running(key));
+          return result;
+        }),
+    },
+  });
+  assert.equal(await w.admission.admitRemote(w.chat(), "p1", ""), true);
+  assert.deepEqual(atRelease, [1]);
   w.admission.letGo(ALICE.id);
   assert.equal(w.admission.running(ALICE.id), 0);
+  w.turns.claim(chatTurnKey(ALICE.id, "g-1"), new ActiveTurn());
+  w.turns.claim(chatTurnKey(ALICE.id, "g-2"), new ActiveTurn());
+  assert.equal(await w.admission.admitRemote(w.chat(), "p2", ""), false); // (at the limit: refused, nothing held)
+  assert.deepEqual(atRelease, [1, 2]);
 });

@@ -34,7 +34,7 @@ export class PersonalRouter {
     const { store, subscriptions } = this.ctx.deps;
     const userId = chat.sender.id;
     store.references.saveReference(userId, wireOf(event)); // (serviceUrl can change: refreshed every time)
-    if (event.type === "action") store.members.notePersonalClick(userId); // (the app is installed for this person)
+    if (event.type === "action" && event.invoke) store.members.notePersonalClick(userId); // (the app is installed for them)
     await this.backfill(userId);
     if (subscriptions !== undefined && store.links.getKey(userId) !== null) await subscriptions.ensure(userId);
     if (event.type === "message") await this.message(event, chat);

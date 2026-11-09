@@ -84,7 +84,8 @@ export class Router {
 
   /** The safety net under every card click: a click whose card is still the placeholder ends with a note. */
   private async settleOpen(event: InboundEvent, chat: Chat, text: string): Promise<void> {
-    if (event.type !== "action" || !event.cardMessageId || chat.conversation.edited.has(event.cardMessageId)) return;
+    if (event.type !== "action" || !event.invoke || !event.cardMessageId) return; // (only a card click left a placeholder)
+    if (chat.conversation.edited.has(event.cardMessageId)) return; // (a handler tried)
     this.ctx.deps.logger.warn("card click was not settled by its handler; replacing the card with a note", {
       verb: event.verb,
     });
