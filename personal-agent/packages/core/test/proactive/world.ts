@@ -79,6 +79,12 @@ export function world(
   const deps: ProactiveDeps = {
     store,
     conversationFor,
+    deliverStored: (envelope) => {
+      const id = envelope["conversation"];
+      return surface
+        .conversation({ id: typeof id === "string" ? id : "", kind: "personal", tenantId: "", wire: {} })
+        .deliver(envelope);
+    },
     messageIds: options.messageIds ?? true,
     say: new SayPlanner({
       store,

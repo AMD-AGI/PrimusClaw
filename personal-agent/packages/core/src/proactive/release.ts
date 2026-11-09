@@ -119,12 +119,11 @@ export class Release {
         session: card.sessionId,
         toolUse: card.toolUseId,
       });
-      const reference = store.references.getReference(card.userId);
       try {
-        if (reference === null) throw new Error("no conversation to send to");
-        await this.deps.conversationFor(reference).deliver(card.envelope);
+        await this.deps.deliverStored(card.envelope);
       } catch (error) {
         store.approvals.approvalSendFailed(card.sessionId, card.toolUseId); // (recorded, unsent: the next sweep tries again)
+        if (cancelled(error)) throw error; // (the worker is stopping: the sweep ends here)
         logger.warn("sending an approval card again failed; the next sweep tries again", { error: errorName(error) });
         continue;
       }
@@ -137,4 +136,9 @@ export class Release {
 
 function say(conversation: Conversation, text: string): Promise<void> {
   return conversation.send({ body: { type: "text", text } });
+}
+
+/** The sweep was cancelled (an abort), as against one card failing to send. */
+function cancelled(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
