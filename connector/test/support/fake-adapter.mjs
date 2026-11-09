@@ -65,7 +65,7 @@ async function prompt(id, params) {
   const s = sessions.get(params.sessionId);
   const said = (params.prompt || []).map((p) => p.text || "").join(" ");
   // A `background` turn records the task it started as a real run_in_background call does (`toolUseResult.backgroundTaskId`).
-  const task = /^background \d+$/.test(said) ? `b${nextOut++}` : null;
+  const task = /^background \S+$/.test(said) ? `b${nextOut++}` : null;
   const ran = task ? [
     { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${task}`, name: "Bash", input: { run_in_background: true } }] } },
     { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${task}`, content: `Command running in background with ID: ${task}` }] }, toolUseResult: { stdout: "", backgroundTaskId: task } },
@@ -113,12 +113,16 @@ async function prompt(id, params) {
     update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "big", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(30000) } }] });
     return done("end_turn");
   }
-  // `background <ms>`: like a Bash call with run_in_background, the turn ends at once; when the task finishes, Claude Code
-  // writes the notification as a prompt of its own and answers it, in this same process, with no one asking.
-  if ((n = /^background (\d+)$/.exec(text))) {
+  // `background <file>`: like a Bash call with run_in_background, the turn ends at once; the task finishes once <file> exists
+  // (the test says when, rather than a timer racing the connector), and Claude Code then writes the notification as a prompt
+  // of its own and answers it, in this same process, with no one asking.
+  if ((n = /^background (\S+)$/.exec(text))) {
     update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "started" } });
     const note = `<task-notification>\n<task-id>${task}</task-id>\n<status>completed</status>\n</task-notification>`;
-    setTimeout(() => writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished"), Number(n[1]));
+    void (async () => {
+      for (let i = 0; i < 1200 && !fs.existsSync(n[1]); i++) await new Promise((r) => setTimeout(r, 25));
+      if (fs.existsSync(n[1])) writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished");
+    })();
     return done("end_turn");
   }
   if (text.startsWith("say ")) {

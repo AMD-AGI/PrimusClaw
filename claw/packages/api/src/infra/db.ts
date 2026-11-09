@@ -1957,6 +1957,19 @@ export async function initDb(): Promise<void> {
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
     );
 
+    // The chat notices of saved memories, by memory id: deleting or undoing an entry removes the title from the
+    // notices that announced it (memory/service.ts, ERASE_NOTICE_TITLES_SQL). They are a sliver of this table, and
+    // without this index that update reads every event -- a sequential scan of the whole table, or of every event
+    // of the user's sessions, either of which outlives the request's statement timeout on a large deployment.
+    // Text, as `->>` returns it, so that no stored value can make the index expression raise on an insert.
+    // CONCURRENTLY and not fatal, for the reasons given above.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_memory_saved",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_memory_saved
+         ON claw_session_events ((data->>'memory_id')) WHERE event = 'memory_saved'`,
+    );
+
     // E2: skill sub-files (multi-file skill support).
     // No FK on purpose — soft-delete the parent skill, orphan rows cleaned by
     // a periodic job. user_id is denormalized for fast filtering / cross-user safety.
