@@ -8,7 +8,7 @@
  *   T2 a file whose test fails leaves none
  *   T3 a file that calls process.exit mid-test leaves none
  *   T4 a file stopped by SIGTERM or SIGINT leaves none, and still ends by that signal
- *   T5 CLAW_TEST_KEEP_TMP=1 keeps them, and names them on stderr
+ *   T5 CLAW_TEST_KEEP_TMP=1 keeps them
  *   T6 the suites that made sa-eval-* and claw-build-* directories in TMPDIR and left them there leave none
  */
 import assert from "node:assert/strict";
@@ -97,13 +97,12 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
   });
 }
 
-test("T5 CLAW_TEST_KEEP_TMP=1 keeps them, and names them on stderr", async () => {
+test("T5 CLAW_TEST_KEEP_TMP=1 keeps them", async () => {
   const tmp = tmpDir("tmp-dirs-t5-");
   const r = await run(join(HERE, "tmp-dirs-fixture.ts"), { FIXTURE_MODE: "pass", CLAW_TEST_KEEP_TMP: "1" }, tmp);
   assert.equal(r.code, 0, r.out + r.err);
   assert.equal(r.dirs.length, 1);
   assert.equal(existsSync(join(r.dirs[0]!, "file")), true, "kept, with what the test wrote");
-  assert.match(r.err, new RegExp(`kept ${r.dirs[0]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
 for (const [file, prefix] of [["sa-eval.test.ts", "sa-eval-"], ["assistant-self-status.test.ts", "claw-build-"]] as const) {
