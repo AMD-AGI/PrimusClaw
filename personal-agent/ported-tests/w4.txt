@@ -147,3 +147,7 @@ teams/tests/test_transparency.py::test_both_connect_cards_render_the_notice -> p
 teams/tests/test_transparency.py::test_the_app_description_says_the_same -> INTERNAL
 teams/tests/test_transparency.py::test_the_readme_quotes_the_statement_word_for_word -> INTERNAL
 teams/tests/test_transparency.py::test_a_delivered_report_is_gone_30_days_after_it_was_filed_without_another_report -> DROPPED: the store's retention of feedback reports is W1's (FeedbackRepository), tested there
+teams/tests/test_capabilities.py::test_every_capability_of_the_code_is_in_the_registry_and_nothing_else_is -> packages/core/test/capabilities-guard.test.ts::test_every_capability_of_the_code_is_in_the_registry_and_nothing_else_is (the router's commands, verbs and routes)
+teams/tests/test_capabilities.py::test_the_derived_sets_are_not_empty -> packages/core/test/capabilities-guard.test.ts::test_the_derived_sets_are_not_empty
+teams/tests/test_capabilities.py::test_every_route_is_in_the_code -> packages/core/test/capabilities-guard.test.ts::test_every_route_is_in_the_code
+teams/tests/test_capabilities.py::test_removing_an_entry_turns_the_guard_red -> packages/core/test/capabilities-guard.test.ts::test_removing_an_entry_turns_the_guard_red
