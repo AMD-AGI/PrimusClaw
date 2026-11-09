@@ -9,7 +9,7 @@ import { receiptText } from "../locales/assistant.js";
 import type { Lang } from "../locales/lang.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
-import type { Conversation, Envelope, MessageId, OutMessage } from "../ports/surface.js";
+import type { Conversation, Envelope, MessageId, OutMessage, UpdateOptions } from "../ports/surface.js";
 import { pyRstrip, pyStrip } from "../text/py-text.js";
 import { Receipt, messageWords, type ReceiptStream } from "./receipt.js";
 
@@ -111,7 +111,7 @@ export class ReceiptConversation implements Conversation {
     return this.inner.edited;
   }
 
-  markSettled(id: string): void {
+  markSettled(id: MessageId): void {
     this.inner.markSettled(id);
   }
 
@@ -138,8 +138,8 @@ export class ReceiptConversation implements Conversation {
     return this.inner.post(message);
   }
 
-  update(id: MessageId, message: OutMessage): Promise<void> {
-    return this.inner.update(id, message);
+  update(id: MessageId, message: OutMessage, options?: UpdateOptions): Promise<void> {
+    return this.inner.update(id, message, options);
   }
 
   delete(id: MessageId): ReturnType<Conversation["delete"]> {
