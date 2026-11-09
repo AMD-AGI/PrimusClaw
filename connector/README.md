@@ -430,6 +430,11 @@ and of the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/`, whose r
 name. The command does not report a row from another host or container that shares the directory (it asks whether the pid is
 alive here), and such a row cannot be checked: it counts as open whatever the command says. If the command is missing or
 fails, the registry alone is the answer; if neither can be read, the answer is "cannot tell" and the takeover is refused.
+A running Claude Code process of this machine whose own row (`sessions/<pid>.json`) is not valid JSON (an empty file a lost
+write left, measured on a dev pod with a terminal open for days) has a conversation open that neither answer names: every
+conversation in that process's folder (every one, when its folder cannot be read) is then reported `unknown`, not `idle`, and
+a takeover of one is refused (`twin_check_failed`, naming the process and the file); `doctor` warns
+(`claude_registry_row_unreadable`). Anything sent in that terminal makes Claude Code write the row again.
 A transcript written within the last 10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
 `session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
 is not mistaken for a twin.

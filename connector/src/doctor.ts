@@ -26,6 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import type { AgentConfig } from "./config.js";
+import { blindHolders } from "./attach.js";
 import { doctorFile, keepaliveFile, keepaliveStampFile, serviceFile, type Dirs } from "./paths.js";
 import { systemCaOutcome, type SystemCaOutcome } from "./system-ca.js";
 import { errMessage, isObject } from "./util.js";
@@ -358,6 +359,14 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
       const signed = await claudeSignedIn(env, d);
       if (signed === false) out.problems.push({ code: "agent_not_signed_in", severity: "fail", agent: a.id, detail: "Claude Code is not signed in on this machine", fix: LOGIN_FIX.claude });
       else if (signed) out.ok.push(`${a.id}: Claude Code is signed in`);
+      // A running Claude Code whose registry row is unreadable: the conversations in its folder are shown as "cannot tell"
+      // and cannot be taken over until it writes the row again.
+      const configDir = path.resolve(env.CLAUDE_CONFIG_DIR?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".claude"));
+      for (const b of await blindHolders(configDir).catch(() => [])) {
+        out.problems.push({ code: "claude_registry_row_unreadable", severity: "warn", agent: a.id,
+          detail: `Claude Code process ${b.pid}${b.cwd ? ` (in ${b.cwd})` : ""} is running, but ${path.join(configDir, "sessions", `${b.pid}.json`)} cannot be read: the conversations in its folder are shown as "cannot tell" and are not offered to take over`,
+          fix: "send anything in that Claude Code terminal (it writes the row again), or exit and restart it there" });
+      }
     } else if (family === "codex") {
       const auth = await codexAuth(env, d);
       if (auth && !auth.ok) out.problems.push({ code: "agent_not_signed_in", severity: "fail", agent: a.id, detail: auth.detail, fix: auth.fix });

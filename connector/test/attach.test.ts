@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
-  AttachSupport, MAX_REPORTED, SESSION_REF_RE, classifyAppended, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
+  AttachSupport, MAX_REPORTED, SESSION_REF_RE, blindHolders, classifyAppended, isClaudeArgv, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
   TranscriptTail, TwinCheckError, transcriptUpdates, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -243,6 +243,51 @@ function hookRow(dir: string, pid: number, extra: Record<string, unknown> = {}, 
   fs.mkdirSync(terminalsDir(dir), { recursive: true });
   fs.writeFileSync(path.join(terminalsDir(dir), name), JSON.stringify({ v: 1, pid, procStart: processStart(pid), sessionId: REF, cwd: "/w", at: Date.now(), pidDomain: localPidDomain(), ...extra }));
 }
+
+// A Claude Code process whose registry row is unreadable (an empty sessions/<pid>.json, measured on a dev pod 2026-11-09: a
+// terminal session open for days was offered to be taken over, as "idle").
+const claudeNamed = (cwd: string): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", cwd, argv0: "claude" });
+  children.push(c);
+  return c;
+};
+// (older than the grace an unreadable row gets while it may be being written: one written moments ago already refuses everything)
+const emptyRow = (dir: string, pid: number) => {
+  const file = path.join(dir, "sessions", `${pid}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "");
+  const t = (Date.now() - 3_600_000) / 1000;
+  fs.utimesSync(file, t, t);
+};
+
+describe("a Claude Code process whose registry row cannot be read", () => {
+  test("is found by its pid, its program and its folder; a readable row, or a process that is not Claude Code, is not", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-blind-"));
+    const blind = claudeNamed(work);
+    const other = sleeper();
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    emptyRow(dir, other.pid!);   // (an unreadable row of a process that is not Claude Code says nothing about a conversation)
+    registryRow(dir, 4242, { procStart: "1" });
+    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, cwd: work }]);
+    assert.equal(isClaudeArgv(["claude"]), true);
+    assert.equal(isClaudeArgv(["/usr/bin/node", "/opt/x/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
+    assert.equal(isClaudeArgv(["node", "/opt/claude-agent-acp/dist/index.js"]), false);
+  });
+
+  test("the twin check refuses: it cannot tell that the conversation is free, and a second writer is never started", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const blind = claudeNamed(os.tmpdir());
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    const v = await support(dir).check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok ? "ok" : v.reason, "twin_check_failed");
+    assert.match(v.ok ? "" : v.detail, new RegExp(`process ${blind.pid} .*sessions/${blind.pid}\\.json cannot be read`));
+    await stop(blind);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, true, "once that process is gone, the row says nothing");
+  });
+});
 
 describe("the terminal hooks' rows in the twin check", () => {
   type Case = {
@@ -577,6 +622,17 @@ describe("attach end to end", () => {
     assert.equal(a.capabilities.resumable[0].updated_at, Date.parse("2026-10-29T10:00:00.000Z") / 1000);
     assert.equal(a.capabilities.resumable[0].cwd, fs.realpathSync(h.work));
     assert.ok(!JSON.stringify(a).includes("claude") && !JSON.stringify(a).includes("Claude"), "Claw is told nothing about the product");
+  });
+
+  test("a conversation in the folder of a Claude Code whose registry row cannot be read is reported unknown, not idle", { skip: process.platform !== "linux" }, async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "idle" }] });
+    const blind = claudeNamed(fs.realpathSync(h.work));
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(h.attachDir, blind.pid!);
+    await h.online();
+    const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    // REF was "idle" (offered to take over); REF2 is still the live one its own row names
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state]), [[REF, "unknown"], [REF2, "live"]]);
   });
 
   test("a session is taken over in its own directory, in the ask mode, whatever mode it was left in; a write asks", async () => {
