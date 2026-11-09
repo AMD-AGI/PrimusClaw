@@ -4,7 +4,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  clipLine,
   cpHead,
+  cpRfind,
+  fixedN,
+  pyRstrip,
   cpLength,
   cpSlice,
   fixed1,
@@ -38,6 +42,52 @@ test("printable is Python's: controls, format and bidi characters are not, the s
   assert.equal(isPyPrintable("\x00"), false);
   assert.equal(isPyPrintable("‮"), false);
   assert.equal(isPyPrintable(" "), false);
+});
+
+test("fixed decimals are Python's format: an exact tie rounds to even", () => {
+  // Each pair is (value, digits) -> what Python 3 printed for f"{value:.{digits}f}".
+  const cases: readonly (readonly [number, number, string])[] = [
+    [12.5, 0, "12"],
+    [13.5, 0, "14"],
+    [0.5, 0, "0"],
+    [1.5, 0, "2"],
+    [2.5, 0, "2"],
+    [-2.5, 0, "-2"],
+    [0.25, 1, "0.2"],
+    [0.75, 1, "0.8"],
+    [-0.25, 1, "-0.2"],
+    [-0.04, 1, "-0.0"],
+    [-0, 1, "-0.0"],
+    [2.675, 2, "2.67"],
+    [1.005, 2, "1.00"],
+    [0.125, 2, "0.12"],
+    [1234.5678, 3, "1234.568"],
+  ];
+  for (const [value, digits, python] of cases)
+    assert.equal(fixedN(value, digits), python, `${String(value)}:.${String(digits)}f`);
+  assert.equal(fixedN(Number.NaN, 1), "nan");
+  assert.equal(fixedN(Infinity, 1), "inf");
+  assert.equal(fixedN(-Infinity, 1), "-inf");
+});
+
+test("strip with chars, negative slices, rfind and a clipped line are Python's", () => {
+  assert.equal(pyStrip("**x**", "*"), "x");
+  assert.equal(pyRstrip("a//", "/"), "a");
+  assert.equal(pyStrip(" .a. ", " ."), "a");
+  assert.equal(pyLstrip("xxa", "x"), "a");
+  assert.equal(pyStrip("😀a😀", "😀"), "a");
+  assert.equal(pyStrip("***", "*"), "");
+  const t = "a😀b😀c";
+  assert.equal(cpSlice(t, -2), "😀c");
+  assert.equal(cpSlice(t, 1, -1), "😀b😀");
+  assert.equal(cpSlice(t, -10, 2), "a😀");
+  assert.equal(cpSlice(t, 3, 1), "");
+  assert.equal(cpRfind(t, "😀"), 3);
+  assert.equal(cpRfind(t, "x"), -1);
+  assert.equal(cpRfind(t, ""), 5);
+  assert.equal(clipLine("abc", 3), "abc");
+  assert.equal(clipLine("ab cd", 4), "ab…");
+  assert.equal(clipLine("😀😀😀", 2), "😀…");
 });
 
 test("one decimal rounds an exact tie to even, like Python's format", () => {

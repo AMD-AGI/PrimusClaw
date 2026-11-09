@@ -38,19 +38,34 @@ export function squashSpaces(text: string): string {
   return pySplit(text).join(" ");
 }
 
-/** `text.strip()`. */
-export function pyStrip(text: string): string {
+function charSet(chars: string): ReadonlySet<string> {
+  return new Set(Array.from(chars));
+}
+
+function stripEnds(text: string, chars: string, left: boolean, right: boolean): string {
+  const set = charSet(chars);
+  const points = Array.from(text);
+  let start = 0;
+  let end = points.length;
+  while (left && start < end && set.has(points[start] ?? "")) start += 1;
+  while (right && end > start && set.has(points[end - 1] ?? "")) end -= 1;
+  return points.slice(start, end).join("");
+}
+
+/** `text.strip()`, or `text.strip(chars)`. */
+export function pyStrip(text: string, chars?: string): string {
+  if (chars !== undefined) return stripEnds(text, chars, true, true);
   return text.replace(LEADING, "").replace(TRAILING, "");
 }
 
-/** `text.lstrip()`. */
-export function pyLstrip(text: string): string {
-  return text.replace(LEADING, "");
+/** `text.lstrip()`, or `text.lstrip(chars)`. */
+export function pyLstrip(text: string, chars?: string): string {
+  return chars === undefined ? text.replace(LEADING, "") : stripEnds(text, chars, true, false);
 }
 
-/** `text.rstrip()`. */
-export function pyRstrip(text: string): string {
-  return text.replace(TRAILING, "");
+/** `text.rstrip()`, or `text.rstrip(chars)`. */
+export function pyRstrip(text: string, chars?: string): string {
+  return chars === undefined ? text.replace(TRAILING, "") : stripEnds(text, chars, false, true);
 }
 
 /** `len(text)`: code points. */
@@ -58,9 +73,27 @@ export function cpLength(text: string): number {
   return Array.from(text).length;
 }
 
-/** `text[start:end]` for non-negative bounds, counted in code points. */
+function sliceIndex(index: number, length: number): number {
+  return index < 0 ? Math.max(0, length + index) : Math.min(index, length);
+}
+
+/** `text[start:end]`, counted in code points; a negative bound counts from the end, as in Python. */
 export function cpSlice(text: string, start: number, end?: number): string {
-  return Array.from(text).slice(start, end).join("");
+  const points = Array.from(text);
+  const from = sliceIndex(start, points.length);
+  const to = end === undefined ? points.length : sliceIndex(end, points.length);
+  return from < to ? points.slice(from, to).join("") : "";
+}
+
+/** `text.rfind(sub)`: the code-point index of the last occurrence, -1 when there is none. */
+export function cpRfind(text: string, sub: string): number {
+  const at = text.lastIndexOf(sub);
+  return at === -1 ? -1 : cpLength(text.slice(0, at));
+}
+
+/** `text if len(text) <= limit else text[: limit - 1].rstrip() + "…"`. */
+export function clipLine(text: string, limit: number): string {
+  return cpLength(text) <= limit ? text : `${pyRstrip(cpSlice(text, 0, Math.max(0, limit - 1)))}\u2026`;
 }
 
 /** `text[:limit]`, without splitting a string that is short enough. */
@@ -68,15 +101,34 @@ export function cpHead(text: string, limit: number): string {
   return text.length <= limit ? text : cpSlice(text, 0, limit);
 }
 
-/** `f"{value:.1f}"`: one decimal, a tie on the exact binary value rounded to even as Python does. */
+/**
+ * `f"{value:.{digits}f}"`. `toFixed` rounds an exact tie (on the binary value) up, Python to even; the two agree on
+ * everything else. A tie is told by the exact decimal expansion, which `toFixed` gives to 40 digits past the cut
+ * (more than any double below 1e21 needs to show a non-tie's difference at these magnitudes).
+ */
+export function fixedN(value: number, digits: number): string {
+  if (!Number.isFinite(value)) return pyNonFiniteFormat(value);
+  const sign = value < 0 || Object.is(value, -0) ? "-" : "";
+  const magnitude = Math.abs(value);
+  const exact = magnitude.toFixed(Math.min(100, digits + 40));
+  const point = exact.indexOf(".");
+  const cut = point + 1 + digits;
+  const rest = exact.slice(cut);
+  const tie = rest.startsWith("5") && /^50*$/.test(rest);
+  const truncated = digits === 0 ? exact.slice(0, point) : exact.slice(0, cut);
+  const lastDigit = Number(truncated.at(-1));
+  const shown = tie && lastDigit % 2 === 0 ? truncated : magnitude.toFixed(digits);
+  return sign + shown;
+}
+
+/** `f"{value:.1f}"`. */
 export function fixed1(value: number): string {
-  const scaled = value * 10;
-  const floor = Math.floor(scaled);
-  if (scaled - floor === 0.5 && Number.isFinite(scaled)) {
-    const even = floor % 2 === 0 ? floor : floor + 1;
-    return (even / 10).toFixed(1);
-  }
-  return value.toFixed(1);
+  return fixedN(value, 1);
+}
+
+function pyNonFiniteFormat(value: number): string {
+  if (Number.isNaN(value)) return "nan";
+  return value > 0 ? "inf" : "-inf";
 }
 
 /**
