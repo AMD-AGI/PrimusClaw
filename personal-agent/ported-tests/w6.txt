@@ -198,8 +198,8 @@ tests/test_session_window.py::test_stop_says_it_interrupts_the_terminal_where_me
 tests/test_deployment_defaults.py::test_the_connector_commands_come_from_the_configured_claw_address -> MERGED packages/core/test/remote/connector-setup.test.ts::the connector commands come from the configured claw address
 
 # tests/test_remote_menu.py::test_a_user_who_is_not_connected_or_in_a_group_gets_no_remote_buttons -> LATER: the router's account check before a click handler (W4)
-# tests/test_remote_menu.py::test_the_personal_menu_has_agents_within_the_limit -> LATER: the Teams app manifest (W3/W4)
-# tests/test_remote_menu.py::test_the_commands_that_left_the_personal_menu_still_work_typed_and_help_still_lists_them -> LATER: menu words and help (W4)
-# tests/test_remote_menu.py::test_every_entry_of_the_personal_menu_is_a_command_the_worker_reads_as_one -> LATER: menu words (W4)
-# tests/test_remote_nl_control.py::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent -> LATER: the router's assistant routing (W4)
-# tests/test_remote_nl_control.py::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do -> LATER: the router's assistant routing (W4)
+# tests/test_remote_menu.py::test_the_personal_menu_has_agents_within_the_limit -> LATER: the Teams app manifest (W3)
+# tests/test_remote_menu.py::test_the_commands_that_left_the_personal_menu_still_work_typed_and_help_still_lists_them -> LATER: the Teams menu words and help (W3)
+# tests/test_remote_menu.py::test_every_entry_of_the_personal_menu_is_a_command_the_worker_reads_as_one -> LATER: the Teams menu words (W3)
+# tests/test_remote_nl_control.py::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent -> LATER: the router's assistant routing (W4, with W5)
+# tests/test_remote_nl_control.py::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do -> LATER: the router's assistant routing (W4, with W5)

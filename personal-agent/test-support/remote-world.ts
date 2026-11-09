@@ -109,6 +109,8 @@ export interface WorldOptions {
   readonly watchSeconds?: { readonly start: number; readonly mode: number };
   readonly windowDefault?: "card" | "chat";
   readonly direct?: boolean;
+  /** The follower's timings (TEST_TIMINGS when not given). */
+  readonly timings?: FollowTimings;
 }
 
 export class RemoteWorld {
