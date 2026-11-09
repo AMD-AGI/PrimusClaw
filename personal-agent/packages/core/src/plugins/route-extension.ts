@@ -8,7 +8,7 @@
  *
  * The body is unvalidated: the extension reads it through its own schema. The response body is JSON.
  */
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+import type { JsonValue } from "../json.js";
 
 export interface RouteRequest {
   /** Header names lower case. */
