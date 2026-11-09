@@ -63,6 +63,9 @@ export async function startAdmissionCluster(
       db: await import("../../src/infra/db.js"),
     };
     await app.db.initDb();
+    // What index.ts starts in the background once it listens, waited for here so that a suite sees the indexes
+    // production ends up with.
+    await app.db.buildDeferredIndexes();
   } catch (err) {
     // Open pools outlive a failed start, and node:test then waits on them
     // instead of reporting why the suite could not begin.
