@@ -35,7 +35,8 @@ import { handleTask, bindTaskDispatchKv } from "../src/tasks/dispatch.js";
 import { bindTaskLockKv } from "../src/tasks/lock.js";
 import { bindTaskRunnerDeps } from "../src/tasks/runner.js";
 import { markRetryPending } from "../src/tasks/retry-pending.js";
-import { activeAbort, resolveAbortTargets } from "../src/tasks/abort-registry.js";
+import { activeAbort, forgetRunAddresses, registerRunAddressesFor, resolveAbortTargets } from "../src/tasks/abort-registry.js";
+import { interruptRunsAt } from "../src/tasks/interrupt.js";
 import { TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT } from "../src/config.js";
 
 const sc = StringCodec();
@@ -108,6 +109,8 @@ async function dispatch(opts: {
   workspace?: { id?: string; required?: boolean };
   /** Carry one delivery's KV state into the next, for retry scenarios. */
   reuse?: ReturnType<typeof fakeKv>;
+  /** Look at the registry once the delivery has returned, before the harness clears it. */
+  afterRun?: () => void;
 }) {
   const { kv, store } = opts.reuse ?? fakeKv(opts.lockTaken, opts.lockProbeFails);
   const lockKey = SESSION;
@@ -156,6 +159,7 @@ async function dispatch(opts: {
   if (opts.inProcess) activeAbort.set(lockKey, new AbortController());
   try {
     await handleTask(msg);
+    opts.afterRun?.();
   } finally {
     activeAbort.delete(lockKey);
   }
@@ -520,4 +524,46 @@ test("a run gated on its workspace is still addressable by its session", async (
     "the session has to reach the run while it is still running");
   assert.deepEqual(resolveAbortTargets(SESSION), [],
     "and stop reaching it afterwards, or the next turn gets the last one's interrupt");
+});
+
+test("a run whose lock a Stop force-released does not, finishing late, unregister the next run of its key", async (t) => {
+  // Run A ignores a Stop; after the interrupt handler's grace the lock is
+  // released by force and A's controller dropped, so run B of the same gate
+  // key can start. A then returns. Its exit used to delete whatever controller
+  // sat under the key and forget whatever addresses were filed under it -- B's
+  // -- so B could no longer be stopped: every interrupt to the session found
+  // nothing on this pod.
+  const key = "ws.kws_abc";
+  const runB = new AbortController();
+  let seen: { ctrl?: AbortController; targets: string[]; stopped: string[] } | undefined;
+  try {
+    await dispatch({
+      deliveryCount: 1,
+      workspace: { id: "kws_abc", required: true },
+      postAgentDone: async () => {
+        t.mock.timers.enable({ apis: ["setTimeout"] });
+        try {
+          assert.deepEqual(interruptRunsAt(SESSION, 30_000), [key], "the Stop reaches A");
+          t.mock.timers.tick(30_000);
+        } finally {
+          t.mock.timers.reset();
+        }
+        assert.equal(activeAbort.has(key), false, "the force release dropped A's controller");
+        // Run B of the key starts, registered the way dispatch registers a run.
+        activeAbort.set(key, runB);
+        registerRunAddressesFor(key, { session_id: SESSION }, runB);
+      },
+      afterRun: () => {
+        seen = { ctrl: activeAbort.get(key), targets: resolveAbortTargets(SESSION), stopped: [] };
+        seen.stopped = interruptRunsAt(SESSION, 3_600_000);
+      },
+    });
+  } finally {
+    forgetRunAddresses(key);
+  }
+  assert.ok(seen, "A's delivery returned");
+  assert.equal(seen.ctrl, runB, "A's exit left B's controller in place");
+  assert.deepEqual(seen.targets, [key], "and B is still addressable by its session");
+  assert.deepEqual(seen.stopped, [key]);
+  assert.equal(runB.signal.aborted, true, "so a Stop of the session stops B");
 });
