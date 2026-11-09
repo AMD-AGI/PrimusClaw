@@ -9,7 +9,7 @@
 import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { tmpDir } from "./tmp-dirs.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const mode = process.env.FIXTURE_MODE ?? "pass";
 

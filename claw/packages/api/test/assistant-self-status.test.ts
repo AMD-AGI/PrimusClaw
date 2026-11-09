@@ -19,7 +19,7 @@ import test from "node:test";
 
 import { buildOf, renderRouterSelfSection, ulidFloor } from "../src/assistant/self-status.js";
 import { ulid } from "../src/tasks/ids.js";
-import { tmpDir } from "./tmp-dirs.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /** A ULID made at `ms`, as `tasks/ids.ts` makes one then. */

@@ -71,7 +71,7 @@ import {
   ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
-import { tmpDir } from "./tmp-dirs.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
 

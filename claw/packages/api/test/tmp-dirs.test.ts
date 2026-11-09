@@ -17,7 +17,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { tmpDir } from "./tmp-dirs.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const API_DIR = join(HERE, "..");

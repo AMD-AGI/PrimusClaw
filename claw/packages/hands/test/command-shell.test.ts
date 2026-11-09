@@ -10,9 +10,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { accessSync, chmodSync, constants, mkdtempSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 process.env.WORKSPACE_PATH = tmpdir();
 const { bash } = await import("../src/tools/shell/bash.js");
@@ -37,13 +38,13 @@ function candidate(dir: string, name: string, mode: number): string {
 }
 
 test("the first executable candidate is the shell", () => {
-  const dir = mkdtempSync(join(tmpdir(), "command-shell-"));
+  const dir = tmpDir("command-shell-");
   const present = candidate(dir, "bash", 0o755);
   assert.equal(resolveCommandShell([join(dir, "missing"), present]), present);
 });
 
 test("a candidate that is present but not executable is passed over", () => {
-  const dir = mkdtempSync(join(tmpdir(), "command-shell-"));
+  const dir = tmpDir("command-shell-");
   const unusable = candidate(dir, "bash", 0o644);
   assert.equal(resolveCommandShell([unusable]), "/bin/sh");
 });

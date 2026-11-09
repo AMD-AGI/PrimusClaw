@@ -9,8 +9,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const { buildPrompt, buildProgressiveSkillHint } = await import("../src/agent/prompt.js");
 const { skillDescription, loadPlatformDefaults, resetPlatformDefaultsCacheForTest, DESCRIPTION_MAX } =
@@ -77,7 +77,7 @@ test("description: injection-looking text stays a single inert line", () => {
 });
 
 test("loader: unset, missing, corrupt and invalid files never throw and mean not enabled", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pd-load-"));
+  const dir = tmpDir("pd-load-");
   resetPlatformDefaultsCacheForTest();
   assert.equal(loadPlatformDefaults(""), null);
   assert.equal(loadPlatformDefaults(path.join(dir, "nope.json")), null);
@@ -90,7 +90,7 @@ test("loader: unset, missing, corrupt and invalid files never throw and mean not
 });
 
 test("loader: valid file loads and a changed mtime reloads it", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pd-load-"));
+  const dir = tmpDir("pd-load-");
   resetPlatformDefaultsCacheForTest();
   const f = path.join(dir, "d.json");
   fs.writeFileSync(f, JSON.stringify({ skills: [{ tool_id: 5, name: "x" }], mcp_servers: { safe: { url: "u" } } }));
@@ -104,7 +104,7 @@ test("loader: valid file loads and a changed mtime reloads it", () => {
 });
 
 test("loader: mcp_env_allow is a list of placeholder names, and anything else rejects the file", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pd-load-"));
+  const dir = tmpDir("pd-load-");
   const f = path.join(dir, "d.json");
   const rows: Array<{ allow: unknown; want: string[] | null }> = [
     { allow: undefined, want: [] },

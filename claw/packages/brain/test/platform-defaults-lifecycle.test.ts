@@ -16,6 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { startWorld, skillZip, fakeHands } from "./support/platform-defaults-world.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const defaults = { skills: [{ tool_id: 11 }] };
 const world = await startWorld(defaults);
@@ -129,7 +130,7 @@ test("slow downloads are staged in parallel, so the chat waits for one, not the 
 });
 
 test("a defaults file with more than the supported number of skills is refused", async () => {
-  const dir = fs.mkdtempSync((await import("node:os")).tmpdir() + "/pd-max-");
+  const dir = tmpDir("pd-max-");
   const f = dir + "/d.json";
   fs.writeFileSync(f, JSON.stringify({ skills: Array.from({ length: 51 }, (_, i) => ({ tool_id: i + 1 })) }));
   assert.equal(loadPlatformDefaults(f), null);

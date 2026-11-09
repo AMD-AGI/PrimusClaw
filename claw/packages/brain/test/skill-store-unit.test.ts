@@ -17,9 +17,10 @@ const { truncateToolResult } = await import("../src/agent/agent-loop.js");
 const { ToolRouter } = await import("../src/tools/router.js");
 const { parseToolAllowlist } = await import("../src/tools/allowlist.js");
 import type { DefaultSkill } from "../src/agent/platform-defaults.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 function stage(files: Record<string, string | Buffer>): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skill-store-"));
+  const dir = tmpDir("skill-store-");
   for (const [rel, body] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
     fs.writeFileSync(path.join(dir, rel), body);
