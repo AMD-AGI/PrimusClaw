@@ -171,3 +171,23 @@ test("a file with runtime code that c8's report does not hold is named, wherever
   );
   assert.deepEqual(missingFromReport(expected, expected, base), []);
 });
+
+test("the judgement reads statements, not emitted text: what only looks like compiler output still counts", () => {
+  assert.equal(isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\n', "a.ts"), false);
+  assert.equal(
+    isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\nexport {};\n', "a.cts"),
+    false,
+  );
+  assert.equal(isTypeOnly('"use strict";\n'), false);
+  assert.equal(isTypeOnly("#!/usr/bin/env node\nexport interface A {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly('import { type A } from "./a.js";\nexport type B = A;\n'), false);
+  assert.equal(isTypeOnly('export { type A } from "./a.js";\n'), false);
+  assert.equal(isTypeOnly('import type { A } from "./a.js";\nexport { type A };\n'), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export type X = string;\n}\n"), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export const x = 1;\n}\n"), false);
+  assert.equal(isTypeOnly("declare global {\n  interface Window { x: string }\n}\nexport {};\n"), true);
+  assert.equal(isTypeOnly("export declare enum E { A }\nexport const enum F { B }\n"), false);
+  assert.equal(isTypeOnly("export default interface D {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly("const x = 1;\nexport default x;\n"), false);
+  assert.equal(isTypeOnly("export = {};\n", "a.cts"), false);
+});
