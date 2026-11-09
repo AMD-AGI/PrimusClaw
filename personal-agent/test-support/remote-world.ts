@@ -125,6 +125,10 @@ export class RemoteWorld {
   readonly claw: ClawRemoteAgentsPort;
   /** A message the channel refuses to post (Teams said no), when this says so. */
   refuse: ((message: OutMessage) => boolean) | null = null;
+  /** A message a test says Teams never answers for: its send hangs (until the test ends). */
+  hang: ((message: OutMessage) => boolean) | null = null;
+  /** The credential the remote agents read with for a person (their linked key here; a test may make it fail). */
+  credential: (person: string) => Promise<string | null> = (person) => Promise.resolve(KEY_OF[person] ?? null);
   /** Whether the chat may be told something now (false: muted hours, as a test says). */
   reachable = true;
   /** What the follower held for later, since the chat could not be told (the assistant's quiet hours keep it). */
@@ -145,7 +149,7 @@ export class RemoteWorld {
       enabled: options.enabled ?? true,
       follow: true,
       windowDefault: options.windowDefault ?? "chat",
-      timings: TEST_TIMINGS,
+      timings: options.timings ?? TEST_TIMINGS,
       watchTimings: TEST_TIMINGS,
       botName: "Clawy",
       streaming: false,
@@ -162,7 +166,7 @@ export class RemoteWorld {
       prefs: store.prefs,
       references: store.references,
       conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
-      credentialFor: (person) => Promise.resolve(KEY_OF[person] ?? null),
+      credentialFor: (person) => this.credential(person),
       reach: {
         reachable: () => this.reachable,
         muted: () => null,
@@ -212,8 +216,10 @@ export class RemoteWorld {
 
   /** The conversation as the channel posts to it, refusing what a test says Teams refuses. */
   private wrap(to: Conversation): Conversation {
-    const refused = (message: OutMessage): Promise<never> | null =>
-      this.refuse?.(message) === true ? Promise.reject(new Error("Teams said no")) : null;
+    const refused = (message: OutMessage): Promise<never> | null => {
+      if (this.hang?.(message) === true) return new Promise<never>(() => undefined);
+      return this.refuse?.(message) === true ? Promise.reject(new Error("Teams said no")) : null;
+    };
     return {
       ref: to.ref,
       edited: to.edited,
