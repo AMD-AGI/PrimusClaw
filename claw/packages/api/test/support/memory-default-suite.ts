@@ -12,6 +12,7 @@
  * (`memory-default-on.test.ts`, `memory-default-off.test.ts`).
  */
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { after, before, beforeEach, describe, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
 
@@ -63,7 +64,7 @@ export function memoryDefaultSuite(defaultOn: boolean | undefined): void {
     ];
 
     async function chat(userId: string): Promise<string> {
-      const sessionId = `s-${userId}-${Math.random().toString(36).slice(2, 8)}`;
+      const sessionId = `s-${userId}-${randomUUID().slice(0, 8)}`;
       await w.q("INSERT INTO claw_sessions (session_id, name, user_id, mode, config) VALUES ($1, 'chat', $2, 'claw', '{}')", [sessionId, userId]);
       return sessionId;
     }
