@@ -385,6 +385,15 @@ jobs:
           cache: npm
           cache-dependency-path: personal-agent/package-lock.json
 
+      # Python with `cryptography`, for the cross-language Fernet test (tokens made here must decrypt in Python, as the
+      # Python worker reads the same database). Without it that test fails in CI rather than skipping.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Python for the cross-language tests
+        run: pip install -r test-support/python/requirements.txt
+
       - run: npm ci
 
       # strict, noUncheckedIndexedAccess and exactOptionalPropertyTypes, over every package, test and fake.
