@@ -29,7 +29,13 @@ export type Recorded =
   | { readonly op: "post"; readonly conversation: string; readonly message: OutMessage; readonly id: MessageId }
   | { readonly op: "update"; readonly conversation: string; readonly id: MessageId; readonly message: OutMessage }
   | { readonly op: "delete"; readonly conversation: string; readonly id: MessageId }
-  | { readonly op: "stream.open"; readonly conversation: string; readonly replyTo: MessageId; readonly text: string }
+  | {
+      readonly op: "stream.open";
+      readonly conversation: string;
+      readonly replyTo: MessageId;
+      readonly text: string;
+      readonly id: MessageId;
+    }
   | { readonly op: "stream.inform"; readonly conversation: string; readonly text: string }
   | { readonly op: "stream.emit"; readonly conversation: string; readonly text: string }
   | { readonly op: "stream.finish"; readonly conversation: string; readonly message: OutMessage };
@@ -212,8 +218,10 @@ class FakeConversation implements Conversation {
     if (!this.surface.caps.streaming) {
       return Promise.resolve(err(refused("this channel cannot stream")));
     }
-    this.surface.record({ op: "stream.open", conversation: this.ref.id, replyTo, text: status });
-    return Promise.resolve(ok(new FakeStream(this.surface, this.ref.id)));
+    // The stream's message takes the next message id, as a channel answers the first stream request with one.
+    const id = this.surface.newId();
+    this.surface.record({ op: "stream.open", conversation: this.ref.id, replyTo, text: status, id });
+    return Promise.resolve(ok(new FakeStream(this.surface, this.ref.id, id)));
   }
 }
 
@@ -228,6 +236,7 @@ class FakeStream implements LiveStream {
   constructor(
     private readonly surface: FakeSurface,
     private readonly conversation: string,
+    readonly id: MessageId,
   ) {}
 
   inform(text: string): Promise<Result<void, StreamRefused>> {

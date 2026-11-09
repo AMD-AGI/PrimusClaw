@@ -13,6 +13,7 @@ test("the inbound builders give complete events with plain defaults", () => {
   assert.equal(message.sender.channelUserId, "29:u1");
   const action = inboundAction();
   assert.equal(action.invoke, true);
+  assert.equal(action.verb, action.data["primusclaw"], "verb is the data's primusclaw kind");
   assert.equal(action.clickVerb, "decision");
   assert.equal(inboundVote().reaction, "like");
 });
