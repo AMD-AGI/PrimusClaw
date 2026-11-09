@@ -5,6 +5,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   clipLine,
+  decimalInt,
+  isDigits,
+  isUpper,
+  splitOnce,
   cpHead,
   cpRfind,
   fixedN,
@@ -161,4 +165,30 @@ test("lower and casefold are Python's", () => {
   assert.equal(pyCasefold("Straße ẞ ſ"), "strasse ss s");
   assert.equal(pyCasefold("ꭰᏸᎠ"), "ᎠᏰᎠ");
   assert.equal(pyCasefold("ABC"), "abc");
+});
+
+test("splitOnce is str.split(None, 1)", () => {
+  assert.deepEqual(splitOnce(""), []);
+  assert.deepEqual(splitOnce(" \u3000 "), []);
+  assert.deepEqual(splitOnce("  /agent  new codex /my repo "), ["/agent", "new codex /my repo "]);
+  assert.deepEqual(splitOnce("/help"), ["/help"]);
+  assert.deepEqual(splitOnce("/help \x1c"), ["/help"]);
+  assert.deepEqual(splitOnce("a\x1cb c"), ["a", "b c"]);
+});
+
+test("strip with characters, and lstrip, as Python's (the routing rules' cases)", () => {
+  assert.equal(pyStrip("。。好了！", "。！"), "好了");
+  assert.equal(pyRstrip("😀😀a😀", "😀"), "😀😀a");
+  assert.equal(pyLstrip("\x1c\u3000 /x"), "/x");
+});
+
+test("a digit of any script is read as Python's int reads it", () => {
+  assert.equal(decimalInt("１２"), 12);
+  assert.equal(decimalInt("٣"), 3);
+  assert.equal(decimalInt("𝟗"), 9);
+  assert.equal(decimalInt("0"), 0);
+  assert.equal(decimalInt("1909"), 1909);
+  assert.ok(Number.isNaN(decimalInt("")) && Number.isNaN(decimalInt("1a")));
+  assert.ok(isDigits("١٢") && !isDigits("") && !isDigits("²"));
+  assert.ok(isUpper("7KQ3") && !isUpper("1234") && !isUpper("Ab") && !isUpper("ß"));
 });

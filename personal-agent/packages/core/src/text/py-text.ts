@@ -100,6 +100,48 @@ export function pyCasefold(text: string): string {
   return Array.from(text, foldPoint).join("");
 }
 
+/** `text.split(None, 1)`: the first word and the rest (its leading white space removed); at most two parts. */
+export function splitOnce(text: string): string[] {
+  const rest = pyLstrip(text);
+  if (rest === "") return [];
+  const match = new RegExp(`^([^${PY_SPACE}]+)[${PY_SPACE}]*`, "u").exec(rest);
+  const head = match?.[1] ?? rest;
+  const tail = rest.slice(match?.[0].length ?? rest.length);
+  return tail === "" ? [head] : [head, tail];
+}
+
+const DECIMAL_DIGIT = /^\p{Nd}$/u;
+
+/** The value of one decimal digit of any script: Unicode keeps every script's 0-9 in a run of ten. */
+function digitValue(ch: string): number {
+  let start = ch.codePointAt(0) ?? 0;
+  const at = start;
+  while (start > 0 && DECIMAL_DIGIT.test(String.fromCodePoint(start - 1))) start -= 1;
+  return (at - start) % 10;
+}
+
+/**
+ * `text.isdigit()` as the Python worker's rules use it: at least one character, each a decimal digit of any script
+ * (what `\d` matches in Python's `re`). (Python's `isdigit` also takes superscripts and circled digits, which `int`
+ * then refuses; no rule reads those.)
+ */
+export function isDigits(text: string): boolean {
+  return /^\p{Nd}+$/u.test(text);
+}
+
+/** `int(text)` for a run of decimal digits of any script (`１２` is 12, `٣` is 3); NaN for anything else. */
+export function decimalInt(text: string): number {
+  if (!isDigits(text)) return Number.NaN;
+  let value = 0;
+  for (const ch of text) value = value * 10 + digitValue(ch);
+  return value;
+}
+
+/** `text.isupper()`: at least one cased character, and none in lower case. */
+export function isUpper(text: string): boolean {
+  return text !== text.toLowerCase() && text === text.toUpperCase();
+}
+
 /** `len(text)`: code points. */
 export function cpLength(text: string): number {
   return Array.from(text).length;
