@@ -16,7 +16,7 @@ export function codePoints(text: string): string[] {
   return Array.from(text);
 }
 
-/** Case left out, as names and repositories are compared: Python's `str.casefold()` (`Straße` and `STRASSE` agree). */
+/** Case left out, as names and repositories are compared. */
 export function casefold(text: string): string {
   return pyCasefold(text);
 }

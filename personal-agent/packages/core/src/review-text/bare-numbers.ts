@@ -9,9 +9,10 @@
  * not read as one is named back to the asker (`strayNumbers`), never dropped in silence.
  */
 
-import { pyRegExp } from "../text/py-regex.js";
-import { PY_SPACE } from "../text/py-text.js";
 import { MARK_CLOSE, MARK_OPEN, prShortPattern, pullsIn, withoutGitSuffix } from "./pull-ref.js";
+import { pyRegExp } from "../text/py-regex.js";
+import { PY_SPACE, decimalInt } from "../text/py-text.js";
+import { hiddenSpans, replaceSpans } from "./text/scan.js";
 import { codePoints, isAlnum, unique } from "./text/unicode.js";
 
 const NOT_WORD_AFTER = "(?![\\p{L}\\p{N}_])";
@@ -24,16 +25,15 @@ const UNIT =
 // (not 10:30, 11-03, 1.5)
 /** White space other than a line break (Python's `[^\S\n]`, written as a class the translator takes). */
 const SPACE_NOT_NEWLINE = `[${PY_SPACE.replace("\\n", "")}]`;
-const NEXT = `(?![0-9])(?![.:：/-][0-9])(?!${SPACE_NOT_NEWLINE}*${UNIT})(?!(?!和|及|与|以及)[A-Za-z\\u3400-\\u9fff])`;
+const NEXT = `(?!\\p{Nd})(?![.:：/-]\\p{Nd})(?!${SPACE_NOT_NEWLINE}*${UNIT})(?!(?!和|及|与|以及)[A-Za-z\\u3400-\\u9fff])`;
 const BARE_PULLS_SOURCE =
   "(?:(?<![A-Za-z0-9_./#-])(?<repo>(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?[A-Za-z][A-Za-z0-9._-]{0,99})\\s*(?:的\\s*)?)?" +
   "(?<kw>(?:PRs?|pull\\s*requests?)\\s*[:：]?\\s*)?" +
-  `(?<nums>#?\\s?[0-9]{1,7}(?:${SEP}#?\\s?[0-9]{1,7}${NEXT})*)(?![0-9])`;
+  `(?<nums>#?\\s?\\p{Nd}{1,7}(?:${SEP}#?\\s?\\p{Nd}{1,7}${NEXT})*)(?!\\p{Nd})`;
 // A number written on its own (not inside a word, a version, a link or owner/repo#N), and not a count or a time.
-const LONE_NUMBER_SOURCE = `(?<![A-Za-z0-9_./#:：-])#?\\s?([0-9]{1,7})${NEXT}`;
+const LONE_NUMBER_SOURCE = `(?<![A-Za-z0-9_./#:：-])#?\\s?(\\p{Nd}{1,7})${NEXT}`;
 const OWNER_REPO_SOURCE =
   "(?<![A-Za-z0-9_./#-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})(?![A-Za-z0-9_/#-])";
-const HIDDEN_SOURCE = `<[^>]*>|&#?[\\p{L}\\p{N}_]+;|https?://\\S+|${MARK_OPEN}[0-9]+${MARK_CLOSE}`;
 
 const NOT_A_REPO = new Set([
   "pr",
@@ -85,9 +85,13 @@ export interface BareGroup {
   readonly explicit: boolean;
 }
 
+/** The text with its links, tags, entities and mention markers blanked (the places stay where they are). */
+function hidden(text: string): string {
+  return replaceSpans(text, hiddenSpans(text, MARK_OPEN, MARK_CLOSE), (m) => " ".repeat(m.length));
+}
+
 function blanked(text: string): string {
-  const spaces = (m: string): string => " ".repeat(m.length);
-  return text.replace(new RegExp(HIDDEN_SOURCE, "gu"), spaces).replace(prShortPattern(), spaces);
+  return hidden(text).replace(prShortPattern(), (m) => " ".repeat(m.length));
 }
 
 function isAsciiWordish(ch: string): boolean {
@@ -121,12 +125,12 @@ function readGroup(blank: string, match: RegExpExecArray): BareGroup | undefined
   const start = indices.nums?.[0] ?? 0;
   if (notPulls(blank, lead, start, indices.repo?.[1])) return undefined;
   const nums = match.groups?.nums ?? "";
-  const spans = [...nums.matchAll(/[0-9]{1,7}/gu)].map(
+  const spans = [...nums.matchAll(/\p{Nd}{1,7}/gu)].map(
     (m) => [m.index + start, m.index + start + m[0].length] as const,
   );
   return {
     spans,
-    numbers: spans.map(([a, b]) => Number(blank.slice(a, b))),
+    numbers: spans.map(([a, b]) => decimalInt(blank.slice(a, b))),
     repo: lead.repo,
     explicit: Boolean(lead.kw) || blank[start] === "#",
   };
@@ -157,7 +161,7 @@ export function strayNumbers(text: string, groups: readonly BareGroup[]): number
   for (const m of blank.matchAll(new RegExp(LONE_NUMBER_SOURCE, "gud"))) {
     const span = m.indices?.[1];
     if (span === undefined || held.has(`${String(span[0])}:${String(span[1])}`)) continue;
-    loose.push(Number(m[1]));
+    loose.push(decimalInt(m[1] ?? ""));
   }
   return unique(loose);
 }
@@ -165,9 +169,7 @@ export function strayNumbers(text: string, groups: readonly BareGroup[]): number
 /** The distinct repositories ("owner/repo") the text names: in its links, its owner/repo#N, and owner/repo written alone. */
 export function writtenRepos(text: string): string[] {
   const found = pullsIn(text).map((p) => `${p.owner}/${p.repo}`);
-  const blank = text
-    .replace(new RegExp(HIDDEN_SOURCE, "gu"), (m) => " ".repeat(m.length))
-    .replace(prShortPattern(), " ");
+  const blank = hidden(text).replace(prShortPattern(), " ");
   for (const m of blank.matchAll(new RegExp(OWNER_REPO_SOURCE, "gu"))) {
     found.push(`${m[1] ?? ""}/${withoutGitSuffix(m[2] ?? "")}`);
   }

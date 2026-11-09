@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The reading of a review request against the Python worker's on 7690 seeded texts (random pieces of requests, and
+ * The reading of a review request against the Python worker's on 7671 seeded texts (random pieces of requests, and
  * 3,000 shaped like "请 XX 帮我 review ..." with dotted and dotless i, full-width space and fictional names): bare numbers,
  * pull requests, the review-only ask, "review 合入", words, flattening, brackets, and where each of four members is
  * named. Every expected value is what the Python functions returned.
@@ -41,10 +41,16 @@ interface Row {
   readonly nin: string[][];
 }
 
-const corpus = JSON.parse(readFileSync(new URL("review-text-parity.json", import.meta.url), "utf8")) as {
-  members: Array<Omit<RosterMember, "channelUserId" | "userId"> & { id: string }>;
-  keys: string[][];
-  rows: Row[];
+/** One JSON object per line: the members and their keys first, then one row per text. */
+const [head = "{}", ...lines] = readFileSync(new URL("review-text-parity.jsonl", import.meta.url), "utf8")
+  .trimEnd()
+  .split("\n");
+const corpus = {
+  ...(JSON.parse(head) as {
+    members: Array<Omit<RosterMember, "channelUserId" | "userId"> & { id: string }>;
+    keys: string[][];
+  }),
+  rows: lines.map((line) => JSON.parse(line) as Row),
 };
 const members: RosterMember[] = corpus.members.map((m) => ({ ...m, channelUserId: "", userId: m.id }));
 const where = (place: ReadonlySet<string>): string[] => [...place].sort();
@@ -66,7 +72,7 @@ function differences(read: (row: Row) => unknown, expected: (row: Row) => unknow
 
 describe("review text parity with the Python worker", () => {
   it("covers asks, pull requests and bare numbers", () => {
-    assert.equal(corpus.rows.length, 7690);
+    assert.equal(corpus.rows.length, 7671);
     assert.ok(corpus.rows.filter((r) => r.ro !== null).length > 500);
     assert.ok(corpus.rows.filter((r) => r.p.length > 0).length > 1000);
     assert.ok(corpus.rows.filter((r) => r.g.length > 0).length > 500);
