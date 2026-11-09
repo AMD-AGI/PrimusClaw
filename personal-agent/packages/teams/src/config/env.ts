@@ -78,6 +78,11 @@ const SCOPE_NAMES: Readonly<Record<string, string>> = {
   group: "groupChat",
 };
 
+/** The scope a word of TEAMS_STREAMING names, "" for none (only the table's own words: `constructor` is none). */
+function scopeName(word: string): string {
+  return Object.hasOwn(SCOPE_NAMES, word) ? (SCOPE_NAMES[word] ?? "") : "";
+}
+
 /** TEAMS_STREAMING: `off`, or the chat kinds that get Teams' floating status (`personal`, `groupChat`, comma separated). */
 export function streamScopes(raw: string): ReadonlySet<string> {
   const value = pyStrip(raw);
@@ -86,7 +91,7 @@ export function streamScopes(raw: string): ReadonlySet<string> {
   const scopes = value
     .split(",")
     .filter((part) => pyStrip(part))
-    .map((part) => SCOPE_NAMES[pyStrip(part).toLowerCase()] ?? "");
+    .map((part) => scopeName(pyStrip(part).toLowerCase()));
   if (!scopes.length || scopes.includes("")) {
     throw new TeamsConfigError(`TEAMS_STREAMING must be off or a list of personal, groupChat; not '${raw}'`);
   }

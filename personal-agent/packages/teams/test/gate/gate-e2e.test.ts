@@ -26,7 +26,7 @@ import { GateToken, NoQueue } from "../../src/gate/no-queue.js";
 import { AckRegistry } from "../../src/messenger/acks.js";
 import { noMasking } from "../../src/messenger/masker.js";
 import { TeamsSurface } from "../../src/surface.js";
-import type { Renderers } from "../../src/views/registry.js";
+import { RENDERERS } from "../../src/views/index.js";
 
 async function world(clock: Clock = new FakeClock()) {
   const connector = await RecordingConnector.start();
@@ -44,7 +44,7 @@ async function world(clock: Clock = new FakeClock()) {
     clock,
     random: new SeededRandom(3),
     style: DEFAULT_STYLE,
-    renderers: {} as Renderers,
+    renderers: RENDERERS,
     masker: noMasking,
     files: { fetchFile: () => Promise.resolve(err({ kind: "file_refused", reason: "none" })) },
   });

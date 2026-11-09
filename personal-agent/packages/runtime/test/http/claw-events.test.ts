@@ -240,3 +240,17 @@ test("an event the chat already answered meanwhile is answered 200 dropped and t
   assert.deepEqual([answered.status, bodyOf(answered)], [200, { status: "dropped" }]);
   assert.deepEqual(bodyOf(await r.handle(signed(clock, say("e-9")))), { status: "duplicate" });
 });
+
+test("event ids that are not strings are python's str() of them, and a body without them is refused", async () => {
+  const { store, clock } = openTestStore();
+  linkedAlice(store);
+  store.links.setClawUserId("aad-a", "True");
+  const sink = new RecordingSink();
+  const r = route(store, clock, sink);
+  const numeric = { ...say(), event_id: 42, user_id: true };
+  const sent = await r.handle(signed(clock, numeric, { eventIdHeader: "42" }));
+  assert.deepEqual([sent.status, bodyOf(sent)], [200, { status: "delivered" }]);
+  assert.equal(store.idempotency.claimEvent("claw-event:42").state, "done");
+  const missing = await r.handle(signed(clock, { type: "assistant.say", event_id: "e-x" }));
+  assert.deepEqual([missing.status, bodyOf(missing)], [400, { error: "bad_event" }]);
+});

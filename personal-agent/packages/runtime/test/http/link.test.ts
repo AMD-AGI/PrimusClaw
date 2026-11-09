@@ -72,10 +72,27 @@ test("malformed requests", async () => {
   try {
     assert.equal((await post(base, "{}")).status, 400);
     assert.equal((await post(base, "not json")).status, 400);
-    assert.equal((await post(base, JSON.stringify({ key: { nested: 1 } }))).status, 400);
+    assert.equal((await post(base, "[1]")).status, 400);
+    assert.equal((await post(base, JSON.stringify("key"))).status, 400);
     const health = await fetch(`${base}/healthz`);
     assert.equal(health.status, 200);
     assert.equal(await health.text(), "ok");
+  } finally {
+    await app.close();
+  }
+});
+
+test("a key that is not a string is taken as python's str() of it", async () => {
+  const seen: string[] = [];
+  const { app, base } = await serve((key) => {
+    seen.push(key);
+    return Promise.resolve(true);
+  });
+  try {
+    for (const key of [{ nested: 1 }, null, true, 12, 1.5, ["a"]]) {
+      assert.equal((await post(base, JSON.stringify({ key }))).status, 200);
+    }
+    assert.deepEqual(seen, ["{'nested': 1}", "None", "True", "12", "1.5", "['a']"]);
   } finally {
     await app.close();
   }

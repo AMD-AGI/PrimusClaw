@@ -23,6 +23,7 @@ test("a stream opens with its status, numbers its requests and ends with the ans
   const opened = await conversation.openStream("user-msg-1", "Thinking…");
   assert.ok(opened.ok);
   const stream = opened.value;
+  assert.equal(stream.id, "stream-1"); // (the id the first request got)
   const informed = stream.inform("Reading  the\nfile");
   await flushMicrotasks();
   await clock.advance(1000);

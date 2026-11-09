@@ -6,7 +6,7 @@
  * parameters, query, the raw body) and answers with a status and a JSON or text body. The server (`server.ts`) mounts
  * them; tests call them directly.
  */
-import type { JsonValue } from "@primusclaw/personal-agent";
+import { pyRepr, type JsonValue } from "@primusclaw/personal-agent";
 
 export type Method = "GET" | "POST" | "PUT" | "DELETE";
 
@@ -48,4 +48,9 @@ export function bodyJson(request: HttpRequest): unknown {
 export function bearerOf(request: HttpRequest): string {
   const auth = request.headers["authorization"] ?? "";
   return auth.slice(0, 7).toLowerCase() === "bearer " ? auth.slice(7).trim() : "";
+}
+
+/** Python's `str(value)` of a JSON value: a string as it is, anything else its repr (`None`, `True`, `{'a': 1}`). */
+export function pythonStr(value: unknown): string {
+  return typeof value === "string" ? value : pyRepr(value);
 }

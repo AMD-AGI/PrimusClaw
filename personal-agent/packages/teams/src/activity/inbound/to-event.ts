@@ -150,8 +150,11 @@ export function toInboundEvent(
   }
   const vote = voteOf(activity);
   if (vote !== undefined) {
-    // (the answer the thumb is on: Teams names it as the invoke's replyToId)
-    return ok({ type: "vote", ...base(activity, sender), messageId: pyStr(activity["replyToId"]), ...vote });
+    // (the answer the thumb is on: Teams names it as the invoke's replyToId; anything but a string names none, as in
+    // Python's voted_message_id)
+    const replyTo = activity["replyToId"];
+    const messageId = typeof replyTo === "string" ? replyTo : "";
+    return ok({ type: "vote", ...base(activity, sender), messageId, ...vote });
   }
   return ok(activity.type === "message" ? messageOf(activity, sender, options) : undefined);
 }

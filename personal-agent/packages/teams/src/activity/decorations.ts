@@ -45,7 +45,8 @@ function mergeRoots(roots: readonly JsonObject[]): JsonObject {
       } else if (key === "citation") {
         if (Array.isArray(value)) citations.push(...value.filter(isObject));
       } else if (!FIXED_ROOT_KEYS.has(key)) {
-        merged[key] = value;
+        // (an own property whatever its name, as a Python dict key: `merged["__proto__"] = v` would set the prototype)
+        Object.defineProperty(merged, key, { value, enumerable: true, writable: true, configurable: true });
       }
     }
   }
