@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
-import { missingFromReport, packagesToCheck } from "../scripts/coverage.js";
+import { codeOutsideSrc, missingFromReport, packagesToCheck } from "../scripts/coverage.js";
 import { isTypeOnly, sourceFiles, symlinksUnder, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -190,4 +190,34 @@ test("the judgement reads statements, not emitted text: what only looks like com
   assert.equal(isTypeOnly("export default interface D {\n  readonly x: string;\n}\n"), true);
   assert.equal(isTypeOnly("const x = 1;\nexport default x;\n"), false);
   assert.equal(isTypeOnly("export = {};\n", "a.cts"), false);
+});
+
+test("a package whose entry points or source files lie outside src is refused", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  const pkg = path.join(packages, "core");
+  fs.mkdirSync(path.join(pkg, "src"), { recursive: true });
+  fs.mkdirSync(path.join(pkg, "test"));
+  fs.mkdirSync(path.join(pkg, "lib"));
+  fs.mkdirSync(path.join(pkg, "node_modules", "x"), { recursive: true });
+  const manifest = {
+    exports: { ".": { types: "./src/index.ts", default: "./outside.js" }, "./more": "./src/more.ts" },
+    main: "./src/index.ts",
+    bin: { tool: "./bin/tool.js" },
+  };
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify(manifest));
+  for (const f of ["src/index.ts", "test/a.test.ts", "outside.js", "lib/helper.ts", "node_modules/x/index.js"]) {
+    fs.writeFileSync(path.join(pkg, f), "export const x = 1;\n");
+  }
+  fs.writeFileSync(path.join(pkg, "README.md"), "# core\n");
+  assert.deepEqual(codeOutsideSrc(packages, "core"), [
+    "packages/core/package.json points at ./outside.js, outside src (the floor would not see it)",
+    "packages/core/package.json points at ./bin/tool.js, outside src (the floor would not see it)",
+    "packages/core/lib/helper.ts is source outside src/ and test/",
+    "packages/core/outside.js is source outside src/ and test/",
+  ]);
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ exports: { ".": "./src/index.ts" } }));
+  fs.rmSync(path.join(pkg, "outside.js"));
+  fs.rmSync(path.join(pkg, "lib"), { recursive: true });
+  assert.deepEqual(codeOutsideSrc(packages, "core"), []);
 });
