@@ -267,18 +267,7 @@ export class GithubReview {
     const status = await this.within(this.deps.credentials.status(userId));
     if (status === undefined || !status.ok) return {};
     const state = status.value;
-    const values: Record<string, string> = {
-      github: state.bound
-        ? state.bound && !state.expired
-          ? `\`${state.login}\``
-          : zh
-            ? "已过期"
-            : "expired"
-        : zh
-          ? "未连接"
-          : "not connected",
-      delegation: state.delegation ? on : off,
-    };
+    const values: Record<string, string> = { github: githubWord(state, zh), delegation: state.delegation ? on : off };
     if (!state.bound) return values;
     // (Claw holds it; before Claw has the setting, the default is what applies)
     const mode = await this.within(modeOf(this.deps, userId));
