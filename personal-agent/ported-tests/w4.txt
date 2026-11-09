@@ -151,3 +151,4 @@ teams/tests/test_capabilities.py::test_every_capability_of_the_code_is_in_the_re
 teams/tests/test_capabilities.py::test_the_derived_sets_are_not_empty -> packages/core/test/capabilities-guard.test.ts::test_the_derived_sets_are_not_empty
 teams/tests/test_capabilities.py::test_every_route_is_in_the_code -> packages/core/test/capabilities-guard.test.ts::test_every_route_is_in_the_code
 teams/tests/test_capabilities.py::test_removing_an_entry_turns_the_guard_red -> packages/core/test/capabilities-guard.test.ts::test_removing_an_entry_turns_the_guard_red
+# after the baseline: internal #463 (the /memory wording), Port-later item assigned to W4
