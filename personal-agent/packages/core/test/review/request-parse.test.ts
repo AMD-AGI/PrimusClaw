@@ -4,16 +4,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { markText } from "../../src/review/message.js";
+import { markedText } from "../../src/inbound-text/marked-text.js";
 import { shortName } from "../../src/review/pull-ref.js";
 import { asksReviewOnly, otherReviewers, parseReviewAsk, saysReviewAndMerge } from "../../src/review/request-parse.js";
 
 const PR = "AMD-AGI/Hyperloom#12";
-const BOB = { channelUserId: "29:b", userId: "", name: "Bob", shown: "<at>Bob</at>" };
+const BOB = { channelUserId: "29:b", userId: "", name: "Bob", shown: "Bob", offset: 0 };
 
 /** A message as the router hands it over: the bot's own mention gone, `{Bob}` an @mention of Bob. */
 function read(text: string, mentions = [BOB]) {
-  const marked = markText(text.replaceAll("{Bob}", "<at>Bob</at>"), mentions, []);
+  const marked = markedText(text.replaceAll("{Bob}", "Bob"), mentions);
   return parseReviewAsk(marked.text, marked.mentions);
 }
 
@@ -88,13 +88,12 @@ test("the model is taken out of the name, and every later line names its reviewe
 
 test("a later line that names the same person in another way is that person", () => {
   const mentions = [
-    { channelUserId: "29:w", userId: "", name: "Lin, Mei", shown: "<at>Lin, Mei</at>" },
-    { channelUserId: "29:w", userId: "", name: "Mei", shown: "<at>Mei</at>" },
+    { channelUserId: "29:w", userId: "", name: "Lin, Mei", shown: "Lin, Mei", offset: 2 },
+    { channelUserId: "29:w", userId: "", name: "Mei", shown: "@Mei", offset: 0 },
   ];
-  const marked = markText(
-    `请 <at>Lin, Mei</at> review 合入 ${PR}\n请 Mei Lin review 合入 AMD-AGI/x#2\n请 <at>Mei</at> review 合入 AMD-AGI/x#3\n请 review 合入 AMD-AGI/x#4`,
+  const marked = markedText(
+    `请 Lin, Mei review 合入 ${PR}\n请 Mei Lin review 合入 AMD-AGI/x#2\n请 @Mei review 合入 AMD-AGI/x#3\n请 review 合入 AMD-AGI/x#4`,
     mentions,
-    [],
   );
   const parsed = parseReviewAsk(marked.text, marked.mentions);
   assert.ok(parsed);

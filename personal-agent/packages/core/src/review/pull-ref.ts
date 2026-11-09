@@ -5,9 +5,7 @@
 
 import type { PullRef } from "../claw/model.js";
 
-/** What a mention is replaced with in a marked text: ⟦0⟧, ⟦1⟧, ... (the Teams adapter writes it; the domain reads it). */
-export const MARK_OPEN = "⟦";
-export const MARK_CLOSE = "⟧";
+export { MARK_CLOSE, MARK_OPEN } from "../inbound-text/marked-text.js";
 
 export type { PullRef };
 
