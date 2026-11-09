@@ -49,5 +49,10 @@ export interface ApprovalRepository {
   approvalSendFailed(sessionId: string, toolUseId: string): void;
   getApproval(sessionId: string, toolUseId: string): Approval | null;
   /** Move an approval to `state`; true if this call did it (only from 'pending' unless `onlyIfPending` is false). */
-  closeApproval(sessionId: string, toolUseId: string, state: ApprovalState, options?: { readonly onlyIfPending?: boolean }): boolean;
+  closeApproval(
+    sessionId: string,
+    toolUseId: string,
+    state: ApprovalState,
+    options?: { readonly onlyIfPending?: boolean },
+  ): boolean;
 }

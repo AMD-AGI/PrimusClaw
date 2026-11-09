@@ -39,7 +39,11 @@ export interface GithubConfirmationRepository {
   /** Still waiting for this person's answer, oldest first. */
   pendingGithubConfirmations(actorId: string): GithubConfirmation[];
   /** False when it was not in `onlyFrom` (default 'pending'). */
-  moveGithubConfirmation(confirmationId: string, state: ConfirmationState, options?: { readonly onlyFrom?: ConfirmationState }): boolean;
+  moveGithubConfirmation(
+    confirmationId: string,
+    state: ConfirmationState,
+    options?: { readonly onlyFrom?: ConfirmationState },
+  ): boolean;
   /** The card could not be sent: a pending row goes. */
   forgetGithubConfirmation(confirmationId: string): void;
 }
@@ -71,7 +75,13 @@ export interface ReviewDelegationRepository {
   noteReviewNotice(notice: ReviewNotice): void;
   /** In the order written. */
   reviewNotices(): ReviewNotice[];
-  addAskerFollow(follow: { readonly itemId: string; readonly batchId: string; readonly review: JsonObject; readonly reference: JsonObject; readonly deadline: number }): void;
+  addAskerFollow(follow: {
+    readonly itemId: string;
+    readonly batchId: string;
+    readonly review: JsonObject;
+    readonly reference: JsonObject;
+    readonly deadline: number;
+  }): void;
   /** Oldest first. */
   askerFollows(): AskerFollow[];
   askerFollowSaid(itemId: string, said: string): void;

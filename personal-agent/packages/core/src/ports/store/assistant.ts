@@ -79,7 +79,10 @@ export interface AssistantCardRepository {
   /** An open card moves to 'ended'; true if this call moved it. */
   endAssistantCard(cardId: string, ended: string): boolean;
   /** The card went out as the channel message `activityId` in `reference`, showing `render`. */
-  placeAssistantCard(cardId: string, placement: { readonly activityId: string; readonly reference: JsonObject; readonly render: JsonObject }): void;
+  placeAssistantCard(
+    cardId: string,
+    placement: { readonly activityId: string; readonly reference: JsonObject; readonly render: JsonObject },
+  ): void;
   /** Open, posted cards: of `itemId`, or (none given) all posted since `since`, oldest first. */
   placedAssistantCards(filter: { readonly itemId: string } | { readonly since?: number }): PlacedCard[];
   moveAssistantCard(cardId: string, state: CardState, options?: MoveOptions): boolean;
@@ -102,7 +105,12 @@ export interface AssistantButtonRepository {
 
 export interface AssistantMessageRepository {
   /** A message this worker sent to the person's assistant, with the actions it declared and the Claw users it named. */
-  noteAssistantMessage(channelMessageId: string, userId: string, actions: readonly string[], people?: readonly string[]): void;
+  noteAssistantMessage(
+    channelMessageId: string,
+    userId: string,
+    actions: readonly string[],
+    people?: readonly string[],
+  ): void;
   /** The Claw user ids the message named, while it is kept (empty otherwise). */
   assistantMessagePeople(channelMessageId: string): ReadonlySet<string>;
   assistantMessage(channelMessageId: string): AssistantMessage | null;
