@@ -12,14 +12,14 @@
  * S2 is in assistant-self-status-db.test.ts: on a real Postgres, with the assistant's configuration set before it is read.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { buildOf, renderRouterSelfSection, ulidFloor } from "../src/assistant/self-status.js";
 import { ulid } from "../src/tasks/ids.js";
+import { tmpDir } from "./tmp-dirs.js";
 
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /** A ULID made at `ms`, as `tasks/ids.ts` makes one then. */
@@ -70,7 +70,7 @@ test("S4 it reads no session settings, no message text, no error message, and bo
 });
 
 test("S5 the build: CLAW_BUILD, else the image's BUILD file, else unknown, and never what is not a tag", () => {
-  const dir = mkdtempSync(join(tmpdir(), "claw-build-"));
+  const dir = tmpDir("claw-build-");
   const file = pathToFileURL(join(dir, "BUILD"));
   assert.equal(buildOf("", file), null, "no file");
   writeFileSync(file, "202611070012\n");

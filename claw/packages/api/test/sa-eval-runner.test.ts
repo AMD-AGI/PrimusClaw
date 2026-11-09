@@ -70,14 +70,14 @@
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, closeSync, fstatSync, mkdtempSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { JUDGE_RETRY_NOTE } from "./e2e/sa-eval-lib.js";
+import { tmpDir } from "./tmp-dirs.js";
 
 const API_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = join(API_DIR, "test", "e2e", "sa-eval.ts");
@@ -330,7 +330,7 @@ const item = (n: number, over: Partial<Item> = {}): Item => ({
 interface Run { code: number | null; out: string; child: ChildProcess }
 
 /** The runner as an operator starts it, on the cases given, against `claw`. */
-function runner(claw: string, cases: object[], env: Record<string, string> = {}, dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"))): { done: Promise<Run>; child: ChildProcess; dir: string } {
+function runner(claw: string, cases: object[], env: Record<string, string> = {}, dir = tmpDir("sa-eval-runner-")): { done: Promise<Run>; child: ChildProcess; dir: string } {
   mkdirSync(join(dir, "cases"), { recursive: true });
   writeFileSync(join(dir, "cases", "c.jsonl"), cases.map((c) => JSON.stringify(c)).join("\n") + "\n");
   writeFileSync(join(dir, "key"), "test-key-not-a-secret\n");
@@ -507,7 +507,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
   it("R4b an earlier run's says, from its log: its assistant session is gone", { timeout: 120_000 }, async () => {
     const claw = new FakeClaw();
     const base = await claw.start();
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     // The earlier run saw three says that leave the hour 4 s after the run asks for its session (and one older than the hour,
     // and a broken line): set then, so how long the runner takes to start does not matter.
     let old = 0;
@@ -535,7 +535,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     const claw = new FakeClaw();
     claw.sayMaxPerHour = 23;
     const base = await claw.start();
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     // As R4b: three says of an earlier run that leave the hour 4 s after the run asks for its session. EVAL_SAY_PER_HOUR=550 would
     // send at once; the server's 23 makes the pace 3, and with the reserve of 1 the case waits for them.
     let old = 0;
@@ -775,7 +775,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     claw.router = (_content, id) => claw.turn(id, { say: "There are 3." });
     const answer = { id: "t-a-002", pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: "how many?" }],
       facts: [{ claim: "the count", oracle: { kind: "static", value: "3" } }] };
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
     const r = runner(base, [answer], { EVAL_INFRA_RETRY: "1", EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key"),
       EVAL_KEEP_TEXT: "1", EVAL_RECORD_DIR: join(dir, "records") }, dir);
@@ -845,7 +845,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       502, "PASS: after a 502", "The reply gives the count the user asked for.\n\nPASS: names the count", 400];
     claw.router = (_content, id) => claw.turn(id, { say: "There are 3 nodes." });
     const answer = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }] });
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
     const r = runner(base, ["t-j-001", "t-j-002", "t-j-003", "t-j-004", "t-j-005", "t-j-006", "t-j-007", "t-j-008"].map(answer),
       { EVAL_JUDGE_URL: `${base}/judge`, EVAL_JUDGE_MODEL: "m", EVAL_JUDGE_KEY_FILE: join(dir, "judge-key") }, dir);
@@ -875,7 +875,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     claw.router = (content, id) => claw.turn(id, { say: content === "t-m-003" ? "There are 4." : "The latest ROCm is 10.1.0." });
     const version = (id: string) => ({ id, pipeline: "catalog", area: "general", lang: "en", modes: ["assistant"], route: "answer", turns: [{ user: id }],
       facts: [{ claim: "the latest ROCm release", oracle: { kind: "static", value: id === "t-m-003" ? "3" : "10.1.0" } }] });
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     writeFileSync(join(dir, "judge-key"), "judge-key-not-a-secret\n");
     const records = join(dir, "private", "records");
     const r = runner(base, ["t-m-001", "t-m-002", "t-m-003"].map(version),
@@ -918,7 +918,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     // A recording directory others can read: refused before anything is sent.
     const open = new FakeClaw();
     const base2 = await open.start();
-    const dir2 = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir2 = tmpDir("sa-eval-runner-");
     mkdirSync(join(dir2, "shared"), { mode: 0o755 });
     chmodSync(join(dir2, "shared"), 0o755);
     // A private directory under one others may write (not sticky): it could be moved away and replaced before the write.
@@ -1274,7 +1274,7 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
     const claw = new FakeClaw();
     const base = await claw.start();
     claw.router = (_content, id) => claw.turn(id, { say: "ok" });
-    const dir = mkdtempSync(join(tmpdir(), "sa-eval-runner-"));
+    const dir = tmpDir("sa-eval-runner-");
     const counter = join(dir, "n");
     // A program and its arguments, run without a shell: here a script file the shell runs.
     writeFileSync(join(dir, "vars.sh"), `n=$(cat '${counter}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${counter}'; printf '{"gh": {"n": %s}}' $n\n`);

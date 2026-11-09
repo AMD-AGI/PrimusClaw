@@ -53,8 +53,7 @@
  *       says for a router that ended in plain text; the line is known by the id the server gives it
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -72,6 +71,7 @@ import {
   ownSays, SYSTEM_TURN_NOTICES,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
 } from "./e2e/sa-eval-lib.js";
+import { tmpDir } from "./tmp-dirs.js";
 
 const SEED_DIR = join(dirname(fileURLToPath(import.meta.url)), "e2e", "sa-eval-cases");
 
@@ -219,7 +219,7 @@ test("S8 loading and selection", () => {
   ].join("\n"), "f.jsonl");
   assert.deepEqual(got.cases.map((c) => c.id), ["a"]);
   assert.equal(got.bad.length, 3);
-  const dir = mkdtempSync(join(tmpdir(), "sa-eval-"));
+  const dir = tmpDir("sa-eval-");
   mkdirSync(join(dir, "real"));
   mkdirSync(join(dir, "catalog"));
   writeFileSync(join(dir, "real", "r.jsonl"), JSON.stringify(caseOf({ id: "r1", pipeline: "real" })) + "\n");
