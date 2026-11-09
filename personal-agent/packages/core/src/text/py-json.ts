@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { isPyPrintable } from "./py-chars.js";
+import { isPyPrintable, pointAt } from "./py-chars.js";
 import { pyNumber } from "./py-number.js";
 
 /** Values parsed from JSON as Python writes them: `str(value or "")`, `repr(value)`, `json.dumps(value, ...)`. */
@@ -32,14 +32,17 @@ function reprString(text: string): string {
     if (ch === "\n") return "\\n";
     if (ch === "\r") return "\\r";
     if (isPyPrintable(ch)) return ch;
-    const code = ch.codePointAt(0) ?? 0;
+    const code = pointAt(ch);
     if (code < 0x100) return `\\x${code.toString(16).padStart(2, "0")}`;
     return code < 0x10000 ? `\\u${code.toString(16).padStart(4, "0")}` : `\\U${code.toString(16).padStart(8, "0")}`;
   });
   return `${quote}${body.join("")}${quote}`;
 }
 
-/** `repr(value)` for a value parsed from JSON (`None`, `True`, `'text'`, `[1, 2]`, `{'a': 1}`). */
+/**
+ * `repr(value)` for a value parsed from JSON (`None`, `True`, `'text'`, `[1, 2]`, `{'a': 1}`). An object's keys are in
+ * its order, which JavaScript keeps for every key but integer-like ones ("2", "10"): those come first, ascending.
+ */
 export function pyRepr(value: unknown): string {
   if (value === null || value === undefined) return "None";
   if (typeof value === "boolean") return value ? "True" : "False";
@@ -92,13 +95,13 @@ function encode(value: unknown, options: JsonDumpsOptions, depth: number): strin
     );
   }
   if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).filter((k) => record[k] !== undefined);
-    if (options.sortKeys) keys.sort(byCodePoint);
-    const items = keys.map((k) => `${jsonString(k)}: ${encode(record[k], options, depth + 1)}`);
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined);
+    if (options.sortKeys) entries.sort(([a], [b]) => byCodePoint(a, b));
+    const items = entries.map(([k, v]) => `${jsonString(k)}: ${encode(v, options, depth + 1)}`);
     return container("{", "}", items, options, depth);
   }
   if (typeof value === "number") return pyNumber(value, "json");
+  if (typeof value === "bigint") return value.toString();
   if (typeof value === "string") return jsonString(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   return "null";
@@ -113,11 +116,12 @@ function container(open: string, close: string, items: string[], options: JsonDu
 
 /** Python orders `str` by code point; JavaScript's default sort compares UTF-16 units (they differ past U+FFFF). */
 function byCodePoint(a: string, b: string): number {
-  const x = Array.from(a);
-  const y = Array.from(b);
-  for (let i = 0; i < Math.min(x.length, y.length); i += 1) {
-    const d = (x[i]?.codePointAt(0) ?? 0) - (y[i]?.codePointAt(0) ?? 0);
-    if (d !== 0) return d;
+  const x = Array.from(a, (ch) => pointAt(ch));
+  const y = Array.from(b, (ch) => pointAt(ch));
+  for (let i = 0; ; i += 1) {
+    const p = x[i];
+    const q = y[i];
+    if (p === undefined || q === undefined) return x.length - y.length;
+    if (p !== q) return p - q;
   }
-  return x.length - y.length;
 }
