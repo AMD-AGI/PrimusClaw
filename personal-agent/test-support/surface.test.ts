@@ -107,3 +107,42 @@ test("openPersonal opens a 1:1 only with a reachable person; members lists only 
   assert.deepEqual(await surface.members(group), [member]);
   assert.equal(await surface.members(testConversation("g2", "group")), undefined);
 });
+
+test("an update aborted before it is sent is not recorded and rejects with the reason", async () => {
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const surface = new FakeSurface({ beforeUpdate: () => held });
+  const c = surface.conversation(testConversation());
+  await assert.rejects(
+    c.update("m1", textMessage("late"), { signal: AbortSignal.abort(new Error("stopped before")) }),
+    /stopped before/,
+  );
+  const controller = new AbortController();
+  const inFlight = c.update("m1", textMessage("progress"), { signal: controller.signal });
+  const other = c.update("m2", textMessage("kept"));
+  controller.abort(new Error("stopped"));
+  release();
+  await assert.rejects(inFlight, /stopped/);
+  await other;
+  assert.deepEqual(
+    surface.outbox.map((r) => (r.op === "update" ? r.id : r.op)),
+    ["m2"],
+  );
+});
+
+test("a channel that cannot edit refuses the update", async () => {
+  const surface = new FakeSurface({ caps: { edit: false } });
+  await assert.rejects(surface.conversation(testConversation()).update("m1", textMessage("x")), /cannot edit/);
+  assert.deepEqual(surface.outbox, []);
+});
+
+test("markSettled counts a message as settled without editing it", () => {
+  const surface = new FakeSurface();
+  const c = surface.conversation(testConversation());
+  assert.equal(c.edited.has("m7"), false);
+  c.markSettled("m7");
+  assert.equal(c.edited.has("m7"), true);
+  assert.deepEqual(surface.outbox, []);
+});
