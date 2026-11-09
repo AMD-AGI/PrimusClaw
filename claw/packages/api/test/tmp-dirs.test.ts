@@ -43,8 +43,10 @@ async function run(file: string, env: Record<string, string>, tmp: string, onDir
   child.stderr!.on("data", (b) => { err += String(b); });
   const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
   let exited = false;
+  child.on("exit", () => { exited = true; });
+  // `close`, not `exit`: it comes after the child's stdout and stderr have ended, so `out` and `err` are whole.
   const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
-    child.on("exit", (code, signal) => { exited = true; clearTimeout(killer); resolve({ code, signal }); }));
+    child.on("close", (code, signal) => { clearTimeout(killer); resolve({ code, signal }); }));
   if (onDir) {
     while (!exited && !existsSync(report)) await sleep(20);
     if (!exited) onDir(child);
