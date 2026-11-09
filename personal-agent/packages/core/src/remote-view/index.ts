@@ -11,6 +11,7 @@ import type { DisconnectView, MachineChoiceView, ModeView, TakeoverView } from "
 import type { DecidedView, PermissionView, RemoteAskView } from "./permission-view.js";
 import type { SessionsView } from "./sessions-view.js";
 import type { StatusView } from "./status-view.js";
+import type { WindowCardView } from "./window-view.js";
 
 export * from "./actions.js";
 export * from "./agents-view.js";
@@ -33,6 +34,7 @@ export * from "./status-view.js";
 export type { Reported } from "./reported.js";
 export * from "./setup.js";
 export * from "./turn-state.js";
+export * from "./window-view.js";
 
 declare module "../ports/surface.js" {
   interface ViewMap {
@@ -46,5 +48,6 @@ declare module "../ports/surface.js" {
     remoteTakeover: TakeoverView;
     remoteMachineChoice: MachineChoiceView;
     remoteMode: ModeView;
+    remoteWindow: WindowCardView;
   }
 }

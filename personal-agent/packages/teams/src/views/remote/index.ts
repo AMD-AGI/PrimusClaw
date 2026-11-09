@@ -8,12 +8,14 @@ import { decidedCard, permissionCard, remoteAskCard } from "./permission-cards.j
 import { sessionsCard } from "./sessions-card.js";
 import { disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 import { statusCard } from "./status-card.js";
+import { windowCard } from "./window-card.js";
 
 export { agentsCard, conversationBlocks } from "./agents-card.js";
 export { decidedCard, permissionCard, remoteAskCard } from "./permission-cards.js";
 export { connectBlocks, sessionsCard } from "./sessions-card.js";
 export { disconnectButtons, disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 export { statusCard } from "./status-card.js";
+export { windowCard } from "./window-card.js";
 
 type RemoteRenderers = Pick<
   Renderers,
@@ -27,6 +29,7 @@ type RemoteRenderers = Pick<
   | "remoteTakeover"
   | "remoteMachineChoice"
   | "remoteMode"
+  | "remoteWindow"
 >;
 
 /** The remote-agent renderers. */
@@ -41,4 +44,5 @@ export const REMOTE_RENDERERS: RemoteRenderers = {
   remoteTakeover: takeoverCard,
   remoteMachineChoice: machineChoiceCard,
   remoteMode: modeCard,
+  remoteWindow: windowCard,
 };
