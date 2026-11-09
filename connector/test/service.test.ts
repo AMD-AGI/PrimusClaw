@@ -48,8 +48,8 @@ function fakeExec(answers: Record<string, ExecResult> = {}) {
 }
 
 /** A process recorded as this home's script supervisor (pid and start time, as `supervise` records itself) that ends on SIGTERM. */
-async function fakeSupervisor(home: string) {
-  const p = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+async function fakeSupervisor(home: string, code = "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)") {
+  const p = spawn(process.execPath, ["-e", code], { stdio: "ignore" });
   const { processStart } = await import("../src/children.js");
   let start: string | null = null;
   for (let i = 0; i < 50 && !start; i++) { start = processStart(p.pid!); if (!start) await new Promise((r) => setTimeout(r, 20)); }
@@ -460,6 +460,22 @@ describe("service install / uninstall / status", () => {
     assert.match(a.text(), /No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again/);
     assert.match(a.text(), /^  sh '.*keepalive\.sh' >\/dev\/null 2>&1$/m);
     fs.rmSync(supervisorPidFile(a.c.dirs), { force: true });
+  });
+
+  test("script: a stopped supervisor that no parent reaps (a container's PID 1) counts as stopped once its pid file is gone", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    // Stands for the zombie: on SIGTERM it removes its pid file as supervise() does, but the process stays (kill(pid, 0) succeeds).
+    const pidf = supervisorPidFile(ctx(home).c.dirs);
+    const old = await fakeSupervisor(home, `process.on('SIGTERM', () => require('fs').rmSync(${JSON.stringify(pidf)}, { force: true })); setInterval(() => {}, 1000)`);
+    try {
+      const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), exec: fakeExec().exec } }, { PATH: "/bin" });
+      const t0 = Date.now();
+      assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+      assert.ok(Date.now() - t0 < 10_000, "not the 20 s wait");
+      assert.match(a.text(), /started the supervisor \(pid \d+\)/);
+    } finally { old.kill("SIGKILL"); fs.rmSync(pidf, { force: true }); }
   });
 
   test("script: with no supervisor running, install starts one and stops nothing", async () => {
