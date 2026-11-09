@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
-  AttachSupport, MAX_REPORTED, SESSION_REF_RE, classifyAppended, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
+  AttachSupport, MAX_REPORTED, SESSION_REF_RE, blindHolders, classifyAppended, isClaudeArgv, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
   TranscriptTail, TwinCheckError, transcriptUpdates, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -243,6 +243,70 @@ function hookRow(dir: string, pid: number, extra: Record<string, unknown> = {}, 
   fs.mkdirSync(terminalsDir(dir), { recursive: true });
   fs.writeFileSync(path.join(terminalsDir(dir), name), JSON.stringify({ v: 1, pid, procStart: processStart(pid), sessionId: REF, cwd: "/w", at: Date.now(), pidDomain: localPidDomain(), ...extra }));
 }
+
+// A Claude Code process whose registry row is unreadable (an empty sessions/<pid>.json, measured on a dev pod 2026-11-09: a
+// terminal session open for days was offered to be taken over, as "idle").
+const claudeNamed = (cwd: string, detached = false): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", cwd, argv0: "claude", detached });
+  children.push(c);
+  return c;
+};
+// (older than the grace an unreadable row gets while it may be being written: one written moments ago already refuses everything)
+const emptyRow = (dir: string, pid: number) => {
+  const file = path.join(dir, "sessions", `${pid}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "");
+  const t = (Date.now() - 3_600_000) / 1000;
+  fs.utimesSync(file, t, t);
+};
+
+describe("a Claude Code process whose registry row cannot be read", () => {
+  test("is found by its pid, its program and its folder; a readable row, or a process that is not Claude Code, is not", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-blind-"));
+    const blind = claudeNamed(work);
+    const other = sleeper();
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    emptyRow(dir, other.pid!);   // (an unreadable row of a process that is not Claude Code says nothing about a conversation)
+    registryRow(dir, 4242, { procStart: "1" });
+    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, pgid: processGroup(blind.pid!), cwd: work }]);
+    assert.equal(isClaudeArgv(["claude"]), true);
+    assert.equal(isClaudeArgv(["/usr/bin/node", "/opt/x/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
+    assert.equal(isClaudeArgv(["node", "/opt/claude-agent-acp/dist/index.js"]), false);
+  });
+
+  test("the twin check refuses: it cannot tell that the conversation is free, and a second writer is never started", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const blind = claudeNamed(os.tmpdir());
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    const v = await support(dir).check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok ? "ok" : v.reason, "twin_check_failed");
+    assert.match(v.ok ? "" : v.detail, new RegExp(`process ${blind.pid} .*sessions/${blind.pid}\\.json cannot be read`));
+    await stop(blind);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, true, "once that process is gone, the row says nothing");
+  });
+
+  test("this connector's own adapter (the process group it leads) is never taken for such a holder", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const mine = claudeNamed(os.tmpdir(), true);   // (detached: it leads its own group, as an adapter the connector starts does)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, mine.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "anyone else's: refused");
+  });
+
+  test("a session this connector holds with its own adapter is not stopped by another process's unreadable row (each prompt checks)", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const unrelated = claudeNamed(os.tmpdir());   // (an unrelated terminal in the same folder, its row empty)
+    const mine = sleeper({ detached: true });     // (this connector's adapter, leading its own group)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, unrelated.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true, "the held session goes on");
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "a new writer is still refused");
+  });
+});
 
 describe("the terminal hooks' rows in the twin check", () => {
   type Case = {
@@ -577,6 +641,19 @@ describe("attach end to end", () => {
     assert.equal(a.capabilities.resumable[0].updated_at, Date.parse("2026-10-29T10:00:00.000Z") / 1000);
     assert.equal(a.capabilities.resumable[0].cwd, fs.realpathSync(h.work));
     assert.ok(!JSON.stringify(a).includes("claude") && !JSON.stringify(a).includes("Claude"), "Claw is told nothing about the product");
+  });
+
+  test("a conversation in the folder of a Claude Code whose registry row cannot be read is reported unknown, not idle", { skip: process.platform !== "linux" }, async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "idle" }] });
+    const blind = claudeNamed(fs.realpathSync(h.work));
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(h.attachDir, blind.pid!);
+    await h.online();
+    // (the connector may have reported once before the row was written: the report after it is the one that counts)
+    const hb = await h.claw.until("a heartbeat that says REF is unknown", () => h.claw.heartbeats.find((b) =>
+      b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF && r.state === "unknown")));
+    // REF was "idle" (offered to take over); REF2 is still the live one its own row names
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state]), [[REF, "unknown"], [REF2, "live"]]);
   });
 
   test("a session is taken over in its own directory, in the ask mode, whatever mode it was left in; a write asks", async () => {
@@ -1031,8 +1108,13 @@ describe("attach end to end", () => {
     fs.utimesSync(file, old, old);
     const sid = await h.attach(REF);
     const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
-    h.prompt(sid, "background 100");
+    // Each task finishes when the test says so, after its turn's end has reached Claw. The connector takes the transcript's
+    // size when a turn ends: a notification written before that (a timer that beat a slow connector) is part of the turn,
+    // and there is no growth between turns left to see.
+    const finished = (n: number) => path.join(h.attachDir, `task-${n}-finished`);
+    h.prompt(sid, `background ${finished(1)}`);
     assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(1), "");
     await h.claw.until("the agent to answer the finished task by itself", () => fs.readFileSync(file, "utf8").includes("task-notification"));
     assert.ok(Date.now() - fs.statSync(file).mtimeMs < 600_000, "the transcript was written a moment ago");
     h.prompt(sid, "say two");
@@ -1043,8 +1125,9 @@ describe("attach end to end", () => {
     assert.ok(h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
     assert.ok(!h.audit().some((a) => a.kind === "transcript_changed"));
     // And again, once more on its own: the agent's program is known from each of its turns.
-    h.prompt(sid, "background 50");
+    h.prompt(sid, `background ${finished(2)}`);
     assert.equal((await h.turnEnd(sid, 3)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(2), "");
     await h.claw.until("the second notification", () => fs.readFileSync(file, "utf8").split('"kind":"task-notification"').length === 3);
     h.prompt(sid, "say four");
     assert.equal((await h.turnEnd(sid, 4)).data.stopReason, "end_turn");
@@ -1060,8 +1143,10 @@ describe("attach end to end", () => {
     const old = (Date.now() - 3_600_000) / 1000;
     fs.utimesSync(file, old, old);
     const sid = await h.attach(REF);
-    h.prompt(sid, "background 50");
+    const finished = path.join(h.attachDir, "task-finished");
+    h.prompt(sid, `background ${finished}`);
     assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished, "");
     await h.claw.until("the agent's own turn", () => fs.readFileSync(file, "utf8").includes("task-notification"));
     // A terminal opened the conversation, the person typed a prompt, it was answered, and the terminal closed.
     fs.appendFileSync(file, jl(...typedTurn));
@@ -1071,7 +1156,7 @@ describe("attach end to end", () => {
     const changed = h.audit().find((a) => a.kind === "transcript_changed");
     assert.equal(changed?.why, "entries written by another program");
     assert.ok(!h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
-    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["background 50"], "not sent to the agent that has not read the terminal's turn");
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), [`background ${finished}`], "not sent to the agent that has not read the terminal's turn");
     // Once it has settled, a fresh agent that reads the transcript takes it.
     fs.utimesSync(file, old, old);
     h.prompt(sid, "say three");

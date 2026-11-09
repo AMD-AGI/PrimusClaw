@@ -170,6 +170,7 @@ const T = {
     held: {
       merge: "合入", review: "批准", schedule: "创建定时任务", cancel: "取消定时任务", scheduleBrief: "创建定时简报", cancelBrief: "取消定时简报",
       comment: (where: string) => `在 ${where} 上发表评论`, send: (agent: string, machine: string) => `发给机器 ${machine} 上的 ${agent} 的指令`,
+      hide: (machine: string) => `在机器 ${machine} 上隐藏或断开会话`,
       other: (kind: string) => `一张待确认卡（${kind}）`,
     },
     items: "事项", pull_requests: "PR", notifications: "通知", jobs: "作业", safe: "SaFE", needs: "需要你：",
@@ -202,6 +203,7 @@ const T = {
     held: {
       merge: "merge", review: "approval", schedule: "schedule", cancel: "cancel", scheduleBrief: "schedule brief", cancelBrief: "cancel brief",
       comment: (where: string) => `comment on ${where}`, send: (agent: string, machine: string) => `instruction to ${agent} on the machine ${machine}`,
+      hide: (machine: string) => `hiding or disconnecting sessions on the machine ${machine}`,
       other: (kind: string) => `a card (${kind})`,
     },
     items: "Items", pull_requests: "Pull requests", notifications: "Notifications", jobs: "Jobs", safe: "SaFE", needs: "Needs you:",
@@ -354,6 +356,7 @@ function heldCard(w: Words, kind: string, p: Record<string, unknown>): string {
     case "trigger_cancel": return `${brief ? w.held.cancelBrief : w.held.cancel} "${oneLine(p.name, 60)}"`;
     case "github_comment": return w.held.comment(`${oneLine(p.repo, 100)}#${oneLine(p.number, 12)}`);
     case "devenv_send": return w.held.send(`"${oneLine(p.agent_id, 40)}"`, `"${oneLine(p.machine, 60)}"`);
+    case "devenv_hide": return w.held.hide(`"${oneLine(p.machine, 60)}"`);
     default: return w.held.other(oneLine(kind, 40));
   }
 }

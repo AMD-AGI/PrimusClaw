@@ -170,6 +170,14 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
+  with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
+  which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation
+  identity's assistant session is deleted between runs but its items are not. The list now leaves off a closed development
+  environment item whose machine is no longer the user's (an open one is listed with no name), the instruction cards voided because
+  their machine was revoked no longer name it, the results of `devenv_list` and `devenv_send` with no machine at all tell the router
+  to name none, and the router's prompt takes a machine's name from this turn's `devenv_list` or `devenv_send` alone.
+  Router prompt router-devenv-v14.
 - The assistant tells a person the commands they can type back in the language it answers them in: approve #ref and deny #ref for a
   card, undo #N after something is remembered, and 批准 / 拒绝 / 撤销 only in a Chinese conversation. The tool results (a memory save,
   a scheduled task, a GitHub comment or a devenv_send instruction card put to the person), what waits for them in the router's state
@@ -1222,6 +1230,11 @@ record it.
   Code's input box is refused in 30 s as `terminal_screen_unknown` (#555). In a container, `claw-connector service install`
   restarts a running supervisor so an edited agents.toml or environment takes effect, and an ended supervisor that PID 1 never
   reaps is no longer taken for a running one (#549).
+- `@primusclaw/connector` 0.1.15: a running Claude Code whose registry row (`sessions/<pid>.json`) cannot be read (an empty file a
+  lost write left) no longer makes the conversations in its folder look free: they are reported `unknown`, not `idle`, so no
+  client offers to take one over, and a takeover or new attach there is refused (`twin_check_failed`, naming the process and the
+  file); a session this connector already holds goes on. The scan is shared and time-limited, and `doctor` warns
+  (`claude_registry_row_unreadable`) with the fix: send anything in that terminal (#572).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
