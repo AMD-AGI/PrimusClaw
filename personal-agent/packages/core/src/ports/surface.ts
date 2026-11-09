@@ -161,7 +161,11 @@ export interface InboundMessage extends InboundBase {
 /** A button pressed on a card the bot posted. */
 export interface InboundAction extends InboundBase {
   readonly type: "action";
-  /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
+  /**
+   * Which action: the `primusclaw` field of the button's data, the worker's own kind that routing dispatches on
+   * (Python `activity._card_data`'s kind: "decision", "answer", "remote", ...). The adapter copies it, never interprets
+   * it; "" when the data names none.
+   */
   readonly verb: string;
   /**
    * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
@@ -234,8 +238,11 @@ export type ViewButton =
   | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
   | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
 
-/** How a button is emphasised (Teams: the action's `style`); none is the channel's default look. */
-export type ButtonStyle = "positive" | "destructive";
+/**
+ * How a button is emphasised (Teams: the action's `style`), carried as written so card JSON matches the Python worker
+ * byte for byte: an explicit "default" (the feedback offer's No) is not the same JSON as no style at all.
+ */
+export type ButtonStyle = "default" | "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
