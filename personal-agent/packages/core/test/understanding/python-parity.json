@@ -1,0 +1,1641 @@
+{
+  "known": [
+    {
+      "name": "Lin Mei",
+      "objectId": "aad-lm",
+      "email": "linmei0120@example.com"
+    },
+    {
+      "name": "Robin Lang",
+      "objectId": "aad-rl",
+      "email": "robin.lang@example.com",
+      "givenName": "Robin",
+      "surname": "Lang"
+    },
+    {
+      "name": "王小明",
+      "objectId": "aad-wx"
+    },
+    {
+      "name": "Bob Stone",
+      "objectId": "aad-bs"
+    },
+    {
+      "name": "Ann Lee (Shanghai)",
+      "objectId": "aad-al",
+      "userPrincipalName": "annlee7@example.com"
+    },
+    {
+      "name": "Al",
+      "objectId": "aad-x1"
+    },
+    {
+      "name": "Mei Lin",
+      "objectId": "",
+      "email": "meilin@example.com"
+    },
+    {
+      "name": "Linda Meier",
+      "objectId": "aad-ld",
+      "email": "lmeier@example.com"
+    }
+  ],
+  "linked": {
+    "aad-lm": "u-lm",
+    "aad-rl": "u-rl",
+    "aad-wx": "u-wx",
+    "aad-al": "u-al",
+    "aad-ld": "u-ld",
+    "aad-m2": "u-m2"
+  },
+  "mentions": [
+    [],
+    [
+      {
+        "mentioned": {
+          "name": "Mention Two",
+          "id": "29:m2"
+        }
+      }
+    ],
+    [
+      {
+        "mentioned": {
+          "name": "Bob Stone",
+          "aadObjectId": "aad-bs"
+        }
+      }
+    ],
+    [
+      {
+        "mentioned": {
+          "name": "",
+          "aadObjectId": "x"
+        }
+      }
+    ]
+  ],
+  "people": [
+    {
+      "text": "请 Lin Mei 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lin Mei 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 Lin Mei 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lin Mei 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 Lin Mei 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lin Mei 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 Lin Mei 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lin Mei 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请linmei帮我review合入AMD-AGI/Hyperloom#12",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请linmei帮我review合入 ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请linmei帮我review合入AMD-AGI/Hyperloom#12",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请linmei帮我review合入 ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请linmei帮我review合入AMD-AGI/Hyperloom#12",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请linmei帮我review合入 ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请linmei帮我review合入AMD-AGI/Hyperloom#12",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请linmei帮我review合入 ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 Mei, Lin review 合入 x/y#1",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Mei, Lin review 合入  ",
+      "pulls": [["x", "y", 1]]
+    },
+    {
+      "text": "请 Mei, Lin review 合入 x/y#1",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Mei, Lin review 合入  ",
+      "pulls": [["x", "y", 1]]
+    },
+    {
+      "text": "请 Mei, Lin review 合入 x/y#1",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Mei, Lin review 合入  ",
+      "pulls": [["x", "y", 1]]
+    },
+    {
+      "text": "请 Mei, Lin review 合入 x/y#1",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Mei, Lin review 合入  ",
+      "pulls": [["x", "y", 1]]
+    },
+    {
+      "text": "请 linme 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-lm"],
+      "without_refs": "请 linme 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 linme 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-lm"],
+      "without_refs": "请 linme 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 linme 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-lm"],
+      "without_refs": "请 linme 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 linme 帮我 review 合入 AMD-AGI/Hyperloom#12",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-lm"],
+      "without_refs": "请 linme 帮我 review 合入  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 robinn 帮我 review AMD-AGI/Hyperloom#12",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-rl"],
+      "without_refs": "请 robinn 帮我 review  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 robinn 帮我 review AMD-AGI/Hyperloom#12",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-rl"],
+      "without_refs": "请 robinn 帮我 review  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 robinn 帮我 review AMD-AGI/Hyperloom#12",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-rl"],
+      "without_refs": "请 robinn 帮我 review  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请 robinn 帮我 review AMD-AGI/Hyperloom#12",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-rl"],
+      "without_refs": "请 robinn 帮我 review  ",
+      "pulls": [["AMD-AGI", "Hyperloom", 12]]
+    },
+    {
+      "text": "请王小明帮我review合入AMD-AGI/x#1",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "王小明",
+          "user_id": "u-wx",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请王小明帮我review合入 ",
+      "pulls": [["AMD-AGI", "x", 1]]
+    },
+    {
+      "text": "请王小明帮我review合入AMD-AGI/x#1",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "王小明",
+          "user_id": "u-wx",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请王小明帮我review合入 ",
+      "pulls": [["AMD-AGI", "x", 1]]
+    },
+    {
+      "text": "请王小明帮我review合入AMD-AGI/x#1",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "王小明",
+          "user_id": "u-wx",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请王小明帮我review合入 ",
+      "pulls": [["AMD-AGI", "x", 1]]
+    },
+    {
+      "text": "请王小明帮我review合入AMD-AGI/x#1",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "王小明",
+          "user_id": "u-wx",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请王小明帮我review合入 ",
+      "pulls": [["AMD-AGI", "x", 1]]
+    },
+    {
+      "text": "请小明帮我 review 合入 o/r#3",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "请小明帮我 review 合入  ",
+      "pulls": [["o", "r", 3]]
+    },
+    {
+      "text": "请小明帮我 review 合入 o/r#3",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请小明帮我 review 合入  ",
+      "pulls": [["o", "r", 3]]
+    },
+    {
+      "text": "请小明帮我 review 合入 o/r#3",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请小明帮我 review 合入  ",
+      "pulls": [["o", "r", 3]]
+    },
+    {
+      "text": "请小明帮我 review 合入 o/r#3",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "请小明帮我 review 合入  ",
+      "pulls": [["o", "r", 3]]
+    },
+    {
+      "text": "请 annlee 帮我 review 合入 o/r#4",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 annlee 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annlee 帮我 review 合入 o/r#4",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 annlee 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annlee 帮我 review 合入 o/r#4",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 annlee 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annlee 帮我 review 合入 o/r#4",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 annlee 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annle 帮我 review 合入 o/r#4",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-al"],
+      "without_refs": "请 annle 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annle 帮我 review 合入 o/r#4",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-al"],
+      "without_refs": "请 annle 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annle 帮我 review 合入 o/r#4",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-al"],
+      "without_refs": "请 annle 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "请 annle 帮我 review 合入 o/r#4",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Ann Lee (Shanghai)",
+          "user_id": "u-al",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-al"],
+      "without_refs": "请 annle 帮我 review 合入  ",
+      "pulls": [["o", "r", 4]]
+    },
+    {
+      "text": "https://github.com/linmei/proj/pull/42 帮我看看",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "  帮我看看",
+      "pulls": [["linmei", "proj", 42]]
+    },
+    {
+      "text": "https://github.com/linmei/proj/pull/42 帮我看看",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "  帮我看看",
+      "pulls": [["linmei", "proj", 42]]
+    },
+    {
+      "text": "https://github.com/linmei/proj/pull/42 帮我看看",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "  帮我看看",
+      "pulls": [["linmei", "proj", 42]]
+    },
+    {
+      "text": "https://github.com/linmei/proj/pull/42 帮我看看",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "  帮我看看",
+      "pulls": [["linmei", "proj", 42]]
+    },
+    {
+      "text": "model: linmei 请 Bob 帮我 review 合入 o/r#5",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "  请 Bob 帮我 review 合入  ",
+      "pulls": [["o", "r", 5]]
+    },
+    {
+      "text": "model: linmei 请 Bob 帮我 review 合入 o/r#5",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "  请 Bob 帮我 review 合入  ",
+      "pulls": [["o", "r", 5]]
+    },
+    {
+      "text": "model: linmei 请 Bob 帮我 review 合入 o/r#5",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "  请 Bob 帮我 review 合入  ",
+      "pulls": [["o", "r", 5]]
+    },
+    {
+      "text": "model: linmei 请 Bob 帮我 review 合入 o/r#5",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "  请 Bob 帮我 review 合入  ",
+      "pulls": [["o", "r", 5]]
+    },
+    {
+      "text": "Bob Stone 你好",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "Bob Stone 你好",
+      "pulls": []
+    },
+    {
+      "text": "Bob Stone 你好",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Bob Stone",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "Bob Stone 你好",
+      "pulls": []
+    },
+    {
+      "text": "Bob Stone 你好",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "Bob Stone 你好",
+      "pulls": []
+    },
+    {
+      "text": "Bob Stone 你好",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "Bob Stone 你好",
+      "pulls": []
+    },
+    {
+      "text": "lindameier review 合入 o/r#6",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "lindameier review 合入  ",
+      "pulls": [["o", "r", 6]]
+    },
+    {
+      "text": "lindameier review 合入 o/r#6",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "lindameier review 合入  ",
+      "pulls": [["o", "r", 6]]
+    },
+    {
+      "text": "lindameier review 合入 o/r#6",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "lindameier review 合入  ",
+      "pulls": [["o", "r", 6]]
+    },
+    {
+      "text": "lindameier review 合入 o/r#6",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "lindameier review 合入  ",
+      "pulls": [["o", "r", 6]]
+    },
+    {
+      "text": "请 lmeie 帮我 review 合入 o/r#7",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-ld"],
+      "without_refs": "请 lmeie 帮我 review 合入  ",
+      "pulls": [["o", "r", 7]]
+    },
+    {
+      "text": "请 lmeie 帮我 review 合入 o/r#7",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-ld"],
+      "without_refs": "请 lmeie 帮我 review 合入  ",
+      "pulls": [["o", "r", 7]]
+    },
+    {
+      "text": "请 lmeie 帮我 review 合入 o/r#7",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": ["aad-ld"],
+      "without_refs": "请 lmeie 帮我 review 合入  ",
+      "pulls": [["o", "r", 7]]
+    },
+    {
+      "text": "请 lmeie 帮我 review 合入 o/r#7",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Linda Meier",
+          "user_id": "u-ld",
+          "email": "lmeier@example.com",
+          "source": "near"
+        }
+      ],
+      "near": ["aad-ld"],
+      "without_refs": "请 lmeie 帮我 review 合入  ",
+      "pulls": [["o", "r", 7]]
+    },
+    {
+      "text": "robin.lang@example.com 帮我 review 合入 o/r#8",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "robin.lang@example.com 帮我 review 合入  ",
+      "pulls": [["o", "r", 8]]
+    },
+    {
+      "text": "robin.lang@example.com 帮我 review 合入 o/r#8",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "robin.lang@example.com 帮我 review 合入  ",
+      "pulls": [["o", "r", 8]]
+    },
+    {
+      "text": "robin.lang@example.com 帮我 review 合入 o/r#8",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "robin.lang@example.com 帮我 review 合入  ",
+      "pulls": [["o", "r", 8]]
+    },
+    {
+      "text": "robin.lang@example.com 帮我 review 合入 o/r#8",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "robin.lang@example.com 帮我 review 合入  ",
+      "pulls": [["o", "r", 8]]
+    },
+    {
+      "text": "请 al 帮我 review 合入 o/r#9",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 al 帮我 review 合入  ",
+      "pulls": [["o", "r", 9]]
+    },
+    {
+      "text": "请 al 帮我 review 合入 o/r#9",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 al 帮我 review 合入  ",
+      "pulls": [["o", "r", 9]]
+    },
+    {
+      "text": "请 al 帮我 review 合入 o/r#9",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 al 帮我 review 合入  ",
+      "pulls": [["o", "r", 9]]
+    },
+    {
+      "text": "请 al 帮我 review 合入 o/r#9",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Al",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 al 帮我 review 合入  ",
+      "pulls": [["o", "r", 9]]
+    },
+    {
+      "text": "请 Robinlang 帮我 review 合入 o/r#10",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Robinlang 帮我 review 合入  ",
+      "pulls": [["o", "r", 10]]
+    },
+    {
+      "text": "请 Robinlang 帮我 review 合入 o/r#10",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Robinlang 帮我 review 合入  ",
+      "pulls": [["o", "r", 10]]
+    },
+    {
+      "text": "请 Robinlang 帮我 review 合入 o/r#10",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Robinlang 帮我 review 合入  ",
+      "pulls": [["o", "r", 10]]
+    },
+    {
+      "text": "请 Robinlang 帮我 review 合入 o/r#10",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Robinlang 帮我 review 合入  ",
+      "pulls": [["o", "r", 10]]
+    },
+    {
+      "text": "just chatting about lunch",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "just chatting about lunch",
+      "pulls": []
+    },
+    {
+      "text": "just chatting about lunch",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "just chatting about lunch",
+      "pulls": []
+    },
+    {
+      "text": "just chatting about lunch",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "just chatting about lunch",
+      "pulls": []
+    },
+    {
+      "text": "just chatting about lunch",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "just chatting about lunch",
+      "pulls": []
+    },
+    {
+      "text": "请 xyzw 帮我 review 合入 o/r#11",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "请 xyzw 帮我 review 合入  ",
+      "pulls": [["o", "r", 11]]
+    },
+    {
+      "text": "请 xyzw 帮我 review 合入 o/r#11",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 xyzw 帮我 review 合入  ",
+      "pulls": [["o", "r", 11]]
+    },
+    {
+      "text": "请 xyzw 帮我 review 合入 o/r#11",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 xyzw 帮我 review 合入  ",
+      "pulls": [["o", "r", 11]]
+    },
+    {
+      "text": "请 xyzw 帮我 review 合入 o/r#11",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "请 xyzw 帮我 review 合入  ",
+      "pulls": [["o", "r", 11]]
+    },
+    {
+      "text": "请问 linmei 帮我 review o/r#1",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请问 linmei 帮我 review  ",
+      "pulls": [["o", "r", 1]]
+    },
+    {
+      "text": "请问 linmei 帮我 review o/r#1",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请问 linmei 帮我 review  ",
+      "pulls": [["o", "r", 1]]
+    },
+    {
+      "text": "请问 linmei 帮我 review o/r#1",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请问 linmei 帮我 review  ",
+      "pulls": [["o", "r", 1]]
+    },
+    {
+      "text": "请问 linmei 帮我 review o/r#1",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Lin Mei",
+          "user_id": "u-lm",
+          "email": "linmei0120@example.com",
+          "source": "known"
+        },
+        {
+          "name": "Mei Lin",
+          "email": "meilin@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请问 linmei 帮我 review  ",
+      "pulls": [["o", "r", 1]]
+    },
+    {
+      "text": "请 meilinn 帮我 review 合入 o/r#2",
+      "mentions": 0,
+      "people": [],
+      "near": [],
+      "without_refs": "请 meilinn 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 meilinn 帮我 review 合入 o/r#2",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 meilinn 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 meilinn 帮我 review 合入 o/r#2",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 meilinn 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 meilinn 帮我 review 合入 o/r#2",
+      "mentions": 3,
+      "people": [],
+      "near": [],
+      "without_refs": "请 meilinn 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 Lang Robin 帮我 review 合入 o/r#2",
+      "mentions": 0,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lang Robin 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 Lang Robin 帮我 review 合入 o/r#2",
+      "mentions": 1,
+      "people": [
+        {
+          "name": "Mention Two",
+          "user_id": "u-m2",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lang Robin 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 Lang Robin 帮我 review 合入 o/r#2",
+      "mentions": 2,
+      "people": [
+        {
+          "name": "Bob Stone",
+          "source": "mention"
+        },
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lang Robin 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    },
+    {
+      "text": "请 Lang Robin 帮我 review 合入 o/r#2",
+      "mentions": 3,
+      "people": [
+        {
+          "name": "Robin Lang",
+          "user_id": "u-rl",
+          "email": "robin.lang@example.com",
+          "source": "known"
+        }
+      ],
+      "near": [],
+      "without_refs": "请 Lang Robin 帮我 review 合入  ",
+      "pulls": [["o", "r", 2]]
+    }
+  ],
+  "keys": [
+    {
+      "person": {
+        "name": "Lin Mei",
+        "objectId": "aad-lm",
+        "email": "linmei0120@example.com"
+      },
+      "keys": ["linmei", "linmei0120", "meilin"]
+    },
+    {
+      "person": {
+        "name": "Robin Lang",
+        "objectId": "aad-rl",
+        "email": "robin.lang@example.com",
+        "givenName": "Robin",
+        "surname": "Lang"
+      },
+      "keys": ["langrobin", "robinlang"]
+    },
+    {
+      "person": {
+        "name": "王小明",
+        "objectId": "aad-wx"
+      },
+      "keys": ["王小明"]
+    },
+    {
+      "person": {
+        "name": "Bob Stone",
+        "objectId": "aad-bs"
+      },
+      "keys": ["bobstone", "stonebob"]
+    },
+    {
+      "person": {
+        "name": "Ann Lee (Shanghai)",
+        "objectId": "aad-al",
+        "userPrincipalName": "annlee7@example.com"
+      },
+      "keys": ["annlee", "annlee7", "annleeshanghai", "leeann", "shanghaileeann"]
+    },
+    {
+      "person": {
+        "name": "Al",
+        "objectId": "aad-x1"
+      },
+      "keys": ["al"]
+    },
+    {
+      "person": {
+        "name": "Mei Lin",
+        "objectId": "",
+        "email": "meilin@example.com"
+      },
+      "keys": ["linmei", "meilin"]
+    },
+    {
+      "person": {
+        "name": "Linda Meier",
+        "objectId": "aad-ld",
+        "email": "lmeier@example.com"
+      },
+      "keys": ["lindameier", "lmeier", "meierlinda"]
+    }
+  ],
+  "stops": [
+    {
+      "text": "停 825",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "把 825 的 review 停一下",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "stop AMD-AGI/Primus#825",
+      "pulls": [["amd-agi/primus", 825]]
+    },
+    {
+      "text": "825 先别合，826 也停",
+      "pulls": [
+        ["", 825],
+        ["", 826]
+      ]
+    },
+    {
+      "text": "停一下",
+      "pulls": []
+    },
+    {
+      "text": "825 为什么停在 CI",
+      "pulls": []
+    },
+    {
+      "text": "帮我 review 825",
+      "pulls": []
+    },
+    {
+      "text": "825 为什么被取消了？",
+      "pulls": []
+    },
+    {
+      "text": "不要停 825",
+      "pulls": []
+    },
+    {
+      "text": "do not stop 825",
+      "pulls": []
+    },
+    {
+      "text": "825 别停，继续审",
+      "pulls": []
+    },
+    {
+      "text": "don't cancel #825",
+      "pulls": []
+    },
+    {
+      "text": "我不想停 #825",
+      "pulls": []
+    },
+    {
+      "text": "我不想取消 #825",
+      "pulls": []
+    },
+    {
+      "text": "I don't want to stop 825",
+      "pulls": []
+    },
+    {
+      "text": "不必撤回 825",
+      "pulls": []
+    },
+    {
+      "text": "停不了 825",
+      "pulls": []
+    },
+    {
+      "text": "825 别审了",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "stop AMD-AGI/Primus#825 please",
+      "pulls": [["amd-agi/primus", 825]]
+    },
+    {
+      "text": "停 https://github.com/AMD-AGI/Primus/pull/825",
+      "pulls": [["amd-agi/primus", 825]]
+    },
+    {
+      "text": "停 AMD-AGI/Primus#825\t826",
+      "pulls": [
+        ["amd-agi/primus", 825],
+        ["", 826]
+      ]
+    },
+    {
+      "text": "停 ８２５",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "STOP 825 now",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "halt #825 #825",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "停 825，826、827 吧",
+      "pulls": [
+        ["", 825],
+        ["", 826],
+        ["", 827]
+      ]
+    },
+    {
+      "text": "取消 AMD-AGI/Primus#825 和 Primus#826",
+      "pulls": [["amd-agi/primus", 825]]
+    },
+    {
+      "text": "停 x825",
+      "pulls": []
+    },
+    {
+      "text": "停 825.5",
+      "pulls": []
+    },
+    {
+      "text": "停 #825 pls",
+      "pulls": [["", 825]]
+    },
+    {
+      "text": "停止 AMD-AGI/a.git#3",
+      "pulls": [["amd-agi/a", 3]]
+    }
+  ]
+}
