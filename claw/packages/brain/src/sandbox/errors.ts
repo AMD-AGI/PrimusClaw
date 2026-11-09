@@ -166,6 +166,53 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
 }
 
 /**
+ * What SaFE writes when the platform, not the container, ended a pod: the
+ * DisruptionTarget condition it records on the pod ("DisruptionTarget:
+ * <reason> ...", or "pod <name> was taken away by a disruption, ..." for a pod
+ * that then reported success), and the pod-level reasons Kubernetes gives a pod
+ * it killed from above the container (NodeLost, Evicted, Preempted, NodeShutdown).
+ * The CamelCase tokens are matched as written, so ordinary prose does not match.
+ */
+const WORKLOAD_DISRUPTION = new RegExp([
+  String.raw`\bDisruptionTarget\b`,
+  "taken away by a disruption",
+  String.raw`\b(?:NodeLost|Evicted|Preempted|NodeShutdown|PreemptionByScheduler|DeletionByTaintManager|DeletionByPodGC|TerminationByKubelet|EvictionByEvictionAPI)\b`,
+].join("|"));
+
+/**
+ * The kubelet's words for evicting a pod over what the pod itself used: past its
+ * own ephemeral-storage limit (the pod's, a container's, an emptyDir's), or the
+ * pod picked because one of its containers used more than it requested when the
+ * node ran short (the kubelet then says "Container c was using X, request is Y,
+ * has larger consumption of memory"). Those come as Evicted /
+ * TerminationByKubelet / EvictionByEvictionAPI too, and are the application's
+ * doing. A node-pressure eviction that names no such container ("The node was
+ * low on resource: memory." alone) is the node's, and stays a disruption.
+ */
+const RESOURCE_EVICTION = /exceeds? (?:the |its )?(?:total )?limit|exceeded its .{0,80}limit|has larger consumption of/i;
+
+/**
+ * Whether a terminal SaFE workload detail says the platform took its pod away
+ * (its node lost, a preemption, a drain) rather than its container failing or
+ * the pod being evicted for what it used itself (`RESOURCE_EVICTION`).
+ *
+ * Reads the terminal condition's message only, the one
+ * {@link classifyWorkloadTerminalReason} reads (it carries the failed pods'
+ * details): never the top-level message, which the scheduler writes and never
+ * clears, so an old "Preempted" there would make a later failure of the
+ * container look like a disruption. No terminal condition is false.
+ */
+export function workloadDisrupted(info: Record<string, unknown>): boolean {
+  const conds = Array.isArray(info.conditions) ? (info.conditions as Array<Record<string, unknown> | null>) : [];
+  const terminal = conds.find((c) => {
+    const t = String(c?.type ?? "").toLowerCase();
+    return t === "adminfailed" || t === "adminstopped";
+  });
+  const text = String(terminal?.message ?? "");
+  return WORKLOAD_DISRUPTION.test(text) && !RESOURCE_EVICTION.test(text);
+}
+
+/**
  * The sandbox this call targeted does not exist any more.
  *
  * Distinct from a transport failure on purpose. Keepalive tolerates several

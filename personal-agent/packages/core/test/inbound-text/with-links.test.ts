@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MARK_CLOSE, MARK_OPEN, markedText } from "../../src/inbound-text/marked-text.js";
+import { markedText } from "../../src/inbound-text/marked-text.js";
+import { MARK_CLOSE, MARK_OPEN } from "../../src/review-text/markers.js";
 import { insertLinks, withLinks } from "../../src/inbound-text/with-links.js";
 import type { InboundMention } from "../../src/ports/surface.js";
 

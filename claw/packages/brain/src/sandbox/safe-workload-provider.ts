@@ -26,6 +26,7 @@ import {
 } from "../config.js";
 import {
   classifyWorkloadTerminalReason,
+  workloadDisrupted,
   SANDBOX_WORKSPACE_FORBIDDEN,
   SandboxExecRouteUnavailableError,
   SandboxProvisionTerminalError,
@@ -218,6 +219,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
           healthy: false,
           state: "terminal",
           reason: classifyWorkloadTerminalReason(info),
+          ...(workloadDisrupted(info) ? { disrupted: true } : {}),
         };
       }
       return { running: false, healthy: false, state: "unknown" };
