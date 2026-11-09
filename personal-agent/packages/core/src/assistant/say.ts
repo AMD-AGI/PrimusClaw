@@ -23,7 +23,8 @@ import type { Citation, OutMessage, View } from "../ports/surface.js";
 import { squashSpaces } from "../text/py-text.js";
 import { replyParts } from "../turn/answer-parts.js";
 import { citationsFromSources } from "./citations.js";
-import { assistantDeliveries } from "./deliveries.js";
+import { assistantDeliveries } from "../turn/deliveries.js";
+import type { JsonObject } from "../json.js";
 import { PULL_LINK, SUGGESTIONS_MAX, confirmActionOf, confirmWriteOf, suggestedRepliesOf } from "./events.js";
 import { parseWorkItem } from "./item-of.js";
 import { fitsWorkCard, workEventText } from "./work-items.js";
@@ -101,12 +102,12 @@ export class SayPlanner {
 
   /** A card for each delivered file Claw gives a link for, and the names of all of them. */
   private fileCards(event: Event, linkFor: DeliveryLink | undefined): { cards: OutMessage[]; names: string[] } {
-    const files = assistantDeliveries(event);
-    const cards = files.flatMap((f) => {
-      const url = linkFor?.(f.sessionId, f.delivery.id);
-      return url ? [view({ name: "delivery", model: { delivery: f.delivery, url } })] : [];
+    const files = assistantDeliveries(event as JsonObject);
+    const cards = files.flatMap(([sessionId, delivery]) => {
+      const url = linkFor?.(sessionId, delivery.id);
+      return url ? [view({ name: "delivery", model: { delivery, url } })] : [];
     });
-    return { cards, names: files.map((f) => shownName(f.delivery.name)) };
+    return { cards, names: files.map(([, delivery]) => shownName(delivery.name)) };
   }
 
   /** The replies to tap, under the last of what was said, when no card follows. */
