@@ -246,8 +246,8 @@ function hookRow(dir: string, pid: number, extra: Record<string, unknown> = {}, 
 
 // A Claude Code process whose registry row is unreadable (an empty sessions/<pid>.json, measured on a dev pod 2026-11-09: a
 // terminal session open for days was offered to be taken over, as "idle").
-const claudeNamed = (cwd: string): ChildProcess => {
-  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", cwd, argv0: "claude" });
+const claudeNamed = (cwd: string, detached = false): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", cwd, argv0: "claude", detached });
   children.push(c);
   return c;
 };
@@ -270,7 +270,7 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     emptyRow(dir, blind.pid!);
     emptyRow(dir, other.pid!);   // (an unreadable row of a process that is not Claude Code says nothing about a conversation)
     registryRow(dir, 4242, { procStart: "1" });
-    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, cwd: work }]);
+    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, pgid: processGroup(blind.pid!), cwd: work }]);
     assert.equal(isClaudeArgv(["claude"]), true);
     assert.equal(isClaudeArgv(["/usr/bin/node", "/opt/x/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
     assert.equal(isClaudeArgv(["node", "/opt/claude-agent-acp/dist/index.js"]), false);
@@ -286,6 +286,15 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     assert.match(v.ok ? "" : v.detail, new RegExp(`process ${blind.pid} .*sessions/${blind.pid}\\.json cannot be read`));
     await stop(blind);
     assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, true, "once that process is gone, the row says nothing");
+  });
+
+  test("this connector's own adapter (the process group it leads) is never taken for such a holder", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const mine = claudeNamed(os.tmpdir(), true);   // (detached: it leads its own group, as an adapter the connector starts does)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, mine.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "anyone else's: refused");
   });
 });
 

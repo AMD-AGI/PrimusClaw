@@ -411,14 +411,18 @@ export class AttachSupport {
     // would hold a thread of the pool until the disk answers).
     this.looking ??= this.liveEntries().catch(() => null).finally(() => { this.looking = null; });
     const live = await within(this.looking, capMs, null);
-    const blind = await within(blindHolders(this.configDir).catch(() => [] as BlindHolder[]), capMs, [] as BlindHolder[]);
+    // A scan that did not answer in time is no evidence either way: every idle conversation is then "unknown", as it is when the
+    // live list cannot be had. Its own adapters' processes (the groups this connector leads) are no holder.
+    const own = new Set(this.d.registry.list().map((r) => r.pgid));
+    const scanned = await within(blindHolders(this.configDir).catch(() => null), capMs, null);
+    const blind = scanned === null ? null : scanned.filter((b) => b.pgid === null || !own.has(b.pgid));
     const attached = this.d.attachedRefs();
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
       let state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
       // A Claude Code process here whose registry row cannot be read may be the one that has it open: not "idle" (which a
       // client offers to take over, starting a second writer), but "unknown".
-      if (state === "idle" && blind.some((b) => mayHold(b, l.cwd))) state = "unknown";
+      if (state === "idle" && (blind === null || blind.some((b) => mayHold(b, l.cwd)))) state = "unknown";
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
       if (state === "live") {
         Object.assign(out, liveActivity(holders));
@@ -554,7 +558,9 @@ export class AttachSupport {
     // Fails closed: a local Claude Code process whose registry row cannot be read, in the conversation's folder (or one
     // whose folder cannot be read), may have it open, and a second writer is never started next to it.
     const cwd = this.listed.find((l) => l.ref === want)?.cwd ?? null;
-    const blind = (await blindHolders(this.configDir).catch(() => [] as BlindHolder[])).find((b) => cwd === null || mayHold(b, cwd));
+    const own = new Set(this.d.registry.list().map((r) => r.pgid));
+    const blind = (await blindHolders(this.configDir).catch(() => [] as BlindHolder[]))
+      .find((b) => (b.pgid === null || (b.pgid !== o.ownPgid && !own.has(b.pgid))) && (cwd === null || mayHold(b, cwd)));
     if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
     if (o.transcript) {
       const file = this.transcriptFile(want);
@@ -937,6 +943,8 @@ export function parseAgentsJson(text: string): LiveEntry[] {
 /** A local Claude Code process that is alive but whose registry row (`sessions/<pid>.json`) cannot be read. */
 export interface BlindHolder {
   pid: number;
+  /** Its process group (null when it cannot be read): a group this connector leads is its own adapter, never a holder. */
+  pgid: number | null;
   /** Its working directory, or null when it cannot be read. */
   cwd: string | null;
 }
@@ -968,7 +976,7 @@ export async function blindHolders(configDir: string, procRoot = "/proc"): Promi
     if (!isClaudeArgv(argv)) continue;
     let cwd: string | null = null;
     try { cwd = await fsp.readlink(path.join(procRoot, String(pid), "cwd")); } catch { /* not readable */ }
-    out.push({ pid, cwd });
+    out.push({ pid, pgid: processGroup(pid), cwd });
   }
   return out;
 }
