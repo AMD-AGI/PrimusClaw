@@ -18,6 +18,7 @@
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
 import { inTransaction } from "../infra/db.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
+import type { RetryRefusal } from "@claw/protocol";
 import { getWorkItem, ITEM_COLUMNS, itemView, RUNNING, type WorkItemView } from "./work-items.js";
 
 /** What the worker is told when the person presses Retry. */
@@ -25,7 +26,7 @@ export const RETRY_TEXT =
   "The person pressed Retry on this task. The previous attempt failed or was stopped. Look at what was done so far, " +
   "then carry the task through from where it stands and report as before.";
 
-export type RetryRefusal = "not_retryable" | "too_many_active_items" | "session_not_found" | "no_credentials" | "acting_session_unattended";
+export type { RetryRefusal } from "@claw/protocol";
 
 export type RetryResult =
   | { status: "ok"; item: WorkItemView }

@@ -22,22 +22,18 @@ import { freezeRequesterView } from "./requester-view.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
+import type {
+  BoardState, ItemKind, ReportKind, StopRefusal, WorkItemDecisionError, WorkItemEvent, WorkItemOutcome,
+  WorkItemView as ProtocolWorkItemView,
+} from "@claw/protocol";
 import { newWorkItemId } from "../tasks/ids.js";
 
-export const BOARD_STATES = ["in_progress", "needs_you", "done"] as const;
-export type BoardState = (typeof BOARD_STATES)[number];
-
-export const REPORT_KINDS = ["progress", "waiting", "ready", "answer", "blocked", "failed", "dropped"] as const;
-export type ReportKind = (typeof REPORT_KINDS)[number];
-
-export type Outcome = "accepted" | "answered" | "dropped" | "stopped";
-
-/**
- * `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`).
- * `remote`: an agent on one of the user's own machines, read off what its session did (`remote-items.ts`).
- */
-export const ITEM_KINDS = ["task", "review", "remote"] as const;
-export type ItemKind = (typeof ITEM_KINDS)[number];
+// The item's wire shape and its closed sets are the HTTP API's contract, defined in @claw/protocol (`claw-api/work-items.ts`)
+// so that clients of the API share them; re-exported here so the API's own modules keep one import path.
+export { BOARD_STATES, ITEM_KINDS, REPORT_KINDS, type BoardState, type ItemKind, type ReportKind, type StopRefusal } from "@claw/protocol";
+export type Outcome = WorkItemOutcome;
+/** An item as the API builds it: `updated_at` is a `Date` here and an ISO 8601 string on the wire. */
+export type WorkItemView = ProtocolWorkItemView<Date>;
 
 export interface WorkReport {
   kind: ReportKind;
@@ -178,24 +174,6 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
 export const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
   outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at, kind, params`;
 
-export interface WorkItemView {
-  item_id: string;
-  seq: number;
-  title: string;
-  summary: string;
-  board_state: BoardState;
-  last_report_kind: ReportKind | null;
-  pending_question: string | null;
-  outcome: Outcome | null;
-  result_version: number;
-  accepted_version: number | null;
-  can_accept: boolean;
-  kind: ItemKind;
-  /** What a review was asked with (`review-items.ts`); `{}` for a task. */
-  params: Record<string, unknown>;
-  updated_at: Date;
-}
-
 /** Derived from the state, never chosen by a model: a result waits for a person. */
 export function canAccept(row: { board_state: string; last_report_kind: string | null }): boolean {
   return row.board_state === "needs_you" && row.last_report_kind === "ready";
@@ -210,7 +188,7 @@ export function itemView(row: Record<string, unknown>): WorkItemView {
     board_state: row.board_state as BoardState,
     last_report_kind: (row.last_report_kind ?? null) as ReportKind | null,
     pending_question: (row.pending_question ?? null) as string | null,
-    outcome: (row.outcome ?? null) as Outcome | null,
+    outcome: (row.outcome ?? null) as WorkItemOutcome | null,
     result_version: Number(row.result_version),
     accepted_version: row.accepted_version == null ? null : Number(row.accepted_version),
     can_accept: canAccept(row as { board_state: string; last_report_kind: string | null }),
@@ -280,12 +258,12 @@ export async function listWorkItems(userId: string, state: BoardState | null): P
   return rows.map(itemView);
 }
 
-export async function recentEvents(itemId: string, limit = 20): Promise<Array<Record<string, unknown>>> {
+export async function recentEvents(itemId: string, limit = 20): Promise<Array<WorkItemEvent<Date>>> {
   return (await db.query(
     `SELECT id, kind, source, generation, run_id, summary, question, result, created_at
        FROM claw_work_item_events WHERE item_id = $1 ORDER BY id DESC LIMIT $2`,
     [itemId, limit],
-  )).rows as Array<Record<string, unknown>>;
+  )).rows as Array<WorkItemEvent<Date>>;
 }
 
 // --- Taking on an item ----------------------------------------------------------------
@@ -378,10 +356,7 @@ export async function insertWorkItem(
 export type DecisionResult =
   | { status: "ok"; item: WorkItemView }
   | { status: "not_found" }
-  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed" | StopRefusal; item: WorkItemView };
-
-/** Why a review item cannot be stopped: its merge is being made, or was made. Saying so is the truth; nothing is undone. */
-export type StopRefusal = "merge_in_progress" | "already_merged";
+  | { status: "conflict"; error: WorkItemDecisionError; item: WorkItemView };
 
 /** Thrown inside the stop's transaction, which it rolls back: nothing was stopped and no confirmation was denied. */
 class StopRefused extends Error {

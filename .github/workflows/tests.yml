@@ -109,6 +109,12 @@ jobs:
           bash scripts/lint-tests-must-resolve.sh --self-test
           bash scripts/lint-tests-must-resolve.sh --all
 
+      # The Claw HTTP API's wire types (packages/protocol/src/claw-api) against what the API builds: the type
+      # assertions in that test file are compiled here, since no package's own build reads its test directory.
+      - name: Wire types compile against the API
+        if: matrix.extras
+        run: npx --no-install tsc -p packages/protocol/tsconfig.wire-test.json
+
       # Runs each package's own `npm test` command with the shard flag added.
       # A TAP copy of the results feeds the per-package counts the gate jobs
       # below check and print.
