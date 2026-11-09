@@ -9,6 +9,14 @@ import { groupChatKey, isGroupKey, personOf } from "../../src/remote/chat-key.js
 import { agentById, connectorById, connectorFrom, sessionFrom } from "../../src/remote/model.js";
 import { remoteConnectorsSchema, remoteSessionsSchema } from "../../src/claw/remote.js";
 
+/** A reading without the answer it was read from (and its agents too). */
+function withoutRaw<T extends { raw: unknown }>(reading: T): Omit<T, "raw"> {
+  const rest: Record<string, unknown> = { ...reading };
+  delete rest.raw;
+  if (Array.isArray(rest.agents)) rest.agents = (rest.agents as { raw: unknown }[]).map(withoutRaw);
+  return rest as Omit<T, "raw">;
+}
+
 test("a connector is read with its agents and every field it did not say is empty", () => {
   const listed = remoteConnectorsSchema.parse([
     {
@@ -26,7 +34,7 @@ test("a connector is read with its agents and every field it did not say is empt
     null,
   ]);
   assert.equal(listed.length, 2);
-  const [connector, bare] = listed.map(connectorFrom);
+  const [connector, bare] = listed.map(connectorFrom).map(withoutRaw);
   assert.deepEqual(connector, {
     connectorId: "c1",
     name: "dev-pod",
@@ -49,8 +57,8 @@ test("a connector is read with its agents and every field it did not say is empt
     paired: false,
     agents: [],
   });
-  assert.deepEqual(connectorById(listed.map(connectorFrom), "c1"), connector);
-  assert.equal(agentById(connector, "codex")?.name, "Codex");
+  assert.equal(connectorById(listed.map(connectorFrom), "c1")?.raw, listed[0]);
+  assert.equal(agentById(connectorFrom(listed[0] ?? {}), "codex")?.name, "Codex");
   assert.equal(agentById(undefined, "codex"), undefined);
 });
 
@@ -71,7 +79,7 @@ test("a session is read with its flags as said or null", () => {
     [],
   ]);
   assert.equal(sessions.length, 1);
-  assert.deepEqual(sessions.map(sessionFrom)[0], {
+  assert.deepEqual(sessions.map(sessionFrom).map(withoutRaw)[0], {
     sessionId: "s1",
     connectorId: "c1",
     agentId: "codex",
@@ -95,5 +103,5 @@ test("an agent that reports no capabilities has none", () => {
   const [connector] = remoteConnectorsSchema
     .parse([{ connector_id: "c", agents: [{ agent_id: "a" }] }])
     .map(connectorFrom);
-  assert.deepEqual(connector?.agents, [{ agentId: "a", kind: "", name: "", capabilities: {} }]);
+  assert.deepEqual(connector?.agents.map(withoutRaw), [{ agentId: "a", kind: "", name: "", capabilities: {} }]);
 });

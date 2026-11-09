@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { ClawError, isErrorWord } from "../../src/claw/errors.js";
 import type { Lang } from "../../src/locales/lang.js";
 import { remoteAgentText } from "../../src/locales/remote-agents.js";
-import type { Connector } from "../../src/remote/model.js";
+import { type Connector, connectorFrom } from "../../src/remote/model.js";
 import {
   REFUSALS,
   Reconnecting,
@@ -33,18 +33,8 @@ const say = (err: ClawError, lang: Lang = "en"): string => failureText(err, erro
 const en = remoteAgentText.in("en");
 const CJK = /[一-鿿]/u;
 
-const machine = (fields: Partial<Connector>): Connector => ({
-  connectorId: "c1",
-  name: "dev-pod",
-  online: false,
-  version: "",
-  versionStatus: "",
-  lastSeenAt: "",
-  heartbeatAt: "",
-  paired: false,
-  agents: [],
-  ...fields,
-});
+const machine = (fields: { last_seen_at?: string }): Connector =>
+  connectorFrom({ connector_id: "c1", name: "dev-pod", online: false, ...fields });
 
 test("what a refusal from claw means for a person", () => {
   const cases: [number, string, string][] = [
@@ -105,7 +95,7 @@ function refusals(): ClawError[] {
   });
   errs.push(...[...STATUS_REFUSALS.keys()].map((status) => new ClawError(status, "")));
   errs.push(
-    new Reconnecting(machine({ lastSeenAt: new Date(NOW * 1000).toISOString() })),
+    new Reconnecting(machine({ last_seen_at: new Date(NOW * 1000).toISOString() })),
     new Reconnecting(machine({})),
     new ClawError(400, '{"ok":false,"error":"invalid_cwd"}'),
     new ClawError(400, '{"ok":false,"error":"Bad Thing"}'),

@@ -12,6 +12,8 @@ import type { RemoteAgent, RemoteConnector, RemoteSession } from "../claw/remote
 
 /** An agent a machine reports. */
 export type Agent = {
+  /** As Claw listed it: what the views read. */
+  readonly raw: RemoteAgent;
   readonly agentId: string;
   readonly kind: string;
   readonly name: string;
@@ -20,6 +22,8 @@ export type Agent = {
 
 /** One of the user's machines: its connector, whether it is online now, and the agents it reports. */
 export type Connector = {
+  /** As Claw listed it: what the views read. */
+  readonly raw: RemoteConnector;
   readonly connectorId: string;
   readonly name: string;
   readonly online: boolean;
@@ -37,6 +41,8 @@ export type Connector = {
 
 /** One of the user's remote sessions. */
 export type Session = {
+  /** As Claw listed it: what the views read. */
+  readonly raw: RemoteSession;
   readonly sessionId: string;
   readonly connectorId: string;
   readonly agentId: string;
@@ -53,6 +59,7 @@ const text = (value: unknown): string => (typeof value === "string" ? value : ""
 
 export function agentFrom(raw: RemoteAgent): Agent {
   return {
+    raw,
     agentId: raw.agent_id ?? "",
     kind: raw.kind ?? "",
     name: raw.name ?? "",
@@ -62,6 +69,7 @@ export function agentFrom(raw: RemoteAgent): Agent {
 
 export function connectorFrom(raw: RemoteConnector): Connector {
   return {
+    raw,
     connectorId: raw.connector_id ?? "",
     name: raw.name ?? "",
     online: raw.online === true,
@@ -76,6 +84,7 @@ export function connectorFrom(raw: RemoteConnector): Connector {
 
 export function sessionFrom(raw: RemoteSession): Session {
   return {
+    raw,
     sessionId: raw.session_id ?? "",
     connectorId: raw.connector_id ?? "",
     agentId: raw.agent_id ?? "",

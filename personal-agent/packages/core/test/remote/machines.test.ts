@@ -6,30 +6,37 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { type Resolved, offlineText, resolveAgent } from "../../src/remote/machines.js";
-import type { Agent, Connector } from "../../src/remote/model.js";
+import { type Connector, connectorFrom } from "../../src/remote/model.js";
 
 const NOW = 1_762_700_000;
 const CJK = /[一-鿿]/u;
 
-const agent = (agentId: string, fields: Partial<Agent> = {}): Agent => ({
-  agentId,
-  kind: "",
-  name: "",
-  capabilities: {},
+interface AgentFields {
+  readonly kind?: string;
+  readonly name?: string;
+}
+
+/** An agent as a connector reports it. */
+const agent = (agentId: string, fields: AgentFields = {}): Record<string, unknown> => ({
+  agent_id: agentId,
   ...fields,
 });
 
-const machine = (connectorId: string, name: string, online: boolean, agents: Agent[], lastSeenAt = ""): Connector => ({
-  connectorId,
-  name,
-  online,
-  version: "",
-  versionStatus: "",
-  lastSeenAt,
-  heartbeatAt: "",
-  paired: false,
-  agents,
-});
+/** A machine as Claw lists it. */
+const machine = (
+  connectorId: string,
+  name: string,
+  online: boolean,
+  agents: Record<string, unknown>[],
+  lastSeenAt?: string,
+): Connector =>
+  connectorFrom({
+    connector_id: connectorId,
+    name,
+    online,
+    agents,
+    ...(lastSeenAt === undefined ? {} : { last_seen_at: lastSeenAt }),
+  });
 
 const seen = (secondsAgo: number): string => new Date((NOW - secondsAgo) * 1000).toISOString();
 
