@@ -6,9 +6,10 @@
  * member list. Only an exact way of writing a member's name ever counts; a resemblance is offered back, never acted on.
  */
 
-import { cpHead, squashSpaces } from "../text/py-text.js";
+import { cpHead, decimalBigInt, squashSpaces } from "../text/py-text.js";
 import type { InboundMention, RosterMember } from "../ports/surface.js";
 import { MARK_CLOSE, MARK_OPEN } from "./pull-ref.js";
+import { withoutBracketed } from "./text/scan.js";
 import { casefold, codePoints, flat, unique } from "./text/unicode.js";
 
 /** One person @mentioned in a message: the channel's id for them, their directory id ('' not given) and display name. */
@@ -21,47 +22,26 @@ const CJK = /[一-鿿]/u;
 const SCRIPT_RUN = /[一-鿿]+|[^一-鿿]+/gu;
 
 export function markerPattern(): RegExp {
-  return new RegExp(`${MARK_OPEN}([0-9]+)${MARK_CLOSE}`, "gu");
+  return new RegExp(`${MARK_OPEN}(\\p{Nd}+)${MARK_CLOSE}`, "gu");
 }
 
 /** The mention indexes a text's markers name, in order. */
 export function markerIndexes(text: string): number[] {
-  return [...text.matchAll(markerPattern())].map((m) => Number(m[1]));
+  // (a marker number past what a number holds exactly is no mention's: it is past every list)
+  return markerKeys(text).map((k) => (k.length > 15 ? Number.POSITIVE_INFINITY : Number(k)));
+}
+
+/** The markers' numbers as exact decimal strings (Python's `int` of each), to compare markers of any length. */
+export function markerKeys(text: string): string[] {
+  return [...text.matchAll(markerPattern())].map((m) => (decimalBigInt(m[1] ?? "") ?? 0n).toString());
 }
 
 export function withoutMarkers(text: string): string {
   return text.replace(markerPattern(), " ");
 }
 
-const OPENS = "(（";
-const CLOSES = ")）";
-
-/**
- * `text` without its bracketed parts (Python's `re.sub(r"[(（][^)）]*[)）]", "", text)`), scanned once: as a regular
- * expression a long run of opening brackets with no closing one takes quadratic time.
- */
 export function withoutParens(text: string): string {
-  let out = "";
-  let at = 0;
-  for (;;) {
-    const open = indexOfAny(text, OPENS, at);
-    const close = open === -1 ? -1 : indexOfAny(text, CLOSES, open + 1);
-    if (close === -1) return out + text.slice(at);
-    out += text.slice(at, open);
-    at = close + 1;
-  }
-}
-
-function indexOfAny(text: string, chars: string, from: number): number {
-  for (let i = from; i < text.length; i++) if (chars.includes(text.charAt(i))) return i;
-  return -1;
-}
-
-/** `re.sub(r"[0-9]+$", "", text)`: the trailing ASCII digits taken off, scanned from the end. */
-function withoutTrailingDigits(text: string): string {
-  let end = text.length;
-  while (end > 0 && text.charCodeAt(end - 1) >= 48 && text.charCodeAt(end - 1) <= 57) end -= 1;
-  return text.slice(0, end);
+  return withoutBracketed(text);
 }
 
 export function hasCjk(text: string): boolean {
@@ -164,9 +144,9 @@ export function samePerson(a: string, b: string, mentions: readonly Mention[]): 
 /** The reviewer a reading gives is the one the rules' span names: the same person, or written inside that span. */
 export function namedWithin(who: string, span: string, mentions: readonly Mention[]): boolean {
   if (samePerson(span, who, mentions)) return true;
-  const refs = markerIndexes(who);
+  const refs = markerKeys(who);
   if (refs.length) {
-    const inSpan = new Set(markerIndexes(span));
+    const inSpan = new Set(markerKeys(span));
     return refs.every((r) => inSpan.has(r));
   }
   return writtenIn(who, withoutMarkers(span));
@@ -204,7 +184,7 @@ export function memberKeys(member: RosterMember): Set<string> {
     const local = flat(address.split("@")[0] ?? "");
     if (local) {
       keys.add(local);
-      keys.add(withoutTrailingDigits(local));
+      keys.add(local.replace(/[0-9]+$/u, ""));
     }
   }
   keys.delete("");
