@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 
 import { remoteAgentText } from "../../../src/locales/remote-agents.js";
+import { newTurn } from "../../../src/remote/chats.js";
 import type { FakeCommand, FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE, type RemoteWorld, Script, USER_A } from "../../../../../test-support/remote-world.js";
 
@@ -46,7 +47,7 @@ export function turnsOf(w: RemoteWorld): Map<string, unknown> {
 }
 
 /** A turn in the worker's books that nothing runs. */
-export const idleTurn = (): unknown => ({ task: null, stopRequested: false, waitsForTerminal: false });
+export const idleTurn = (): unknown => newTurn();
 
 /** An agent that answers each prompt with `text`, `chunks` times, and ends its turn. */
 export function promptScript(chunks = 1, text = "Done."): Script {

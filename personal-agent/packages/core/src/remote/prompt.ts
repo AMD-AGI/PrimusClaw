@@ -221,7 +221,7 @@ export class Prompts {
 
   /** The Stop card's turn is still the one running for the chat, and the chat is still attached. */
   private stillOn(chatKey: string, turn: RemoteTurn | undefined, only: RemoteTurn): boolean {
-    return turn === only && turn.task?.running === true && this.ctx.remoteState.attachedRemote(chatKey) !== null;
+    return turn === only && !turn.ended && this.ctx.remoteState.attachedRemote(chatKey) !== null;
   }
 
   private async cancel(chatKey: string, key: string, state: RemoteState, to: Conversation): Promise<void> {

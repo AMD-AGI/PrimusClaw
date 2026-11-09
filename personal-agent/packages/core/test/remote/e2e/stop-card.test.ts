@@ -29,8 +29,10 @@ const press = (w: RemoteWorld, only: Parameters<RemoteWorld["remote"]["stop"]>[3
 test("a phones message to an attached agent gets the card and its press cancels that turn", () =>
   remoteWorld(async (w) => {
     const { turn } = await running(w);
+    assert.equal(turn.ended, false);
     assert.equal(await press(w, turn), true);
     await w.idle();
+    assert.equal(turn.ended, true);
     assert.equal(w.server.commandsOf("cancel").length, 1);
     assert.equal(w.answer(), "Stopped.");
     assert.equal(w.remote.currentTurn(AAD), undefined);
