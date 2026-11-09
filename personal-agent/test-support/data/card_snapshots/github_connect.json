@@ -1,0 +1,124 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "style": "positive",
+            "title": "打开 GitHub",
+            "type": "Action.OpenUrl",
+            "url": "https://github.com/login/device"
+          },
+          {
+            "data": {
+              "card": "card-6",
+              "op": "dismiss",
+              "primusclaw": "github_connect"
+            },
+            "title": "先不连",
+            "type": "Action.Execute",
+            "verb": "primusclaw.github_connect"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Accent",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "🔌 连上 GitHub，我就能读到你的 PR 和 CI",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "你问的是你 GitHub 上的事，我还读不到。连一次就好。",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "facts": [
+              {
+                "title": "验⁠证⁠码",
+                "value": "ABCD-1234（15 分钟内有效）"
+              }
+            ],
+            "type": "FactSet"
+          },
+          {
+            "text": "1. 点「打开 GitHub」，输入上面的验证码\n2. 页面上的应用名是 “GitHub CLI”，这是正常的；用你自己的账号批准\n3. 批准后我用你的 GitHub 再回答一次：「我开着几个 PR？」",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "github-connect-more-toggle",
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Small",
+                "text": "权限和安全 ▾",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "selectAction": {
+              "targetElements": ["github-connect-more"],
+              "title": "权限和安全",
+              "type": "Action.ToggleVisibility"
+            },
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "github-connect-more",
+            "isVisible": false,
+            "items": [
+              {
+                "isSubtle": true,
+                "size": "Small",
+                "text": "申请 `repo` 权限，你能访问的私有、内部仓库也读得到。令牌加密存在 Primus 身份服务，只在服务端用：你问 GitHub 时以你的身份读取，会写入的操作每次先问你；同事在群里点你名请你代审时也用它（要你先开 `/github auto-merge on`）。`/github unbind` 随时解除。",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

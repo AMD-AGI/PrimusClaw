@@ -1,0 +1,80 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "include": true,
+              "offer": "off-1",
+              "primusclaw": "feedback"
+            },
+            "style": "positive",
+            "title": "Yes, add them",
+            "type": "Action.Execute",
+            "verb": "primusclaw.feedback"
+          },
+          {
+            "data": {
+              "include": false,
+              "offer": "off-1",
+              "primusclaw": "feedback"
+            },
+            "style": "default",
+            "title": "No",
+            "type": "Action.Execute",
+            "verb": "primusclaw.feedback"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Accent",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "💬 Add your last question and my answer to #512?",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "The PrimusClaw team can then read them. Passwords and keys are hidden first. The report does not include them unless you choose Yes.",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}
