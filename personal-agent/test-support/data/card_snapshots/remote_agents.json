@@ -1,156 +1,156 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "actions": [
-          {
-            "data": {
-              "op": "list",
-              "primusclaw": "remote"
-            },
-            "title": "Refresh",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_list"
-          },
-          {
-            "data": {
-              "op": "pair",
-              "primusclaw": "remote"
-            },
-            "title": "Connect a new machine",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_pair"
-          }
-        ],
-        "body": [
-          {
-            "items": [
-              {
-                "size": "Medium",
-                "text": "🖥️ Your agents",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              }
-            ],
-            "type": "Container"
-          },
-          {
-            "separator": false,
-            "text": "**robin-dev** (online)",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "id": "row-agent-0",
-            "items": [
-              {
-                "text": "🟠 Claude Code",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              },
-              {
-                "id": "dir0",
-                "label": "Folder on the machine",
-                "maxLength": 300,
-                "placeholder": "/home/me/repo",
-                "type": "Input.Text"
-              },
-              {
-                "actions": [
-                  {
-                    "data": {
-                      "agent_id": "a1",
-                      "connector_id": "c1",
-                      "op": "new",
-                      "primusclaw": "remote",
-                      "slot": 0
-                    },
-                    "style": "positive",
-                    "title": "New session",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_new"
-                  }
-                ],
-                "type": "ActionSet"
-              }
-            ],
-            "separator": true,
-            "spacing": "Medium",
-            "type": "Container"
-          },
-          {
-            "separator": true,
-            "text": "**laptop** (offline)",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "isSubtle": true,
-            "text": "⬛ Codex (offline)",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "separator": true,
-            "text": "**Your sessions**",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "items": [
-              {
-                "text": "1. 🟠 Claude Code · **New session** · active · robin-dev (active, 5 min ago)",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "actions": [
-                  {
-                    "data": {
-                      "op": "attach",
-                      "primusclaw": "remote",
-                      "session_id": "rs-1"
-                    },
-                    "style": "positive",
-                    "title": "Attach",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_attach"
-                  },
-                  {
-                    "data": {
-                      "op": "close",
-                      "primusclaw": "remote",
-                      "session_id": "rs-1"
-                    },
-                    "style": "destructive",
-                    "title": "Close",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_close"
-                  }
-                ],
-                "type": "ActionSet"
-              }
-            ],
-            "separator": false,
-            "type": "Container"
-          },
-          {
-            "isSubtle": true,
-            "separator": true,
-            "size": "Small",
-            "text": "Typing works too: /help lists the commands.",
-            "type": "TextBlock",
-            "wrap": true
-          }
-        ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "op": "list",
+       "primusclaw": "remote"
       },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+      "title": "Refresh",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_list"
+     },
+     {
+      "data": {
+       "op": "pair",
+       "primusclaw": "remote"
+      },
+      "title": "Connect a new machine",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_pair"
+     }
+    ],
+    "body": [
+     {
+      "items": [
+       {
+        "size": "Medium",
+        "text": "🖥️ Your agents",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "type": "Container"
+     },
+     {
+      "separator": false,
+      "text": "**robin-dev** (online)",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "row-agent-0",
+      "items": [
+       {
+        "text": "🟠 Claude Code",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       },
+       {
+        "id": "dir0",
+        "label": "Folder on the machine",
+        "maxLength": 300,
+        "placeholder": "/home/me/repo",
+        "type": "Input.Text"
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "agent_id": "a1",
+           "connector_id": "c1",
+           "op": "new",
+           "primusclaw": "remote",
+           "slot": 0
+          },
+          "style": "positive",
+          "title": "New session",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_new"
+         }
+        ],
+        "type": "ActionSet"
+       }
+      ],
+      "separator": true,
+      "spacing": "Medium",
+      "type": "Container"
+     },
+     {
+      "separator": true,
+      "text": "**laptop** (offline)",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "text": "⬛ Codex (offline)",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "separator": true,
+      "text": "**Your sessions**",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "items": [
+       {
+        "text": "1. 🟠 Claude Code · **New session** · active · robin-dev (active, 5 min ago)",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "op": "attach",
+           "primusclaw": "remote",
+           "session_id": "rs-1"
+          },
+          "style": "positive",
+          "title": "Attach",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_attach"
+         },
+         {
+          "data": {
+           "op": "close",
+           "primusclaw": "remote",
+           "session_id": "rs-1"
+          },
+          "style": "destructive",
+          "title": "Close",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_close"
+         }
+        ],
+        "type": "ActionSet"
+       }
+      ],
+      "separator": false,
+      "type": "Container"
+     },
+     {
+      "isSubtle": true,
+      "separator": true,
+      "size": "Small",
+      "text": "Typing works too: /help lists the commands.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }

@@ -43,6 +43,11 @@ export function pyStrip(text: string): string {
   return text.replace(LEADING, "").replace(TRAILING, "");
 }
 
+/** `text.lstrip()`. */
+export function pyLstrip(text: string): string {
+  return text.replace(LEADING, "");
+}
+
 /** `text.rstrip()`. */
 export function pyRstrip(text: string): string {
   return text.replace(TRAILING, "");
@@ -75,19 +80,71 @@ export function fixed1(value: number): string {
 }
 
 /**
- * `json.dumps(value, ensure_ascii=False)` for a value parsed from JSON: `", "` and `": "` separators, non-ASCII kept.
- * (A float that JSON wrote with a zero fraction, `1.0`, is the number 1 once parsed, so it comes out as `1`.)
+ * `str(value or "")` for a value read from JSON: a missing or false value is "", a string is itself, a number is its
+ * digits, `true` is "True". An object or a list is "" (the Python worker never shows one this way).
  */
-export function pyJsonDumps(value: unknown): string {
+export function pyStr(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === true) return "True";
+  if (typeof value === "number") return value === 0 || Number.isNaN(value) ? "" : String(value);
+  if (typeof value === "bigint") return value === 0n ? "" : value.toString();
+  return "";
+}
+
+export interface JsonDumpsOptions {
+  /** `indent=`: each nesting level on its own lines, this many spaces deeper (items then end in "," alone). */
+  readonly indent?: number;
+  /** `sort_keys=True`: keys in code-point order, as Python sorts `str`. */
+  readonly sortKeys?: boolean;
+}
+
+/**
+ * `json.dumps(value, ensure_ascii=False, ...)` for a value parsed from JSON: non-ASCII kept; `", "` and `": "` separators,
+ * or `","` and newlines with `indent`. A key whose value is undefined is left out. (A float that JSON wrote with a zero
+ * fraction, `1.0`, is the number 1 once parsed, so it comes out as `1`.)
+ */
+export function pyJsonDumps(value: unknown, options: JsonDumpsOptions = {}): string {
+  return encode(value, options, 0);
+}
+
+function encode(value: unknown, options: JsonDumpsOptions, depth: number): string {
   if (value === null || value === undefined) return "null";
-  if (Array.isArray(value)) return `[${value.map(pyJsonDumps).join(", ")}]`;
+  if (Array.isArray(value))
+    return container(
+      "[",
+      "]",
+      value.map((v) => encode(v, options, depth + 1)),
+      options,
+      depth,
+    );
   if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}: ${pyJsonDumps(v)}`).join(", ")}}`;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).filter((k) => record[k] !== undefined);
+    if (options.sortKeys) keys.sort(byCodePoint);
+    const items = keys.map((k) => `${JSON.stringify(k)}: ${encode(record[k], options, depth + 1)}`);
+    return container("{", "}", items, options, depth);
   }
   if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : pyNonFinite(value);
   if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   return "null";
+}
+
+function container(open: string, close: string, items: string[], options: JsonDumpsOptions, depth: number): string {
+  if (items.length === 0) return open + close;
+  if (options.indent === undefined) return `${open}${items.join(", ")}${close}`;
+  const inner = `\n${" ".repeat(options.indent * (depth + 1))}`;
+  return `${open}${inner}${items.join(`,${inner}`)}\n${" ".repeat(options.indent * depth)}${close}`;
+}
+
+/** Python orders `str` by code point; JavaScript's default sort compares UTF-16 units (they differ past U+FFFF). */
+function byCodePoint(a: string, b: string): number {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i += 1) {
+    const d = (x[i]?.codePointAt(0) ?? 0) - (y[i]?.codePointAt(0) ?? 0);
+    if (d !== 0) return d;
+  }
+  return x.length - y.length;
 }
 
 function pyNonFinite(value: number): string {
