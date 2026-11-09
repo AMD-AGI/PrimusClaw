@@ -5,8 +5,6 @@
  * An inbound Teams activity as core's `InboundEvent`: validated, then read into a message (the person's words, who
  * they mention, the links behind the words, the messages they quote) or a card press. Everything else Teams delivers
  * (typing, installs, conversation updates) is not an event core acts on.
- *
- * A card press carries two fields core's `InboundAction` does not have (yet): `invoke` and `clickVerb`.
  */
 import { inboundFiles } from "../../inbound/attachments.js";
 import {
@@ -29,14 +27,8 @@ import { addressedToBot, DEFAULT_BOT_NAME, isMentioned, isTargeted, mentionsOf, 
 import { isBotQuote, logPlaceholderQuotes, quotesOf } from "./quotes.js";
 import { parseActivity, partOf, truthy, type Activity } from "./schema.js";
 
-export type TeamsInboundAction = InboundAction & {
-  /** An Action.Execute invoke (the ingress answered it with a placeholder card that must be replaced). */
-  readonly invoke: boolean;
-  /** The button's verb, for a log line ("unknown" when none). */
-  readonly clickVerb: string;
-};
-
-export type TeamsInboundEvent = InboundMessage | TeamsInboundAction;
+/** The events a Teams activity can be (a vote of Teams' own thumbs is added by the feedback feature's reader). */
+export type TeamsInboundEvent = InboundMessage | InboundAction;
 
 /** The activity has no Entra identity behind it: nobody to act for. */
 export interface NoSender {
@@ -92,6 +84,7 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
   const logger = options.logger ?? silentLogger;
   const personal = isPersonal(activity);
   const found = quotesOf(activity);
+  const attached = inboundFiles(activity);
   logPlaceholderQuotes(activity, found, logger);
   const bot = partOf(activity, "recipient");
   return {
@@ -113,12 +106,13 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
       deleted: q.deleted,
       source: q.source,
     })),
-    files: inboundFiles(activity).files,
+    files: attached.files,
+    unreadableFiles: attached.unreadable,
     provenance: "typed",
   };
 }
 
-function actionOf(activity: Activity, sender: UserRef): TeamsInboundAction {
+function actionOf(activity: Activity, sender: UserRef): InboundAction {
   return {
     type: "action",
     ...base(activity, sender),

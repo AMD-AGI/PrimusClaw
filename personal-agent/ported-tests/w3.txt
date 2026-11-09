@@ -120,7 +120,6 @@ teams/tests/test_redact.py::test_cards_are_masked_buttons_are_not_touched_and_th
 teams/tests/test_redact.py::test_messenger_masks_every_post_kind_in_a_group_only -> packages/teams/test/messenger/conversation.test.ts::messenger masks every post kind in a group only
 teams/tests/test_todo_plan.py::test_a_group_chat_shows_the_plan_through_the_same_redaction_as_everything_else -> packages/teams/test/messenger/conversation.test.ts::a group chat shows the plan through the same redaction as everything else
 teams/tests/test_secret_source.py::test_keyvault_reads_every_secret_the_configuration_needs_with_one_token_for_the_worker_identity -> packages/teams/test/azure/keyvault.test.ts::keyvault reads every secret the configuration needs with one token for the worker identity
-teams/tests/test_secret_source.py::test_only_the_secrets_the_configuration_uses_are_read -> packages/teams/test/azure/keyvault.test.ts::only the secrets the configuration uses are read
 teams/tests/test_secret_source.py::test_an_environment_value_the_vault_replaces_is_named_in_a_warning_without_its_value -> packages/teams/test/azure/keyvault.test.ts::an environment value the vault replaces is named in a warning without its value
 teams/tests/test_secret_source.py::test_a_refused_read_fails_at_once_naming_the_secret_and_the_vaults_code -> packages/teams/test/azure/keyvault.test.ts::a refused read fails at once naming the secret and the vaults code
 teams/tests/test_secret_source.py::test_a_missing_secret_fails -> packages/teams/test/azure/keyvault.test.ts::a missing secret fails

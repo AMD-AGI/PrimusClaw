@@ -24,3 +24,7 @@ export * from "./http/routes.js";
 export * from "./http/server.js";
 export * from "./http/link.js";
 export * from "./http/claw-events.js";
+export * from "./claw/index.js";
+export * from "./metrics/index.js";
+export * from "./exchange/index.js";
+export * from "./config/index.js";

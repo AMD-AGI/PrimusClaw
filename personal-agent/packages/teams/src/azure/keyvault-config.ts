@@ -7,6 +7,7 @@
  * setting each one replaces (`ENV_NAMES`, named in a warning when it is set anyway).
  */
 import { pyStrip, SecretsUnavailable, type SecretName } from "@primusclaw/personal-agent";
+import { stripTrailing } from "../text/trim.js";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -75,7 +76,7 @@ export function vaultHost(url: string): string {
 
 /** KEYVAULT_URL without a trailing slash: https, a <name>.vault.azure.net host, nothing after the host. */
 export function vaultUrl(env: Env): string {
-  const url = get(env, "KEYVAULT_URL").replace(/\/+$/, "");
+  const url = stripTrailing(get(env, "KEYVAULT_URL"), "/");
   const parts = splitUrl(url);
   if (parts.scheme !== "https" || !parts.hostname.endsWith(".vault.azure.net") || parts.path || parts.query) {
     throw new SecretsUnavailable(
