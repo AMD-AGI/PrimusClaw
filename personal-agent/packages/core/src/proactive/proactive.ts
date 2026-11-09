@@ -127,8 +127,8 @@ export class Proactive {
     if (record === undefined || !record["tool_use_id"] || !event["session_id"]) return "dropped";
     const expires = approvalExpiry(event, now);
     if (expires <= now) return "dropped";
-    const sessionId = String(event["session_id"]);
-    const toolUseId = String(record["tool_use_id"]);
+    const sessionId = text(event["session_id"]);
+    const toolUseId = text(record["tool_use_id"]);
     if (this.deps.store.approvals.getApproval(sessionId, toolUseId) !== null) {
       return this.deps.store.approvals.approvalInFlight(sessionId, toolUseId) ? "retry" : "dropped";
     }
@@ -156,7 +156,7 @@ export class Proactive {
     const type = event["type"];
     if ((type !== "run.completed" && type !== "run.failed") || !event["session_id"]) return null;
     const messageId = typeof event["message_id"] === "string" ? event["message_id"] : "";
-    return this.deps.store.turns.answeredInChat(String(event["session_id"]), {
+    return this.deps.store.turns.answeredInChat(text(event["session_id"]), {
       finishedAt: finishedAt(event, now),
       runningMax: TURN_RUNNING_MAX_SECONDS,
       slack: SKEW_SLACK_SECONDS,
@@ -182,4 +182,9 @@ export function pythonIsoUtc(seconds: number): string {
   const micros = Math.round((seconds - whole) * 1e6);
   const base = new Date(whole * 1000).toISOString().slice(0, 19);
   return `${base}${micros ? `.${String(micros).padStart(6, "0")}` : ""}+00:00`;
+}
+
+/** Python's `str(value)` for the scalar ids Claw sends. */
+function text(value: unknown): string {
+  return typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
 }

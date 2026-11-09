@@ -20,8 +20,8 @@ const itemSchema = z.looseObject({
   title: text,
   board_state: text,
   result_version: count,
-  can_accept: z.unknown(),
-  needs_accept: z.unknown(),
+  can_accept: z.unknown().optional(),
+  needs_accept: z.unknown().optional(),
   last_report_kind: text,
   pending_question: text,
   summary: text,
@@ -34,7 +34,10 @@ const itemSchema = z.looseObject({
 export function parseWorkItem(raw: unknown): WorkItem | undefined {
   const parsed = itemSchema.safeParse(raw);
   if (!parsed.success || typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-  const r = parsed.data;
+  return itemOf(parsed.data);
+}
+
+function itemOf(r: z.output<typeof itemSchema>): WorkItem {
   const params = (r.params ?? {}) as JsonObject;
   const pull = pr.safeParse(params["pr"]);
   return {
@@ -44,13 +47,22 @@ export function parseWorkItem(raw: unknown): WorkItem | undefined {
     boardState: r.board_state ?? "in_progress",
     resultVersion: r.result_version ?? 0,
     canAccept: r.can_accept === true && r.needs_accept !== false,
-    lastReportKind: r.last_report_kind ?? null,
-    pendingQuestion: r.pending_question ?? null,
+    ...missingAsNull(r),
     summary: r.summary ?? "",
-    outcome: r.outcome ?? null,
     kind: r.kind ?? "task",
     params,
     pull: pull.success ? pull.data : null,
     updatedAt: r.updated_at ?? "",
+  };
+}
+
+/** The fields an event's item may lack, as the board reads a missing one: null. */
+function missingAsNull(
+  r: z.output<typeof itemSchema>,
+): Pick<WorkItem, "lastReportKind" | "pendingQuestion" | "outcome"> {
+  return {
+    lastReportKind: r.last_report_kind ?? null,
+    pendingQuestion: r.pending_question ?? null,
+    outcome: r.outcome ?? null,
   };
 }

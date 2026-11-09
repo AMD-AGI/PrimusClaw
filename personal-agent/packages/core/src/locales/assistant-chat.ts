@@ -34,7 +34,8 @@ export const assistantChatText = defineCatalog({
     ...fixed,
   },
   zh: {
-    notUnderstood: "暂时连不上你的助理，这条消息没有处理，请稍后再发一次。斜杠命令（如 /board、/help）和卡片上的按钮照常可用。",
+    notUnderstood:
+      "暂时连不上你的助理，这条消息没有处理，请稍后再发一次。斜杠命令（如 /board、/help）和卡片上的按钮照常可用。",
     filesOnly: "（发来了文件，没有附言）",
     ...fixed,
   },
