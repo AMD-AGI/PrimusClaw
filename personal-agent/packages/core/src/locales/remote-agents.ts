@@ -93,6 +93,8 @@ export const remoteAgentText = defineCatalog({
       (p.reason ? `The session ended: ${p.reason}.` : "The session ended.") +
       " Your messages go to PrimusClaw again. Start a new session with `/agent new AGENT PATH`.",
     noMachineYet: "You have no machine connected yet.",
+    changedElsewhere: "(Switched: see the status card below)",
+    listBelow: "(Updated: see the card below)",
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -166,6 +168,8 @@ export const remoteAgentText = defineCatalog({
       (p.reason ? `会话已结束：${p.reason}。` : "会话已结束。") +
       "你的消息会重新发给 PrimusClaw。用 `/agent new AGENT PATH` 开新会话。",
     noMachineYet: "你还没有连接任何机器。",
+    changedElsewhere: "（已切换，见下方的新状态卡）",
+    listBelow: "（已更新，见下方的新卡片）",
   },
 });
 

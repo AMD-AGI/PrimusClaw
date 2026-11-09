@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** What the remote-agent domain is given: its settings and the ports it works through. */
+import type { DirectChat } from "../direct-chat/direct-chat.js";
 import type { ClawRemoteAgentsPort } from "../ports/claw/remote-agents.js";
 import type { JsonObject } from "../json.js";
 import type { Lang } from "../locales/lang.js";
@@ -92,6 +93,6 @@ export interface RemoteContext {
   sha1Hex(text: string): string;
   /** The language a person is answered in. */
   langOf(person: string): Lang;
-  /** TEAMS_DIRECT_CHAT is on for this person: their 1:1 chat is the agent's window itself. */
-  directOn(person: string): boolean;
+  /** TEAMS_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */
+  readonly directChat: DirectChat;
 }
