@@ -312,3 +312,4 @@ teams/tests/test_github_review_direct.py::test_a_latin_name_glued_on_both_sides_
 teams/tests/test_github_review_direct.py::test_a_latin_name_glued_to_chinese_is_still_a_whole_word -> packages/core/test/review/direct-request.test.ts::a latin name glued to chinese is still a whole word
 teams/tests/test_github_review_direct.py::test_where_a_name_is_written_next_to_chinese -> packages/core/test/review/direct-request.test.ts::where a name is written next to chinese: linmei in 帮我请linmei review并合入PrimusClaw PR 249
 teams/tests/test_github_review_direct.py::test_a_word_ends_where_chinese_meets_a_letter_or_a_digit -> packages/core/test/review/direct-request.test.ts::a word ends where chinese meets a letter or a digit
+teams/tests/test_github_review_many.py::test_two_models_in_one_request_start_nothing -> packages/core/test/review/request-refusals.test.ts::two models in one request start nothing
