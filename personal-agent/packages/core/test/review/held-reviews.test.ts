@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ALICE, CONV, reviewWorld } from "../../../../test-support/review-world.js";
+import { ALICE, CONV, TOKEN, reviewWorld } from "../../../../test-support/review-world.js";
 import {
   ClawError,
   REVIEW,
@@ -271,4 +271,12 @@ test("a held review for someone who is not connected is not answered", async () 
   assert.ok(settled.text.includes("not connected") && settled.text.includes("Review needs confirmation"), settled.text);
   assert.ok(reviewButtons(settled.text));
   assert.equal(row(world)?.state, "pending");
+});
+
+test("the text of a held review reaches the card masked", async () => {
+  const world = await heldReview({
+    review: { ...REVIEW, event: "APPROVE", body: `fine, token ${TOKEN} was in the log`, comments: [] },
+  });
+  const [card] = cards(world, "personal:aad-b");
+  assert.ok(card?.review?.body.includes("[hidden]") && !card.review.body.includes(TOKEN), card?.review?.body ?? "");
 });

@@ -10,6 +10,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { IntentReader, UserRef } from "../../src/index.js";
+import { decisionWords, namesReviewAndMerge } from "../../src/typed-answer/mode.js";
+import { readTypedAnswer } from "../../src/typed-answer/read.js";
+import { REQUESTS } from "../../../../test-support/review-requests.js";
 import {
   ALICE,
   BOB,
@@ -270,3 +273,73 @@ REVIEW_AND_MERGE.forEach((text, i) => {
     assert.equal(row(world)?.state, "pending");
   });
 });
+
+test("every request to review and merge that has a word of an answer names a review and a merge", () => {
+  const asks = REQUESTS.filter((r) => r.reading.intent === "review_merge").map((r) =>
+    r.text.replaceAll("{", "").replaceAll("}", ""),
+  );
+  const answerable = asks.filter((t) => decisionWords(t));
+  assert.ok(answerable.length >= 20); // (the table is read, not empty)
+  assert.deepEqual(
+    answerable.filter((t) => !namesReviewAndMerge(t)),
+    [],
+  );
+  assert.deepEqual(
+    REVIEW_AND_MERGE.filter((t) => !namesReviewAndMerge(t)),
+    [],
+  );
+});
+
+const CONFIRMATIONS = [
+  "确认",
+  "合入",
+  "合并",
+  "同意 #12",
+  "确认 #12",
+  "确认 #12 合入",
+  "合并 Hyperloom#12",
+  "merge Hyperloom#12",
+  "approve Hyperloom#12",
+  "我看过了，#12 那个没问题，合吧",
+  "#12 可以合",
+];
+
+for (const text of CONFIRMATIONS) {
+  test(`a confirmation that names no review still confirms the merge: ${text}`, async () => {
+    assert.equal(namesReviewAndMerge(text), false);
+    const world = reviewWorld(["AMD-AGI"], { intent: answerReading("answer", []) });
+    await held({}, world);
+    await says(world, text);
+    assert.deepEqual(decisions(world), [["tok-aad-b", "cf-1", "allow"]]);
+  });
+}
+
+for (const text of ["确认 #12", "合并 #12", "合入 #12"]) {
+  test(`a bare confirmation with no model reading still confirms: ${text}`, async () => {
+    const world = await held();
+    await says(world, text);
+    assert.deepEqual(decisions(world), [["tok-aad-b", "cf-1", "allow"]]);
+  });
+}
+
+for (const text of ["确认 #12 能不能合", "确认 #12 可不可以合入", "确认 #12 能否合并"]) {
+  test(`whether it can merge is a question never a choice of the merge: ${text}`, async () => {
+    const world = reviewWorld(["AMD-AGI"], { intent: answerReading("answer", []) });
+    await held({}, world);
+    world.store.githubConfirmations.addGithubConfirmation({
+      confirmationId: "cf-r",
+      sessionId: "sess-1",
+      actorId: "aad-b",
+      requesterId: "aad-a",
+      repo: "AMD-AGI/Hyperloom",
+      pr: 12,
+      reference: { conversation: { id: CONV } },
+      expiresAt: world.store.now() + 3600,
+      kind: "review",
+      event: "REQUEST_CHANGES",
+    });
+    await says(world, text);
+    assert.deepEqual(decisions(world), []);
+    assert.equal(readTypedAnswer(text, [["AMD-AGI/Hyperloom", 12]], false), null);
+  });
+}

@@ -361,6 +361,14 @@ teams/tests/test_github_review.py::test_nobody_is_messaged_when_the_reviewer_is_
 teams/tests/test_github_review.py::test_naming_oneself_for_a_pull_request_one_wrote_is_refused_too -> packages/core/test/review/author-checks.test.ts::naming oneself for a pull request one wrote is refused too
 teams/tests/test_github_review.py::test_the_author_is_read_from_the_pull_request_asked_about_without_any_credential -> packages/core/test/review/author-checks.test.ts::the author is read from the pull request asked about without any credential
 teams/tests/test_github_review.py::test_an_author_that_could_not_be_read_does_not_stop_the_request_claw_still_refuses_an_approval_by_the_author -> packages/core/test/review/author-checks.test.ts::an author that could not be read does not stop the request (rate limit)
+teams/tests/test_github_review.py::test_the_confirmation_card_is_clipped_and_carries_only_the_id_and_the_choice -> packages/teams/test/views/review-cards.test.ts::the confirmation card is clipped and carries only the id and the choice
+teams/tests/test_github_review.py::test_the_card_of_a_held_review_names_its_event_and_masks_and_clips_its_text -> packages/teams/test/views/review-cards.test.ts::the card of a held review names its event and clips its text
+teams/tests/test_review_pr_summary.py::test_an_ended_review_card_says_what_it_does_right_under_how_it_ended -> packages/teams/test/views/review-cards.test.ts::an ended review card says what it does right under how it ended
+teams/tests/test_review_pr_summary.py::test_the_confirmation_card_says_what_the_pull_request_does -> packages/teams/test/views/review-cards.test.ts::the confirmation card says what the pull request does
+teams/tests/test_typed_answer.py::test_every_request_to_review_and_merge_that_has_a_word_of_an_answer_names_a_review_and_a_merge -> packages/core/test/review/typed-answers.test.ts::every request to review and merge that has a word of an answer names a review and a merge
+teams/tests/test_typed_answer.py::test_a_confirmation_that_names_no_review_still_confirms_the_merge -> packages/core/test/review/typed-answers.test.ts::a confirmation that names no review still confirms the merge: 确认
+teams/tests/test_typed_answer.py::test_a_bare_confirmation_with_no_model_reading_still_confirms -> packages/core/test/review/typed-answers.test.ts::a bare confirmation with no model reading still confirms: 确认 #12
+teams/tests/test_typed_answer.py::test_whether_it_can_merge_is_a_question_never_a_choice_of_the_merge -> packages/core/test/review/typed-answers.test.ts::whether it can merge is a question never a choice of the merge: 确认 #12 能不能合
 
 # LATER: tests of another line's code, to be ported by that line (the checker skips comment lines; one per Python test).
 # LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out
