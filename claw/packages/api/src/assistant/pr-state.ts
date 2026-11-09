@@ -16,6 +16,12 @@
  * a binding is written to GitHub review's audit log first, as every such read is (`github-mcp/mcp.ts`). A person with no GitHub here
  * is read for as anyone on the internet is: only a public repository answers. Best effort: a read that fails, or an audit row that
  * cannot be written, is `unknown` and leaves the request as it was before this check, never refused for it.
+ *
+ * GitHub's REST API gives a reader with no credential 60 requests an hour per IP, and every pod of a cluster leaves through the same
+ * address: on 2026-11-09 the API pods' anonymous quota read 0 of 60 and every `pr_state` of a person with no GitHub here was a 403,
+ * so merged pull requests were offered for review again and "#99999" was "could not be read" rather than "does not exist" (parity
+ * G3, H2). Such a read that GitHub refuses as over its limit (403 or 429) reads the pull request's public page on github.com instead
+ * (`pageState`), which anyone can open and which the REST limit does not count.
  */
 import pino from "pino";
 import { db as defaultDb } from "../infra/db.js";
@@ -64,6 +70,8 @@ export interface PrStateDeps {
   settings?: () => GithubMcpSettings;
   resolveBinding?: ResolveBinding;
   fetchImpl?: typeof fetch;
+  /** Where the pull requests' public pages are (`https://github.com`); by default derived from the API's address. */
+  webUrl?: string | null;
 }
 
 const nameOf = (p: PrRef): string => `${p.owner}/${p.repo}#${p.number}`;
@@ -99,6 +107,66 @@ function anonymousReader(apiUrl: string, fetchImpl: typeof fetch): (path: string
   };
 }
 
+/** The public web address of the GitHub whose API is `apiUrl` (`https://api.github.com` -> `https://github.com`), or null. */
+export function githubWebUrl(apiUrl: string): string | null {
+  try {
+    const u = new URL(apiUrl);
+    if (u.protocol === "https:" && u.hostname === "api.github.com") return "https://github.com";
+    if (u.protocol === "https:" && /^\/api\/v3\/?$/.test(u.pathname)) return `https://${u.host}`;
+  } catch { /* not an address */ }
+  return null;
+}
+
+/** The longest page read (a pull request's page is about 400 kB). */
+const PAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Where a public pull request stands, read from its page on github.com with no credential, for when the REST API refuses a reader with
+ * none as over its limit. Only the page's own data about this pull request is used (`payload.pullRequestsLayoutRoute.pullRequest` of
+ * its `react-app.embeddedData`, the same number), each field checked for its shape as the API's are; a number that is not a pull
+ * request redirects to the repository's issue of that number, so the repository was read and it is `not_found`. Anything else,
+ * including a page whose layout changed, is `unknown`.
+ */
+async function pageState(webUrl: string, p: PrRef, fetchImpl: typeof fetch): Promise<PullState> {
+  const name = nameOf(p);
+  const failed: PullState = { pr: name, state: "unknown", reason: "read_failed" };
+  const base = `${webUrl}/${encodeURIComponent(p.owner)}/${encodeURIComponent(p.repo)}`;
+  const res = await fetchImpl(new URL(`${base}/pull/${p.number}`), {
+    headers: { Accept: "text/html", "User-Agent": "primus-claw-assistant" },
+    signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    redirect: "manual",
+  });
+  if (res.status >= 300 && res.status < 400) {
+    const to = res.headers.get("location");
+    try {
+      if (to && new URL(to, base).href === `${base}/issues/${p.number}`) return { pr: name, state: "not_found" };
+    } catch { /* a location that is not an address */ }
+    return failed;
+  }
+  if (!res.ok) return failed;
+  const html = await res.text();
+  if (html.length > PAGE_MAX_BYTES) return failed;
+  const m = /<script type="application\/json" data-target="react-app\.embeddedData">([\s\S]*?)<\/script>/.exec(html);
+  if (!m) return failed;
+  let pr: Record<string, unknown> | undefined;
+  try {
+    pr = (JSON.parse(m[1]!) as any)?.payload?.pullRequestsLayoutRoute?.pullRequest;
+  } catch {
+    return failed;
+  }
+  if (!pr || typeof pr !== "object" || pr.number !== p.number) return failed;
+  switch (pr.state) {
+    case "MERGED": {
+      const mergedAt = time(pr.mergedTime);
+      return mergedAt ? { pr: name, state: "merged", merged_at: mergedAt, merge_commit: commit(pr.mergeCommitSha) } : failed;
+    }
+    case "CLOSED": return { pr: name, state: "closed", closed_at: time(pr.closedTime) };
+    case "OPEN": return { pr: name, state: "open", draft: false };
+    case "DRAFT": return { pr: name, state: "open", draft: true };
+    default: return failed;
+  }
+}
+
 /**
  * Where each of `prs` stands on GitHub, in their order, as `userId` reads them: with their own GitHub (their `GH_TOKEN`, else the
  * account they bound), and with none, as anyone reads a public repository. Never throws: what cannot be read is `unknown`.
@@ -113,10 +181,14 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   let read: (path: string) => Promise<Record<string, any>>;
   let gh: GithubClient | null = null;
   let audit: { id: number } | null = null;
+  // Set when the person has no GitHub here: a REST read refused as over the anonymous limit falls back to the public page.
+  let pageFallback: ((p: PrRef) => Promise<PullState>) | null = null;
   try {
     const cred = await resolveGithubToken(q, userId, { binding: s.binding, purpose: `github_mcp:${PR_STATE_TOOL}`, resolve: deps.resolveBinding });
     if (cred.token === null) {
       read = anonymousReader(s.apiUrl, deps.fetchImpl ?? fetch);
+      const webUrl = deps.webUrl === undefined ? githubWebUrl(s.apiUrl) : deps.webUrl;
+      if (webUrl) pageFallback = (p) => pageState(webUrl, p, deps.fetchImpl ?? fetch);
     } else {
       const client = new GithubClient({ token: cred.token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
       gh = client;
@@ -156,6 +228,11 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
       } catch (err) {
         const status = (err as { status?: number })?.status;
         if (status === 404 && await repoReadable(p)) return { pr: nameOf(p), state: "not_found" };
+        if (pageFallback && (status === 403 || status === 429)) {
+          const fromPage = await pageFallback(p).catch((): PullState => ({ pr: nameOf(p), state: "unknown", reason: "read_failed" }));
+          logger.info({ sessionId, pr: nameOf(p), status, state: fromPage.state }, "assistant.pr_state_read_from_page");
+          if (fromPage.state !== "unknown") return fromPage;
+        }
         failed++;
         logger.warn({ sessionId, pr: nameOf(p), status }, "assistant.pr_state_read_failed");
         return { pr: nameOf(p), state: "unknown", reason: "read_failed" };

@@ -7,7 +7,30 @@
  */
 export * from "./asks.js";
 export * from "./bare-numbers.js";
-export * from "./names.js";
+export {
+  MAX_CANDIDATES,
+  displayName,
+  markerIndexes,
+  markerKeys,
+  markerPattern,
+  memberKeys,
+  memberMatches,
+  memberNames,
+  mentionId,
+  namedIn,
+  namedWithin,
+  normName,
+  oneLine,
+  personOf,
+  plainText,
+  samePerson,
+  sortedCp,
+  tokens,
+  withoutMarkers,
+  withoutParens,
+  writtenIn,
+} from "./names.js";
+export type { Mention, Place } from "./names.js";
 export * from "./pull-ref.js";
 export {
   NAME_PADDING,
@@ -17,7 +40,6 @@ export {
   flat,
   isAlnum,
   isWordChar,
-  pickLang,
   stripChars,
   unique,
 } from "./text/unicode.js";

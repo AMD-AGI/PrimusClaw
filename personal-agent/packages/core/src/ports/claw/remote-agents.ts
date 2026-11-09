@@ -2,16 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import type { JsonObject } from "../../json.js";
+import type { RemoteHidden } from "../../protocol.js";
 import type { ClawCredential } from "../../claw/credential.js";
 import type { SseEvent } from "../../claw/model.js";
-import type {
-  RemoteConnector,
-  RemoteEventRow,
-  RemoteHiddenAnswer,
-  RemotePairing,
-  RemoteSession,
-  RemoteSetup,
-} from "../../claw/remote.js";
+import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
 
 /** What a remote session starts with. */
 export interface NewRemoteSession {
@@ -44,7 +38,7 @@ export interface ClawRemoteAgentsPort {
    * again; nothing on the machine changes. ClawError(404): not the caller's machine, or revoked; 400 for refs Claw does
    * not take.
    */
-  hide(key: ClawCredential, connectorId: string, refs: readonly string[], hidden: boolean): Promise<RemoteHiddenAnswer>;
+  hide(key: ClawCredential, connectorId: string, refs: readonly string[], hidden: boolean): Promise<RemoteHidden>;
   /** A one-time pairing code inside the command line that uses it. */
   pair(key: ClawCredential): Promise<RemotePairing>;
   revoke(key: ClawCredential, connectorId: string): Promise<void>;

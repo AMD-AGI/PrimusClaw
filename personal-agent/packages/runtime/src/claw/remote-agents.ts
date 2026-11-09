@@ -3,6 +3,7 @@
 
 import {
   ClawAnswerInvalid,
+  REMOTE_HIDDEN_INCLUDE,
   remoteConnectorsSchema,
   remoteEventRowsSchema,
   remoteHiddenSchema,
@@ -15,7 +16,7 @@ import {
   type NewRemoteSession,
   type RemoteConnector,
   type RemoteEventRow,
-  type RemoteHiddenAnswer,
+  type RemoteHidden,
   type RemotePairing,
   type RemoteSession,
   type RemoteSetup,
@@ -38,7 +39,7 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   }
 
   async connectors(key: ClawCredential, options: { includeHidden?: boolean } = {}): Promise<RemoteConnector[]> {
-    const path = options.includeHidden === true ? "/connectors?hidden=include" : "/connectors";
+    const path = options.includeHidden === true ? `/connectors?hidden=${REMOTE_HIDDEN_INCLUDE}` : "/connectors";
     return read(remoteConnectorsSchema, anyDataOf(await this.#call("GET", path, key), "connectors"), "connectors");
   }
 
@@ -55,7 +56,7 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
     connectorId: string,
     refs: readonly string[],
     hidden: boolean,
-  ): Promise<RemoteHiddenAnswer> {
+  ): Promise<RemoteHidden> {
     const answer = await this.#call("POST", `/connectors/${segment(connectorId)}/hidden`, key, { refs, hidden });
     return read(remoteHiddenSchema, anyDataOf(answer, "hidden conversations"), "hidden conversations");
   }
