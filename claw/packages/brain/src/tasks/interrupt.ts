@@ -35,7 +35,7 @@ export function interruptRunsAt(address: string, forceReleaseAfterMs = 30_000): 
       if (left > 0) { setTimeout(forceRelease, left).unref(); return; }
       logger.error({ address, lockKey }, "task.interrupt_force_release");
       activeAbort.delete(lockKey);
-      releaseTaskLock(lockKey).catch(() => {});
+      releaseTaskLock(lockKey, ctrl).catch(() => {});
     };
     setTimeout(forceRelease, forceReleaseAfterMs).unref();
   }
@@ -45,14 +45,17 @@ export function interruptRunsAt(address: string, forceReleaseAfterMs = 30_000): 
 /** The session is being deleted: abort every run of it, whatever it answers to, and release their locks. */
 export async function abortRunsOfDeletedSession(sid: string): Promise<void> {
   const lockKeys = resolveSessionEndTargets(sid);
+  // Each run's own controller, so its release names the acquisition it took.
+  const runs = new Map<string, AbortController>();
   for (const lockKey of lockKeys) {
     const ctrl = activeAbort.get(lockKey);
     if (!ctrl) continue;
+    runs.set(lockKey, ctrl);
     ctrl.abort();
     activeAbort.delete(lockKey);
     logger.info({ sessionId: sid, lockKey }, "session.cleanup_aborted_task");
   }
   for (const lockKey of lockKeys.length ? lockKeys : [sid]) {
-    await releaseTaskLock(lockKey);
+    await releaseTaskLock(lockKey, runs.get(lockKey));
   }
 }

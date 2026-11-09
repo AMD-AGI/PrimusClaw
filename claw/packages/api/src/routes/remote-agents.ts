@@ -375,8 +375,30 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const owner = requireOwner(req, reply);
     if (!owner) return;
     const policy = connectorVersionPolicy();
-    const rows = await store.listConnectors(owner, onlineWindowMs);
+    // `?hidden=include`: the conversations the owner hid are listed too, marked `hidden: true` (to show them again).
+    const includeHidden = (req.query as { hidden?: string } | undefined)?.hidden === "include";
+    const rows = await store.listConnectors(owner, onlineWindowMs, { includeHidden });
     return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
+  });
+
+  /**
+   * Hide conversations of one of the caller's machines from their lists, or show them again: `{refs: [...], hidden: true|false}`.
+   * Nothing on the machine changes. A conversation a process has open is refused (`live`): it is disconnected, not hidden.
+   */
+  app.post("/v1/remote-agents/connectors/:cid/hidden", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const id = parseRemoteId((req.params as { cid?: string }).cid);
+    if (!id) return notFound(reply);
+    const body = (req.body ?? {}) as { refs?: unknown; hidden?: unknown };
+    if (typeof body.hidden !== "boolean") return fail(reply, 400, "hidden_must_be_boolean");
+    const refs = Array.isArray(body.refs) ? body.refs : null;
+    if (!refs || refs.length === 0 || refs.length > 50 || !refs.every((r) => typeof r === "string" && /^[\x21-\x7e]{1,128}$/.test(r))) {
+      return fail(reply, 400, "invalid_refs");
+    }
+    const out = await store.setHidden(owner, id, (refs as string[]).map((ref) => ({ ref })), body.hidden);
+    if (!out) return notFound(reply);
+    return reply.send({ ok: true, data: out });
   });
 
   /** How to connect a machine to this server: the package, the exact commands and this deployment's addresses (`remote-agents/setup.ts`). */
