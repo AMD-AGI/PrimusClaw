@@ -331,9 +331,9 @@ export class ReviewChecks {
         repo: slug(pull),
         pr_number: pull.number,
       });
-      if (limited !== undefined) {
+      if (limited !== null) {
         if (!several) {
-          await this.say(ctx, t.limited(shortName(pull), limited.text(true), limited.text()));
+          await this.say(ctx, t.limited(shortName(pull), limited.text("zh"), limited.text("en")));
           return undefined;
         }
         refused.push([pull, t.limitedShort]);

@@ -8,6 +8,7 @@
  */
 
 import type { JsonObject } from "../../json.js";
+import type { Guardrails } from "../../guardrails/guardrails.js";
 import type { Lang } from "../../locales/lang.js";
 import type { TokenExchange } from "../../plugins/token-exchange.js";
 import type { ClawPort } from "../../ports/claw/index.js";
@@ -21,21 +22,8 @@ import type { ReviewTurn } from "../review-turn.js";
 import type { ReviewTurnOptions } from "../../turn/runner.js";
 import type { Redact } from "../summary.js";
 
-/** A per-person limit (the Python worker's `Guardrails.take` / `give_back`): a refusal's words, or undefined when taken. */
-export interface Limited {
-  text(zh?: boolean): string;
-}
-
-export interface Guard {
-  /** One use of `operation` by `userId`, named by `ticket` (so exactly that use can be given back). */
-  take(
-    userId: string,
-    operation: string,
-    ticket: object,
-    details?: Readonly<Record<string, unknown>>,
-  ): Limited | undefined;
-  giveBack(userId: string, operation: string, ticket: object): void;
-}
+/** The per-person limits of the operations that act with someone's authority (W2's `Guardrails`). */
+export type Guard = Pick<Guardrails, "take" | "giveBack">;
 
 /** The audit trail of what was done with a person's GitHub account (`guardrails.audit`). */
 export type Audit = (event: string, fields: Readonly<Record<string, unknown>>) => void;

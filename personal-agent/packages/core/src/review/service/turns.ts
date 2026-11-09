@@ -9,6 +9,7 @@
  */
 
 import { errorName } from "../../errors.js";
+import { correlationId } from "../../guardrails/correlation.js";
 import { REVIEW_MODES } from "../views.js";
 import type { Conversation } from "../../ports/surface.js";
 import type { GithubOutcome } from "../../turn/github-outcome.js";
@@ -101,6 +102,7 @@ export class ReviewTurns {
         repo: slug(review.pull),
         pr_number: review.pull.number,
         github_login: review.actorLogin || null,
+        correlation_id: correlationId(review.sessionId, slug(review.pull).toLowerCase(), review.pull.number),
       });
     }
     return resultLine(review, outcome, model);
@@ -127,7 +129,12 @@ export class ReviewTurns {
   }
 
   /** The turn has ended: what follows it, by how it ended. */
-  async afterTurn(review: ReviewTurn, finalAnswer: string, outcome: ReviewTurnOutcome, asked: Conversation): Promise<void> {
+  async afterTurn(
+    review: ReviewTurn,
+    finalAnswer: string,
+    outcome: ReviewTurnOutcome,
+    asked: Conversation,
+  ): Promise<void> {
     if (outcome.moved) return; // (followed as the reviewer's item now)
     if (outcome.refusal !== null) {
       await this.notices.tellRequesterRefused(review, outcome.refusal.code);
