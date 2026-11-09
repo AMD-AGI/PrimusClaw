@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { typedAnswerText } from "../locales/typed-answer.js";
-import { decimalInt } from "../text/py-text.js";
+import { decimalBigInt } from "../text/py-text.js";
 import { ALL, ALLOW, CLAUSE_END, DENY, FILLER, PULL, QUESTION, WEAK, WORD, has } from "./patterns.js";
 import { withoutModes } from "./mode.js";
 
@@ -27,7 +27,8 @@ interface Written {
   readonly start: number;
   readonly end: number;
   readonly repo: string;
-  readonly number: number;
+  /** Python's `int()` of the digits written: no bound (a number past 2^53 is still read, and said back as written). */
+  readonly number: bigint;
 }
 
 interface Target {
@@ -45,17 +46,20 @@ function unique<T extends Pending>(pulls: readonly T[]): T[] {
   return [...seen.values()];
 }
 
+/** `int(digits)` of digits of any script (the pattern matched only digits). */
+const intOf = (digits: string | undefined): bigint => decimalBigInt(digits ?? "0") ?? 0n;
+
 function written(text: string): Written[] {
   return [...text.matchAll(PULL)].map((m) => {
     const g = m.groups ?? {};
     const start = m.index;
     const end = start + m[0].length;
-    if (g["lnum"]) return { start, end, repo: `${g["lo"] ?? ""}/${g["ln"] ?? ""}`, number: decimalInt(g["lnum"]) };
+    if (g["lnum"]) return { start, end, repo: `${g["lo"] ?? ""}/${g["ln"] ?? ""}`, number: intOf(g["lnum"]) };
     if (g["rnum"]) {
       const repo = g["owner"] ? `${g["owner"]}/${g["name"] ?? ""}` : (g["name"] ?? "");
-      return { start, end, repo, number: decimalInt(g["rnum"]) };
+      return { start, end, repo, number: intOf(g["rnum"]) };
     }
-    return { start, end, repo: "", number: decimalInt(g["num"] ?? g["bare"] ?? "0") };
+    return { start, end, repo: "", number: intOf(g["num"] ?? g["bare"]) };
   });
 }
 
@@ -94,7 +98,7 @@ function onlyAnAnswer(rest: string): boolean {
 function targetsOf(all: Written[], pending: readonly Pending[], strict: boolean): Target[] | TypedAnswer | null {
   const targets: Target[] = [];
   for (const { start, end, repo, number } of all) {
-    const found = unique(pending.filter((p) => p[1] === number && matches(p[0], repo)));
+    const found = unique(pending.filter((p) => BigInt(p[1]) === number && matches(p[0], repo)));
     const name = repo ? `${repo}#${String(number)}` : `#${String(number)}`;
     const first = found[0];
     if (first === undefined) {
@@ -103,7 +107,13 @@ function targetsOf(all: Written[], pending: readonly Pending[], strict: boolean)
     }
     if (found.length > 1) {
       return ask(
-        typedAnswerText.whichRepo({ name, count: found.length, listing: listing(found), repo: first[0], number }),
+        typedAnswerText.whichRepo({
+          name,
+          count: found.length,
+          listing: listing(found),
+          repo: first[0],
+          number: first[1],
+        }),
       );
     }
     targets.push({ start, end, pull: first });

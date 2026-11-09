@@ -132,6 +132,7 @@ export class HttpTokenExchange implements TokenExchange {
         body: form,
         headers: { authorization: this.authorization },
         signal: AbortSignal.timeout(this.timeoutMs),
+        redirect: "manual",
       });
     } catch (error) {
       return err(unreachable("token", error));
@@ -187,6 +188,7 @@ export class HttpTokenExchange implements TokenExchange {
         body: JSON.stringify(payload),
         headers: { authorization: this.authorization, "content-type": "application/json" },
         signal: AbortSignal.timeout(this.timeoutMs),
+        redirect: "manual",
       });
     } catch (error) {
       return err(unreachable("binding", error));

@@ -206,6 +206,13 @@ describe("a rule archive that lies about its size", () => {
     assert.throws(() => ruleText(honest), ClawAnswerInvalid);
   });
 
+  it("a file whose checksum is not the one recorded is refused", () => {
+    const corrupt = zip({ "rule.md": "the rule" }, true);
+    const at = corrupt.indexOf(0x74); // the first byte of the stored text ("t")
+    corrupt[at] = 0x54;
+    assert.throws(() => ruleText(corrupt), ClawAnswerInvalid);
+  });
+
   it("a stored file shorter than it declares is refused", () => {
     const short = zip({ "rule.md": "rule" }, true);
     const view = new DataView(short.buffer, short.byteOffset, short.byteLength);
