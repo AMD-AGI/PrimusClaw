@@ -20,6 +20,7 @@ export * from "./review-text/index.js";
 export * from "./typed-answer/index.js";
 export * from "./understanding/index.js";
 export * from "./locales/index.js";
+export * from "./observe/index.js";
 export * from "./plugins/index.js";
 export * from "./proactive/views.js";
 export * from "./ports/crypto.js";

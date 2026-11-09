@@ -22,6 +22,26 @@ test("the command is read only when it is the command", () => {
   assert.equal(parseObserve(""), undefined);
 });
 
+test("a verb that names an Object.prototype property is no verb", async (t) => {
+  // Expected values are python3's parse_observe: a dict has none of these keys, so each is "usage".
+  const names = [
+    "constructor",
+    "CONSTRUCTOR",
+    "__proto__",
+    "toString",
+    "hasOwnProperty",
+    "valueOf",
+    "isPrototypeOf",
+    "__defineGetter__",
+  ];
+  for (const name of names) {
+    await t.test(`/observe ${name}`, () => {
+      assert.equal(parseObserve(`/observe ${name}`), "usage");
+      assert.equal(parseObserve(`observe ${name}`), "usage");
+    });
+  }
+});
+
 test("a scope is only an id claw takes", () => {
   assert.equal(scopeOf(CONV), `group:teams:${CONV}`);
   assert.equal(scopeOf(""), undefined);
