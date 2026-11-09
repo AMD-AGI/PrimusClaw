@@ -10,7 +10,7 @@
 import type { CardClick } from "../approvals/click.js";
 import type { Decision, WorkItem } from "../claw/model.js";
 import { boardText } from "../locales/assistant-board.js";
-import { workClickText } from "../locales/work-clicks.js";
+import { workClickText } from "../locales/assistant-work-clicks.js";
 import type { ClawWorkItemsPort } from "../ports/claw/index.js";
 import type { AssistantCard, StorePort } from "../ports/store/index.js";
 import type { OutMessage, View } from "../ports/surface.js";

@@ -5,7 +5,7 @@
  * What came of a press on a hide card (`devenv_hide`): how many conversations were hidden, shown again and disconnected, or why
  * nothing was; in one line (teams_agent/agent.py `devenv_hide_outcome`).
  */
-import { devenvHideText } from "../locales/devenv-hide.js";
+import { devenvHideText } from "../locales/assistant-devenv-hide.js";
 import type { Lang } from "../locales/lang.js";
 
 type Fields = Readonly<Record<string, unknown>>;
