@@ -123,10 +123,10 @@ export class RemoteAgents implements RemoteChat {
       signer,
     );
     return new ChatTurn(request.to, policy, {
-      clock: this.ctx.clock,
+      clock: this.ctx.paceClock ?? this.ctx.clock,
       log: this.ctx.logger,
       lang,
-      replyTo: request.replyTo,
+      replyTo: this.ctx.settings.streaming ? request.replyTo : undefined,
     });
   }
 
@@ -264,6 +264,18 @@ export class RemoteAgents implements RemoteChat {
 
   shutdown(): void {
     this.follow.shutdown();
+  }
+
+  /** The chats a turn or a short watch is reading now. */
+  busyChats(): string[] {
+    const watching = [...this.chats.watchers].filter(([, task]) => task.running).map(([key]) => key);
+    return [...this.chats.turns.keys(), ...watching];
+  }
+
+  /** Every turn and short watch is cancelled: nothing outlives the process (or the test) that started it. */
+  cancelAll(): void {
+    for (const key of [...this.chats.turns.keys()]) this.runner.cancel(key);
+    for (const task of this.chats.watchers.values()) task.cancel();
   }
 
   // --- the cards' buttons ----------------------------------------------------------------------------------------------------

@@ -161,7 +161,7 @@ export class SessionStarts {
       const fresh = connectorById(machines.connectors, start.connector.connectorId) ?? start.connector;
       if (!reconnecting(fresh, this.ctx.clock.epochMs() / 1000)) throw error;
     }
-    await this.ctx.clock.sleep(RECONNECT_RETRY_SECONDS * 1000);
+    await (this.ctx.paceClock ?? this.ctx.clock).sleep(RECONNECT_RETRY_SECONDS * 1000);
     try {
       return await create();
     } catch (error) {

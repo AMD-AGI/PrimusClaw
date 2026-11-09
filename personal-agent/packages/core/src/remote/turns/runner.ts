@@ -206,7 +206,7 @@ export class TurnRunner {
       if (isOver(fold)) return;
       failures += 1;
       if (failures >= STREAM_ATTEMPTS) throw new LostConnection("stream kept dropping");
-      await this.ctx.clock.sleep(RECONNECT_BACKOFF_SECONDS * failures * 1000, signal);
+      await (this.ctx.paceClock ?? this.ctx.clock).sleep(RECONNECT_BACKOFF_SECONDS * failures * 1000, signal);
     }
   }
 

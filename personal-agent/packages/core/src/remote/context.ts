@@ -27,8 +27,8 @@ import type { WindowMode } from "./window/view.js";
 export type GuardedOperation = "remote_agent" | "approval";
 
 export interface GuardRefusal {
-  /** The sentence the person is told (English unless `zh`). */
-  text(zh?: boolean): string;
+  /** The sentence the person is told (English unless asked otherwise). */
+  text(): string;
 }
 
 export interface RemoteGuard {
@@ -62,6 +62,8 @@ export interface RemoteSettings {
   readonly watchTimings: FollowTimings;
   /** The assistant's display name. */
   readonly botName: string;
+  /** A turn is shown in a live stream answering the person's message (the reply style streams here and the channel can). */
+  readonly streaming: boolean;
 }
 
 export interface RemoteContext {
@@ -86,6 +88,11 @@ export interface RemoteContext {
   audit(event: "approval_answered", fields: Readonly<Record<string, string | number | null>>): void;
   readonly errors: RemoteErrors;
   readonly clock: Clock;
+  /**
+   * The clock of the remote agents' own paced waits (a turn's live view, a throttled edit of the session card, a retry): `clock`
+   * when not given. Tests give a virtual one, so nothing really waits for them.
+   */
+  readonly paceClock?: Clock;
   readonly random: Random;
   readonly logger: Logger;
   /** The hex digest of `text` (UTF-8): an idempotency key, a correlation id. */

@@ -10,6 +10,7 @@
  * is cut off. In a chat that is the agent's window itself (`signer`), its words are shown under its head from the first update on,
  * later messages get a short head of their own, and the way on and back goes under the last message.
  */
+import { errorName } from "../../errors.js";
 import type { Logger } from "../../ports/logger.js";
 import type { Clock } from "../../ports/clock.js";
 import { type OutMessage, richMessage } from "../../ports/surface.js";
@@ -120,9 +121,9 @@ export class ChatTurn implements TurnDisplay {
   private readonly status: StatusMessage<RemoteStep>;
 
   constructor(
-    surface: TurnSurface,
+    private readonly surface: TurnSurface,
     private readonly policy: RemoteStatusPolicy,
-    options: {
+    private readonly options: {
       readonly clock: Clock;
       readonly log: Logger;
       readonly lang: string;
@@ -148,6 +149,12 @@ export class ChatTurn implements TurnDisplay {
 
   begin(): void {
     this.status.begin();
+    // (a stream shows the channel's own status at once: no typing indicator besides it)
+    if (this.options.replyTo === undefined) {
+      this.surface.typing().catch((error: unknown) => {
+        this.options.log.warn("typing indicator failed; the turn goes on", { error: errorName(error) });
+      });
+    }
   }
 
   progress(step: RemoteStep): void {

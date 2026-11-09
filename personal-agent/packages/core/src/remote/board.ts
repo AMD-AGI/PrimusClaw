@@ -188,7 +188,7 @@ export class StatusBoard {
     if (this.edits.get(chatKey)?.running) return;
     const task = new Task(
       async (signal) => {
-        await this.ctx.clock.sleep(EDIT_SECONDS * 1000, signal);
+        await (this.ctx.paceClock ?? this.ctx.clock).sleep(EDIT_SECONDS * 1000, signal);
         await this.refreshWindow(chatKey, to, { streaming: true });
       },
       this.ctx.logger,
