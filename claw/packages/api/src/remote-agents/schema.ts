@@ -53,6 +53,17 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       ADD COLUMN IF NOT EXISTS offline_notice    TEXT,
       ADD COLUMN IF NOT EXISTS presence_episode  BIGINT
   `);
+  // Conversations on a machine its owner hid from their lists (`store.setHidden`): never deleted on the machine, only not listed.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_hidden (
+      owner_user_id TEXT NOT NULL,
+      connector_id  UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      ref           TEXT NOT NULL,
+      title         TEXT NOT NULL DEFAULT '',
+      hidden_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (owner_user_id, connector_id, ref)
+    )
+  `);
   // Every change of presence the sweep saw. No owner index: it is read per connector.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_connector_transitions (

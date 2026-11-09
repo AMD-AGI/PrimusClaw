@@ -25,7 +25,7 @@ import pino from "pino";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
-  parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
+  REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -375,8 +375,26 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const owner = requireOwner(req, reply);
     if (!owner) return;
     const policy = connectorVersionPolicy();
-    const rows = await store.listConnectors(owner, onlineWindowMs);
+    // `?hidden=include`: the conversations the owner hid are listed too, marked `hidden: true` (to show them again).
+    const includeHidden = (req.query as { hidden?: string } | undefined)?.hidden === REMOTE_HIDDEN_INCLUDE;
+    const rows = await store.listConnectors(owner, onlineWindowMs, { includeHidden });
     return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
+  });
+
+  /**
+   * Hide conversations of one of the caller's machines from their lists, or show them again: `{refs: [...], hidden: true|false}`.
+   * Nothing on the machine changes. A conversation a process has open is refused (`live`): it is disconnected, not hidden.
+   */
+  app.post("/v1/remote-agents/connectors/:cid/hidden", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const id = parseRemoteId((req.params as { cid?: string }).cid);
+    if (!id) return notFound(reply);
+    const body = parseHiddenRequest(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    const out = await store.setHidden(owner, id, body.value.refs.map((ref) => ({ ref })), body.value.hidden);
+    if (!out) return notFound(reply);
+    return reply.send({ ok: true, data: out });
   });
 
   /** How to connect a machine to this server: the package, the exact commands and this deployment's addresses (`remote-agents/setup.ts`). */

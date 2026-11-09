@@ -2,36 +2,53 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Which source files have no runtime at all: compiled, they are empty or only `export {}` (interfaces, type aliases,
- * `import type`, `declare module` augmentations). Such a file is never loaded by a test, so c8 `--all` would count it
- * as 0 % covered although there is nothing in it to run. The coverage gate leaves these out, judged by compiling each
- * file, never by a hand-kept list of paths: a file that gains one runtime value (a constant, a default, a zod schema)
- * is counted again at once.
+ * Which source files have no runtime at all: every top-level statement is a type-only construct (an interface, a type
+ * alias, `import type`, `export type`, an empty `export {}`, an ambient `declare ...`, a namespace of only such
+ * statements). Such a file is never loaded by a test, so c8 `--all` would count it as 0 % covered although there is
+ * nothing in it to run. The coverage gate leaves these out, judged by reading each file's syntax tree, never by a
+ * hand-kept list of paths and never by matching emitted text: a file with any other statement (a constant, a default,
+ * a zod schema, a re-export, a side-effect import, an `export =`, a directive, an expression) is counted.
  */
 import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 
-/** Whether `source` compiles to nothing that runs. */
+function hasDeclare(node: ts.Node): boolean {
+  return (
+    ts.canHaveModifiers(node) &&
+    (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)
+  );
+}
+
+/** `export {}`, `export type { ... }` and `export { type A }` with no `from`: nothing is emitted that runs. */
+function isTypeOnlyExport(node: ts.ExportDeclaration): boolean {
+  if (node.isTypeOnly) return true;
+  if (node.moduleSpecifier !== undefined) return false; // (`export { type A } from "x"` still loads "x")
+  const clause = node.exportClause;
+  return clause !== undefined && ts.isNamedExports(clause) && clause.elements.every((element) => element.isTypeOnly);
+}
+
+/** Whether one top-level (or namespace-level) statement emits nothing that runs. */
+function isTypeOnlyStatement(node: ts.Statement): boolean {
+  if (hasDeclare(node)) return true;
+  if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEmptyStatement(node)) return true;
+  if (ts.isImportDeclaration(node)) return node.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword;
+  if (ts.isImportEqualsDeclaration(node)) return node.isTypeOnly;
+  if (ts.isExportDeclaration(node)) return isTypeOnlyExport(node);
+  if (ts.isModuleDeclaration(node)) {
+    const body = node.body;
+    return body !== undefined && ts.isModuleBlock(body) && body.statements.every(isTypeOnlyStatement);
+  }
+  return false;
+}
+
+/** Whether `source` has nothing that runs. */
 export function isTypeOnly(source: string, fileName = "file.ts"): boolean {
-  // A declaration file (.d.ts, .d.mts, .d.cts) emits nothing by definition; the compiler refuses to transpile one.
+  // A declaration file (.d.ts, .d.mts, .d.cts) holds declarations only, by definition.
   if (/\.d\.[cm]?ts$/.test(fileName)) return true;
-  const { outputText } = ts.transpileModule(source, {
-    fileName,
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      verbatimModuleSyntax: true,
-      removeComments: true,
-    },
-  });
-  // A file with no import or export compiles as a script, which gains a "use strict" directive and nothing else; a
-  // CommonJS module (.cts) gains the `__esModule` marker. Neither is code of the file's own.
-  const code = outputText
-    .replace(/\s+/g, "")
-    .replace(/^["']usestrict["'];/, "")
-    .replace(/^Object\.defineProperty\(exports,["']__esModule["'],\{value:true\}\);/, "");
-  return code === "" || code === "export{};";
+  const kind = fileName.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.ES2022, false, kind);
+  return file.statements.every(isTypeOnlyStatement);
 }
 
 /** Every extension a source file of the workspace can have: what the compiler or Node would load. */

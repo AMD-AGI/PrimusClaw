@@ -14,8 +14,11 @@ import { redactPublicJson } from "../events/redaction.js";
 import {
   REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
-  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat,
+  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
 } from "@claw/protocol";
+import { withHidden } from "./hidden.js";
+
+export { withHidden };
 
 export type Row = Record<string, any>;
 
@@ -201,7 +204,7 @@ export const LAST_SEEN_SQL = "GREATEST(c.heartbeat_at, c.stream_seen_at, c.strea
  * The caller's connectors that are not revoked, with their agents and presence: `online`, `last_seen_at`, and, while
  * offline, `offline_since` (when it was last seen before it went) and `offline_reason` (`presence.ts`).
  */
-export async function listConnectors(owner: string, onlineWindowMs: number): Promise<Row[]> {
+export async function listConnectors(owner: string, onlineWindowMs: number, opts: { includeHidden?: boolean } = {}): Promise<Row[]> {
   const rows = (await direct(
     `SELECT c.connector_id, c.name, c.version, c.heartbeat_at, c.created_at, ${ONLINE_SQL},
             ${LAST_SEEN_SQL} AS last_seen_at, c.presence_state, c.offline_since, c.offline_reason, c.stream_end_reason,
@@ -218,10 +221,71 @@ export async function listConnectors(owner: string, onlineWindowMs: number): Pro
   const agents = (await direct(
     "SELECT connector_id, agent_id, kind, name, capabilities FROM claw_remote_agents WHERE owner_user_id = $1 ORDER BY agent_id", [owner],
   )).rows;
+  const hidden = await hiddenRefs(owner);
   return connectors.map((c) => ({
     ...c,
-    agents: agents.filter((a) => a.connector_id === c.connector_id).map(({ connector_id: _c, ...a }) => a),
+    agents: agents.filter((a) => a.connector_id === c.connector_id)
+      .map(({ connector_id: _c, ...a }) => withHidden(a, hidden.get(String(c.connector_id)), opts.includeHidden === true)),
   }));
+}
+
+/** connector id -> the refs of the conversations its owner hid there. A Claw from before the table answers none. */
+async function hiddenRefs(owner: string): Promise<Map<string, Set<string>>> {
+  const out = new Map<string, Set<string>>();
+  let rows: Row[];
+  try {
+    rows = (await direct("SELECT connector_id::text AS connector_id, ref FROM claw_remote_hidden WHERE owner_user_id = $1", [owner])).rows;
+  } catch (err) {
+    if ((err as { code?: string }).code === "42P01") return out;   // (undefined_table: remote agents' schema predates it)
+    throw err;
+  }
+  for (const r of rows) {
+    const set = out.get(String(r.connector_id)) ?? new Set<string>();
+    set.add(String(r.ref));
+    out.set(String(r.connector_id), set);
+  }
+  return out;
+}
+
+/** What a hide or show of conversations did: the refs changed, and the ones refused with why (`@claw/protocol`). */
+export type HideOutcome = RemoteHidden;
+
+/**
+ * Hide (or show again) conversations of one of the owner's machines in their lists. Only conversations the machine reports now
+ * may be hidden, and never one a process has open (`live`) or a session holds (`attached`): those are disconnected, not hidden.
+ * Showing again takes any ref the owner hid there. Null when the machine is not theirs or was revoked. Nothing on the machine
+ * changes either way.
+ */
+export async function setHidden(
+  owner: string, connectorId: string, entries: Array<{ ref: string; title?: string }>, hidden: boolean,
+): Promise<HideOutcome | null> {
+  return inTransaction(async (q) => {
+    const c = (await q("SELECT 1 FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL FOR SHARE",
+      [connectorId, owner])).rows[0];
+    if (!c) return null;
+    const out: HideOutcome = { changed: [], refused: [] };
+    if (!hidden) {
+      const gone = (await q("DELETE FROM claw_remote_hidden WHERE owner_user_id = $1 AND connector_id = $2 AND ref = ANY($3::text[]) RETURNING ref",
+        [owner, connectorId, entries.map((e) => e.ref)])).rows;
+      out.changed = gone.map((r) => String(r.ref));
+      return out;
+    }
+    const reported = new Map<string, Row>();
+    for (const a of (await q("SELECT capabilities FROM claw_remote_agents WHERE connector_id = $1 AND owner_user_id = $2", [connectorId, owner])).rows) {
+      const list = a.capabilities && Array.isArray(a.capabilities.resumable) ? a.capabilities.resumable : [];
+      for (const r of list) if (r && typeof r === "object" && typeof r.ref === "string") reported.set(r.ref, r);
+    }
+    for (const e of entries) {
+      const r = reported.get(e.ref);
+      if (!r) { out.refused.push({ ref: e.ref, reason: "unknown_conversation" }); continue; }
+      if (r.state === "live" || r.state === "attached") { out.refused.push({ ref: e.ref, reason: "live" }); continue; }
+      await q(`INSERT INTO claw_remote_hidden (owner_user_id, connector_id, ref, title) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (owner_user_id, connector_id, ref) DO UPDATE SET title = EXCLUDED.title`,
+        [owner, connectorId, e.ref, String(e.title ?? r.title ?? "").slice(0, 200)]);
+      out.changed.push(e.ref);
+    }
+    return out;
+  });
 }
 
 /**

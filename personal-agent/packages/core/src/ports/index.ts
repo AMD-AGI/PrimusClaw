@@ -9,8 +9,6 @@
  * Implementations live in the runtime package (Node) or a channel package; tests use `test-support/`.
  */
 export * from "./clock.js";
-export * from "./crypto.js";
 export * from "./logger.js";
 export * from "./random.js";
-export * from "./store/index.js";
 export * from "./surface.js";
