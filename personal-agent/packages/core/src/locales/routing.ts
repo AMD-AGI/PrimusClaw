@@ -28,6 +28,8 @@ export const routingText = defineCatalog({
     notFinished: "I could not finish that. Please send me a message to carry on.",
     buttonInactive: "That button is not active any more.",
     dmLead: "You mentioned me in a group chat. ",
+    stopPressed: "Stop was pressed.",
+    stopTurnOver: "That turn has already ended, so nothing was stopped.",
   },
   zh: {
     notConnected: "这个聊天还没有连上 PrimusClaw 账号（或者我刚才没查到）。给我发一条消息，我告诉你怎么连。",
@@ -48,5 +50,7 @@ export const routingText = defineCatalog({
     notFinished: "这件事我没能做完。给我发条消息就能接着来。",
     buttonInactive: "这个按钮已经失效了。",
     dmLead: "你在群聊里 @ 了我。",
+    stopPressed: "已按下「停止」。",
+    stopTurnOver: "这一轮已经结束了，没有停止任何东西。",
   },
 });

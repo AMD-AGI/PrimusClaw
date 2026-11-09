@@ -32,7 +32,7 @@ function assistantWorld(understands = false) {
       },
       stop: () => {
         stopped.push("stop");
-        return Promise.resolve();
+        return Promise.resolve(true);
       },
       route: (request) => {
         routed.push(request);

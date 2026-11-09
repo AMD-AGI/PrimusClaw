@@ -11,7 +11,7 @@ import type { HistorySession } from "../ports/store/sessions.js";
 import type { InboundAction } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
-import { chatTurnKey } from "./turn-registry.js";
+import { chatTurnKey, type ActiveTurn } from "./turn-registry.js";
 import type { TurnStarter } from "./turn-start.js";
 import { whenText, zoneOf } from "./time.js";
 import { repoButton } from "./views.js";
@@ -58,11 +58,29 @@ export class SessionCommands {
     await this.stopTurn(chat, key, scope);
   }
 
-  private async stopTurn(chat: Chat, key: string, scope: string): Promise<void> {
-    const { store, claw } = this.ctx.deps;
+  /**
+   * `/stop` of the turn on the chat's own session (not a remote agent's, not the assistant's). `only`: stop only while that
+   * turn is the one running (a Stop card's turn), checked with no wait before the interrupt goes; false when it is not, and
+   * nothing was said or stopped.
+   */
+  async stopTurn(chat: Chat, key: string, scope = "", only?: ActiveTurn): Promise<boolean> {
+    const { store } = this.ctx.deps;
     const turns = this.ctx.turns.of(chatTurnKey(chat.sender.id, scope));
     const [turn] = turns;
     const sessionId = store.sessions.getSession(chat.sender.id, scope);
+    if (only !== undefined && (turn !== only || only.over || sessionId === null)) return false;
+    await this.interrupt(chat, key, sessionId, turns);
+    return true;
+  }
+
+  private async interrupt(
+    chat: Chat,
+    key: string,
+    sessionId: string | null,
+    turns: readonly ActiveTurn[],
+  ): Promise<void> {
+    const { claw } = this.ctx.deps;
+    const [turn] = turns;
     const said = routingText.in(chat.lang());
     if (sessionId === null) {
       await chat.say(said.nothingRunning);

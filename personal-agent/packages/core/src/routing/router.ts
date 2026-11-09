@@ -41,6 +41,7 @@ export class Router {
     this.ctx = new RouterContext(deps);
     this.starter = new TurnStarter(this.ctx);
     const sessions = new SessionCommands(this.ctx, this.starter);
+    this.starter.sessionStop = (chat, credential, only) => sessions.stopTurn(chat, credential, "", only);
     this.onboarding = new Onboarding(this.ctx, this.starter);
     const link = new LinkCommands(this.ctx, (chat, pending, announce) =>
       this.onboarding.resume(chat, pending, announce),

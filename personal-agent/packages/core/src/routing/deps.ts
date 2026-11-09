@@ -25,6 +25,7 @@ import type {
   Observing,
   RemoteChat,
   ReviewStopReader,
+  StopCards,
   Subscriptions,
 } from "./features.js";
 import type { TurnRunner } from "./turn-runner.js";
@@ -123,6 +124,8 @@ export interface RouterDeps {
   readonly assistant: AssistantChat;
   readonly remote: RemoteChat;
   readonly turns: TurnRunner;
+  /** The Stop cards of turns a phone starts. */
+  readonly stopCards: StopCards;
   readonly proactive: ProactiveHold;
   readonly observing: Observing;
   readonly github: GithubChat | undefined;

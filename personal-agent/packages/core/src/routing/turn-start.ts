@@ -11,10 +11,16 @@ import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 import { ActiveTurn, chatTurnKey, reviewTurnKey, type TurnKey } from "./turn-registry.js";
 import type { ReviewRunFields, TurnHooks, TurnOutcome, TurnRun } from "./turn-runner.js";
+import type { StopCardKind } from "./features.js";
 
 /** What a waiting message gives the turn in front to start running in Claw (`_queue_behind`). */
 export const SUBMIT_WAIT_SECONDS = 15;
 const MOBILE_PLATFORMS = ["ios", "ipados", "android"];
+
+/** Teams on a phone or a tablet: its own Stop under a reply is greyed out, and its own thumbs never reach the worker. */
+export function isMobile(clientPlatform: string): boolean {
+  return MOBILE_PLATFORMS.includes(clientPlatform.toLowerCase());
+}
 
 /** A review the review service starts as a turn here (its item runs in Claw already; the turn only follows it). */
 export interface ReviewTurnStart {
@@ -62,6 +68,10 @@ export interface StartTurn {
 export class TurnStarter {
   private readonly running = new Set<Promise<void>>();
 
+  /** How a session turn is stopped (the session commands' `/stop`, set once they are built). */
+  sessionStop: (chat: StartTurn["chat"], credential: string, only: ActiveTurn) => Promise<boolean> = () =>
+    Promise.resolve(false);
+
   constructor(private readonly ctx: RouterContext) {}
 
   /** The turns that run now (a test waits for them). */
@@ -89,7 +99,16 @@ export class TurnStarter {
     const task = this.guarded(request, run, key, turn);
     this.running.add(task);
     void task.finally(() => this.running.delete(task));
+    if (review === undefined && !chat.scope && isMobile(request.clientPlatform)) this.offerStop(chat, key, turn, task);
     return { done: task };
+  }
+
+  /** The Stop card of a phone's turn on the chat's own session: it stops that very turn while it still runs. */
+  private offerStop(chat: StartTurn["chat"], key: TurnKey, turn: ActiveTurn, ended: Promise<void>): void {
+    const alive = (): Promise<boolean> => Promise.resolve(!turn.over && this.ctx.turns.of(key)[0] === turn);
+    const stop = (at: StartTurn["chat"], credential: string): Promise<boolean> =>
+      this.sessionStop(at, credential, turn);
+    offerStopCard(this.ctx, chat, { kind: "session", alive, ended, stop });
   }
 
   /** True when admitted as the chat's first turn; false when the chat has one (queue behind it); undefined: refused. */
@@ -146,8 +165,7 @@ export class TurnStarter {
   }
 
   private ownThumbs(request: StartTurn): boolean {
-    const mobile = MOBILE_PLATFORMS.includes(request.clientPlatform.toLowerCase());
-    return mobile && request.review === undefined && this.ctx.deps.config.ownThumbsMobile;
+    return isMobile(request.clientPlatform) && request.review === undefined && this.ctx.deps.config.ownThumbsMobile;
   }
 
   /** What the run reads of the chat's session: its id, the model it has, the repository a new one is bound to. */
@@ -264,5 +282,34 @@ export class TurnStarter {
       branch: bound && run.repo ? run.repo.branch : "",
     });
     if (created && run.repo) store.repoHistory.clearPendingRepo(userId);
+  }
+}
+
+/**
+ * Offers a phone's Stop card; only the card is lost when it cannot be (the turn goes on, and /stop still works). `stop`
+ * stops that very turn, only while it still runs (false, with nothing said or stopped, when it does not).
+ */
+export function offerStopCard(
+  ctx: RouterContext,
+  chat: StartTurn["chat"],
+  turn: {
+    readonly kind: StopCardKind;
+    readonly alive: (credential: string) => Promise<boolean>;
+    readonly ended: Promise<unknown>;
+    readonly stop: (chat: StartTurn["chat"], credential: string) => Promise<boolean>;
+  },
+): void {
+  try {
+    const offer = ctx.deps.stopCards.offer(
+      chat.sender.id,
+      turn.kind,
+      chat.conversation,
+      chat.lang(),
+      turn.alive,
+      turn.ended,
+    );
+    ctx.stoppers.set(offer, turn.stop);
+  } catch (error) {
+    ctx.deps.logger.warn("the Stop card of a turn from Teams mobile could not be offered", { error: errorName(error) });
   }
 }

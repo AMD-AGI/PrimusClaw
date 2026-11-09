@@ -8,6 +8,7 @@ import { TaskAdmission } from "./admission.js";
 import { Chat, settleClick } from "./chat.js";
 import { Credentials } from "./credentials.js";
 import type { RouterDeps } from "./deps.js";
+import type { StopCardOffer } from "./features.js";
 import { KeyOwners } from "./identity.js";
 import { TurnRegistry } from "./turn-registry.js";
 import { CommandViews } from "./views.js";
@@ -19,6 +20,8 @@ export class RouterContext {
   readonly credentials: Credentials;
   readonly admission: TaskAdmission;
   readonly owners: KeyOwners;
+  /** How the turn behind each phone's Stop card is stopped, by its offer. */
+  readonly stoppers = new WeakMap<StopCardOffer, (chat: Chat, credential: string) => Promise<boolean>>();
 
   constructor(readonly deps: RouterDeps) {
     this.views = new CommandViews(deps.config.botName, deps.config.publicBaseUrl, deps.note);

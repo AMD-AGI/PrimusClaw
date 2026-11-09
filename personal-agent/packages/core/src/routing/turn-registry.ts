@@ -51,6 +51,8 @@ export class ActiveTurn {
   stopConfirmed = false;
   /** Set once Claw runs the turn's message, or the turn is over: a message sent behind it may go then. */
   readonly running = new Latch();
+  /** The turn is over (or never started). */
+  over = false;
 
   constructor(
     /** A review for a colleague: its own session, so nothing is queued behind it. */
@@ -113,6 +115,7 @@ export class TurnRegistry {
   /** The turn is over (or never started): whatever waits behind it may go, and the chat no longer holds it. */
   drop(key: TurnKey, turn: ActiveTurn): void {
     turn.running.set();
+    turn.over = true;
     const entry = this.turns.get(keyOf(key));
     if (entry === undefined) return;
     const at = entry.turns.indexOf(turn);

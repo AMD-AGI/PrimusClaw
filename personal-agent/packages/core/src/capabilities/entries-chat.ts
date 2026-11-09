@@ -88,12 +88,12 @@ export const CHAT_ENTRIES: readonly Capability[] = [
   capability({
     key: "stop",
     category: "chat",
-    zh: "让我停下手上的事",
-    en: "Stop what I am doing",
+    zh: "让我停下手上的事（手机上点「停止」卡片）",
+    en: "Stop what I am doing (on a phone, tap Stop on its card)",
     sayZh: "停一下",
     sayEn: "stop",
     reaches: "stop",
-    covers: ["command:stop"],
+    covers: ["command:stop", "card:turn_stop"],
     where: "both",
   }),
   capability({

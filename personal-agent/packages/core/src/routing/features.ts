@@ -25,7 +25,12 @@ export interface AssistantRouteRequest {
   readonly files: readonly InboundFile[];
   /** Present only where remote agents are on: what this chat is attached to (null for nothing). */
   readonly attached?: JsonObject | null;
+  /** Told (session, message id or null when Claw queued it) once Claw has taken the message (a phone's Stop card). */
+  readonly onSent?: OnSent;
 }
+
+/** Claw took a message to the assistant: its session and the message id its turn answers (null: queued). */
+export type OnSent = (sessionId: string, messageId: string | null) => void;
 
 /** A message of a person the assistant understands (the Python `Assistant.understand`). */
 export interface UnderstandRequest {
@@ -40,6 +45,7 @@ export interface UnderstandRequest {
   readonly lang: Lang;
   readonly conversation: Conversation;
   readonly files: readonly InboundFile[];
+  readonly onSent?: OnSent;
 }
 
 /** The person's assistant (Python `assistant.Assistant`). */
@@ -53,8 +59,11 @@ export interface AssistantChat {
   /** The reply, in `lang`, to a command that has no meaning with the assistant on; undefined when `text` is not one. */
   hiddenCommand(text: string, lang: Lang): string | undefined;
   board(userId: string, credential: string, conversation: Conversation): Promise<void>;
-  /** What the assistant is doing this moment is stopped. */
-  stop(userId: string, credential: string, conversation: Conversation): Promise<void>;
+  /**
+   * What the assistant is doing this moment is stopped. `onlyMessage`: only while Claw's running turn answers that
+   * message; false, with nothing said or stopped, when it does not.
+   */
+  stop(userId: string, credential: string, conversation: Conversation, onlyMessage?: string): Promise<boolean>;
   /** Forget what is kept for the person (they unlinked). */
   forget(userId: string): void;
   /** True when the assistant took the message. */
@@ -73,6 +82,11 @@ export interface Attachment {
   readonly cwd: string;
   /** The line that says where the chat box goes while the session card is the window, in the language asked for. */
   readonly cardWindowLine: string;
+}
+
+/** One turn of an attached agent: settles when it is over. */
+export interface RemoteTurn {
+  readonly ended: Promise<unknown>;
 }
 
 export interface RemotePrompt {
@@ -111,8 +125,18 @@ export interface RemoteChat {
   chatContext(userId: string, credential: string): Promise<JsonObject | null>;
   attachment(chatKey: string, lang: Lang): Attachment | undefined;
   prompt(request: RemotePrompt): Promise<void>;
-  /** True when the attached agent was the one to stop. */
-  stop(chat: UserRef, credential: string, conversation: Conversation): Promise<boolean>;
+  /**
+   * True when the attached agent was the one to stop. `only`: stop only while that turn (`currentTurn`) still runs; false,
+   * with nothing said or stopped, when it does not.
+   */
+  stop(chat: UserRef, credential: string, conversation: Conversation, only?: RemoteTurn): Promise<boolean>;
+  /**
+   * The attached agent's turn running for this chat now (undefined: none), compared by identity. Absent on a remote-agent
+   * feature that does not follow turns: a phone's message to an agent then gets no Stop card.
+   */
+  currentTurn?(chatKey: string): RemoteTurn | undefined;
+  /** The chat's session card is the window (it has a Stop of its own). */
+  windowed?(chatKey: string): boolean;
   agents(sender: UserRef, credential: string, conversation: Conversation): Promise<void>;
   agent(command: RemoteAgentCommand): Promise<void>;
   forgetPerson(userId: string): void;
@@ -234,3 +258,28 @@ export type NoteFactory = (
   text: string,
   options?: { readonly title?: string; readonly tone?: string; readonly buttons?: readonly NoteButton[] },
 ) => OutMessage;
+
+/** Which kind of turn a phone's Stop card stops. */
+export type StopCardKind = "session" | "assistant" | "remote";
+
+/** One Stop card's offer (the turn engine's `StopButtons`): whose, which kind, the card, and whether it was used. */
+export interface StopCardOffer {
+  readonly kind: StopCardKind;
+  readonly alive: (credential: string) => Promise<boolean>;
+  cardId: string | undefined;
+  used: boolean;
+}
+
+/** The Stop cards of turns started from a phone, whose own Stop is greyed out (the turn engine's `StopButtons`). */
+export interface StopCards {
+  offer(
+    userId: string,
+    kind: StopCardKind,
+    conversation: Pick<Conversation, "post" | "delete">,
+    lang: string,
+    alive: (credential: string) => Promise<boolean>,
+    ended: Promise<unknown>,
+  ): StopCardOffer;
+  /** The offer of a card this person pressed; undefined for an unknown, forgotten or someone else's token. */
+  get(token: string, userId: string): StopCardOffer | undefined;
+}
