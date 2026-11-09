@@ -6,7 +6,8 @@
  * `RENDERERS` must name every view core declares, so a view without a renderer does not compile.
  */
 import type { Renderers } from "./registry.js";
+import { TURN_RENDERERS } from "./turn/index.js";
 
-export const RENDERERS: Renderers = {};
+export const RENDERERS: Renderers = { ...TURN_RENDERERS };
 
 export { renderView, type Renderer, type Renderers, type TeamsMessage } from "./registry.js";
