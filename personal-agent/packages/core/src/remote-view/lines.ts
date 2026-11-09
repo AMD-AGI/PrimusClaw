@@ -6,7 +6,7 @@ import type { Lang } from "../locales/lang.js";
 import { remoteQueuedText, remoteStopText, remoteText } from "../locales/remote.js";
 import { inertLinks, neutral, masked as redactText } from "./inert.js";
 import { TYPED_LINES_MAX } from "./limits.js";
-import { pyStr, rstrip, slice, splitlines, squash, strip } from "./py-text.js";
+import { length, pyStr, rstrip, slice, splitlines, squash, strip } from "./py-text.js";
 
 /** What Claw writes for an instruction or a start its machine never got (a reason code, said by the connector reasons). */
 export const NOT_DELIVERED = "not_delivered";
@@ -65,19 +65,24 @@ export function placeOf(cwd: unknown, lit: (text: unknown, limit: number) => str
   return lit(tail || path, 40);
 }
 
-const SCHEME = /\b(https?):(?=\/\/)/gi;
+/** A typed line is cut at this many characters: well under what the rich text converts, past which the message would go as plain
+ * markdown (where a reference link could be live). */
+export const TYPED_CHARS_MAX = 4000;
 
-/** `text` with no address the chat's rich text would make a link by itself (it links a bare `http(s)://...`): a zero-width space
- * after the scheme's colon. */
+/** `text` with no address the chat's rich text would make a link by itself (it links a bare `http(s)://...` after any character
+ * that is not a letter or a digit): a zero-width space after the colon of every `://`. */
 function noAutolink(text: string): string {
-  return text.replace(SCHEME, "$1:\u{200b}");
+  return text.replaceAll("://", ":\u{200b}//");
 }
 
 /** How a prompt typed at the terminal shows in the chat: said as the terminal's, quoted, credentials masked, and unable to make a
  * link, an image or a tag, nor an address the rich text links by itself (whoever types at that terminal reaches the chat through the
  * connector: what they typed is shown, never followed). */
 export function typedLine(text: string, lang: Lang): string {
-  const quoted = splitlines(noAutolink(inertLinks(redactText(strip(text)))))
+  let shown = noAutolink(inertLinks(redactText(strip(text))));
+  // (and so the message is always rich text: a longer one would go as plain markdown)
+  if (length(shown) > TYPED_CHARS_MAX) shown = rstrip(slice(shown, 0, TYPED_CHARS_MAX - 1)) + "…";
+  const quoted = splitlines(shown)
     .slice(0, TYPED_LINES_MAX)
     .map((line) => (strip(line) ? `> ${line}` : ">"))
     .join("\n");

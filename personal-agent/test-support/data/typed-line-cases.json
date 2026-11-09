@@ -1,5 +1,5 @@
 {
- "about": "typed_line(text, lang) after the fix: the prompt typed at the shared terminal, shown whole, credentials masked, quoted, with markdown links/images and tags made inert: '](' -> ']\\u200b(', '<' -> '\\u2039', '>' -> '\\u203a', applied after masking and before quoting; then a zero-width space after the colon of an http(s) scheme, so the chat's rich text does not make a bare address a link (codex r1 on the internal pull request). First generated from the TS port, the http(s) step added in Python: the TS port must follow it. Generated from the TS port (personal-agent/packages/core/src/remote-view/lines.ts typedLine, commit 70ca34f3).",
+ "about": "typed_line(text, lang) after the fix: the prompt typed at the shared terminal, shown whole, credentials masked, quoted, with markdown links/images and tags made inert: '](' -> ']\\u200b(', '<' -> '\\u2039', '>' -> '\\u203a', applied after masking and before quoting; then a zero-width space after the colon of every `://`, so the chat's rich text does not make a bare address a link (codex r1 on the internal pull request). First generated from the TS port, the http(s) step added in Python: the TS port must follow it. Generated from the TS port (personal-agent/packages/core/src/remote-view/lines.ts typedLine, commit 70ca34f3).",
  "cases": [
   {
    "input": "fix it",
