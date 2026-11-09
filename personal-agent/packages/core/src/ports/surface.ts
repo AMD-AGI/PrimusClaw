@@ -301,6 +301,12 @@ export interface StreamRefused {
  * thing the way it would without a stream.
  */
 export interface LiveStream {
+  /**
+   * The id of the stream's message (Teams: the id the first stream request was answered with), so that what the same
+   * turn later amends or replaces after the stream closed edits this message instead of posting a new one (the Python
+   * worker keeps the stream id for that). "" when the channel did not say it.
+   */
+  readonly id: MessageId;
   /** Informative status lines ("Thinking…", the step in progress). */
   inform(text: string): Promise<Result<void, StreamRefused>>;
   /** The answer text so far; each call carries the whole text, which must start with the previous one. */

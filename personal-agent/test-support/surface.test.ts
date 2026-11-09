@@ -175,3 +175,20 @@ test("an update aborted while it is held rejects at once, before the hold ends, 
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(surface.outbox, []);
 });
+
+test("a stream carries its message id, and a later edit of that id replaces the closed stream's message", async () => {
+  const surface = new FakeSurface();
+  const c = surface.conversation(testConversation("c1"));
+  await c.post(textMessage("before"));
+  const opened = await c.openStream("in-1", "Thinking…");
+  assert.ok(opened.ok);
+  const stream = opened.value;
+  assert.equal(stream.id, "m2");
+  assert.ok((await stream.finish(textMessage("answer"))).ok);
+  await c.update(stream.id, textMessage("answer, amended"));
+  assert.deepEqual(
+    surface.outbox.filter((r) => r.op === "stream.open" || r.op === "update").map((r) => ("id" in r ? r.id : "")),
+    ["m2", "m2"],
+  );
+  assert.equal(await c.post(textMessage("after")), "m3");
+});

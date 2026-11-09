@@ -15,7 +15,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
+import { oddCaseSources, SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
 
 /**
  * Each package's floor, in percent. Lowering one is a change to this file that review sees. A package directory under
@@ -66,7 +66,10 @@ export function codeOutsideSrc(packagesDir: string, pkg: string): string[] {
     .flatMap((e) => (e.isDirectory() ? sourceFiles(path.join(dir, e.name)) : [path.join(dir, e.name)]))
     .filter((file) => (SOURCE_EXTENSIONS as readonly string[]).includes(path.extname(file)))
     .map((file) => `${path.relative(path.dirname(packagesDir), file)} is source outside src/ and test/`);
-  return [...badEntries, ...stray];
+  const oddCase = oddCaseSources(dir).map(
+    (file) => `${path.relative(path.dirname(packagesDir), file)} has a source extension in upper case (use lower case)`,
+  );
+  return [...badEntries, ...stray, ...oddCase];
 }
 
 /**
