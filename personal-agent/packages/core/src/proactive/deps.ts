@@ -8,7 +8,7 @@ import type { ClawWorkItemsPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { StorePort } from "../ports/store/index.js";
-import type { Conversation, OutMessage } from "../ports/surface.js";
+import type { Conversation, Envelope, OutMessage } from "../ports/surface.js";
 import type { Receipts } from "../assistant/receipts.js";
 import type { DeliveryLink, SayPlanner } from "../assistant/say.js";
 import type { SaidMessages } from "./said-memory.js";
@@ -62,6 +62,11 @@ export interface ProactiveDeps {
   readonly store: ProactiveStore;
   /** The conversation a stored reference posts to. */
   readonly conversationFor: (reference: JsonObject) => Conversation;
+  /**
+   * Publish a stored envelope as it was built (it carries its own conversation: a group's card goes back to that group), the
+   * Python worker's `outbox.publish(card.envelope)`.
+   */
+  readonly deliverStored: (envelope: Envelope) => Promise<void>;
   /** `post` gives back the new message's id (it can be added to later). */
   readonly messageIds: boolean;
   readonly say: SayPlanner;

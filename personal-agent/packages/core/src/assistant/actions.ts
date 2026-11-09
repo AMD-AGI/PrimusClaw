@@ -211,10 +211,7 @@ export class AssistantActions {
     logger.warn("a held write's card could not be answered", { error: errorName(error), status: refused?.status });
     if (refused !== undefined && (refused.status === 403 || refused.status === 404)) {
       store.assistantButtons.moveConfirmCard(card.cardId, "done");
-      await finish(
-        click,
-        refused.status === 404 ? t.confirmGone : serviceRefusal(refused, said.nothingDone, click.lang()),
-      );
+      await finish(click, refused.status === 404 ? t.confirmGone : serviceRefusal(refused, said.nothingDone));
       return;
     }
     store.assistantButtons.moveConfirmCard(card.cardId, "open");

@@ -20,7 +20,13 @@ export const SUGGESTED_REPLY_MAX = 30;
 /** Teams shows the first three suggested replies only. */
 export const SUGGESTIONS_MAX = 3;
 /** The writes Claw holds for the person that this worker draws as a card. */
-export const CONFIRM_KINDS = ["trigger_create", "trigger_cancel", "devenv_send", "github_comment"] as const;
+export const CONFIRM_KINDS = [
+  "trigger_create",
+  "trigger_cancel",
+  "devenv_send",
+  "github_comment",
+  "devenv_hide",
+] as const;
 
 /** The default replies under what the assistant said: (what the button says, what it sends). */
 export const ASSISTANT_SUGGESTED_REPLIES: Readonly<Record<Lang, readonly SuggestedReply[]>> = {

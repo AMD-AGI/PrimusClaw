@@ -8,6 +8,7 @@
  * when it cannot be had the card stays as it was. An approval is limited per person (a denial never is).
  */
 import { ClawError } from "../claw/errors.js";
+import { serviceRefusal } from "../claw/service-refusal.js";
 import { errorName } from "../errors.js";
 import { decisionText } from "../locales/approval-decisions.js";
 import type { ClawSessionsPort } from "../ports/claw/index.js";
@@ -279,7 +280,7 @@ export class ApprovalDecisions {
     if (stale) await this.showExpired(click, press.tool);
     else if (status === null) await this.again(click, press, en.unreachable);
     else if (call.acting && status === 403 && error instanceof ClawError) {
-      await this.again(click, press, `${serviceRefusalReason(error)} ${en.notSent}`);
+      await this.again(click, press, serviceRefusal(error, en.notSent));
     } else await this.again(click, press, en.refused({ answering: press.answering, status }));
   }
 
@@ -356,15 +357,3 @@ function isTransport(error: unknown): boolean {
     (error.name === "ClawUnreachable" || error.name === "TypeError" || error.name === "AbortError")
   );
 }
-
-/** The reason Claw named for refusing an answer that acts as someone (claw.py `service_refusal`, W2 owns the wording). */
-function serviceRefusalReason(error: ClawError): string {
-  return SERVICE_REFUSAL_REASONS[error.code] ?? SERVICE_REFUSAL_REASONS["only_the_acting_user_can_decide"] ?? "";
-}
-
-const SERVICE_REFUSAL_REASONS: Readonly<Record<string, string>> = {
-  service_client_not_allowed:
-    "PrimusClaw does not take answers from me yet: its operator has to allow this worker's client.",
-  interactive_sign_in_required: "PrimusClaw did not take my credential for you as a sign-in; tell the operator.",
-  only_the_acting_user_can_decide: "PrimusClaw says this answer is not yours to give.",
-};

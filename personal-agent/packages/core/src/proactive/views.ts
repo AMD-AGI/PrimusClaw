@@ -13,6 +13,7 @@ import { proactiveText } from "../locales/proactive.js";
 import type { PublicErrors } from "../public-error/public-errors.js";
 import { redactText } from "../security/redact.js";
 import { clip } from "../text/plain.js";
+import { pyRstrip } from "../text/py-text.js";
 
 /** The longest summary a notice shows. */
 export const NOTICE_SUMMARY_MAX = 280;
@@ -66,7 +67,7 @@ declare module "../ports/surface.js" {
 /** The absolute https URL of a Claw-relative link; null for anything else (never an arbitrary URL). */
 export function openUrl(link: unknown, publicBaseUrl: string): string | null {
   const path = asText(link);
-  const base = publicBaseUrl.replace(/\/+$/, "");
+  const base = pyRstrip(publicBaseUrl, "/");
   if (!path.startsWith("/") || path.startsWith("//") || !base.startsWith("https://")) return null;
   return base + path;
 }

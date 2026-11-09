@@ -44,18 +44,25 @@ export interface ArgumentLines {
 export function humanizeTool(tool: string): string {
   let name = pyStrip(tool);
   let server = "";
-  const match = /^mcp__(.+?)__(.+)$/s.exec(name);
-  if (match) {
-    server = match[1] ?? "";
-    name = match[2] ?? "";
-  }
-  const spaced = name.split(/[_\-\s]+/).join(" ") || name;
+  const parts = mcpParts(name);
+  if (parts) [server, name] = parts;
+  const spaced = pyStrip(name.split(/[_\-\s]+/).join(" ")) || name;
   return server ? `${spaced} (${server})` : spaced;
 }
 
 function bareName(tool: string): string {
-  const match = /^mcp__(.+?)__(.+)$/s.exec(tool);
-  return match ? (match[2] ?? "") : tool;
+  return mcpParts(tool)?.[1] ?? tool;
+}
+
+/**
+ * (server, tool) of `mcp__<server>__<tool>` (Python's `re.fullmatch(r"mcp__(.+?)__(.+)", name)`: the shortest server, neither part
+ * empty, no line break), read in one pass; undefined for any other name.
+ */
+export function mcpParts(name: string): readonly [server: string, tool: string] | undefined {
+  if (!name.startsWith("mcp__") || name.includes("\n")) return undefined;
+  const split = name.indexOf("__", 6);
+  if (split < 0 || split + 2 >= name.length) return undefined;
+  return [name.slice(5, split), name.slice(split + 2)];
 }
 
 function isEmptyInput(input: unknown): boolean {
