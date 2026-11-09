@@ -236,6 +236,8 @@ const MAX_WATCHED_PROJECT_DIRS = 200;
 const MAX_SCANNED_PROJECT_DIRS = 2000;
 /** A registry file that does not parse is ignored once it is this old; a younger one may be mid-write. */
 const UNREADABLE_GRACE_MS = 60_000;
+/** How long a check or a poll waits for the unreadable-row scan (`blindHolders`) before it counts as no answer. */
+const BLIND_CHECK_MS = 5_000;
 
 export interface AttachDeps {
   registry: ChildRegistry;
@@ -400,6 +402,17 @@ export class AttachSupport {
    * heartbeat for more than `capMs`.
    */
   private looking: Promise<LiveEntry[] | null> | null = null;
+  /**
+   * The scan for Claude Code processes with an unreadable registry row (`blindHolders`), shared as `looking` is: one at a time, so
+   * a scan stalled on a network disk holds one thread of the pool, never one more per heartbeat or per check (service.ts: once the
+   * pool is used up, the next heartbeat's DNS lookup starves and the machine drops off Claw).
+   */
+  private blindScan: Promise<BlindHolder[]> | null = null;
+
+  private scanBlind(): Promise<BlindHolder[]> {
+    this.blindScan ??= blindHolders(this.configDir).finally(() => { this.blindScan = null; });
+    return this.blindScan;
+  }
 
   async resumable(capMs = 3_000): Promise<Resumable[]> {
     if (!this.waitedOnce) {
@@ -411,10 +424,18 @@ export class AttachSupport {
     // would hold a thread of the pool until the disk answers).
     this.looking ??= this.liveEntries().catch(() => null).finally(() => { this.looking = null; });
     const live = await within(this.looking, capMs, null);
+    // A scan that did not answer in time is no evidence either way: every idle conversation is then "unknown", as it is when the
+    // live list cannot be had. Its own adapters' processes (the groups this connector leads) are no holder.
+    const own = new Set(this.d.registry.list().map((r) => r.pgid));
+    const scanned = await within(this.scanBlind().catch(() => null), capMs, null);
+    const blind = scanned === null ? null : scanned.filter((b) => b.pgid === null || !own.has(b.pgid));
     const attached = this.d.attachedRefs();
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
-      const state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
+      let state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
+      // A Claude Code process here whose registry row cannot be read may be the one that has it open: not "idle" (which a
+      // client offers to take over, starting a second writer), but "unknown".
+      if (state === "idle" && (blind === null || blind.some((b) => mayHold(b, l.cwd)))) state = "unknown";
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
       if (state === "live") {
         Object.assign(out, liveActivity(holders));
@@ -464,7 +485,9 @@ export class AttachSupport {
     }
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
     // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
-    const summary = (rows === null ? "unreadable;" : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
+    // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
+    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? []).map((b) => b.pid).sort().join(".");
+    const summary = (rows === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
       return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
     }).join(",");
@@ -546,6 +569,19 @@ export class AttachSupport {
     const twin = live.find((e) => isTwin(e, want, o.ownPgid));
     if (twin) {
       return { ok: false, reason: "session_live", detail: describeTwin(twin) };
+    }
+    // Fails closed before a second writer would start (an attach, a takeover, a session whose adapter is gone resuming it): a local
+    // Claude Code process whose registry row cannot be read, in the conversation's folder (or one whose folder cannot be read),
+    // may have it open. Not for a session this connector holds with its own adapter (`ownPgid`), checked before each prompt:
+    // another process's unreadable row is no reason to stop a session that is already the writer. A scan that does not answer
+    // in time cannot tell either way, and refuses.
+    if (o.ownPgid == null) {
+      const cwd = this.listed.find((l) => l.ref === want)?.cwd ?? null;
+      const own = new Set(this.d.registry.list().map((r) => r.pgid));
+      const scanned = await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null);
+      if (scanned === null) return { ok: false, reason: "twin_check_failed", detail: "the Claude Code session registry did not answer in time" };
+      const blind = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && (cwd === null || mayHold(b, cwd)));
+      if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
     }
     if (o.transcript) {
       const file = this.transcriptFile(want);
@@ -923,6 +959,56 @@ export function parseAgentsJson(text: string): LiveEntry[] {
     }
   }
   return out;
+}
+
+/** A local Claude Code process that is alive but whose registry row (`sessions/<pid>.json`) cannot be read. */
+export interface BlindHolder {
+  pid: number;
+  /** Its process group (null when it cannot be read): a group this connector leads is its own adapter, never a holder. */
+  pgid: number | null;
+  /** Its working directory, or null when it cannot be read. */
+  cwd: string | null;
+}
+
+/** Whether a process's arguments are Claude Code's: the `claude` program, or its npm package's cli.js run by node. */
+export function isClaudeArgv(argv: string[]): boolean {
+  return argv.some((a) => path.basename(a) === "claude" || /claude-code[\\/]cli\.js$/.test(a));
+}
+
+/**
+ * The local Claude Code processes the registry cannot speak for: a row `sessions/<pid>.json` that is not valid JSON (empty,
+ * cut off: a write that a full or stalled disk lost) for a pid that is alive here and runs Claude Code. Such a process has a
+ * conversation open that no list says, so a conversation in its folder is not known to be free. Linux only (elsewhere a
+ * process's arguments and folder are not read): none.
+ */
+export async function blindHolders(configDir: string, procRoot = "/proc"): Promise<BlindHolder[]> {
+  if (process.platform !== "linux") return [];
+  const dir = path.join(configDir, "sessions");
+  let names: string[];
+  try { names = await fsp.readdir(dir); } catch { return []; }
+  const out: BlindHolder[] = [];
+  for (const name of names) {
+    const m = /^(\d+)\.json$/.exec(name);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    try { JSON.parse(await fsp.readFile(path.join(dir, name), "utf8")); continue; } catch { /* unreadable: whose is it? */ }
+    let argv: string[];
+    try { argv = (await fsp.readFile(path.join(procRoot, String(pid), "cmdline"), "utf8")).split("\0").filter(Boolean); } catch { continue; }
+    if (!isClaudeArgv(argv)) continue;
+    let cwd: string | null = null;
+    try { cwd = await fsp.readlink(path.join(procRoot, String(pid), "cwd")); } catch { /* not readable */ }
+    out.push({ pid, pgid: processGroup(pid), cwd });
+  }
+  return out;
+}
+
+/** Whether a blind holder may have a conversation of `cwd` open: its own folder is that folder, or its folder is not known. */
+function mayHold(b: BlindHolder, cwd: string): boolean {
+  return b.cwd === null || path.resolve(b.cwd) === path.resolve(cwd);
+}
+
+function describeBlind(b: BlindHolder, configDir: string): string {
+  return `Claude Code process ${b.pid}${b.cwd ? ` (in ${b.cwd})` : ""} is running, but its registry row ${path.join(configDir, "sessions", `${b.pid}.json`)} cannot be read, so whether it has this conversation open cannot be told; send anything in that terminal (Claude Code writes the row again) or restart it`;
 }
 
 /**

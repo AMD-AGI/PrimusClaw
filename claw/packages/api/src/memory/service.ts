@@ -480,6 +480,20 @@ export async function updateMemory(
 }
 
 /**
+ * The chat notices that announced the entries (`memory_saved`, see `runMemoryTool`) lose their title. Exported for the
+ * plan test.
+ *
+ * The memory id is compared as the text `->>` returns, so the lookup is `idx_events_memory_saved` (infra/db.ts): the
+ * notices are a sliver of claw_session_events, and anything else -- a cast of every row's memory_id, or walking the
+ * user's sessions, which for a busy user is most of the table -- reads millions of rows and outlives the pool's
+ * statement timeout, so the delete fails. The user's sessions still bound the update: a notice in another user's
+ * session is not this user's to change.
+ */
+export const ERASE_NOTICE_TITLES_SQL = `UPDATE claw_session_events SET data = data - 'title'
+  WHERE event = 'memory_saved' AND (data->>'memory_id') = ANY($1::text[]) AND data ? 'title'
+    AND session_id IN (SELECT session_id FROM claw_sessions WHERE user_id = $2)`;
+
+/**
  * What a deleted entry leaves behind: nothing it said. The row goes, its earlier events lose their title and
  * quote, the chat notice that announced it loses its title, and one content-free event records the delete.
  */
@@ -490,12 +504,7 @@ async function eraseEntries(q: Querier, userId: string, ids: number[], actor: st
   await q("DELETE FROM claw_memory_entries WHERE user_id = $1 AND id = ANY($2::int[])", [userId, ids]);
   await maintainLinks(q, userId, "erase_resolve", () => resolveNames(q, userId, null));
   await q("UPDATE claw_memory_events SET title = NULL, evidence_quote = NULL WHERE user_id = $1 AND entry_id = ANY($2::int[])", [userId, ids]);
-  await q(
-    `UPDATE claw_session_events SET data = data - 'title'
-      WHERE event = 'memory_saved' AND data ? 'title' AND (data->>'memory_id')::int = ANY($1::int[])
-        AND session_id IN (SELECT session_id FROM claw_sessions WHERE user_id = $2)`,
-    [ids, userId],
-  );
+  await q(ERASE_NOTICE_TITLES_SQL, [ids.map(String), userId]);
   for (const id of ids) await recordEvent(q, { userId, entryId: id, op, actor });
 }
 
