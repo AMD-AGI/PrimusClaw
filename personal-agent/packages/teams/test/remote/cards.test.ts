@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { remoteView } from "@primusclaw/personal-agent";
 
 import { assertValidCard, buttonsOf, cardOf, elements, textsOf } from "../../../../test-support/adaptive-card.js";
-import { machineChoiceCard, modeCard } from "../../src/views/remote/index.js";
+import { hiddenCard, machineChoiceCard, modeCard } from "../../src/views/remote/index.js";
 import { CONNECTORS, SESSIONS, agent, agents, connector, sessions, status } from "./fixtures.js";
 
 type Json = Record<string, unknown>;
@@ -303,4 +303,59 @@ test("at most twelve conversations are read and the card with them validates", (
   assert.ok(!items.some((i) => String(i["type"]).startsWith("Input."))); // an agent of kind attach starts nothing of its own
   const takeOver = buttonsOf(card).filter((b) => b["title"] === "Take over");
   assert.equal(takeOver.length, remoteView.IDLE_SHOWN);
+});
+
+test("conversations are hidden one at a time or all the idle ones and the hidden come back from show hidden", () => {
+  const resumable = [
+    ...Array.from({ length: 3 }, (_, n) => ({
+      ref: `h${String(n)}`,
+      title: `t${String(n)}`,
+      cwd: "/w",
+      updated_at: NOW - n,
+      state: "idle",
+    })),
+    { ref: "u1", title: "unsure", cwd: "/w", state: "unknown" },
+    { ref: "old", title: "gone", cwd: "/w", state: "idle", hidden: true },
+  ];
+  const a = agent({ agentId: "at", kind: "attach", name: "at-main", capabilities: { hidden_count: 2, resumable } });
+  const c = connector({ connectorId: "c-hid", name: "devbox-8", online: true, agents: [a] });
+  const { card } = agents({ connectors: [c], sessions: [], attached: null, now: NOW });
+  assertValidCard(card);
+  const hide = buttonsOf(card)
+    .filter((b) => data(b)["op"] === "hide")
+    .map((b) => [b["title"], data(b)]);
+  assert.deepEqual(hide, [
+    ["Hide", { primusclaw: "remote", op: "hide", connector_id: "c-hid", ref: "h0" }],
+    ["Hide", { primusclaw: "remote", op: "hide", connector_id: "c-hid", ref: "h1" }],
+    ["Hide", { primusclaw: "remote", op: "hide", connector_id: "c-hid", ref: "u1" }],
+    [
+      "Hide all 4 earlier conversations",
+      { primusclaw: "remote", op: "hide", connector_id: "c-hid", agent_id: "at", all: "idle" },
+    ],
+  ]);
+  assert.ok(textsOf(card).includes("2 conversations hidden (nothing deleted)."));
+  assert.deepEqual(
+    buttonsOf(card)
+      .filter((b) => data(b)["op"] === "hidden")
+      .map(data),
+    [{ primusclaw: "remote", op: "hidden", connector_id: "c-hid" }],
+  );
+  const hidden = cardOf(hiddenCard(remoteView.hiddenView(c, NOW, "zh")));
+  assertValidCard(hidden);
+  assert.ok(textsOf(hidden).includes("🗂️ devbox-8 上隐藏的会话") && textsOf(hidden).includes("gone"));
+  assert.deepEqual(
+    buttonsOf(hidden).map((b) => [b["title"], data(b)]),
+    [
+      ["取消隐藏", { primusclaw: "remote", op: "unhide", connector_id: "c-hid", ref: "old" }],
+      ["全部取消隐藏", { primusclaw: "remote", op: "unhide", connector_id: "c-hid", all: "1" }],
+      ["返回列表", { primusclaw: "remote", op: "list" }],
+    ],
+  );
+  const none = cardOf(hiddenCard(remoteView.hiddenView(connector({ connectorId: "x", name: "box" }), NOW)));
+  assert.ok(textsOf(none).includes("Nothing is hidden on this machine."));
+  assert.deepEqual(
+    buttonsOf(none).map((b) => data(b)["op"]),
+    ["list"],
+  );
+  assert.equal(remoteView.hiddenCount(agent({ agentId: "a", capabilities: { hidden_count: true } })), 0);
 });

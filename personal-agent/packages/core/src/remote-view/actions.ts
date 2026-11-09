@@ -22,7 +22,10 @@ export type RemoteOp =
   | "pair"
   | "takeover"
   | "full"
-  | "send";
+  | "send"
+  | "hide"
+  | "hidden"
+  | "unhide";
 
 /** A button's look: the primary act (`positive`), a primary act that stops or removes (`destructive`), or plain. */
 export type ButtonStyle = "positive" | "destructive" | "default";

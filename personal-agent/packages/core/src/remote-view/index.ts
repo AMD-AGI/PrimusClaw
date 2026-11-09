@@ -11,6 +11,7 @@ import type { DisconnectView, MachineChoiceView, ModeView, TakeoverView } from "
 import type { DecidedView, PermissionView, RemoteAskView } from "./permission-view.js";
 import type { SessionsView } from "./sessions-view.js";
 import type { StatusView } from "./status-view.js";
+import type { HiddenView } from "./hidden-view.js";
 import type { WindowCardView } from "./window-view.js";
 
 export * from "./actions.js";
@@ -21,6 +22,7 @@ export * from "./conversations-view.js";
 export * from "./conversations.js";
 export * from "./events.js";
 export * from "./health.js";
+export * from "./hidden-view.js";
 export { defang, lit, plain } from "./inert.js";
 export * from "./limits.js";
 export * from "./lines.js";
@@ -51,5 +53,6 @@ declare module "../ports/surface.js" {
     remoteMachineChoice: MachineChoiceView;
     remoteMode: ModeView;
     remoteWindow: WindowCardView;
+    remoteHidden: HiddenView;
   }
 }

@@ -11,6 +11,7 @@ import { SETUP, agent, connector, session } from "../../../../test-support/card-
 import {
   agentsCard,
   decidedCard,
+  hiddenCard,
   disconnectCard,
   machineChoiceCard,
   modeCard,
@@ -307,6 +308,49 @@ function agentsCards(lang: Lang): Record<string, Rendered> {
       names: new Map([[shown, { title: "修复测试", ref: "r-typed" }]]),
     }),
     "agents card, many earlier": view({ connectors: [many], sessions: [], attached: null, now: NOW, lang }),
+    // hiding: an agent with earlier conversations, some hidden
+    "agents card, hidden": view({ connectors: [hiding()], sessions: [], attached: null, now: NOW, lang }),
+  };
+}
+
+function hiding() {
+  const resumable = Array.from({ length: 3 }, (_, n) => ({
+    ref: `h${String(n)}`,
+    title: `t${String(n)}`,
+    cwd: "/srv/proj",
+    updated_at: NOW - n,
+    state: "idle",
+  }));
+  return connector({
+    connectorId: "c-hid",
+    name: "devbox-8",
+    online: true,
+    agents: [agent({ agentId: "at", kind: "attach", name: "at-main", capabilities: { hidden_count: 2, resumable } })],
+  });
+}
+
+function hiddenCards(lang: Lang): Record<string, unknown> {
+  const hidden = connector({
+    connectorId: "c-hid",
+    name: "devbox-8",
+    agents: [
+      agent({
+        agentId: "at",
+        kind: "attach",
+        capabilities: {
+          resumable: [{ ref: "h9", title: "旧的", cwd: "/srv/proj", updated_at: NOW - 9, state: "idle", hidden: true }],
+        },
+      }),
+    ],
+  });
+  const words = remoteView.remoteText.in(lang);
+  return {
+    "hidden card": hiddenCard(remoteView.hiddenView(hidden, NOW, lang)),
+    "hidden card, empty": hiddenCard(
+      remoteView.hiddenView(connector({ connectorId: "c-hid", name: "devbox-8" }), NOW, lang),
+    ),
+    // what a hide tap says (lines, not cards)
+    "hide lines": [words.hidN({ n: 2 }), words.hideLive({ title: "x" }), words.unhidN({ n: 1 })].join("\n"),
   };
 }
 
@@ -399,6 +443,7 @@ export function renders(lang: Lang): Record<string, unknown> {
       remoteView.sessionsView({ connectors: [], sessions: [], attached: null, now: NOW, lang, setup: SETUP }),
     ),
     ...smallCards(lang),
+    ...hiddenCards(lang),
     disconnected: remoteView.disconnectedText("devbox-7", "claw-connector login", lang),
     "disconnected, paired": remoteView.disconnectedText("devbox-7", "", lang, true),
     "live view": liveView(lang),

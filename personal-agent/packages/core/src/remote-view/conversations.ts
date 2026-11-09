@@ -109,3 +109,14 @@ export function joinPath(root: string, sub: string): string {
   const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
   return root.replace(/[/\\]+$/, "") + sep + sub.replaceAll("/", sep);
 }
+
+/** The conversations of an agent its owner hid (`hidden: true`, in a listing with them included), read as `resumableOf` reads them. */
+export function hiddenOf(agent: Agent): Conversation[] {
+  const marked = new Set(
+    list(agent.capabilities["resumable"]).flatMap((raw) => {
+      const item = objOrNull(raw);
+      return item && item["hidden"] === true ? [String(item["ref"])] : [];
+    }),
+  );
+  return resumableOf(agent).filter((e) => marked.has(e.ref));
+}

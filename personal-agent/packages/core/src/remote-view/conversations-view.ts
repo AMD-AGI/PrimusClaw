@@ -125,14 +125,16 @@ export function conversationItems(
     for (const entry of shownIdle) {
       items.push(heading(entry, place), {
         kind: "buttons",
-        buttons: [resume(words.takeOver, "positive", entry, place)],
+        buttons: [resume(words.takeOver, "positive", entry, place), hideButton(entry, place)],
       });
     }
   }
   if (unknown.length > 0) {
     items.push({ kind: "group", text: words.unknownGroup, separator: live.length > 0 || shownIdle.length > 0 });
-    for (const entry of unknown.slice(0, UNKNOWN_SHOWN))
+    for (const entry of unknown.slice(0, UNKNOWN_SHOWN)) {
       items.push(heading(entry, place), { kind: "note", text: words.cannotTell });
+      items.push({ kind: "buttons", buttons: [hideButton(entry, place)] });
+    }
   }
   const hidden =
     entries.length -
@@ -140,5 +142,43 @@ export function conversationItems(
     shownIdle.length -
     Math.min(unknown.length, UNKNOWN_SHOWN);
   if (hidden > 0) items.push({ kind: "more", text: words.olderConversations({ n: hidden }) });
+  items.push(...hidingItems(agent, idle.length, place));
+  return items;
+}
+
+function hideButton(entry: Conversation, place: Place): RemoteButton {
+  return remoteButton(remoteText.in(place.lang).hide, "hide", null, {
+    connector_id: place.connectorId,
+    ref: entry.ref,
+  });
+}
+
+/** How many of an agent's conversations its owner hid here (Claw leaves them out of the list and counts them), or 0. */
+export function hiddenCount(agent: Agent): number {
+  const count = agent.capabilities["hidden_count"];
+  return typeof count === "number" && Number.isInteger(count) && count > 0 ? count : 0;
+}
+
+/** Hiding every conversation no process runs at once (only the idle ones: one the connector cannot tell may be open), and what was
+ * hidden here before, with the way back. */
+function hidingItems(agent: Agent, idle: number, place: Place): ConversationItem[] {
+  const words = remoteText.in(place.lang);
+  const items: ConversationItem[] = [];
+  const buttons: RemoteButton[] = [];
+  if (idle > 1) {
+    buttons.push(
+      remoteButton(words.hideAllIdle({ n: idle }), "hide", null, {
+        connector_id: place.connectorId,
+        agent_id: place.agentId,
+        all: "idle",
+      }),
+    );
+  }
+  const count = hiddenCount(agent);
+  if (count > 0) {
+    items.push({ kind: "more", text: words.hiddenCount({ n: count }) });
+    buttons.push(remoteButton(words.showHidden, "hidden", null, { connector_id: place.connectorId }));
+  }
+  if (buttons.length > 0) items.push({ kind: "buttons", buttons });
   return items;
 }
