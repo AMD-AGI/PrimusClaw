@@ -7,6 +7,7 @@ import {
   clipLine,
   decimalInt,
   isDigits,
+  isPySpace,
   isUpper,
   splitOnce,
   cpHead,
@@ -128,7 +129,7 @@ test('lstrip and str(value or "") are Python\'s', () => {
   assert.equal(pyStr(false), "");
   assert.equal(pyStr(true), "True");
   assert.equal(pyStr(0), "");
-  assert.equal(pyStr(Number.NaN), "");
+  assert.equal(pyStr(Number.NaN), "nan"); // NaN is truthy in Python
   assert.equal(pyStr(12), "12");
   assert.equal(pyStr(0n), "");
   assert.equal(pyStr(7n), "7");
@@ -191,4 +192,63 @@ test("a digit of any script is read as Python's int reads it", () => {
   assert.ok(Number.isNaN(decimalInt("")) && Number.isNaN(decimalInt("1a")));
   assert.ok(isDigits("١٢") && !isDigits("") && !isDigits("²"));
   assert.ok(isUpper("7KQ3") && !isUpper("1234") && !isUpper("Ab") && !isUpper("ß"));
+});
+
+test("isPySpace agrees with the white-space class on every BMP code unit", () => {
+  const space = new RegExp(`^[${PY_SPACE}]$`, "u");
+  for (let c = 0; c < 0x10000; c += 1) {
+    const ch = String.fromCharCode(c);
+    if (isPySpace(ch) !== space.test(ch)) assert.fail(`U+${c.toString(16)}`);
+  }
+  assert.equal(isPySpace(""), false);
+  assert.equal(isPySpace("  "), false);
+  assert.equal(isPySpace("😀"), false);
+});
+
+/** The fastest of a few runs, in milliseconds (the minimum is the least disturbed by other work on the machine). */
+function fastest(run: () => void): number {
+  let best = Infinity;
+  for (let i = 0; i < 5; i += 1) {
+    const start = performance.now();
+    run();
+    best = Math.min(best, performance.now() - start);
+  }
+  return Math.max(best, 0.05);
+}
+
+test("stripping takes time linear in the text, also with long white space inside", () => {
+  // A run of white space that something follows is what an end-anchored regular expression rescans from every start.
+  const text = (n: number): string => `${" ".repeat(n)}x${" ".repeat(n)}y`;
+  const small = text(20_000);
+  const large = text(80_000);
+  for (const strip of [pyStrip, pyRstrip, pyLstrip, (t: string) => pyStrip(t, " "), (t: string) => clipLine(t, 10)]) {
+    const ratio = fastest(() => strip(large)) / fastest(() => strip(small));
+    assert.ok(ratio < 12, `4x the text took ${ratio.toFixed(1)}x the time`); // linear ~4, quadratic ~16
+  }
+});
+
+test("numbers are written as Python writes them, and the edges of clip, rfind and fixed decimals", () => {
+  // Each right-hand side is what Python 3 printed.
+  for (const [value, python] of [
+    [1e-7, "1e-07"],
+    [1.5e-7, "1.5e-07"],
+    [0.001, "0.001"],
+    [123.456, "123.456"],
+    [1.5, "1.5"],
+    [-2.25, "-2.25"],
+    [12, "12"],
+    [Number.NaN, "nan"],
+    [Infinity, "inf"],
+  ] as const) {
+    assert.equal(pyStr(value), python, String(value));
+  }
+  assert.equal(pyJsonDumps([1e-7, 0.5, 1e300, -1.5e-10, 12]), "[1e-07, 0.5, 1e+300, -1.5e-10, 12]");
+  assert.equal(fixedN(1e21, 2), "1000000000000000000000.00");
+  assert.equal(fixedN(1e23, 0), "99999999999999991611392");
+  assert.equal(fixedN(-1e22, 1), "-10000000000000000000000.0");
+  assert.equal(clipLine("abc", 0), "ab\u2026");
+  assert.equal(cpRfind("😀", "\ude00"), -1);
+  assert.equal(cpRfind("a😀b", "b"), 2);
+  assert.equal(cpRfind("x\ud83d\ude00", "\ud83d"), -1);
+  assert.equal(cpRfind("\ud83dx", "\ud83d"), 0);
 });
