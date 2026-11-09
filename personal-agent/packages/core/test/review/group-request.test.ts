@@ -77,7 +77,8 @@ test("a named reviewer with github gets a session of the askers that acts as the
   assert.equal(turn.token, "tok-aad-a");
   assert.equal(turn.turn.actingAs, "u-bob");
   assert.deepEqual(turn.turn.reviewTarget, { owner: "AMD-AGI", repo: "Hyperloom", number: 12 });
-  assert.ok(turn.prompt.includes(PR) && turn.prompt.includes("https://github.com/AMD-AGI/Hyperloom/pull/12"));
+  assert.ok(turn.prompt.includes(PR));
+  assert.match(turn.prompt, /(?:^|\s)https:\/\/github\.com\/AMD-AGI\/Hyperloom\/pull\/12(?:\s|$)/);
   assert.ok(turn.prompt.includes("review_instructions") && !turn.prompt.includes("帮我"));
   // (a Claw without review items: the session is made here, on the asker's own key)
   assert.equal(turn.modelKey, "ak-alice-linked");
