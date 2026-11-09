@@ -6,8 +6,9 @@
 /**
  * A number as Python writes it, for a value parsed from JSON: a safe integer as the int JSON gave, anything else as
  * Python's float `repr` (`1e-07`, `1e+300`). `str` writes the non-finite as `nan`/`inf`, `json.dumps` as `NaN`/
- * `Infinity`. What JSON cannot tell apart once JavaScript has parsed it is written the common way: a float `1.0` was
- * already the number 1, `-0.0` is `0`, an integer beyond 2^53 is written as the float it became.
+ * `Infinity`. What JSON cannot tell apart once JavaScript has parsed it is written the likelier way: a float `1.0` was
+ * already the number 1 (an int), a negative zero is the float `-0.0` (JSON's `-0` int is rare), an integer beyond 2^53
+ * is written as the float it became.
  */
 export function pyNumber(value: number, how: "str" | "json"): string {
   if (!Number.isFinite(value)) {
@@ -15,6 +16,7 @@ export function pyNumber(value: number, how: "str" | "json"): string {
     if (how === "str") return value > 0 ? "inf" : "-inf";
     return value > 0 ? "Infinity" : "-Infinity";
   }
+  if (Object.is(value, -0)) return "-0.0";
   if (Number.isSafeInteger(value)) return String(value);
   return floatRepr(value);
 }

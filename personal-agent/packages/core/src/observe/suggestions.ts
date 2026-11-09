@@ -26,7 +26,7 @@ const ARGS_SHOWN = 1200;
 
 /** The assistant tool's own name, without the MCP prefix. */
 export function toolOf(raw: unknown): string {
-  const name = typeof raw === "string" ? raw : "";
+  const name = pyStr(raw);
   return name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : name;
 }
 

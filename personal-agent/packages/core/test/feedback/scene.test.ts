@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fixed1 } from "../../src/text/py-text.js";
 import {
   lastTurnId,
   lastTurns,
@@ -114,6 +115,18 @@ test("timestamps are epoch seconds, epoch milliseconds or ISO 8601", () => {
   assert.equal(secondsOf(1_700_000_000), 1_700_000_000);
   assert.equal(secondsOf(1_700_000_000_000), 1_700_000_000);
   assert.equal(secondsOf("2026-01-01T00:00:00Z"), Date.UTC(2026, 0, 1) / 1000);
+  // microseconds count, as Python's fromisoformat reads them: these two are 0.0499 s apart, "0.0 s" in Python
+  const a = secondsOf("2026-01-01T00:00:00.001100Z") ?? 0;
+  const b = secondsOf("2026-01-01T00:00:00.051000Z") ?? 0;
+  assert.equal(fixed1(b - a), "0.0");
+  assert.equal(secondsOf("2026-01-01T00:00:00.5+08:00"), Date.UTC(2025, 11, 31, 16) / 1000 + 0.5);
+  // Python's separator may also be a space or a lowercase t
+  assert.equal(
+    fixed1((secondsOf("2026-01-01t00:00:00.051000+00:00") ?? 0) - (secondsOf("2026-01-01 00:00:00.001100+00:00") ?? 0)),
+    "0.0",
+  );
+  assert.equal(secondsOf("2026-01-01T00:00:00.Z"), Date.parse("2026-01-01T00:00:00.Z") / 1000 || undefined);
+  assert.equal(secondsOf(`2026-01-01T00:00:00.${"0".repeat(50_000)}x`), undefined); // linear, and no date
   assert.equal(secondsOf("not a date"), undefined);
   assert.equal(secondsOf(""), undefined);
   assert.equal(secondsOf(true), undefined);
