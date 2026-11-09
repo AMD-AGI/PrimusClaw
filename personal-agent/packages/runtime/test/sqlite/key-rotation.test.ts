@@ -7,12 +7,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { LINK_CODE_TTL_SECONDS, type LogFields, type Logger } from "@primusclaw/personal-agent";
+import { LINK_CODE_TTL_SECONDS, silentLogger, type LogFields, type Logger } from "@primusclaw/personal-agent";
 import {
   ENCRYPTED_COLUMNS,
   Fernet,
   InvalidToken,
   MultiFernet,
+  DEFAULT_LINK_LIMITS,
   openWorkerStore,
   type SqliteStore,
 } from "@primusclaw/personal-agent-runtime";
@@ -172,8 +173,8 @@ test("the worker re-encrypts when it opens the store, and logs counts but no sec
     };
     const logger: Logger = { debug: record, info: record, warn: record, error: record, child: () => logger };
     openWorkerStore(
-      { path: f.path, encryptionKeys: [fresh, old], clock: f.clock, securityEvent: ignoreEvents },
-      logger,
+      { dbPath: f.path, encryptionKeys: [fresh, old], linkLimits: DEFAULT_LINK_LIMITS },
+      { securityEvent: ignoreEvents, logger, clock: f.clock },
     ).close();
     assert.equal(f.reopen({ encryptionKeys: [fresh] }).links.getKey("aad-alice"), "ak-alice-linked");
     assert.deepEqual(lines, [
@@ -186,4 +187,25 @@ test("the worker re-encrypts when it opens the store, and logs counts but no sec
     for (const secret of ["ak-alice-linked", "ak-bob-pending", "whsec-alice", old, fresh])
       assert.ok(!text.includes(secret));
   });
+});
+
+test("the worker's store takes its link limits and its security-event log from what it is opened with", () => {
+  const f = openFileTestStore();
+  try {
+    const events: string[] = [];
+    const store = openWorkerStore(
+      { dbPath: f.path, encryptionKeys: f.encryptionKeys, linkLimits: { perUser: 2, global: 50, windowSeconds: 900 } },
+      {
+        securityEvent: (event, fields) => events.push(`${event}:${String(fields["outcome"] ?? fields["scope"])}`),
+        logger: silentLogger,
+      },
+    );
+    assert.equal(store.links.linkWindowSeconds, 900);
+    for (let i = 0; i < 2; i++) assert.equal(store.links.redeemPending("aad-m", "M", "WRONG222"), "invalid");
+    assert.equal(store.links.redeemPending("aad-m", "M", "WRONG222"), "limited");
+    assert.deepEqual(events, ["link_attempt:wrong", "link_attempt:wrong", "link_lockout:user", "link_attempt:locked"]);
+    store.close();
+  } finally {
+    f.close();
+  }
 });

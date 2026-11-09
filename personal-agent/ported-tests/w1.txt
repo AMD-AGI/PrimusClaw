@@ -42,7 +42,7 @@ tests/test_link_code_hardening.py::test_with_the_default_limits_many_accounts_gu
 tests/test_link_code_hardening.py::test_refused_attempts_do_not_extend_a_lockout -> packages/runtime/test/sqlite/link.test.ts::refused attempts do not extend a lockout
 tests/test_link_code_hardening.py::test_concurrent_wrong_codes_cannot_overrun_the_limit -> packages/runtime/test/sqlite/link.test.ts::wrong codes from several stores on one file cannot overrun the limit
 tests/test_link_code_hardening.py::test_no_log_record_carries_the_code_or_the_key -> packages/runtime/test/sqlite/link.test.ts::no reported event carries the code (in any case or spacing) or the key
-tests/test_link_code_hardening.py::test_the_worker_builds_its_store_with_the_configured_link_limits -> MERGED packages/runtime/test/sqlite/link.test.ts::the configured link limits are the store's (window and per-person count)
+tests/test_link_code_hardening.py::test_the_worker_builds_its_store_with_the_configured_link_limits -> packages/runtime/test/sqlite/key-rotation.test.ts::the worker's store takes its link limits and its security-event log from what it is opened with
 tests/test_remote_store.py::test_a_chat_is_attached_to_one_session_and_detaching_forgets_where_it_was -> packages/runtime/test/sqlite/remote-store.test.ts::a chat is attached to one session, and detaching forgets where it was
 tests/test_remote_store.py::test_the_read_position_only_moves_forward_and_only_for_the_attached_session -> packages/runtime/test/sqlite/remote-store.test.ts::the read position only moves forward, and only for the attached session
 tests/test_remote_store.py::test_ids_compare_as_numbers_not_as_text -> packages/runtime/test/sqlite/remote-store.test.ts::ids compare as numbers, not as text
