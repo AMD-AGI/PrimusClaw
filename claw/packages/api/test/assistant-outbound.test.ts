@@ -837,7 +837,13 @@ describe("assistant outbound", { skip }, () => {
           "both, oldest first; not the one from yesterday");
         assert.equal(queued[0].payload.turn_message_id, "m-1", "the payload it would have had, not one rebuilt from its text");
         await deliver();
-        assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]), [first.say_id, second.say_id]);
+        // A kick an earlier say started may still be running and claim one of the two rows while deliver() claims the other:
+        // two senders, so the order they reach the receiver in is not this test's to assert (CI 2026-11-09, PrimusClaw#551, the two
+        // came swapped). Wait for any delivery still running in this process (kickDelivery returns it, or runs one that finds
+        // nothing due), then check what matters here: both were sent, each once, and nothing else.
+        await outbox.kickDelivery(deliveryDeps());
+        const sentIds = sent.map((r) => r.headers[EVENT_ID_HEADER]);
+        assert.deepEqual([...sentIds].sort(), [first.say_id, second.say_id].sort(), "both, each once, not the one from yesterday");
         assert.ok((await saysRows()).filter((x) => x.say_id !== old.say_id).every((x) => x.delivered_at), "marked delivered");
 
         // Once: neither the same subscription changed nor another one made later is sent them again.
