@@ -217,7 +217,10 @@ export class ReviewClaw {
           this.reviewModes.set(token, mode);
           return Promise.resolve();
         },
-        githubConnection: () => Promise.resolve(this.connection),
+        githubConnection: (key: string) => {
+          this.calls.push(["githubConnection", key]);
+          return Promise.resolve(this.connection);
+        },
         models: (key: string) => {
           this.calls.push(["models", key]);
           return this.models instanceof ClawError ? Promise.reject(this.models) : Promise.resolve([...this.models]);

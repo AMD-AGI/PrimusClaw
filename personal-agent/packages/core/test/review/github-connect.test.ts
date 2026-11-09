@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { connectionsText } from "../../src/review/connect/connections.js";
 import { asksAboutOwnGithub, repositoriesNamed } from "../../src/review/connect/questions.js";
 import { consentText, readsLine } from "../../src/review/consent.js";
-import { ALICE, reviewWorld, saidIn, type ReviewWorld } from "../../../../test-support/review-world.js";
+import { ALICE, groupMessage, reviewWorld, saidIn, type ReviewWorld } from "../../../../test-support/review-world.js";
 
 const QUESTION = "我开着几个 PR？";
 const DM = `personal:${ALICE.id}`;
@@ -227,4 +227,45 @@ test("whoami in chinese", () => {
   assert.ok(text.startsWith("连接状态：\n- SaFE：已连接（爱丽丝）"));
   assert.ok(text.includes("- GitHub：已连接 `alice-gh`（只用于代审"));
   assert.ok(text.split("\n").some((line) => line === "- 记忆：关，在这里打开：https://m"));
+});
+
+const connectionReads = (world: ReviewWorld) => world.claw.calls.filter((c) => c[0] === "githubConnection").length;
+
+test("once github is read the next questions do not ask claw again", async () => {
+  const world = connectWorld();
+  world.claw.connection = { readsWith: "binding", login: "alice-gh", missing: "", bindingReads: true };
+  assert.equal(await offer(world, () => Promise.resolve()), false);
+  assert.equal(await offer(world, () => Promise.resolve(), "我的 CI 挂了吗"), false);
+  assert.equal(connectionReads(world), 1);
+});
+
+test("a person already bound whose binding claw cannot read gets no card", async () => {
+  const world = connectWorld();
+  world.identity.know("aad-a", "u-alice", "alice-gh");
+  assert.equal(await offer(world, () => Promise.resolve()), false);
+  assert.deepEqual(world.github.starts, []);
+  assert.deepEqual(
+    world.surface.of(DM).filter((r) => "message" in r && r.message.body.type === "view"),
+    [],
+  );
+});
+
+test("a github command forgets what was remembered of the connection", async () => {
+  const world = connectWorld();
+  world.claw.connection = { readsWith: "binding", login: "alice-gh", missing: "", bindingReads: true };
+  await offer(world, () => Promise.resolve());
+  const conversation = world.surface.conversation({
+    id: DM,
+    kind: "personal",
+    tenantId: "t",
+    wire: { conversation: { id: DM } },
+  });
+  const github = world.service.routeHandlers().commands.find((c) => c.name === "github");
+  const message = groupMessage("/github unbind", ALICE, [], "u1", "personal");
+  await github?.run(
+    { message, text: message.text, sender: ALICE, conversation, scope: "", lang: () => "zh" } as never,
+    "unbind",
+  );
+  await offer(world, () => Promise.resolve(), "我的 CI 挂了吗");
+  assert.equal(connectionReads(world), 2); // asked again after the unbind
 });
