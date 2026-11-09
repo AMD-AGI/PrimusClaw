@@ -5,8 +5,4 @@ dist/
 package-lock.json
 ported-tests/
 test-names.jsonl
-# Generated test data, kept byte for byte as its generator wrote it (test-support/python/fernet_golden.py).
-test-support/data/fernet-golden.json
-# Golden data generated from the Python worker: kept as generated (one row per line).
-test-support/data/routing/
 test-support/data/
