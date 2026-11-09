@@ -15,7 +15,7 @@ import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { typeOnlyFiles } from "./type-only.js";
+import { SOURCE_EXTENSIONS, typeOnlyFiles } from "./type-only.js";
 
 /** Each package's floor, in percent. Lowering one is a change to this file that review sees. */
 export const FLOORS: Readonly<Record<string, number>> = { core: 90, runtime: 85, teams: 85 };
@@ -52,7 +52,7 @@ function checkPackage(pkg: string, floor: number): boolean {
     "--src",
     src,
     "--include",
-    `${src}/**/*.ts`,
+    `${src}/**/*.{${SOURCE_EXTENSIONS.map((e) => e.slice(1)).join(",")}}`,
     ...excluded.flatMap((file) => ["--exclude", file]),
     "--reporter=text",
     "--check-coverage",
