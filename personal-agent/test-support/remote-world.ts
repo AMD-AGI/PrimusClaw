@@ -74,7 +74,7 @@ export class VirtualClock implements Clock {
   }
 }
 
-const errors: RemoteErrors = {
+export const WORLD_ERRORS: RemoteErrors = {
   looksInternal: (text) => /gateway|brain/u.test(text),
   withhold: () => "0123abcd",
   publicReason: (reason) => (typeof reason === "string" ? reason : ""),
@@ -120,6 +120,8 @@ export class RemoteWorld {
   readonly claw: ClawRemoteAgentsPort;
   /** A message the channel refuses to post (Teams said no), when this says so. */
   refuse: ((message: OutMessage) => boolean) | null = null;
+  /** Whether the chat may be told something now (false: muted hours, as a test says). */
+  reachable = true;
   /** The worker's settings, which a test may change (remote agents turned off under a card). */
   readonly settings: { -readonly [K in keyof RemoteSettings]: RemoteSettings[K] };
   private n = 0;
@@ -154,10 +156,10 @@ export class RemoteWorld {
       references: store.references,
       conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
       credentialFor: (person) => Promise.resolve(KEY_OF[person] ?? null),
-      reach: { reachable: () => true, muted: () => null, holdRemote: () => undefined },
+      reach: { reachable: () => this.reachable, muted: () => null, holdRemote: () => undefined },
       guard: guardOf(new Guardrails(systemClock, () => undefined)),
       audit: () => undefined,
-      errors,
+      errors: WORLD_ERRORS,
       // (wall time is the store's, which a test moves; waits and durations are real)
       clock: {
         epochMs: () => this.test.clock.epochMs(),
