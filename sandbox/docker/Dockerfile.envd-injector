@@ -154,7 +154,7 @@ RUN cat /extra-ca/amd-root-ca.crt /extra-ca/amd-issuing-ca.crt > /extra-ca/ca-bu
        fi
 
 # ── Stage 4: Final injector image ─────────────────────────────────────────────────────
-FROM busybox:1.38.0-musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37
+FROM busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
 
 COPY --from=envd-builder /envd /envd
 COPY --from=tmux-builder /tmux /tmux
