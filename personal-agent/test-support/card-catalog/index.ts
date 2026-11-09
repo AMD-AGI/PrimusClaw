@@ -12,7 +12,6 @@ export const CATALOG: readonly CatalogEntry[] = [...TURN];
 
 const BY_LINE = {
   W4: ["binding", "link", "onboarding", "repo", "session"],
-  W4b: ["error_note", "inactive_note", "show_here_note"],
   W5: [
     "answered",
     "approval_decided",

@@ -5,6 +5,7 @@
 import { turn } from "@primusclaw/personal-agent";
 
 import { changesCard, deliveryCard } from "../../packages/teams/src/views/turn/index.js";
+import { noteCard } from "../../packages/teams/src/views/turn/note.js";
 import { BASE, entries, SID } from "./catalog.js";
 
 function changes(): turn.Changes {
@@ -36,7 +37,22 @@ const delivery: turn.Delivery = {
   image: "",
 };
 
+/** "Show here": the worker shows a session's last answer in this chat (its button is W4's click). */
+const SHOW = { title: "Show here", verb: "primusclaw.show", data: { primusclaw: "show", session_id: SID } };
+
 export const TURN = entries(
   ["changes", () => changesCard({ changes: changes(), sessionId: SID, publicBaseUrl: BASE })],
   ["delivery", () => deliveryCard({ delivery, url: `${BASE}/x` })],
+  [
+    "error_note",
+    () =>
+      noteCard({
+        text: "这一步没有完成：Claw 暂时没有响应。请稍后再点一次。",
+        buttons: [SHOW],
+        title: "没有完成",
+        tone: "attention",
+      }),
+  ],
+  ["inactive_note", () => noteCard({ text: "This button is no longer active." })],
+  ["show_here_note", () => noteCard({ text: "回答在下面的聊天里。你的下一条消息会接着这个会话。", buttons: [SHOW] })],
 );

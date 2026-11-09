@@ -25,3 +25,4 @@ export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
 export * as turn from "./turn/index.js";
+export * from "./note/note.js";

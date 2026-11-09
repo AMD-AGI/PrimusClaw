@@ -10,6 +10,7 @@ import { turn } from "@primusclaw/personal-agent";
 import { buttons, execute, header, message, note, openUrl, text, TITLE_MAX } from "../../cards/kit.js";
 import type { CardElement } from "../../cards/json.js";
 import type { Renderers } from "../registry.js";
+import { noteCard } from "./note.js";
 
 /** Files listed on the changes card, over all repositories; the rest is one "+N more" line. */
 export const CHANGES_MAX_FILES = 8;
@@ -88,4 +89,5 @@ export function changesCard(model: turn.ChangesModel): ReturnType<typeof message
 export const TURN_RENDERERS = {
   delivery: deliveryCard,
   changes: changesCard,
+  note: noteCard,
 } satisfies Partial<Renderers>;
