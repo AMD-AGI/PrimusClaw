@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import { switchCommand } from "../capabilities/sessions-words.js";
-import { exactCommand } from "../commands/exact.js";
+import { isKnownCommand } from "../commands/names.js";
+import { exactCommand } from "../understanding/commands.js";
 import { commandArgs, menuCommand, parseLinkCode } from "../commands/parse.js";
 import type { JsonObject } from "../json.js";
 import { routingText } from "../locales/routing.js";
@@ -55,7 +56,7 @@ export class PersonalRouter {
     // The assistant understands this person's messages: only an exact command is read here
     const understood = assistant.understands(userId);
     const switching = understood && remote.enabled && switchCommand(message.text) !== null;
-    const forAssistant = understood && !exactCommand(message.text) && !switching;
+    const forAssistant = understood && !exactCommand(message.text, { menuCommand, isKnownCommand }) && !switching;
     const text = understood ? menuCommand(message.text) : this.text.textOf(message);
     learnLang(this.ctx.deps.store, userId, message.text);
     if (await this.beforeCredential(message, chat, text, forAssistant)) return;

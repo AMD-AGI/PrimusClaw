@@ -186,7 +186,18 @@ class FakeConversation implements Conversation {
       record();
       return Promise.resolve();
     }
-    return hold().then(record);
+    if (signal === undefined) return hold().then(record);
+    // Aborted while held: reject at once, and the edit is not recorded when the hold ends.
+    const aborted = new Promise<never>((_, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          reject(signal.reason as Error);
+        },
+        { once: true },
+      );
+    });
+    return Promise.race([hold().then(record), aborted]);
   }
 
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>> {

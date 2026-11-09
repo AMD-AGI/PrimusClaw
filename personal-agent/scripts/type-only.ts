@@ -14,6 +14,8 @@ import ts from "typescript";
 
 /** Whether `source` compiles to nothing that runs. */
 export function isTypeOnly(source: string, fileName = "file.ts"): boolean {
+  // A declaration file (.d.ts, .d.mts, .d.cts) emits nothing by definition; the compiler refuses to transpile one.
+  if (/\.d\.[cm]?ts$/.test(fileName)) return true;
   const { outputText } = ts.transpileModule(source, {
     fileName,
     compilerOptions: {
@@ -44,6 +46,19 @@ export function sourceFiles(dir: string): string[] {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) return sourceFiles(full);
     return (SOURCE_EXTENSIONS as readonly string[]).includes(path.extname(entry.name)) ? [full] : [];
+  });
+}
+
+/**
+ * The symbolic links under `dir` (recursively, not followed), relative to `base`. The coverage gate refuses a source
+ * tree that has any: a linked directory is walked by neither this judgement nor reliably by c8, so a file in it could
+ * be counted wrongly or not at all.
+ */
+export function symlinksUnder(dir: string, base: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) return [path.relative(base, full)];
+    return entry.isDirectory() ? symlinksUnder(full, base) : [];
   });
 }
 
