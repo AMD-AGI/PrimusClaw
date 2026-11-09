@@ -110,9 +110,12 @@ test("P3b the worker makes the write the task asks for and lets the hold ask; it
 // holds for a card (Brain's bash-approval-defaults.ts; its engine test holds `gh api -X PUT user/starred/...`).
 test("P3c a GitHub write no tool makes is made with gh, whose hold asks the user; never failed for want of a tool (both prompts)", () => {
   for (const prompt of [WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT]) {
-    assert.match(prompt, /A write on GitHub that none of your tools makes \(starring a repository, a label, a release, another GitHub API call\) is made in your workspace with gh, as the user/);
-    assert.match(prompt, /gh api -X PUT user\/starred\/<owner>\/<repo>/);
-    assert.match(prompt, /the shell holds a GitHub write for the user's approval just as a tool does, so that is how it is put to them on a card, never a way around it/);
+    assert.match(prompt, /A GitHub write that none of your tools makes \(starring a repository, a label, a release\) is made in your workspace as the user, with one gh command that spells it out/);
+    assert.match(prompt, /gh api with its method and path written in the command \(gh api -X PUT user\/starred\/<owner>\/<repo>\), or gh label or gh release/);
+    assert.match(prompt, /The shell holds such a command for the user's approval just as a tool's write is held, so that is how it is put to them on a card/);
+    // Only what the default bash rules hold is invited: a GraphQL mutation built from a variable runs unheld (codex r1 on #551).
+    assert.match(prompt, /Never build the call from a variable, a file or a script, and never make it with another program/);
+    assert.doesNotMatch(prompt, /another GitHub API call/);
     assert.match(prompt, /Never report\(kind="failed"\) or report\(kind="blocked"\) only because no tool of yours makes the write/);
     // The missing login stays a blocked report: the new line never overrides it.
     assert.match(prompt, /When you cannot make it \(no GitHub login, no write access\), report\(kind="blocked"\)/);
