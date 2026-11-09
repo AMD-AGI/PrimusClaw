@@ -81,9 +81,9 @@ it("two users two subscriptions two routes", async () => {
 it("a stale or shared subscription to this worker is replaced not stacked", async () => {
   const { store, claw, subs } = world();
   store.link("aad-a", "ak-alice");
-  await claw.createSubscription("ak-alice", BASE);
-  await claw.createSubscription("ak-alice", `${BASE}/orphan`);
-  await claw.createSubscription("ak-alice", "http://elsewhere.example/hook");
+  await claw.create("ak-alice", BASE);
+  await claw.create("ak-alice", `${BASE}/orphan`);
+  await claw.create("ak-alice", "http://elsewhere.example/hook");
   await subs.ensure("aad-a");
   assert.deepEqual(
     claw.of("ak-alice").map((r) => r.url.startsWith(`${BASE}/`) || r.url === BASE),
@@ -262,7 +262,7 @@ it("secrets and keys are never logged", async () => {
 it("off means no assistant types and a refusal other than 400 is not a ladder step", async () => {
   const { store, claw, subs } = world({ assistant: true });
   store.link("aad-a", "ak-alice");
-  claw.createSubscription = () => Promise.reject(new ClawStatusError(503));
+  claw.create = () => Promise.reject(new ClawStatusError(503));
   await subs.ensure("aad-a");
   assert.equal(store.subs.size, 0);
 });

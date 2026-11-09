@@ -14,9 +14,10 @@ import { errorName } from "../errors.js";
 import type { Logger } from "../ports/logger.js";
 import type { NotifySubscription } from "../ports/store/index.js";
 import type { Random } from "../ports/random.js";
-import { clawRefusal, refusedWith } from "../claw-failure.js";
+import { ClawAnswerInvalid, ClawError } from "../claw/errors.js";
 import { ASSISTANT_TYPES_VERSION, RUN_SOURCES, wantedTypes, type WantedTypes } from "./event-types.js";
-import type { ClawSubscriptionRow, ClawSubscriptions, SubscriptionStore } from "./ports.js";
+import type { ClawSubscription } from "../ports/claw/index.js";
+import type { ClawSubscriptions, SubscriptionStore } from "./ports.js";
 
 /** Notifications off on Claw, or Claw unreachable: a subscription is tried again at most daily. */
 export const RETRY_SECONDS = 24 * 3600;
@@ -156,9 +157,8 @@ export class Subscriptions {
       if (key === null || !this.store.notifySubs.claimNotifyAttempt(aadId, RETRY_SECONDS)) return;
       await this.create(aadId, key);
     } catch (error) {
-      const refusal = clawRefusal(error);
-      if (refusal)
-        this.log.info("notification subscription not set up for a user; retrying later", { status: refusal.status });
+      if (error instanceof ClawError)
+        this.log.info("notification subscription not set up for a user; retrying later", { status: error.status });
       else
         this.log.warn("notification subscription not set up for a user; retrying later", { error: errorName(error) });
     }
@@ -168,12 +168,12 @@ export class Subscriptions {
     await this.dropStale(key);
     const route = base64Url(this.random.bytes(ROUTE_BYTES));
     const url = `${this.base}/${route}`;
-    let created: { subscription_id: string; secret: string } | undefined;
+    let created: ClawSubscription | undefined;
     let version = 0;
     if (this.assistantOnFor(aadId)) {
       for (const rung of wantedTypes(this.understood(aadId))) {
         try {
-          created = await this.claw.createSubscription(key, url, rung.types, rung.sources);
+          created = await this.claw.create(key, url, rung.types, rung.sources);
           version = rung.version;
           break;
         } catch (error) {
@@ -182,11 +182,11 @@ export class Subscriptions {
       }
     }
     // (a Claw that does not know the assistant's events yet: the subscription it has always made; the types come with `ensure`)
-    created ??= await this.claw.createSubscription(key, url);
+    created ??= await this.claw.create(key, url);
     this.store.notifySubs.saveNotifySub(aadId, {
       route,
-      subscriptionId: created.subscription_id,
-      secret: created.secret,
+      subscriptionId: required(created.subscription_id),
+      secret: required(created.secret),
       typesVersion: version,
     });
   }
@@ -203,7 +203,7 @@ export class Subscriptions {
     }
     let version: number;
     try {
-      const row = (await this.claw.listSubscriptions(key)).find((r) => r.subscription_id === subscriptionId);
+      const row = (await this.claw.list(key)).find((r) => r.subscription_id === subscriptionId);
       if (row === undefined) {
         this.store.notifySubs.forgetNotifySub(aadId);
         return null;
@@ -218,17 +218,17 @@ export class Subscriptions {
   }
 
   /** The best rung the subscription has already, or the best Claw takes; throws Claw's last refusal when it takes none. */
-  private async mend(aadId: string, key: string, subscriptionId: string, row: ClawSubscriptionRow): Promise<number> {
+  private async mend(aadId: string, key: string, subscriptionId: string, row: ClawSubscription): Promise<number> {
     const disabled = row.enabled === false;
     const has = new Set(row.event_types ?? []);
     const hasSources = new Set(row.sources && row.sources.length > 0 ? row.sources : RUN_SOURCES);
-    let refused: unknown = { status: 400 };
+    let refused: unknown = new ClawError(400);
     for (const rung of wantedTypes(this.understood(aadId))) {
       if (!disabled && covers(rung, has, hasSources)) return rung.version;
       try {
-        await this.claw.updateSubscriptionTypes(key, subscriptionId, rung.types, {
+        await this.claw.updateTypes(key, subscriptionId, rung.types, {
           enable: disabled,
-          sources: rung.sources,
+          ...(rung.sources ? { sources: rung.sources } : {}),
         });
         return rung.version;
       } catch (error) {
@@ -241,13 +241,13 @@ export class Subscriptions {
 
   /** Delete this person's earlier subscriptions to this worker: their secret is unknown here, so they would only be refused. */
   private async dropStale(key: string): Promise<void> {
-    for (const sub of await this.claw.listSubscriptions(key)) {
+    for (const sub of await this.claw.list(key)) {
       const url = sub.url ?? "";
       if (url !== this.base && !url.startsWith(`${this.base}/`)) continue;
       try {
-        await this.claw.deleteSubscription(key, sub.subscription_id);
+        await this.claw.delete(key, sub.subscription_id ?? "");
       } catch (error) {
-        if (clawRefusal(error) === undefined) throw error;
+        if (!(error instanceof ClawError)) throw error;
       }
     }
   }
@@ -257,7 +257,7 @@ export class Subscriptions {
     const found = this.store.notifySubs.getNotifySub(aadId);
     if (found !== null && key !== null) {
       try {
-        await this.claw.deleteSubscription(key, found.subscriptionId);
+        await this.claw.delete(key, found.subscriptionId);
       } catch (error) {
         this.log.info("could not delete a user's notification subscription in Claw", { error: errorName(error) });
       }
@@ -270,4 +270,14 @@ function covers(rung: WantedTypes, has: ReadonlySet<string>, hasSources: Readonl
   return (
     rung.types.every((t) => has.has(t)) && (rung.sources === undefined || rung.sources.every((s) => hasSources.has(s)))
   );
+}
+
+function refusedWith(error: unknown, ...statuses: number[]): boolean {
+  return error instanceof ClawError && statuses.includes(error.status);
+}
+
+/** A field Claw's answer must carry (the Python worker's `data["subscription_id"]`, a KeyError when absent). */
+function required(value: string | undefined): string {
+  if (value === undefined) throw new ClawAnswerInvalid("a subscription without its id or secret");
+  return value;
 }

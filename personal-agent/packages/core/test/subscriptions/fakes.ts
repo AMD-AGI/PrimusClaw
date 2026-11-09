@@ -3,22 +3,11 @@
 
 /** In-memory stand-ins for the store slices and Claw's subscription endpoints the subscription keeper uses. */
 import type { NotifySubscription } from "../../src/ports/store/index.js";
-import type {
-  ClawSubscriptionRow,
-  ClawSubscriptions,
-  CreatedSubscription,
-  SubscriptionStore,
-} from "../../src/subscriptions/ports.js";
+import type { ClawSubscription } from "../../src/ports/claw/index.js";
+import type { ClawSubscriptions, SubscriptionStore } from "../../src/subscriptions/ports.js";
 
-export class ClawStatusError extends Error {
-  override readonly name = "ClawError";
-  constructor(
-    readonly status: number,
-    readonly code = "",
-  ) {
-    super(`claw returned ${String(status)}`);
-  }
-}
+export { ClawError as ClawStatusError } from "../../src/claw/errors.js";
+import { ClawError as ClawStatusError } from "../../src/claw/errors.js";
 
 interface Row {
   subscription_id: string;
@@ -54,12 +43,7 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
     return values === undefined || (values.length > 0 && values.every((v) => known.has(v)));
   }
 
-  createSubscription(
-    key: string,
-    url: string,
-    types?: readonly string[],
-    sources?: readonly string[],
-  ): Promise<CreatedSubscription> {
+  create(key: string, url: string, types?: readonly string[], sources?: readonly string[]): Promise<ClawSubscription> {
     this.calls.push(`create ${key}`);
     this.check();
     if (!this.known(types, this.knownTypes) || !this.known(sources, this.knownSources))
@@ -78,36 +62,38 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
     return Promise.resolve({ subscription_id: row.subscription_id, secret: row.secret });
   }
 
-  listSubscriptions(key: string): Promise<readonly ClawSubscriptionRow[]> {
+  list(key: string): Promise<ClawSubscription[]> {
     this.calls.push(`list ${key}`);
     this.check();
     return Promise.resolve([...this.rows.values()].filter((r) => r.owner === key).map((r) => ({ ...r })));
   }
 
-  updateSubscriptionTypes(
+  updateTypes(
     key: string,
     subscriptionId: string,
     types: readonly string[],
-    options: { readonly enable: boolean; readonly sources: readonly string[] | undefined },
-  ): Promise<void> {
+    options: { enable?: boolean; sources?: readonly string[] } = {},
+  ): Promise<ClawSubscription> {
     this.calls.push(`patch ${key}`);
     this.check();
     const row = this.rows.get(subscriptionId);
-    if (row === undefined || row.owner !== key) return Promise.reject(new ClawStatusError(404, "not_found"));
+    if (row === undefined || row.owner !== key)
+      return Promise.reject(new ClawStatusError(404, '{"error":"not_found"}'));
     if (!this.known(types, this.knownTypes) || !this.known(options.sources, this.knownSources)) {
-      return Promise.reject(new ClawStatusError(400, "invalid_filter"));
+      return Promise.reject(new ClawStatusError(400, '{"error":"invalid_filter"}'));
     }
     row.event_types = [...types];
     if (options.sources) row.sources = [...options.sources];
     if (options.enable) row.enabled = true;
-    return Promise.resolve();
+    return Promise.resolve({});
   }
 
-  deleteSubscription(key: string, subscriptionId: string): Promise<void> {
+  delete(key: string, subscriptionId: string): Promise<void> {
     this.calls.push(`delete ${key}`);
     this.check();
     const row = this.rows.get(subscriptionId);
-    if (row === undefined || row.owner !== key) return Promise.reject(new ClawStatusError(404, "not_found"));
+    if (row === undefined || row.owner !== key)
+      return Promise.reject(new ClawStatusError(404, '{"error":"not_found"}'));
     this.rows.delete(subscriptionId);
     return Promise.resolve();
   }
