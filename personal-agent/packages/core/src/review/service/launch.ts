@@ -281,6 +281,46 @@ export class ReviewLaunch {
     return running;
   }
 
+  /**
+   * A review asked of someone else whose session was made here, refused by a newer Claw (`acting_as_must_be_self`): asked for
+   * once more as the reviewer's item, exactly as the start asks. True: the asker was told; false: the turn says its failure.
+   */
+  async asItem(review: ReviewTurn, s: Settled): Promise<boolean> {
+    const refused: [PullRef, string][] = [];
+    const request = {
+      token: s.token,
+      modelKey: s.modelKey,
+      actor: s.actor,
+      actingAs: s.state.userId,
+      merge: s.ask.merge,
+      model: s.model,
+      actingToken: s.actingToken,
+      actingKey: s.actingKey,
+      note: s.ctx.text,
+      handoffId: "",
+    };
+    const asked = await this.items.start(request, [review], refused);
+    const [started] = asked.kind === "started" ? asked.reviews : [];
+    // (not started this way either: refused, a 404 again, or an error: never done, as the session before it was not)
+    if (started === undefined) s.giveBack([review]);
+    if (asked.kind === "refused") {
+      await say(this.deps, s.ctx.conversation, asked.text);
+      return true;
+    }
+    if (started === undefined) {
+      if (!refused.length) return false;
+      await say(this.deps, s.ctx.conversation, t.notStarted(refusedText(refused)));
+      return true;
+    }
+    this.deps.logger.info("a review started as the reviewer's item after Claw refused the session", {
+      item: started.item?.itemId ?? "",
+    });
+    this.follows.follow([started], s.ctx.conversation);
+    await this.notices.tellReviewerStarted(started);
+    await this.postCards(s, [started]);
+    return true;
+  }
+
   /** The cards with Stop, in the asker's own chat (a group's request too). */
   async postCards(s: Settled, reviews: readonly ReviewTurn[]): Promise<void> {
     if (!reviews.some((r) => r.item !== undefined)) return;
