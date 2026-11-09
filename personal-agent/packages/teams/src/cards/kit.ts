@@ -21,7 +21,9 @@
 import { clip, unbroken, zh } from "./cjk.js";
 import type { CardElement, Json, JsonObject } from "./json.js";
 import { walk } from "./json.js";
-import { str, strip } from "../text/pystr.js";
+import { pyStrip } from "@primusclaw/personal-agent";
+
+import { pyStr } from "../text/py-extra.js";
 
 export const CARD_VERSION = "1.5";
 export const SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json";
@@ -237,7 +239,7 @@ export function emojiIn(value: string): string[] {
 export function emojiBudget(card: JsonObject): number {
   let budget = EMOJI_MAX;
   for (const node of walk(card)) {
-    const id = str(node["id"]);
+    const id = pyStr(node["id"]);
     if (id.startsWith("row-") || id.startsWith("band-") || id.startsWith("badge-")) budget += 1;
   }
   return budget;
@@ -246,7 +248,7 @@ export function emojiBudget(card: JsonObject): number {
 /** The rows that have a value, as one FactSet (an empty list when none has): short names, clipped values. */
 export function facts(rows: ReadonlyArray<readonly [string, unknown]>, limit: number = FACT_VALUE_MAX): CardElement[] {
   const kept = rows
-    .filter(([, value]) => strip(str(value)) !== "")
+    .filter(([, value]) => pyStrip(pyStr(value)) !== "")
     .map(([name, value]) => ({ title: unbroken(zh(clip(name, FACT_TITLE_MAX))), value: zh(clip(value, limit)) }));
   return kept.length ? [{ type: "FactSet", facts: kept }] : [];
 }

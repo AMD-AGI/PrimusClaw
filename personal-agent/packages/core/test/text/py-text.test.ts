@@ -73,6 +73,8 @@ test('lstrip and str(value or "") are Python\'s', () => {
   assert.equal(pyStr(0), "");
   assert.equal(pyStr(Number.NaN), "");
   assert.equal(pyStr(12), "12");
+  assert.equal(pyStr(0n), "");
+  assert.equal(pyStr(7n), "7");
   assert.equal(pyStr({ a: 1 }), "");
 });
 

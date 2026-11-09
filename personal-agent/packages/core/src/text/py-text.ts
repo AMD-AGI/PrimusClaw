@@ -87,6 +87,7 @@ export function pyStr(value: unknown): string {
   if (typeof value === "string") return value;
   if (value === true) return "True";
   if (typeof value === "number") return value === 0 || Number.isNaN(value) ? "" : String(value);
+  if (typeof value === "bigint") return value === 0n ? "" : value.toString();
   return "";
 }
 

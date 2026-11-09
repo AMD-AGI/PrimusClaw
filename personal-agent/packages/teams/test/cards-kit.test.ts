@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { clip, hasCjk, zh } from "../src/cards/cjk.js";
 import type { CardElement } from "../src/cards/json.js";
-import { collapse, isSpace, lstrip, pyLen, pySlice, pySplit, rstrip, str, strip } from "../src/text/pystr.js";
+import { pyLstrip, pyRstrip, pyStr } from "../src/text/py-extra.js";
 import {
   buttons,
   card,
@@ -196,18 +196,23 @@ test("buttons, links and the card around them", () => {
   assert.equal(hasCjk(null), false);
 });
 
-test("python string semantics: code points and Python's whitespace", () => {
-  assert.equal(pyLen("a😀"), 2);
-  assert.equal(pySlice("a😀b", 1, 2), "😀");
-  assert.equal(pySlice("a😀b", 1), "😀b");
-  assert.deepEqual(pySplit("\u001fa b﻿"), ["a", "b﻿"]);
-  assert.equal(collapse(" a 　 b "), "a b");
-  assert.equal(strip("\u0085 x  "), "x");
-  assert.equal(lstrip("  x "), "x ");
-  assert.equal(rstrip("  x "), "  x");
-  assert.equal(isSpace(""), false);
+test("python string semantics the core does not have yet: lstrip and str()", () => {
+  assert.equal(pyLstrip("\u0085 x \u2028"), "x \u2028");
+  assert.equal(pyLstrip("   "), "");
+  assert.equal(pyRstrip("  x "), "  x");
   assert.deepEqual(
-    [str("s"), str(0), str(2), str(Number.NaN), str(0n), str(3n), str(true), str(false), str(null), str({})],
+    [
+      pyStr("s"),
+      pyStr(0),
+      pyStr(2),
+      pyStr(Number.NaN),
+      pyStr(0n),
+      pyStr(3n),
+      pyStr(true),
+      pyStr(false),
+      pyStr(null),
+      pyStr({}),
+    ],
     ["s", "", "2", "", "", "3", "True", "", "", ""],
   );
 });
