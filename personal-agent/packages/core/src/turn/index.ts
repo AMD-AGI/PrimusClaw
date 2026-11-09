@@ -51,7 +51,21 @@ export { lastAnswer, LAST_ANSWER_TAIL, type LastAnswerDeps } from "./last-answer
 export { LIVE_HEADER, LIVE_HEADERS, LiveView } from "./live-view.js";
 export { planText, type Todo, todosOf } from "./plan.js";
 export type { TurnClaw, TurnSurface } from "./ports.js";
-export { StatusMessage } from "./progress/status-message.js";
+export {
+  StatusMessage,
+  type StatusOptions,
+  turnStatusMessage,
+  type TurnStatusOptions,
+} from "./progress/status-message.js";
+export {
+  defaultStreamFinish,
+  type LiveViewLike,
+  type StatusPolicy,
+  STREAM_TEXT_MAX,
+  type StreamFinish,
+  type StreamFinishInput,
+  TurnStatusPolicy,
+} from "./progress/status-policy.js";
 export type { Step } from "./step.js";
 export { TurnState } from "./turn-state.js";
 export { type ChangesModel, type DeliveryModel, viewMessage } from "./views.js";

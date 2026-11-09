@@ -14,7 +14,7 @@ import { it } from "node:test";
 import { turnEnglish } from "../../src/locales/turn.js";
 import { runTurn } from "../../src/turn/engine/run-turn.js";
 import { LIVE_HEADER, LIVE_MAX_CHARS, LiveView } from "../../src/turn/live-view.js";
-import { StatusMessage } from "../../src/turn/progress/status-message.js";
+import { turnStatusMessage } from "../../src/turn/progress/status-message.js";
 import type { Step } from "../../src/turn/step.js";
 import { play, quiet, setUpWorld } from "./play.js";
 import { Timeline } from "./timeline.js";
@@ -413,7 +413,7 @@ it("test_the_throttle_counts_from_when_a_slow_edit_finished_not_from_when_it_beg
 it("test_a_pending_repeat_of_the_done_line_is_cancelled_with_the_turn", async () => {
   const clock = new Timeline();
   const bus = new Bus(clock, { fail: (s) => s.operation === "delete" }); // (it cannot delete: edited down instead)
-  const status = new StatusMessage(bus, { clock, log: new RecordingLogger() });
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger() });
   status.begin();
   status.progress({ narration: "one" });
   await clock.advanceTo(clock.start + 1.5);

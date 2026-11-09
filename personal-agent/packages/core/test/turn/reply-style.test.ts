@@ -12,10 +12,10 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
-import { SUGGESTED_REPLIES, turnText } from "../../src/locales/turn.js";
+import { turnText } from "../../src/locales/turn.js";
 import type { OutMessage } from "../../src/ports/surface.js";
 import { LIVE_HEADER } from "../../src/turn/live-view.js";
-import { LIVE_MIN_INTERVAL, StatusMessage } from "../../src/turn/progress/status-message.js";
+import { LIVE_MIN_INTERVAL, turnStatusMessage } from "../../src/turn/progress/status-message.js";
 import { statusText } from "../../src/turn/progress/status-text.js";
 import { play, type PlayOptions, type Run } from "./play.js";
 import { Timeline } from "./timeline.js";
@@ -264,7 +264,12 @@ it("test_a_finished_1on1_answer_offers_three_replies_and_the_switch_takes_them_a
   const run = await turn(WALK, { request: { lang: "zh" } });
   assert.deepEqual(
     finalOf(run).suggestions,
-    SUGGESTED_REPLIES.zh.map(([title, value]) => ({ title, value })),
+    // written out, not taken from SUGGESTED_REPLIES: an oracle read from the code cannot see the code change
+    [
+      { title: "继续", value: "继续" },
+      { title: "详细说说", value: "详细说说" },
+      { title: "开个新会话", value: "/new" },
+    ],
   );
   const off = await turn(WALK, { style: { suggestedReplies: false } });
   assert.equal(finalOf(off).suggestions, undefined);
@@ -300,7 +305,7 @@ it("test_with_text_streaming_the_agents_text_fills_the_bubble_as_it_grows", asyn
 it("test_a_status_message_without_a_stream_is_the_status_message_of_before", async () => {
   const clock = new Timeline();
   const bus = new Bus(clock);
-  const status = new StatusMessage(bus, { clock, log: new RecordingLogger() });
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger() });
   status.begin();
   status.progress({ narration: "Hi" });
   await clock.pump(status.finish(["answer"], { ai: true }));
