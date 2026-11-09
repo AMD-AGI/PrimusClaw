@@ -145,7 +145,7 @@ test("a stop is read as the Python worker read it", () => {
 
 test("names are compared as difflib compares them", () => {
   const cases: Array<readonly [string, string, number]> = [
-    ["huiru", "huirui", 0.9090909090909091],
+    ["linme", "linmei", 0.9090909090909091],
     ["linme", "linmei", 0.9090909090909091],
     ["abc", "abc", 1.0],
     ["", "x", 0.0],
