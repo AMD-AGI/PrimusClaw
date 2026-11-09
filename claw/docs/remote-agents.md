@@ -456,9 +456,13 @@ that terminal writes), a machine that is offline first, then read-only sessions,
 `close` to its connector and a `session.reclaimed` audit, and `201` names them in `reclaimed`. Only when none may be closed is
 the answer `409 session_limit_reached`.
 
-A write made through the same API replica reaches an open stream at once. A write
-made through another replica is found by the stream's own read of the database,
-which an idle stream does every 5 s, so it can arrive up to that much later.
+A write made through any API replica reaches an open stream at once: the replica it
+was made through wakes its own streams, and sends the same wake to the others as a
+Postgres `NOTIFY` on `claw_remote_agents_wake`, which every replica `LISTEN`s on with a
+connection of its own (`remote-agents/wake-relay.ts`). The wake carries only which
+stream to read, never the data. An idle stream still reads the database every 5 s, so
+a wake that was lost (a replica whose listening connection is reconnecting) costs at
+most that; a listener that comes back wakes all of its replica's streams once.
 
 ## The assistant
 

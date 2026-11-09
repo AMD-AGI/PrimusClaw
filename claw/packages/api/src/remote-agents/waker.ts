@@ -6,17 +6,36 @@
  *
  * The database is the truth; this only shortens the wait. A stream that is
  * asleep until its next poll wakes at once when something is written through
- * the same process. A write made through another replica is found by the poll
- * instead, so a missed or lost wake-up costs latency and never data.
+ * the same process, and, with a relay (`remote-agents/wake-relay.ts`), when it
+ * is written through another replica. Without one, or while it is down, such a
+ * write is found by the poll instead, so a missed or lost wake-up costs latency
+ * and never data.
  */
 export class Waker {
   private readonly waiting = new Map<string, Set<() => void>>();
+  private relay?: (key: string) => void;
 
-  /** Wake every stream waiting on `key`. */
+  /** Also ring every wake on the other replicas; `undefined` stops it. */
+  setRelay(relay: ((key: string) => void) | undefined): void {
+    this.relay = relay;
+  }
+
+  /** Wake every stream waiting on `key`, here and, through the relay, on every other replica. */
   wake(key: string): void {
+    this.wakeHere(key);
+    this.relay?.(key);
+  }
+
+  /** Wake every stream of this process waiting on `key`: what a wake relayed from another replica does. */
+  wakeHere(key: string): void {
     const set = this.waiting.get(key);
     if (!set) return;
     for (const fn of [...set]) fn();
+  }
+
+  /** Wake every stream of this process, to re-read whatever a relay that was down may have missed. */
+  wakeAll(): void {
+    for (const key of [...this.waiting.keys()]) this.wakeHere(key);
   }
 
   /**

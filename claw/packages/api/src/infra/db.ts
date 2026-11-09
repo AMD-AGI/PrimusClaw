@@ -88,6 +88,15 @@ const commonPoolConfig: pg.PoolConfig = {
       : undefined,
 };
 
+/**
+ * A connection of its own, outside both pools, for a session that is held for the life of the process: a `LISTEN`
+ * (`remote-agents/wake-relay.ts`), which a pool would hand to someone else or close as idle. The same server, SSL and
+ * keepalives as the pools; the caller connects it, watches its `error` and `end`, and ends it.
+ */
+export function dedicatedClient(): pg.Client {
+  return new pg.Client(commonPoolConfig);
+}
+
 // Main pool: all reads and business writes. Capped and env-overridable so ops
 // can tune each replica against the server's max_connections budget.
 const PG_POOL_MAX = Number(process.env.PG_POOL_MAX) || 20;
