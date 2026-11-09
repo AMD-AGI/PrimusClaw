@@ -7,7 +7,7 @@ import type { SseEvent } from "../../claw/model.js";
 import type {
   RemoteConnector,
   RemoteEventRow,
-  RemoteHidden,
+  RemoteHiddenAnswer,
   RemotePairing,
   RemoteSession,
   RemoteSetup,
@@ -44,7 +44,7 @@ export interface ClawRemoteAgentsPort {
    * again; nothing on the machine changes. ClawError(404): not the caller's machine, or revoked; 400 for refs Claw does
    * not take.
    */
-  hide(key: ClawCredential, connectorId: string, refs: readonly string[], hidden: boolean): Promise<RemoteHidden>;
+  hide(key: ClawCredential, connectorId: string, refs: readonly string[], hidden: boolean): Promise<RemoteHiddenAnswer>;
   /** A one-time pairing code inside the command line that uses it. */
   pair(key: ClawCredential): Promise<RemotePairing>;
   revoke(key: ClawCredential, connectorId: string): Promise<void>;

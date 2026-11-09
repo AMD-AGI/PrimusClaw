@@ -81,7 +81,7 @@ export const remoteHiddenSchema = z.looseObject({
   changed: lenient(z.array(z.string())),
   refused: lenient(rowsOf(z.looseObject({ ref: z.string(), reason: z.string() }))),
 });
-export type RemoteHidden = z.output<typeof remoteHiddenSchema>;
+export type RemoteHiddenAnswer = z.output<typeof remoteHiddenSchema>;
 
 /** How to connect a machine (`GET /setup`): the connector's package and the exact commands, passed on as Claw wrote them. */
 export type RemoteSetup = JsonObject;

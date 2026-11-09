@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
-  parseRemoteId, parseSessionNew, sseFrame,
+  parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, REMOTE_HIDDEN_INCLUDE, REMOTE_HIDE_LIMITS,
 } from "../src/remote-agents.js";
 
 const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -190,4 +190,18 @@ test("connector versions order as semver, and a connector's status follows the m
   const status = (v: string | null) => connectorVersionStatus(v, policy);
   assert.deepEqual(["0.0.0-stage", "0.1.2", "0.1.3", "0.1.4-rc.1", "0.1.4", "0.2.0", null, "dev"].map(status),
     ["unsupported", "unsupported", "outdated", "outdated", "current", "current", "unknown", "unknown"]);
+});
+
+test("a hide request: hidden a boolean first, then 1 to 50 refs of printable ASCII", () => {
+  assert.deepEqual(parseHiddenRequest({ refs: ["r1", "x".repeat(128)], hidden: true }), { ok: true, value: { refs: ["r1", "x".repeat(128)], hidden: true } });
+  assert.deepEqual(parseHiddenRequest({ refs: ["r1"], hidden: false }), { ok: true, value: { refs: ["r1"], hidden: false } });
+  for (const body of [undefined, null, [], "x", { refs: ["r1"] }, { refs: ["r1"], hidden: "true" }]) {
+    assert.deepEqual(parseHiddenRequest(body), { ok: false, error: "hidden_must_be_boolean" }, JSON.stringify(body));
+  }
+  const refs = (n: number) => Array.from({ length: n }, (_, i) => `r${i}`);
+  for (const bad of [[], "x", ["has space"], ["é"], ["x".repeat(129)], [1], refs(REMOTE_HIDE_LIMITS.maxRefs + 1)]) {
+    assert.deepEqual(parseHiddenRequest({ refs: bad, hidden: true }), { ok: false, error: "invalid_refs" }, JSON.stringify(bad).slice(0, 40));
+  }
+  assert.equal(parseHiddenRequest({ refs: refs(REMOTE_HIDE_LIMITS.maxRefs), hidden: true }).ok, true);
+  assert.equal(REMOTE_HIDDEN_INCLUDE, "include");
 });

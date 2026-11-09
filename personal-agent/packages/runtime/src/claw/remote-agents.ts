@@ -15,7 +15,7 @@ import {
   type NewRemoteSession,
   type RemoteConnector,
   type RemoteEventRow,
-  type RemoteHidden,
+  type RemoteHiddenAnswer,
   type RemotePairing,
   type RemoteSession,
   type RemoteSetup,
@@ -55,7 +55,7 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
     connectorId: string,
     refs: readonly string[],
     hidden: boolean,
-  ): Promise<RemoteHidden> {
+  ): Promise<RemoteHiddenAnswer> {
     const answer = await this.#call("POST", `/connectors/${segment(connectorId)}/hidden`, key, { refs, hidden });
     return read(remoteHiddenSchema, anyDataOf(answer, "hidden conversations"), "hidden conversations");
   }
