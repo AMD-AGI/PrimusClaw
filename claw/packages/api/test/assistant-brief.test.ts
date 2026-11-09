@@ -345,6 +345,32 @@ describe("assistant brief", { skip }, () => {
     assert.equal(bobs.sections.find((x) => x.key === "notifications")!.summary, "1 runs finished, 1 failed, 1 approvals asked; 0 writes wait for your confirmation");
   });
 
+  test("B7b each card waiting is listed by its own kind: a comment card is the comment, never a schedule with no name", async () => {
+    const card = (id: string, kind: string, params: object) => w.q(
+      `INSERT INTO claw_assistant_confirmations (confirmation_id, user_id, session_id, message_id, kind, params, dedupe_key, expires_at)
+       VALUES ($1, 'alice', $2, 'm', $3, $4::jsonb, $1, NOW() + INTERVAL '1 hour')`,
+      [id, alice.routerSid, kind, JSON.stringify(params)],
+    );
+    // At most three "needs you" lines are kept: each language is asked about three cards.
+    await card("c-comment", "github_comment", { repo: "AMD-AGI/PrimusClaw", number: 322, body: "LGTM" });
+    await card("c-send", "devenv_send", { agent_id: "claude", machine: "laptop", text: "run make test" });
+    await card("c-brief", "trigger_create", { name: "周报", schedule: "0 9 * * 1", timezone: "Asia/Shanghai", action: "brief" });
+    const en = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "en", now });
+    assert.deepEqual(en.needs_you, [
+      "waits for you: comment on AMD-AGI/PrimusClaw#322",
+      'waits for you: instruction to "claude" on the machine "laptop"',
+      'waits for you: schedule brief "周报"',
+    ]);
+    assert.doesNotMatch(en.text, /schedule ""/, en.text);
+    const zh = await brief.composeBrief("alice", { apiKey: "pk-alice", lang: "zh", now });
+    assert.deepEqual(zh.needs_you, [
+      "等你确认：在 AMD-AGI/PrimusClaw#322 上发表评论",
+      '等你确认：发给机器 "laptop" 上的 "claude" 的指令',
+      '等你确认：创建定时简报 "周报"',
+    ]);
+    assert.doesNotMatch(zh.text, /创建定时任务 ""/, zh.text);
+  });
+
   test("B8 the week: seven days of what happened, what ended and how, and each pull request's link", async () => {
     await world();
     // Merged this week, on a pull request an item of Alice's watches.

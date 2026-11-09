@@ -16,6 +16,8 @@
  *   S5  the limits are asked before a card is shown: an invalid schedule, a full trigger list, no key, a report's turn, a turn that
  *       has read what others wrote (the brief), a worker
  *   S6  trigger_list shows the user's triggers and the cards waiting; the router's state lists the cards
+ *   S6b each card is shown by its own kind, in the router's state and in trigger_list: a comment card is a comment to post, not a
+ *       scheduled task with an empty name; a brief card is a brief; an instruction card is the instruction; an unknown kind is named
  *   S7  the tools are offered to a router only with the trigger tools on, and confirmation_answer reaches a card with the review tools
  *       on or off
  *   S8  a lapsed card does nothing when pressed
@@ -292,6 +294,40 @@ describe("assistant schedules", { skip }, () => {
     assert.deepEqual(after.waiting_for_confirmation, []);
     const routes = await app.inject({ method: "GET", url: "/v1/assistant/confirmations", headers: { "x-test-user": "alice" } });
     assert.deepEqual(routes.json().data, []);
+  });
+
+  test("S6b every card is shown by its own kind: a comment card is a comment, never a scheduled task with no name", async () => {
+    const card = (id: string, kind: string, params: object) => w.q(
+      `INSERT INTO claw_assistant_confirmations (confirmation_id, user_id, session_id, message_id, kind, params, dedupe_key, expires_at)
+       VALUES ($1, 'alice', $2, 'm', $3, $4::jsonb, $1, NOW() + INTERVAL '1 hour')`,
+      [id, alice.routerSid, kind, JSON.stringify(params)],
+    );
+    await card("c1000000-0000-4000-8000-000000000000", "github_comment",
+      { repo: "AMD-AGI/PrimusClaw", number: 322, body: "LGTM.\nThe count in citations.ts is off by one." });
+    await card("c2000000-0000-4000-8000-000000000000", "trigger_create",
+      { name: "周报", schedule: "0 9 * * 1", timezone: "Asia/Shanghai", action: "brief", until: null, max_runs: null });
+    await card("c3000000-0000-4000-8000-000000000000", "trigger_cancel", { trigger_id: "t1", name: "PR 早报", schedule: "0 9 * * *", timezone: "UTC" });
+    await card("c4000000-0000-4000-8000-000000000000", "devenv_send", { agent_id: "claude", machine: "laptop", text: "run make test" });
+    await card("c5000000-0000-4000-8000-000000000000", "some_future_kind", { name: "x" });
+    const { confirmationRef: ref } = await import("../src/assistant/prompts.js");
+
+    const state = await sch.renderScheduleState("alice");
+    const line = (id: string) => state.split("\n").find((l) => l.startsWith(`- ref #${ref(id)} `)) ?? "";
+    assert.match(line("c1000000-0000-4000-8000-000000000000"),
+      /\| post a comment as the user's GitHub account on AMD-AGI\/PrimusClaw#322 \(no scheduled task\): "LGTM\. The count in citations\.ts is off by one\." \|/);
+    assert.match(line("c2000000-0000-4000-8000-000000000000"), /\| create scheduled brief "周报" \(0 9 \* \* 1, Asia\/Shanghai\) \|/);
+    assert.match(line("c3000000-0000-4000-8000-000000000000"), /\| cancel scheduled task "PR 早报" \(0 9 \* \* \*, UTC\) \|/);
+    assert.match(line("c4000000-0000-4000-8000-000000000000"), /\| send to "claude" on the machine "laptop": "run make test" \|/);
+    assert.match(line("c5000000-0000-4000-8000-000000000000"), /\| a "some_future_kind" card \|/);
+    assert.match(state, /^Cards waiting for the user's confirmation \(/);
+    assert.doesNotMatch(state, /scheduled task ""/, "no card is a scheduled task with an empty name");
+    for (const id of ["c1", "c2", "c3", "c4", "c5"]) assert.match(line(`${id}000000-0000-4000-8000-000000000000`), /or: approve #[0-9a-f]{6}/);
+
+    const listed = await sch.triggerListTool(await userTurn(alice, "我有哪些定时任务")) as Record<string, any>;
+    const what = Object.fromEntries(listed.waiting_for_confirmation.map((c: any) => [c.kind, c.what]));
+    assert.match(what.github_comment, /^post a comment as the user's GitHub account on AMD-AGI\/PrimusClaw#322 \(no scheduled task\)/);
+    assert.match(what.trigger_create, /^create scheduled brief "周报"/);
+    assert.match(what.devenv_send, /^send to "claude"/);
   });
 
   test("S7 the router has the tools with the trigger tools on; confirmation_answer reaches a card with the review tools on or off", async () => {
