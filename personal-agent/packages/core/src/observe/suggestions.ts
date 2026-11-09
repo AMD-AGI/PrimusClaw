@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { OBSERVE_TEXT } from "../locales/observe.js";
-import { cpHead, pyJsonDumps, pyStrip } from "../text/py-text.js";
+import { cpHead, pyJsonDumps, pyStr, pyStrip } from "../text/py-text.js";
 
 /**
  * What an observer turn would have done, as a suggestion: which recorded tool calls are suggestions at all, and how one
@@ -37,21 +37,12 @@ export interface Suggestion {
   readonly what: string;
 }
 
-/** `str(args.get(name) or "")`: a missing or empty value is "", a flag is True, an object is its JSON. */
-function field(args: Readonly<Record<string, unknown>>, name: string): string {
-  const value = args[name];
-  if (value === undefined || value === null || value === "" || value === false || value === 0) return "";
-  if (typeof value === "string") return value;
-  if (value === true) return "True";
-  return typeof value === "number" ? String(value) : pyJsonDumps(value);
-}
-
 /** The suggestion a recorded call `tool(args)` is. */
 export function describe(tool: string, args: unknown): Suggestion {
   const a = typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
-  if (tool === "say") return { kind: OBSERVE_TEXT.replyKind, what: field(a, "text") };
+  if (tool === "say") return { kind: OBSERVE_TEXT.replyKind, what: pyStr(a["text"]) };
   if (tool === "work_create") {
-    return { kind: OBSERVE_TEXT.taskKind, what: pyStrip(`${field(a, "title")}\n${field(a, "brief")}`) };
+    return { kind: OBSERVE_TEXT.taskKind, what: pyStrip(`${pyStr(a["title"])}\n${pyStr(a["brief"])}`) };
   }
   return { kind: tool, what: cpHead(pyJsonDumps(a), ARGS_SHOWN) };
 }

@@ -24,11 +24,14 @@ const texts = {
   isOn: (p: { bot: string }) =>
     `本群开着静默观察（只记录，不行动）。任何人都可以 @${p.bot} /observe off 关闭。 / Observation is on here (recorded only, nothing is done).`,
   noScope: "这个聊天不能观察。 / This chat cannot be observed.",
-  clawOff: "PrimusClaw 现在没有开观察功能，什么都没改。 / PrimusClaw does not observe chats right now; nothing changed.",
+  clawOff:
+    "PrimusClaw 现在没有开观察功能，什么都没改。 / PrimusClaw does not observe chats right now; nothing changed.",
   clawFailed: (p: { status: string }) =>
     `现在打不开观察（PrimusClaw 返回 ${p.status}），什么都没改。请稍后再试。 / Could not turn observation on (PrimusClaw ${p.status}).`,
-  usage: (p: { bot: string }) => `用法：@${p.bot} /observe on | off | status / Usage: @${p.bot} /observe on | off | status`,
-  cardGone: "这个按钮已失效。发 /board 看最新的建议。 / That button is no longer valid. Send /board for the latest suggestions.",
+  usage: (p: { bot: string }) =>
+    `用法：@${p.bot} /observe on | off | status / Usage: @${p.bot} /observe on | off | status`,
+  cardGone:
+    "这个按钮已失效。发 /board 看最新的建议。 / That button is no longer valid. Send /board for the latest suggestions.",
   cardUsed: "这条建议已经处理过了。 / That suggestion was already handled.",
   dismissed: "已忽略这条建议。 / Dismissed.",
   posted: "已在群里发出。 / Posted in the group.",
@@ -42,7 +45,8 @@ const texts = {
   unsureWithAssistant:
     "不确定有没有送达，为免重复不会再发；请自己看一下和助理的聊天和 /board。 / It is not certain this went through; to avoid " +
     "doing it twice it is not sent again: please check your assistant's chat and /board.",
-  assistantDown: "你的助理现在接不了，可以稍后再按一次。 / Your assistant cannot take it right now; press again in a moment.",
+  assistantDown:
+    "你的助理现在接不了，可以稍后再按一次。 / Your assistant cannot take it right now; press again in a moment.",
   noSuggestions: (p: { on: number }) =>
     `群聊观察：${String(p.on)} 个群在观察，最近没有建议。 / Group observation: ${String(p.on)} chat(s) observed, no suggestions lately.`,
   moreSuggestions: (p: { more: number }) =>
