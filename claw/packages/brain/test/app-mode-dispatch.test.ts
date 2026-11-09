@@ -23,6 +23,8 @@
  *      execution, so a finish-only dispatch finishes its run
  *   A5 an outbox entry that does not parse is dropped and the delivery runs,
  *      instead of being retried until it is poisoned
+ *   A6 a run whose lock a Stop force-released leaves, on its late exit, the
+ *      controller of the next run of its key in place
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -34,6 +36,7 @@ import type { TaskRunnerSideEffects } from "../src/tasks/runner.js";
 import type { AppRunner, AppRunResult, AppRunOutcome } from "../src/apps/app-runner.js";
 
 const { bindTaskRunnerDeps, runHandleTask, refuseUnsupportedMode } = await import("../src/tasks/runner.js");
+const { interruptRunsAt } = await import("../src/tasks/interrupt.js");
 const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON } =
   await import("../src/tasks/abort-registry.js");
 
@@ -402,4 +405,33 @@ test("A5 an outbox entry that does not parse is dropped and the delivery runs, n
   assert.equal(h.finishDone(), 1);
   assert.equal(h.acked(), 1);
   assert.equal(h.released(), 1);
+});
+
+test("A6 a run whose lock a Stop force-released leaves, on its late exit, the next run's controller in place", async (t) => {
+  // finishRun used to clear the key's controller whoever it belonged to. After
+  // a Stop force-released this run, the key's next run is filed there, and
+  // clearing it left that run unreachable by any interrupt.
+  const runB = new AbortController();
+  const runner = fakeRunner(async () => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      assert.deepEqual(interruptRunsAt("lock.s-app", 30_000), ["lock.s-app"]);
+      t.mock.timers.tick(30_000);
+    } finally {
+      t.mock.timers.reset();
+    }
+    assert.equal(activeAbort.has("lock.s-app"), false, "the force release dropped this run's controller");
+    activeAbort.set("lock.s-app", runB);
+    return { kind: "superseded" };
+  });
+  const h = harness(runner);
+  try {
+    const runA = await runApp(h);
+    assert.notEqual(runA, runB);
+    assert.equal(activeAbort.get("lock.s-app"), runB, "the late exit did not take the next run's controller");
+    assert.deepEqual(interruptRunsAt("lock.s-app", 3_600_000), ["lock.s-app"]);
+    assert.equal(runB.signal.aborted, true, "so a Stop still reaches it");
+  } finally {
+    activeAbort.delete("lock.s-app");
+  }
 });
