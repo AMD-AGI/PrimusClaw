@@ -352,3 +352,14 @@ test("an exchange error keeps only an OAuth error word, never other text from th
   const leak = await new HttpTokenExchange(CFG, new FakeClock(), answer("eyJhbGciOi.eyJzdWIi.c2ln")).tokenFor("aad-a");
   assert.ok(!leak.ok && leak.error.kind === "exchange_failed" && !leak.error.reason.includes("eyJ"));
 });
+
+test("a binding reply whose lifetime is written as a float is refused, as Python's isinstance(int) refuses it", async () => {
+  const reply = (lifetime: string) => () =>
+    Promise.resolve(new Response(`{"confirm_url":"https://id.example/c","expires_in":${lifetime}}`, { status: 200 }));
+  for (const lifetime of ["300.0", "3e2"]) {
+    const r = await new HttpTokenExchange(CFG, new FakeClock(), reply(lifetime)).bindingRequest("aad-a", "");
+    assert.equal(r.ok, false, lifetime);
+  }
+  const whole = await new HttpTokenExchange(CFG, new FakeClock(), reply("300")).bindingRequest("aad-a", "");
+  assert.ok(whole.ok && whole.value.expiresInSeconds === 300);
+});

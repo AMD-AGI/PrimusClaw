@@ -128,5 +128,7 @@ describe("the assistant's settings", () => {
 
   it("the reply window", () => {
     assert.equal(settings({ ASSISTANT_REPLY_WINDOW_SECONDS: "60" }).assistant.replyWindowSeconds, 60);
+    // Python's isdigit and int read decimal digits of any script
+    assert.equal(settings({ ASSISTANT_REPLY_WINDOW_SECONDS: "\u0666\u0660" }).assistant.replyWindowSeconds, 60);
   });
 });

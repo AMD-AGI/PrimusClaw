@@ -17,13 +17,15 @@ describe("a person's settings", () => {
               { content: "Lin", category: "user_profile" },
               { category: "fact" },
               { content: 3 },
+              { content: null },
+              { content: false },
             ],
           }),
     );
     assert.deepEqual(await wire.client().settings.memory("ak-a"), {
       enabled: true,
       available: true,
-      items: ["likes tea", "", "3"],
+      items: ["likes tea", "", "3", "None", "False"],
     });
     assert.deepEqual((await wire.client().settings.memory("ak-a", 1)).items, ["likes tea"]);
     wire.answer = (sent) =>
@@ -35,7 +37,9 @@ describe("a person's settings", () => {
     assert.deepEqual(await wire.client().settings.setMemory("ak-a", false), { enabled: false, available: false });
     assert.deepEqual(wire.sent.at(-1)?.body, { enabled: false });
   });
+});
 
+describe("a person's models and assistant settings", () => {
   it("the models a person may use; a Claw that cannot say is an error, never an empty list", async () => {
     const wire = new Wire(() => json(200, { data: [{ id: "a" }, { id: "" }, { id: 3 }, "b", { id: "c" }] }));
     assert.deepEqual(await wire.client().settings.models("ak-a"), ["a", "c"]);

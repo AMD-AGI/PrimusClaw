@@ -53,11 +53,12 @@ export type Attached = undefined | null | Readonly<Record<string, unknown>>;
 export function attachedContext(attached: Attached): { attached?: JsonObject | null } {
   if (attached === undefined) return {};
   if (attached === null || typeof attached !== "object" || Array.isArray(attached)) return { attached: null };
-  const kept: Record<string, JsonValue> = {};
-  for (const [k, v] of Object.entries(attached)) {
-    if (typeof v === "string") kept[k] = clip(v);
-    else if (typeof v === "boolean") kept[k] = v;
-  }
+  // (built from entries, so that a field named "__proto__" or "constructor" is an own field, as in Python's dict)
+  const kept = Object.fromEntries(
+    Object.entries(attached).flatMap(([k, v]): Array<[string, JsonValue]> =>
+      typeof v === "string" ? [[k, clip(v)]] : typeof v === "boolean" ? [[k, v]] : [],
+    ),
+  );
   return { attached: kept };
 }
 

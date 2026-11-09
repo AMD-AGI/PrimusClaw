@@ -32,6 +32,8 @@ describe("the assistant", () => {
     const wire = new Wire(() => json(200, { data: { session_id: "asst-1", created: true } }));
     assert.deepEqual(await wire.client().assistant.session("ak-a"), { sessionId: "asst-1", created: true });
     assert.deepEqual(wire.sent[0]?.body, {});
+    wire.answer = () => json(200, { data: { session_id: 0 } });
+    assert.deepEqual(await wire.client().assistant.session("ak-a"), { sessionId: "0", created: false });
     wire.answer = () => json(200, { data: {} });
     await assert.rejects(wire.client().assistant.session("ak-a"), ClawAnswerInvalid);
     wire.answer = () => json(404, { ok: false, error: "not_found" });
