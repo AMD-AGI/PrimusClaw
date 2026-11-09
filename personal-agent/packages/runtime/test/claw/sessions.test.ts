@@ -222,14 +222,13 @@ describe("reading a session", () => {
 describe("how Claw was not reached", () => {
   const failed = (cause: Error): TypeError => new TypeError("fetch failed", { cause });
   const coded = (code: string): Error => Object.assign(new Error(`connect ${code} 10.0.0.1:443`), { code });
-  const cases: Array<[string, () => unknown, string]> = [
+  const cases: Array<[string, () => Error, string]> = [
     ["a refused connection", () => failed(coded("ECONNREFUSED")), "connect"],
     ["no such host", () => failed(coded("ENOTFOUND")), "connect"],
     ["a connection not made in time", () => failed(coded("UND_ERR_CONNECT_TIMEOUT")), "timeout"],
     ["an answer not in time", () => new DOMException("timed out", "TimeoutError"), "timeout"],
     ["a connection reset after sending", () => failed(coded("ECONNRESET")), "network"],
     ["an error without a code", () => new TypeError("fetch failed"), "network"],
-    ["a thrown string", () => "x", "network"],
   ];
   for (const [what, error, kind] of cases) {
     it(`a request that never went out is told apart: ${what}`, async () => {

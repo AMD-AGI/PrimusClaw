@@ -102,7 +102,9 @@ describe("a session's changes on the wire", () => {
     const plain = new Wire(() => new Response(JSON.stringify(MIXED), { headers: { "content-encoding": "identity" } }));
     assert.deepEqual(await plain.client().sessions.changes("ak-a", "s1", 5000), MIXED);
   });
+});
 
+describe("a session's changes, what the call is", () => {
   it("the call is a get with the caller's key and its own short timeout", async () => {
     const wire = new Wire(() => json(200, MIXED));
     await wire.client().sessions.changes("ak-a", "sess-7", 5000);
