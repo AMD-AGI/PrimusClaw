@@ -1,0 +1,72 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Good",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "✅ 代审结束：#14 example-org/example-repo#292",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "facts": [
+              {
+                "title": "身⁠份",
+                "value": "Lin Mei"
+              },
+              {
+                "title": "方⁠式",
+                "value": "review，通过就合入"
+              },
+              {
+                "title": "模⁠型",
+                "value": "claude-opus-4-8"
+              }
+            ],
+            "type": "FactSet"
+          },
+          {
+            "text": "已批准并合入：没有需要修改的地方，检查全部通过。",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

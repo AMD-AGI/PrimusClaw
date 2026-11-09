@@ -1,0 +1,140 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "action": "allow",
+              "primusclaw": "decision",
+              "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+              "tool": "bash",
+              "tool_use_id": "tu-1"
+            },
+            "style": "positive",
+            "title": "批准",
+            "type": "Action.Execute",
+            "verb": "primusclaw.decision"
+          },
+          {
+            "data": {
+              "action": "deny",
+              "primusclaw": "decision",
+              "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+              "tool": "bash",
+              "tool_use_id": "tu-1"
+            },
+            "title": "拒绝",
+            "type": "Action.Execute",
+            "verb": "primusclaw.decision"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "id": "approval-title",
+                    "size": "Medium",
+                    "text": "⚠️ 需要你批准",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "text": "删除 /workspace/PrimusClaw/build 下的旧产物",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "None",
+            "text": "以上摘要由模型生成，请对照下面的参数核对。",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "操⁠作",
+                "value": "bash — Run a shell command"
+              },
+              {
+                "title": "command",
+                "value": "rm -rf /workspace/PrimusClaw/build && make clean"
+              }
+            ],
+            "type": "FactSet"
+          },
+          {
+            "id": "approval-details-toggle",
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Small",
+                "text": "详情 ▾",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "selectAction": {
+              "targetElements": ["approval-details"],
+              "title": "详情",
+              "type": "Action.ToggleVisibility"
+            },
+            "spacing": "Small",
+            "type": "Container"
+          },
+          {
+            "id": "approval-details",
+            "isVisible": false,
+            "items": [
+              {
+                "fontType": "Monospace",
+                "isSubtle": true,
+                "size": "Small",
+                "text": "bash\n{\"command\": \"rm -rf /workspace/PrimusClaw/build && make clean\"}",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Small",
+            "type": "Container"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

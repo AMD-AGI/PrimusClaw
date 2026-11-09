@@ -1,0 +1,97 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "action": "allow",
+              "primusclaw": "decision",
+              "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+              "tool": "bash",
+              "tool_use_id": "tu-1"
+            },
+            "style": "positive",
+            "title": "Approve",
+            "type": "Action.Execute",
+            "verb": "primusclaw.decision"
+          },
+          {
+            "data": {
+              "action": "deny",
+              "primusclaw": "decision",
+              "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77",
+              "tool": "bash",
+              "tool_use_id": "tu-1"
+            },
+            "title": "Deny",
+            "type": "Action.Execute",
+            "verb": "primusclaw.decision"
+          },
+          {
+            "title": "Details",
+            "type": "Action.OpenUrl",
+            "url": "https://claw.example.com/primus-claw/3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚠️ Approval needed: bash",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "Valid until 16:30 (Asia/Shanghai). After that it is refused.",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "fontType": "Monospace",
+            "maxLines": 4,
+            "size": "Small",
+            "text": "rm -rf /workspace/PrimusClaw/build && make clean",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}

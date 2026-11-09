@@ -1,0 +1,42 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "primusclaw": "thumb",
+              "reaction": "like"
+            },
+            "title": "👍",
+            "type": "Action.Execute",
+            "verb": "primusclaw.thumb"
+          },
+          {
+            "data": {
+              "primusclaw": "thumb",
+              "reaction": "dislike"
+            },
+            "title": "👎",
+            "type": "Action.Execute",
+            "verb": "primusclaw.thumb"
+          }
+        ],
+        "body": [
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "text": "💬 Was this answer helpful?",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}
