@@ -123,6 +123,21 @@ export class ClawHttp {
    * reply that comes content-encoded all the same is refused unread. An error reply is only quoted (512 bytes).
    */
   async boundedJson(request: ClawRequest, maxBytes: number, signal?: AbortSignal): Promise<unknown> {
+    const { status, bytes } = await this.boundedBytes(request, maxBytes, signal);
+    const text = new TextDecoder().decode(bytes);
+    if (status >= 400) throw new ClawError(status, head(text));
+    return parseJson(text);
+  }
+
+  /**
+   * A GET's status and body, the body refused (ReplayRefused) once it is larger than `maxBytes`, read in pieces and
+   * never held whole beyond that; an error body is cut at 512 bytes. Asked for and read as it is on the wire.
+   */
+  async boundedBytes(
+    request: ClawRequest,
+    maxBytes: number,
+    signal?: AbortSignal,
+  ): Promise<{ status: number; bytes: Uint8Array }> {
     const deadline = signal ?? AbortSignal.timeout(request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const response = await this.send(
       { ...request, headers: { ...request.headers, "Accept-Encoding": "identity" } },
@@ -135,10 +150,7 @@ export class ClawHttp {
     }
     const failed = response.status >= 400;
     const limit = { bytes: failed ? 512 : maxBytes, refuse: !failed };
-    const bytes = await readBounded(response, limit, deadline, request.path);
-    const text = new TextDecoder().decode(bytes);
-    if (failed) throw new ClawError(response.status, head(text));
-    return parseJson(text);
+    return { status: response.status, bytes: await readBounded(response, limit, deadline, request.path) };
   }
 }
 
