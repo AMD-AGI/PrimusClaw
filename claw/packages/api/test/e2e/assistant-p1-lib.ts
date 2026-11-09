@@ -124,10 +124,10 @@ export function answerTo(messageId: string, session: readonly SessionEvent[], re
 export interface ApiResult { status: number; json: any }
 
 export function apiClient(base: string, defaultKey: string) {
-  return async (method: string, path: string, body?: unknown, key: string = defaultKey): Promise<ApiResult> => {
+  return async (method: string, path: string, body?: unknown, key: string = defaultKey, extra: Record<string, string> = {}): Promise<ApiResult> => {
     const res = await fetch(`${base}${path}`, {
       method,
-      headers: { authorization: `Bearer ${key}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { ...extra, authorization: `Bearer ${key}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });

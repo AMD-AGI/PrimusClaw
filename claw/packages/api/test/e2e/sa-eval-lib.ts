@@ -15,7 +15,9 @@
  *   lang             zh | en | mixed                                   (the user's language)
  *   turns            [{user, after_ms, files?}]                         one or more user messages; after_ms from the first; files
  *                    [{fixture, name?, media_type?}] are sent with the message as a channel sends them (uploaded to the assistant's
- *                    session, named in channel_context.files); fixture is a path relative to the cases directory
+ *                    session, named in channel_context.files); fixture is a path relative to the cases directory.
+ *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?}) is sent
+ *                    with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through `files`)
  *   route            answer | item | review | confirm | clarify         expected handling of the last turn
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
@@ -82,7 +84,34 @@ export type Mode = "assistant" | "baseline";
 export type Cards = "none" | "accept" | "confirm";
 
 export interface TurnFile { fixture: string; name?: string; media_type?: string }
-export interface Turn { user: string; after_ms?: number; files?: TurnFile[] }
+export interface Turn { user: string; after_ms?: number; files?: TurnFile[]; channel_context?: Record<string, unknown> }
+
+/** What a case may put in a turn's `channel_context`: what a channel sends beside a message (`parseChannelContext`), files aside. */
+export const TURN_CONTEXT_KEYS: readonly string[] = ["channel", "via", "channel_message_id", "people", "actions", "repos", "handoffs", "attached"];
+
+/** The body of a turn's message: its words, and the channel's context with the files uploaded for it. */
+export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files: readonly unknown[]): Record<string, unknown> {
+  const context = { ...(t.channel_context ?? {}), ...(files.length ? { files } : {}) };
+  return { content: t.user, messageType: "text", ...(Object.keys(context).length ? { channel_context: context } : {}) };
+}
+
+/**
+ * Why a request may not be sent with the signed-in token (EVAL_SEND_TOKEN_CMD), or null when it may. The token answers for the person,
+ * so the run uses it for the person's own message, to close a card with `deny`, and to check whose it is, and for nothing else: never
+ * an `allow`, an `answer`, or any other write. A run that tries is a defect of the run, so the caller throws.
+ */
+export function tokenRequestRefusal(method: string, path: string, body?: unknown): string | null {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const keys = Object.keys(b).sort().join(",");
+  if (method === "GET" && path === "/v1/me" && body === undefined) return null;
+  if (method === "POST" && /^\/v1\/sessions\/[^/?#]+\/messages$/.test(path)) {
+    return b.messageType === "text" && typeof b.content === "string" && !("extData" in b) ? null : "only the person's own text message is sent with the token";
+  }
+  if (method === "POST" && /^\/v1\/(?:assistant|github-review)\/confirmations\/[^/?#]+\/decision$/.test(path)) {
+    return keys === "decision" && b.decision === "deny" ? null : "a card is only ever denied with the token, never allowed or answered";
+  }
+  return `${method} ${path.split("?")[0]} is not sent with the token`;
+}
 export interface Delivers { name?: string; type?: string }
 export interface Oracle { kind: "static" | "api" | "fixture"; value?: string; query?: string }
 export interface Fact { claim: string; oracle?: Oracle }
@@ -168,6 +197,12 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
     if (typeof f?.fixture !== "string" || !f.fixture || f.fixture.startsWith("/") || f.fixture.split("/").includes("..")) {
       out.push(`a file without a fixture inside the cases directory (${String(f?.fixture)})`);
     }
+  }
+  for (const t of Array.isArray(c.turns) ? c.turns : []) {
+    const ctx = t?.channel_context;
+    if (ctx === undefined) continue;
+    if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) out.push("channel_context must be an object");
+    else for (const k of Object.keys(ctx).filter((k) => !TURN_CONTEXT_KEYS.includes(k))) out.push(`channel_context.${k} is not sent by a case (${TURN_CONTEXT_KEYS.join(", ")})`);
   }
   if (c.delivers !== undefined && (!Array.isArray(c.delivers) || c.delivers.some((d) => !d || (typeof d.name !== "string" && typeof d.type !== "string")))) {
     out.push("delivers needs a name or a type for each file");
