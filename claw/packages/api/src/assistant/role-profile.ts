@@ -19,7 +19,7 @@ import pino from "pino";
 import { REMOTE_AGENT_TIMING } from "@claw/protocol";
 import {
   CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
-  CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
+  CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, CLAW_REMOTE_AGENTS_ENABLED, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
@@ -117,6 +117,19 @@ export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
 }
 
 /**
+ * A closed development environment item (`kind = 'remote'`) whose machine is no longer one of the user's is not listed. A machine is
+ * the user's while a connector of theirs that is not revoked has its name (a machine set up again under its name is theirs: the old
+ * row is revoked, and the new one has the name), which is exactly what `devenv_list` names. The name of one that is not was the only
+ * trace of it in the router's context, and an answer about the user's machines took it for one of theirs: "之前的 dev-box-1 已离线"
+ * with no machine connected (DM21-zms-a, 2026-11-07). Only where remote agents are on: their tables exist only then.
+ */
+const CLOSED_ITEM_OF_REMOVED_MACHINE = `AND NOT (w.kind = 'remote' AND NOT EXISTS (
+           SELECT 1 FROM claw_remote_connectors c
+            WHERE c.owner_user_id = w.user_id AND c.revoked_at IS NULL
+              AND (c.connector_id::text = w.params->>'connector_id'
+                   OR left(btrim(regexp_replace(c.name, '[[:cntrl:][:space:]]+', ' ', 'g')), 60) = w.params->>'machine')))`;
+
+/**
  * The router's item list: every open item, and the newest items closed in the last day. Open items are never cut: the
  * prompt tells the router that an item missing from the list is closed, which holds only while all open ones are in it.
  * Their number is bounded where they are made (`insertWorkItem`: the user's own, and reviews others asked of them).
@@ -127,9 +140,10 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
             outcome, created_at, closed_at FROM (
        (SELECT * FROM claw_work_items WHERE user_id = $1 AND board_state <> 'done')
        UNION ALL
-       (SELECT * FROM claw_work_items
-         WHERE user_id = $1 AND board_state = 'done' AND closed_at > NOW() - $2::interval
-         ORDER BY seq DESC LIMIT $3)
+       (SELECT w.* FROM claw_work_items w
+         WHERE w.user_id = $1 AND w.board_state = 'done' AND w.closed_at > NOW() - $2::interval
+           ${CLAW_REMOTE_AGENTS_ENABLED ? CLOSED_ITEM_OF_REMOVED_MACHINE : ""}
+         ORDER BY w.seq DESC LIMIT $3)
      ) listed ORDER BY seq`,
     [userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS],
   )).rows as Array<Record<string, unknown>>;
@@ -141,7 +155,7 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
   return rows.map((r) => ({
     itemId: String(r.item_id),
     seq: Number(r.seq),
-    title: String(r.title),
+    title: remote.get(String(r.item_id))?.title ?? String(r.title),
     boardState: String(r.board_state),
     summary: String(r.summary ?? ""),
     lastReportKind: (r.last_report_kind as string | null) ?? null,

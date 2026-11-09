@@ -651,8 +651,10 @@ describe("development environment items and devenv_send", { skip }, () => {
     const laptopRef = prompts.confirmationRef(String(toLaptop.confirmation_id));
     const voidedLine = voidedPart.split("\n").find((l) => l.startsWith(`- ref #${laptopRef} `));
     assert.ok(voidedLine, voidedPart);
-    assert.match(voidedLine, /on the machine "laptop": "跑 make test"/);
-    assert.match(voidedLine, /voided_reason: connector_revoked \(the machine "laptop" was revoked/);
+    assert.match(voidedLine, /on a machine that was removed: "跑 make test"/);
+    assert.match(voidedLine, /voided_reason: connector_revoked \(its machine was revoked/);
+    // The revoked machine is no longer theirs: its name is nowhere in what the router is shown (DM21-zms-a).
+    assert.doesNotMatch(voidedPart, /laptop/);
     assert.match(voidedLine, /never pressed: nothing was sent/);
     assert.match(voidedPart, /asked what waits for them, leave these out\. Do not bring one up on your own\./);
     assert.match(voidedPart, /never say you cannot tell whether it was pressed or lapsed/);
@@ -1587,6 +1589,114 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.equal((await says("alice")).filter((x: Recorded) => x.item_id).length, 2, "said once");
   });
 
+  test("F36 a machine that is no longer the user's is named nowhere in the router's context (DM21-zms-a: 之前的 <machine> 已离线 with none connected)", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const gone = await machine("alice", "dev-box-1");
+    const spare = await machine("alice", "spare-box");
+    const sidGone = await chatSession("alice", gone);
+    const sidSpare = await chatSession("alice", spare);
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sidGone })).status, "done");
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 build"), { text: "跑 build", target: sidSpare })).status, "done");
+    // The second one then goes offline (its laptop closed): still the user's, so still named.
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [spare]);
+    const itemGone = await remoteItem(sidGone);
+    const itemSpare = await remoteItem(sidSpare);
+    // Both machines are the user's: both items name theirs.
+    const before = prompts.renderRouterItems(await role.routerManifest("alice"));
+    assert.match(before, /machine: "dev-box-1"/);
+    assert.match(before, /machine: "spare-box"/);
+
+    // The user removes the first one (/agent off, a logout): its session closes and so does its item.
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${gone}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200);
+    assert.deepEqual([(await remoteItem(sidGone)).board_state, (await remoteItem(sidGone)).outcome], ["done", "dropped"]);
+    // The item closed with it is not listed: its machine is not one of theirs, and a name from the list was said as one of them. A
+    // machine of theirs that is only offline stays named, as devenv_list names it.
+    const manifest = await role.routerManifest("alice");
+    assert.equal(manifest.find((m) => m.itemId === itemGone.item_id), undefined, "the closed item of a removed machine is not listed");
+    assert.ok(manifest.find((m) => m.itemId === itemSpare.item_id));
+    const state = prompts.renderRouterItems(manifest);
+    assert.doesNotMatch(state, /dev-box-1/);
+    assert.match(state, /in progress, but that machine is offline now.*machine: "spare-box"/);
+
+    // An item still open when its machine is gone (its close was never applied) is listed, as open items must be, with no name.
+    const old = await machine("alice", "old-box");
+    const sidOld = await chatSession("alice", old);
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 test"), { text: "跑 test", target: sidOld })).status, "done");
+    const itemOld = await remoteItem(sidOld);
+    await w.q("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE connector_id = $1", [old]);
+    assert.equal((await remoteItem(sidOld)).board_state, "in_progress", "nothing closed it");
+    const open = (await role.routerManifest("alice")).find((m) => m.itemId === itemOld.item_id);
+    assert.ok(open, "an open item is never left off the list");
+    const line = prompts.formatManifestLine(open);
+    assert.doesNotMatch(line, /old-box/);
+    assert.match(line, /in progress, but its machine is no longer connected to the user/);
+    assert.match(line, /title: "claude：跑 test"/);
+
+    // With no machine left at all, nothing in the item list names one the user had.
+    await w.q("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE connector_id = $1 AND revoked_at IS NULL", [spare]);
+    const none = prompts.renderRouterItems(await role.routerManifest("alice"));
+    for (const name of ["dev-box-1", "spare-box", "old-box"]) assert.doesNotMatch(none, new RegExp(name), name);
+  });
+
+  test("F38 a machine set up again under its name is still the user's: the items of its old registration stay named, until it is removed", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const laptop = await machine("alice", "laptop");
+    const sid = await chatSession("alice", laptop);
+    assert.equal((await sendByCard(await userTurn(alice, "让它跑 lint"), { text: "跑 lint", target: sid })).status, "done");
+    const item = await remoteItem(sid);
+    // The laptop closed with the prompt never collected, and came back with its local state lost: a new row under the same name. The
+    // old row is revoked and its item closed (dropped) with it.
+    await w.q("UPDATE claw_remote_connectors SET created_at = NOW() - interval '1 hour', heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL WHERE connector_id = $1", [laptop]);
+    const again = await post("alice", "/v1/remote-agents/connectors", { name: "laptop" });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    const fresh = String(again.body.data.connector_id);
+    assert.ok((await w.q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1", [laptop]))[0].revoked_at, "the old row was replaced");
+    assert.deepEqual([(await remoteItem(sid)).board_state, (await remoteItem(sid)).outcome], ["done", "dropped"]);
+    // The machine is the user's (devenv_list names it): its closed item is listed, naming it.
+    const line = (await role.routerManifest("alice")).find((m) => m.itemId === item.item_id);
+    assert.ok(line, "the closed item of a machine that is still the user's is listed");
+    assert.match(prompts.formatManifestLine(line), /machine: "laptop"/);
+    assert.match(prompts.formatManifestLine(line), /title: "laptop claude：跑 lint"/);
+    // So is an item still open on the old row (its close not applied): named, as a machine of theirs, not "removed".
+    await w.q("UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL WHERE item_id = $1", [item.item_id]);
+    const open = (await role.routerManifest("alice")).find((m) => m.itemId === item.item_id);
+    assert.ok(open && !open.remote?.removed);
+    assert.match(prompts.formatManifestLine(open), /machine: "laptop"/);
+    await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'dropped', closed_at = NOW() WHERE item_id = $1", [item.item_id]);
+    // Removed for good (no row of that name left): the item is gone from the list, and nothing names the machine.
+    const r = await fetch(`${base}/v1/remote-agents/connectors/${fresh}`, { method: "DELETE", headers: { "x-test-user": "alice" } });
+    assert.equal(r.status, 200);
+    const gone = await role.routerManifest("alice");
+    assert.equal(gone.find((m) => m.itemId === item.item_id), undefined);
+    assert.doesNotMatch(prompts.renderRouterItems(gone), /laptop/);
+  });
+
+  test("F37 with no machine at all devenv_list and devenv_send say to name none, and name none themselves", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    // A machine the user had, removed: nothing of it is left to read.
+    const gone = await machine("alice", "dev-box-1");
+    await w.q("UPDATE claw_remote_connectors SET revoked_at = NOW() WHERE connector_id = $1", [gone]);
+    const listed = await tools.devenvList(await userTurn(alice, "我的开发环境有哪些"));
+    assert.deepEqual([listed.total, listed.machines], [0, []]);
+    assert.ok(String(listed.note).includes(tools.NO_MACHINE_NOTE), String(listed.note));
+    assert.doesNotMatch(JSON.stringify(listed), /dev-box-1/, "the result names no machine");
+    await assert.rejects(tools.devenvSend(await userTurn(alice, "让开发机上的 claude 跑一下 ls"), { text: "ls" }), (e: Recorded) => {
+      assert.equal(e.code, "no_machine");
+      assert.ok(String(e.message).includes(tools.NO_MACHINE_NOTE), String(e.message));
+      assert.doesNotMatch(JSON.stringify([e.message, e.data]), /dev-box-1/);
+      return true;
+    });
+    // And with a machine the user has, the note is not there: its name is the answer.
+    await machine("alice", "laptop");
+    const some = await tools.devenvList(await userTurn(alice, "我的开发环境有哪些"));
+    assert.equal(some.total, 1);
+    assert.ok(!String(some.note).includes(tools.NO_MACHINE_NOTE));
+  });
+
   test("F32 an instruction Claw cannot confirm its machine got is said as that, and the machine's own end still closes it", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
@@ -1755,7 +1865,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v13");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v14");
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);
