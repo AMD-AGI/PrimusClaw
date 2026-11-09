@@ -15,10 +15,10 @@ import { langOf, type TurnContext } from "./context.js";
 export const TURN_DEADLINE_SECONDS = 30 * 60;
 
 /** What the chat says when the turn's time is up and the run is still going. */
-export function stillRunningText(ctx: TurnContext): string {
+export function stillRunningText(ctx: TurnContext, deadlineSeconds = TURN_DEADLINE_SECONDS): string {
   const text = turnText.in(langOf(ctx));
   const follow = ctx.request.notifies && !ctx.request.group ? text.stillRunningNotify : text.stillRunningOpen;
-  return text.stillRunning({ minutes: Math.round(TURN_DEADLINE_SECONDS / 60) }) + follow;
+  return text.stillRunning({ minutes: Math.round(deadlineSeconds / 60) }) + follow;
 }
 
 /** What a Claw refusal before the turn ran is said as. The log gets the status and Claw's error word only, never the body. */
