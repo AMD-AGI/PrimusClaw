@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { Lang } from "../locales/lang.js";
-import type { Conversation, InboundAction, InboundMessage, OutMessage, UserRef } from "./surface.js";
+import type { Conversation, InboundAction, InboundMessage, InboundVote, OutMessage, UserRef } from "./surface.js";
 
 /**
  * How features plug into the router (the Python worker's `Agent._dispatch` and `Agent._route_group`). The router only
@@ -98,6 +98,15 @@ export interface ClickHandler {
   inGroup?(click: ClickRoute): Promise<boolean>;
 }
 
+export interface VoteRoute extends RouteBase {
+  readonly vote: InboundVote;
+}
+
+/** The channel's own thumbs under an answer (feedback's). */
+export interface VoteHandler {
+  vote(route: VoteRoute): Promise<void>;
+}
+
 /** The handlers a feature brings, in the order they are tried. */
 export interface RouteHandlers {
   /** Read in a 1:1 chat before the account check. */
@@ -106,6 +115,8 @@ export interface RouteHandlers {
   readonly groupInterceptors: readonly MessageInterceptor[];
   readonly commands: readonly CommandHandler[];
   readonly clicks: readonly ClickHandler[];
+  /** The channel's thumbs (undefined: they are dropped). */
+  readonly votes?: VoteHandler;
 }
 
 /** No handlers. */

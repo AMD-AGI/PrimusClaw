@@ -33,6 +33,7 @@ function config(exchangeForChat: boolean): RouterConfig {
     botName: "Clawy",
     pluginId: "",
     model: "",
+    reviewModel: "",
     fallbackModel: "",
     exchangeForChat,
     briefEnabled: false,
