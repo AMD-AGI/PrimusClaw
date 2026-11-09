@@ -19,15 +19,11 @@ on:
       - "deploy/**"
     paths:
       - "docs/**"
-      - "memory/memory-service/src/**"
-      - "memory/knowledge-worker/src/**"
       - "sandbox/sdk-python/**"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "docs/**"
-      - "memory/memory-service/src/**"
-      - "memory/knowledge-worker/src/**"
       - "sandbox/sdk-python/**"
       - ".github/workflows/docs.yml"
 
@@ -64,15 +60,16 @@ jobs:
       - name: Build docs
         run: python -m sphinx -b html -W --keep-going docs docs/_build/html
 
-      # A build with no API content would otherwise pass. The three packages
-      # currently contribute far more than this; the floor only catches autodoc
-      # silently documenting nothing, e.g. after a sys.path or layout change.
+      # A build with no API content would otherwise pass. The floor is the
+      # number of modules docs/api/sdk-python.md names with `automodule`, so
+      # autodoc silently dropping any of them, e.g. after a sys.path or layout
+      # change, fails here. Raise it when a page documents more modules.
       - name: Assert the API reference is not empty
         run: |
           set -e
           count=$(grep -ro 'id="module-' docs/_build/html/api | wc -l)
           echo "documented modules: $count"
-          if [ "$count" -lt 20 ]; then
-            echo "::error::API reference collapsed to $count modules (expected >= 20)."
+          if [ "$count" -lt 10 ]; then
+            echo "::error::API reference collapsed to $count modules (expected >= 10)."
             exit 1
           fi

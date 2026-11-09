@@ -1418,6 +1418,14 @@ record it.
   `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
   like the platform defaults instead of being inlined.
 
+### Removed
+- The Python memory plane under `memory/` (`claw-memory-service` and `knowledge-worker`), its image build, Helm chart, release
+  checks, CI suites and API docs. Claw's long-term memory has been the API's own store since the remote backend was frozen,
+  no deployment runs either service, and the knowledge base it used to co-host now lives outside this repository. With it go
+  `MEMORY_BACKEND` / `MEMORY_SERVICE_URL` (a deployment that still sets `MEMORY_BACKEND=remote` now gets the built-in store
+  when `CLAW_MEMORY_ENABLED` is on, instead of memory being off) and the unused `claw/packages/api/src/memory/storage-client.ts`.
+  The required `test` check now runs the remaining Python suite, `deploy/litellm/tests`.
+
 ### Security
 - What the API stores of a conversation now has credentials masked before it is written: session events (`claw_session_events`,
   as the event consumer, the message route and the A2A route write them), conversation turns (`claw_conversation_turns`) and the

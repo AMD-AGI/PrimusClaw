@@ -16,7 +16,6 @@ body:
         - claw / protocol or utils
         - sandbox (Go control plane)
         - sandbox / sdk-python
-        - memory (memory-service or knowledge-worker)
         - deployment (Helm, installers, Docker)
         - docs
         - not sure

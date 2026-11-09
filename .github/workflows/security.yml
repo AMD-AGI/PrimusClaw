@@ -103,13 +103,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Extras follow what each image installs, so the audited set is the
-          # set that ships: memory-service's Dockerfile installs `.[storage]`,
-          # which is where fastapi, uvicorn and asyncpg come from.
-          - package: memory/memory-service
-            extras: "[storage]"
-          - package: memory/knowledge-worker
-            extras: ""
           - package: sandbox/sdk-python
             extras: ""
     steps:
@@ -119,8 +112,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Audits what a fresh install resolves to, not the declared ranges. All
-      # three packages pin lower bounds only, so the resolved set is what a user
+      # Audits what a fresh install resolves to, not the declared ranges. The
+      # package pins lower bounds only, so the resolved set is what a user
       # actually receives and is therefore the set worth checking.
       #
       # The resolution happens in a throwaway virtualenv and the audit runs

@@ -24,11 +24,10 @@
  *
  * The question it answers is only whether the column is there, never whether it
  * is the column the code thinks it is: types, nullability and defaults are not
- * compared. That boundary matters most on `claw_memory_entries`, which has two
- * independent migration owners -- this file's `initDb` and the Python
- * memory-service's `002_kb_extension.sql` -- both declaring their columns with
- * `ADD COLUMN IF NOT EXISTS`. Whichever runs first defines the type and the
- * other silently no-ops, and a divergence there passes this check.
+ * compared. That boundary matters most on `claw_memory_entries`, whose columns
+ * `initDb` declares with `ADD COLUMN IF NOT EXISTS`: a database where an older
+ * writer (the retired Python memory service) already added one with another
+ * type keeps that type, and the divergence passes this check.
  */
 
 export interface SchemaRequirement {
