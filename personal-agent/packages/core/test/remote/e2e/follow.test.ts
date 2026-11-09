@@ -14,10 +14,12 @@ import {
   ALICE,
   type RemoteWorld,
   Script,
+  USER_A,
+  USER_B,
   TEST_TIMINGS,
   remoteWorld,
 } from "../../../../../test-support/remote-world.js";
-import { AAD, TWO_AGENTS } from "./helpers.js";
+import { AAD, BOB, TWO_AGENTS } from "./helpers.js";
 
 /** The chat attached to a claude session on dev-pod; the script the test then changes. */
 async function attachedClaude(w: RemoteWorld, script = new Script()): Promise<{ sid: string; script: Script }> {
@@ -227,4 +229,117 @@ test("a stream that drops is picked up after the last event and nothing is said 
     assert.ok(told[0]?.includes("part one, part two, part three."), told[0] ?? "");
     const opens = streams(w, sid);
     assert.ok(opens.length >= 2 && (opens.at(-1)?.after ?? 0) > 0, JSON.stringify(opens));
+  }));
+
+test("a session that ends while the chat is idle is told and the chat goes back to primusclaw", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.server.emit(sid, "session_closed", { reason: "the connector was stopped" });
+    await w.until(() => w.said().some((t) => t.includes("The session ended")));
+    assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
+  }));
+
+// --- leaving, and who is followed -------------------------------------------------------------------------------------------
+
+const followers = (w: RemoteWorld): Map<string, unknown> =>
+  (w.remote as unknown as { chats: { followers: Map<string, unknown> } }).chats.followers;
+
+test("after a detach nothing the agent writes reaches the chat", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.say("/agent detach");
+    const before = w.said().length;
+    await w.server.say(sid, "Still working on my own.");
+    await settle();
+    assert.equal(w.said().length, before);
+    assert.equal(followers(w).size, 0);
+  }));
+
+test("after an unlink nothing is read any more", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    w.remote.forgetPerson(AAD); // (what /unlink asks of the remote agents, the router's half aside)
+    const opens = streams(w, sid).length;
+    await w.server.say(sid, "Still here.");
+    await settle();
+    assert.deepEqual(onItsOwn(w), []);
+    assert.equal(followers(w).size, 0);
+    assert.equal(streams(w, sid).length, opens);
+  }));
+
+test("each attached chat is followed on one stream and only for its own session", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const bob = USER_B.id;
+    const bobCid = w.server.addConnector(BOB, "bobs-box", TWO_AGENTS);
+    const bobSid = w.server.addSession(BOB, bobCid, "codex");
+    w.conversationOf(USER_B); // (Bob's chat reference: where his news goes)
+    w.test.store.remoteState.attachRemote(bob, {
+      sessionId: bobSid,
+      connectorId: bobCid,
+      agentId: "codex",
+      agentLabel: "⬛ Codex",
+      host: "bobs-box",
+      cwd: "/x",
+    });
+    follow(w).ensure(bob);
+    await w.server.say(sid, "Alice's news.");
+    await w.server.say(bobSid, "Bob's news.");
+    await settle();
+    const to = (user: { id: string }) =>
+      w
+        .operations()
+        .filter((o) => o.conversation === `conv-${user.id}` && o.text.includes("on its own"))
+        .map((o) => o.text);
+    assert.equal(to(USER_A).length, 1);
+    assert.ok(to(USER_A)[0]?.includes("Alice's news."));
+    assert.equal(to(USER_B).length, 1);
+    assert.ok(to(USER_B)[0]?.includes("Bob's news."));
+    // (the first of Alice's is the one that waited for the agent to start)
+    assert.equal(streams(w, sid).filter((s) => s.after > 0).length, 1);
+    assert.equal(streams(w, bobSid).length, 1);
+  }));
+
+test("with the push switched off nothing is read between turns", () =>
+  remoteWorld(async (w) => {
+    w.settings.follow = false;
+    const { sid } = await attachedClaude(w);
+    await w.server.say(sid, "On its own.");
+    await settle();
+    assert.deepEqual(onItsOwn(w), []);
+    assert.equal(followers(w).size, 0);
+  }));
+
+test("stop while the agent works on its own tells it to cancel and with nothing going on says so", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.say("/stop");
+    assert.equal(w.last(), "Nothing is running.");
+    assert.deepEqual(w.server.commandsOf("cancel"), []);
+    await w.server.say(sid, "Busy with a thing I started myself");
+    await w.server.tool(sid, "t1", "make", "pending");
+    await sleep(200);
+    const before = w.said().length;
+    await w.say("/stop");
+    assert.ok(w.said().slice(before).includes("Stopping the agent."), w.said().slice(before).join(" | "));
+    assert.equal(w.server.commandsOf("cancel").length, 1);
+    // (the agent ends its turn as cancelled: what it had said is delivered at once)
+    await w.until(() => onItsOwn(w).length > 0);
+  }));
+
+// --- a worker that restarts -------------------------------------------------------------------------------------------------
+
+test("a worker that starts follows the chats that are attached and says what it missed once", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.server.say(sid, "Said before the restart.");
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+    w.remote.shutdown(); // the worker goes down...
+    await w.server.say(sid, "Said while the worker was down.");
+    w.remote.resume(); // ...and comes back
+    await settle();
+    const told = onItsOwn(w);
+    assert.equal(told.length, 2, told.join(" | "));
+    assert.ok(told[1]?.includes("while the worker was down") && !told[1].includes("before the restart"), told[1] ?? "");
   }));

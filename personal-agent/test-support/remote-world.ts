@@ -102,6 +102,8 @@ export interface Operation {
   readonly card: Json | undefined;
   /** The message's own text ("" for none). */
   readonly text: string;
+  /** The conversation it went to. */
+  readonly conversation: string;
 }
 
 export interface WorldOptions {
@@ -347,11 +349,12 @@ export class RemoteWorld {
    */
   operations(): Operation[] {
     return this.surface.outbox.flatMap((r): Operation[] => {
-      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined, text: "" }];
+      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined, text: "", conversation: r.conversation }];
       if (r.op !== "send" && r.op !== "post" && r.op !== "update") return [];
       const activity = activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json;
       const text = typeof activity["text"] === "string" ? activity["text"] : "";
-      return [{ op: r.op, id: r.op === "send" ? "" : r.id, card: cardsOf(activity)[0], text }];
+      const id = r.op === "send" ? "" : r.id;
+      return [{ op: r.op, id, card: cardsOf(activity)[0], text, conversation: r.conversation }];
     });
   }
 
