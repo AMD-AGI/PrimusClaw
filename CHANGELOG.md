@@ -170,6 +170,12 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A sandbox grant's 8-GPU template is admitted on an MI355X node. Each card was sized at 256Gi memory, so the g8 template asked
+  for 2Ti and SaFE refused it ("Resource request exceeds maximum available: memory"): the vk-mi355x flavor has 2Ti, of which SaFE
+  admits 95% (about 1.90TiB). Each card is now 224Gi, so g8 asks for 1792Gi, and eight g1 sandboxes (or four g2, two g4) now fit
+  one node together, which at 2Ti they did not. CPU (24 per card), shared memory (125Gi) and pod storage (187.5Gi) are unchanged and already fit.
+  Templates registered before the release keep their size until their grant is issued again. Deploy the sandbox control plane
+  (`agent-sandbox-controlplane`, which serves sandbox grants); Claw is unchanged.
 - The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
   with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
   which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation

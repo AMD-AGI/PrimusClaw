@@ -775,7 +775,7 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g1.Spec.GPU.Count != 1 || g1.Spec.GPU.SharedMemory != "125Gi" {
 		t.Fatalf("gpu=%+v", g1.Spec.GPU)
 	}
-	assertQuantity(t, g1.Spec.Template.Resources.Requests, "24", "256Gi")
+	assertQuantity(t, g1.Spec.Template.Resources.Requests, "24", "224Gi")
 	if got := g1.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("187.5Gi")) != 0 {
 		t.Fatalf("storage=%s", got.String())
 	}
@@ -789,7 +789,7 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g8.Spec.GPU.Count != 8 || g8.Spec.GPU.SharedMemory != "1000Gi" {
 		t.Fatalf("gpu=%+v", g8.Spec.GPU)
 	}
-	assertQuantity(t, g8.Spec.Template.Resources.Requests, "192", "2048Gi")
+	assertQuantity(t, g8.Spec.Template.Resources.Requests, "192", "1792Gi")
 	if got := g8.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("1500Gi")) != 0 {
 		t.Fatalf("storage=%s", got.String())
 	}
