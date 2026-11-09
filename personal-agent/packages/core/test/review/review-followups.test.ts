@@ -128,12 +128,6 @@ test("an english request asks for english", async () => {
   assert.ok(reviewPrompt(turn("zh")).includes("Simplified Chinese") && reviewPrompt(turn("en")).includes("in English"));
 });
 
-/** What the turn engine keeps of one tool answer. */
-function wrote(status: string, event = "") {
-  const tool = event ? "mcp__github-review__gh_review_submit" : "mcp__github-review__gh_pr_merge";
-  return githubWrite(tool, JSON.stringify({ status, ...(event ? { detail: { event } } : {}) }));
-}
-
 for (const [name, text, outcome, line] of [
   [
     "merged",
@@ -176,5 +170,6 @@ test("an approval alone does not settle a review that may merge", () => {
   );
   assert.ok(resultLine(turn("zh"), ["gh_pr_merge", "delegation_off", ""], "")?.includes("没有合入"));
   assert.ok(resultLine(turn("zh"), ["gh_pr_merge", "merged", ""], "")?.includes("（模型：默认模型）"));
-  assert.deepEqual(wrote("confirmation_required"), undefined); // (a hold is no write: only its line says it)
+  // (a hold is no write: only its line says it)
+  assert.equal(githubWrite("mcp__github-review__gh_pr_merge", '{"status":"confirmation_required"}'), undefined);
 });

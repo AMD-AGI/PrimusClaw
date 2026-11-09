@@ -56,7 +56,11 @@ for (const [origin, kind, text] of [
       [SUBMIT, submitted("APPROVE", 2)],
       [MERGE, JSON.stringify({ status: "merged" })],
     ]);
-    for (const expected of [PR, URL, "批准", "已合入", "2 条行内评论", "（模型：", "没有发现必须修改的问题"]) {
+    assert.ok(
+      final.split("\n").some((line) => line === URL),
+      final,
+    );
+    for (const expected of [PR, "批准", "已合入", "2 条行内评论", "（模型：", "没有发现必须修改的问题"]) {
       assert.ok(final.includes(expected), `${expected} in ${final}`);
     }
     assert.ok(final.indexOf("已合入") < final.indexOf("没有发现必须修改的问题")); // the result first, then the summary
@@ -91,7 +95,11 @@ test("a review only says it was not merged", async () => {
   // (acknowledged as before, but at the top of the progress message: the chat is left with the one answer)
   assert.ok(turn.turn.lead.startsWith("收到") && turn.turn.lead.includes("review"), turn.turn.lead);
   const final = answerOf(turn, [[SUBMIT, submitted("APPROVE", 0)]]);
-  assert.ok(final.includes("review 完成：批准") && final.includes("只 review，没有合入") && final.includes(URL), final);
+  assert.ok(final.includes("review 完成：批准") && final.includes("只 review，没有合入"), final);
+  assert.ok(
+    final.split("\n").some((line) => line === URL),
+    final,
+  );
 });
 
 test("an acknowledged review still ends as one message", async () => {
