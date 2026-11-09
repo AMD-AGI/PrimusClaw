@@ -3,15 +3,13 @@
 
 /** A pull request named in a review request, and how one is read out of text (links and owner/repo#N). */
 
+import type { PullRef } from "../claw/model.js";
+
 /** What a mention is replaced with in a marked text: ⟦0⟧, ⟦1⟧, ... (the Teams adapter writes it; the domain reads it). */
 export const MARK_OPEN = "⟦";
 export const MARK_CLOSE = "⟧";
 
-export interface PullRef {
-  readonly owner: string;
-  readonly repo: string;
-  readonly number: number;
-}
+export type { PullRef };
 
 export type PullKey = string;
 

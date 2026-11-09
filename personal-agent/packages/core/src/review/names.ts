@@ -7,26 +7,14 @@
  */
 
 import { cpHead, squashSpaces } from "../text/py-text.js";
+import type { InboundMention, RosterMember } from "../ports/surface.js";
 import { MARK_CLOSE, MARK_OPEN } from "./pull-ref.js";
 import { casefold, codePoints, flat, unique } from "./text/unicode.js";
 
 /** One person @mentioned in a message: the channel's id for them, their directory id ('' not given) and display name. */
-export interface Mention {
-  readonly channelUserId: string;
-  readonly userId: string;
-  readonly name: string;
-}
+export type Mention = Pick<InboundMention, "channelUserId" | "userId" | "name">;
 
-/** One member of a group, as the channel's member list gives them. */
-export interface RosterMember {
-  readonly channelUserId: string;
-  readonly userId: string;
-  readonly name: string;
-  readonly givenName: string;
-  readonly surname: string;
-  readonly email: string;
-  readonly userPrincipalName: string;
-}
+export type { RosterMember };
 
 export const MAX_CANDIDATES = 5;
 

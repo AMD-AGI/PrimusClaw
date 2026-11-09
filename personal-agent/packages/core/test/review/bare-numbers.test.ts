@@ -16,7 +16,7 @@ const FORMS: readonly [string, number[] | undefined][] = [
   ["#245、#246", [245, 246]],
   ["PR #245 #246", [245, 246]],
   ["PrimusClaw PR #245和 #246", [245, 246]],
-  ["huirui0120", undefined],
+  ["linmei0120", undefined],
   ["claude-opus-5.5", undefined],
   ["&#160;", undefined],
 ];
@@ -26,7 +26,7 @@ test("the forms a bare number is written in", () => {
 });
 
 const TEN = [248, 232, 243, 241, 238, 236, 233, 234, 237, 235];
-const ROHAN_TEN = "请 huirui 帮我review并合入PrimusClaw PR 248 232 243 241 238 236 233 234 237 235";
+const ROHAN_TEN = "请 linmei 帮我review并合入PrimusClaw PR 248 232 243 241 238 236 233 234 237 235";
 
 const ENDS: readonly [string, number[], number[]][] = [
   [ROHAN_TEN, TEN, []],
@@ -65,7 +65,7 @@ test("a list in any mix of separators is one group", () => {
     ["PrimusClaw PR 245和246和247", [245, 246, 247]],
   ];
   for (const [text, numbers] of mixed) {
-    const groups = bareGroups(`请 huirui 帮我review并合入${text}`);
+    const groups = bareGroups(`请 linmei 帮我review并合入${text}`);
     assert.deepEqual(
       groups.flatMap((g) => g.numbers),
       numbers,
@@ -76,15 +76,10 @@ test("a list in any mix of separators is one group", () => {
 });
 
 test("the repository word and whether the numbers are explicit", () => {
-  const [glued] = bareGroups("请huirui帮我review并合入PrimusClaw PR 245和246");
-  assert.equal(glued?.repo, "PrimusClaw");
-  assert.equal(glued?.explicit, true);
-  const [owned] = bareGroups("合入 AMD-AGI/PrimusClaw 245");
-  assert.deepEqual([owned?.repo, owned?.explicit, owned?.numbers], ["AMD-AGI/PrimusClaw", false, [245]]);
-  assert.deepEqual(
-    bareGroups("合入PR 245").map((g) => [g.repo, g.explicit]),
-    [["", true]],
-  );
+  const read = (text: string) => bareGroups(text).map((g) => [g.repo, g.explicit, g.numbers]);
+  assert.deepEqual(read("请linmei帮我review并合入PrimusClaw PR 245和246"), [["PrimusClaw", true, [245, 246]]]);
+  assert.deepEqual(read("合入 AMD-AGI/PrimusClaw 245"), [["AMD-AGI/PrimusClaw", false, [245]]]);
+  assert.deepEqual(read("合入PR 245"), [["", true, [245]]]);
 });
 
 test("links, owner/repo#N and mentions are not read as bare numbers", () => {
