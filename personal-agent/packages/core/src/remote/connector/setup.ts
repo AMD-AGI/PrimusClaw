@@ -11,7 +11,6 @@
  * Nothing here talks to Claw or to a chat.
  */
 import type { ConnectSteps, ConnectorSetupWords } from "../../remote-view/setup.js";
-import type { Reported } from "../../remote-view/reported.js";
 import type { Connector } from "../model.js";
 import { recordOf, textOf } from "../fields.js";
 import { connectorSetupText } from "../../locales/connector-setup.js";
@@ -132,13 +131,10 @@ export function upgradeText(lang: Lang, command: string = UPGRADE_COMMAND): stri
  * One line under a machine whose connector Claw says is old (`version_status`), with the command that upgrades it; else null. The
  * command is this module's, never text from the connector list.
  */
-export function versionNote(connector: Reported, lang: Lang = "en"): string | null {
-  const status = connector["version_status"];
+export function versionNote(connector: Pick<Connector, "version" | "versionStatus">, lang: Lang = "en"): string | null {
+  const status = connector.versionStatus;
   if (status !== "outdated" && status !== "unsupported") return null;
-  const version =
-    textOf(connector["version"])
-      .replace(/[^0-9A-Za-z.+-]/gu, "")
-      .slice(0, 40) || "?"; // (the connector named it)
+  const version = connector.version.replace(/[^0-9A-Za-z.+-]/gu, "").slice(0, 40) || "?"; // (the connector named it)
   const text = connectorSetupText.in(lang);
   const head = status === "unsupported" ? text.versionUnsupported({ version }) : text.versionOutdated({ version });
   return head + text.sep + upgradeText(lang);
@@ -162,7 +158,7 @@ export class ConnectorSetup implements ConnectorSetupWords {
   }
 
   versionNote(connector: Connector, lang: Lang): string | null {
-    return versionNote({ version: connector.version, version_status: connector.versionStatus }, lang);
+    return versionNote(connector, lang);
   }
 
   offlineHint(lang: Lang): string {

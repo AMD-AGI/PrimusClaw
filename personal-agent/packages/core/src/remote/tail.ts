@@ -7,8 +7,10 @@
  * or the agent going on by itself, which the events do not tell apart), the steps that have begun and not ended since then, and the
  * permission requests nobody has answered yet.
  */
-import type { RemoteStep, SseEvent } from "../remote-view/index.js";
-import { textOf } from "./fields.js";
+import type { SseEvent } from "../claw/model.js";
+import type { RemoteStep } from "../remote-view/index.js";
+import type { JsonObject } from "../json.js";
+import { recordOf, textOf } from "./fields.js";
 import { noteStep } from "./follow/steps.js";
 
 /** Events read per page of the replay; a shorter page is the last. */
@@ -42,9 +44,9 @@ export interface EventRow {
   readonly data: unknown;
 }
 
-/** The event a replayed row is, as the stream would have sent it. */
+/** The event a replayed row is, as the stream would have sent it (a `data` that is no object says nothing). */
 export function rowEvent(row: EventRow): SseEvent {
-  return { id: row.id, name: row.type, data: { data: row.data } };
+  return { id: row.id, name: row.type, data: { data: (recordOf(row.data) ?? {}) as JsonObject } };
 }
 
 /** The rows of a session's events folded into its tail, step by step. */

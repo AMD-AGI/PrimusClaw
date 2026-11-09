@@ -121,11 +121,11 @@ export class Lists {
       const steps = agentsText([], await this.setup(key), lang);
       return { kind: "rich", text: (lead ? `${lead}\n\n` : "") + steps };
     }
-    const { raw: sessions } = await this.sessions(key);
+    const { sessions } = await this.sessions(key);
     const state = this.ctx.remoteState.attachedRemote(chatKey);
     const attached = state?.sessionId ?? null;
     const card = this.ctx.views.agents({
-      connectors: listed.raw,
+      connectors: listed.connectors,
       sessions,
       attached,
       now: this.now(),
@@ -141,7 +141,7 @@ export class Lists {
       own: this.ctx.sessionNames.remoteSessionAcps(chatKey),
     });
     if (!machines && card.listing.length === 0) {
-      const { text, listing } = sessionsText(sessions, listed.raw, attached, this.now(), lang);
+      const { text, listing } = sessionsText(sessions, listed.connectors, attached, this.now(), lang);
       this.ctx.remoteState.setRemoteListing(chatKey, listing);
       return { kind: "text", text: (lead ? `${lead}\n\n` : "") + text };
     }
@@ -157,10 +157,10 @@ export class Lists {
     lead = "",
   ): Promise<import("../ports/surface.js").OutMessage> {
     const listed = await this.machines(key);
-    const { raw: sessions } = await this.sessions(key);
+    const { sessions } = await this.sessions(key);
     const state = this.ctx.remoteState.attachedRemote(chatKey);
     const card = this.ctx.views.sessions({
-      connectors: listed.raw,
+      connectors: listed.connectors,
       sessions,
       attached: state?.sessionId ?? null,
       now: this.now(),

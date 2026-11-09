@@ -10,7 +10,8 @@
 import type { Lang } from "../locales/lang.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import { length } from "../remote-view/py-text.js";
-import { neutral, resumableOf } from "../remote-view/index.js";
+import { resumableOf } from "../remote-view/index.js";
+import { neutral } from "../remote-view/inert.js";
 import type { Agent, Connector, Session } from "./model.js";
 
 /** What a user types to name an agent: `machine/id`, inert, with no backtick to end the code span it is shown in. */

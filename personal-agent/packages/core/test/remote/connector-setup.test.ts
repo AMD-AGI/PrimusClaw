@@ -106,19 +106,19 @@ test("a pairing command is rebuilt from a code and a server of the expected shap
 });
 
 test("a version note names the upgrade command and only a version's own characters", () => {
-  assert.equal(versionNote({ version: "0.1.4", version_status: "current" }), null);
-  assert.equal(versionNote({ version_status: "unknown" }), null);
+  assert.equal(versionNote({ version: "0.1.4", versionStatus: "current" }), null);
+  assert.equal(versionNote({ version: "", versionStatus: "unknown" }), null);
   assert.ok(
     versionNote({
       version: "0.1.2",
-      version_status: "unsupported",
+      versionStatus: "unsupported",
     })?.startsWith("Its connector (0.1.2) is too old"),
   );
   assert.ok(
     versionNote({
       version: "0.1.3`$(id)`",
-      version_status: "outdated",
+      versionStatus: "outdated",
     })?.startsWith("Its connector (0.1.3id) is out of date."),
   );
-  assert.ok(versionNote({ version_status: "outdated" }, "zh")?.startsWith("连接器版本 ? 较旧"));
+  assert.ok(versionNote({ version: "", versionStatus: "outdated" }, "zh")?.startsWith("连接器版本 ? 较旧"));
 });

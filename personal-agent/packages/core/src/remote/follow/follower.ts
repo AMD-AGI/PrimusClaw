@@ -19,9 +19,10 @@
  *   so a worker that restarts delivers what was waiting, once.
  */
 import { ClawError } from "../../claw/errors.js";
+import type { SseEvent } from "../../claw/model.js";
 import { errorName } from "../../errors.js";
 import type { RemotePermissionRepository } from "../../ports/store/remote.js";
-import type { RemoteStep, RemoteTurnState, SseEvent } from "../../remote-view/index.js";
+import type { RemoteStep, RemoteTurnState } from "../../remote-view/index.js";
 import { actionIdOf, filled } from "../tail.js";
 import { Inbox, TIMED_OUT } from "./inbox.js";
 import { BurstSpeaker, type SpeakerDeps } from "./speaker.js";

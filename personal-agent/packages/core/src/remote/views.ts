@@ -9,7 +9,7 @@
 import type { Lang } from "../locales/lang.js";
 import type { OutMessage } from "../ports/surface.js";
 import type { Conversation } from "../remote-view/conversations.js";
-import type { Reported } from "../remote-view/reported.js";
+import type { Agent, Connector, Session } from "./model.js";
 import type { ConnectorSetupWords } from "../remote-view/setup.js";
 import type { WindowView } from "./window/view.js";
 
@@ -67,8 +67,8 @@ export interface Listed {
 }
 
 export interface AgentsInput {
-  readonly connectors: readonly Reported[];
-  readonly sessions: readonly Reported[];
+  readonly connectors: readonly Connector[];
+  readonly sessions: readonly Session[];
   readonly attached: string | null;
   readonly now: number;
   readonly lead: string;
@@ -79,8 +79,8 @@ export interface AgentsInput {
 }
 
 export interface SessionsInput {
-  readonly connectors: readonly Reported[];
-  readonly sessions: readonly Reported[];
+  readonly connectors: readonly Connector[];
+  readonly sessions: readonly Session[];
   readonly attached: string | null;
   readonly now: number;
   readonly lang: Lang;
@@ -107,7 +107,7 @@ export interface RemoteViews {
   window(input: WindowInput): { readonly message: OutMessage; readonly takesInput: boolean };
   agents(input: AgentsInput): Listed;
   sessions(input: SessionsInput): Listed;
-  machineChoice(connector: Reported, agents: readonly Reported[], token: string, path: string, lang: Lang): OutMessage;
+  machineChoice(connector: Connector, agents: readonly Agent[], token: string, path: string, lang: Lang): OutMessage;
   modes(
     sessionId: string,
     current: string,
@@ -130,8 +130,8 @@ export interface RemoteViews {
     lang: Lang,
   ): OutMessage;
   takeoverConfirm(
-    connector: Reported,
-    agent: Reported,
+    connector: Connector,
+    agent: Agent,
     entry: Conversation,
     lang: Lang,
     view: string,

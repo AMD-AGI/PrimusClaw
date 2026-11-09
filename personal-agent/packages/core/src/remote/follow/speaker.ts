@@ -15,6 +15,7 @@ import {
   guardHeads,
   signed,
 } from "../../direct-chat/direct-chat.js";
+import type { SseEvent } from "../../claw/model.js";
 import { errorName } from "../../errors.js";
 import type { JsonObject } from "../../json.js";
 import type { Lang } from "../../locales/lang.js";
@@ -27,7 +28,6 @@ import { type Conversation, type OutMessage, richMessage, textMessage } from "..
 import {
   type RemoteStep,
   type RemoteTurnState,
-  type SseEvent,
   TERMINAL_CLOSED,
   answerParts,
   recoveredLine,
