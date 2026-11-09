@@ -11,7 +11,7 @@ const WS_RUN = new RegExp(`[${WS}]+`, "gu");
 const LEADING = new RegExp(`^[${WS}]+`, "u");
 const TRAILING = new RegExp(`[${WS}]+$`, "u");
 const ASTRAL = /[\uD800-\uDFFF]/;
-const LINE_BREAK = new RegExp("\\r\\n|[\\n\\r\\v\\f\\x1c\\x1d\\x1e\\x85\\u2028\\u2029]");
+const LINE_BREAKS = new Set(["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]);
 
 /** Python `str.strip()`. */
 export function strip(text: string): string {
@@ -33,10 +33,34 @@ export function squash(text: string): string {
 
 /** Python `str.splitlines()`. */
 export function splitlines(text: string): string[] {
-  if (text === "") return [];
-  const lines = text.split(LINE_BREAK);
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charAt(i);
+    if (!LINE_BREAKS.has(ch)) continue;
+    lines.push(text.slice(start, i));
+    if (ch === "\r" && text.charAt(i + 1) === "\n") i += 1;
+    start = i + 1;
+  }
+  if (start < text.length) lines.push(text.slice(start));
   return lines;
+}
+
+function isControl(code: number): boolean {
+  return code <= 0x1f || code === 0x7f;
+}
+
+/** Whether `text` has a control character (U+0000-U+001F or U+007F). */
+export function hasControl(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) if (isControl(text.charCodeAt(i))) return true;
+  return false;
+}
+
+/** `text` with every control character replaced by a blank. */
+export function controlsToBlanks(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) out += isControl(text.charCodeAt(i)) ? " " : text.charAt(i);
+  return out;
 }
 
 /** Python `len(text)`. */

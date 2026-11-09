@@ -7,9 +7,8 @@
  * from it); `defang` keeps a JSON value whole but inert; `lit` is `neutral` for a card TextBlock, which reads markdown.
  */
 import { redactText } from "./pending-redact.js";
-import { clipWithEllipsis, orEmpty, pyStr, squash } from "./py-text.js";
+import { clipWithEllipsis, controlsToBlanks, orEmpty, pyStr, squash } from "./py-text.js";
 
-const CONTROL = /[\u0000-\u001f\u007f]/g;
 const MARKDOWN = /([\\`*_[\]<])/g;
 
 /** `text` for a card TextBlock, which reads markdown: its markup characters escaped, so that `__init__.py` is not bold. */
@@ -20,7 +19,7 @@ export function plain(text: string): string {
 /** One short line of untrusted text, safe in a card or a list: control characters gone, credentials masked, `[`/`]`/`<`/`>`
  * swapped for look-alikes, then clipped to `limit` characters with an ellipsis. */
 export function neutral(text: unknown, limit = 200): string {
-  const flat = redactText(squash(orEmpty(text).replace(CONTROL, " ")))
+  const flat = redactText(squash(controlsToBlanks(orEmpty(text))))
     .replaceAll("[", "(")
     .replaceAll("]", ")")
     .replaceAll("<", "‹")

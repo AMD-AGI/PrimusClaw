@@ -7,11 +7,9 @@
  */
 import { neutral } from "./inert.js";
 import { ROOT_MAX, ROOTS_MAX } from "./limits.js";
-import { strip } from "./py-text.js";
+import { hasControl, strip } from "./py-text.js";
 import type { RemoteAgent, RemoteConnector } from "./pending-model.js";
 import { list } from "./reported.js";
-
-const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** `kind` is an opaque label the connector reports; a client picks an icon from it. Unknown kinds get a neutral one. */
 const KINDS: readonly (readonly [prefix: string, label: string, icon: string])[] = [
@@ -27,7 +25,7 @@ export interface KindLabel {
 
 /** The icon and label of a connector's agent `kind`. */
 export function kindLabel(kind: unknown): KindLabel {
-  const word = strip(typeof kind === "string" ? kind : kind ? String(kind) : "").toLowerCase();
+  const word = strip(typeof kind === "string" ? kind : "").toLowerCase();
   for (const [prefix, label, icon] of KINDS) {
     if (word.startsWith(prefix)) return { icon, label };
   }
@@ -47,7 +45,7 @@ export function agentRoots(agent: RemoteAgent): string[] {
       typeof root === "string" &&
       strip(root) !== "" &&
       Array.from(root).length <= ROOT_MAX &&
-      !CONTROL.test(root) &&
+      !hasControl(root) &&
       !roots.includes(root)
     ) {
       roots.push(root);

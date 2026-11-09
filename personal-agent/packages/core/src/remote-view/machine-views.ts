@@ -103,7 +103,7 @@ export function approvalInput(agent: RemoteAgent, slot: number, lang: Lang): App
   if (!choice) return null;
   const words = remoteText.in(lang);
   return {
-    id: `appr${slot}`,
+    id: `appr${String(slot)}`,
     label: words.approval,
     value: choice.default,
     choices: [
@@ -181,7 +181,10 @@ export function modeView(
     lang,
     title: words.whichMode,
     value: current !== null && modes.includes(current) ? current : (modes[0] ?? ""),
-    choices: modes.map((m) => ({ title: neutral(m, 40) + (unattended.has(m) ? words.unattendedSuffix : ""), value: m })),
+    choices: modes.map((m) => ({
+      title: neutral(m, 40) + (unattended.has(m) ? words.unattendedSuffix : ""),
+      value: m,
+    })),
     setMode: remoteButton(words.setMode, "set_mode", null, { session_id: sessionId }),
     back: remoteButton(words.backButton, "row", null, { session_id: sessionId }),
   };

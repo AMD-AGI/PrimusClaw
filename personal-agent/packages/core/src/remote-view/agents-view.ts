@@ -169,6 +169,20 @@ function offlineAgent(agent: RemoteAgent, lang: Lang): AgentsItem {
   return { kind: "subtle", text };
 }
 
+/** What a machine's heading says: its name, online or since when it is offline, its connector's version and health. */
+function machineHeading(connector: RemoteConnector, input: AgentsInput, separator: boolean): AgentsItem[] {
+  const lang = input.lang ?? "en";
+  const words = remoteText.in(lang);
+  const state = connector.online ? words.online : offlineSince(connector, lang);
+  const items: AgentsItem[] = [{ kind: "machine", text: `**${lit(connector.name, 80)}** (${state})`, separator }];
+  const note = input.setup.versionNote(connector, lang);
+  if (note) items.push({ kind: "versionNote", text: note });
+  const problems = healthLines(connector, lang);
+  if (problems.length > 0) items.push({ kind: "problems", lines: problems });
+  if (connector.agents.length === 0) items.push({ kind: "subtle", text: words.noAgentReported });
+  return items;
+}
+
 function machineItems(input: AgentsInput, joined: Joined): AgentsItem[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
@@ -176,24 +190,12 @@ function machineItems(input: AgentsInput, joined: Joined): AgentsItem[] {
   let slot = 0;
   let more = 0;
   for (const connector of input.connectors) {
-    const online = connector.online;
-    const state = online ? words.online : offlineSince(connector, lang);
-    items.push({
-      kind: "machine",
-      text: `**${lit(connector.name, 80)}** (${state})`,
-      separator: slot > 0 || items.length > 0 || Boolean(input.lead),
-    });
-    const note = input.setup.versionNote(connector, lang);
-    if (note) items.push({ kind: "versionNote", text: note });
-    const problems = healthLines(connector, lang);
-    if (problems.length > 0) items.push({ kind: "problems", lines: problems });
-    const agents = connector.agents;
-    if (agents.length === 0) items.push({ kind: "subtle", text: words.noAgentReported });
-    for (const agent of agents) {
-      if (online && connector.connectorId && slot < AGENT_BLOCKS_MAX) {
+    items.push(...machineHeading(connector, input, slot > 0 || items.length > 0 || Boolean(input.lead)));
+    for (const agent of connector.agents) {
+      if (connector.online && connector.connectorId && slot < AGENT_BLOCKS_MAX) {
         items.push(agentBlock(connector, agent, slot, input, joined));
         slot += 1;
-      } else if (online) more += 1;
+      } else if (connector.online) more += 1;
       else items.push(offlineAgent(agent, lang));
     }
   }

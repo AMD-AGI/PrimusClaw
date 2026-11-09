@@ -81,7 +81,9 @@ const PHASE_WORDS = {
 
 function phaseWords(phase: StatusPhase, lang: Lang): string {
   // (said only while attached: no words for detached/ended)
-  return Object.hasOwn(PHASE_WORDS, phase) ? remoteText.in(lang)[PHASE_WORDS[phase as keyof typeof PHASE_WORDS]] : phase;
+  return Object.hasOwn(PHASE_WORDS, phase)
+    ? remoteText.in(lang)[PHASE_WORDS[phase as keyof typeof PHASE_WORDS]]
+    : phase;
 }
 
 /** One small line with the link to open a session (or the list) in a window of its own; null with no link. */
@@ -99,6 +101,18 @@ function titleOf(input: StatusInput, attached: boolean, named: string, where: st
   return input.phase === "detached" ? words.titleDetached : words.titleEnded;
 }
 
+/** The lines only a chat still in the session gets: how it stands, the unattended note, which messages stay with the
+ * assistant, and the session's own page. */
+function attachedLines(input: StatusInput, lang: Lang): StatusLine[] {
+  const words = remoteText.in(lang);
+  const lines: StatusLine[] = [{ kind: "phase", text: words.status + phaseWords(input.phase, lang) }];
+  if (input.unattended) lines.push({ kind: "unattended", text: words.unattendedNote });
+  lines.push({ kind: "assistant", text: clawyLine(lang, input.bot) });
+  const window = windowText(input.page ?? "", lang);
+  if (window) lines.push({ kind: "window", text: window });
+  return lines;
+}
+
 function linesOf(input: StatusInput, attached: boolean, named: string, where: string): StatusLine[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
@@ -108,11 +122,7 @@ function linesOf(input: StatusInput, attached: boolean, named: string, where: st
   if (!attached) lines.push({ kind: "lastSession", text: plain(words.lastSession({ where })) });
   const folder = lit(input.cwd, 120) + (input.mode ? words.modeSuffix({ mode: lit(input.mode, 40) }) : "");
   if (strip(folder)) lines.push({ kind: "folder", text: folder });
-  if (attached) lines.push({ kind: "phase", text: words.status + phaseWords(input.phase, lang) });
-  if (input.unattended && attached) lines.push({ kind: "unattended", text: words.unattendedNote });
-  if (attached) lines.push({ kind: "assistant", text: clawyLine(lang, input.bot) });
-  const window = attached ? windowText(input.page ?? "", lang) : null;
-  if (window) lines.push({ kind: "window", text: window });
+  if (attached) lines.push(...attachedLines(input, lang));
   lines.push({ kind: "updated", text: words.updated({ stamp: utcClock(input.at) }) });
   return lines;
 }

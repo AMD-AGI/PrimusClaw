@@ -83,7 +83,7 @@ export class RemoteLiveView {
 
   /** The few short lines of Teams' floating status while the agent works: where its plan stands, a step that failed last, and
    * the step running now. Its words are streamed into the answer's bubble, not into the status. */
-  statusLines(_isPrivate: boolean): string[] {
+  statusLines(): string[] {
     const lines: string[] = [];
     const plan = this.blocks.find((b) => b.kind === "plan")?.text ?? "";
     if (plan) lines.push(plan);

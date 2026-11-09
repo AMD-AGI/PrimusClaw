@@ -24,7 +24,12 @@ import { ago } from "./time.js";
 
 export type AgentRow =
   /** A session of the user's, numbered (`row-session-N`), and its buttons. */
-  | { readonly kind: "session"; readonly number: number; readonly line: string; readonly buttons: readonly RemoteButton[] }
+  | {
+      readonly kind: "session";
+      readonly number: number;
+      readonly line: string;
+      readonly buttons: readonly RemoteButton[];
+    }
   | { readonly kind: "more"; readonly text: string }
   /** A conversation the agent offers (`row-conv-N`, N counted over the whole card). */
   | { readonly kind: "conversation"; readonly rowId: number; readonly line: string }
@@ -90,7 +95,11 @@ function hasEntries(agent: RemoteAgent, connectorId: string, active: readonly Re
 }
 
 /** An agent with nothing to list is left out when another agent of the machine has something: one "no session" line at most. */
-function listedAgents(agents: readonly RemoteAgent[], connectorId: string, active: readonly RemoteSession[]): RemoteAgent[] {
+function listedAgents(
+  agents: readonly RemoteAgent[],
+  connectorId: string,
+  active: readonly RemoteSession[],
+): RemoteAgent[] {
   const listed = agents.filter((a) => hasEntries(a, connectorId, active));
   const quiet = agents.filter((a) => !listed.includes(a));
   if (listed.length > 0 && quiet.length > 0) return listed;
@@ -106,7 +115,7 @@ function sessionRows(mine: readonly RemoteSession[], input: SessionsInput, count
     const sid = session.sessionId;
     counters.listing.push(sid);
     const when = ago(input.now, session.updatedAt, lang);
-    let line = `${counters.listing.length}. ${lit(session.cwd, 80)}` + (when ? ` · ${when}` : "");
+    let line = `${String(counters.listing.length)}. ${lit(session.cwd, 80)}` + (when ? ` · ${when}` : "");
     if (waiting.has(sid)) line = words.waitingApprovalMark({ mark: MARKS.needsYou }) + line;
     const close = remoteButton(words.close, "close", "destructive", { session_id: sid, view: "sessions" });
     const current = sid === input.attached; // (no switching to it: it is the one; closing it is still one tap)
@@ -119,7 +128,8 @@ function sessionRows(mine: readonly RemoteSession[], input: SessionsInput, count
         : [remoteButton(words.switchToIt, "attach", "positive", { session_id: sid, view: "sessions" }), close],
     });
   }
-  if (mine.length > SESSIONS_PER_AGENT) rows.push({ kind: "more", text: words.olderSessions({ n: mine.length - SESSIONS_PER_AGENT }) });
+  if (mine.length > SESSIONS_PER_AGENT)
+    rows.push({ kind: "more", text: words.olderSessions({ n: mine.length - SESSIONS_PER_AGENT }) });
   return rows;
 }
 
@@ -142,12 +152,21 @@ function conversationRows(
   } else if (entry.state === WATCH_STATE) {
     // shared with the phone: typed into, or watched; never taken from the terminal
     const { title, style } = shareButton(agent, entry, lang);
-    rows.push({ kind: "note", text: shareNote(agent, entry, lang) }, { kind: "buttons", buttons: [remoteButton(title, "new", style, fields)] });
+    rows.push(
+      { kind: "note", text: shareNote(agent, entry, lang) },
+      { kind: "buttons", buttons: [remoteButton(title, "new", style, fields)] },
+    );
   }
   return rows;
 }
 
-function agentItem(connector: RemoteConnector, agent: RemoteAgent, active: readonly RemoteSession[], input: SessionsInput, counters: Counters): SessionsItem {
+function agentItem(
+  connector: RemoteConnector,
+  agent: RemoteAgent,
+  active: readonly RemoteSession[],
+  input: SessionsInput,
+  counters: Counters,
+): SessionsItem {
   const lang = input.lang ?? "en";
   const waiting = input.waiting ?? new Set<string>();
   const { icon, label } = kindLabel(agent.kind);
@@ -169,7 +188,12 @@ function agentItem(connector: RemoteConnector, agent: RemoteAgent, active: reado
   return { kind: "agent", rowId: counters.agents, title: `${icon} ${lit(agent.name, 60) || label}`, rows };
 }
 
-function machineItems(connector: RemoteConnector, active: readonly RemoteSession[], input: SessionsInput, counters: Counters): SessionsItem[] {
+function machineItems(
+  connector: RemoteConnector,
+  active: readonly RemoteSession[],
+  input: SessionsInput,
+  counters: Counters,
+): SessionsItem[] {
   const lang = input.lang ?? "en";
   const words = remoteText.in(lang);
   const online = connector.online;

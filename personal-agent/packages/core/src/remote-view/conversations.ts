@@ -7,11 +7,9 @@
  */
 import { neutral } from "./inert.js";
 import { RESUMABLE_READ_MAX, RESUME_REF_MAX, ROOT_MAX, SUBFOLDER_MAX, WAITING_FOR_MAX } from "./limits.js";
-import { length, strip } from "./py-text.js";
+import { hasControl, length, strip } from "./py-text.js";
 import type { RemoteAgent } from "./pending-model.js";
 import { type Reported, list, objOrNull } from "./reported.js";
-
-const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** What a connector says about a conversation: no process runs it, a terminal has it open, a session of the chat's holds it. */
 export type ConversationState = "idle" | "live" | "attached" | "unknown";
@@ -43,11 +41,11 @@ const STATES = new Set<string>(["idle", "live", "attached"]);
 const ACTIVITIES = new Set<string>(["working", "waiting", "idle"]);
 
 function usableRef(ref: unknown): ref is string {
-  return typeof ref === "string" && ref.length > 0 && length(ref) <= RESUME_REF_MAX && !CONTROL.test(ref);
+  return typeof ref === "string" && ref.length > 0 && length(ref) <= RESUME_REF_MAX && !hasControl(ref);
 }
 
 function usableCwd(cwd: unknown): cwd is string {
-  return typeof cwd === "string" && strip(cwd) !== "" && length(cwd) <= ROOT_MAX && !CONTROL.test(cwd);
+  return typeof cwd === "string" && strip(cwd) !== "" && length(cwd) <= ROOT_MAX && !hasControl(cwd);
 }
 
 function terminalFacts(item: Reported, state: ConversationState): Partial<Conversation> {
@@ -98,10 +96,9 @@ const DRIVE = /^[A-Za-z]:/;
 /** A subfolder typed under a root as `a/b` (separators `/` or `\`, `.` parts dropped); "" when nothing was typed; null for anything
  * that is not a plain path below the root: absolute, `~`, a drive, a `..` part, a control character, too long. */
 export function cleanSubfolder(text: unknown): string | null {
-  const sub = strip(typeof text === "string" ? text : text ? String(text) : "");
+  const sub = strip(typeof text === "string" ? text : "");
   if (!sub) return "";
-  if (length(sub) > SUBFOLDER_MAX || CONTROL.test(sub) || "/\\~".includes(sub.charAt(0)) || DRIVE.test(sub))
-    return null;
+  if (length(sub) > SUBFOLDER_MAX || hasControl(sub) || "/\\~".includes(sub.charAt(0)) || DRIVE.test(sub)) return null;
   const parts = sub.split(/[\\/]+/).filter((p) => p && p !== ".");
   return parts.includes("..") ? null : parts.join("/");
 }

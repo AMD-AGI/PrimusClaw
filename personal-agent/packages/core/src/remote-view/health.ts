@@ -38,7 +38,9 @@ function problemsOf(agent: RemoteAgent): { problems: readonly unknown[]; checked
 
 /** The machine's problems, failures first, a machine-wide one once, and when they were checked; null when no agent reports
  * health (an older connector: unknown, not fine). */
-export function machineProblems(connector: RemoteConnector): { problems: MachineProblem[]; checked: string | null } | null {
+export function machineProblems(
+  connector: RemoteConnector,
+): { problems: MachineProblem[]; checked: string | null } | null {
   const out: MachineProblem[] = [];
   const seen = new Set<string>();
   let reported = false;
@@ -53,11 +55,7 @@ export function machineProblems(connector: RemoteConnector): { problems: Machine
       const code = problem?.["code"];
       if (!problem || typeof code !== "string" || !CODE.test(code)) continue;
       const machineWide = problem["scope"] === "machine";
-      const key = JSON.stringify([
-        machineWide ? null : agent.agentId,
-        code,
-        slice(orEmpty(problem["detail"]), 0, 200),
-      ]);
+      const key = JSON.stringify([machineWide ? null : agent.agentId, code, slice(orEmpty(problem["detail"]), 0, 200)]);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({

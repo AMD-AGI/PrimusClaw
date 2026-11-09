@@ -81,7 +81,11 @@ export function sessionFacts(
 }
 
 /** `/agents` as text. With no machine: the exact commands that connect one (markdown, for a rich message). */
-export function agentsText(connectors: readonly RemoteConnector[], setup: ConnectorSetupWords, lang: Lang = "en"): string {
+export function agentsText(
+  connectors: readonly RemoteConnector[],
+  setup: ConnectorSetupWords,
+  lang: Lang = "en",
+): string {
   if (connectors.length === 0) return setup.connectMarkdown(lang);
   const words = remoteText.in(lang);
   const blocks = [`**${words.yourAgents}**`];

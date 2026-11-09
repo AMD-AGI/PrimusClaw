@@ -35,8 +35,8 @@ export function answerParts(text: string, lang: Lang = "en"): string[] {
   const body = redactText(strip(text)) || remoteText.in(lang).noTextOutput;
   const chunks = splitAtParagraphs(body, ANSWER_CHARS_MAX);
   if (chunks.length <= ANSWER_MESSAGES_MAX) return chunks;
-  const kept = chunks.slice(0, ANSWER_MESSAGES_MAX);
-  kept[kept.length - 1] += remoteText.in(lang).answerShortened;
+  const kept = chunks.slice(0, ANSWER_MESSAGES_MAX - 1);
+  kept.push(`${chunks[ANSWER_MESSAGES_MAX - 1] ?? ""}${remoteText.in(lang).answerShortened}`);
   return kept;
 }
 

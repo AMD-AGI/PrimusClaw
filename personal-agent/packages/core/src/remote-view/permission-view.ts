@@ -10,7 +10,14 @@ import type { Lang } from "../locales/lang.js";
 import { remoteText } from "../locales/remote.js";
 import type { DecisionButton } from "./actions.js";
 import { defang, lit, neutral } from "./inert.js";
-import { type PermissionOption, buttonTitle, decidedVerdict, isPrimary, offersAlways, shownOptions } from "./options.js";
+import {
+  type PermissionOption,
+  buttonTitle,
+  decidedVerdict,
+  isPrimary,
+  offersAlways,
+  shownOptions,
+} from "./options.js";
 import { orEmpty } from "./py-text.js";
 import type { Reported } from "./reported.js";
 import { clock } from "./time.js";

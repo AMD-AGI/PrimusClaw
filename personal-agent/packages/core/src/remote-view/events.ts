@@ -194,7 +194,7 @@ function planLine(payload: Json): string | null {
   if (items.length === 0) return null;
   const done = items.filter((e) => e["status"] === "completed").length;
   const current = items.find((e) => e["status"] === "in_progress") ?? items.find((e) => e["status"] !== "completed");
-  let line = `\u{1f4cb} Plan: ${done} of ${items.length} done`;
+  let line = `\u{1f4cb} Plan: ${String(done)} of ${String(items.length)} done`;
   if (current && str(current["content"])) line += `, now: ${neutral(current["content"], PLAN_ITEM_MAX)}`;
   return line;
 }
