@@ -9,12 +9,14 @@
 
 import { reviewRequestText } from "../locales/review-request.js";
 import { decimalInt, pyStrip, squashSpaces } from "../text/py-text.js";
-import { type BareGroup, bareGroups } from "./bare-numbers.js";
-import { displayName, type Mention, mentionId, personOf, writtenIn } from "./names.js";
-import { MARK_CLOSE, MARK_OPEN, type PullRef, pullKey, pullsIn, keyParts, type PullKey } from "./pull-ref.js";
-import { MODEL_ID, type ReviewAsk, reviewAsk } from "./request-parse.js";
-import { wordHashNumbers } from "./text/scan.js";
-import { casefold, flat, unique } from "./text/unicode.js";
+import { type BareGroup, bareGroups } from "../review-text/bare-numbers.js";
+import { displayName, type Mention, mentionId, personOf, writtenIn } from "../review-text/names.js";
+import { MARK_CLOSE, MARK_OPEN, pullKey, pullsIn, keyParts, type PullKey } from "../review-text/pull-ref.js";
+import type { PullRef } from "../claw/model.js";
+import { MODEL_ID } from "../review-text/asks.js";
+import { type ReviewAsk, reviewAsk } from "./request-parse.js";
+import { wordHashNumbers } from "../review-text/text/scan.js";
+import { casefold, flat, unique } from "../review-text/text/unicode.js";
 
 export const INTENTS = ["review_merge", "review", "none"] as const;
 

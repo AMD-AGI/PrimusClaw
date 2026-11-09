@@ -29,7 +29,7 @@ export type Guard = Pick<Guardrails, "take" | "giveBack">;
 export type Audit = (event: string, fields: Readonly<Record<string, unknown>>) => void;
 
 /** The task slots a request's reviews may use (`Agent._admit_reviews`). */
-export interface ReviewSlots {
+export interface ReviewTaskSlots {
   readonly granted: number;
   readonly running: number;
   readonly limit: number;
@@ -41,7 +41,7 @@ export interface ReviewSlots {
 }
 
 /** A review turn the router started: `ended` settles when the turn has ended, whichever way. */
-export interface RunningTurn {
+export interface StartedReviewTurn {
   readonly ended: Promise<void>;
 }
 
@@ -63,7 +63,7 @@ export interface StartReviewTurn {
 /** What the chat the service runs in does for it. */
 export interface ReviewHost {
   /** Starts the review's turn; undefined when it did not start (the asker was told why). */
-  startTurn(request: StartReviewTurn): Promise<RunningTurn | undefined>;
+  startTurn(request: StartReviewTurn): Promise<StartedReviewTurn | undefined>;
   /** The usual onboarding of a group member who is not connected (`identity`: they connect at the identity service). */
   onboard(message: InboundMessage, sender: UserRef, conversation: Conversation, scope: string): Promise<void>;
   /** The steps that link a person's own Primus key (`/link`), after `lead`. */
@@ -71,7 +71,7 @@ export interface ReviewHost {
   /** The card that binds a person at the identity service, after `lead`. */
   connectIdentity(person: UserRef, conversation: Conversation, lead: string): Promise<void>;
   /** The task slots `count` reviews may use; undefined: no task limit here. */
-  admitReviews?(message: InboundMessage, sender: UserRef, count: number, modelKey: string): Promise<ReviewSlots>;
+  admitReviews?(message: InboundMessage, sender: UserRef, count: number, modelKey: string): Promise<ReviewTaskSlots>;
   /** '' when what waits for this person reaches their chat (their subscription made or mended first), else why not. */
   reviewerReach?(userId: string): Promise<string>;
 }

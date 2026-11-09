@@ -17,10 +17,10 @@ import type { Conversation, InboundMessage, UserRef } from "../../ports/surface.
 import type { ReviewTurnOptions, ReviewTurnOutcome } from "../../turn/runner.js";
 import { GithubConnect } from "../connect/github-connect.js";
 import type { ReviewHandoff } from "../handoff.js";
-import { pullKey } from "../pull-ref.js";
+import { pullKey } from "../../review-text/pull-ref.js";
 import { otherReviewers, reviewAsk } from "../request-parse.js";
 import { isReviewMode, type ReviewTurn } from "../review-turn.js";
-import { bareName, unique } from "../text/unicode.js";
+import { bareName, unique } from "../../review-text/text/unicode.js";
 import { GithubAccount } from "./account.js";
 import { say } from "./chat.js";
 import { HeldWrites } from "./confirm.js";

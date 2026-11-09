@@ -8,8 +8,8 @@
  */
 
 import type { AskerView } from "../claw/model.js";
-import { pullUrl, shortName } from "./pull-ref.js";
-import { oneLine } from "./names.js";
+import { pullUrl, shortName } from "../review-text/pull-ref.js";
+import { oneLine } from "../review-text/names.js";
 import { askerName, type ReviewTurn, reviewerName, viewFinished, viewWaitsForReviewer } from "./review-turn.js";
 import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
 

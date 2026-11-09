@@ -11,13 +11,14 @@
 import { errorName } from "../../errors.js";
 import { reviewStartText as t } from "../../locales/review-start.js";
 import type { InboundMessage } from "../../ports/surface.js";
-import { type PullRef, shortName } from "../pull-ref.js";
+import { shortName } from "../../review-text/pull-ref.js";
+import type { PullRef } from "../../claw/model.js";
 import { modelNote } from "../receipt.js";
 import { ALREADY, REVIEWS_STARTED_AT_ONCE, itemsNote, mergeLine, modelChosenNote, refusedText } from "../refusals.js";
 import { reviewPrompt } from "../prompts.js";
 import { DEFAULT_MODE, isReviewMode, type ReviewTurn } from "../review-turn.js";
 import { say } from "./chat.js";
-import type { ReviewDeps, RunningTurn } from "./deps.js";
+import type { ReviewDeps, StartedReviewTurn } from "./deps.js";
 import type { AskerFollow } from "./follow.js";
 import { modeOf } from "./identity.js";
 import type { ItemCards } from "./item-cards.js";
@@ -245,8 +246,12 @@ export class ReviewLaunch {
     this.follows.follow(followed, s.ctx.conversation);
   }
 
-  private async startTurn(s: Settled, review: ReviewTurn, message: InboundMessage): Promise<RunningTurn | undefined> {
-    let running: RunningTurn | undefined;
+  private async startTurn(
+    s: Settled,
+    review: ReviewTurn,
+    message: InboundMessage,
+  ): Promise<StartedReviewTurn | undefined> {
+    let running: StartedReviewTurn | undefined;
     try {
       try {
         running = await this.deps.host.startTurn({

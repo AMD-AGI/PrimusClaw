@@ -9,9 +9,9 @@
  */
 
 import { ClawError, ReviewsRefused, errorKind } from "../../claw/errors.js";
-import type { ReviewStart } from "../../claw/model.js";
-import { oneLine, displayName } from "../names.js";
-import { type PullRef, pullKey, shortName } from "../pull-ref.js";
+import type { ReviewStart, PullRef } from "../../claw/model.js";
+import { oneLine, displayName } from "../../review-text/names.js";
+import { pullKey, shortName } from "../../review-text/pull-ref.js";
 import {
   ALREADY,
   ONE_PULL,

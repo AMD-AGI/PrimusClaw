@@ -13,7 +13,7 @@ import type { AskerView } from "../../claw/model.js";
 import { errorName } from "../../errors.js";
 import type { JsonObject } from "../../json.js";
 import { type Conversation, type OutMessage, textMessage } from "../../ports/surface.js";
-import { displayName } from "../names.js";
+import { displayName } from "../../review-text/names.js";
 import {
   type Followed,
   entryStage,

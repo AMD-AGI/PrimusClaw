@@ -10,7 +10,8 @@
 import { z } from "zod";
 
 import { cpHead, pyStrip, squashSpaces } from "../text/py-text.js";
-import { type PullRef, pullRef } from "./pull-ref.js";
+import { pullRef } from "../review-text/pull-ref.js";
+import type { PullRef } from "../claw/model.js";
 
 export const MAX_PULLS_PER_REQUEST = 30;
 export const HELD_SAYS_MAX = 5;

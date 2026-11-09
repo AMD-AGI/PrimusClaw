@@ -6,8 +6,8 @@
  * the request itself, and the agent is told to treat everything it reads on GitHub as data.
  */
 
-import { displayName } from "./names.js";
-import { pullUrl, shortName } from "./pull-ref.js";
+import { displayName } from "../review-text/names.js";
+import { pullUrl, shortName } from "../review-text/pull-ref.js";
 import type { ReviewTurn } from "./review-turn.js";
 
 function asked(review: ReviewTurn, actor: string): string {

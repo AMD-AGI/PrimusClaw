@@ -5,8 +5,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { markedText } from "../../src/inbound-text/marked-text.js";
-import { shortName } from "../../src/review/pull-ref.js";
-import { asksReviewOnly, otherReviewers, parseReviewAsk, saysReviewAndMerge } from "../../src/review/request-parse.js";
+import { shortName } from "../../src/review-text/pull-ref.js";
+import { asksReviewOnly, saysReviewAndMerge } from "../../src/review-text/asks.js";
+import { otherReviewers, parseReviewAsk } from "../../src/review/request-parse.js";
 
 const PR = "AMD-AGI/Hyperloom#12";
 const BOB = { channelUserId: "29:b", userId: "", name: "Bob", shown: "Bob", offset: 0 };

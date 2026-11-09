@@ -6,7 +6,7 @@
  * the repositories it names: what decides whether the GitHub connect card is offered beside the answer.
  */
 
-import { isUpper } from "../text/unicode.js";
+import { isUpper } from "../../review-text/text/unicode.js";
 
 // A word for something on GitHub, bounded by anything that is not an ASCII letter ("的pr" has no word boundary in Unicode).
 const NOUN =

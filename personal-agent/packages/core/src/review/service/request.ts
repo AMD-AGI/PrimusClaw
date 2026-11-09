@@ -11,12 +11,19 @@ import { markedText } from "../../inbound-text/marked-text.js";
 import { quoteBlock } from "../../inbound-text/quote-block.js";
 import { reviewRequestText as t } from "../../locales/review-request.js";
 import type { InboundMessage, UserRef } from "../../ports/surface.js";
-import { type BareGroup, bareGroups, strayNumbers, writtenRepos, looksLikeRepo } from "../bare-numbers.js";
+import {
+  type BareGroup,
+  bareGroups,
+  strayNumbers,
+  writtenRepos,
+  looksLikeRepo,
+} from "../../review-text/bare-numbers.js";
 import { checkIntent } from "../intent-check.js";
-import { type Mention, namedWithin } from "../names.js";
-import { MARK_CLOSE, MARK_OPEN, pullsIn, keyOf, type PullKey } from "../pull-ref.js";
-import { asksReviewOnly, parseReviewAsk, type ReviewAsk, saysReviewAndMerge } from "../request-parse.js";
-import { bareName, unique } from "../text/unicode.js";
+import { type Mention, namedWithin } from "../../review-text/names.js";
+import { MARK_CLOSE, MARK_OPEN, pullsIn, keyOf, type PullKey } from "../../review-text/pull-ref.js";
+import { asksReviewOnly, saysReviewAndMerge } from "../../review-text/asks.js";
+import { parseReviewAsk, type ReviewAsk } from "../request-parse.js";
+import { bareName, unique } from "../../review-text/text/unicode.js";
 import type { ReviewDeps } from "./deps.js";
 
 /** A message as the request is read from it. */

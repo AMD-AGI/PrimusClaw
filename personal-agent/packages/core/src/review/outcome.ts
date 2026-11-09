@@ -10,7 +10,7 @@
 
 import type { PublicErrors } from "../public-error/public-errors.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
-import { oneLine, plainText } from "./names.js";
+import { oneLine, plainText } from "../review-text/names.js";
 
 /** What one confirmation flow says for what Claw holds: only these sentences differ between a merge and a review. */
 export interface HeldWords {

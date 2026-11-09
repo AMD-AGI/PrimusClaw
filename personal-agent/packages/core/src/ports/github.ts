@@ -9,7 +9,7 @@
 
 import type { NotBound } from "../plugins/token-exchange.js";
 import type { Result } from "../result.js";
-import type { PullRef } from "../review/pull-ref.js";
+import type { PullRef } from "../claw/model.js";
 
 /** The GitHub device flow ended without a token: 'unavailable' (GitHub did not answer sensibly), 'expired' (the code ran
  * out unused) or 'denied' (the person said no). Nothing but the reason is kept (no body, no code, no token). */

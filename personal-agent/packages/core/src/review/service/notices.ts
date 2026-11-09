@@ -8,15 +8,14 @@
  */
 
 import { errorKind } from "../../claw/errors.js";
-import type { WorkItem } from "../../claw/model.js";
+import type { WorkItem, PullRef } from "../../claw/model.js";
 import { errorName } from "../../errors.js";
 import { REACH_WORDS } from "../../locales/review-github.js";
 import type { Conversation, ConversationRef, UserRef } from "../../ports/surface.js";
-import { shortName } from "../pull-ref.js";
+import { shortName } from "../../review-text/pull-ref.js";
 import { queueReason, shorts } from "../refusals.js";
 import { askerName, type ReviewTurn, reviewerName } from "../review-turn.js";
 import { prSummaryLine } from "../summary.js";
-import type { PullRef } from "../pull-ref.js";
 import { personalChat, say } from "./chat.js";
 import { tokenFor } from "./identity.js";
 import type { ReviewDeps } from "./deps.js";

@@ -16,11 +16,11 @@ import {
 } from "../locales/review-receipt.js";
 import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import type { GithubOutcome } from "../turn/github-outcome.js";
-import { shortName, pullUrl } from "./pull-ref.js";
+import { shortName, pullUrl } from "../review-text/pull-ref.js";
 import { autoOf, type ReviewTurn, reviewerName } from "./review-turn.js";
 import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
-import { hasFileLine } from "./text/scan.js";
-import { pickLang } from "./text/unicode.js";
+import { hasFileLine } from "../review-text/text/scan.js";
+import { pickLang } from "../review-text/text/unicode.js";
 
 export const SUMMARY_CHARS = 1200;
 export const DM_SUMMARY_CHARS = 700;

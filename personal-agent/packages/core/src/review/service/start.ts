@@ -12,13 +12,14 @@ import { errorKind } from "../../claw/errors.js";
 import { reviewStartText as t } from "../../locales/review-start.js";
 import { describeRefusal, usable, type GithubState } from "../../ports/github.js";
 import type { Conversation, ConversationRef, InboundMessage, UserRef } from "../../ports/surface.js";
-import { oneLine } from "../names.js";
-import { type PullRef, shortName, slug } from "../pull-ref.js";
+import { oneLine } from "../../review-text/names.js";
+import { shortName, slug } from "../../review-text/pull-ref.js";
+import type { PullRef } from "../../claw/model.js";
 import { MAX_MODELS_LISTED, MAX_PULLS_PER_REQUEST, REVIEWS_STARTED_AT_ONCE, refusedText } from "../refusals.js";
 import type { ReviewAsk } from "../request-parse.js";
 import { type ReviewTurn, reviewTurn } from "../review-turn.js";
-import { bareName, pickLang } from "../text/unicode.js";
-import type { ReviewDeps, ReviewSlots } from "./deps.js";
+import { bareName, pickLang } from "../../review-text/text/unicode.js";
+import type { ReviewDeps, ReviewTaskSlots } from "./deps.js";
 import { clawFailure, tokenFor } from "./identity.js";
 import type { ReviewItems } from "./items.js";
 import type { Notices } from "./notices.js";
@@ -53,7 +54,7 @@ export interface Settled {
   readonly several: boolean;
   /** Gives back the per-person count of each review given to it that did not start. */
   readonly giveBack: (notStarted: readonly ReviewTurn[]) => void;
-  readonly slots: ReviewSlots | undefined;
+  readonly slots: ReviewTaskSlots | undefined;
 }
 
 export type Launch = (settled: Settled, held: PullRef[], handed: PullRef[]) => Promise<void>;
@@ -377,7 +378,7 @@ export class ReviewChecks {
     refused: [PullRef, string][],
     giveBack: (notStarted: readonly ReviewTurn[]) => void,
     modelKey: string,
-  ): Promise<{ reviews: ReviewTurn[]; slots: ReviewSlots | undefined }> {
+  ): Promise<{ reviews: ReviewTurn[]; slots: ReviewTaskSlots | undefined }> {
     if (!reviews.length || this.deps.host.admitReviews === undefined) return { reviews, slots: undefined };
     const needed = Math.min(reviews.length, REVIEWS_STARTED_AT_ONCE);
     const slots = await this.deps.host.admitReviews(ctx.message, ctx.sender, needed, modelKey);

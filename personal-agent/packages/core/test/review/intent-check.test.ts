@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { checkIntent, pullsWritten } from "../../src/review/intent-check.js";
-import { pullKey, pullRef, pullsIn, shortName } from "../../src/review/pull-ref.js";
+import { pullKey, pullRef, pullsIn, shortName } from "../../src/review-text/pull-ref.js";
 
 const H1 = "AMD-AGI/Hyperloom#1";
 const TEXT = `请 Bob 帮我 review 合入 ${H1}`;

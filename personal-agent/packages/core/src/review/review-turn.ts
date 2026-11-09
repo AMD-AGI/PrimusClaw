@@ -7,12 +7,11 @@
  * the pull request's one-line summary as it learns them.
  */
 
-import type { AskerView, ReviewStart } from "../claw/model.js";
+import type { AskerView, ReviewStart, PullRef } from "../claw/model.js";
 import type { JsonObject } from "../json.js";
 import type { ConversationRef } from "../ports/surface.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
-import { displayName } from "./names.js";
-import type { PullRef } from "./pull-ref.js";
+import { displayName } from "../review-text/names.js";
 
 export type ReviewMode = "high_risk_confirm" | "fully_auto";
 export const DEFAULT_MODE: ReviewMode = "high_risk_confirm";

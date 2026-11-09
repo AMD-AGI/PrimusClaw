@@ -7,7 +7,8 @@
  * confirmation never outlives what Claw would still accept.
  */
 
-import { type PullRef, slug } from "./pull-ref.js";
+import { slug } from "../review-text/pull-ref.js";
+import type { PullRef } from "../claw/model.js";
 
 export const CONFIRMATION_FALLBACK_SECONDS = 3600;
 export const CONFIRMATION_MAX_SECONDS = 24 * 3600;

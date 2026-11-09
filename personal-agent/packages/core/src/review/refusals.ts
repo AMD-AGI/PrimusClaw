@@ -10,8 +10,9 @@
 import type { ReviewsRefused } from "../claw/errors.js";
 import type { PublicErrors } from "../public-error/public-errors.js";
 import { cpHead } from "../text/py-text.js";
-import { oneLine } from "./names.js";
-import { type PullRef, shortName } from "./pull-ref.js";
+import { oneLine } from "../review-text/names.js";
+import { shortName } from "../review-text/pull-ref.js";
+import type { PullRef } from "../claw/model.js";
 import { type ReviewTurn, selfReview } from "./review-turn.js";
 import { modelId } from "./receipt.js";
 

@@ -21,10 +21,11 @@ import {
   namedIn,
   tokens,
   withoutMarkers,
-} from "../names.js";
-import { prShortPattern, prUrlPattern } from "../pull-ref.js";
-import { modelFieldPattern, type ReviewAsk } from "../request-parse.js";
-import { bareName } from "../text/unicode.js";
+} from "../../review-text/names.js";
+import { prShortPattern, prUrlPattern } from "../../review-text/pull-ref.js";
+import { modelFieldPattern } from "../../review-text/asks.js";
+import type { ReviewAsk } from "../request-parse.js";
+import { bareName } from "../../review-text/text/unicode.js";
 import type { ReviewDeps } from "./deps.js";
 
 /** A group's member list is read again after this long (names are matched against it). */
