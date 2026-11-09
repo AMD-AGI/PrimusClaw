@@ -48,8 +48,8 @@ function fakeExec(answers: Record<string, ExecResult> = {}) {
 }
 
 /** A process recorded as this home's script supervisor (pid and start time, as `supervise` records itself) that ends on SIGTERM. */
-async function fakeSupervisor(home: string, code = "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)") {
-  const p = spawn(process.execPath, ["-e", code], { stdio: "ignore" });
+async function fakeSupervisor(home: string, code = "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)", args: string[] = []) {
+  const p = spawn(process.execPath, ["-e", code, ...args], { stdio: "ignore" });
   const { processStart } = await import("../src/children.js");
   let start: string | null = null;
   for (let i = 0; i < 50 && !start; i++) { start = processStart(p.pid!); if (!start) await new Promise((r) => setTimeout(r, 20)); }
@@ -468,7 +468,7 @@ describe("service install / uninstall / status", () => {
     await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
     // Stands for the zombie: on SIGTERM it removes its pid file as supervise() does, but the process stays (kill(pid, 0) succeeds).
     const pidf = supervisorPidFile(ctx(home).c.dirs);
-    const old = await fakeSupervisor(home, `process.on('SIGTERM', () => require('fs').rmSync(${JSON.stringify(pidf)}, { force: true })); setInterval(() => {}, 1000)`);
+    const old = await fakeSupervisor(home, "process.on('SIGTERM', () => require('fs').rmSync(process.argv[1], { force: true })); setInterval(() => {}, 1000)", [pidf]);
     try {
       const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), exec: fakeExec().exec } }, { PATH: "/bin" });
       const t0 = Date.now();
