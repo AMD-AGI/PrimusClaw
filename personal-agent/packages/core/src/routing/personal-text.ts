@@ -185,13 +185,7 @@ export class PersonalText {
       await remote.prompt(request); // (refused by the agent's own rule: one remote turn at a time)
       return;
     }
-    // (the slot is taken under the person's lock, so a turn admitted meanwhile in another chat sees it)
-    const held = await this.ctx.admission.lock.run(chat.sender.id, async () => {
-      if (await this.ctx.admission.overLimit(chat, message.id, "remote_agent", "", key)) return false;
-      this.ctx.admission.hold(chat.sender.id);
-      return true;
-    });
-    if (!held) return;
+    if (!(await this.ctx.admission.admitRemote(chat, message.id, key))) return;
     try {
       await remote.prompt(request);
     } finally {

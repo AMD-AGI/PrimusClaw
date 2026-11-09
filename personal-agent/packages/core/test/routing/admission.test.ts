@@ -181,3 +181,14 @@ test("a keyed lock runs one at a time per key, in order", async () => {
   await assert.rejects(lock.run("k", () => Promise.reject(new Error("x"))));
   assert.equal(await lock.run("k", () => Promise.resolve(1)), 1);
 });
+
+test("a remote prompt's slot is taken before the person's lock is let go: the next admission sees it", async () => {
+  const w = setup(2);
+  // the next task asks the lock while the prompt's check is still under it; what it sees is what a turn in another chat would
+  const admitted = w.admission.admitRemote(w.chat(), "p1", "");
+  const seen = w.admission.lock.run(ALICE.id, () => Promise.resolve(w.admission.running(ALICE.id)));
+  assert.equal(await admitted, true);
+  assert.equal(await seen, 1);
+  w.admission.letGo(ALICE.id);
+  assert.equal(w.admission.running(ALICE.id), 0);
+});

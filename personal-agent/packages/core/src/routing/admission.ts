@@ -242,7 +242,18 @@ export class TaskAdmission {
     });
   }
 
-  /** A remote-agent prompt being sent holds a slot until it counts as running (taken under the person's lock). */
+  /**
+   * A remote-agent prompt being sent holds a slot until it counts as running: checked and taken under the person's lock,
+   * so a task admitted next (in another chat) sees it. False: refused (the person was told). The caller lets it go.
+   */
+  admitRemote(chat: Chat, activityId: string, key: string): Promise<boolean> {
+    return this.lock.run(chat.sender.id, async () => {
+      if (await this.overLimit(chat, activityId, "remote_agent", "", key)) return false;
+      this.hold(chat.sender.id);
+      return true;
+    });
+  }
+
   hold(userId: string): void {
     this.reserved.set(userId, (this.reserved.get(userId) ?? 0) + 1);
   }
