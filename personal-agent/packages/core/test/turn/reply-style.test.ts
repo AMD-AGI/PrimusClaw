@@ -246,7 +246,8 @@ it("test_a_chat_turns_links_stay_links_and_its_label_is_one_root_entity_teams_ta
   const final = finalOf(run);
   assert.equal(final.aiGenerated, true);
   assert.equal(final.citations, undefined);
-  assert.ok(!textOf(final).includes("[1]") && textOf(final).includes("https://github.com/o/r/pull/1"));
+  // the answer is the agent's words as written: its links are the markdown links it wrote, and nothing is added
+  assert.equal(textOf(final), "See [the PR](https://github.com/o/r/pull/1) and [the run](https://ci.test/r/2).");
 });
 
 it("test_only_what_an_agent_wrote_carries_the_label", async () => {
