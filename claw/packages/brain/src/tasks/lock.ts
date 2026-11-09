@@ -95,8 +95,8 @@ export function incarnationPod(env: NodeJS.ProcessEnv = process.env): string | u
 
 // In-process map of lockKey -> last-known NATS KV revision. Populated on a
 // successful acquireTaskLock, advanced on each successful refreshTaskLock
-// CAS, and consulted by releaseTaskLock when issuing its holder-checked
-// CAS delete. A brain pod handles one in-flight task per lockKey at a time
+// CAS, and dropped by releaseTaskLock before it reads the entry (the delete
+// CASes on the revision it reads, not on this one). A brain pod handles one in-flight task per lockKey at a time
 // (activeAbort guard above the call sites), so concurrent map mutation on
 // the same key is structurally impossible inside a single event loop.
 const lockRevisions = new Map<string, number>();
@@ -123,6 +123,23 @@ const lockProvenAt = new Map<string, number>();
 // kind of run a successor can be handed with this lock's `task` on it. Only
 // these stand down at the self-fence; any other lock keeps the proof deadline.
 const lockFenceable = new Set<string>();
+
+// Run -> the acquisition it took (LockValue.acq), recorded by the dispatcher
+// right after acquireTaskLock succeeds (`bindLockRun`). A run's release has to
+// name the acquisition it is giving back rather than read it from the per-key
+// map above: once a run's lock has been force-released (interrupt.ts) a later
+// run of the key may hold it, and the per-key map then describes that later
+// run. Keyed weakly by the run's AbortController, so nothing has to clear it.
+const runAcquisitions = new WeakMap<object, string>();
+
+/**
+ * Remember which acquisition `run` holds under `lockKey`. Call synchronously
+ * after a successful acquireTaskLock, before anything else can touch the key.
+ */
+export function bindLockRun(lockKey: string, run: object): void {
+  const acq = lockAcquisitions.get(lockKey);
+  if (acq !== undefined) runAcquisitions.set(run, acq);
+}
 
 /** Drop all local memory of a lock we no longer hold. */
 function forgetLock(lockKey: string): void {
@@ -737,76 +754,126 @@ function renewalFailed(lockKey: string, e: unknown): LockRenewal {
   return expired ? "expired" : "error";
 }
 
-export async function releaseTaskLock(lockKey: string): Promise<void> {
+/**
+ * How many times a release re-reads and retries its delete after the entry
+ * moved under it. Each retry needs a write of this very acquisition to have
+ * landed in between, and once the release has begun at most two can still
+ * arrive: the CAS of a renewal already sent, and the read-back adoption of a
+ * stored-but-unacknowledged one (see renewOverOwnCommittedWrite). Anything
+ * beyond that is somebody else writing, and the INV-13 check sees it first.
+ */
+const LOCK_RELEASE_ATTEMPTS = 4;
+
+/**
+ * Give the lock back, if it is still this acquisition's.
+ *
+ * The delete is a CAS on the revision just read, and a renewal of the very same
+ * acquisition can land between that read and the delete: the run's renewal timer
+ * is stopped before release, but a renewal it already sent is not, and the store
+ * answers it whenever it answers. That write moves the revision, the delete is
+ * refused, and the lock used to be left where it was -- held by nobody, renewed
+ * by nobody, and refused to every later run of the key until the bucket TTL
+ * reaped it (2026-11-09: a session's next message waited six minutes behind
+ * its own finished turn). So a refused delete re-reads the entry, and deletes
+ * again at the new revision when the entry is still ours.
+ *
+ * "Ours" is INV-13's question, asked again on every read: this process's holder
+ * id, and -- when this process knows which acquisition it is releasing -- the
+ * same acquisition id. Any other holder, a later acquisition of the key in this
+ * same process, or a value that does not parse, is left untouched.
+ *
+ * The local record is dropped before the first read, not after the delete, so
+ * that no renewal of this acquisition writes from here on: an in-flight renewal
+ * that answers now finds it gone and neither records nor adopts its write.
+ *
+ * `run` is the object the dispatcher bound the acquisition to (`bindLockRun`,
+ * the run's AbortController). Callers that have it pass it: without it the
+ * release can only assume the key's current local acquisition is the one being
+ * given back.
+ */
+export async function releaseTaskLock(lockKey: string, run?: object): Promise<void> {
   const key = `lock.${lockKey}`;
-  let entry;
-  try {
-    entry = await getKv().get(key);
-  } catch (e) {
-    logger.warn({ err: e, lockKey }, "lock.release.get_failed");
-    // Nothing was learned about the lock, and a release has no renewal left for
-    // the local revision to serve. Kept, it would sit there for the life of the
-    // process on any lockKey nothing acquires again -- a deleted session's.
-    forgetLock(lockKey);
-    return;
-  }
-  if (!entry || isTombstone(entry)) {
-    forgetLock(lockKey);
-    return; // reaped by TTL, by a competing brain, or by our own earlier release
-  }
+  const local = lockAcquisitions.get(lockKey);
+  // The acquisition being given back: the run's own when the caller names its
+  // run (a late release of a run whose lock was force-released must not be
+  // mistaken for the release of whichever run holds the key now), else
+  // whatever this process holds under the key.
+  const acq = (run !== undefined ? runAcquisitions.get(run) : undefined) ?? local;
+  // Only this acquisition's local record is ours to drop; a later run's stays.
+  if (local === undefined || local === acq) forgetLock(lockKey);
 
-  let value: Partial<LockValue> | null = null;
-  try {
-    value = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
-  } catch {
-    // Legacy plain-string lock from a pre-INV13 brain pod still in the
-    // cluster. Per decision 4A: do NOT attempt to identify the holder
-    // (BRAIN_ID can match by env), do NOT delete (would corrupt INV-13).
-    // The bucket TTL will reap it once the legacy owner stops renewing.
-    logger.warn({ lockKey }, "lock.release.legacy_value_format_skip");
-    metrics.onLockReleaseSkipped("legacy_format");
-    forgetLock(lockKey);
-    return;
-  }
-
-  if (value?.holderId !== BRAIN_HOLDER_ID) {
-    // INV-13 protection: the lock now belongs to someone else (e.g. our
-    // event loop hung past the bucket TTL and a new pod grabbed it). A
-    // plain delete here would create an unlocked window — refuse and
-    // record the diagnostic counter for alerting.
-    logger.warn(
-      {
-        lockKey,
-        ourHolderId: BRAIN_HOLDER_ID,
-        currentHolderId: value?.holderId,
-        lockAge: value?.acquiredAt ? Date.now() - value.acquiredAt : null,
-      },
-      "lock.release.skipped_not_holder_INV13_protected",
-    );
-    metrics.onLockReleaseSkipped("not_holder");
-    forgetLock(lockKey);
-    return;
-  }
-
-  try {
-    // CAS delete: NATS rejects if revision moved between our get() and
-    // delete() (i.e. a competitor wrote during that window). Cast required
-    // because @types/nats narrows the second arg to `Partial<MsgRequest>`
-    // without `previousSeq` in 2.29.x; the server-side option is real.
-    await getKv().delete(key, { previousSeq: entry.revision } as any);
-  } catch (e: any) {
-    const errMsg = String(e?.message ?? e);
-    if (errMsg.includes("wrong last sequence")) {
-      logger.warn(
-        { lockKey, rev: entry.revision },
-        "lock.release.cas_lost_INV13_protected",
-      );
-      metrics.onLockReleaseSkipped("cas_lost");
-    } else {
-      logger.error({ err: e, lockKey }, "lock.release.delete_failed");
+  for (let attempt = 1; ; attempt++) {
+    let entry;
+    try {
+      entry = await getKv().get(key);
+    } catch (e) {
+      // Nothing was learned about the lock. The local record is already gone,
+      // so nothing lingers for the life of the process on a key that nothing
+      // acquires again -- a deleted session's.
+      logger.warn({ err: e, lockKey, attempt }, "lock.release.get_failed");
+      return;
     }
-  } finally {
-    forgetLock(lockKey);
+    if (!entry || isTombstone(entry)) {
+      return; // reaped by TTL, by a competing brain, or by our own earlier release
+    }
+
+    let value: Partial<LockValue> | null = null;
+    try {
+      value = JSON.parse(sc.decode(entry.value)) as Partial<LockValue>;
+    } catch {
+      // Legacy plain-string lock from a pre-INV13 brain pod still in the
+      // cluster. Per decision 4A: do NOT attempt to identify the holder
+      // (BRAIN_ID can match by env), do NOT delete (would corrupt INV-13).
+      // The bucket TTL will reap it once the legacy owner stops renewing.
+      logger.warn({ lockKey }, "lock.release.legacy_value_format_skip");
+      metrics.onLockReleaseSkipped("legacy_format");
+      return;
+    }
+
+    const otherAcquisition = acq !== undefined && value?.acq !== acq;
+    if (value?.holderId !== BRAIN_HOLDER_ID || otherAcquisition) {
+      // INV-13 protection: the lock now belongs to someone else (e.g. our
+      // event loop hung past the bucket TTL and a new pod grabbed it, or a
+      // later run of the key in this process took it). A delete here would
+      // create an unlocked window -- refuse and record the diagnostic counter
+      // for alerting.
+      logger.warn(
+        {
+          lockKey,
+          ourHolderId: BRAIN_HOLDER_ID,
+          currentHolderId: value?.holderId,
+          otherAcquisition,
+          attempt,
+          lockAge: value?.acquiredAt ? Date.now() - value.acquiredAt : null,
+        },
+        "lock.release.skipped_not_holder_INV13_protected",
+      );
+      metrics.onLockReleaseSkipped("not_holder");
+      return;
+    }
+
+    try {
+      // CAS delete: NATS rejects if the revision moved between our get() and
+      // delete(). Cast required because @types/nats narrows the second arg to
+      // `Partial<MsgRequest>` without `previousSeq` in 2.29.x; the server-side
+      // option is real.
+      await getKv().delete(key, { previousSeq: entry.revision } as any);
+      if (attempt > 1) logger.info({ lockKey, rev: entry.revision, attempt }, "lock.release.retried_after_own_write");
+      return;
+    } catch (e: any) {
+      if (!isRevisionConflict(e)) {
+        logger.error({ err: e, lockKey }, "lock.release.delete_failed");
+        return;
+      }
+      if (attempt >= LOCK_RELEASE_ATTEMPTS) {
+        logger.warn({ lockKey, rev: entry.revision, attempt }, "lock.release.cas_lost_INV13_protected");
+        metrics.onLockReleaseSkipped("cas_lost");
+        return;
+      }
+      // The entry moved. Read it again: a write of our own (a renewal sent
+      // before the release began) is deleted at its new revision; anybody
+      // else's is refused above.
+    }
   }
 }
 

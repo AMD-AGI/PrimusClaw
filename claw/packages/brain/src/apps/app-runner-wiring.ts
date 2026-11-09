@@ -49,7 +49,7 @@ export type AppEventPublisher = (sessionId: string, event: Record<string, unknow
 export function publicLastExit(exit: AppRunRecord["last_exit"]): Record<string, unknown> | null {
   if (!exit) return null;
   const out: Record<string, unknown> = {};
-  for (const key of ["at", "cause", "final", "returncode", "stop_reason", "error"] as const) {
+  for (const key of ["at", "cause", "final", "returncode", "stop_reason", "error", "platform_losses"] as const) {
     if (exit[key] !== undefined) out[key] = exit[key];
   }
   return out;
