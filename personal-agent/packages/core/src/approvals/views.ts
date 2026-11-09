@@ -34,9 +34,44 @@ export interface QuestionCardModel {
   readonly note: string;
 }
 
+/** What replaces an approval card once it was answered (render.decided_card). */
+export interface ApprovalDecidedModel {
+  readonly tool: string;
+  /** "allow" or "deny". */
+  readonly action: string;
+  /** When it was answered, epoch seconds, shown as HH:MM in `zone`. */
+  readonly when: number;
+  readonly zone: string;
+}
+
+/** An approval or a question that ran out (render.expired_card). */
+export interface ApprovalExpiredModel {
+  readonly tool: string;
+}
+
+/** What replaces a question card once it was answered (render.answered_card). */
+export interface QuestionAnsweredModel {
+  /** (question id, answer), in the order of the questions. */
+  readonly answers: readonly (readonly [string, string])[];
+  readonly when: number;
+  readonly zone: string;
+}
+
+/** An approval card put back after a press that did not go through: the note, then Approve and Deny again. */
+export interface ApprovalAgainModel {
+  readonly text: string;
+  readonly tool: string;
+  readonly sessionId: string;
+  readonly toolUseId: string;
+}
+
 declare module "../ports/surface.js" {
   interface ViewMap {
     approval: ApprovalCardModel;
+    approvalAgain: ApprovalAgainModel;
+    approvalDecided: ApprovalDecidedModel;
+    approvalExpired: ApprovalExpiredModel;
     question: QuestionCardModel;
+    questionAnswered: QuestionAnsweredModel;
   }
 }
