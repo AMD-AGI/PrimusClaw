@@ -44,8 +44,6 @@ teams/tests/test_proactive_ux.py::test_an_http_base_never_produces_an_open_url -
 teams/tests/test_proactive_ux.py::test_approval_card_names_action_target_and_deadline_and_carries_no_credentials -> packages/teams/test/views-proactive.test.ts::approval card names action target and deadline and carries no credentials
 teams/tests/test_show_here.py::test_run_cards_carry_show_here_then_open_in_claw -> packages/teams/test/views-proactive.test.ts::run cards carry show here then open in claw
 teams/tests/test_show_here.py::test_digest_card_has_at_most_three_actions_and_show_here_is_among_them -> packages/teams/test/views-proactive.test.ts::digest card has at most three actions and show here is among them
-teams/tests/test_assistant_cards.py::test_the_cards_validate_and_are_one_column_with_at_most_three_actions -> packages/teams/test/views-assistant.test.ts::the cards validate and are one column with at most three actions
-teams/tests/test_assistant_cards.py::test_an_asked_line_never_fails_on_a_link_it_cannot_read -> packages/teams/test/views-assistant.test.ts::an asked line never fails on a link it cannot read
 teams/tests/test_assistant_citations.py::test_each_cited_source_is_a_source_card_with_clawys_own_summary -> packages/core/test/assistant/citations.test.ts::each cited source is a source card with clawys own summary
 teams/tests/test_assistant_citations.py::test_a_source_the_text_does_not_cite_or_that_is_not_well_formed_is_left_out -> packages/core/test/assistant/citations.test.ts::a source the text does not cite or that is not well formed is left out
 teams/tests/test_assistant_citations.py::test_an_address_that_carries_a_credential_is_never_a_card -> packages/core/test/assistant/citations.test.ts::an address that carries a credential is never a card
@@ -262,53 +260,78 @@ teams/tests/test_assistant_suggested.py::test_claws_replies_are_checked_again_a_
 teams/tests/test_assistant_suggested.py::test_none_with_the_switch_off_under_a_card_or_a_needs_you_notice -> packages/core/test/assistant/suggested.test.ts::none with the switch off under a card or a needs you notice
 teams/tests/test_assistant_suggested.py::test_a_reply_said_as_several_messages_has_the_buttons_on_its_last_only -> packages/core/test/assistant/suggested.test.ts::a reply said as several messages has the buttons on its last only
 teams/tests/test_assistant_suggested.py::test_the_receipts_final_carries_the_buttons_the_ai_label_and_the_thumbs -> packages/core/test/assistant/suggested.test.ts::the receipts final carries the buttons the ai label and the thumbs (words streamed)
+teams/tests/test_assistant_cards.py::test_a_result_that_waits_is_a_new_card_with_accept_for_that_version_and_stop -> packages/teams/test/assistant-cards-render.test.ts::a result that waits is a new card with accept for that version and stop
+teams/tests/test_assistant_cards.py::test_a_say_about_an_item_that_does_not_wait_for_acceptance_is_only_a_message -> packages/core/test/assistant/assistant-cards-port.test.ts::a say about an item that does not wait for acceptance is only a message
+teams/tests/test_assistant_cards.py::test_a_long_say_about_a_result_arrives_whole_and_its_card_follows_with_the_buttons -> packages/teams/test/assistant-cards-render.test.ts::a long say about a result arrives whole and its card follows with the buttons
+teams/tests/test_assistant_cards.py::test_accept_accepts_that_version_and_says_so_in_the_card_and_in_a_new_message -> packages/teams/test/assistant-cards-render.test.ts::accept accepts that version and says so in the card and in a new message
+teams/tests/test_assistant_cards.py::test_the_version_pressed_is_the_one_on_the_card_and_what_the_click_says_is_not_believed -> packages/core/test/assistant/assistant-cards-port.test.ts::the version pressed is the one on the card and what the click says is not believed
+teams/tests/test_assistant_cards.py::test_a_result_that_moved_on_is_not_accepted_and_the_card_for_the_new_one_is_a_new_message -> packages/teams/test/assistant-cards-render.test.ts::a result that moved on is not accepted and the card for the new one is a new message
+teams/tests/test_assistant_cards.py::test_the_old_cards_of_one_item_cannot_accept_what_they_never_showed -> packages/teams/test/assistant-cards-render.test.ts::the old cards of one item cannot accept what they never showed
+teams/tests/test_assistant_cards.py::test_an_item_that_is_no_longer_acceptable_says_where_it_stands_and_nothing_is_accepted -> packages/teams/test/assistant-cards-render.test.ts::an item that is no longer acceptable says where it stands and nothing is accepted
+teams/tests/test_assistant_cards.py::test_two_presses_on_one_card_carry_out_one -> packages/core/test/assistant/assistant-cards-port.test.ts::two presses on one card carry out one
+teams/tests/test_assistant_cards.py::test_a_card_pressed_again_after_it_was_used_is_refused_without_asking_claw -> packages/core/test/assistant/assistant-cards-port.test.ts::a card pressed again after it was used is refused without asking claw
+teams/tests/test_assistant_cards.py::test_a_card_that_is_forged_or_someone_elses_does_nothing -> packages/core/test/assistant/assistant-cards-port.test.ts::a card that is forged or someone elses does nothing
+teams/tests/test_assistant_cards.py::test_accept_on_a_card_that_never_had_it_is_refused -> packages/teams/test/assistant-cards-render.test.ts::accept on a card that never had it is refused
+teams/tests/test_assistant_cards.py::test_when_claw_cannot_take_it_the_card_comes_back_as_a_new_message_that_can_be_pressed -> packages/teams/test/assistant-cards-render.test.ts::when claw cannot take it the card comes back as a new message that can be pressed
+teams/tests/test_assistant_cards.py::test_when_claw_cannot_be_reached_the_card_can_be_pressed_again -> packages/teams/test/assistant-cards-render.test.ts::when claw cannot be reached the card can be pressed again
+teams/tests/test_assistant_cards.py::test_a_task_claw_does_not_know_any_more_is_said_so_and_the_card_is_done -> packages/core/test/assistant/assistant-cards-port.test.ts::a task claw does not know any more is said so and the card is done
+teams/tests/test_assistant_cards.py::test_a_rejected_key_is_told_what_to_do -> packages/core/test/assistant/assistant-cards-port.test.ts::a rejected key is told what to do
+teams/tests/test_assistant_cards.py::test_a_press_by_the_user_is_made_with_their_own_key_and_claw_is_the_second_check -> packages/core/test/assistant/assistant-cards-port.test.ts::a press by the user is made with their own key and claw is the second check
+teams/tests/test_assistant_cards.py::test_the_cards_still_work_when_the_switch_is_turned_off -> packages/core/test/assistant/assistant-cards-port.test.ts::the cards still work when the switch is turned off
+teams/tests/test_assistant_cards.py::test_stop_closes_the_item_stops_its_worker_and_says_so_twice -> packages/teams/test/assistant-cards-render.test.ts::stop closes the item stops its worker and says so twice
+teams/tests/test_assistant_cards.py::test_a_stop_that_closed_the_item_but_could_not_interrupt_its_worker_can_be_pressed_again -> packages/teams/test/assistant-cards-render.test.ts::a stop that closed the item but could not interrupt its worker can be pressed again
+teams/tests/test_assistant_cards.py::test_stop_on_an_item_that_is_done_another_way_says_so -> packages/core/test/assistant/assistant-cards-port.test.ts::stop on an item that is done another way says so
+teams/tests/test_assistant_cards.py::test_the_board_lists_three_columns_and_a_card_for_each_task_that_waits -> packages/teams/test/assistant-cards-render-board.test.ts::the board lists three columns and a card for each task that waits
+teams/tests/test_assistant_cards.py::test_a_board_card_accepts_like_any_other -> packages/core/test/assistant/assistant-cards-port.test.ts::a board card accepts like any other
+teams/tests/test_assistant_cards.py::test_an_empty_board_says_so -> packages/core/test/assistant/assistant-cards-port.test.ts::an empty board says so
+teams/tests/test_assistant_cards.py::test_a_long_column_shows_the_newest_and_counts_the_rest_and_at_most_five_cards_are_sent -> packages/teams/test/assistant-cards-render-board.test.ts::a long column shows the newest and counts the rest and at most five cards are sent
+teams/tests/test_assistant_cards.py::test_the_board_escapes_what_a_title_could_make_of_the_markdown -> packages/teams/test/assistant-cards-render-board.test.ts::the board escapes what a title could make of the markdown
+teams/tests/test_assistant_cards.py::test_the_board_says_what_is_wrong_when_it_cannot_be_read -> packages/core/test/assistant/assistant-cards-port.test.ts::the board says what is wrong when it cannot be read
+teams/tests/test_assistant_cards.py::test_the_board_is_not_there_for_a_chat_that_is_not_with_the_assistant -> packages/core/test/assistant/assistant-cards-port.test.ts::the board is not there for a chat that is not with the assistant
+teams/tests/test_assistant_cards.py::test_the_cards_validate_and_are_one_column_with_at_most_three_actions -> packages/teams/test/views-assistant.test.ts::the cards validate and are one column with at most three actions
+teams/tests/test_assistant_cards.py::test_a_say_of_many_short_lines_is_never_clipped_by_the_card_layout -> packages/teams/test/assistant-cards-render.test.ts::a say of many short lines is never clipped by the card layout
+teams/tests/test_assistant_cards.py::test_the_board_shows_the_reviews_the_person_asked_of_others_beside_their_own -> packages/teams/test/assistant-cards-render-board.test.ts::the board shows the reviews the person asked of others beside their own
+teams/tests/test_assistant_cards.py::test_a_claw_without_the_list_shows_the_board_as_before -> packages/core/test/assistant/assistant-cards-port.test.ts::a claw without the list shows the board as before
+teams/tests/test_assistant_cards.py::test_an_asked_line_never_fails_on_a_link_it_cannot_read -> packages/teams/test/views-assistant.test.ts::an asked line never fails on a link it cannot read
+teams/tests/test_board_retry_accept_all.py::test_the_board_offers_accept_all_and_a_retry_for_each_task_that_failed_or_was_stopped -> packages/teams/test/assistant-cards-render-board.test.ts::the board offers accept all and a retry for each task that failed or was stopped
+teams/tests/test_board_retry_accept_all.py::test_one_result_is_no_accept_all_and_no_failed_task_is_no_retry -> packages/core/test/assistant/board-port.test.ts::one result is no accept all and no failed task is no retry
+teams/tests/test_board_retry_accept_all.py::test_accept_all_accepts_what_the_board_showed_and_nothing_newer -> packages/core/test/assistant/board-port.test.ts::accept all accepts what the board showed and nothing newer
+teams/tests/test_board_retry_accept_all.py::test_accept_all_with_cards_of_someone_else_does_nothing -> packages/core/test/assistant/board-port.test.ts::accept all with cards of someone else does nothing
+teams/tests/test_board_retry_accept_all.py::test_retry_runs_a_failed_task_again_once -> packages/core/test/assistant/board-port.test.ts::retry runs a failed task again once
+teams/tests/test_board_retry_accept_all.py::test_retry_of_a_stopped_task_with_no_slot_left_says_why_and_changes_nothing -> packages/core/test/assistant/board-port.test.ts::retry of a stopped task with no slot left says why and changes nothing
+teams/tests/test_board_retry_accept_all.py::test_retry_on_a_claw_without_it_says_so -> packages/core/test/assistant/board-port.test.ts::retry on a claw without it says so
+teams/tests/test_board_retry_accept_all.py::test_a_result_that_names_a_pull_request_offers_to_watch_it_and_one_that_does_not_is_only_accept_and_stop -> packages/teams/test/assistant-cards-render-board.test.ts::a result that names a pull request offers to watch it and one that does not is only accept and stop
+teams/tests/test_board_retry_accept_all.py::test_watch_subscribes_the_pull_request_claw_recorded_as_the_person_signed_in -> packages/teams/test/assistant-cards-render-board.test.ts::watch subscribes the pull request claw recorded as the person signed in
+teams/tests/test_board_retry_accept_all.py::test_watch_without_a_reported_pull_request_or_without_sign_in_subscribes_nothing -> packages/core/test/assistant/board-port.test.ts::watch without a reported pull request or without sign in subscribes nothing
+teams/tests/test_board_retry_accept_all.py::test_turn_off_auto_reply_ends_every_watch_of_the_item_and_the_next_card_offers_it_again -> packages/teams/test/assistant-cards-render-board.test.ts::turn off auto reply ends every watch of the item and the next card offers it again
+teams/tests/test_board_retry_accept_all.py::test_turn_off_auto_reply_on_someone_elses_card_does_nothing -> packages/core/test/assistant/board-port.test.ts::turn off auto reply on someone elses card does nothing
+teams/tests/test_board_retry_accept_all.py::test_turned_on_before_this_worker_kept_track_the_press_says_it_was_on_and_offers_turn_off -> packages/teams/test/assistant-cards-render-board.test.ts::turned on before this worker kept track the press says it was on and offers turn off
+teams/tests/test_board_retry_accept_all.py::test_turned_off_from_the_chat_the_next_card_no_longer_says_it_is_on -> packages/teams/test/assistant-cards-render-board.test.ts::turned off from the chat the next card no longer says it is on
+teams/tests/test_board_retry_accept_all.py::test_a_watch_the_item_started_with_replies_off_is_turned_on_and_said_so_not_as_on_already -> packages/core/test/assistant/board-port.test.ts::a watch the item started with replies off is turned on and said so not as on already
+teams/tests/test_board_remote_ask.py::test_the_board_puts_a_waiting_request_to_the_person_with_its_own_buttons -> packages/core/test/assistant/board-port.test.ts::the board puts a waiting request to the person with its own buttons
+teams/tests/test_board_remote_ask.py::test_a_request_answered_run_out_or_never_shown_here_leaves_the_items_own_card -> packages/core/test/assistant/board-port.test.ts::a request answered run out or never shown here leaves the items own card
+teams/tests/test_conversation_language.py::test_the_conversation_decides_and_the_client_or_the_content_only_while_nothing_was_written -> packages/core/test/assistant/language-port.test.ts::the conversation decides and the client or the content only while nothing was written
+teams/tests/test_conversation_language.py::test_an_english_conversation_gets_an_english_board_of_chinese_titles_and_a_chinese_one_a_chinese_board -> packages/core/test/assistant/language-port.test.ts::an english conversation gets an english board of chinese titles and a chinese one a chinese board
+teams/tests/test_conversation_language.py::test_an_english_answer_that_names_a_chinese_title_is_followed_by_english_replies -> packages/core/test/assistant/language-port.test.ts::an english answer that names a chinese title is followed by english replies
+teams/tests/test_conversation_language.py::test_a_chinese_conversation_is_unchanged -> packages/core/test/assistant/language-port.test.ts::a chinese conversation is unchanged
+teams/tests/test_bash_approval_flow.py::test_held_then_denied_then_asked_again_and_approved -> packages/core/test/approvals/bash-approval-flow.test.ts::held then denied then asked again and approved
+teams/tests/test_bash_approval_flow.py::test_an_approval_card_works_for_as_long_as_brain_waits_and_not_longer -> packages/core/test/approvals/bash-approval-flow.test.ts::an approval card works for as long as brain waits and not longer
+teams/tests/test_bash_approval_flow.py::test_a_command_that_fits_is_shown_whole -> packages/teams/test/assistant-cards-render-approvals.test.ts::a command that fits is shown whole
+teams/tests/test_bash_approval_flow.py::test_a_long_command_keeps_its_start_and_its_end_where_the_push_is -> packages/teams/test/assistant-cards-render-approvals.test.ts::a long command keeps its start and its end where the push is
+teams/tests/test_bash_approval_flow.py::test_the_limits_are_these_numbers -> packages/teams/test/assistant-cards-render-approvals.test.ts::the limits are these numbers
+teams/tests/test_bash_approval_flow.py::test_the_rule_that_held_the_call_is_on_the_card_and_only_in_a_1_to_1_chat -> packages/teams/test/assistant-cards-render-approvals.test.ts::the rule that held the call is on the card and only in a 1 to 1 chat
+teams/tests/test_bash_approval_flow.py::test_a_label_cannot_smuggle_a_credential_onto_the_card -> packages/teams/test/assistant-cards-render-approvals.test.ts::a label cannot smuggle a credential onto the card
+teams/tests/test_bash_approval_flow.py::test_the_notification_card_shows_a_whole_command_as_its_target -> packages/teams/test/assistant-cards-render-approvals.test.ts::the notification card shows a whole command as its target
+teams/tests/test_bash_approval_flow.py::test_a_notification_for_a_shell_command_is_a_card_with_the_command_and_both_buttons -> packages/teams/test/assistant-cards-render-approvals.test.ts::a notification for a shell command is a card with the command and both buttons
+teams/tests/test_ask_user_question.py::test_the_question_is_a_card_and_the_answer_reaches_claw_and_the_run_goes_on -> packages/teams/test/assistant-cards-render-approvals.test.ts::the question is a card and the answer reaches claw and the run goes on
+teams/tests/test_ask_user_question.py::test_send_with_nothing_chosen_brings_the_question_back_and_sends_nothing -> packages/teams/test/assistant-cards-render-approvals.test.ts::send with nothing chosen brings the question back and sends nothing
+teams/tests/test_ask_user_question.py::test_only_the_asker_answers_in_a_group -> packages/teams/test/assistant-cards-render-approvals.test.ts::only the asker answers in a group
+teams/tests/test_ask_user_question.py::test_answers_are_the_chosen_labels_then_the_words_and_a_choice_the_card_never_had_is_ignored -> packages/core/test/approvals/ask-user-question.test.ts::answers are the chosen labels then the words and a choice the card never had is ignored
+teams/tests/test_ask_user_question.py::test_the_card_keeps_to_what_teams_shows -> packages/teams/test/assistant-cards-render-approvals.test.ts::the card keeps to what teams shows
 
 # teams/tests/test_approval_card.py::test_a_turn_shows_the_summary_in_the_users_language -> LATER: W4b turn engine shows the card (TurnApprovals); view/body covered above
 # teams/tests/test_approval_card.py::test_a_turn_from_an_older_brain_follows_the_language_of_what_the_user_wrote -> LATER: W4b turn engine
 # teams/tests/test_approval_card.py::test_a_group_turn_never_shows_the_input_and_keeps_the_summary -> LATER: W4b turn engine in a group
-# teams/tests/test_deliveries.py::test_a_delivery_is_read_only_from_a_successful_deliver_file_that_says_what_it_delivered -> LATER: W4b ports it (core/test/turn/deliveries.test.ts on personal-agent/w4b-turn); W5 keeps only assistantDeliveries
-# teams/tests/test_deliveries.py::test_an_image_is_shown_only_as_exactly_the_small_image_the_delivery_says -> LATER: W4b ports it (core/test/turn/deliveries.test.ts)
-# teams/tests/test_deliveries.py::test_names_and_captions_are_one_clipped_line -> LATER: W4b ports it (core/test/turn/deliveries.test.ts)
-# teams/tests/test_deliveries.py::test_sizes_read_like_a_file_manager -> LATER: W4b ports it (core/test/turn/deliveries.test.ts)
-# teams/tests/test_deliveries.py::test_the_card_names_the_file_says_its_size_and_caption_and_has_download -> LATER: delivery_card is W4b's view (views/turn deliveryCard); its card test goes with it
-# teams/tests/test_deliveries.py::test_an_image_that_came_along_is_in_the_card -> LATER: delivery_card is W4b's view (views/turn deliveryCard)
-# teams/tests/test_deliveries.py::test_the_link_is_claws_own_and_only_over_https -> LATER: tests ClawClient.delivery_link (the Claw client, not a card)
-# teams/tests/test_deliveries.py::test_a_delivered_small_image_is_a_card_after_the_answer_with_the_image_in_it -> LATER: needs the whole worker (a turn's stream); W4b
-# teams/tests/test_deliveries.py::test_a_file_with_no_image_is_a_card_with_download_alone -> LATER: needs the whole worker; W4b
-# teams/tests/test_deliveries.py::test_each_file_once_in_order_and_none_from_a_sub_agent_or_a_refusal -> LATER: needs the whole worker; W4b
-# teams/tests/test_deliveries.py::test_no_delivery_no_card -> LATER: needs the whole worker; W4b
-# teams/tests/test_deliveries.py::test_a_group_gets_one_line_with_the_link_and_nothing_of_the_file -> LATER: needs the whole worker (group chat turn); W4b
-# teams/tests/test_assistant_cards.py::test_a_say_of_many_short_lines_is_never_clipped_by_the_card_layout -> LATER: needs the assistant worker (say + card); the card-side rule is covered by views-assistant.test.ts::a work card lays every line out as a paragraph and clips what does not fit
-# teams/tests/test_assistant_cards.py::test_the_board_shows_the_reviews_the_person_asked_of_others_beside_their_own -> LATER: needs the assistant worker (/board over the fake Claw); the card side is covered by views-assistant.test.ts::the reviews asked of others stand beside the person's own, in their language
-# teams/tests/test_assistant_cards.py::test_a_result_that_waits_is_a_new_card_with_accept_for_that_version_and_stop -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_say_about_an_item_that_does_not_wait_for_acceptance_is_only_a_message -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_long_say_about_a_result_arrives_whole_and_its_card_follows_with_the_buttons -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_accept_accepts_that_version_and_says_so_in_the_card_and_in_a_new_message -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_version_pressed_is_the_one_on_the_card_and_what_the_click_says_is_not_believed -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_result_that_moved_on_is_not_accepted_and_the_card_for_the_new_one_is_a_new_message -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_old_cards_of_one_item_cannot_accept_what_they_never_showed -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_an_item_that_is_no_longer_acceptable_says_where_it_stands_and_nothing_is_accepted -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_two_presses_on_one_card_carry_out_one -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_card_pressed_again_after_it_was_used_is_refused_without_asking_claw -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_card_that_is_forged_or_someone_elses_does_nothing -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_accept_on_a_card_that_never_had_it_is_refused -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_when_claw_cannot_take_it_the_card_comes_back_as_a_new_message_that_can_be_pressed -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_when_claw_cannot_be_reached_the_card_can_be_pressed_again -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_task_claw_does_not_know_any_more_is_said_so_and_the_card_is_done -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_rejected_key_is_told_what_to_do -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_press_by_the_user_is_made_with_their_own_key_and_claw_is_the_second_check -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_cards_still_work_when_the_switch_is_turned_off -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_stop_closes_the_item_stops_its_worker_and_says_so_twice -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_stop_that_closed_the_item_but_could_not_interrupt_its_worker_can_be_pressed_again -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_stop_on_an_item_that_is_done_another_way_says_so -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_board_lists_three_columns_and_a_card_for_each_task_that_waits -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_board_card_accepts_like_any_other -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_an_empty_board_says_so -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_long_column_shows_the_newest_and_counts_the_rest_and_at_most_five_cards_are_sent -> LATER: needs the assistant worker (card side covered by views-assistant.test.ts::a long board section shows the newest, folds the rest of eight and counts the older ones)
-# teams/tests/test_assistant_cards.py::test_the_board_escapes_what_a_title_could_make_of_the_markdown -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_board_says_what_is_wrong_when_it_cannot_be_read -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_the_board_is_not_there_for_a_chat_that_is_not_with_the_assistant -> LATER: needs the assistant worker
-# teams/tests/test_assistant_cards.py::test_a_claw_without_the_list_shows_the_board_as_before -> LATER: needs the assistant worker
 # teams/tests/test_item_approvals.py::* (all 8) -> LATER: every test drives the worker (subscriptions, presses, quiet hours); the cards they show are approval_item / question_item, covered by the snapshots and views-proactive.test.ts
 # teams/tests/test_proactive_ux.py::test_in_quiet_* and every test from test_notices_during_quiet_hours_are_held... on -> LATER: quiet hours, pause, approval presses and brief need the worker (not card builders)
 # teams/tests/test_assistant_citations.py::test_a_long_reply_cites_in_each_message_what_its_own_words_cite -> LATER: needs say_activities (reply split into messages, root entity per message)
@@ -469,3 +492,17 @@ teams/tests/test_assistant_suggested.py::test_the_receipts_final_carries_the_but
 # teams/tests/test_assistant_files.py::test_a_file_name_said_back_draws_no_link_or_formatting -> LATER: W3 inbound (failed_line/unreadable_line/shown_name and to_teams_html)
 # teams/tests/test_assistant_files.py::test_a_delivered_image_carried_inline_passes_the_endpoint -> LATER: endpoint (link_api body cap) owner
 # teams/tests/test_assistant_live_status.py::test_the_steps_the_assistant_takes_have_plain_labels -> LATER: step labels (step_labels.lookup_label/label_for are not ported to TS; AssistantChat takes stepLabel injected)
+# teams/tests/test_conversation_language.py::test_english_sentences_that_are_commands_set_the_language_help_reports -> LATER: router W4 (English sentences routed as commands, and /help's "(now: English, auto)")
+# teams/tests/test_deliveries.py::test_a_delivery_is_read_only_from_a_successful_deliver_file_that_says_what_it_delivered -> LATER: W4b (a turn's deliver_file; ported in ported-tests/w4b.txt, core/test/turn/deliveries.test.ts)
+# teams/tests/test_deliveries.py::test_an_image_is_shown_only_as_exactly_the_small_image_the_delivery_says -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_names_and_captions_are_one_clipped_line -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_the_card_names_the_file_says_its_size_and_caption_and_has_download -> LATER: W4b (turn's delivery card; ported in ported-tests/w4b.txt, teams/test/turn-views.test.ts)
+# teams/tests/test_deliveries.py::test_an_image_that_came_along_is_in_the_card -> LATER: W4b (ported in ported-tests/w4b.txt, teams/test/turn-views.test.ts)
+# teams/tests/test_deliveries.py::test_sizes_read_like_a_file_manager -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_a_delivered_small_image_is_a_card_after_the_answer_with_the_image_in_it -> LATER: W4b (a turn's stream; ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_a_file_with_no_image_is_a_card_with_download_alone -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_each_file_once_in_order_and_none_from_a_sub_agent_or_a_refusal -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_no_delivery_no_card -> LATER: W4b (ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_a_group_gets_one_line_with_the_link_and_nothing_of_the_file -> LATER: W4b (group chat turn; ported in ported-tests/w4b.txt)
+# teams/tests/test_deliveries.py::test_the_link_is_claws_own_and_only_over_https -> LATER: W2 (ClawClient.delivery_link; ported in ported-tests as runtime/test/claw/sessions.test.ts)
+# teams/tests/test_bash_approval_flow.py::test_the_live_progress_never_shows_the_command_the_card_is_where_it_is_shown -> LATER: W4b (the turn's live progress message)
