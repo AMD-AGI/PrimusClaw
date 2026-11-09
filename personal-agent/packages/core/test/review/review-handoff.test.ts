@@ -317,3 +317,32 @@ test("the assistant's action event for a handoff goes to the review service and 
   } as never);
   assert.equal(await without.runAction("aad-a", handoffEvent({ eventId: "ev-3" }), run), "dropped");
 });
+
+test("an event id that is a number is claimed as python writes it, and an action that is not an object is no handoff", async () => {
+  const world = handoffWorld();
+  assert.deepEqual(await handBack(world, { ...handoffEvent(), event_id: 7 }, { ...handoffEvent(), event_id: 7 }), [
+    "delivered",
+    "dropped",
+  ]);
+  assert.equal(world.store.idempotency.claimProcessed("assistant-action:7"), false); // (claimed as "7")
+  assert.deepEqual(await handBack(world, { ...handoffEvent({ eventId: "ev-9" }), action: "review_for_other" }), [
+    "dropped",
+  ]);
+});
+
+test("a handoff whose failure cannot be said either is let go quietly", async () => {
+  const world = handoffWorld();
+  const service = world.service as unknown as { handoff: () => Promise<void> };
+  service.handoff = () => Promise.reject(new RangeError("boom"));
+  const surface = world.surface;
+  const open = surface.conversation.bind(surface);
+  surface.conversation = (ref) => {
+    const conversation = open(ref);
+    conversation.send = () => Promise.reject(new Error("Teams refused it"));
+    return conversation;
+  };
+  const event = handoffEvent();
+  (event.review as Record<string, unknown>).held_says = ["note"];
+  assert.deepEqual(await handBack(world, event), ["delivered"]);
+  assert.deepEqual(world.surface.of(ALICE_DM), []);
+});

@@ -91,3 +91,51 @@ test("a reviewer whose chat refuses the notice does not stop the review", async 
   assert.equal(world.claw.calls.filter((c) => c[0] === "startReviews").length, 1);
   assert.ok(saidIn(world.surface, CONV).includes("收到"), saidIn(world.surface, CONV));
 });
+
+test("a reason the worker has no words for is said as a missing subscription", async () => {
+  const world = reviewWorld();
+  withItems(world);
+  (world.deps.host as { reviewerReach?: (id: string) => Promise<string> }).reviewerReach = () =>
+    Promise.resolve("something_new");
+  await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  const said = saidIn(world.surface, CONV);
+  assert.ok(said.includes("Bob 现在收不到") && said.includes("通知订阅还没开通"), said);
+});
+
+test("a waiting review with no number from claw says how to answer by any number", async () => {
+  const world = reviewWorld();
+  withItems(world, { seqFrom: 0 });
+  world.claw.views.set("item-1", [{ status: "waiting_for_reviewer", waitingFor: "confirm_merge", verdict: "approve" }]);
+  await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  for (let i = 0; i < 3; i += 1) await world.clock.advance(30_000);
+  const bob = saidIn(world.surface, "personal:aad-b");
+  assert.ok(
+    bob.includes(`Alice请你代审的 ${PR} 在等你确认。`) &&
+      bob.includes("直接回复「批准 #编号」确认、「拒绝 #编号」不同意。"),
+    bob,
+  );
+});
+
+test("an asker whose key claw did not take and whose chat cannot be opened is told nothing more", async () => {
+  const world = reviewWorld();
+  const message = groupMessage(`请 {Bob} 帮我 review 合入 ${PR}`);
+  const conversation = world.surface.conversation(message.conversation);
+  await world.service.request({
+    message,
+    text: message.text,
+    sender: ALICE,
+    conversation,
+    scope: CONV,
+    lang: () => "zh",
+  });
+  const [turn] = world.started;
+  assert.ok(turn);
+  (world.surface as unknown as { reachable: Set<string> }).reachable = new Set(["aad-b"]);
+  await world.service.afterTurn(
+    turn.review,
+    "",
+    { moved: false, refusal: { status: 401, code: "invalid_api_key" }, ranModel: "", wrote: [], prSummary: "" },
+    conversation,
+  );
+  assert.deepEqual(world.surface.of("personal:aad-a"), []);
+});
