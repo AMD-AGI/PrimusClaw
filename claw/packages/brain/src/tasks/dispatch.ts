@@ -32,7 +32,7 @@ import {
 import { activeAbort, forgetRunAddresses, registerRunAddressesFor } from "./abort-registry.js";
 import { markSessionDeleted } from "../infra/deleted-sessions.js";
 import {
-  pickLockKey, acquireTaskLock, gateBindingError, lockContentionNakMs, readTaskLock,
+  pickLockKey, acquireTaskLock, bindLockRun, gateBindingError, lockContentionNakMs, readTaskLock,
 } from "./lock.js";
 import { releasePreGateLease, runHandleTask, resolvePoisonedTask } from "./runner.js";
 import { claimRun, failClaimedRun, type ClaimedRun } from "../clients/run-claim.js";
@@ -644,12 +644,15 @@ async function handleResolvedRequest(
     });
     return;
   }
+  // Before any await: the release of this run has to name this acquisition, not
+  // whichever one holds the key by the time it runs.
+  const abortCtrl = new AbortController();
+  bindLockRun(lockKey, abortCtrl);
   logger.info({ sessionId, lockKey, messageId }, "task.lock_acquired");
   await clearRetryPending(kv, sessionId, lockKey).catch((err) =>
     logger.warn({ err, sessionId, messageId }, "retry_pending.clear_failed"),
   );
 
-  const abortCtrl = new AbortController();
   activeAbort.set(lockKey, abortCtrl);
   // The names this run can be interrupted by, taken from the same request the
   // gate key was computed from. Nobody publishes to a gate key: the stop
