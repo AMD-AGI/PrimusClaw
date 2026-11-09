@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** Which capabilities a chat offers: what help shows and what the assistant may ask a chat to do. */
-import { words } from "../text/words.js";
+import { pyLower, pySplit } from "../text/py-text.js";
 import { CAPABILITIES, type Capability, type Part } from "./registry.js";
 
 export interface ChatShape {
@@ -40,8 +40,8 @@ const AGENT_ACTION_SUMMARY = "开发环境：切到某台机器上的 agent 会�
 
 /** The arguments of an `agent` action the assistant asked for are one of AGENT_ACTION_VERBS, with at most one reference. */
 export function agentActionAllowed(args: string): boolean {
-  const parts = words(args);
-  const verb = parts[0]?.toLowerCase();
+  const parts = pySplit(args);
+  const verb = parts[0] === undefined ? undefined : pyLower(parts[0]);
   if (verb === undefined || !(AGENT_ACTION_VERBS as readonly string[]).includes(verb)) return false;
   return parts.length <= (verb === "attach" ? 2 : 1);
 }
@@ -61,7 +61,7 @@ export function channelActions(parts: ReadonlySet<Part>): ChannelAction[] {
   const chat: ChatShape = { group: false, assistant: true, parts, understanding: true };
   for (const c of CAPABILITIES) {
     if (!c.action || !shown(c, chat)) continue;
-    const name = words(c.reaches)[0] ?? "";
+    const name = pySplit(c.reaches)[0] ?? "";
     if (name === "agent") {
       if (!out.some((action) => action.name === name)) {
         out.push({ name, usage: AGENT_ACTION_USAGE, summary: AGENT_ACTION_SUMMARY });

@@ -12,4 +12,7 @@ export * from "./clock.js";
 export * from "./logger.js";
 export * from "./random.js";
 export * from "./surface.js";
+export * from "./claw/index.js";
+export * from "./metrics.js";
+export * from "./secret-source.js";
 export * from "./routing.js";

@@ -5,7 +5,8 @@
  * Sentences about the remote-agent sessions themselves: switching the chat to an agent's session ("切到 robin-dev-pod 的 claude")
  * and the words that ask to switch or open a session while a chat is attached to one.
  */
-import { pyFullmatch } from "../text/words.js";
+import { pyFullmatch } from "../text/py-regex.js";
+import { pyLower } from "../text/py-text.js";
 import { flatten } from "./spoken.js";
 
 /** Python's Unicode `\b` before a word character: no word character behind, one ahead. */
@@ -69,7 +70,7 @@ export function switchCommand(text: string): string | null {
   for (const pattern of SWITCH) {
     const groups = pattern.exec(flat)?.groups;
     if (groups === undefined) continue;
-    const agent = (groups["a"] ?? "").toLowerCase().replace(/[\s-]*code$/u, "");
+    const agent = pyLower(groups["a"] ?? "").replace(/[\s-]*code$/u, "");
     const machine = groups["m"] ?? groups["m2"];
     return machine ? `/agent attach ${machine}/${agent}` : `/agent attach ${agent}`;
   }

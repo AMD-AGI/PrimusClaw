@@ -21,8 +21,7 @@ export const routingText = defineCatalog({
     nothingRunning: "Nothing is running.",
     noSessions: "There are no earlier sessions in this chat yet. Send me a message to start one.",
     sessionsUnreachable: "I could not check your sessions just now. Please try again in a minute.",
-    sessionsLead:
-      "Your last sessions. Show here puts one back as this chat's session, with everything it remembers.",
+    sessionsLead: "Your last sessions. Show here puts one back as this chat's session, with everything it remembers.",
     stopping: "Stopping the running task.",
     stopFirst: "A task is still running. Send /stop first, then /new.",
     newSession: "Started a new session. What would you like to do?",

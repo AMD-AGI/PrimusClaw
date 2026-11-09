@@ -1,0 +1,86 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-1",
+       "op": "stop",
+       "primusclaw": "work"
+      },
+      "style": "destructive",
+      "title": "停止",
+      "type": "Action.Execute",
+      "verb": "primusclaw.work_stop"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔍 代审中：#14 example-org/example-repo#292",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "facts": [
+       {
+        "title": "身⁠份",
+        "value": "Lin Mei"
+       },
+       {
+        "title": "方⁠式",
+        "value": "review，通过就合入"
+       },
+       {
+        "title": "模⁠型",
+        "value": "claude-opus-4-8"
+       }
+      ],
+      "type": "FactSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "点「停止」随时停下；已经合入的不会撤回。",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

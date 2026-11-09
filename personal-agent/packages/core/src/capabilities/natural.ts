@@ -6,7 +6,8 @@
  * `晚上 10 点到早上 8 点别打扰我` sets quiet hours just as `/quiet 22:00-08:00` does. A sentence is read only when it is the whole
  * message and says exactly that; anything else is a request for Claw, as before.
  */
-import { lstrip, lstripChars, pyFullmatch, rstripChars, strip, words } from "../text/words.js";
+import { pyLower, pyLstrip, pyRstrip, pySplit, pyStrip } from "../text/py-text.js";
+import { pyFullmatch } from "../text/py-regex.js";
 import * as P from "./phrases.js";
 import { sessionControl, switchCommand } from "./sessions-words.js";
 import { clockOf, flatten, NUM, phraseKey, PUNCT, spokenDuration, TIME } from "./spoken.js";
@@ -33,13 +34,13 @@ export function detachKey(key: string): string {
     changed = false;
     for (const lead of DETACH_LEAD) {
       if (rest.startsWith(lead) && rest.length > lead.length) {
-        rest = lstripChars(rest.slice(lead.length), PUNCT);
+        rest = pyLstrip(rest.slice(lead.length), PUNCT);
         changed = true;
       }
     }
     for (const tail of DETACH_TAIL) {
       if (rest.endsWith(tail) && rest.length > tail.length) {
-        rest = rstripChars(rest.slice(0, -tail.length), PUNCT);
+        rest = pyRstrip(rest.slice(0, -tail.length), PUNCT);
         changed = true;
       }
     }
@@ -191,7 +192,7 @@ function settingCommand(flat: string): string | null {
   const zone = firstMatch(flat, TIMEZONE_PATTERNS);
   if (zone !== null) return `/timezone ${zone["z"] ?? ""}`;
   const lang = firstMatch(flat, LANG_PATTERNS);
-  if (lang !== null) return `/lang ${LANG_WORDS[(lang["l"] ?? "").toLowerCase()] ?? ""}`;
+  if (lang !== null) return `/lang ${LANG_WORDS[pyLower(lang["l"] ?? "")] ?? ""}`;
   return null;
 }
 
@@ -225,10 +226,10 @@ function personal(text: string, flat: string, key: string): string {
 }
 
 function natural(text: string, group: boolean): string {
-  if (text === "" || lstrip(text).startsWith("/")) return text;
+  if (text === "" || pyLstrip(text).startsWith("/")) return text;
   const flat = flatten(text);
   const key = phraseKey(text);
-  const feedback = strip(FEEDBACK.exec(flat)?.groups?.["t"] ?? "");
+  const feedback = pyStrip(FEEDBACK.exec(flat)?.groups?.["t"] ?? "");
   if (feedback) return `/feedback ${feedback}`;
   if (FEEDBACK_ALONE.has(key)) return "/feedback";
   const command = lookUp(key, GROUP_PHRASES);
@@ -247,7 +248,7 @@ export function naturalCommand(text: string, group = false, off: ReadonlySet<str
   const command = natural(text, group);
   if (command === text) return text;
   if (command === "/stop" && off.has("stop it") && STOP_IT.has(phraseKey(text))) return text;
-  const parts = words(command.slice(1));
+  const parts = pySplit(command.slice(1));
   const first = parts[0] ?? "";
   return off.has(first) || off.has(parts.slice(0, 2).join(" ")) ? text : command;
 }

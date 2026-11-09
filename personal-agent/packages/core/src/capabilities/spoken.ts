@@ -5,8 +5,8 @@
  * Numbers, times of day and durations as people say them ("晚上 10 点", "八点半", "两小时"), for the sentences that set quiet hours,
  * a pause or the brief (`natural.ts`).
  */
-import { pySplit } from "../text/py-text.js";
-import { decimalInt, isDigits, pyFullmatch, rstripChars, strip, stripChars } from "../text/words.js";
+import { decimalInt, isDigits, pyLower, pyRstrip, pySplit, pyStrip } from "../text/py-text.js";
+import { pyFullmatch } from "../text/py-regex.js";
 
 /** The punctuation and spacing a whole message may carry at either end without changing what it says. */
 export const PUNCT = " \t\r\n。．.！!？?～~，,、；;：:\"'“”‘’（）()";
@@ -40,12 +40,12 @@ const TIME_PARTS = pyFullmatch(
 
 /** A whole message as a phrase to look up: lower case, no spaces between the words, no punctuation at either end. */
 export function phraseKey(text: string): string {
-  return pySplit(stripChars(text, PUNCT).toLowerCase()).join("");
+  return pySplit(pyLower(pyStrip(text, PUNCT))).join("");
 }
 
 /** A whole message as it is matched against a sentence pattern: no spacing at either end, no closing punctuation. */
 export function flatten(text: string): string {
-  return strip(rstripChars(strip(text), TRAILING));
+  return pyStrip(pyRstrip(pyStrip(text), TRAILING));
 }
 
 /** A number as written ("12", "十二", "两"); null when it is none. */
@@ -71,7 +71,7 @@ function afternoon(period: string, hour: number): number {
 
 /** '晚上 10 点' / '早上 8 点半' / '22:00' / '九点' as '22:00' / '08:30' / '22:00' / '09:00'; null when it is no time of day. */
 export function clockOf(text: string): string | null {
-  const groups = TIME_PARTS.exec(strip(text))?.groups;
+  const groups = TIME_PARTS.exec(pyStrip(text))?.groups;
   if (groups === undefined) return null;
   const hour = spokenNumber(groups["h"] ?? "");
   const minute = groups["half"] !== undefined ? 30 : spokenNumber(groups["m"] ?? groups["m2"] ?? "0");
@@ -94,7 +94,7 @@ const HOURS = ["个小时", "小时", "个钟头", "钟头"];
 
 /** A duration as `/pause` takes it ("30m", "2h", "1d") from a number and a unit as said; null when it is none. */
 export function spokenDuration(count: string, unit: string): string | null {
-  const lower = unit.toLowerCase();
+  const lower = pyLower(unit);
   if (count === "半") return HOURS.includes(lower) ? "30m" : null;
   const value = spokenNumber(count);
   if (value === null || value === 0) return null;

@@ -5,7 +5,7 @@
  * `/repo owner/name [branch]`. Claw is sent `config.repo = {url, branch?}` and clones it, so what is accepted is a name GitHub
  * itself allows and a branch git itself allows, and nothing else: no URL, no credential, no shell or option text.
  */
-import { words } from "../text/words.js";
+import { pyLower, pySplit } from "../text/py-text.js";
 
 export const REPO_HOST = "https://github.com";
 
@@ -34,7 +34,7 @@ export function validRepo(repo: string): boolean {
   if (slash < 0) return false;
   const owner = repo.slice(0, slash);
   const name = repo.slice(slash + 1);
-  return OWNER.test(owner) && NAME.test(name) && name !== "." && name !== ".." && !name.toLowerCase().endsWith(".git");
+  return OWNER.test(owner) && NAME.test(name) && name !== "." && name !== ".." && !pyLower(name).endsWith(".git");
 }
 
 /**
@@ -48,7 +48,7 @@ export function validBranch(branch: string): boolean {
 
 /** `owner/name` or `owner/name branch` (what follows `/repo`) to a pick; null for anything else. */
 export function parseRepo(args: string): RepoPick | null {
-  const parts = words(args);
+  const parts = pySplit(args);
   const [repo, branch] = parts;
   if (repo === undefined || parts.length > 2 || !validRepo(repo)) return null;
   if (branch !== undefined && !validBranch(branch)) return null;

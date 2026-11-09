@@ -5,5 +5,4 @@ dist/
 package-lock.json
 ported-tests/
 test-names.jsonl
-# Golden data generated from the Python worker: kept as generated (one row per line).
-test-support/data/routing/
+test-support/data/
