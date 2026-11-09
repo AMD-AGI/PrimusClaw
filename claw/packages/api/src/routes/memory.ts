@@ -61,7 +61,8 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     return userId;
   }
 
-  // Opt-in preference. Off by default; `available` says whether the deployment
+  // The user's preference: their own choice once they made one, the deployment's default
+  // (`CLAW_MEMORY_DEFAULT_ON`, off unless set) before; `available` says whether the deployment
   // has memory at all, so a UI can explain a dead toggle.
   app.get<{ Params: { userId: string } }>("/v1/users/:userId/memory-settings", async (req, reply) => {
     const userId = resolveUserId(req, reply);
