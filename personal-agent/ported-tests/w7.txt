@@ -361,3 +361,96 @@ teams/tests/test_github_review.py::test_nobody_is_messaged_when_the_reviewer_is_
 teams/tests/test_github_review.py::test_naming_oneself_for_a_pull_request_one_wrote_is_refused_too -> packages/core/test/review/author-checks.test.ts::naming oneself for a pull request one wrote is refused too
 teams/tests/test_github_review.py::test_the_author_is_read_from_the_pull_request_asked_about_without_any_credential -> packages/core/test/review/author-checks.test.ts::the author is read from the pull request asked about without any credential
 teams/tests/test_github_review.py::test_an_author_that_could_not_be_read_does_not_stop_the_request_claw_still_refuses_an_approval_by_the_author -> packages/core/test/review/author-checks.test.ts::an author that could not be read does not stop the request (rate limit)
+
+# LATER: tests of another line's code, to be ported by that line (the checker skips comment lines; one per Python test).
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_sends_the_exchanged_token_to_the_decision_route_and_refuses_a_key_before_anything_goes_out
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_a_refusal_from_claw_carries_the_reason_it_named
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_sends_the_exchanged_token_for_an_answer_in_a_session_that_acts_as_a_user_and_refuses_a_key_before_anything_goes_out
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_on_the_wire_the_token_is_the_only_credential_and_the_askers_key_rides_only_the_call_that_makes_the_session
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_carries_the_model_key_beside_the_token_and_nowhere_else
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_on_the_wire_a_held_review_is_answered_at_the_decision_route_with_the_reviewers_token_and_the_choice
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_hands_the_queued_answer_over_as_claw_sends_it
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review_many.py::test_on_the_wire_the_named_model_is_the_sessions_model_and_without_one_none_is_added
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review_many.py::test_the_client_lists_the_models_with_the_key_it_is_given_and_never_reads_a_failure_as_none
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_the_client_never_starts_reviews_with_an_api_key
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_an_answer_that_cannot_be_followed_is_not_understood
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_reviews_asked_of_someone_else_need_no_session_but_still_their_item_and_pull
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_the_client_never_asks_for_someone_else_without_their_key_or_with_a_key_as_their_token
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_a_refusal_is_read_from_the_whole_answer_not_from_its_first_200_characters
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_a_404_is_how_the_client_says_the_route_is_missing
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_review_items.py::test_replay_the_request_claw_gets_is_exactly_the_one_asked_for
+# LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_repo_scope.py::test_the_client_puts_the_setting_as_the_key_owner
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_turn_that_loses_the_exchange_midway_goes_on_with_the_token_it_has_never_with_a_key
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_when_claw_refuses_the_session_that_acts_as_the_reviewer_the_group_is_told_why_and_nothing_is_recorded
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_403_without_a_reason_on_an_ordinary_turn_is_still_the_linked_key_message
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_review_session_is_made_without_the_plugin_and_with_nothing_appended_to_the_prompt
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_review_turn_that_is_run_again_on_the_fallback_model_writes_to_the_review_session_without_the_plugin_too
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_message_the_turn_writes_into_an_existing_session_that_acts_as_a_user_goes_without_the_plugin
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_an_ordinary_chat_still_carries_the_plugin_and_the_reply_style
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_a_review_is_never_started_without_a_model_key
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_github_review.py::test_the_model_key_goes_with_the_message_that_runs_the_turn_again_on_the_fallback_model
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_one_message.py::test_no_run_completed_card_when_claw_closes_the_run_long_after_the_answer
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_one_message.py::test_a_review_stopped_after_its_result_keeps_the_result_in_its_one_message
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_one_message.py::test_a_review_that_fails_after_its_result_keeps_the_result_in_its_one_message
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_items.py::test_a_worker_with_the_plugin_follows_claws_session_and_never_makes_one_of_its_own
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_pr_summary.py::test_a_tool_answer_gives_it_only_for_the_review_and_merge_tools
+# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_model_default.py::test_an_ordinary_chat_still_sends_clawy_model
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_an_asker_without_a_key_of_her_own_can_stop_what_she_asked_of_bob
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_stop_on_the_card_stops_that_item_as_the_asker_and_says_so
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_stop_claw_refuses_because_github_has_the_merge_is_said_as_it_is
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_the_askers_stop_answered_with_her_view_alone_is_said_and_not_said_again
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_stop_refused_as_already_merged_is_said_from_the_askers_view
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_the_owners_whole_item_is_never_read_as_a_view
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_nobody_but_the_asker_can_press_stop
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_stopped_item_ends_its_followed_turn_as_stopped_not_as_a_failure
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_when_bobs_review_ends_alices_card_shows_how_and_has_no_stop
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_the_ended_card_says_how_it_ended
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_late_press_on_the_stop_of_an_ended_review_says_so_and_never_asks_claw
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_press_claw_answers_as_closed_says_the_review_ended_and_offers_no_new_stop
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_in_a_one_to_one_chat_the_card_there_is_closed_too
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_card_already_pressed_is_left_as_the_press_made_it
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_a_review_through_the_assistant_and_one_through_the_old_path_both_start_and_both_stop
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_one_message.py::test_a_review_item_ends_as_one_message_and_keeps_its_stop_card
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_a_review_session_is_remembered_as_one_that_acts_as_a_user_and_an_ordinary_one_is_not
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_an_approval_of_a_review_session_is_answered_with_the_exchanged_token
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_when_the_token_cannot_be_had_the_approval_card_stays_as_it_was_and_no_key_is_sent
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_a_person_who_is_not_connected_is_shown_the_way_to_connect_in_their_own_chat_and_never_in_the_group
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_what_claw_says_when_it_refuses_an_answer_in_a_session_that_acts_as_a_user_is_told_and_the_card_stays_usable
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_a_person_with_a_binding_answers_an_acting_session_with_the_token_and_an_ordinary_one_with_the_key
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_an_ordinary_session_of_a_person_with_only_a_linked_key_is_still_answered_with_that_key
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_review.py::test_a_click_by_someone_else_or_on_a_forged_card_is_refused_before_any_token_is_asked_for
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_ensure_all_fills_in_every_linked_persons_claw_user_id
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_a_recorded_claw_user_id_is_not_read_again
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_a_reviewer_whose_subscription_lacks_the_assistants_types_has_it_mended_when_handed_a_review
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_a_reviewer_without_a_subscription_gets_one_made_when_handed_a_review
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_why_a_reviewer_cannot_be_reached_is_said_in_order
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_a_reviewer_without_a_claw_user_id_is_not_reachable
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_a_reviewer_with_no_chat_known_is_not_reachable
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_reviewer_reach.py::test_the_agent_fills_claw_user_ids_on_its_timer
+# LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_github_connect.py::test_the_question_asked_again_is_a_message_of_its_own_on_the_assistant_path
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_an_event_for_a_person_with_no_chat_is_410_with_the_switch_on
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_without_the_switch_it_is_200_dropped_as_an_older_claw_needs
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_the_switch_is_read_from_teams_claw_events_gone
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_a_delivered_event_is_counted_with_how_long_it_took
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_an_event_that_did_not_reach_the_chat_is_not_counted
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_the_worker_app_counts_into_the_metrics_it_is_given_and_reads_the_switch
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_reviewer_reach.py::test_the_agent_checks_with_the_subscriptions_it_keeps
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_typed_answer.py::test_the_install_link_is_read_from_the_environment_and_must_be_https
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_review_model_default.py::test_the_worker_as_main_builds_it_runs_reviews_on_the_review_setting
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_review_model_default.py::test_the_worker_as_main_builds_it_keeps_chats_on_clawy_model
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_github_review.py::test_a_github_token_in_a_message_to_a_group_is_masked
+# LATER: W3 (link_api endpoint, metrics, settings, composition root, Teams surface) teams/tests/test_github_review.py::test_the_roster_reader_of_the_direct_connector_asks_teams_for_the_members
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_with_the_flag_off_the_request_is_chat_exactly_as_before
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_with_the_flag_off_slash_github_is_text_for_claw_and_help_is_unchanged
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_the_flag_needs_the_token_exchange
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_github_commands_are_refused_in_a_group_and_call_nothing
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_github_is_not_a_menu_word_so_a_bare_github_is_text_and_slash_github_is_unchanged
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_slash_github_is_answered_by_the_github_commands_also_while_the_chat_is_attached_to_a_remote_agent
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review_direct.py::test_files_sent_with_a_review_request_are_named_as_not_passed_on
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_connect.py::test_in_an_attached_chat_a_question_to_clawy_is_offered_the_card
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_connect.py::test_in_an_attached_chat_a_question_typed_to_the_session_is_not_offered_the_card
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_repo_scope.py::test_memory_is_switched_off_and_on_from_teams
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_repo_scope.py::test_a_memory_switch_claw_refuses_is_said_and_points_to_the_page
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_typed_answer.py::test_a_group_click_is_not_a_1on1_click
+# LATER: W4 (routing: feature flag, command scopes, menu words, attached chats, memory command, inbound files) teams/tests/test_github_review.py::test_a_member_with_no_key_who_asks_a_plain_question_gets_the_link_steps_even_with_the_exchange_on
