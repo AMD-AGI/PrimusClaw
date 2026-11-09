@@ -100,6 +100,9 @@ export class ClawHttp {
         ...(body === undefined ? {} : { body }),
         ...extra,
         signal,
+        // Never followed: a redirect would carry the credential headers (a model key, a person's token) to wherever it
+        // points, which `fetch` keeps for custom headers even across origins. Python's httpx did not follow either.
+        redirect: "manual",
       });
     } catch (err) {
       throw unreachable(err, request.path);

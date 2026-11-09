@@ -29,6 +29,7 @@ export async function* sseEvents(
   const onAbort = (): void => {
     controller.abort(signal?.reason);
   };
+  if (signal?.aborted === true) return; // ended before it started: nothing is asked for
   signal?.addEventListener("abort", onAbort, { once: true });
   const full = after === undefined || after === "" ? path : `${path}?${new URLSearchParams({ after }).toString()}`;
   const watchdog = new Watchdog(controller, timing.connectMs ?? DEFAULT_TIMEOUT_MS);

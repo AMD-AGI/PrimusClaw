@@ -255,3 +255,17 @@ describe("how Claw was not reached", () => {
     });
   }
 });
+
+describe("a redirect from Claw", () => {
+  it("is never followed, so no credential header goes on to wherever it points", async () => {
+    const wire = new Wire(
+      () => new Response(null, { status: 307, headers: { location: "https://elsewhere.test/v1/sessions" } }),
+    );
+    await assert.rejects(
+      wire.client().sessions.create("tok", { text: "t", idempotencyKey: "i", modelKey: "ak-own" }),
+      (err: unknown) => err instanceof ClawAnswerInvalid || (err instanceof ClawError && err.status === 307),
+    );
+    assert.equal(wire.sent.length, 1);
+    assert.equal(wire.inits[0]?.redirect, "manual");
+  });
+});
