@@ -95,6 +95,9 @@ export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files
   return { content: t.user, messageType: "text", ...(Object.keys(context).length ? { channel_context: context } : {}) };
 }
 
+/** All a message sent with the signed-in token may hold (`turnMessageBody`). */
+const TOKEN_MESSAGE_KEYS: readonly string[] = ["content", "messageType", "channel_context"];
+
 /**
  * Why a request may not be sent with the signed-in token (EVAL_SEND_TOKEN_CMD), or null when it may. The token answers for the person,
  * so the run uses it for the person's own message, to close a card with `deny`, and to check whose it is, and for nothing else: never
@@ -105,7 +108,8 @@ export function tokenRequestRefusal(method: string, path: string, body?: unknown
   const keys = Object.keys(b).sort().join(",");
   if (method === "GET" && path === "/v1/me" && body === undefined) return null;
   if (method === "POST" && /^\/v1\/sessions\/[^/?#]+\/messages$/.test(path)) {
-    return b.messageType === "text" && typeof b.content === "string" && !("extData" in b) ? null : "only the person's own text message is sent with the token";
+    const other = Object.keys(b).filter((k) => !TOKEN_MESSAGE_KEYS.includes(k));
+    return b.messageType === "text" && typeof b.content === "string" && !other.length ? null : "only the person's own text message is sent with the token";
   }
   if (method === "POST" && /^\/v1\/(?:assistant|github-review)\/confirmations\/[^/?#]+\/decision$/.test(path)) {
     return keys === "decision" && b.decision === "deny" ? null : "a card is only ever denied with the token, never allowed or answered";

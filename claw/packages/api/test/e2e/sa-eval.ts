@@ -101,7 +101,7 @@
  *                     the identity's answer (`GET /v1/assistant/confirmations`, `GET /v1/github-review/confirmations`) are closed:
  *                     the assistant is shown them in every session, and answers a case asked again with "it is already waiting"
  *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
- *                     `deny`); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
+ *                     `deny`; once more after the last attempt); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
  *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
@@ -1540,6 +1540,12 @@ async function main(): Promise<void> {
       } else {
         // No session open (none was had, or the run stopped while it changed sessions): the run's items are still closed.
         cleanupFailed.push(...await closeRunItems(floorAtStart, leftOpen, null));
+      }
+      // The cards the last attempts made are closed as well, so the next run, or the person, does not find them waiting.
+      if (FRESH_ATTEMPT && SEND_TOKEN_CMD && !stopSignal) {
+        const waiting = await closeCards().catch(() => null);
+        if (waiting === null) cleanupFailed.push("the cards waiting for the identity's answer could not be read after the run");
+        else if (waiting.length) cleanupFailed.push(`cards still waiting for the identity's answer after the run: ${waiting.length}`);
       }
       log(`items created by the run that are still open: ${leftOpen.length ? leftOpen.join(",") : "none"}`);
       if (leftOpen.length) cleanupFailed.push(`items still open: ${leftOpen.join(",")}`);
