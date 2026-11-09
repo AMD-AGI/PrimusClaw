@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Base64 as Python's `base64.urlsafe_b64decode` / `urlsafe_b64encode` do it, because a Fernet key or token is read by
- * both workers and must be accepted or refused by both alike. Python's decoder is lenient: it maps `-_` to `+/`, skips
- * every character outside the alphabet, stops at a completed pad sequence, and refuses only a wrong amount of data.
+ * Base64 as Python's `base64.urlsafe_b64decode` / `urlsafe_b64encode` do it in Python 3.12, the worker image's
+ * interpreter, because a Fernet key or token is read by both workers and must be accepted or refused by both alike.
+ * That decoder is lenient: it maps `-_` to `+/`, skips every character outside the alphabet, stops at a completed pad
+ * sequence (ignoring what follows), and refuses only a wrong amount of data. (Python 3.13 and later refuse data after
+ * the padding; a token the store wrote never has any.)
  */
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
