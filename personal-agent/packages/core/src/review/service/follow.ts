@@ -40,6 +40,15 @@ export const VIEW_HOLD_MS = 600_000;
 /** How often a last line is tried before it is left (to the next worker that starts). */
 export const DEADLINE_TRIES = 10;
 
+/** The item waits for its reviewer for something they have not been told of yet. */
+function waitsNewly(entry: Followed, view: AskerView): boolean {
+  return viewWaitsForReviewer(view) && view.waitingFor !== "failed" && !entry.reviewerTold;
+}
+
+function stillRunning(view: AskerView): boolean {
+  return !viewFinished(view) && !viewWaitsForReviewer(view);
+}
+
 interface BatchState {
   readonly open: Map<string, Followed>;
   readonly news: Map<string, readonly [Followed, AskerView]>;
