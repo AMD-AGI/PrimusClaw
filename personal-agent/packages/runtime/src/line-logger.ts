@@ -21,6 +21,14 @@ function formatValue(value: LogValue): string {
   return JSON.stringify(value);
 }
 
+/**
+ * A message as one line: its line breaks escaped (`\r` and `\n` written as those two characters), so that a message
+ * carrying text from outside (a card's verb, an error field of an answer) cannot forge a log line of its own (CWE-117).
+ */
+function oneLine(message: string): string {
+  return message.replaceAll("\r", "\\r").replaceAll("\n", "\\n");
+}
+
 function formatFields(fields: LogFields): string {
   return Object.entries(fields)
     .map(([key, value]) => ` ${key}=${formatValue(value)}`)
@@ -36,7 +44,9 @@ export function lineLogger(options: LineLoggerOptions, bound: LogFields = {}): L
   const emit = (level: LogLevel, message: string, fields: LogFields = {}): void => {
     if (ORDER[level] < ORDER[options.level]) return;
     const time = new Date(options.now()).toISOString();
-    options.write(redactLogLine(`${time} ${level.toUpperCase()} ${message}${formatFields({ ...bound, ...fields })}`));
+    options.write(
+      redactLogLine(`${time} ${level.toUpperCase()} ${oneLine(message)}${formatFields({ ...bound, ...fields })}`),
+    );
   };
   return {
     debug: (message, fields) => {

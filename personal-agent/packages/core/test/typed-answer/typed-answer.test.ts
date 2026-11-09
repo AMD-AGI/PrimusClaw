@@ -267,3 +267,32 @@ test("the model is asked only whether it is an answer", () => {
   assert.ok(ANSWER_PROMPT.startsWith("You read one message a person sent to Clawy"));
   assert.ok(ANSWER_PROMPT.endsWith("only classify it."));
 });
+
+test("a number past 2^53 is read and said back as Python's int writes it, never thrown on", () => {
+  const pending = [["AMD-AGI/x", 1] as const];
+  const big = "99999999999999999999";
+  const notWaiting = (name: string): string =>
+    `${name} 没有在等你确认。在等你确认的是：AMD-AGI/x#1。 / ${name} is not waiting for your confirmation; these are: AMD-AGI/x#1.`;
+  // (each expected value is what the Python worker's read_typed_answer returned)
+  for (const text of [
+    `合入 #${big}`,
+    `确认 PR ${big}`,
+    `approve AMD-AGI/x#${big}`,
+    `https://github.com/o/r/pull/${big} 合入`,
+  ]) {
+    assert.equal(readTypedAnswer(text, pending, true), null, text);
+  }
+  assert.deepEqual(readTypedAnswer(`合入 #${big}`, pending, false), { decisions: [], question: notWaiting(`#${big}`) });
+  assert.deepEqual(readTypedAnswer(`确认 PR ${big}`, pending, false), {
+    decisions: [[["AMD-AGI/x", 1], "allow"]],
+    question: "",
+  });
+  assert.deepEqual(readTypedAnswer(`approve AMD-AGI/x#${big}`, pending, false), {
+    decisions: [],
+    question: notWaiting(`AMD-AGI/x#${big}`),
+  });
+  assert.deepEqual(readTypedAnswer(`https://github.com/o/r/pull/${big} 合入`, pending, false), {
+    decisions: [],
+    question: notWaiting(`o/r#${big}`),
+  });
+});
