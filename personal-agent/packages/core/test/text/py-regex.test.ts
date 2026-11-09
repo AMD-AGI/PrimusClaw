@@ -14,6 +14,7 @@ import {
   pyIsAlnum,
   pyRegExp,
 } from "../../src/text/py-regex.js";
+import { InvariantError } from "../../src/errors.js";
 
 /**
  * (pattern, flags, text, what Python 3's re.fullmatch said). `\\p{Lu}` was checked in Python with the class of the
@@ -85,7 +86,6 @@ const MORE: readonly (readonly [string, string, string, string, boolean])[] = [
   ["(?i)k", "", "\u212a", "search", true],
   ["(?<=i)x", "i", "\u0130x", "search", true],
   ["(?<!i)x", "i", "\u0130x", "search", false],
-  ["(?P<n>i)(?P=n)", "i", "iI", "search", true],
   ["(?<id>i+)", "i", "\u0131I", "search", true],
   ["a", "", "a\n", "full", false],
   ["a$", "", "a\n", "search", true],
@@ -136,4 +136,73 @@ test("the building blocks of Python's word, digit and boundary are exported for 
   assert.ok(new RegExp(`^${PY_W}$`, "u").test("é") && !new RegExp(`^${PY_W}$`, "u").test("-"));
   assert.ok(pyIsAlnum("中") && pyIsAlnum("٣") && !pyIsAlnum("_") && !pyIsAlnum(" "));
   assert.ok(isAsciiAlpha("abc") && !isAsciiAlpha("abç") && !isAsciiAlpha("ab1") && !isAsciiAlpha(""));
+});
+
+/** Python syntax JavaScript's `u` mode reads otherwise or not at all: (pattern, flags, text, how, what CPython 3 said). */
+const PYTHON_SYNTAX: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["[\\1]", "", "\u0001", "full", true],
+  ["a\\-b", "", "a-b", "full", true],
+  ["a\\ b", "", "a b", "full", true],
+  ["\\#\\&\\~", "", "#&~", "full", true],
+  ["a\\-b\\ c\\#\\&\\~\\.\\*", "", "a-b c#&~.*", "full", true],
+  ["[\\-a]+", "", "-a-", "full", true],
+  ["[a\\]]+", "", "a]", "full", true],
+  ["(?#note)ab", "", "ab", "full", true],
+  ["a{,2}", "", "aa", "full", true],
+  ["a{,2}", "", "aaa", "full", false],
+  ["a{", "", "a{", "full", true],
+  ["{abc}", "", "{abc}", "full", true],
+  ["a}", "", "a}", "full", true],
+  ["]", "", "]", "full", true],
+  ["a{2}", "", "aa", "full", true],
+  ["a{1,}", "", "aaa", "full", true],
+  ["\\012", "", "\n", "full", true],
+  ["\\0", "", "\u0000", "full", true],
+  ["\\101", "", "A", "full", true],
+  ["[\\101]", "", "A", "full", true],
+  ["\\a", "", "\u0007", "full", true],
+  ["\\U0001F600", "", "\ud83d\ude00", "full", true],
+  ["\\x41B", "", "AB", "full", true],
+  ["\u0130", "i", "i", "full", true],
+  ["\u0131", "i", "I", "full", true],
+  ["[\u0131]", "i", "i", "full", true],
+  ["[\u0130]", "i", "I", "full", true],
+  ["\\x49", "i", "\u0131", "full", true],
+  ["\\x69", "i", "\u0131", "full", true],
+  ["[^\u0131]", "i", "i", "full", false],
+  ["(?P<\u540d>\\w+)", "", "\u4e2d\u6587", "full", true],
+  ["(a)\\1", "", "aa", "full", true],
+  ["(a)\\1", "", "ab", "full", false],
+  ["[\\b]", "", "\b", "full", true],
+];
+
+test("identity escapes, comments, braces, octal and named escapes, and the four i's are read as Python reads them", () => {
+  for (const [pattern, flags, text, how, python] of PYTHON_SYNTAX) {
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.equal(regex.test(text), python, `${how} ${pattern} /${flags} ${JSON.stringify(text)}`);
+  }
+});
+
+test("what has no JavaScript form is refused when the pattern is built, never read another way", () => {
+  // Python reads each of these (the last but two are its own errors); JavaScript would read them otherwise or not at all.
+  for (const [pattern, flags] of [
+    ["a(?s:.)b", ""],
+    ["(?m:^)b", ""],
+    ["(?i:link)", ""],
+    ["(?-i:a)", "i"],
+    ["(?P<x>i)(?P=x)", "i"],
+    ["(a)\\1", "i"],
+    ["\\N{LATIN SMALL LETTER A}", ""],
+    ["a(?i)b", ""],
+    ["\\q", ""],
+    ["[\\S]", ""],
+    ["a\\", ""],
+    ["\\x4g", ""],
+    ["\\pL", ""],
+    ["[\\A]", ""],
+    ["(", ""],
+  ] as const) {
+    assert.throws(() => pyRegExp(pattern, flags), InvariantError, pattern);
+  }
+  // In Python a(?s:.)b matches "a\nb" and (?i:link) matches "LİNK": refusing is the only answer that is not wrong.
 });
