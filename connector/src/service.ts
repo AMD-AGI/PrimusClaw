@@ -637,12 +637,31 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
     recordInstalled(ctx, "script", vars);
+    // As `systemctl --user restart` does above: a supervisor that is already running keeps the agents.toml and the
+    // environment it was started with, so after an edit of either (a root added, a key renewed) an install that left it
+    // be would change nothing. It is stopped (it passes the signal to its run) and started again.
+    const old = supervisorPid(ctx);
+    if (old !== null) {
+      if (!await stopSupervisor(old)) {
+        ctx.err(`the running supervisor (pid ${old}) did not stop within 20 s; run "claw-connector stop", then install again`);
+        return 1;
+      }
+      ctx.out(`stopped the running supervisor (pid ${old}) so the connector starts again with this agents.toml and environment`);
+    }
     const code = await ensure(ctx, d, h, { byInstall: true });
     if (code !== 0) return code;
     ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies.`);
     scheduleKeepalive(ctx, d, script);
   }
   return 0;
+}
+
+/** SIGTERM to a script supervisor (it passes the signal to its run and ends its loop); whether it ended within 20 s. */
+async function stopSupervisor(pid: number): Promise<boolean> {
+  try { process.kill(pid, "SIGTERM"); } catch { return true; }   // (gone already)
+  const end = Date.now() + 20_000;
+  while (Date.now() < end && isAlive(pid) && processStart(pid) !== null) await sleep(100);
+  return !(isAlive(pid) && processStart(pid) !== null);
 }
 
 /** The two crontab lines that call keepalive.sh: at boot, and every 5 minutes (it does nothing while the supervisor lives). */
@@ -792,11 +811,7 @@ async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<num
     ctx.out(had ? `stopped and removed ${plist}` : `no LaunchAgent at ${plist}`);
   } else {
     const pid = supervisorPid(ctx);
-    if (pid !== null) {
-      process.kill(pid, "SIGTERM");
-      const end = Date.now() + 20_000;
-      while (Date.now() < end && isAlive(pid) && processStart(pid) !== null) await sleep(100);
-    }
+    if (pid !== null) await stopSupervisor(pid);
     const script = keepaliveFile(ctx.dirs);
     const had = fs.existsSync(script);
     fs.rmSync(script, { force: true });

@@ -305,7 +305,7 @@ grant was revoked, `no_heartbeat` otherwise.
 When the assistant is on, a connector that stays offline for 5 minutes, counted from when
 the sweep first found it offline, is reported once to its owner through their assistant:
 when it was last seen, why it went, and the command that brings it back
-(`claw-connector run`, after `claw-connector login` when its sign-in ran out). When it
+(`claw-connector service install`, after `claw-connector login` when its sign-in ran out). When it
 comes back after that, the owner is told once that it has. Short breaks (a Claw release
 cuts every stream for a few seconds) and a Claw outage (the sweep is down with it) are
 never reported. Nothing is said about a connector its owner revoked, one replaced by an
