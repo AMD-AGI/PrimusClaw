@@ -90,6 +90,15 @@ test("no snapshot is left without a card", () => {
   );
 });
 
+test("every snapshot file is written as Python writes it (indent 1, sorted keys), so a formatter cannot rewrite one unseen", () => {
+  const files = readdirSync(SNAPSHOTS).filter((f) => f.endsWith(".json"));
+  assert.ok(files.length >= 50);
+  for (const file of files) {
+    const written = readFileSync(new URL(file, SNAPSHOTS), "utf8");
+    assert.equal(pythonJson(JSON.parse(written)), written, file);
+  }
+});
+
 for (const entry of CATALOG) {
   test(`card matches its snapshot: ${entry.id}`, () => {
     const expected = readFileSync(new URL(`${entry.id}.json`, SNAPSHOTS), "utf8");

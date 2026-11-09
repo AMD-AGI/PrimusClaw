@@ -1,167 +1,167 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "actions": [
-          {
-            "data": {
-              "op": "switch",
-              "primusclaw": "remote",
-              "session_id": ""
-            },
-            "title": "刷新",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_switch"
-          }
-        ],
-        "body": [
-          {
-            "items": [
-              {
-                "size": "Medium",
-                "text": "🗂️ 你的会话",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              }
-            ],
-            "type": "Container"
-          },
-          {
-            "color": "attention",
-            "id": "badge-waiting",
-            "text": "⚠️ 有 1 个会话在等你",
-            "type": "TextBlock",
-            "weight": "Bolder",
-            "wrap": true
-          },
-          {
-            "color": "good",
-            "separator": true,
-            "text": "**robin-dev** (在线)",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "id": "row-agent-1",
-            "items": [
-              {
-                "spacing": "Small",
-                "text": "🤖 Claude Code (existing sessions)",
-                "type": "TextBlock",
-                "weight": "Bolder",
-                "wrap": true
-              },
-              {
-                "id": "row-conv-1",
-                "spacing": "Small",
-                "text": "⚠️ **等你**（permission prompt） · 修 flaky 测试 · /root/ws/active · 2 分钟前",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "isSubtle": true,
-                "size": "Small",
-                "spacing": "None",
-                "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "actions": [
-                  {
-                    "data": {
-                      "agent_id": "a1-sessions",
-                      "connector_id": "c1",
-                      "op": "new",
-                      "primusclaw": "remote",
-                      "resume": "r-1",
-                      "view": "sessions"
-                    },
-                    "title": "只看（终端照常用）",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_new"
-                  }
-                ],
-                "type": "ActionSet"
-              },
-              {
-                "id": "row-conv-2",
-                "spacing": "Small",
-                "text": "⏳ 正在做 · 重构连接器 · /root/ws/conn · 刚刚",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "isSubtle": true,
-                "size": "Small",
-                "spacing": "None",
-                "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "actions": [
-                  {
-                    "data": {
-                      "agent_id": "a1-sessions",
-                      "connector_id": "c1",
-                      "op": "new",
-                      "primusclaw": "remote",
-                      "resume": "r-2",
-                      "view": "sessions"
-                    },
-                    "title": "只看（终端照常用）",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_new"
-                  }
-                ],
-                "type": "ActionSet"
-              },
-              {
-                "id": "row-conv-3",
-                "spacing": "Small",
-                "text": "写文档 · /root/ws/docs · 1 小时前",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "isSubtle": true,
-                "size": "Small",
-                "spacing": "None",
-                "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
-                "type": "TextBlock",
-                "wrap": true
-              },
-              {
-                "actions": [
-                  {
-                    "data": {
-                      "agent_id": "a1-sessions",
-                      "connector_id": "c1",
-                      "op": "new",
-                      "primusclaw": "remote",
-                      "resume": "r-3",
-                      "view": "sessions"
-                    },
-                    "title": "只看（终端照常用）",
-                    "type": "Action.Execute",
-                    "verb": "primusclaw.remote_new"
-                  }
-                ],
-                "type": "ActionSet"
-              }
-            ],
-            "spacing": "Small",
-            "type": "Container"
-          }
-        ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "op": "switch",
+       "primusclaw": "remote",
+       "session_id": ""
       },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+      "title": "刷新",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_switch"
+     }
+    ],
+    "body": [
+     {
+      "items": [
+       {
+        "size": "Medium",
+        "text": "🗂️ 你的会话",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "type": "Container"
+     },
+     {
+      "color": "attention",
+      "id": "badge-waiting",
+      "text": "⚠️ 有 1 个会话在等你",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "color": "good",
+      "separator": true,
+      "text": "**robin-dev** (在线)",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "row-agent-1",
+      "items": [
+       {
+        "spacing": "Small",
+        "text": "🤖 Claude Code (existing sessions)",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       },
+       {
+        "id": "row-conv-1",
+        "spacing": "Small",
+        "text": "⚠️ **等你**（permission prompt） · 修 flaky 测试 · /root/ws/active · 2 分钟前",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "isSubtle": true,
+        "size": "Small",
+        "spacing": "None",
+        "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "agent_id": "a1-sessions",
+           "connector_id": "c1",
+           "op": "new",
+           "primusclaw": "remote",
+           "resume": "r-1",
+           "view": "sessions"
+          },
+          "title": "只看（终端照常用）",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_new"
+         }
+        ],
+        "type": "ActionSet"
+       },
+       {
+        "id": "row-conv-2",
+        "spacing": "Small",
+        "text": "⏳ 正在做 · 重构连接器 · /root/ws/conn · 刚刚",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "isSubtle": true,
+        "size": "Small",
+        "spacing": "None",
+        "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "agent_id": "a1-sessions",
+           "connector_id": "c1",
+           "op": "new",
+           "primusclaw": "remote",
+           "resume": "r-2",
+           "view": "sessions"
+          },
+          "title": "只看（终端照常用）",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_new"
+         }
+        ],
+        "type": "ActionSet"
+       },
+       {
+        "id": "row-conv-3",
+        "spacing": "Small",
+        "text": "写文档 · /root/ws/docs · 1 小时前",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "isSubtle": true,
+        "size": "Small",
+        "spacing": "None",
+        "text": "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "agent_id": "a1-sessions",
+           "connector_id": "c1",
+           "op": "new",
+           "primusclaw": "remote",
+           "resume": "r-3",
+           "view": "sessions"
+          },
+          "title": "只看（终端照常用）",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_new"
+         }
+        ],
+        "type": "ActionSet"
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }
