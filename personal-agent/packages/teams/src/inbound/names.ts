@@ -7,6 +7,7 @@
  * say.
  */
 import { imageType } from "./types.js";
+import { stripLeading, stripTrailing } from "../text/trim.js";
 
 /** Everything but ASCII letters, digits, ".", "_", " " and "-", a run at a time. */
 const UNSAFE = /[^A-Za-z0-9._ -]+/gu;
@@ -14,7 +15,7 @@ const NAME_MAX = 100;
 
 /** Python's `str.strip(" .")`. */
 function stripSpacesAndDots(text: string): string {
-  return text.replace(/^[ .]+/, "").replace(/[ .]+$/, "");
+  return stripTrailing(stripLeading(text, " ."), " .");
 }
 
 /** `name` made one safe path component; `bytes` and `index` (1-based) name a file that has none. */

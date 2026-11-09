@@ -195,3 +195,22 @@ describe("what rides on a message", () => {
     ]);
   });
 });
+
+describe("a rule archive that lies about its size", () => {
+  it("a file that inflates past the size it declares is refused, before more than that is produced", () => {
+    const honest = zip({ "rule.md": "x".repeat(5_000_000) });
+    const view = new DataView(honest.buffer, honest.byteOffset, honest.byteLength);
+    const end = honest.byteLength - 22;
+    const central = view.getUint32(end + 16, true);
+    view.setUint32(central + 24, 1, true); // the central directory now says one byte
+    assert.throws(() => ruleText(honest), ClawAnswerInvalid);
+  });
+
+  it("a stored file shorter than it declares is refused", () => {
+    const short = zip({ "rule.md": "rule" }, true);
+    const view = new DataView(short.buffer, short.byteOffset, short.byteLength);
+    const central = view.getUint32(short.byteLength - 22 + 16, true);
+    view.setUint32(central + 24, 10, true);
+    assert.throws(() => ruleText(short), ClawAnswerInvalid);
+  });
+});

@@ -55,11 +55,13 @@ export class EnvReader {
     return Number(value);
   }
 
-  /** A whole number (Python's `int()` of the value, which allows a sign and surrounding space). */
+  /** A whole number (Python's `int()` of the value: a sign, surrounding space and `_` between digits allowed). */
   int(name: string, fallback: string): number {
     const value = pyStrip(this.raw(name, fallback));
-    if (!/^[+-]?[0-9]+$/.test(value)) throw new ConfigError(`${name} must be a whole number, not ${pyRepr(value)}`);
-    return Number(value);
+    if (!/^[+-]?[0-9]+(?:_[0-9]+)*$/.test(value)) {
+      throw new ConfigError(`${name} must be a whole number, not ${pyRepr(value)}`);
+    }
+    return Number(value.replaceAll("_", ""));
   }
 
   /** A whole number, or null when unset or blank. */

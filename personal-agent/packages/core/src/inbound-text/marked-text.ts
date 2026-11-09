@@ -11,6 +11,7 @@
  * mentions, each replaced where it stands (`offset`), so a name typed before the same person's mention stays a name.
  */
 import type { InboundLink, InboundMention } from "../ports/surface.js";
+import { MARK_CLOSE, MARK_OPEN } from "../review-text/markers.js";
 import { pyStrip } from "../text/py-text.js";
 import { MARK_CLOSE, MARK_OPEN } from "../review-text/markers.js";
 import { withLinks, type WithLinksOptions } from "./with-links.js";

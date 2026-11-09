@@ -119,7 +119,17 @@ export function written(activity: Activity): string {
 }
 
 const MESSAGE_ID = new RegExp(caseless("messageId"), "gu");
-const ID_HEAD = new RegExp(`${SPACE}*=${SPACE}*["']?`, "uy");
+const SPACE_ONE = new RegExp(`^${SPACE}$`, "u");
+
+/** Where the value starts after `\s*=\s*["']?` at `at`, or undefined when no `=` follows (one linear scan). */
+function idHeadEnd(text: string, at: number): number | undefined {
+  let i = at;
+  while (i < text.length && SPACE_ONE.test(text.charAt(i))) i += 1;
+  if (text.charAt(i) !== "=") return undefined;
+  i += 1;
+  while (i < text.length && SPACE_ONE.test(text.charAt(i))) i += 1;
+  return text.charAt(i) === '"' || text.charAt(i) === "'" ? i + 1 : i;
+}
 const VALUE_STOP = new RegExp(`["'/>${SPACE_CHARS}]`, "u");
 const WORD_CHAR = new RegExp(`^${WORD}$`, "u");
 
@@ -160,9 +170,8 @@ function idCandidates(text: string): IdCandidate[] {
   for (const match of text.matchAll(MESSAGE_ID)) {
     const before = codePointBefore(text, match.index);
     if (before !== undefined && WORD_CHAR.test(before)) continue;
-    ID_HEAD.lastIndex = match.index + match[0].length;
-    if (!ID_HEAD.test(text)) continue;
-    const valueStart = ID_HEAD.lastIndex;
+    const valueStart = idHeadEnd(text, match.index + match[0].length);
+    if (valueStart === undefined) continue;
     const valueEnd = end(valueStart);
     if (valueEnd > valueStart) found.push({ start: match.index, valueStart, valueEnd });
   }

@@ -13,13 +13,13 @@ import "../../src/ports/claw/work-items.js";
 import { ConfigError, SECRET_NAMES, SECURITY_EVENTS, SecretsUnavailable, noMetrics } from "../../src/index.js";
 
 describe("W2 ports", () => {
-  it("metrics that go nowhere take every call", () => {
+  it("metrics that go nowhere take every call without throwing", () => {
     noMetrics.eventDelivered("assistant.say", 1, null);
     noMetrics.securityEvent({ event: "link_attempt" });
     noMetrics.processed(null, 1, true);
     noMetrics.limited("user_limit");
     noMetrics.filesDropped("session");
-    assert.ok(true);
+    noMetrics.filesDropped("session", 2);
   });
 
   it("names the secrets and the events", () => {

@@ -6,6 +6,7 @@
  * `int(value)`, truthiness, and `str.rstrip("/")`.
  */
 import { pyStrip } from "@primusclaw/personal-agent";
+import { stripTrailing } from "../text/trim.js";
 
 const ALWAYS_SAFE = /[A-Za-z0-9_.\-~]/;
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
@@ -59,5 +60,5 @@ export function pyTruthy(value: unknown): boolean {
 
 /** `text.rstrip("/")`. */
 export function rstripSlash(text: string): string {
-  return text.replace(/\/+$/, "");
+  return stripTrailing(text, "/");
 }

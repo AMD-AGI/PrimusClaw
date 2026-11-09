@@ -26,6 +26,11 @@ describe("a person's settings", () => {
       items: ["likes tea", "", "3"],
     });
     assert.deepEqual((await wire.client().settings.memory("ak-a", 1)).items, ["likes tea"]);
+    wire.answer = (sent) =>
+      sent.rawPath.endsWith("memory-settings")
+        ? json(200, { data: { enabled: [], available: {} } })
+        : json(200, { data: [] });
+    assert.deepEqual(await wire.client().settings.memory("ak-a"), { enabled: false, available: false, items: [] });
     wire.answer = () => json(200, { data: { enabled: false, available: null } });
     assert.deepEqual(await wire.client().settings.setMemory("ak-a", false), { enabled: false, available: false });
     assert.deepEqual(wire.sent.at(-1)?.body, { enabled: false });
