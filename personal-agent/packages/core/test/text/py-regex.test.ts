@@ -251,3 +251,16 @@ test("the one kept difference: under IGNORECASE U+0345 counts as a word characte
   // Python: re.search(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", "Bearer \u212a" + "x" * 33) matches
   assert.ok(pyRegExp(String.raw`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}`).test(`Bearer \u212a${"x".repeat(33)}`));
 });
+
+test("no translated pattern carries a scoped flag modifier, which in V8 turns off the case folding of every class", () => {
+  const modifier = /\(\?[a-z]*-[a-z]+:|\(\?[a-z]+:/;
+  const all = [...CASES, ...MORE, ...PYTHON_SYNTAX, ...FOLLOW_UP];
+  for (const [pattern, flags, ...rest] of all) {
+    const how = rest.length === 3 ? rest[1] : "full";
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.ok(!modifier.test(regex.source), `${pattern} -> ${regex.source}`);
+  }
+  for (const flags of ["", "i", "im", "is"]) {
+    assert.ok(!modifier.test(pyRegExp(String.raw`\w+\b\B\W[\w-]^$.`, flags).source), flags);
+  }
+});
