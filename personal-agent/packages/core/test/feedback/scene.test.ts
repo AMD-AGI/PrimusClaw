@@ -120,6 +120,11 @@ test("timestamps are epoch seconds, epoch milliseconds or ISO 8601", () => {
   const b = secondsOf("2026-01-01T00:00:00.051000Z") ?? 0;
   assert.equal(fixed1(b - a), "0.0");
   assert.equal(secondsOf("2026-01-01T00:00:00.5+08:00"), Date.UTC(2025, 11, 31, 16) / 1000 + 0.5);
+  // Python's separator may also be a space or a lowercase t
+  assert.equal(
+    fixed1((secondsOf("2026-01-01t00:00:00.051000+00:00") ?? 0) - (secondsOf("2026-01-01 00:00:00.001100+00:00") ?? 0)),
+    "0.0",
+  );
   assert.equal(secondsOf("2026-01-01T00:00:00.Z"), Date.parse("2026-01-01T00:00:00.Z") / 1000 || undefined);
   assert.equal(secondsOf(`2026-01-01T00:00:00.${"0".repeat(50_000)}x`), undefined); // linear, and no date
   assert.equal(secondsOf("not a date"), undefined);

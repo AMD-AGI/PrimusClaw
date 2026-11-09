@@ -75,8 +75,9 @@ export function objectOf(value: unknown): Readonly<Record<string, unknown>> {
  * microseconds. Read by position, not by a pattern (no backtracking on a long input).
  */
 function splitFraction(value: string): { readonly base: string; readonly fraction: number } {
-  const dot = value.indexOf(".", value.indexOf("T"));
-  if (dot === -1 || value.indexOf("T") === -1) return { base: value, fraction: 0 };
+  // the time follows the date's ten characters and Python's separator: "T", "t" or a space
+  const dot = "Tt ".includes(value.charAt(10)) ? value.indexOf(".", 11) : -1;
+  if (dot === -1) return { base: value, fraction: 0 };
   let end = dot + 1;
   while (end < value.length && value.charCodeAt(end) >= 48 && value.charCodeAt(end) <= 57) end += 1;
   if (end === dot + 1) return { base: value, fraction: 0 };
