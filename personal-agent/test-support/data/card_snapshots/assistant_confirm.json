@@ -1,0 +1,77 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "card": "card-5",
+              "op": "allow",
+              "primusclaw": "assistant_confirm"
+            },
+            "style": "positive",
+            "title": "创建定时任务",
+            "type": "Action.Execute",
+            "verb": "primusclaw.assistant_confirm_allow"
+          },
+          {
+            "data": {
+              "card": "card-5",
+              "op": "deny",
+              "primusclaw": "assistant_confirm"
+            },
+            "title": "不要",
+            "type": "Action.Execute",
+            "verb": "primusclaw.assistant_confirm_deny"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚠️ 需要你确认",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "text": "每天 09:00 给你发 SaFE 节点日报（工作日）。",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}
