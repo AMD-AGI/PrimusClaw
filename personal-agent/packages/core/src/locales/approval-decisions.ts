@@ -22,6 +22,8 @@ const english = {
   questionExpired: "The agent stopped waiting for that answer.",
   approvalExpired: "That approval has run out and was refused.",
   approvalNeeded: (p: { tool: string }) => `Approval needed: ${p.tool}`,
+  onlyAskerAnswers: "Only the person who asked can answer this question.",
+  onlyAskerDecides: "Only the person who asked can approve or deny this request.",
 };
 
 export const decisionText = defineCatalog({

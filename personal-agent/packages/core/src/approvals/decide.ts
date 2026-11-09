@@ -72,6 +72,36 @@ function str(value: unknown): string {
 export class ApprovalDecisions {
   constructor(private readonly deps: DecisionDeps) {}
 
+  /**
+   * A press on an approval or question card in a group chat: answered ONLY by the person it was raised for (read from the stored
+   * request, never the card); anyone else, linked or not, is refused before any key is read, and the card is put back for the
+   * asker. `credential` reads the presser's linked key (null: none).
+   */
+  async inGroup(click: CardClick, credential: () => Promise<string | null>): Promise<void> {
+    const press = this.read(click);
+    const { pending } = press;
+    const t = decisionText.in(click.lang());
+    if (pending === null) {
+      await click.settle(press.answering ? t.questionInactive : t.approvalInactive);
+      return;
+    }
+    if (pending.userId !== click.sender.id) {
+      const en = decisionText.in("en");
+      await this.again(click, { ...press, tool: pending.tool }, press.answering ? en.onlyAskerAnswers : en.onlyAskerDecides);
+      return;
+    }
+    if (this.deps.store.reviewDelegation.isActingSession(press.sessionId)) {
+      await this.decide(click, null); // (answered with the exchanged token, never with a linked key)
+      return;
+    }
+    const key = await credential();
+    if (key === null) {
+      await click.settle(t.notConnected);
+      return;
+    }
+    await this.decide(click, key);
+  }
+
   /** A press with the person's linked key (`key`; null when they have none). */
   async decide(click: CardClick, key: string | null): Promise<void> {
     const press = this.read(click);

@@ -370,3 +370,53 @@ it("a question card cannot answer an approval and an expired question says the a
   await new ApprovalDecisions(w.deps()).decide(failed.route, "ak-alice");
   assert.ok(failed.settled[0]?.options?.fallback?.startsWith("PrimusClaw did not accept the answer (error 500)"));
 });
+
+it("in a group only the person it was raised for answers and the card is put back for the asker", async () => {
+  const w = new World();
+  w.pending();
+  const decisions = new ApprovalDecisions(w.deps());
+  const other = click(ALLOW, "aad-b", "19:g");
+  await decisions.inGroup(other.route, () => Promise.resolve("ak-bob"));
+  assert.equal(other.settled[0]?.options?.fallback, "Only the person who asked can approve or deny this request.");
+  const question = click({ ...ANSWER }, "aad-b", "19:g");
+  w.pending("ask_user_question");
+  await decisions.inGroup(question.route, () => Promise.resolve("ak-bob"));
+  assert.equal(question.settled[0]?.options?.fallback, "Only the person who asked can answer this question.");
+  w.pending();
+  const unlinked = click(ALLOW, "aad-a", "19:g");
+  await decisions.inGroup(unlinked.route, () => Promise.resolve(null));
+  const said = unlinked.settled[0]?.card;
+  assert.ok(typeof said === "string" && said.startsWith("This chat is not connected"));
+  const owner = click(ALLOW, "aad-a", "19:g");
+  await decisions.inGroup(owner.route, () => Promise.resolve("ak-alice"));
+  assert.deepEqual(w.claw.calls, [["decide", "ak-alice", "s1", "tu1", "allow", {}]]);
+  const gone = click({ ...ALLOW, tool_use_id: "nope" }, "aad-a", "19:g");
+  await decisions.inGroup(gone.route, () => Promise.resolve("ak-alice"));
+  assert.equal(gone.settled[0]?.card, "That approval request is no longer active.");
+  w.acting.add("s1");
+  w.pending();
+  const acting = click(ALLOW, "aad-a", "19:g");
+  await decisions.inGroup(acting.route, () => Promise.reject(new Error("no key is read")));
+  assert.deepEqual(w.claw.calls.at(-1), ["decide", "idt-token", "s1", "tu1", "allow", { acting: true }]);
+});
+
+it("the router hands acting cards over before any key is read", async () => {
+  const { ApprovalClicks } = await import("../../src/approvals/handler.js");
+  const w = new World();
+  w.pending();
+  const decisions = new ApprovalDecisions(w.deps());
+  const handler = new ApprovalClicks(
+    decisions,
+    (s) => w.acting.has(s),
+    () => Promise.resolve("ak-alice"),
+  );
+  assert.deepEqual([...handler.verbs], ["decision", "answer"]);
+  assert.equal(await handler.beforeCredential(click(ALLOW).route as never), false);
+  w.acting.add("s1");
+  assert.equal(await handler.beforeCredential(click(ALLOW).route as never), true);
+  w.pending();
+  w.acting.clear();
+  await handler.withCredential(click(ALLOW).route as never, "ak-alice");
+  assert.equal(await handler.inGroup(click(ALLOW, "aad-b", "19:g").route as never), true);
+  assert.equal(w.claw.calls.length, 2);
+});
