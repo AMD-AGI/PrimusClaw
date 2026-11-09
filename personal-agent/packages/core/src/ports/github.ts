@@ -1,22 +1,21 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * What the review delegation needs from GitHub and from the identity service's GitHub credentials, as ports. The runtime
  * implements them over HTTP (`runtime/src/github/`); tests use fakes. No port ever returns or logs a GitHub token except
  * `DeviceFlow.waitForToken`, whose token goes straight to `GithubCredentials.bind`.
  */
 
+import type { NotBound } from "../plugins/token-exchange.js";
+import type { Result } from "../result.js";
 import type { PullRef } from "../review/pull-ref.js";
 
-/** The GitHub device flow ended without a token. Nothing but the reason is kept (no body, no code, no token). */
-export type DeviceFlowFailure = "unavailable" | "expired" | "denied";
-
-export class DeviceFlowError extends Error {
-  readonly reason: DeviceFlowFailure;
-
-  constructor(reason: DeviceFlowFailure) {
-    super(reason);
-    this.name = "DeviceFlowError";
-    this.reason = reason;
-  }
+/** The GitHub device flow ended without a token: 'unavailable' (GitHub did not answer sensibly), 'expired' (the code ran
+ * out unused) or 'denied' (the person said no). Nothing but the reason is kept (no body, no code, no token). */
+export interface DeviceFlowFailed {
+  readonly kind: "device_flow_failed";
+  readonly reason: "unavailable" | "expired" | "denied";
 }
 
 export interface DeviceCode {
@@ -31,33 +30,31 @@ export interface DeviceCode {
 
 /** RFC 8628 against github.com with a public client; the scope asked for is always `repo`. */
 export interface DeviceFlow {
-  start(): Promise<DeviceCode>;
-  /** Polls until the person approves: the token, or DeviceFlowError. */
-  waitForToken(code: DeviceCode): Promise<string>;
+  start(): Promise<Result<DeviceCode, DeviceFlowFailed>>;
+  /** Polls until the person approves: the token, or why not. */
+  waitForToken(code: DeviceCode): Promise<Result<string, DeviceFlowFailed>>;
 }
 
 /**
  * The identity service refused or could not be asked. `status` is the HTTP status (0: no answer) and `code` its OAuth error
  * code; nothing else of the answer is kept.
  */
-export class CredentialError extends Error {
+export interface CredentialRefused {
+  readonly kind: "credential_refused";
   readonly status: number;
   readonly code: string;
-
-  constructor(status: number, code = "") {
-    super(`identity service answered ${String(status)} ${code}`.trim());
-    this.name = "CredentialError";
-    this.status = status;
-    this.code = code;
-  }
 }
 
-/** The identity service has no binding for this person: only they can make one, by connecting their Primus account. */
-export class CredentialNotBound extends Error {
-  constructor() {
-    super("not bound");
-    this.name = "CredentialNotBound";
-  }
+/** `not_bound`: the identity service has no binding for this person; only they can make one, by connecting their account. */
+export type CredentialFailure = NotBound | CredentialRefused;
+
+export function credentialRefused(status: number, code = ""): CredentialRefused {
+  return { kind: "credential_refused", status, code };
+}
+
+/** How a refusal is logged: status and code only. */
+export function describeRefusal(refused: CredentialRefused): string {
+  return `identity service answered ${String(refused.status)} ${refused.code}`.trim();
 }
 
 export interface GithubState {
@@ -85,10 +82,10 @@ export function needsWiderScope(scopes: readonly string[]): boolean {
 
 /** The identity service's `/oauth/external-credentials` calls for a person (by their directory id). */
 export interface GithubCredentials {
-  status(aadId: string): Promise<GithubState>;
-  bind(aadId: string, token: string): Promise<GithubState>;
-  unbind(aadId: string): Promise<boolean>;
-  setDelegation(aadId: string, enabled: boolean): Promise<GithubState>;
+  status(userId: string): Promise<Result<GithubState, CredentialFailure>>;
+  bind(userId: string, token: string): Promise<Result<GithubState, CredentialFailure>>;
+  unbind(userId: string): Promise<Result<boolean, CredentialFailure>>;
+  setDelegation(userId: string, enabled: boolean): Promise<Result<GithubState, CredentialFailure>>;
 }
 
 /** Who wrote a pull request, and other public facts, read with no credential. Any failure reads as "not known". */

@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Text helpers that keep the Python worker's string semantics where a review request depends on them: lengths and slices count
  * code points (not UTF-16 units), "alphanumeric" and "word" are Unicode-aware, and whitespace runs collapse as `str.split()` does.
@@ -8,9 +11,12 @@ const ALNUM = /[\p{L}\p{N}]/u;
 
 /** The number of code points in `text` (Python's `len`). */
 export function cpLength(text: string): number {
-  let n = 0;
-  for (const _ of text) n += 1;
-  return n;
+  return codePoints(text).length;
+}
+
+/** The code points of `text` (Python iterates a string by code point). */
+export function codePoints(text: string): string[] {
+  return Array.from(text);
 }
 
 /** The first `limit` code points of `text` (Python's `text[:limit]`). */
@@ -75,7 +81,7 @@ export function isUpper(text: string): boolean {
 /** Python's `str.strip(chars)`: every character of `chars` taken off both ends. */
 export function stripChars(text: string, chars: string): string {
   const set = new Set(chars);
-  const points = [...text];
+  const points = codePoints(text);
   let start = 0;
   let end = points.length;
   while (start < end && set.has(points[start] ?? "")) start += 1;

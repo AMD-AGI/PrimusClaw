@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * The shared GitHub REST client of the worker: one place that knows GitHub's base URL, headers and how a token is used. The
  * review service reads public pull requests through it with no credential; feedback files issues with a GitHub App installation

@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /** A pull request named in a review request, and how one is read out of text (links and owner/repo#N). */
 
 /** What a mention is replaced with in a marked text: ⟦0⟧, ⟦1⟧, ... (the Teams adapter writes it; the domain reads it). */

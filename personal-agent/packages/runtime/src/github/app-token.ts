@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * A GitHub App installation token: an RS256 JWT signed with the App's key, exchanged for a short-lived token scoped to one
  * repository and the permissions asked for, cached until shortly before it expires. A plain token (a file, a secret) can stand
