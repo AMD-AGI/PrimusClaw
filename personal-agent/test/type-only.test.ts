@@ -5,7 +5,9 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { isTypeOnly, typeOnlyFiles } from "../scripts/type-only.js";
+import fs from "node:fs";
+import os from "node:os";
+import { isTypeOnly, sourceFiles, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -50,4 +52,33 @@ test("core's type-only files are found by compiling them, and files with runtime
   ]) {
     assert.ok(!found.includes(file), file);
   }
+});
+
+test("every source extension is found; only TypeScript can be type-only, JavaScript always counts", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "type-only-"));
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  fs.mkdirSync(path.join(dir, "nested"));
+  const types = "export interface A {\n  readonly x: string;\n}\n";
+  const files: Record<string, string> = {
+    "a.ts": types,
+    "nested/b.tsx": types,
+    "c.mts": types,
+    "d.cts": types,
+    "e.tsx": "export const probe = (): number => 1;\n",
+    "f.js": "export {};\n",
+    "g.mjs": "export const x = 1;\n",
+    "h.cjs": "module.exports = {};\n",
+    "i.jsx": "export {};\n",
+    "notes.txt": "x",
+  };
+  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
+  assert.deepEqual(
+    sourceFiles(dir)
+      .map((f) => path.relative(dir, f))
+      .sort(),
+    ["a.ts", "c.mts", "d.cts", "e.tsx", "f.js", "g.mjs", "h.cjs", "i.jsx", "nested/b.tsx"],
+  );
+  assert.deepEqual(typeOnlyFiles(dir, dir), ["a.ts", "c.mts", "d.cts", "nested/b.tsx"]);
 });

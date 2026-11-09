@@ -17,7 +17,7 @@ import {
   type SqliteStore,
 } from "@primusclaw/personal-agent-runtime";
 
-import { advanceSeconds, openFileTestStore, type FileTestStore } from "../../../../test-support/index.js";
+import { advanceSeconds, openFileTestStore, type FileTestStore, ignoreEvents } from "../../../../test-support/index.js";
 
 function seed(f: FileTestStore): void {
   const { links, notifySubs } = f.store;
@@ -171,7 +171,10 @@ test("the worker re-encrypts when it opens the store, and logs counts but no sec
       lines.push(fields === undefined ? { message } : { message, fields });
     };
     const logger: Logger = { debug: record, info: record, warn: record, error: record, child: () => logger };
-    openWorkerStore({ path: f.path, encryptionKeys: [fresh, old], clock: f.clock }, logger).close();
+    openWorkerStore(
+      { path: f.path, encryptionKeys: [fresh, old], clock: f.clock, securityEvent: ignoreEvents },
+      logger,
+    ).close();
     assert.equal(f.reopen({ encryptionKeys: [fresh] }).links.getKey("aad-alice"), "ak-alice-linked");
     assert.deepEqual(lines, [
       {
