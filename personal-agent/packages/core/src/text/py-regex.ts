@@ -20,7 +20,8 @@ export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes
  *  - with the `i` flag, `i`, `I`, `ı` and `İ` all match one another, as Python folds them (JavaScript does not).
  * The `u` flag is always on. What has no JavaScript form is refused when the pattern is built, with an InvariantError:
  * an escape Python refuses, `\N{...}`, a negated class escape inside a class (`[\S]`), inline flags anywhere but at the
- * start or scoped to a group (`(?s:...)`), a backreference under `i` (JavaScript folds it without `ı`/`İ`), and any
+ * start or scoped to a group (`(?s:...)`), a backreference (JavaScript matches one to a group that took no part as
+ * the empty string, where Python fails), and any
  * other syntax JavaScript cannot read.
  */
 
@@ -82,7 +83,7 @@ const NAME = String.raw`[\p{L}_][\p{L}\p{N}_]*`;
  * `(?P=name)` (`\k<name>`), JavaScript's own `(?<name>` and `\k<name>`, a comment `(?#...)` (dropped), and a flag group
  * anywhere but the start (refused). A lookbehind `(?<=`/`(?<!` is no name and is read as the pattern it is.
  */
-function groupAt(source: string, i: number, flags: Flags): Step | undefined {
+function groupAt(source: string, i: number): Step | undefined {
   const rest = source.slice(i);
   if (rest.startsWith("(?#")) {
     const close = rest.indexOf(")");
@@ -93,18 +94,17 @@ function groupAt(source: string, i: number, flags: Flags): Step | undefined {
   const python = new RegExp(`^\\(\\?P<(${NAME})>`, "u").exec(rest);
   if (python) return { text: `(?<${python[1] ?? ""}>`, length: python[0].length };
   const reference = new RegExp(`^(?:\\(\\?P=(${NAME})\\)|\\\\k<(${NAME})>)`, "u").exec(rest);
-  if (reference) {
-    if (flags.ignoreCase) throw new InvariantError("a backreference under IGNORECASE has no JavaScript form here");
-    return { text: `\\k<${reference[1] ?? reference[2] ?? ""}>`, length: reference[0].length };
-  }
+  // a named backreference: refused like \1 (JavaScript matches one to a group that took no part as empty)
+  if (reference) throw new InvariantError("a backreference has no JavaScript form here");
   const own = new RegExp(`^\\(\\?<(?![=!])${NAME}>`, "u").exec(rest);
   return own ? { text: own[0], length: own[0].length } : undefined;
 }
 
-/** A `{` that begins a quantifier (`{,n}` written `{0,n}`), or the literal `{`. */
+/** A `{` that begins a quantifier (`{,n}` written `{0,n}`, `{,}` written `{0,}`), or the literal `{`. */
 function braceAt(source: string, i: number): Step {
   const quantifier = /^\{(\d*)(,(\d*))?\}/.exec(source.slice(i));
-  if (quantifier && (quantifier[1] || quantifier[3])) {
+  // Python: {m}, {m,}, {,n}, {m,n} and {,} (= {0,}); only {} is the characters themselves
+  if (quantifier && (quantifier[1] || quantifier[2] !== undefined)) {
     const text = quantifier[2] === undefined ? quantifier[0] : `{${quantifier[1] || "0"},${quantifier[3] ?? ""}}`;
     return { text, length: quantifier[0].length };
   }
@@ -113,7 +113,7 @@ function braceAt(source: string, i: number): Step {
 
 function outsideClass(source: string, i: number, flags: Flags): Step {
   const ch = source.charAt(i);
-  if (ch === "(") return groupAt(source, i, flags) ?? { text: ch, length: 1 };
+  if (ch === "(") return groupAt(source, i) ?? { text: ch, length: 1 };
   if (ch === "{") return braceAt(source, i);
   if (ch === "}" || ch === "]") return { text: `\\${ch}`, length: 1 };
   const special = anchorOrDot(ch, flags);
