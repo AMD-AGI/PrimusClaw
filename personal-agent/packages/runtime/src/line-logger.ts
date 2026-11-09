@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { LogFields, Logger, LogLevel, LogValue } from "@primusclaw/personal-agent";
+import { redactLogLine, type LogFields, type Logger, type LogLevel, type LogValue } from "@primusclaw/personal-agent";
 
 const ORDER: Readonly<Record<LogLevel, number>> = { debug: 10, info: 20, warn: 30, error: 40 };
 
@@ -29,13 +29,14 @@ function formatFields(fields: LogFields): string {
 
 /**
  * A logger that writes one line per call: `<ISO time> <LEVEL> <message> key=value ...`. The fields of `child` loggers
- * come first, in the order they were bound.
+ * come first, in the order they were bound. The whole line goes through `redactLogLine`: a net under the rule that a
+ * line carries ids, statuses and kinds of error only (credential shapes and credential-named URL parameters masked).
  */
 export function lineLogger(options: LineLoggerOptions, bound: LogFields = {}): Logger {
   const emit = (level: LogLevel, message: string, fields: LogFields = {}): void => {
     if (ORDER[level] < ORDER[options.level]) return;
     const time = new Date(options.now()).toISOString();
-    options.write(`${time} ${level.toUpperCase()} ${message}${formatFields({ ...bound, ...fields })}`);
+    options.write(redactLogLine(`${time} ${level.toUpperCase()} ${message}${formatFields({ ...bound, ...fields })}`));
   };
   return {
     debug: (message, fields) => {

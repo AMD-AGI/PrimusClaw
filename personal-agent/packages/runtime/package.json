@@ -9,6 +9,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@primusclaw/personal-agent": "0.0.0"
+    "@primusclaw/personal-agent": "0.0.0",
+    "zod": "^4.6.5"
   }
 }

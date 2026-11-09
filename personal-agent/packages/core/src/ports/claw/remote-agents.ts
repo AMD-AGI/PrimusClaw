@@ -4,7 +4,14 @@
 import type { JsonObject } from "../../json.js";
 import type { ClawCredential } from "../../claw/credential.js";
 import type { SseEvent } from "../../claw/model.js";
-import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
+import type {
+  RemoteConnector,
+  RemoteEventRow,
+  RemoteHidden,
+  RemotePairing,
+  RemoteSession,
+  RemoteSetup,
+} from "../../claw/remote.js";
 
 /** What a remote session starts with. */
 export interface NewRemoteSession {
@@ -26,8 +33,18 @@ export interface NewRemoteSession {
 export interface ClawRemoteAgentsPort {
   /** How to connect a machine: the connector's package and the exact commands. */
   setup(key: ClawCredential): Promise<RemoteSetup>;
-  /** The caller's connectors, each with `online` and its `agents`. */
-  connectors(key: ClawCredential): Promise<RemoteConnector[]>;
+  /**
+   * The caller's connectors, each with `online` and its `agents`. The conversations the caller hid are left out of each
+   * agent's `capabilities.resumable` and counted in `capabilities.hidden_count`; `includeHidden` lists them too, marked
+   * `hidden: true` (`?hidden=include`).
+   */
+  connectors(key: ClawCredential, options?: { includeHidden?: boolean }): Promise<RemoteConnector[]>;
+  /**
+   * Hides conversations (1-50 refs) of one of the caller's machines from their lists, or (`hidden` false) shows them
+   * again; nothing on the machine changes. ClawError(404): not the caller's machine, or revoked; 400 for refs Claw does
+   * not take.
+   */
+  hide(key: ClawCredential, connectorId: string, refs: readonly string[], hidden: boolean): Promise<RemoteHidden>;
   /** A one-time pairing code inside the command line that uses it. */
   pair(key: ClawCredential): Promise<RemotePairing>;
   revoke(key: ClawCredential, connectorId: string): Promise<void>;
