@@ -50,7 +50,7 @@ test("a connector is read with its agents and every field it did not say is empt
     agents: [],
   });
   assert.deepEqual(connectorById(listed.map(connectorFrom), "c1"), connector);
-  assert.equal(agentById(connector, "codex")?.name, "Codex");
+  assert.equal(agentById(connectorFrom(listed[0] ?? {}), "codex")?.name, "Codex");
   assert.equal(agentById(undefined, "codex"), undefined);
 });
 

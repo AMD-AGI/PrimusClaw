@@ -65,7 +65,10 @@ interface InboundBase {
   readonly conversation: ConversationRef;
   /** The locale of the person's client ("" when not said), e.g. "zh-CN". */
   readonly locale: string;
-  /** The client the person used ("Windows", "Web", "iOS", ...; "" when not said), letters and digits only. */
+  /**
+   * The client the person used ("Windows", "Mac", "Web", "iOS", "Android"; "" when not said), letters and digits only,
+   * at most 16 (Python `activity.client_platform`).
+   */
   readonly clientPlatform: string;
 }
 
@@ -77,12 +80,21 @@ export interface InboundLink {
 
 /** A message the person quoted or replied to. */
 export interface InboundQuote {
+  /** The channel's id of the quoted message ("" when not said): tells whether a reply quotes a card the bot posted. */
+  readonly messageId: string;
   readonly author: string;
   readonly text: string;
   /** Whether the quoted message is one this bot posted. */
   readonly fromBot: boolean;
   /** When it was written, as the channel said it ("" when not said). */
   readonly sentAt: string;
+  /** The quoted message was deleted (its text is then ""), as opposed to a quote whose text the channel did not give. */
+  readonly deleted: boolean;
+  /**
+   * Where the adapter read the quote (for a log line, never the text): a structured entity, the message's HTML, or a
+   * placeholder that came with no data (Python `Quote.source`).
+   */
+  readonly source: "entity" | "html" | "placeholder";
 }
 
 /** Someone the message @mentions (never the bot itself: the adapter removes its own mention). */
@@ -94,6 +106,11 @@ export interface InboundMention {
   readonly name: string;
   /** The mention as it appears in the message text. */
   readonly shown: string;
+  /**
+   * Where `shown` starts in `InboundMessage.text`, in code points: a mention is replaced at its position, never at the
+   * first occurrence of the name ("Dana, ask @Dana" mentions the second "Dana").
+   */
+  readonly offset: number;
 }
 
 /** A file that came with a message. The bytes are fetched through `Surface.fetchFile`, never by core directly. */
@@ -109,8 +126,19 @@ export interface InboundMessage extends InboundBase {
   readonly type: "message";
   /** What the person wrote, the bot's own mention removed. */
   readonly text: string;
-  /** In a group or channel: whether the bot was @mentioned or the message otherwise addressed to it. Always true in 1:1. */
-  readonly addressedToBot: boolean;
+  /** The bot itself is @mentioned; a mention of someone else does not count (Python `activity.is_mentioned`). */
+  readonly mentioned: boolean;
+  /**
+   * A targeted (private) message: in a group chat the person picked the bot under "/" and only the bot sees what they
+   * wrote (Python `activity.is_targeted`; Teams marks it on the recipient, `isTargeted`).
+   */
+  readonly targeted: boolean;
+  /**
+   * The message starts by naming the bot ("@<bot name> ...", typed as words or as the bot's mention put first): in a
+   * 1:1 chat attached to a remote session, the way the person says these words are for the bot and not for the session
+   * (Python `activity.addressed_to_bot`, with the configured bot name).
+   */
+  readonly namesBotFirst: boolean;
   /** The conversation's name (a group chat's title; "" in 1:1 or when the channel gave none). */
   readonly conversationName: string;
   /** The people the message @mentions, in order, the bot excluded. */
@@ -162,6 +190,8 @@ export type View = { readonly [K in keyof ViewMap]: { readonly name: K; readonly
 
 /** A source a reply cites (`[n]` in its text). */
 export interface Citation {
+  /** The `n` of the `[n]` in the text that cites it. */
+  readonly position: number;
   readonly title: string;
   readonly url: string;
   readonly abstract: string;
@@ -175,6 +205,15 @@ export interface SuggestedReply {
   readonly title: string;
   readonly value: string;
 }
+
+/**
+ * A button on a view: one that sends an action back to the worker (`verb` and its `data`, which arrive as an
+ * `InboundAction`), or one that opens a link. This is the worker's own click protocol, not channel markup; a channel
+ * renders it as its own button (Teams: Action.Execute / Action.OpenUrl).
+ */
+export type ViewButton =
+  | { readonly title: string; readonly verb: string; readonly data: JsonObject }
+  | { readonly title: string; readonly url: string };
 
 /** What a message is. */
 export type OutBody =
@@ -240,6 +279,10 @@ export interface LiveStream {
   finish(message: OutMessage): Promise<Result<void, StreamRefused>>;
 }
 
+export interface UpdateOptions {
+  readonly signal?: AbortSignal;
+}
+
 /**
  * A message built for one conversation and not yet sent: the channel's own envelope (Teams: the Python worker's
  * `{"operation": "send", "reference": ..., "activity": ...}`), opaque to core. A flow that must keep what it is about to
@@ -261,7 +304,11 @@ export interface Conversation {
   send(message: OutMessage): Promise<void>;
   /** Post and return the new message's id; undefined when the channel never said it (keep sending, do not edit). */
   post(message: OutMessage): Promise<MessageId | undefined>;
-  update(id: MessageId, message: OutMessage): Promise<void>;
+  /**
+   * Replace message `id`. With `signal`, an edit not yet sent when it is aborted is not sent, and the promise rejects
+   * with the signal's reason (a stop that must not let a late progress edit overwrite what it shows).
+   */
+  update(id: MessageId, message: OutMessage, options?: UpdateOptions): Promise<void>;
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>>;
   /** The envelope `send` would publish for `message` (masked in a group), built without sending it. */
   outgoing(message: OutMessage): Envelope;
