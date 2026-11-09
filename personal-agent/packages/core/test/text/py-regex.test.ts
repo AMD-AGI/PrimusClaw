@@ -210,6 +210,13 @@ test("what has no JavaScript form is refused when the pattern is built, never re
 
 /** Round-3 review cases: (pattern, flags, text, how, what CPython 3 said). */
 const FOLLOW_UP: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["\\w", "i", "\u03b9", "full", true],
+  ["[\\w]", "i", "\u03b9", "full", true],
+  ["\\W", "i", "\u03b9", "full", false],
+  ["[^\\w]", "i", "\u03b9", "full", false],
+  ["\\bA", "i", "\u03b9A", "search", false],
+  ["\\w+", "i", "\u0399\u03b9a", "full", true],
+  ["\\123", "", "S", "full", true],
   ["\\w", "i", "\u0345", "full", false],
   ["\\W", "i", "\u0345", "full", true],
   ["\\bA", "i", "\u0345A", "search", true],
@@ -237,7 +244,7 @@ test("a full match is the same on every call and Python's own errors are refused
   const second = again.test("a"); // a second call on the same RegExp: no lastIndex carried over
   assert.ok(first && second);
   assert.equal(pyRegExp("a", "gi").flags, "giu"); // searching for every match keeps g
-  for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a"]) {
+  for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a", `${"()".repeat(400)}\\400`]) {
     assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
   }
 });

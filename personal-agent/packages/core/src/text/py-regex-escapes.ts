@@ -30,7 +30,8 @@ const I_SET: ReadonlySet<string> = new Set(Array.from(I_VARIANTS));
  * Under IGNORECASE JavaScript folds a class's letters and finds U+0345 (which folds to the letter ι) in `\p{L}`; Python
  * does not count it a word character. These are `\w`, `\W` and the boundaries with it left out.
  */
-export const COMBINING_IOTA = "\\u{345}";
+/** U+0345 alone, compared without case: under IGNORECASE a plain `\\u{345}` would also be ι, which IS a word character. */
+export const COMBINING_IOTA = "(?-i:\\u{345})";
 const PY_W_I = `(?:(?!${COMBINING_IOTA})${PY_W})`;
 const OUTSIDE_I: Readonly<Record<string, string>> = {
   w: PY_W_I,
@@ -98,7 +99,7 @@ function hexEscape(source: string, i: number, context: EscapeContext): Escape {
 /** `\0`, `\012`, `\101` (octal) and, outside a class, `\1`-`\99` (a group's text again). */
 function digitEscape(source: string, i: number, context: EscapeContext): Escape {
   const rest = source.slice(i + 1);
-  const octal = /^(?:0[0-7]{0,2}|[0-3][0-7]{2})/.exec(rest) ?? (context.inClass ? /^[0-7]{1,3}/.exec(rest) : null);
+  const octal = /^(?:0[0-7]{0,2}|[0-7]{3})/.exec(rest) ?? (context.inClass ? /^[0-7]{1,3}/.exec(rest) : null);
   if (octal) {
     const ch = codePoint(parseInt(octal[0], 8), `the octal escape \\${octal[0]} (past \\377)`, 0o377);
     return { text: literal(ch, context), length: 1 + octal[0].length };
