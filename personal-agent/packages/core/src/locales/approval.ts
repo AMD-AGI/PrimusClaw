@@ -15,7 +15,8 @@ export const approvalText = defineCatalog({
     more: (p: { n: number }) => `+${String(p.n)} more field(s) in Details`,
     details: "Details",
     rule: (p: { label: string }) => `Held by a rule: ${p.label}`,
-    only: (p: { who: string }) => `Only ${p.who} can approve or deny this. The details are in their PrimusClaw session.`,
+    only: (p: { who: string }) =>
+      `Only ${p.who} can approve or deny this. The details are in their PrimusClaw session.`,
     asker: "the person who asked",
     fallbackTool: "an action",
     sep: ": ",

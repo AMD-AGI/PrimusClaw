@@ -49,11 +49,7 @@ export function humanizeTool(tool: string): string {
     server = match[1] ?? "";
     name = match[2] ?? "";
   }
-  const spaced =
-    name
-      .split(/[_\-\s]+/)
-      .join(" ")
-      || name;
+  const spaced = name.split(/[_\-\s]+/).join(" ") || name;
   return server ? `${spaced} (${server})` : spaced;
 }
 
