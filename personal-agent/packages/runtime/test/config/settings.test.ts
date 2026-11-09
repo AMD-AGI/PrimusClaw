@@ -135,13 +135,19 @@ describe("the per-person limits", () => {
     refused({ TEAMS_LIMIT_PR_REVIEW: "five/600" }, "TEAMS_LIMIT_PR_REVIEW");
   });
 
-  it("the link limits", () => {
+  it("link limits default and come from the environment", () => {
+    assert.deepEqual(settings().linkLimits, { perUser: 5, global: 100, windowSeconds: 600 });
     const s = settings({
+      TEAMS_LINK_MAX_FAILURES_GLOBAL: "40",
       TEAMS_LINK_MAX_FAILURES_PER_USER: "3",
-      TEAMS_LINK_MAX_FAILURES_GLOBAL: "50",
-      TEAMS_LINK_ATTEMPT_WINDOW_SECONDS: "60",
+      TEAMS_LINK_ATTEMPT_WINDOW_SECONDS: "900",
     });
-    assert.deepEqual(s.linkLimits, { perUser: 3, global: 50, windowSeconds: 60 });
-    refused({ TEAMS_LINK_MAX_FAILURES_GLOBAL: "0" }, "TEAMS_LINK_MAX_FAILURES_GLOBAL must be a positive whole number");
+    assert.deepEqual(s.linkLimits, { perUser: 3, global: 40, windowSeconds: 900 });
   });
+
+  for (const value of ["0", "-1", "ten", "1.5"]) {
+    it(`a bad link limit refuses to start: ${value}`, () => {
+      refused({ TEAMS_LINK_MAX_FAILURES_GLOBAL: value }, "TEAMS_LINK_MAX_FAILURES_GLOBAL");
+    });
+  }
 });

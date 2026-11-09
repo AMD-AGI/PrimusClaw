@@ -5,6 +5,7 @@ import {
   ClawAnswerInvalid,
   remoteConnectorsSchema,
   remoteEventRowsSchema,
+  remoteHiddenSchema,
   remotePairingSchema,
   remoteSessionSchema,
   remoteSessionsSchema,
@@ -14,6 +15,7 @@ import {
   type NewRemoteSession,
   type RemoteConnector,
   type RemoteEventRow,
+  type RemoteHidden,
   type RemotePairing,
   type RemoteSession,
   type RemoteSetup,
@@ -35,12 +37,9 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
     return dataOf(await this.#call("GET", "/setup", key), "the remote setup");
   }
 
-  async connectors(key: ClawCredential): Promise<RemoteConnector[]> {
-    return read(
-      remoteConnectorsSchema,
-      anyDataOf(await this.#call("GET", "/connectors", key), "connectors"),
-      "connectors",
-    );
+  async connectors(key: ClawCredential, options: { includeHidden?: boolean } = {}): Promise<RemoteConnector[]> {
+    const path = options.includeHidden === true ? "/connectors?hidden=include" : "/connectors";
+    return read(remoteConnectorsSchema, anyDataOf(await this.#call("GET", path, key), "connectors"), "connectors");
   }
 
   async pair(key: ClawCredential): Promise<RemotePairing> {
@@ -49,6 +48,16 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
       anyDataOf(await this.#call("POST", "/pairings", key, {}), "a pairing"),
       "a pairing",
     );
+  }
+
+  async hide(
+    key: ClawCredential,
+    connectorId: string,
+    refs: readonly string[],
+    hidden: boolean,
+  ): Promise<RemoteHidden> {
+    const answer = await this.#call("POST", `/connectors/${segment(connectorId)}/hidden`, key, { refs, hidden });
+    return read(remoteHiddenSchema, anyDataOf(answer, "hidden conversations"), "hidden conversations");
   }
 
   async revoke(key: ClawCredential, connectorId: string): Promise<void> {

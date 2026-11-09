@@ -96,3 +96,42 @@ describe("remote agent sessions", () => {
     await assert.rejects(wire.client().remoteAgents.events("ak-a", "rs1"), ClawAnswerInvalid);
   });
 });
+
+describe("hiding a machine's conversations", () => {
+  it("hides or shows again by ref, and says what changed and what was refused", async () => {
+    const wire = new Wire(() =>
+      json(200, { ok: true, data: { changed: ["r1"], refused: [{ ref: "r2", reason: "live" }, "junk"] } }),
+    );
+    const claw = wire.client();
+    assert.deepEqual(await claw.remoteAgents.hide("ak-a", "c1", ["r1", "r2"], true), {
+      changed: ["r1"],
+      refused: [{ ref: "r2", reason: "live" }],
+    });
+    await claw.remoteAgents.hide("ak-a", "c1", ["r1"], false);
+    assert.deepEqual(
+      wire.sent.map((s) => [s.method, s.rawPath, s.body]),
+      [
+        ["POST", "/v1/remote-agents/connectors/c1/hidden", { refs: ["r1", "r2"], hidden: true }],
+        ["POST", "/v1/remote-agents/connectors/c1/hidden", { refs: ["r1"], hidden: false }],
+      ],
+    );
+    wire.answer = () => json(404, { ok: false, error: "not_found" });
+    await assert.rejects(claw.remoteAgents.hide("ak-a", "c9", ["r1"], true), { name: "ClawError", status: 404 });
+  });
+
+  it("the listing leaves hidden conversations out unless asked to include them", async () => {
+    const wire = new Wire(() =>
+      json(200, {
+        data: [{ connector_id: "c1", agents: [{ agent_id: "a1", capabilities: { resumable: [], hidden_count: 2 } }] }],
+      }),
+    );
+    const claw = wire.client();
+    const [connector] = await claw.remoteAgents.connectors("ak-a");
+    assert.equal(connector?.agents?.[0]?.capabilities?.["hidden_count"], 2);
+    await claw.remoteAgents.connectors("ak-a", { includeHidden: true });
+    assert.deepEqual(
+      wire.sent.map((s) => s.url.search),
+      ["", "?hidden=include"],
+    );
+  });
+});

@@ -89,6 +89,7 @@ const CASES: Readonly<Record<string, Drive>> = {
   "mergeConfirmations.pending:sessionId": (c, id) => c.mergeConfirmations.pending("k", id),
   "mergeConfirmations.decide:confirmationId": (c, id) => c.mergeConfirmations.decide("exchanged-token", id, "allow"),
   "remoteAgents.revoke:connectorId": (c, id) => c.remoteAgents.revoke("k", id),
+  "remoteAgents.hide:connectorId": (c, id) => c.remoteAgents.hide("k", id, ["r1"], true),
   "remoteAgents.createSession:connectorId": (c, id) =>
     c.remoteAgents.createSession("k", { connectorId: id, agentId: "a1", cwd: "/" }),
   "remoteAgents.createSession:agentId": (c, id) =>
