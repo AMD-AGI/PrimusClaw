@@ -38,9 +38,7 @@ const call = async (
 };
 
 test("a session is the owner's alone and refusals carry Claw's error words", async () => {
-  const cid = srv.addConnector("u-alice", "dev-pod", [
-    ["codex", "codex", "Codex"],
-  ]);
+  const cid = srv.addConnector("u-alice", "dev-pod", [["codex", "codex", "Codex"]]);
   const created = await call("POST", "/sessions", "ak-alice", {
     connector_id: cid,
     agent_id: "codex",
@@ -123,30 +121,18 @@ test("the event stream replays after a cursor, marks the history and goes on liv
   const sid = srv.addSession("u-alice", cid, "codex");
   const firstId = await srv.say(sid, "one");
   await srv.say(sid, "two");
-  const res = await fetch(
-    `${srv.url}/v1/remote-agents/sessions/${sid}/events?after=${String(firstId)}`,
-    {
-      headers: { Authorization: "Bearer ak-alice" },
-    },
-  );
+  const res = await fetch(`${srv.url}/v1/remote-agents/sessions/${sid}/events?after=${String(firstId)}`, {
+    headers: { Authorization: "Bearer ak-alice" },
+  });
   const reader = res.body?.getReader();
   assert.ok(reader);
   let text = "";
   const decoder = new TextDecoder();
-  while (!text.includes("historyComplete"))
-    text += decoder.decode((await reader.read()).value);
-  assert.ok(
-    !text.includes('"one"') &&
-      text.includes('"two"') &&
-      text.includes("event: agent_message_chunk"),
-  );
+  while (!text.includes("historyComplete")) text += decoder.decode((await reader.read()).value);
+  assert.ok(!text.includes('"one"') && text.includes('"two"') && text.includes("event: agent_message_chunk"));
   await srv.end(sid);
-  while (!text.includes("turn_end"))
-    text += decoder.decode((await reader.read()).value);
+  while (!text.includes("turn_end")) text += decoder.decode((await reader.read()).value);
   await reader.cancel();
-  const replay = await call(
-    "GET",
-    `/sessions/${sid}/events?mode=replay&after=0&limit=2`,
-  );
+  const replay = await call("GET", `/sessions/${sid}/events?mode=replay&after=0&limit=2`);
   assert.equal((replay.body.data as unknown[]).length, 2);
 });

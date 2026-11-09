@@ -12,12 +12,7 @@
  * from its `onCommand` hook or directly, which is exactly what a connector posts.
  */
 import { randomUUID } from "node:crypto";
-import {
-  type IncomingMessage,
-  type Server,
-  type ServerResponse,
-  createServer,
-} from "node:http";
+import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import {
@@ -50,10 +45,7 @@ import {
 
 export * from "./remote-fake-data.js";
 
-export type CommandHook = (
-  server: FakeRemote,
-  command: FakeCommand,
-) => Promise<void> | void;
+export type CommandHook = (server: FakeRemote, command: FakeCommand) => Promise<void> | void;
 
 export class FakeRemote {
   readonly connectors = new Map<string, FakeConnector>();
@@ -102,9 +94,7 @@ export class FakeRemote {
       void this.serve(req, res);
     });
     this.server = server;
-    await new Promise<void>((resolve) =>
-      server.listen(0, "127.0.0.1", resolve),
-    );
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
     this.url = `http://127.0.0.1:${String(port)}`;
     return this.url;
@@ -123,10 +113,7 @@ export class FakeRemote {
     }
   }
 
-  private async serve(
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
+  private async serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://fake");
     const method = req.method ?? "GET";
     const key = (req.headers.authorization ?? "").replace(/^Bearer /u, "");
@@ -163,20 +150,12 @@ export class FakeRemote {
   }
 
   /** What answers before any route: remote agents off, or an injected failure. */
-  private gate(
-    method: string,
-    path: string,
-    user: string | undefined,
-  ): Reply | null {
+  private gate(method: string, path: string, user: string | undefined): Reply | null {
     if (!this.enabled) return notARoute(method, path);
     for (const [where, failure] of this.fail) {
-      const [m, suffix] = [
-        where.slice(0, where.indexOf(" ")),
-        where.slice(where.indexOf(" ") + 1),
-      ];
+      const [m, suffix] = [where.slice(0, where.indexOf(" ")), where.slice(where.indexOf(" ") + 1)];
       if (method === m && path.endsWith(suffix)) {
-        const [status, error] =
-          typeof failure === "number" ? [failure, "injected"] : failure;
+        const [status, error] = typeof failure === "number" ? [failure, "injected"] : failure;
         return refuse(status, error);
       }
     }
@@ -186,8 +165,7 @@ export class FakeRemote {
   /** The answer to one request of the user side (`ROUTES`). */
   private async route(req: RouteRequest): Promise<Reply> {
     for (const [method, pattern, handle] of ROUTES) {
-      const match =
-        req.method === method ? pattern.exec(req.url.pathname) : null;
+      const match = req.method === method ? pattern.exec(req.url.pathname) : null;
       if (match) return handle(this, req, match[1] ?? "");
     }
     return notARoute(req.method, req.url.pathname);
@@ -195,9 +173,7 @@ export class FakeRemote {
 
   /** What GET .../setup answers. */
   setupAnswer(path: string): Reply {
-    return this.setup === null
-      ? notARoute("GET", path)
-      : reply(200, { ok: true, data: this.setup });
+    return this.setup === null ? notARoute("GET", path) : reply(200, { ok: true, data: this.setup });
   }
 
   // --- state helpers a test uses -----------------------------------------------------------------------------------
@@ -301,13 +277,7 @@ export class FakeRemote {
     });
   }
 
-  tool(
-    sid: string,
-    callId: string,
-    title: string,
-    status = "pending",
-    kind = "execute",
-  ): Promise<number> {
+  tool(sid: string, callId: string, title: string, status = "pending", kind = "execute"): Promise<number> {
     const name = status === "pending" ? "tool_call" : "tool_call_update";
     return this.acp(sid, name, { toolCallId: callId, title, kind, status });
   }
@@ -350,8 +320,7 @@ export class FakeRemote {
         ...(flags && m in flags ? { unattended: flags[m] } : {}),
       })),
     };
-    if (options.unattended !== undefined && options.unattended !== null)
-      data.unattended = options.unattended;
+    if (options.unattended !== undefined && options.unattended !== null) data.unattended = options.unattended;
     return this.emit(sid, "session_started", data);
   }
 
@@ -375,10 +344,7 @@ export class FakeRemote {
         version: c.version,
         online: c.online,
         version_status: c.version_status,
-        ...(c.version_status === "outdated" ||
-        c.version_status === "unsupported"
-          ? { upgrade_command: UPGRADE }
-          : {}),
+        ...(c.version_status === "outdated" || c.version_status === "unsupported" ? { upgrade_command: UPGRADE } : {}),
         ...(c.last_seen_at ? { last_seen_at: c.last_seen_at } : {}),
         ...(c.paired !== null ? { paired: c.paired } : {}),
         agents: c.agents,
@@ -405,24 +371,18 @@ export class FakeRemote {
     const c = this.connectors.get(cid);
     if (!c || c.owner !== user || c.revoked) return refuse(404, "not_found");
     c.revoked = true;
-    for (const s of this.sessions.values())
-      if (s.connector_id === c.connector_id) s.status = "closed";
+    for (const s of this.sessions.values()) if (s.connector_id === c.connector_id) s.status = "closed";
     return reply(200, { ok: true });
   }
 
   async createSession(user: string, body: Json): Promise<Reply> {
     const c = this.connectors.get(String(body.connector_id));
     if (!c || c.owner !== user || c.revoked) return refuse(404, "not_found");
-    if (!c.agents.some((a) => a.agent_id === body.agent_id))
-      return refuse(404, "agent_not_found");
+    if (!c.agents.some((a) => a.agent_id === body.agent_id)) return refuse(404, "agent_not_found");
     if (!c.online) return refuse(409, "connector_offline");
-    if (c.version_status === "unsupported")
-      return refuse(409, "connector_outdated");
-    const active = [...this.sessions.values()].filter(
-      (s) => s.owner === user && s.status === "active",
-    );
-    if (active.length >= MAX_ACTIVE_SESSIONS)
-      return refuse(409, "session_limit_reached");
+    if (c.version_status === "unsupported") return refuse(409, "connector_outdated");
+    const active = [...this.sessions.values()].filter((s) => s.owner === user && s.status === "active");
+    if (active.length >= MAX_ACTIVE_SESSIONS) return refuse(409, "session_limit_reached");
     const sid = this.addSession(user, c.connector_id, String(body.agent_id), {
       cwd: typeof body.cwd === "string" ? body.cwd : "",
     });
@@ -433,9 +393,7 @@ export class FakeRemote {
   listSessions(user: string): Reply {
     return reply(200, {
       ok: true,
-      data: [...this.sessions.values()]
-        .filter((s) => s.owner === user)
-        .map(publicOf),
+      data: [...this.sessions.values()].filter((s) => s.owner === user).map(publicOf),
     });
   }
 
@@ -451,19 +409,9 @@ export class FakeRemote {
     });
   }
 
-  command(
-    user: string,
-    sid: string,
-    body: Json,
-    idem: string | null,
-  ): Promise<Reply> {
+  command(user: string, sid: string, body: Json, idem: string | null): Promise<Reply> {
     const type = body.type;
-    if (
-      typeof type !== "string" ||
-      !["prompt", "cancel", "set_mode", "resume", "close", "withdraw"].includes(
-        type,
-      )
-    ) {
+    if (typeof type !== "string" || !["prompt", "cancel", "set_mode", "resume", "close", "withdraw"].includes(type)) {
       return Promise.resolve(refuse(400, "unknown_command_type"));
     }
     return this.issue(user, sid, type, body, idem);
@@ -472,50 +420,27 @@ export class FakeRemote {
   /** The decision's own checks: the request was asked, not resolved, and the option is one it offered. */
   private decisionRefusal(s: FakeSession, body: Json): Reply | null {
     const rows = this.events.get(s.session_id) ?? [];
-    const asked = [...rows]
-      .reverse()
-      .find(
-        (e) =>
-          e.type === "permissionRequest" && e.data.actionId === body.action_id,
-      );
+    const asked = [...rows].reverse().find((e) => e.type === "permissionRequest" && e.data.actionId === body.action_id);
     if (!asked) return refuse(404, "action_not_found");
-    if (
-      rows.some(
-        (e) =>
-          e.type === "permission_resolved" &&
-          e.data.actionId === body.action_id,
-      )
-    )
+    if (rows.some((e) => e.type === "permission_resolved" && e.data.actionId === body.action_id))
       return refuse(409, "already_resolved");
-    const offered = Array.isArray(asked.data.options)
-      ? (asked.data.options as Json[]).map((o) => o.optionId)
-      : [];
-    return offered.includes(body.option_id)
-      ? null
-      : refuse(400, "unknown_option");
+    const offered = Array.isArray(asked.data.options) ? (asked.data.options as Json[]).map((o) => o.optionId) : [];
+    return offered.includes(body.option_id) ? null : refuse(400, "unknown_option");
   }
 
-  async issue(
-    user: string,
-    sid: string,
-    type: string,
-    body: Json,
-    idempotency: string | null,
-  ): Promise<Reply> {
+  async issue(user: string, sid: string, type: string, body: Json, idempotency: string | null): Promise<Reply> {
     const s = this.mine(user, sid);
     if (!s) return refuse(404, "not_found");
     if (s.status !== "active") return refuse(409, "session_closed");
     const c = this.connector(s.connector_id);
-    if (["prompt", "set_mode", "resume"].includes(type) && !c.online)
-      return refuse(409, "connector_offline");
+    if (["prompt", "set_mode", "resume"].includes(type) && !c.online) return refuse(409, "connector_offline");
     let cmdId = idempotency !== null ? `k:${idempotency}` : randomUUID();
     if (type === "decision") {
       const refused = this.decisionRefusal(s, body);
       if (refused) return refused;
       cmdId = `dec:${s.session_id}:${String(body.action_id)}`;
     }
-    if (this.idem.has(cmdId))
-      return reply(200, { ok: true, data: { cmd_id: cmdId, duplicate: true } });
+    if (this.idem.has(cmdId)) return reply(200, { ok: true, data: { cmd_id: cmdId, duplicate: true } });
     this.idem.set(cmdId, body);
     if (type === "close") s.status = "closed";
     await this.hook({
@@ -545,9 +470,7 @@ export class FakeRemote {
     if (!this.mine(user, sid)) return refuse(404, "not_found");
     const after = numberParam(url, "after", 0);
     const limit = Math.min(1000, numberParam(url, "limit", 500));
-    const rows = (this.events.get(sid) ?? [])
-      .filter((e) => e.id > after)
-      .slice(0, limit);
+    const rows = (this.events.get(sid) ?? []).filter((e) => e.id > after).slice(0, limit);
     return reply(200, {
       ok: true,
       data: rows.map((e) => ({
@@ -579,9 +502,7 @@ export class FakeRemote {
     const pump = async (): Promise<void> => {
       while (open(res)) {
         const version = this.version;
-        for (const e of (this.events.get(sid) ?? []).filter(
-          (row) => row.id > after,
-        )) {
+        for (const e of (this.events.get(sid) ?? []).filter((row) => row.id > after)) {
           const frame = {
             type: e.type,
             session_id: sid,
@@ -589,9 +510,7 @@ export class FakeRemote {
             ts: e.ts,
             data: e.data,
           };
-          res.write(
-            `id: ${String(e.id)}\nevent: ${e.type}\ndata: ${JSON.stringify(frame)}\n\n`,
-          );
+          res.write(`id: ${String(e.id)}\nevent: ${e.type}\ndata: ${JSON.stringify(frame)}\n\n`);
           after = e.id;
           sent += 1;
           if (this.dropStreamAfter !== null && sent >= this.dropStreamAfter) {
@@ -602,9 +521,7 @@ export class FakeRemote {
         }
         if (!marked) {
           marked = true;
-          res.write(
-            `event: historyComplete\ndata: ${JSON.stringify({ type: "historyComplete", count: sent })}\n\n`,
-          );
+          res.write(`event: historyComplete\ndata: ${JSON.stringify({ type: "historyComplete", count: sent })}\n\n`);
         }
         const changed = await this.changedSince(version, 500);
         if (!changed && open(res)) res.write(": keepalive\n\n");
@@ -648,11 +565,7 @@ interface RouteRequest {
 type Route = readonly [
   method: string,
   pattern: RegExp,
-  handle: (
-    srv: FakeRemote,
-    req: RouteRequest,
-    id: string,
-  ) => Reply | Promise<Reply>,
+  handle: (srv: FakeRemote, req: RouteRequest, id: string) => Reply | Promise<Reply>,
 ];
 
 const ID = "([^/]+)";
@@ -661,41 +574,13 @@ const at = (path: string): RegExp => new RegExp(`^${PREFIX}${path}$`, "u");
 /** The user side of the remote-agents API, as `claw/docs/remote-agents.md` lists it (the event stream is served apart). */
 const ROUTES: readonly Route[] = [
   ["GET", at("/connectors"), (srv, req) => srv.listConnectors(req.user)],
-  [
-    "POST",
-    at("/pairings"),
-    (srv, req) => srv.pair(req.user, req.method, req.url.pathname),
-  ],
+  ["POST", at("/pairings"), (srv, req) => srv.pair(req.user, req.method, req.url.pathname)],
   ["GET", at("/setup"), (srv, req) => srv.setupAnswer(req.url.pathname)],
-  [
-    "DELETE",
-    at(`/connectors/${ID}`),
-    (srv, req, id) => srv.revoke(req.user, id),
-  ],
-  [
-    "POST",
-    at("/sessions"),
-    (srv, req) => srv.createSession(req.user, req.body),
-  ],
+  ["DELETE", at(`/connectors/${ID}`), (srv, req, id) => srv.revoke(req.user, id)],
+  ["POST", at("/sessions"), (srv, req) => srv.createSession(req.user, req.body)],
   ["GET", at("/sessions"), (srv, req) => srv.listSessions(req.user)],
-  [
-    "GET",
-    at(`/sessions/${ID}`),
-    (srv, req, id) => srv.getSession(req.user, id),
-  ],
-  [
-    "POST",
-    at(`/sessions/${ID}/commands`),
-    (srv, req, id) => srv.command(req.user, id, req.body, req.idem),
-  ],
-  [
-    "POST",
-    at(`/sessions/${ID}/decisions`),
-    (srv, req, id) => srv.issue(req.user, id, "decision", req.body, req.idem),
-  ],
-  [
-    "GET",
-    at(`/sessions/${ID}/events`),
-    (srv, req, id) => srv.replay(req.user, id, req.url),
-  ],
+  ["GET", at(`/sessions/${ID}`), (srv, req, id) => srv.getSession(req.user, id)],
+  ["POST", at(`/sessions/${ID}/commands`), (srv, req, id) => srv.command(req.user, id, req.body, req.idem)],
+  ["POST", at(`/sessions/${ID}/decisions`), (srv, req, id) => srv.issue(req.user, id, "decision", req.body, req.idem)],
+  ["GET", at(`/sessions/${ID}/events`), (srv, req, id) => srv.replay(req.user, id, req.url)],
 ];

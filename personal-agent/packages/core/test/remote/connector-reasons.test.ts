@@ -3,7 +3,7 @@
 
 // A connector's refusal codes are told as what happened and what to do, never as the bare code (`remote/connector/reasons.ts`).
 import assert from "node:assert/strict";
-import { describe as group, test } from "node:test";
+import { test } from "node:test";
 
 import {
   OLD_CONNECTOR,
@@ -94,16 +94,13 @@ const CONNECTOR_CODES = [
 ];
 
 // The codes Claw itself writes (`data.by = "claw"`): a command never collected, and a session closed with its connector's row.
-const CLAW_CODES = [
-  "not_delivered",
-  "delivery_unconfirmed",
-  "connector_revoked",
-  "machine_reconnected",
-];
+const CLAW_CODES = ["not_delivered", "delivery_unconfirmed", "connector_revoked", "machine_reconnected"];
 
 const HAN = /[一-鿿]/u;
-const isAscii = (text: string): boolean =>
-  [...text].every((ch) => ch.charCodeAt(0) < 0x80);
+const isAscii = (text: string): boolean => {
+  for (let i = 0; i < text.length; i += 1) if (text.charCodeAt(i) >= 0x80) return false;
+  return true;
+};
 const UPGRADE_LINE =
   "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install";
 
@@ -119,96 +116,70 @@ test("the closed set is all known", () => {
   );
 });
 
-group("every code is said in words not as the code", () => {
+test("every code is said in words not as the code", () => {
   for (const code of [...CONNECTOR_CODES, ...CLAW_CODES]) {
     for (const lang of ["zh", "en", null] as const) {
-      test(`${code} in ${lang ?? "both"}`, () => {
-        const text = describe(code, lang);
-        assert.ok(text && text !== `${code}.` && text.length >= 6, text);
-        // (a plain word such as "closed" may be part of the sentence; a code with an underscore never is)
-        if (code.includes("_")) assert.ok(!text.includes(code), text);
-        const [zh, en] = explain(code);
-        assert.ok(HAN.test(zh) && isAscii(en) && zh !== en);
-        if (lang === "zh") assert.equal(text, zh);
-        else if (lang === "en") assert.equal(text, en);
-        else assert.equal(text, `${zh}\n${en}`); // (no language known: both)
-      });
+      const text = describe(code, lang);
+      assert.ok(text && text !== `${code}.` && text.length >= 6, `${code} ${String(lang)}: ${text}`);
+      // (a plain word such as "closed" may be part of the sentence; a code with an underscore never is)
+      if (code.includes("_")) assert.ok(!text.includes(code), text);
+      const [zh, en] = explain(code);
+      assert.ok(HAN.test(zh) && isAscii(en) && zh !== en, code);
+      if (lang === "zh") assert.equal(text, zh);
+      else if (lang === "en") assert.equal(text, en);
+      else assert.equal(text, `${zh}\n${en}`); // (no language known: both)
     }
   }
 });
 
-group(
-  "an old or unknown connector is told to upgrade and how to get by",
-  () => {
-    for (const code of [...OLD_CONNECTOR].sort()) {
-      for (const version of [null, "", "0.1.3", "0.1.4", "v0.1.4", "garbage"]) {
-        test(`${code} at ${JSON.stringify(version)}`, () => {
-          for (const [lang, upgrade, sandbox] of [
-            ["zh", UPGRADE[0], SANDBOX[0]],
-            ["en", UPGRADE[1], SANDBOX[1]],
-          ] as const) {
-            const text = describe(code, lang, version);
-            assert.ok(text.includes(upgrade) && text.includes(sandbox));
-            assert.ok(text.includes(UPGRADE_LINE));
-            assert.ok(text.includes('env = { IS_SANDBOX = "1" }'));
-          }
-        });
+test("an old or unknown connector is told to upgrade and how to get by", () => {
+  for (const code of [...OLD_CONNECTOR].sort()) {
+    for (const version of [null, "", "0.1.3", "0.1.4", "v0.1.4", "garbage"]) {
+      for (const [lang, upgrade, sandbox] of [
+        ["zh", UPGRADE[0], SANDBOX[0]],
+        ["en", UPGRADE[1], SANDBOX[1]],
+      ] as const) {
+        const text = describe(code, lang, version);
+        assert.ok(text.includes(upgrade) && text.includes(sandbox), `${code} ${String(version)} ${lang}`);
+        assert.ok(text.includes(UPGRADE_LINE));
+        assert.ok(text.includes('env = { IS_SANDBOX = "1" }'));
       }
     }
-  },
-);
+  }
+});
 
-group("a fixed connector is not told to upgrade", () => {
+test("a fixed connector is not told to upgrade", () => {
   for (const version of ["0.1.5", "0.1.10", "0.2.0", "1.0.0", "0.1.5-rc.1"]) {
-    test(version, () => {
-      for (const code of OLD_CONNECTOR) {
-        const text = describe(code, "en", version);
-        assert.ok(
-          !text.includes("npm install") &&
-            !text.includes("IS_SANDBOX") &&
-            text.includes("claw-connector status"),
-        );
-      }
-    });
+    for (const code of OLD_CONNECTOR) {
+      const text = describe(code, "en", version);
+      assert.ok(
+        !text.includes("npm install") && !text.includes("IS_SANDBOX") && text.includes("claw-connector status"),
+        `${code} ${version}`,
+      );
+    }
   }
 });
 
 test("an unknown code gets a generic sentence that names it and words stay as they are", () => {
   assert.ok(describe("brand_new_reason", "en").includes("(brand_new_reason)"));
-  assert.ok(
-    describe("brand_new_reason", "zh").includes("（brand_new_reason）"),
-  );
-  assert.equal(
-    describe("the connector was revoked", "en"),
-    "the connector was revoked.",
-  );
+  assert.ok(describe("brand_new_reason", "zh").includes("（brand_new_reason）"));
+  assert.equal(describe("the connector was revoked", "en"), "the connector was revoked.");
   assert.equal(describe("", "en"), "");
   assert.equal(describe(null, "zh"), "");
 });
 
 test("ended puts the lead first in the language", () => {
   assert.ok(
-    ended(
-      ["会话没能启动", "The session could not start"],
-      "too_many_sessions",
-      "en",
-    ).startsWith("The session could not start: Too many sessions"),
+    ended(["会话没能启动", "The session could not start"], "too_many_sessions", "en").startsWith(
+      "The session could not start: Too many sessions",
+    ),
   );
   assert.ok(
-    ended(
-      ["会话没能启动", "The session could not start"],
-      "too_many_sessions",
-      "zh",
-    ).startsWith("会话没能启动："),
+    ended(["会话没能启动", "The session could not start"], "too_many_sessions", "zh").startsWith("会话没能启动："),
   );
-  assert.equal(
-    ended(["会话已结束", "The session ended"], "", "en"),
-    "The session ended.",
-  );
+  assert.equal(ended(["会话已结束", "The session ended"], "", "en"), "The session ended.");
   const both = ended(["会话已结束", "The session ended"], "adapter_gone", null);
-  assert.ok(
-    both.startsWith("会话已结束：") && both.includes("\nThe session ended: "),
-  );
+  assert.ok(both.startsWith("会话已结束：") && both.includes("\nThe session ended: "));
 });
 
 test("a revoked connector is given the whole login command", () => {

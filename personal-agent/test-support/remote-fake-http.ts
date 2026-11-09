@@ -16,8 +16,7 @@ export const reply = (status: number, body: unknown): Reply => ({
   body,
 });
 
-export const refuse = (status: number, error: string): Reply =>
-  reply(status, { ok: false, error });
+export const refuse = (status: number, error: string): Reply => reply(status, { ok: false, error });
 
 export const notARoute = (method: string, path: string): Reply =>
   reply(404, { message: `Route ${method}:${path} not found` });
@@ -34,9 +33,7 @@ export function numberParam(url: URL, name: string, fallback: number): number {
 }
 
 export function publicOf(row: FakeSession): Json {
-  return Object.fromEntries(
-    Object.entries(row).filter(([key]) => key !== "owner"),
-  );
+  return Object.fromEntries(Object.entries(row).filter(([key]) => key !== "owner"));
 }
 
 export async function readJson(req: IncomingMessage): Promise<Json> {
@@ -45,11 +42,7 @@ export async function readJson(req: IncomingMessage): Promise<Json> {
   if (chunks.length === 0) return {};
   try {
     const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    return typeof parsed === "object" &&
-      parsed !== null &&
-      !Array.isArray(parsed)
-      ? (parsed as Json)
-      : {};
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Json) : {};
   } catch {
     return {};
   }

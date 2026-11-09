@@ -10,13 +10,23 @@
 import { z } from "zod";
 
 /** A field read as text: a string as it is, a number in decimal, anything else as nothing. */
-const text = z.unknown().transform((v): string => (typeof v === "string" ? v : typeof v === "number" ? String(v) : ""));
+const text = z
+  .unknown()
+  .optional()
+  .transform((v): string => (typeof v === "string" ? v : typeof v === "number" ? String(v) : ""));
 /** A field read as a flag: only `true` is true. */
-const flag = z.unknown().transform((v): boolean => v === true);
+const flag = z
+  .unknown()
+  .optional()
+  .transform((v): boolean => v === true);
 /** A field read as an optional flag: `true` / `false` as said, anything else null. */
-const maybeFlag = z.unknown().transform((v): boolean | null => (typeof v === "boolean" ? v : null));
+const maybeFlag = z
+  .unknown()
+  .optional()
+  .transform((v): boolean | null => (typeof v === "boolean" ? v : null));
 const record = z
   .unknown()
+  .optional()
   .transform((v): Readonly<Record<string, unknown>> =>
     typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {},
   );
@@ -36,14 +46,17 @@ export interface RemoteAgent {
   readonly capabilities: Readonly<Record<string, unknown>>;
 }
 
-const agents = z.unknown().transform((v): RemoteAgent[] =>
-  (Array.isArray(v) ? v : []).flatMap((raw) => {
-    const parsed = agentSchema.safeParse(raw);
-    if (!parsed.success || typeof raw !== "object" || raw === null) return [];
-    const a = parsed.data;
-    return [{ agentId: a.agent_id, kind: a.kind, name: a.name, capabilities: a.capabilities }];
-  }),
-);
+const agents = z
+  .unknown()
+  .optional()
+  .transform((v): RemoteAgent[] =>
+    (Array.isArray(v) ? v : []).flatMap((raw) => {
+      const parsed = agentSchema.safeParse(raw);
+      if (!parsed.success || typeof raw !== "object" || raw === null) return [];
+      const a = parsed.data;
+      return [{ agentId: a.agent_id, kind: a.kind, name: a.name, capabilities: a.capabilities }];
+    }),
+  );
 
 const connectorSchema = z.object({
   connector_id: text,

@@ -5,18 +5,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import {
-  Setup,
-  connectMarkdown,
-  pairCommand,
-  setupFrom,
-  versionNote,
-} from "../../src/remote/connector/setup.js";
+import { Setup, connectMarkdown, pairCommand, setupFrom, versionNote } from "../../src/remote/connector/setup.js";
 
 const BASE = "https://claw.example.com/claw-api";
 
-const same = (a: Setup, b: Setup): boolean =>
-  a.server === b.server && a.identityUrl === b.identityUrl;
+const same = (a: Setup, b: Setup): boolean => a.server === b.server && a.identityUrl === b.identityUrl;
 
 test("setup comes from claw else from the address claw is reached at", () => {
   const told = setupFrom(
@@ -52,20 +45,15 @@ test("setup comes from claw else from the address claw is reached at", () => {
     assert.ok(same(setupFrom(bad, BASE), made), JSON.stringify(bad));
   }
   assert.equal(
-    setupFrom({ server: BASE, identity_url: "https://phish.example.com" }, BASE)
-      .identityUrl,
+    setupFrom({ server: BASE, identity_url: "https://phish.example.com" }, BASE).identityUrl,
     "https://claw.example.com",
   );
   assert.equal(
-    setupFrom(
-      { server: BASE, identity_url: "https://claw.example.com/x;rm -rf ~" },
-      BASE,
-    ).identityUrl,
+    setupFrom({ server: BASE, identity_url: "https://claw.example.com/x;rm -rf ~" }, BASE).identityUrl,
     "https://claw.example.com",
   );
   assert.equal(
-    setupFrom({ server: BASE, identity_url: "http://claw.example.com" }, BASE)
-      .identityUrl,
+    setupFrom({ server: BASE, identity_url: "http://claw.example.com" }, BASE).identityUrl,
     "https://claw.example.com",
   );
 });
@@ -73,18 +61,10 @@ test("setup comes from claw else from the address claw is reached at", () => {
 test("the connector commands come from the configured claw address", () => {
   const login =
     "claw-connector login --server https://claw.example.org/claw-api --identity-url https://claw.example.org";
-  assert.equal(
-    setupFrom(null, "https://claw.example.org/claw-api").login(),
-    login,
-  );
+  assert.equal(setupFrom(null, "https://claw.example.org/claw-api").login(), login);
   // Not configured: no address to give, and nothing Claw says is taken (there is nothing to check it against).
   assert.equal(setupFrom(null, "").login(), "claw-connector login");
-  assert.ok(
-    same(
-      setupFrom({ server: "https://x.example/claw-api" }, ""),
-      new Setup("", null),
-    ),
-  );
+  assert.ok(same(setupFrom({ server: "https://x.example/claw-api" }, ""), new Setup("", null)));
 });
 
 test("the connect steps are one block of commands to copy", () => {
@@ -96,11 +76,7 @@ test("the connect steps are one block of commands to copy", () => {
         "claw-connector service install\n```",
     ),
   );
-  assert.ok(
-    text.includes("WSL") &&
-      text.includes("loginctl enable-linger") &&
-      text.includes("EACCES"),
-  );
+  assert.ok(text.includes("WSL") && text.includes("loginctl enable-linger") && text.includes("EACCES"));
   assert.ok(!/(?<!claw-)connector (login|run)/u.test(text));
 });
 
@@ -130,10 +106,7 @@ test("a pairing command is rebuilt from a code and a server of the expected shap
 });
 
 test("a version note names the upgrade command and only a version's own characters", () => {
-  assert.equal(
-    versionNote({ version: "0.1.4", version_status: "current" }),
-    null,
-  );
+  assert.equal(versionNote({ version: "0.1.4", version_status: "current" }), null);
   assert.equal(versionNote({ version_status: "unknown" }), null);
   assert.ok(
     versionNote({
@@ -147,9 +120,5 @@ test("a version note names the upgrade command and only a version's own characte
       version_status: "outdated",
     })?.startsWith("Its connector (0.1.3id) is out of date."),
   );
-  assert.ok(
-    versionNote({ version_status: "outdated" }, "zh")?.startsWith(
-      "连接器版本 ? 较旧",
-    ),
-  );
+  assert.ok(versionNote({ version_status: "outdated" }, "zh")?.startsWith("连接器版本 ? 较旧"));
 });
