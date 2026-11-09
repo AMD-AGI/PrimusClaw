@@ -6,10 +6,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { groupChatKey, isGroupKey, personOf } from "../../src/remote/chat-key.js";
-import { agentById, connectorById, readConnectors, readSession, readSessions } from "../../src/remote/model.js";
+import { agentById, connectorById, connectorFrom, sessionFrom } from "../../src/remote/model.js";
+import { remoteConnectorsSchema, remoteSessionsSchema } from "../../src/claw/remote.js";
 
 test("a connector is read with its agents and every field it did not say is empty", () => {
-  const listed = readConnectors([
+  const listed = remoteConnectorsSchema.parse([
     {
       connector_id: "c1",
       name: "dev-pod",
@@ -25,7 +26,7 @@ test("a connector is read with its agents and every field it did not say is empt
     null,
   ]);
   assert.equal(listed.length, 2);
-  const [connector, bare] = listed;
+  const [connector, bare] = listed.map(connectorFrom);
   assert.deepEqual(connector, {
     connectorId: "c1",
     name: "dev-pod",
@@ -38,7 +39,7 @@ test("a connector is read with its agents and every field it did not say is empt
     agents: [{ agentId: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/repo"] } }],
   });
   assert.deepEqual(bare, {
-    connectorId: "7",
+    connectorId: "", // (an id of another type than text is no id)
     name: "",
     online: false,
     version: "",
@@ -48,13 +49,13 @@ test("a connector is read with its agents and every field it did not say is empt
     paired: false,
     agents: [],
   });
-  assert.equal(connectorById(listed, "c1"), connector);
+  assert.deepEqual(connectorById(listed.map(connectorFrom), "c1"), connector);
   assert.equal(agentById(connector, "codex")?.name, "Codex");
   assert.equal(agentById(undefined, "codex"), undefined);
 });
 
 test("a session is read with its flags as said or null", () => {
-  const sessions = readSessions([
+  const sessions = remoteSessionsSchema.parse([
     {
       session_id: "s1",
       connector_id: "c1",
@@ -70,20 +71,16 @@ test("a session is read with its flags as said or null", () => {
     [],
   ]);
   assert.equal(sessions.length, 1);
-  assert.deepEqual(sessions[0], {
+  assert.deepEqual(sessions.map(sessionFrom)[0], {
     sessionId: "s1",
     connectorId: "c1",
     agentId: "codex",
     cwd: "/repo",
     status: "active",
-    mode: "",
     readOnly: true,
-    connectorOnline: false,
-    createdAt: "2026-10-29T06:00:00.000Z",
     updatedAt: "2026-10-29T06:00:01.000Z",
   });
-  assert.equal(readSession({ session_id: "s2" })?.readOnly, null);
-  assert.equal(readSession("s3"), null);
+  assert.equal(sessionFrom({ session_id: "s2" }).readOnly, null);
 });
 
 test("a group binding's chat key names its binder and the group, a 1:1 chat's is the person", () => {
@@ -95,6 +92,8 @@ test("a group binding's chat key names its binder and the group, a 1:1 chat's is
 });
 
 test("an agent that reports no capabilities has none", () => {
-  const [connector] = readConnectors([{ connector_id: "c", agents: [{ agent_id: "a" }] }]);
+  const [connector] = remoteConnectorsSchema
+    .parse([{ connector_id: "c", agents: [{ agent_id: "a" }] }])
+    .map(connectorFrom);
   assert.deepEqual(connector?.agents, [{ agentId: "a", kind: "", name: "", capabilities: {} }]);
 });
