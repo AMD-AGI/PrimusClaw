@@ -3,7 +3,6 @@
 
 /** The review delegation's cards (W7), with the Python catalog's inputs. */
 import {
-  endedItemCard,
   githubConfirmCard,
   githubConnectCard,
   reviewItemCard,

@@ -9,7 +9,7 @@
 
 import type { JsonObject } from "../json.js";
 import type { OutMessage } from "../ports/surface.js";
-import type { ViewButton } from "../note/note.js";
+import type { ViewButton } from "../ports/surface.js";
 import type { ReviewMode } from "./review-turn.js";
 
 export interface ReviewModeView {
