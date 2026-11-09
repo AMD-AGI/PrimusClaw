@@ -28,6 +28,8 @@ export class FakeAssistantClaw {
   readonly fail = new Map<Call, Error>();
   /** Files Claw refuses by name. */
   readonly refuseFiles = new Set<string>();
+  /** The message the running turn answers (what `turn` says), "" none. */
+  turnMessage = "";
   /** Messages are queued (no message id) while this is set. */
   queue = false;
   /** Scripted live events, played to the next stream opened once the next message is heard. */
@@ -69,7 +71,7 @@ export class FakeAssistantClaw {
   readonly sessions: Pick<ClawSessionsPort, "turn" | "interrupt" | "stream" | "uploadFiles"> = {
     turn: (_key, sessionId) => {
       this.check("turn");
-      return Promise.resolve({ running: this.running.has(sessionId), messageId: null });
+      return Promise.resolve({ running: this.running.has(sessionId), messageId: this.turnMessage || null });
     },
     interrupt: (_key, sessionId) => {
       this.check("interrupt");

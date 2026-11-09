@@ -9,7 +9,7 @@ import { FakeClock } from "../../../../test-support/clock.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openFileTestStore } from "../../../../test-support/store.js";
 import { DirectChat } from "../../src/direct-chat/direct-chat.js";
-import { ALICE, at, event, link, shown, world } from "./world.js";
+import { ALICE, at, event, link, shown, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const APPROVAL = (id = "tu-1", extra: Record<string, unknown> = {}) =>
   event("approval.requested", `ap-${id}`, {

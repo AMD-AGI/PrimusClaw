@@ -14,12 +14,6 @@ const fixed = {
   stopped: "Stopped what I was doing. ",
   notBusy: "I am not busy right now. ",
   stopHint: 'To stop a task, say "stop #2" (its number from /board), or press Stop under its card.',
-  noSessions:
-    "I keep one conversation with you and start a separate task for each thing you ask, so there are no " +
-    "sessions to start or switch. Just tell me what you need; `/board` shows your tasks.",
-  noRepo:
-    'Just say which repository you mean in your message, for example "in AMD-AGI/PrimusClaw, fix the failing ' +
-    'test", and I will work in it.',
   notTaken: "this worker does not take files",
   clawRefused: "Claw did not take it",
   anImage: "an image",

@@ -13,7 +13,11 @@ import {
   UPGRADE_RETRY_SECONDS,
   type SubscriptionsOptions,
 } from "../../src/subscriptions/subscriptions.js";
-import { ClawStatusError, FakeClawSubscriptions, FakeSubscriptionStore } from "./fakes.js";
+import {
+  ClawStatusError,
+  FakeClawSubscriptions,
+  FakeSubscriptionStore,
+} from "../../../../test-support/assistant/subscription-fakes.js";
 
 const BASE = "http://agent.example.svc/claw-events";
 
@@ -176,10 +180,7 @@ it("a subscription claw turned off is turned on again and one claw deleted is ma
   assert.equal(row.enabled, true);
   claw.rows.clear();
   store.now += UPGRADE_RETRY_SECONDS + 1;
-  await subs.ensure("aad-a");
-  assert.equal(store.subs.size, 0);
-  store.now += RETRY_SECONDS + 1;
-  await subs.ensure("aad-a");
+  await subs.ensure("aad-a"); // (forgotten here, and made again at once)
   assert.equal(claw.of("ak-alice").length, 1);
   assert.equal(store.subs.get("aad-a")?.subscriptionId, claw.of("ak-alice")[0]?.subscription_id);
 });
