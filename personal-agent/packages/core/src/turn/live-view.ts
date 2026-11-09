@@ -19,7 +19,7 @@
 
 import { type Lang, toLang } from "../locales/lang.js";
 import { turnEnglish, turnText } from "../locales/turn.js";
-import { collapseSpaces, pyLen, pyLstrip, pyRstrip, pySlice, pyStrip } from "../text/python-str.js";
+import { cpLength, cpSlice, pyLstrip, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { planHead, planText, type Todo } from "./plan.js";
 import type { Step } from "./step.js";
 import { type Integrations, noIntegrations } from "../plugins/integrations.js";
@@ -98,7 +98,7 @@ export class LiveView {
       this.running = []; // the agent speaks once its tools are done; a finish that never came must not pin a line
       this.group = undefined;
     } else if (step.tool) {
-      const name = pySlice(collapseSpaces(step.tool[0]) || "tool", 0, LIVE_TOOL_NAME_MAX);
+      const name = cpSlice(squashSpaces(step.tool[0]) || "tool", 0, LIVE_TOOL_NAME_MAX);
       const status = step.tool[1];
       if (step.preparation) this.loadFailed(name);
       else if (TOOL_DONE.has(status)) this.finish(step, name, status);
@@ -194,9 +194,9 @@ export class LiveView {
     }
     const said = findLast(this.blocks, (b) => b.kind === "text");
     if (said && said.kind === "text") {
-      const flat = collapseSpaces(said.body.replaceAll("**", "").replaceAll("`", ""));
+      const flat = squashSpaces(said.body.replaceAll("**", "").replaceAll("`", ""));
       lines.push(
-        pyLen(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(pySlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`,
+        cpLength(flat) <= STATUS_NARRATION_MAX ? flat : `${pyRstrip(cpSlice(flat, 0, STATUS_NARRATION_MAX - 1))}…`,
       );
     }
     return lines;
@@ -204,17 +204,17 @@ export class LiveView {
 
   render(): string {
     const plan = planText(this.todos, this.lang);
-    const budget = LIVE_MAX_CHARS - (plan ? pyLen(plan) + 2 : 0); // the plan keeps its place; the lines get the rest
+    const budget = LIVE_MAX_CHARS - (plan ? cpLength(plan) + 2 : 0); // the plan keeps its place; the lines get the rest
     let body = "";
     let clipped = false;
     for (const paragraph of this.paragraphs().reverse()) {
       const joined = body ? `${paragraph}\n\n${body}` : paragraph;
-      if (pyLen(joined) <= budget) {
+      if (cpLength(joined) <= budget) {
         body = joined;
         continue;
       }
       clipped = true;
-      if (!body) body = pyLstrip(pySlice(paragraph, -budget)); // the newest paragraph alone is too long: keep its end
+      if (!body) body = pyLstrip(cpSlice(paragraph, -budget)); // the newest paragraph alone is too long: keep its end
       break;
     }
     if (clipped) body = `...\n\n${body}`;

@@ -10,7 +10,7 @@
  * - `pickLang`: W5 (approval view).
  */
 
-import { clipWithEllipsis, collapseSpaces, pyStrip } from "../text/python-str.js";
+import { clipLine, pyStrip, squashSpaces } from "../text/py-text.js";
 
 // --- Claw (W2) -------------------------------------------------------------------------------------------------------
 
@@ -40,9 +40,9 @@ const SUMMARY_MARKUP: Readonly<Record<string, string>> = { "[": "［", "]": "］
 /** A review's sentence of what the pull request does, as shown (interim: without credential masking). */
 export function clipPrSummary(value: unknown): string {
   if (typeof value !== "string") return "";
-  const line = pyStrip(collapseSpaces(value).replace(/[[\]<>]/g, (c) => SUMMARY_MARKUP[c] ?? c));
+  const line = pyStrip(squashSpaces(value).replace(/[[\]<>]/g, (c) => SUMMARY_MARKUP[c] ?? c));
   if (!line) return "";
-  return clipWithEllipsis(line, CJK.test(line) ? 80 : 160);
+  return clipLine(line, CJK.test(line) ? 80 : 160);
 }
 
 // --- language (W5) ---------------------------------------------------------------------------------------------------
