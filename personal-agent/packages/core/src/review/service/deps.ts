@@ -18,7 +18,7 @@ import type { StorePort } from "../../ports/store/index.js";
 import type { Conversation, ConversationRef, InboundMessage, Surface, UserRef } from "../../ports/surface.js";
 import type { PublicErrors } from "../../public-error/public-errors.js";
 import type { ReviewTurn } from "../review-turn.js";
-import type { Mask } from "../summary.js";
+import type { Redact } from "../summary.js";
 
 /** A per-person limit (the Python worker's `Guardrails.take` / `give_back`): a refusal's words, or undefined when taken. */
 export interface Limited {
@@ -103,7 +103,7 @@ export interface ReviewDeps {
   readonly logger: Logger;
   readonly errors: PublicErrors;
   /** Credential shapes masked: what a group, and a reviewer's own chat, are sent. */
-  readonly mask: Mask;
+  readonly mask: Redact;
   readonly guard: Guard;
   readonly audit: Audit;
   readonly host: ReviewHost;

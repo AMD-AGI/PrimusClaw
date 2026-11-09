@@ -17,7 +17,7 @@ import {
 import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import { shortName, pullUrl } from "./pull-ref.js";
 import { autoOf, type ReviewTurn, reviewerName } from "./review-turn.js";
-import { type Mask, prSummaryLine, withSummaryLine } from "./summary.js";
+import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
 import { pickLang } from "./text/unicode.js";
 
 export const SUMMARY_CHARS = 1200;
@@ -166,7 +166,7 @@ export interface AnswerParts {
 }
 
 /** A review's ONE message where it was asked: the headline, the summary line, then the answer in plain words. */
-export function reviewAnswer(review: ReviewTurn, answer: string, parts: AnswerParts, mask: Mask): string {
+export function reviewAnswer(review: ReviewTurn, answer: string, parts: AnswerParts, mask: Redact): string {
   const lang = pyStrip(answer) ? pickLang(answer) : review.lang;
   const headline = reviewHeadline(review, parts.results ?? [], parts.comments ?? 0, parts.model ?? "", lang);
   const head = withSummaryLine(headline, prSummaryLine(parts.prSummary ?? "", mask, lang));

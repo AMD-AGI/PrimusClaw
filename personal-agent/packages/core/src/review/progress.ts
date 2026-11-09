@@ -11,7 +11,7 @@ import type { AskerView } from "../claw/model.js";
 import { pullUrl, shortName } from "./pull-ref.js";
 import { oneLine } from "./names.js";
 import { askerName, type ReviewTurn, reviewerName, viewFinished, viewWaitsForReviewer } from "./review-turn.js";
-import { type Mask, prSummaryLine, withSummaryLine } from "./summary.js";
+import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
 
 const VERDICT_ZH: Readonly<Record<string, string>> = {
   approve: "批准",
@@ -58,7 +58,7 @@ function viewLink(review: ReviewTurn, view: AskerView): string {
 }
 
 /** What the asker of a review someone else ran hears of it, once. */
-export function requesterResultText(review: ReviewTurn, view: AskerView, mask: Mask): string {
+export function requesterResultText(review: ReviewTurn, view: AskerView, mask: Redact): string {
   return withSummaryLine(
     `${shortName(review.pull)}（${reviewerName(review)} 代审）：${viewWords(view)}\n${viewLink(review, view)}`,
     prSummaryLine(view.prSummary, mask),
@@ -83,7 +83,7 @@ export function ownItemEndText(review: ReviewTurn): string {
 }
 
 /** What the reviewer hears when a review asked of them ends. */
-export function reviewerResultText(review: ReviewTurn, view: AskerView, mask: Mask): string {
+export function reviewerResultText(review: ReviewTurn, view: AskerView, mask: Redact): string {
   const line = prSummaryLine(view.prSummary, mask);
   return `${askerName(review)}请你代审的 ${shortName(review.pull)}：${viewWords(view)}。${line ? `\n${line}\n` : ""}详情在你的看板上（/board）。`;
 }
@@ -152,7 +152,7 @@ function settledWords(review: ReviewTurn, view: AskerView): string {
 export function progressText(
   entries: readonly Followed[],
   told: readonly (readonly [Followed, AskerView])[],
-  mask: Mask,
+  mask: Redact,
 ): string {
   const [first] = told;
   if (entries.length === 1 && first !== undefined) {
@@ -195,7 +195,7 @@ export function unfinishedText(left: readonly Followed[]): string {
 }
 
 /** What the reviewer hears when reviews asked of them end. */
-export function reviewerEndedText(ended: readonly (readonly [Followed, AskerView])[], mask: Mask): string {
+export function reviewerEndedText(ended: readonly (readonly [Followed, AskerView])[], mask: Redact): string {
   const [first] = ended;
   if (first === undefined) return "";
   if (ended.length === 1) return reviewerResultText(first[0].review, first[1], mask);
