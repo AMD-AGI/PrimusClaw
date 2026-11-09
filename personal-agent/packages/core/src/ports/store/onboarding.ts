@@ -39,7 +39,11 @@ export type NewPendingRequest = Omit<PendingRequest, "createdAt" | "quote" | "se
 
 export interface OnboardingRepository {
   /** One card per person per group per day: the new card's id, or null when one went out within the day. */
-  claimOnboardingCard(userId: string, scope: string, member: { readonly channelUserId: string; readonly name: string }): string | null;
+  claimOnboardingCard(
+    userId: string,
+    scope: string,
+    member: { readonly channelUserId: string; readonly name: string },
+  ): string | null;
   /** The claimed card never reached the chat: the allowance is not spent. */
   releaseOnboardingCard(promptId: string): void;
   getOnboardingCard(promptId: string): OnboardingCard | null;

@@ -21,7 +21,12 @@ import type { LinkRepository } from "./link.js";
 import type { NotifySubscriptionRepository } from "./notify.js";
 import type { ObserveRepository } from "./observe.js";
 import type { OnboardingRepository } from "./onboarding.js";
-import type { ConversationRefRepository, HeldEventRepository, MemberDirectoryRepository, PrefsRepository } from "./people.js";
+import type {
+  ConversationRefRepository,
+  HeldEventRepository,
+  MemberDirectoryRepository,
+  PrefsRepository,
+} from "./people.js";
 import type { RemotePermissionRepository, RemoteSessionNameRepository, RemoteStateRepository } from "./remote.js";
 import type { RepoHistoryRepository, SessionRepository } from "./sessions.js";
 import type { TurnAnswerRepository } from "./turns.js";
@@ -66,6 +71,5 @@ export type * from "./people.js";
 export type * from "./remote.js";
 export type * from "./sessions.js";
 export type * from "./turns.js";
-export type { JsonObject } from "./json.js";
 export { isJsonObject } from "./json.js";
 export * from "./policy.js";

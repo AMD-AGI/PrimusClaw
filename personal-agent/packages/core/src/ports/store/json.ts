@@ -1,12 +1,11 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { JsonValue } from "../../plugins/route-extension.js";
+import type { JsonObject } from "../../json.js";
 
+export type { JsonObject };
 
-/** A JSON object (a conversation reference, a card envelope, a held event, a review). */
-export type JsonObject = { readonly [key: string]: JsonValue };
-
+/** A JSON object as opposed to an array or a scalar (what a `*_json` column of an object holds when it is well formed). */
 export function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

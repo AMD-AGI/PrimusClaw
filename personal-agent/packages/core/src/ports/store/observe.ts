@@ -43,7 +43,10 @@ export interface NewObserveCard {
 
 export interface ObserveRepository {
   /** `/observe on`: one observer per group, the last to turn it on. `name` is kept to 200 characters. */
-  observeGroup(conversationId: string, observer: GroupObserver & { readonly reference: JsonObject; readonly name?: string }): void;
+  observeGroup(
+    conversationId: string,
+    observer: GroupObserver & { readonly reference: JsonObject; readonly name?: string },
+  ): void;
   /** `/observe off`: returns whose observer it was, or null when it was not on. The row stays for /board. */
   unobserveGroup(conversationId: string): string | null;
   groupObserver(conversationId: string): GroupObserver | null;
