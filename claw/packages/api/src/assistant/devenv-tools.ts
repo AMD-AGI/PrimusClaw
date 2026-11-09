@@ -1206,11 +1206,12 @@ export async function closeCardsOfConnector(
                                  'message', 'that machine was removed before the card was answered: nothing was sent') END
       WHERE confirmation_id IN (
               SELECT confirmation_id FROM claw_assistant_confirmations
-               WHERE user_id = $1 AND kind = 'devenv_send' AND status = 'pending' AND params->>'connector_id' = $2
+               WHERE user_id = $1 AND kind IN ('devenv_send', 'devenv_hide') AND status = 'pending' AND params->>'connector_id' = $2
                  -- A card that already lapsed was not voided by this: it stays as it lapsed (\`pendingConfirmations\` no longer lists it),
                  -- never stamped \`connector_revoked\`, so the router is not told the machine took a card the person let run out.
                  AND expires_at > NOW()
-                 AND (NOT $3 OR COALESCE(params->>'session_id', '') <> '' OR COALESCE(params->>'resume_ref', '') <> '')
+                 -- (a hide card names conversations and sessions of the old registration: it goes with it either way)
+                 AND (NOT $3 OR kind = 'devenv_hide' OR COALESCE(params->>'session_id', '') <> '' OR COALESCE(params->>'resume_ref', '') <> '')
                  FOR UPDATE SKIP LOCKED)
       RETURNING confirmation_id`,
     [owner, connectorId, opts.replaced === true],
@@ -1302,7 +1303,7 @@ function namesConversation(want: string, c: HideConversation): boolean {
 
 /**
  * Hide conversations of one of the user's machines from their lists (隐藏会话; "除了 autopilot重构 和 blog 都隐藏"), show hidden ones
- * again (`undo`), and disconnect the chat's own sessions there (`disconnect`: the phone's sessions close, every terminal keeps
+ * again (`undo`), and disconnect every session of the user's open there (`disconnect`: whichever chat opened it; every terminal keeps
  * running). Never done from the turn: a card shows exactly what will be hidden, kept and disconnected, and it is done only when the
  * user presses it (`hideConfirmed`). A conversation a process has open is never hidden: it is said as such. Only the user's own
  * message can ask for it.
@@ -1333,13 +1334,19 @@ export async function devenvHide(claims: AssistantTokenClaims, args: DevenvHideA
   const c = machines[0]!;
   // From here on the turn has read what the machine reported (its conversations' titles): it acts for the user in nothing else.
   await markUntrustedRead(q, claims.sid, claims.mid);
+  // Every conversation the machine reports, the ones a session holds (`attached`) too: they can be named (kept, or said as open), never
+  // hidden. Then the ones hidden there that the machine no longer reports, by the title stored when they were hidden, so undo finds them.
   const conversations: HideConversation[] = [];
   for (const a of (Array.isArray(c.agents) ? c.agents : []) as Row[]) {
     const list = isObject(a.capabilities) && Array.isArray(a.capabilities.resumable) ? a.capabilities.resumable : [];
     for (const r of list as Row[]) {
-      if (!isObject(r) || typeof r.ref !== "string" || r.state === "attached" || conversations.some((x) => x.ref === r.ref)) continue;
+      if (!isObject(r) || typeof r.ref !== "string" || conversations.some((x) => x.ref === r.ref)) continue;
       conversations.push({ ref: r.ref, title: flat(r.title, HIDE_TITLE_MAX) ?? "", state: String(r.state ?? "unknown"), hidden: r.hidden === true });
     }
+  }
+  for (const h of (await q("SELECT ref, title FROM claw_remote_hidden WHERE owner_user_id = $1 AND connector_id = $2 ORDER BY hidden_at DESC",
+    [userId, c.connector_id])).rows as Row[]) {
+    if (!conversations.some((x) => x.ref === h.ref)) conversations.push({ ref: String(h.ref), title: flat(h.title, HIDE_TITLE_MAX) ?? "", state: "gone", hidden: true });
   }
   const unmatched = [...targets, ...keep].filter((t) => !conversations.some((x) => namesConversation(t, x)));
   if (unmatched.length) {
@@ -1353,15 +1360,17 @@ export async function devenvHide(claims: AssistantTokenClaims, args: DevenvHideA
   } else if (keep.length || targets.length) {
     hide = conversations.filter((x) => !x.hidden && (keep.length ? !keep.some((t) => namesConversation(t, x)) : targets.some((t) => namesConversation(t, x))));
   }
-  const live = hide.filter((x) => x.state === "live");
-  hide = hide.filter((x) => x.state !== "live");
+  // Open in a process, or held by a session of the user's: never hidden, said as such.
+  const open = (x: HideConversation) => x.state === "live" || x.state === "attached";
+  const live = hide.filter(open);
+  hide = hide.filter((x) => !open(x));
   const sessions = args.disconnect
-    ? (await q(`SELECT session_id::text AS session_id, agent_id, cwd FROM claw_remote_sessions
+    ? (await q(`SELECT session_id::text AS session_id, agent_id, cwd, updated_at FROM claw_remote_sessions
                  WHERE owner_user_id = $1 AND connector_id = $2 AND status = 'active' ORDER BY updated_at DESC`, [userId, c.connector_id])).rows as Row[]
     : [];
   if (!hide.length && !show.length && !sessions.length) {
     throw new ToolRefused("nothing_to_do", live.length
-      ? `${live.map((x) => x.title).join(", ")}: a process has it open on that machine, so it is not hidden (it can only be disconnected)`
+      ? `${live.map((x) => x.title).join(", ")}: open on that machine (a process or one of the user's sessions has it), so it is not hidden (it can only be disconnected)`
       : "nothing matches: no conversation to hide or show again there, and no session of the chat to disconnect");
   }
   const { assistantSchedulesOn, proposeConfirmation, proposed } = await import("./schedules.js");
@@ -1369,7 +1378,10 @@ export async function devenvHide(claims: AssistantTokenClaims, args: DevenvHideA
   const params = {
     connector_id: String(c.connector_id), machine: flat(c.name, NAME_MAX), lang,
     hide: hide.map((x) => ({ ref: x.ref, title: x.title })), show: show.map((x) => ({ ref: x.ref, title: x.title })),
-    close: sessions.map((s) => ({ session_id: String(s.session_id), agent_id: flat(s.agent_id, NAME_MAX), cwd: flat(s.cwd, CWD_MAX) })),
+    close: sessions.map((s) => ({
+      session_id: String(s.session_id), agent_id: flat(s.agent_id, NAME_MAX), cwd: flat(s.cwd, CWD_MAX),
+      last_activity: s.updated_at instanceof Date ? s.updated_at.toISOString().slice(0, 16).replace("T", " ") : null,
+    })),
     live: live.map((x) => x.title),
   };
   const out = await inTransaction(async (tx) => {
@@ -1394,16 +1406,20 @@ export function inertMd(text: string | null | undefined): string {
 }
 
 /** What the card of a `devenv_hide` says: each conversation by its title, what happens to it, and that nothing on the machine is deleted. */
-export function hideCardText(p0: { machine: string | null; hide: Array<{ title: string }>; show: Array<{ title: string }>; close: Array<{ agent_id: string | null; cwd: string | null }>; live: string[] }, ref: string, zh: boolean): string {
+export function hideCardText(p0: { machine: string | null; hide: Array<{ title: string }>; show: Array<{ title: string }>; close: Array<{ agent_id: string | null; cwd: string | null; last_activity?: string | null }>; live: string[] }, ref: string, zh: boolean): string {
   const p = { ...p0, machine: inertMd(p0.machine) };
   const list = (xs: string[]) => xs.map((x) => `- ${inertMd(x) || (zh ? "（未命名）" : "(untitled)")}`).join("\n");
   const parts: string[] = [];
   if (p.hide.length) parts.push(zh ? `在 ${p.machine} 上隐藏这些对话（不删除，/agents 不再列出；说"显示隐藏的会话"可以恢复）：\n${list(p.hide.map((x) => x.title))}`
     : `Hide these conversations on ${p.machine} (nothing is deleted; /agents stops listing them; "show hidden sessions" brings them back):\n${list(p.hide.map((x) => x.title))}`);
   if (p.show.length) parts.push(zh ? `在 ${p.machine} 上重新显示这些隐藏的对话：\n${list(p.show.map((x) => x.title))}` : `Show these hidden conversations on ${p.machine} again:\n${list(p.show.map((x) => x.title))}`);
-  if (p.close.length) parts.push(zh ? `断开这个聊天在 ${p.machine} 上的会话（终端照常用）：\n${list(p.close.map((x) => `${x.agent_id ?? ""} · ${x.cwd ?? ""}`))}`
-    : `Disconnect this chat's sessions on ${p.machine} (every terminal keeps running):\n${list(p.close.map((x) => `${x.agent_id ?? ""} · ${x.cwd ?? ""}`))}`);
-  if (p.live.length) parts.push(zh ? `有进程在跑、不会隐藏（只能断开）：\n${list(p.live)}` : `A process has these open, so they are not hidden (they can only be disconnected):\n${list(p.live)}`);
+  // Every one of the user's sessions on that machine, whichever chat or client opened it: Claw does not record which chat that was,
+  // so the card lists each one it would close.
+  const sessionLine = (x: { agent_id: string | null; cwd: string | null; last_activity?: string | null }) =>
+    `${x.agent_id ?? ""} · ${x.cwd ?? ""}${x.last_activity ? ` · ${x.last_activity}Z` : ""}`;
+  if (p.close.length) parts.push(zh ? `断开你在 ${p.machine} 上打开着的全部 ${p.close.length} 个会话（不只这个聊天开的；终端照常用）：\n${list(p.close.map(sessionLine))}`
+    : `Disconnect all ${p.close.length} of your open sessions on ${p.machine} (not only this chat's; every terminal keeps running):\n${list(p.close.map(sessionLine))}`);
+  if (p.live.length) parts.push(zh ? `正开着（有进程在跑或你的会话连着）、不会隐藏（只能断开）：\n${list(p.live)}` : `Open (a process or one of your sessions has them), so they are not hidden (they can only be disconnected):\n${list(p.live)}`);
   parts.push(zh ? `点「确认」执行，或回复 ${typedCommand("approve", ref, "zh")}。` : `Press "Confirm" to do it, or reply ${typedCommand("approve", ref, "en")}.`);
   return parts.join("\n\n");
 }

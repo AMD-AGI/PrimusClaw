@@ -89,7 +89,7 @@ describe("devenv_hide", { skip }, () => {
     assert.equal(done.status, "done", JSON.stringify(done));
     assert.deepEqual(await listedRefs("alice"), [REFS[0], REFS[1]]);
     // asking to hide the live one says it cannot be: a process has it open
-    await assert.rejects(tools.devenvHide(await userTurn(alice, "把 blog 也隐藏"), { targets: ["blog"] }), (e: any) => e.code === "nothing_to_do" && /blog: a process has it open/.test(e.message));
+    await assert.rejects(tools.devenvHide(await userTurn(alice, "把 blog 也隐藏"), { targets: ["blog"] }), (e: any) => e.code === "nothing_to_do" && /blog: open on that machine/.test(e.message));
     // undo, by card
     const back = await tools.devenvHide(await userTurn(alice, "显示隐藏的会话"), { undo: true });
     assert.deepEqual([back.hide, back.show], [0, 2]);
@@ -97,7 +97,7 @@ describe("devenv_hide", { skip }, () => {
     assert.deepEqual(await listedRefs("alice"), REFS);
   });
 
-  test("H2 targets by name, and disconnect closes the chat's own sessions there, after the card", async () => {
+  test("H2 targets by name, and disconnect closes the user's sessions there, after the card", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
     const cid = await machine("alice", "autopilot-devpod");
@@ -119,6 +119,52 @@ describe("devenv_hide", { skip }, () => {
     assert.doesNotMatch(text, /\]\(|https:\/\/|<b>/);
     assert.match(text, /\\\[Confirm\\\]\\\(https:\/\u200b\/attacker\.example\\\)/);
     assert.equal(tools.inertMd("pwd 与 ls -la"), "pwd 与 ls -la", "plain words stay as they are");
+  });
+
+  test("H5 a conversation one of the user's sessions holds (attached) can be named: kept by keep, said as open by targets, never hidden", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "autopilot-devpod");
+    const held = { ...ATTACH, capabilities: { resumable: ATTACH.capabilities.resumable.map((r) => (r.ref === REFS[0] ? { ...r, state: "attached" } : r)) } };
+    await store.recordHeartbeat(cid, "alice", { version: "0.1.14", cmdCursor: null, agents: [held] as never });
+    const card = await tools.devenvHide(await userTurn(alice, "除了 autopilot重构 和 blog 都隐藏"), { keep: ["autopilot重构", "blog"] });
+    assert.deepEqual([card.hide, card.not_hidden_live], [2, []]);
+    await assert.rejects(tools.devenvHide(await userTurn(alice, "隐藏 autopilot重构"), { targets: ["autopilot重构"] }),
+      (e: any) => e.code === "nothing_to_do" && /autopilot重构: open on that machine/.test(e.message));
+  });
+
+  test("H6 undo lists a hidden conversation the machine no longer reports, by the title stored when it was hidden", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "autopilot-devpod");
+    await store.setHidden("alice", cid, [{ ref: REFS[2], title: "数字1到400逐行列出" }], true);
+    const gone = { ...ATTACH, capabilities: { resumable: ATTACH.capabilities.resumable.filter((r) => r.ref !== REFS[2]) } };
+    await store.recordHeartbeat(cid, "alice", { version: "0.1.14", cmdCursor: null, agents: [gone] as never });
+    const back = await tools.devenvHide(await userTurn(alice, "显示隐藏的会话"), { undo: true });
+    assert.equal(back.show, 1);
+    assert.match(await cardText(), /重新显示这些隐藏的对话：\n- 数字1到400逐行列出/);
+    assert.equal((await press(back.confirmation_id)).status, "done");
+    assert.equal((await w.q("SELECT count(*)::int AS n FROM claw_remote_hidden WHERE owner_user_id = 'alice'"))[0].n, 0);
+  });
+
+  test("H7 disconnect lists every session of the user's on that machine, says it is not only this chat's; a revoke voids the card", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "autopilot-devpod");
+    for (const cwd of ["/w/a", "/w/b"]) {
+      const made = await store.createSession({ owner: "alice", client: null, connectorId: cid, agentId: "claude-sessions", cwd, mode: null,
+        maxActive: 5, commandsPerMinute: 60 });
+      assert.equal(made.status, "created");
+    }
+    const card = await tools.devenvHide(await userTurn(alice, "把我在那台机器上的会话都断开"), { disconnect: true });
+    assert.equal(card.disconnect, 2);
+    const text = await cardText();
+    assert.match(text, /断开你在 autopilot-devpod 上打开着的全部 2 个会话（不只这个聊天开的；终端照常用）/);
+    assert.match(text, /- claude-sessions · \/w\/a/);
+    assert.match(text, /- claude-sessions · \/w\/b/);
+    await store.revokeConnector("alice", cid, null, (q) => tools.closeCardsOfConnector(q, "alice", cid).then(() => undefined));
+    const row = (await w.q("SELECT status, decided_via FROM claw_assistant_confirmations WHERE confirmation_id = $1", [card.confirmation_id]))[0];
+    assert.deepEqual([row.status, row.decided_via], ["expired", "connector_revoked"]);
   });
 
   test("H3 refused: a name that matches nothing, several machines with none named, a report's turn", async () => {

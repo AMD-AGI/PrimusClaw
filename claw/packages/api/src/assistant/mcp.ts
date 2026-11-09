@@ -499,17 +499,18 @@ export function createAssistantMcpServer(
       mcp.tool(
         "devenv_hide",
         "Hide conversations on one of the user's development environments from their lists (隐藏会话, 别再显示, 'hide all but X and Y'), "
-        + "show hidden ones again (undo: 显示隐藏的会话), and disconnect the chat's own sessions there (disconnect: the phone's sessions "
-        + "close; every terminal keeps running). Nothing on the machine is deleted. It only shows the user a card listing exactly what "
-        + "will be hidden, shown and disconnected; it is done when they press it. A conversation a process has open is never hidden "
-        + "(the card says so). Call it directly with the names as the user said them (titles or parts of titles), never after "
-        + "devenv_list. Only the user's own words, in a turn answering their own message.",
+        + "show hidden ones again (undo: 显示隐藏的会话), and disconnect (断开) every session of the user's open on that machine "
+        + "(whichever chat or client opened it; every terminal keeps running). Nothing on the machine is deleted. It only shows the user "
+        + "a card listing exactly what will be hidden, shown and each session that will be disconnected; it is done when they press it. "
+        + "A conversation open in a process or held by one of the user's sessions is never hidden (the card says so). Call it directly "
+        + "with the names as the user said them (titles or parts of titles), never after devenv_list. Only the user's own words, in a "
+        + "turn answering their own message.",
         {
           machine: z.string().max(200).optional().describe("The machine they named; left out when they have one machine."),
           targets: z.array(z.string().max(200)).max(30).optional().describe("The conversations to hide (or, with undo, to show again), by the names they said."),
           keep: z.array(z.string().max(200)).max(30).optional().describe("'All but these': every other conversation there is hidden."),
           undo: z.boolean().optional().describe("true: show hidden conversations again (all of them on that machine, or only targets)."),
-          disconnect: z.boolean().optional().describe("true: also disconnect the chat's own sessions on that machine (断开)."),
+          disconnect: z.boolean().optional().describe("true: also disconnect every session of the user's open on that machine (断开); the card lists each."),
         },
         (args) => answer(claims, "devenv_hide", () => devenvHide(claims, args)),
       );

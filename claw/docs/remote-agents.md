@@ -531,10 +531,13 @@ untrusted text. `work_send` refuses these items; `work_stop` and the item's stop
 ### Hiding conversations (`devenv_hide`)
 
 `devenv_hide` hides conversations of one of the user's machines from their lists ("除了 autopilot重构 和 blog 都隐藏": `keep`; or
-`targets`, by the names the user said), shows hidden ones again (`undo`), and disconnects the chat's own sessions there
-(`disconnect`: a `close` for each; the terminals keep running). It is never done from the turn: a card lists exactly what will be
-hidden, shown and disconnected, and what is not hidden because a process has it open, and it is done when the user presses it (a
-`devenv_hide` confirmation). Only the user's own message can ask for it.
+`targets`, by the names the user said; also one a session of theirs holds, which is kept and never hidden), shows hidden ones again
+(`undo`, also those the machine no longer reports, by the title stored when they were hidden), and disconnects every session of the
+user's open on that machine (`disconnect`: a `close` for each, whichever chat or client opened it, since Claw does not record which
+chat opened a session; every terminal keeps running). It is never done from the turn: a card lists exactly what will be hidden and
+shown, each session that will be disconnected, and what is not hidden because it is open, and it is done when the user presses it
+(a `devenv_hide` confirmation). A machine revoked or replaced while the card waits voids it, as a `devenv_send` card is. Only the
+user's own message can ask for it.
 
 ### Sending an instruction (`devenv_send`)
 
