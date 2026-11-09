@@ -134,6 +134,18 @@ export const remoteAgentText = defineCatalog({
     workingNow: "It is working right now; I will tell you what it says when it pauses.",
     agentsOnHost: (p: { host: string; names: string }) => `${p.host} has more than one agent. Name one: ${p.names}.`,
     whichConversation: "I could not tell which conversation you mean. Send `/agent sessions` to pick one.",
+    notAModeId: "That is not a mode id. Send `/agent mode` to see the ones the agent offers.",
+    notOffered: (p: { mode: string; have: string }) => `The agent does not offer \`${p.mode}\`. It offers: ${p.have}.`,
+    closedNumber: (p: { number: number; where: string }) => `Closed session ${String(p.number)}${p.where}.`,
+    closedSession: (p: { where: string }) => `Closed the session${p.where}.`,
+    closedIn: (p: { folder: string }) => ` in ${p.folder}`,
+    closedBack: " Your messages go to PrimusClaw again.",
+    newUsage:
+      "Use `/agent new AGENT PATH`, for example `/agent new codex /home/me/repo`, or pick a folder here and tap New session.",
+    modeIs: (p: { mode: string }) => `Mode: \`${p.mode}\`. `,
+    modesOffered: (p: { have: string }) => `The agent offers ${p.have}. Change it with \`/agent mode ID\`.`,
+    whichMachine: (p: { names: string }) => `Which machine? Use \`/agent off NAME\` with one of ${p.names}.`,
+    whichMachineNone: "Which machine? Use `/agent off NAME`. You have no machine connected.",
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -245,6 +257,20 @@ export const remoteAgentText = defineCatalog({
     agentsOnHost: (p) => `${p.host} 上有不止一个 agent。指定一个：${p.names}。`,
     // (said in English, as the worker did)
     whichConversation: "I could not tell which conversation you mean. Send `/agent sessions` to pick one.",
+    // (said in English, as the worker did)
+    notAModeId: "That is not a mode id. Send `/agent mode` to see the ones the agent offers.",
+    notOffered: (p) => `The agent does not offer \`${p.mode}\`. It offers: ${p.have}.`,
+    closedNumber: (p) => `已关闭会话 ${String(p.number)}${p.where}。`,
+    closedSession: (p) => `已关闭会话${p.where}。`,
+    closedIn: (p) => `（${p.folder}）`,
+    closedBack: "你的消息会重新发给 PrimusClaw。",
+    // (said in English, as the worker did)
+    newUsage:
+      "Use `/agent new AGENT PATH`, for example `/agent new codex /home/me/repo`, or pick a folder here and tap New session.",
+    modeIs: (p) => `Mode: \`${p.mode}\`. `,
+    modesOffered: (p) => `The agent offers ${p.have}. Change it with \`/agent mode ID\`.`,
+    whichMachine: (p) => `Which machine? Use \`/agent off NAME\` with one of ${p.names}.`,
+    whichMachineNone: "Which machine? Use `/agent off NAME`. You have no machine connected.",
   },
 });
 

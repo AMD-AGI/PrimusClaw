@@ -382,6 +382,25 @@ export class StatusBoard {
     await to.send({ ...textMessage(line), suggestions: [{ title, value }] });
   }
 
+  /**
+   * The suggested replies under what the assistant says to a chat that is the agent's window itself: back to the assistant while
+   * attached, else back to the agent it last talked to.
+   */
+  backReplies(chatKey: string): { title: string; value: string }[] {
+    if (!this.state.direct(chatKey)) return [];
+    const reader = {
+      remoteState: (key: string) => {
+        const found = this.ctx.remoteState.getRemote(key);
+        return found
+          ? { sessionId: found.sessionId ?? "", agentLabel: found.agentLabel, host: found.host, agentId: found.agentId }
+          : undefined;
+      },
+    };
+    return this.ctx.directChat
+      .clawyExtras(reader, chatKey, this.state.lang(chatKey))
+      .replies.map(([title, value]) => ({ title, value }));
+  }
+
   /** How a chat that is the agent's window signs what it wrote: its head, and the way on and back under the last message. */
   signerOf(chatKey: string, state: RemoteState): Signer {
     const lang = this.state.lang(chatKey);

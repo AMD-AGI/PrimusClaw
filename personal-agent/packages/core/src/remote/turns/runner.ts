@@ -37,7 +37,7 @@ export const CURSOR_EVERY = 25;
 export const STREAM_ATTEMPTS = 4;
 
 /** How the turn is shown: in the chat, or in the session card (`window-turn.ts`). */
-export type DisplayFor = (chatKey: string, to: Conversation, state: RemoteState, signer: Signer | null) => TurnDisplay;
+export type DisplayFor = (request: TurnRequest, signer: Signer | null) => TurnDisplay;
 
 /** The read gave up (the stream kept dropping, or the deadline passed): the person is told the connection was lost. */
 class LostConnection extends Error {
@@ -51,6 +51,8 @@ export interface TurnRequest {
   readonly provider: Provider;
   readonly to: Conversation;
   readonly state: RemoteState;
+  /** The person's message the turn answers (a stream answers it); undefined: shown by a progress message. */
+  readonly replyTo: string | undefined;
 }
 
 export class TurnRunner {
@@ -98,7 +100,7 @@ export class TurnRunner {
 
   private display(request: TurnRequest): { display: TurnDisplay; signer: Signer | null } {
     const signer = this.state.direct(request.chatKey) ? this.board.signerOf(request.chatKey, request.state) : null;
-    return { display: this.displayFor(request.chatKey, request.to, request.state, signer), signer };
+    return { display: this.displayFor(request, signer), signer };
   }
 
   private async run(request: TurnRequest, turn: RemoteTurn, signal: AbortSignal): Promise<void> {
