@@ -160,7 +160,8 @@ export class AccountCommands {
   async memorySwitch(chat: Chat, key: string, arg: string): Promise<void> {
     const page = this.memoryPage();
     const said = accountText.in(chat.lang());
-    const choice = MEMORY_SWITCH[pyLower(pyStrip(arg))];
+    const word = pyLower(pyStrip(arg));
+    const choice = Object.hasOwn(MEMORY_SWITCH, word) ? MEMORY_SWITCH[word] : undefined;
     if (choice === undefined) {
       await chat.say(said.memoryUsage);
       return;

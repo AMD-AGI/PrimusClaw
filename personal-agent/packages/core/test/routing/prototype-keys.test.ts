@@ -61,3 +61,17 @@ test("a review stop refused with a code that is a name every object has says tha
     assert.equal(said(w).at(-1), `o/r#825：没能停下（${code}）。`, code);
   }
 });
+
+test("memory with a name every object has is told the usage and switches nothing", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak");
+  for (const word of INHERITED) {
+    await w.router.handle(message(`/memory ${word}`));
+    assert.equal(
+      said(w).at(-1),
+      "Use `/memory on` to turn memory on, `/memory off` to turn it off, or `/memory` alone to see it.",
+      word,
+    );
+  }
+  assert.deepEqual(w.claw.memoryWrites, []);
+});
