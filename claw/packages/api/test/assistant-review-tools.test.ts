@@ -1632,7 +1632,7 @@ describe("assistant review tools", { skip }, () => {
 
     const asked = await userTurn(alice, "把 254 停掉");
     const out = await w.mod.tools.workStop(asked, { item_id: item, reason: "user said stop" });
-    const view = { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null };
+    const view = { status: "stopped", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null, pr_summary: null };
     assert.deepEqual(out, { ok: true, item_id: item, outcome: "stopped", requester_view: view }, "the four facts, never the reviewer's item");
     const closed = await w.item(item);
     assert.deepEqual([closed.board_state, closed.outcome, closed.params.requester_view], ["done", "stopped", view], "frozen as it closed");
@@ -1650,7 +1650,7 @@ describe("assistant review tools", { skip }, () => {
     const pr = { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 };
     const item = await reviewItem(bob, 1, pr, { requested_by: alice.userId, requester_label: "Alice A" });
     await w.q("UPDATE claw_work_items SET summary = 'bob-only notes', pending_question = 'bob-only question' WHERE item_id = $1", [item]);
-    const view = { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null };
+    const view = { status: "in_progress", pr_url: "https://github.com/AMD-AGI/PrimusClaw/pull/254", verdict: null, merged: false, waiting_for: null, findings: null, note: null, pr_summary: null };
     const turn = await userTurn(alice, "254 怎么样了");
     for (const detail of ["summary", "reports", "worker_tail"] as const) {
       assert.deepEqual(await w.mod.tools.workRecall(turn, { item_id: item, detail }),
@@ -1675,7 +1675,7 @@ describe("assistant review tools", { skip }, () => {
     assert.ok(!system.includes("bob-only"), "nothing of the reviewer's item but the four facts");
     assert.ok(!prompts.renderRouterSystem([], []).includes(prompts.ASKED_OF_OTHERS_HEADER), "no section when there is nothing");
     // Closed: what was frozen is what is read, whatever the session did after.
-    const frozen = { status: "done", pr_url: view.pr_url, verdict: "approve", merged: false, waiting_for: null, findings: null, note: null };
+    const frozen = { status: "done", pr_url: view.pr_url, verdict: "approve", merged: false, waiting_for: null, findings: null, note: null, pr_summary: null };
     await w.q(
       "UPDATE claw_work_items SET board_state = 'done', outcome = 'accepted', closed_at = NOW(), params = params || jsonb_build_object('requester_view', $2::jsonb) WHERE item_id = $1",
       [item, JSON.stringify(frozen)],
@@ -1688,7 +1688,7 @@ describe("assistant review tools", { skip }, () => {
     // As on 2026-11-07 14:34: the router was shown the 20 latest and said "19 of the 20 merged" when 82 had been handed over.
     const rp = await import("../src/assistant/role-profile.js");
     const prompts = await import("../src/assistant/prompts.js");
-    const frozen = (merged: boolean, verdict: string) => ({ status: "done", pr_url: null, verdict, merged, waiting_for: null, findings: null, note: null });
+    const frozen = (merged: boolean, verdict: string) => ({ status: "done", pr_url: null, verdict, merged, waiting_for: null, findings: null, note: null, pr_summary: null });
     for (let n = 1; n <= 25; n++) {
       const item = await reviewItem(bob, n, { owner: "AMD-AGI", repo: "PrimusClaw", number: 600 + n }, { requested_by: alice.userId, requester_label: "Alice A" });
       if (n <= 22) {

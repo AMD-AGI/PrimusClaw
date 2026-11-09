@@ -10,7 +10,8 @@
  * what (`waiting_for`: a held merge or approval for X to confirm, a review that failed and is restarted or asked again, or something else
  * for X to look at), so that R is not left guessing. And R may know what the review found, as it was posted on the pull request R named:
  * how many of its findings are still open and the first of them in one line (`findings`, `note`), from the item's record of what was
- * posted, which anyone who can read the pull request reads there too. Every answer R gets about the item is this and only this
+ * posted, which anyone who can read the pull request reads there too. And what the pull request does, in the one sentence the review
+ * gave with its verdict (`pr_summary`), which is about the pull request R named and nothing of X's. Every answer R gets about the item is this and only this
  * (`GET /v1/work-items/:id`, the stop and its 409, `GET /v1/work-items/asked-of-others`), never the item's summary, its pending question,
  * its params or the session's id. When the item closes, the view is written into `params.requester_view` and stays as it was: what X does
  * in the session afterwards (a second look, another verdict) is X's and does not reach R. One more fact reaches R on its own, as a notice
@@ -18,6 +19,7 @@
  * the base, which GitHub shows on the pull request as it does the review's findings.
  */
 import { redactPublicJson } from "../events/redaction.js";
+import { latestPrSummary } from "../github-review/pr-summary.js";
 import type { StatementRunner } from "../infra/db.js";
 
 export interface RequesterView {
@@ -32,6 +34,11 @@ export interface RequesterView {
   findings: number | null;
   /** The first open finding, one line, at most NOTE_MAX characters, credentials masked; null when there is none. */
   note: string | null;
+  /**
+   * What the pull request does, in one sentence the review session gave with its review or merge call (`pr_summary`, pr-summary.ts):
+   * one line, credentials masked, at most about 80 Chinese or 160 English characters; null when the session gave none.
+   */
+  pr_summary: string | null;
 }
 
 /** The longest `note` R is shown: one line of a finding, as a summary names it. */
@@ -59,6 +66,13 @@ function foundOf(params: Record<string, unknown>): Pick<RequesterView, "findings
   const first = open.map((f) => (f as { note?: unknown }).note).find((n): n is string => typeof n === "string" && n.trim() !== "");
   const line = first ? String(redactPublicJson(first.replace(/\s+/g, " ").trim()) ?? "") : "";
   return { findings: open.length, note: line ? (line.length > NOTE_MAX ? `${line.slice(0, NOTE_MAX - 1)}…` : line) : null };
+}
+
+/** The review's sentence of what the item's own pull request does (`params.pr`), never one given for another pull request. */
+async function summaryOf(q: StatementRunner, sessionId: unknown, params: Record<string, unknown>): Promise<string | null> {
+  const pr = params.pr as { owner?: unknown; repo?: unknown; number?: unknown } | undefined;
+  if (!pr || typeof pr.owner !== "string" || typeof pr.repo !== "string") return null;
+  return latestPrSummary(q, sessionId, `${pr.owner}/${pr.repo}`, pr.number);
 }
 
 /** The view as it is now, read from the item row and from what the session did (the audit and confirmation tables). */
@@ -90,27 +104,29 @@ export async function currentRequesterView(
     : facts.held === "merge" ? "confirm_merge" : facts.held === "review" ? "confirm_review" : "reviewer";
   return {
     status, pr_url: prUrlOf(params), verdict: VERDICTS[String(facts.verdict ?? "").toUpperCase()] ?? null, merged: facts.merged === true,
-    waiting_for: waitingFor, ...foundOf(params),
+    waiting_for: waitingFor, ...foundOf(params), pr_summary: await summaryOf(q, row.worker_session_id, params),
   };
 }
 
 /**
- * The view as the requester's assistant (the router) is given it: without `note`, the one field the reviewer's session wrote (a line of
- * a finding it posted), so that nothing a worker wrote reaches the router's context through a read that is not marked as such.
- * The person's channel shows the note; the router knows how many findings there are.
+ * The view as the requester's assistant (the router) is given it: without `note` and `pr_summary`, the fields the reviewer's session
+ * wrote (a line of a finding it posted, the sentence of what the pull request does), so that nothing a worker wrote reaches the router's
+ * context through a read that is not marked as such. The person's channel shows both; the router knows how many findings there are.
  */
 export function routerView(view: RequesterView): RequesterView {
-  return { ...view, note: null };
+  return { ...view, note: null, pr_summary: null };
 }
 
 /** The view written when the item closed, or null while it is open (and for an item nobody else asked for). One written before the
- * view had `waiting_for`, `findings` and `note` reads them as null. */
+ * view had `waiting_for`, `findings`, `note` and `pr_summary` reads them as null. */
 export function frozenRequesterView(params: unknown): RequesterView | null {
   const p = params !== null && typeof params === "object" ? params as Record<string, unknown> : null;
   const v = p?.requester_view;
   if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
   const view = v as Partial<RequesterView> & Pick<RequesterView, "status" | "pr_url" | "verdict" | "merged">;
-  return { ...view, waiting_for: view.waiting_for ?? null, findings: view.findings ?? null, note: view.note ?? null };
+  return {
+    ...view, waiting_for: view.waiting_for ?? null, findings: view.findings ?? null, note: view.note ?? null, pr_summary: view.pr_summary ?? null,
+  };
 }
 
 /** What R is answered: the frozen view of a closed item, else the view as it is now. */

@@ -28,6 +28,13 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `pr_summary` on `gh_review_submit` and `gh_pr_merge`: the review session's one sentence of what the pull request does, read from
+  the diff, in the language of its answer (one line, credentials masked, cut at 80 characters when Chinese and 160 otherwise). It is
+  part of the review's own output, not a model call of its own: the tools' answers carry it next to their `status`, the audit keeps it,
+  the requester view has it (`pr_summary`, null when the session gave none; not in the view the requester's router is given), and
+  `GET /v1/github-review/confirmations` lists it with each held write, so a channel shows it beside the verdict. It is read per
+  session and pull request, from calls that passed their checks only: a refused call, or one on another pull request, never lends its
+  sentence.
 - `CLAW_ASSISTANT_SAY_EVAL_USERS` (Claw user ids, comma-separated, no wildcard; default none) and
   `CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR` (default 600): the evaluation identities named there have that hourly say cap instead of
   `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` (120, unchanged for everyone else). `POST /v1/assistant` answers the caller's own cap as
