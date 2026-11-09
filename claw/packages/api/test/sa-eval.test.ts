@@ -51,8 +51,8 @@
  *   S29 the stored calls of the run's own turns (the messages it knows by id): a person's turn in the same session is not one
  *   S30 a turn's reply is not its "on it" line: the wait after a turn's end goes on until another say of the turn, which the server
  *       says for a router that ended in plain text; the line is known by the id the server gives it
- *   S35 the signed-in token is sent only with the person's text message, a card's `deny` and the check of whose it is: an allow, an
- *       answer, a decision with more in it or any other route is refused; a turn's channel_context is sent beside its files, and a
+ *   S35 the signed-in token is sent only with the person's text message (its words, type and channel context, nothing else), a card's
+ *       `deny` and the check of whose it is: an allow, an answer, a decision or a message with more in it, or any other route is refused; a turn's channel_context is sent beside its files, and a
  *       case may name only what a channel sends
  */
 import assert from "node:assert/strict";
@@ -1108,6 +1108,8 @@ test("S35 the signed-in token only says what the person may: their message, a de
     ["POST", messages, { messageType: "decision", extData: { tool_use_id: "t", action: "deny" } }],
     ["POST", messages, { messageType: "answer", extData: { tool_use_id: "t", answers: {} } }],
     ["POST", messages, { content: "q", messageType: "text", extData: { action: "allow" } }],
+    ["POST", messages, { content: "q", messageType: "text", tool_use_id: "t", action: "allow" }],
+    ["POST", messages, { content: "q", messageType: "text", config: {} }],
     ["POST", `${card}/../allow`, { decision: "deny" }],
     ["POST", "/v1/triggers", { name: "x" }],
     ["DELETE", "/v1/sessions/s1", undefined],
