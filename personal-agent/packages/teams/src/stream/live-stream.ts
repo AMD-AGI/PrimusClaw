@@ -72,6 +72,10 @@ class TeamsLiveStream implements LiveStream {
     private readonly render: (message: OutMessage) => JsonObject,
   ) {}
 
+  get id(): string {
+    return this.stream.streamId;
+  }
+
   inform(text: string): Promise<Result<void, StreamRefused>> {
     return attempt(() => this.stream.inform(informativeText([text])));
   }
