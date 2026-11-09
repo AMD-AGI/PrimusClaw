@@ -6,34 +6,16 @@
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).
  */
 import { APPROVAL_CARDS } from "./approval.js";
+import { ASSISTANT_CARDS } from "./assistant.js";
 import type { CatalogEntry } from "./catalog.js";
+import { PROACTIVE_CARDS } from "./proactive.js";
 import { REMOTE } from "./remote.js";
+import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...REMOTE];
+export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...ASSISTANT_CARDS, ...PROACTIVE_CARDS, ...REMOTE, ...TURN];
 
 const BY_LINE = {
-  W4: ["binding", "link", "onboarding", "repo"],
-  W4b: ["changes", "error_note", "inactive_note", "session", "show_here_note"],
-  W5: [
-    "answered",
-    "approval_decided",
-    "approval_expired",
-    "approval_item",
-    "approval_proactive",
-    "assistant_action",
-    "assistant_confirm",
-    "board",
-    "board_asked",
-    "delivery",
-    "digest",
-    "question_item",
-    "run_completed",
-    "run_failed",
-    "work_done",
-    "work_question",
-    "work_result",
-    "work_stopped",
-  ],
+  W4: ["binding", "link", "onboarding", "repo", "session"],
   W7: ["github_connect", "review_confirm_merge", "review_confirm_post", "review_end", "review_mode", "review_start"],
   W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;

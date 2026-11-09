@@ -9,14 +9,19 @@
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
 export * from "./approvals/index.js";
+export * from "./assistant/deliveries.js";
+export type * from "./assistant/views.js";
+export * from "./assistant/work-items.js";
 export * from "./errors.js";
 export * from "./feedback/index.js";
 export * from "./json.js";
 export * from "./locales/index.js";
 export * from "./plugins/index.js";
+export * from "./proactive/views.js";
 export * from "./ports/index.js";
 export * from "./protocol.js";
 export * from "./result.js";
+export * from "./text/py-regex.js";
 export * from "./text/py-text.js";
 export * from "./validate.js";
 export * from "./claw/credential.js";
@@ -28,3 +33,5 @@ export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
 export * as remoteView from "./remote-view/index.js";
 export * from "./inbound-text/index.js";
+export * as turn from "./turn/index.js";
+export * from "./note/note.js";

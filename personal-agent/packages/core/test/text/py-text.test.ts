@@ -4,12 +4,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  clipLine,
+  decimalInt,
+  isDigits,
+  isPySpace,
+  isUpper,
+  splitOnce,
   cpHead,
+  cpRfind,
+  fixedN,
+  pyRstrip,
   cpLength,
   cpSlice,
   fixed1,
   isPyPrintable,
+  PY_SPACE,
+  pyCasefold,
   pyJsonDumps,
+  pyLower,
   pyLstrip,
   pyStr,
   pySplit,
@@ -38,6 +50,52 @@ test("printable is Python's: controls, format and bidi characters are not, the s
   assert.equal(isPyPrintable("\x00"), false);
   assert.equal(isPyPrintable("‮"), false);
   assert.equal(isPyPrintable(" "), false);
+});
+
+test("fixed decimals are Python's format: an exact tie rounds to even", () => {
+  // Each pair is (value, digits) -> what Python 3 printed for f"{value:.{digits}f}".
+  const cases: readonly (readonly [number, number, string])[] = [
+    [12.5, 0, "12"],
+    [13.5, 0, "14"],
+    [0.5, 0, "0"],
+    [1.5, 0, "2"],
+    [2.5, 0, "2"],
+    [-2.5, 0, "-2"],
+    [0.25, 1, "0.2"],
+    [0.75, 1, "0.8"],
+    [-0.25, 1, "-0.2"],
+    [-0.04, 1, "-0.0"],
+    [-0, 1, "-0.0"],
+    [2.675, 2, "2.67"],
+    [1.005, 2, "1.00"],
+    [0.125, 2, "0.12"],
+    [1234.5678, 3, "1234.568"],
+  ];
+  for (const [value, digits, python] of cases)
+    assert.equal(fixedN(value, digits), python, `${String(value)}:.${String(digits)}f`);
+  assert.equal(fixedN(Number.NaN, 1), "nan");
+  assert.equal(fixedN(Infinity, 1), "inf");
+  assert.equal(fixedN(-Infinity, 1), "-inf");
+});
+
+test("strip with chars, negative slices, rfind and a clipped line are Python's", () => {
+  assert.equal(pyStrip("**x**", "*"), "x");
+  assert.equal(pyRstrip("a//", "/"), "a");
+  assert.equal(pyStrip(" .a. ", " ."), "a");
+  assert.equal(pyLstrip("xxa", "x"), "a");
+  assert.equal(pyStrip("😀a😀", "😀"), "a");
+  assert.equal(pyStrip("***", "*"), "");
+  const t = "a😀b😀c";
+  assert.equal(cpSlice(t, -2), "😀c");
+  assert.equal(cpSlice(t, 1, -1), "😀b😀");
+  assert.equal(cpSlice(t, -10, 2), "a😀");
+  assert.equal(cpSlice(t, 3, 1), "");
+  assert.equal(cpRfind(t, "😀"), 3);
+  assert.equal(cpRfind(t, "x"), -1);
+  assert.equal(cpRfind(t, ""), 5);
+  assert.equal(clipLine("abc", 3), "abc");
+  assert.equal(clipLine("ab cd", 4), "ab…");
+  assert.equal(clipLine("😀😀😀", 2), "😀…");
 });
 
 test("one decimal rounds an exact tie to even, like Python's format", () => {
@@ -86,4 +144,85 @@ test("json dumps with indent and sorted keys is json.dumps(indent=1, sort_keys=T
   );
   assert.equal(pyJsonDumps({ b: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "b": 1}');
   assert.equal(pyJsonDumps({ ab: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "ab": 1}');
+});
+
+test("the white space class is Python's str.isspace, x1c to x1f and x85 included", () => {
+  const space = new RegExp(`^[${PY_SPACE}]+$`, "u");
+  for (const ch of ["\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0", "\u2028", "\u3000", " ", "\t"]) {
+    assert.ok(space.test(ch), JSON.stringify(ch));
+    assert.equal(pyStrip(`${ch}a${ch}`), "a");
+  }
+  for (const ch of ["\ufeff", "\u200b", "a"]) assert.ok(!space.test(ch), JSON.stringify(ch));
+});
+
+test("lower and casefold are Python's", () => {
+  // Python 3: each right-hand side is what str.lower() / str.casefold() returned.
+  assert.equal(pyLower("ΑΣ Α"), "ας α");
+  assert.equal(pyLower("ΌΣΟΣ"), "όσος");
+  assert.equal(pyLower("İSTANBUL"), "i\u0307stanbul");
+  assert.equal(pyCasefold("ΌΣΟΣ"), "όσοσ");
+  assert.equal(pyCasefold("İSTANBUL"), "i\u0307stanbul");
+  assert.equal(pyCasefold("ı"), "ı");
+  assert.equal(pyCasefold("Straße ẞ ſ"), "strasse ss s");
+  assert.equal(pyCasefold("ꭰᏸᎠ"), "ᎠᏰᎠ");
+  assert.equal(pyCasefold("ABC"), "abc");
+});
+
+test("splitOnce is str.split(None, 1)", () => {
+  assert.deepEqual(splitOnce(""), []);
+  assert.deepEqual(splitOnce(" \u3000 "), []);
+  assert.deepEqual(splitOnce("  /agent  new codex /my repo "), ["/agent", "new codex /my repo "]);
+  assert.deepEqual(splitOnce("/help"), ["/help"]);
+  assert.deepEqual(splitOnce("/help \x1c"), ["/help"]);
+  assert.deepEqual(splitOnce("a\x1cb c"), ["a", "b c"]);
+});
+
+test("strip with characters, and lstrip, as Python's (the routing rules' cases)", () => {
+  assert.equal(pyStrip("。。好了！", "。！"), "好了");
+  assert.equal(pyRstrip("😀😀a😀", "😀"), "😀😀a");
+  assert.equal(pyLstrip("\x1c\u3000 /x"), "/x");
+});
+
+test("a digit of any script is read as Python's int reads it", () => {
+  assert.equal(decimalInt("１２"), 12);
+  assert.equal(decimalInt("٣"), 3);
+  assert.equal(decimalInt("𝟗"), 9);
+  assert.equal(decimalInt("0"), 0);
+  assert.equal(decimalInt("1909"), 1909);
+  assert.ok(Number.isNaN(decimalInt("")) && Number.isNaN(decimalInt("1a")));
+  assert.ok(isDigits("١٢") && !isDigits("") && !isDigits("²"));
+  assert.ok(isUpper("7KQ3") && !isUpper("1234") && !isUpper("Ab") && !isUpper("ß"));
+});
+
+test("isPySpace agrees with the white-space class on every BMP code unit", () => {
+  const space = new RegExp(`^[${PY_SPACE}]$`, "u");
+  for (let c = 0; c < 0x10000; c += 1) {
+    const ch = String.fromCharCode(c);
+    if (isPySpace(ch) !== space.test(ch)) assert.fail(`U+${c.toString(16)}`);
+  }
+  assert.equal(isPySpace(""), false);
+  assert.equal(isPySpace("  "), false);
+  assert.equal(isPySpace("😀"), false);
+});
+
+/** The fastest of a few runs, in milliseconds (the minimum is the least disturbed by other work on the machine). */
+function fastest(run: () => void): number {
+  let best = Infinity;
+  for (let i = 0; i < 5; i += 1) {
+    const start = performance.now();
+    run();
+    best = Math.min(best, performance.now() - start);
+  }
+  return Math.max(best, 0.05);
+}
+
+test("stripping takes time linear in the text, also with long white space inside", () => {
+  // A run of white space that something follows is what an end-anchored regular expression rescans from every start.
+  const text = (n: number): string => `${" ".repeat(n)}x${" ".repeat(n)}y`;
+  const small = text(20_000);
+  const large = text(80_000);
+  for (const strip of [pyStrip, pyRstrip, pyLstrip, (t: string) => pyStrip(t, " "), (t: string) => clipLine(t, 10)]) {
+    const ratio = fastest(() => strip(large)) / fastest(() => strip(small));
+    assert.ok(ratio < 12, `4x the text took ${ratio.toFixed(1)}x the time`); // linear ~4, quadratic ~16
+  }
 });

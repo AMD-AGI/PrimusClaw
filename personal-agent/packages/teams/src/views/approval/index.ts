@@ -13,17 +13,27 @@ import {
   TITLE_ID,
   approvalText,
   approvalView,
+  clockText,
+  proactiveText,
   questionWire,
+  type ApprovalAgainModel,
   type ApprovalCardModel,
+  type ApprovalDecidedModel,
+  type ApprovalExpiredModel,
   type ApprovalView,
   type CardQuestion,
+  type QuestionAnsweredModel,
   type QuestionCardModel,
 } from "@primusclaw/personal-agent";
 
-import { hasCjk } from "../../cards/cjk.js";
+import { clip, hasCjk } from "../../cards/cjk.js";
 import type { CardElement, JsonObject } from "../../cards/json.js";
-import { buttons, execute, facts, fold, header, message, note, text } from "../../cards/kit.js";
-import type { Renderers } from "../registry.js";
+import { TITLE_MAX, buttons, execute, facts, fold, header, message, note, text } from "../../cards/kit.js";
+import { noteCard } from "../assistant/index.js";
+import type { Renderers, TeamsMessage } from "../registry.js";
+
+/** The longest answer an answered card shows. */
+const ANSWER_SHOWN_MAX = 280;
 
 /** Approve (the primary button) and Deny: what an approval card's buttons carry. */
 export function decisionButtons(tool: string, sessionId: string, toolUseId: string, lang: string): CardElement[] {
@@ -129,7 +139,50 @@ function questionCard(model: QuestionCardModel) {
   return message(body, [answerButton(model.sessionId, model.toolUseId, model.questions)]);
 }
 
+/** What replaces an approval card once it was answered: who answered (you), when, and on what. */
+function approvalDecided(model: ApprovalDecidedModel): TeamsMessage {
+  const allow = model.action === "allow";
+  const said = proactiveText.in("en").decided({ allow, at: clockText(model.when, model.zone) });
+  return message([
+    header(said, {
+      tone: allow ? "good" : "attention",
+      subtitle: clip(model.tool, TITLE_MAX),
+      emoji: allow ? "good" : "denied",
+    }),
+  ]);
+}
+
+/** An approval or a question that ran out, and what the person can still do. */
+function approvalExpired(model: ApprovalExpiredModel): TeamsMessage {
+  const t = proactiveText.in("en");
+  const line =
+    model.tool === QUESTION_TOOL ? t.questionExpired : t.approvalExpired({ tool: clip(model.tool, TITLE_MAX) });
+  return message([header(t.expired, { tone: "attention", emoji: "expired" }), text(line, { subtle: true })]);
+}
+
+/** What replaces a question card once it was answered: when, and each answer. */
+function questionAnswered(model: QuestionAnsweredModel): TeamsMessage {
+  const said = proactiveText.in("en").answered({ at: clockText(model.when, model.zone) });
+  return message([
+    header(said, { tone: "good", emoji: "good" }),
+    ...model.answers.map(([, answer]) => text(clip(answer, ANSWER_SHOWN_MAX))),
+  ]);
+}
+
+/** An approval card put back after a press that did not go through: the note, then Approve and Deny again. */
+function approvalAgain(model: ApprovalAgainModel): TeamsMessage {
+  return noteCard(
+    model.text,
+    decisionButtons(model.tool, model.sessionId, model.toolUseId, "en"),
+    proactiveText.in("en").approvalNeeded({ tool: model.tool }),
+  );
+}
+
 export const approvalRenderers = {
   approval: approvalCard,
+  approvalAgain,
+  approvalDecided,
+  approvalExpired,
   question: questionCard,
+  questionAnswered,
 } satisfies Partial<Renderers>;
