@@ -16,6 +16,7 @@ import {
   type StartReviewTurn,
   type UserRef,
   ClawError,
+  ReviewsRefused,
   GithubReview,
   Guardrails,
   ok,
@@ -168,6 +169,21 @@ export class ReviewClaw {
   confirmations: JsonObject[] = [];
   decision: JsonObject | ClawError = { status: "merged", merge_sha: "0123456789abcdef" };
   connection: JsonObject | null = null;
+  /** Refusals by pull request ("owner/repo#n", lower case): [status, error, data]. */
+  refuse = new Map<string, [number, string, Record<string, unknown>]>();
+  /** What the asker's view of each item says. */
+  views = new Map<string, Record<string, unknown>>();
+  /** A whole request refused, or not answered. */
+  refuseAll: Error | undefined;
+
+  private refused(request: Record<string, unknown>): Error | undefined {
+    if (this.refuseAll !== undefined) return this.refuseAll;
+    for (const pr of request.prs as { pull: { owner: string; repo: string; number: number } }[]) {
+      const refusal = this.refuse.get(`${pr.pull.owner}/${pr.pull.repo}#${String(pr.pull.number)}`.toLowerCase());
+      if (refusal) return new ReviewsRefused(refusal[0], refusal[1], "", { ...refusal[2], pr: pr.pull });
+    }
+    return undefined;
+  }
 
   port(): ClawPort {
     const fail = (): never => {
@@ -195,6 +211,8 @@ export class ReviewClaw {
       assistant: {
         startReviews: (token: string, request: Record<string, unknown>) => {
           this.calls.push(["startReviews", token, request]);
+          const refused = this.refused(request);
+          if (refused !== undefined) return Promise.reject(refused);
           if (this.starts === undefined)
             return Promise.reject(new ClawError(404, '{"message":"Route POST:/v1/assistant/reviews not found"}'));
           return Promise.resolve(this.starts(token, request));
@@ -210,7 +228,26 @@ export class ReviewClaw {
           return this.decision instanceof ClawError ? Promise.reject(this.decision) : Promise.resolve(this.decision);
         },
       },
-      workItems: { get: fail, requesterView: fail },
+      workItems: {
+        get: fail,
+        requesterView: (token: string, itemId: string) => {
+          this.calls.push(["view", token, itemId]);
+          const view = this.views.get(itemId);
+          if (view === undefined) return Promise.reject(new ClawError(404));
+          return Promise.resolve({
+            itemId,
+            status: "",
+            prUrl: "",
+            verdict: "",
+            merged: false,
+            waitingFor: "",
+            findings: null,
+            note: "",
+            prSummary: "",
+            ...view,
+          });
+        },
+      },
     };
     return port as unknown as ClawPort;
   }

@@ -107,7 +107,8 @@ export class ReviewItems {
 
   private ask(request: ItemsRequest, left: readonly ReviewTurn[], model: string): Promise<ReviewStart[]> {
     return this.deps.claw.assistant.startReviews(request.token, {
-      modelKey: request.modelKey,
+      // (asked of someone else: their key pays, and nothing of the asker's is sent)
+      modelKey: request.actingToken ? "" : request.modelKey,
       prs: left.map((r) => ({ pull: r.pull, message: reviewPrompt(r) })),
       actingAs: request.actingAs,
       actingAsName: request.actor.name,
