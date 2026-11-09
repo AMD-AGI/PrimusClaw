@@ -8,9 +8,7 @@
  * links are added as `withLinks` adds them.
  *
  * Input is channel-neutral: the message's text (the bot's own mention already removed by the channel adapter) and its
- * mentions, whose `shown` is the mention as it stands in that text. Difference from the Python worker, which replaced
- * the mention's markup (`<at>Dana</at>`) in the raw text: here the first occurrence of the shown words is replaced, so
- * when the same words were also typed before the mention ("Dana, ask @Dana"), the typed ones get the marker.
+ * mentions, each replaced where it stands (`offset`), so a name typed before the same person's mention stays a name.
  */
 import type { InboundLink, InboundMention } from "../ports/surface.js";
 import { pyStrip } from "../text/py-text.js";
@@ -30,19 +28,44 @@ export interface MarkedTextOptions extends WithLinksOptions {
   readonly links?: readonly InboundLink[];
 }
 
+/** The mentions that stand where they say (their `shown` at their `offset`), not overlapping, by their offset. */
+function placed(points: readonly string[], mentions: readonly InboundMention[]): Map<number, InboundMention> {
+  const byOffset = new Map<number, InboundMention>();
+  let taken = -1;
+  const order = mentions
+    .map((mention, index) => ({ mention, index }))
+    .sort((a, b) => a.mention.offset - b.mention.offset || a.index - b.index);
+  for (const { mention } of order) {
+    const shown = Array.from(mention.shown);
+    const at = mention.offset;
+    if (!shown.length || at <= taken || points.slice(at, at + shown.length).join("") !== mention.shown) continue;
+    byOffset.set(at, mention);
+    taken = at + shown.length - 1;
+  }
+  return byOffset;
+}
+
 export function markedText(
   text: string,
   mentions: readonly InboundMention[],
   options: MarkedTextOptions = {},
 ): MarkedText {
-  // A marker the person typed is no mention.
-  let out = text.replaceAll(MARK_OPEN, "").replaceAll(MARK_CLOSE, "");
-  const marked: InboundMention[] = [];
-  for (const mention of mentions) {
-    const at = mention.shown ? out.indexOf(mention.shown) : -1;
-    if (at < 0) continue;
-    out = `${out.slice(0, at)}${MARK_OPEN}${String(marked.length)}${MARK_CLOSE}${out.slice(at + mention.shown.length)}`;
-    marked.push(mention);
+  const points = Array.from(text);
+  const byOffset = placed(points, mentions);
+  // Markers are numbered in the order of the mentions given (Python: the order of the entities).
+  const marked = mentions.filter((mention) => byOffset.get(mention.offset) === mention);
+  let out = "";
+  for (let at = 0; at < points.length;) {
+    const mention = byOffset.get(at);
+    if (mention !== undefined) {
+      out += `${MARK_OPEN}${String(marked.indexOf(mention))}${MARK_CLOSE}`;
+      at += Array.from(mention.shown).length;
+      continue;
+    }
+    const point = points[at] ?? "";
+    // A marker the person typed is no mention.
+    if (point !== MARK_OPEN && point !== MARK_CLOSE) out += point;
+    at++;
   }
   return { text: withLinks(pyStrip(out), options.links ?? [], options), mentions: marked };
 }
