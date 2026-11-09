@@ -91,7 +91,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
+  clearActiveAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { transientNatsErrorIn } from "../infra/nats-transient.js";
@@ -897,6 +897,7 @@ async function replayPendingCallback(
   msg: JsMsg,
   request: ExecuteRequest,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   if (!request.task_id) return false;
   const { kvCkpt } = getDeps();
@@ -907,8 +908,8 @@ async function replayPendingCallback(
   } catch (err) {
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_lookup_failed");
     msg.nak(5_000);
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
     return true;
   }
   if (!entry) return false;
@@ -947,8 +948,8 @@ async function replayPendingCallback(
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_failed");
     msg.nak(5_000);
   } finally {
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
   return true;
 }
@@ -1027,8 +1028,8 @@ async function maybeRunSandboxlessTask(
   } finally {
     // Drop the in-process abort handle and release the per-task lock so
     // the next DAG step (or unrelated task) can be picked up immediately.
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, abortCtrl);
+    await fx().releaseTaskLock(lockKey, abortCtrl).catch(() => {});
   }
   return true;
 }
@@ -1048,10 +1049,11 @@ export async function refuseUnsupportedMode(
   request: ExecuteRequest,
   sessionId: string,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   if (request.mode === undefined || request.mode === "llm" || request.mode === "script" || request.mode === "app") return false;
   logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
-  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode));
+  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode), run);
   return true;
 }
 
@@ -1065,16 +1067,19 @@ export async function refuseReviewWithoutTurnBudget(
   request: ExecuteRequest,
   sessionId: string,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   const why = reviewTurnBudgetRefusal(request);
   if (why === null) return false;
   logger.error({ sessionId, taskId: request.task_id, maxTurns: request.max_turns ?? null }, "task.review_without_turn_budget_refused");
-  await refuseBeforeRun(msg, request, lockKey, why);
+  await refuseBeforeRun(msg, request, lockKey, why, run);
   return true;
 }
 
 /** Fail a task that is not to run at all, with the reason, and let go of it. */
-async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string): Promise<void> {
+async function refuseBeforeRun(
+  msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string, run?: AbortController,
+): Promise<void> {
   const { kvCkpt } = getDeps();
   try {
     await deliverAgentDone(kvCkpt, request, {
@@ -1098,8 +1103,8 @@ async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: str
       throw err;
     }
   } finally {
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
 }
 
@@ -5150,8 +5155,8 @@ class TaskRunner {
     if (this.selfFence) clearInterval(this.selfFence);
     if (leaseTimer) clearInterval(leaseTimer);
     endRun(this.runIdentity.key);
-    activeAbort.delete(this.lockKey);
-    await fx().releaseTaskLock(this.lockKey);
+    clearActiveAbort(this.lockKey, this.abortCtrl);
+    await fx().releaseTaskLock(this.lockKey, this.abortCtrl);
     await this.hands?.close().catch(() => {});
   }
 
@@ -5199,9 +5204,9 @@ export async function runHandleTask(
   // Before anything decides the run's sandbox (a multi-node cluster, the image, the workspace): a requested review keeps only its fixed
   // profile, and the prompt that holds the requester's words is not read as configuration (`agent/review-profile.ts`).
   applyReviewProfileBackstop(request);
-  if (await replayPendingCallback(msg, request, lockKey)) return;
-  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
-  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey)) return;
+  if (await replayPendingCallback(msg, request, lockKey, abortCtrl)) return;
+  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey, abortCtrl)) return;
+  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey, abortCtrl)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,
