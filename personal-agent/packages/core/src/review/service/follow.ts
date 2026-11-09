@@ -269,9 +269,8 @@ export class AskerFollow {
         running = true;
         continue;
       }
-      if (viewWaitsForReviewer(view) && view.waitingFor !== "failed" && !entry.reviewerTold)
-        waiting.push([entry, view.prSummary]);
-      if (!viewFinished(view) && !viewWaitsForReviewer(view)) running = true;
+      if (waitsNewly(entry, view)) waiting.push([entry, view.prSummary]);
+      running ||= stillRunning(view);
       await this.note(entry, view, state);
     }
     // (each with its own card, whose buttons answer it; marked first: never told twice after a restart)
