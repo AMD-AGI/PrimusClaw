@@ -17,7 +17,6 @@ export const MASK = "[hidden]";
  */
 export const NOTE = "Some sensitive-looking values were hidden. Ask me in a 1:1 chat if you need them.";
 
-const B64 = "[A-Za-z0-9+/=_\\-]";
 /** Under Python's `re.I`, `i` and `I` also match the dotted and dotless i (`İ`, `ı`); JavaScript's `iu` does not. */
 const DOTTED_I = "\u0130\u0131";
 /** `B64` and the letters `[A-Za-z]` as an `re.I` pattern reads them. */
