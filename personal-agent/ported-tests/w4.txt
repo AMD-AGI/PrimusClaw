@@ -172,3 +172,17 @@ teams/tests/test_clawy_model.py::test_new_starts_a_session_that_is_created_with_
 #   test_clawy_model.py (patching a session's model, the wire format): W4b engine and W2 client
 #   test_queued_messages.py (TurnState adoption, the wire format, the queued notice): W4b engine and W2 client; ::test_stop_while_the_queued_message_waits_interrupts_without_asking_claw_if_busy: W4b engine
 #   test_agents_card_refresh.py: W6b
+# internal #458 (open, head 7c1679d4): the Stop card of a phone's turn, routing half (the card itself is W4b's)
+teams/tests/test_stop_button.py::test_a_turn_from_a_phone_gets_the_card_and_its_press_interrupts_that_turn -> packages/core/test/routing/stop-card.test.ts::test_a_turn_from_a_phone_gets_the_card_and_its_press_interrupts_that_turn iOS
+teams/tests/test_stop_button.py::test_a_turn_from_a_desktop_or_the_web_gets_no_card -> packages/core/test/routing/stop-card.test.ts::test_a_turn_from_a_desktop_or_the_web_gets_no_card Windows
+teams/tests/test_stop_button.py::test_a_press_after_the_turn_ended_stops_nothing_and_says_so -> packages/core/test/routing/stop-card.test.ts::test_a_press_after_the_turn_ended_stops_nothing_and_says_so
+teams/tests/test_stop_button.py::test_the_card_of_an_earlier_turn_never_stops_the_next_one -> packages/core/test/routing/stop-card.test.ts::test_the_card_of_an_earlier_turn_never_stops_the_next_one
+teams/tests/test_stop_button.py::test_a_phones_message_to_an_attached_agent_gets_the_card_and_its_press_cancels_that_turn -> packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_an_attached_agent_gets_the_card_and_its_press_cancels_that_turn
+teams/tests/test_stop_button.py::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before -> packages/core/test/routing/stop-card.test.ts::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before
+teams/tests/test_stop_button.py::test_an_attached_agents_turn_from_the_desktop_gets_no_card -> packages/core/test/routing/stop-card.test.ts::test_an_attached_agents_turn_from_the_desktop_gets_no_card
+teams/tests/test_stop_button.py::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it -> packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it
+teams/tests/test_stop_button.py::test_a_press_after_the_agents_turn_ended_on_its_own_cancels_nothing -> MERGED packages/core/test/routing/stop-card.test.ts::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before
+teams/tests/test_stop_button.py::test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited -> packages/core/test/routing/stop-card.test.ts::test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited
+teams/tests/test_stop_button.py::test_the_assistants_card_stays_while_its_turn_runs_past_a_first_say_and_goes_when_claw_says_it_ended -> packages/core/test/routing/stop-card.test.ts::a phone's message to the assistant: the card goes once Claw says the turn ended
+teams/tests/test_stop_button.py::test_the_turn_is_checked_by_the_stop_itself_so_a_turn_that_ends_meanwhile_is_never_the_one_stopped -> MERGED packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it
+# test_stop_button.py's StopButtons tests (the delay, the token's life, the card's words) are W4b's

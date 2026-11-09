@@ -251,3 +251,28 @@ test("a phone's message to the assistant: the card goes once Claw says the turn 
   assert.deepEqual(opsOn(a.w, cardId), ["delete"]);
   assert.deepEqual(a.stopped, []);
 });
+
+test("test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited", async () => {
+  const r = remoteWorld();
+  Object.assign(r.w.deps.remote, { direct: () => true });
+  Object.assign(r.w.surface, { caps: { ...r.w.surface.caps, delete: false } });
+  await r.w.router.handle(fromPhone("run the tests"));
+  await cardShows(r.w);
+  const [[cardId, token] = ["", ""]] = stopCards(r.w);
+  await r.w.router.handle(press(token, cardId));
+  assert.equal(r.stops.length, 1);
+  assert.deepEqual(opsOn(r.w, cardId), []); // (not deleted: Teams would not; not edited: a window is never edited)
+});
+
+test("a pressed card the channel will not delete is closed to a line, outside an agent's window", async () => {
+  const { w, release } = sessionWorld();
+  Object.assign(w.surface, { caps: { ...w.surface.caps, delete: false } });
+  await w.router.handle(fromPhone("do it"));
+  await cardShows(w);
+  const [[cardId, token] = ["", ""]] = stopCards(w);
+  await w.router.handle(press(token, cardId));
+  release();
+  await w.router.settled();
+  assert.deepEqual(opsOn(w, cardId), ["update"]);
+  assert.ok(said(w).includes("note::Stop was pressed."));
+});
