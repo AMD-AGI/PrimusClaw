@@ -15,7 +15,7 @@
 import pino from "pino";
 
 import {
-  CLAW_MEMORY_CATALOGUE_MAX_LINES, CLAW_MEMORY_CATALOGUE_MAX_TOKENS, CLAW_MEMORY_ENABLED, CLAW_MEMORY_MAX_ENTRIES,
+  CLAW_MEMORY_CATALOGUE_MAX_LINES, CLAW_MEMORY_CATALOGUE_MAX_TOKENS, CLAW_MEMORY_DEFAULT_ON, CLAW_MEMORY_ENABLED, CLAW_MEMORY_MAX_ENTRIES,
   CLAW_MEMORY_PROJECT_REVIEW_DAYS, CLAW_MEMORY_REFERENCE_REVIEW_DAYS,
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -71,20 +71,23 @@ async function maintainLinks(q: Querier, userId: string, what: string, work: () 
   }
 }
 
-// ===== Per-user opt-in =====
+// ===== Per-user preference =====
 
 /**
- * Whether this user has opted in to long-term memory. Default is no: a user
- * with no row is off. Deliberately not wrapped in a catch -- when the preference
- * cannot be read, the caller must fail closed (nothing injected, nothing stored).
- * This is the user's choice; CLAW_MEMORY_ENABLED stays the deployment-wide switch
- * and both must be on for memory to be used.
+ * Whether this user has long-term memory on. Their own row decides when they have one, on or off; a user with
+ * no row gets the deployment's default (`CLAW_MEMORY_DEFAULT_ON`, off unless set, and off wherever
+ * CLAW_MEMORY_ENABLED is). The one place a preference is read: every check of it (the session access below, the
+ * routes, the assistant's memory) comes through here.
+ * Deliberately not wrapped in a catch -- when the preference cannot be read, the caller must fail closed (nothing
+ * injected, nothing stored). CLAW_MEMORY_ENABLED stays the deployment-wide switch and both must be on for memory
+ * to be used.
  */
 export async function getMemoryPreference(userId: string): Promise<boolean> {
   const row = (await db.query(
     "SELECT enabled FROM claw_user_memory_prefs WHERE user_id = $1", [userId],
   )).rows[0];
-  return row?.enabled === true;
+  // The default turns nothing on where the deployment has no memory: the REST writes ask only this.
+  return row ? row.enabled === true : CLAW_MEMORY_DEFAULT_ON && memoryAvailable();
 }
 
 export async function setMemoryPreference(userId: string, enabled: boolean): Promise<void> {
@@ -98,7 +101,7 @@ export async function setMemoryPreference(userId: string, enabled: boolean): Pro
 // ===== Which sessions memory serves =====
 
 export interface MemoryAccess {
-  /** The user turned memory on (and the deployment has it). */
+  /** The user has memory on, by their own choice or the deployment's default (and the deployment has it). */
   optedIn: boolean;
   /** This session's turns are shown the catalogue and offered the memory tools. */
   serves: boolean;

@@ -531,6 +531,9 @@ export const MAX_SELECTED_SKILLS = envInt("MAX_SELECTED_SKILLS", 3);
 // --- Phase-2 feature flags (default OFF; opt-in per deployment) ---
 // When false: long-term memory read and write paths are short-circuited.
 export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
+// Whether long-term memory is on for a user who has never set it (no row in claw_user_memory_prefs). Default false: memory
+// is opt-in. A user's own choice, on or off, always wins over it, and CLAW_MEMORY_ENABLED still has to be on for anyone.
+export const CLAW_MEMORY_DEFAULT_ON = envBool("CLAW_MEMORY_DEFAULT_ON", false);
 // Long-term memory limits. The catalogue is what every turn of an opted-in user carries (one line per entry);
 // a write past the entry limit is refused, never made room for by dropping another entry.
 export const CLAW_MEMORY_MAX_ENTRIES = envInt("CLAW_MEMORY_MAX_ENTRIES", 100, { min: 1 });
