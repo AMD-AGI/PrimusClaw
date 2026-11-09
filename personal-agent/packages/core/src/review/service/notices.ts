@@ -18,6 +18,7 @@ import { askerName, type ReviewTurn, reviewerName } from "../review-turn.js";
 import { prSummaryLine } from "../summary.js";
 import type { PullRef } from "../pull-ref.js";
 import { personalChat, say } from "./chat.js";
+import { tokenFor } from "./identity.js";
 import type { ReviewDeps } from "./deps.js";
 import type { Actor } from "./reviewer.js";
 
@@ -32,6 +33,51 @@ export class Notices {
     private readonly deps: ReviewDeps,
     private readonly postWorkCard: PostWorkCard,
   ) {}
+
+  /** The asker's exchanged token, to read what a review's session holds as them; undefined when there is none now. */
+  async requesterToken(review: ReviewTurn): Promise<string | undefined> {
+    const token = await tokenFor(this.deps, review.requesterId);
+    return "token" in token ? token.token : undefined;
+  }
+
+  /**
+   * Claw did not take the asker's credentials for this review (401): what they can do goes to them alone. A key that belongs
+   * to another Primus account than the one connected at the identity service (`key_subject_mismatch`) is linked again from
+   * the right account; any other is linked again.
+   */
+  async tellRequesterRefused(review: ReviewTurn, code: string): Promise<void> {
+    const pull = shortName(review.pull);
+    const [en, zh] =
+      code === "key_subject_mismatch"
+        ? [
+            "the key you linked belongs to a different Primus account than the one you connected at the identity service. Send `/unlink`, then link again (`/link CODE`) while signed in to the account you connected there. If that does not help, tell the operator.",
+            "你 /link 的 key 属于的 Primus 账号，和你在身份服务里连接的不是同一个。请发 `/unlink`，再用你在身份服务里连接的那个账号登录后重新 `/link CODE`；仍不行请联系管理员。",
+          ]
+        : [
+            "PrimusClaw did not accept your linked key (it may have expired or been deleted). Send `/unlink`, then link again (`/link CODE`). If it happens again, tell the operator.",
+            "PrimusClaw 没有接受你 /link 的 key（可能已过期或被删除）。请发 `/unlink`，再用 `/link CODE` 重新连接；仍然如此请联系管理员。",
+          ];
+    try {
+      const chat = await personalChat(
+        this.deps,
+        { userId: review.requesterId, channelUserId: review.requesterChannelId },
+        review.asked,
+      );
+      if (chat === undefined) return;
+      await say(
+        this.deps,
+        chat,
+        `Your request to review ${pull} for a colleague did not start: ${en}\n\n你请我代同事 review ${pull}，但没有开始：${zh}`,
+      );
+    } catch (err) {
+      this.deps.logger.warn("the asker could not be told that Claw did not take their key", { error: errorName(err) });
+    }
+  }
+
+  /** A person's own 1:1 chat. */
+  personalChatOf(person: Actor, via: ConversationRef): Promise<Conversation | undefined> {
+    return personalChat(this.deps, person, via);
+  }
 
   /** The reviewer's own 1:1 chat. */
   reviewerChat(review: ReviewTurn): Promise<Conversation | undefined> {

@@ -18,6 +18,7 @@ import type { StorePort } from "../../ports/store/index.js";
 import type { Conversation, ConversationRef, InboundMessage, Surface, UserRef } from "../../ports/surface.js";
 import type { PublicErrors } from "../../public-error/public-errors.js";
 import type { ReviewTurn } from "../review-turn.js";
+import type { ReviewTurnOptions } from "../../turn/runner.js";
 import type { Redact } from "../summary.js";
 
 /** A per-person limit (the Python worker's `Guardrails.take` / `give_back`): a refusal's words, or undefined when taken. */
@@ -51,8 +52,10 @@ export interface ReviewSlots {
   release(): void;
 }
 
-/** A review turn the router started: it settles when the turn has ended, whichever way. */
-export type RunningTurn = Promise<void>;
+/** A review turn the router started: `ended` settles when the turn has ended, whichever way. */
+export interface RunningTurn {
+  readonly ended: Promise<void>;
+}
 
 export interface StartReviewTurn {
   readonly message: InboundMessage;
@@ -65,6 +68,8 @@ export interface StartReviewTurn {
   readonly review: ReviewTurn;
   /** The asker's own linked key, the model key of a review of their own ('' none). */
   readonly modelKey: string;
+  /** What the turn engine is given for a review (`TurnRun.review.turn`). */
+  readonly turn: ReviewTurnOptions;
 }
 
 /** What the chat the service runs in does for it. */

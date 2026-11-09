@@ -79,6 +79,13 @@ export class AskerFollow {
     await Promise.all([...new Set(this.viewing.values())]);
   }
 
+  /** Whether the asker stopped this item from its card (forgotten once asked). */
+  takeStopped(itemId: string): boolean {
+    const was = this.stopped.has(itemId);
+    this.stopped.delete(itemId);
+    return was;
+  }
+
   /** The asker stopped the item from their card, where that is said: its end is not said a second time. */
   itemStopped(itemId: string): void {
     this.stopped.add(itemId);

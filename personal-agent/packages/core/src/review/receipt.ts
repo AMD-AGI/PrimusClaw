@@ -15,6 +15,7 @@ import {
   reviewWords,
 } from "../locales/review-receipt.js";
 import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
+import type { GithubOutcome } from "../turn/github-outcome.js";
 import { shortName, pullUrl } from "./pull-ref.js";
 import { autoOf, type ReviewTurn, reviewerName } from "./review-turn.js";
 import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
@@ -38,7 +39,7 @@ const RAW_NAME = new RegExp(
 );
 
 /** One call of a write tool, as the stream showed it: the tool, the status it answered, the review's event. */
-export type ToolResult = readonly [tool: string, status: string, event: string];
+export type ToolResult = GithubOutcome;
 
 /**
  * The text with each tool name or state the model wrote by its code said in plain words, in Chinese when the text has any
