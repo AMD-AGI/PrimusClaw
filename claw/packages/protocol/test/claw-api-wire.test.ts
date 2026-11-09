@@ -19,7 +19,7 @@ import {
   type HistoryCompleteData, type NotificationPayload, type NotificationSubscription, type OutboundPayload,
   type RequesterView, type RetryRefusal, type StartedReview, type StartedReviewForRequester, type WorkItemDecisionError,
   type WorkItemDetail, type WorkItemEvent, type WorkItemNeedsYouPayload, type WorkItemView,
-  type RemoteHidden, type RemoteHiddenCapabilities,
+  type RemoteHidden, type RemoteHiddenCapabilities, type RemoteResumableListed,
 } from "../src/index.js";
 // Runtime imports of the API's serializers: pure functions over a row, no database or network.
 import { itemView } from "../../api/src/assistant/work-items.js";
@@ -97,6 +97,8 @@ export type WireAssertions = [
   Expect<Equal<HideOutcome, RemoteHidden>>,
   Expect<Equal<RequiredKeys<RemoteHidden>, (typeof REMOTE_HIDDEN_KEYS)[number]>>,
   Expect<Equal<RequiredKeys<RemoteHiddenCapabilities>, (typeof HIDDEN_CAPABILITY_KEYS)[number]>>,
+  // The mark on a hidden conversation is a named field, not the open rest of the entry: renamed, this reads `unknown`.
+  Expect<Equal<RemoteResumableListed["hidden"], true | undefined>>,
 ];
 
 // ------------------------------------------------------------------------------------------- runtime
