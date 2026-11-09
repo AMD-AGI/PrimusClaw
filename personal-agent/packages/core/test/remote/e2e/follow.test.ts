@@ -513,7 +513,7 @@ test("text that cannot be sent when the user writes is held and not part of the 
     const { sid, script } = await attachedClaude(w);
     refollow(w, { quietMs: 30_000, toolQuietMs: 30_000, maxAgeMs: 60_000 });
     script.onPrompt = answer("Answer to the prompt.");
-    await w.server.say(sid, "Read, not yet said.");
+    const said = await w.server.say(sid, "Read, not yet said.");
     await sleep(300);
     w.refuse = (message) => JSON.stringify(message).includes("Read, not yet said."); // (the queue is down for it)
     await w.say("go on");
@@ -523,6 +523,7 @@ test("text that cannot be sent when the user writes is held and not part of the 
     assert.equal(w.held.length, 1);
     assert.ok(w.held[0]?.text.includes("Read, not yet said."));
     assert.equal(w.held[0]?.chatKey, AAD);
+    assert.equal(w.held[0].eventId, String(said)); // (the event it came with: the assistant holds one burst once)
   }));
 
 test("a message is not sent when the end of the session cannot be read and goes when it can", () =>

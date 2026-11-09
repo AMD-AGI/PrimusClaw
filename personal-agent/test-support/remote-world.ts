@@ -136,7 +136,7 @@ export class RemoteWorld {
   /** Whether the chat may be told something now (false: muted hours, as a test says). */
   reachable = true;
   /** What the follower held for later, since the chat could not be told (the assistant's quiet hours keep it). */
-  readonly held: { chatKey: string; label: string; text: string }[] = [];
+  readonly held: { chatKey: string; label: string; text: string; eventId: string }[] = [];
   /** The worker's settings, which a test may change (remote agents turned off under a card). */
   readonly settings: { -readonly [K in keyof RemoteSettings]: RemoteSettings[K] };
   private n = 0;
@@ -174,8 +174,8 @@ export class RemoteWorld {
       reach: {
         reachable: () => this.reachable,
         muted: () => null,
-        holdRemote: (chatKey, label, text) => {
-          this.held.push({ chatKey, label, text });
+        holdRemote: (chatKey, label, text, eventId) => {
+          this.held.push({ chatKey, label, text, eventId });
         },
       },
       guard: guardOf(new Guardrails(systemClock, () => undefined)),

@@ -43,7 +43,11 @@ export interface FollowReach {
   reachable(chatKey: string): boolean;
   /** "paused" when the person paused proactive messages (`/pause`); anything else is not a pause. */
   muted(chatKey: string): string | null;
-  holdRemote(chatKey: string, label: string, text: string): void;
+  /**
+   * Hold what was not said for the assistant's release. `eventId`: the id of the last event the held text came with (the assistant
+   * holds one burst once, whoever holds it again).
+   */
+  holdRemote(chatKey: string, label: string, text: string, eventId: string): void;
 }
 
 /** What the speaker needs: where to say it, whether it may, and how. */
@@ -91,6 +95,7 @@ export class BurstSpeaker {
   private sent: string[] = []; // the parts of the text that waits that were delivered (a failure sends on from there)
   private typedTurn = false; // the text that waits answers a prompt typed at the shared terminal
   private settle = false;
+  private lastTextEvent = ""; // the id of the last event while text waits: what a hold of it is known by
 
   constructor(
     private readonly chatKey: string,
@@ -107,7 +112,9 @@ export class BurstSpeaker {
   }
 
   feed(event: SseEvent): RemoteStep {
-    return this.turn.feed(event);
+    const step = this.turn.feed(event);
+    if (event.id && this.turn.answer) this.lastTextEvent = event.id; // (the text that waits is as of this event)
+    return step;
   }
 
   settleAt(cursor: string): void {
@@ -271,7 +278,9 @@ export class BurstSpeaker {
     const raw = answerParts(text);
     const rest = raw.slice(this.delivered(raw)).join("\n\n");
     const state = this.deps.remoteState.attachedRemote(this.chatKey);
-    if (rest && state !== null) this.deps.reach.holdRemote(this.chatKey, `${state.agentLabel} on ${state.host}`, rest);
+    if (rest && state !== null) {
+      this.deps.reach.holdRemote(this.chatKey, `${state.agentLabel} on ${state.host}`, rest, this.lastTextEvent);
+    }
   }
 
   async settleWindow(): Promise<void> {

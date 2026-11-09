@@ -17,7 +17,7 @@ import { TEST_TIMINGS, WORLD_ERRORS } from "../../../../test-support/remote-worl
 const CHAT = "aad-a";
 
 /** A speaker with text waiting, whose chat's sends never come back; and the sends it tried. */
-function speakerThatHangs(cutOff: AbortSignal) {
+function speakerThatHangs(cutOff: AbortSignal, reachable = true) {
   const { store } = openTestStore();
   store.references.saveReference(CHAT, { conversation: { id: "conv-a" } });
   store.remoteState.attachRemote(CHAT, {
@@ -35,12 +35,12 @@ function speakerThatHangs(cutOff: AbortSignal) {
       return new Promise<never>(() => undefined); // (Teams never answers)
     },
   } as unknown as Conversation;
-  const held: string[] = [];
+  const held: { text: string; eventId: string }[] = [];
   const turn = new RemoteTurnState(WORLD_ERRORS);
-  turn.feed({
-    id: "1",
+  const chunk = (id: string, text: string) => ({
+    id,
     name: "agent_message_chunk",
-    data: { data: { update: { content: { text: "Said on its own." } } } },
+    data: { data: { update: { content: { text } } } },
   });
   const speaker = new BurstSpeaker(
     CHAT,
@@ -50,10 +50,11 @@ function speakerThatHangs(cutOff: AbortSignal) {
       logger: silentLogger,
       timings: TEST_TIMINGS,
       reach: {
-        reachable: () => true,
+        reachable: () => reachable,
         muted: () => null,
-        holdRemote: (_chat, _label, text) => {
-          held.push(text);
+        holdRemote: (_chat, _label, text, eventId) => {
+          // (as the assistant holds it: one burst once, by its event)
+          if (!held.some((h) => h.eventId === eventId)) held.push({ text, eventId });
         },
       },
       remoteState: store.remoteState,
@@ -66,7 +67,8 @@ function speakerThatHangs(cutOff: AbortSignal) {
     turn,
     cutOff,
   );
-  return { speaker, sends, held };
+  speaker.feed(chunk("41", "Said on its own."));
+  return { speaker, sends, held, chunk };
 }
 
 /** Every continuation that is ready runs (no timer, no clock). */
@@ -98,4 +100,16 @@ test("a reader cancelled before it speaks sends nothing it waits for", async () 
   });
   await ready();
   assert.equal(done, false);
+});
+
+test("what is held carries the id of the event it came with, and holding it again holds it once", async () => {
+  const { speaker, held, chunk } = speakerThatHangs(new AbortController().signal, false); // (the person may not be woken)
+  assert.equal(await speaker.flush({ force: false, holdOnFailure: false }, "41"), true);
+  assert.deepEqual(held, [{ text: "Said on its own.", eventId: "41" }]);
+  speaker.feed(chunk("41", "Said on its own.")); // the same event read again (a reader that started over): the same hold
+  await speaker.flush({ force: false, holdOnFailure: false }, "41");
+  assert.equal(held.length, 1);
+  speaker.feed(chunk("42", "Said later."));
+  await speaker.flush({ force: false, holdOnFailure: false }, "42");
+  assert.deepEqual(held.at(-1), { text: "Said later.", eventId: "42" });
 });
