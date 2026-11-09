@@ -22,7 +22,7 @@ import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
-import type { AssistantEventPayload, AssistantItemSnapshot } from "./assistant-events.js";
+import type { NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
@@ -53,62 +53,9 @@ const CLAIM_LEASE_SECONDS = 120;
 const CLAIM_BATCH = 10;
 const SUMMARY_MAX = 500;
 
-export type NotificationEventType = "run.completed" | "run.failed" | "approval.requested";
-
-/** The part of an `approval.requested` payload that says what is being asked. */
-export interface ApprovalInfo {
-  tool_use_id: string;
-  tool: string;
-  /** Redacted and clipped to 300 characters; see approval-target.ts. */
-  target: string;
-  /** ISO-8601 with an offset: when Brain stops waiting, after which the request is refused. */
-  expires_at: string;
-}
-
-export interface NotificationPayload {
-  event_id: string;
-  type: NotificationEventType;
-  occurred_at: string;
-  user_id: string;
-  session_id: string;
-  task_id: string;
-  /**
-   * Run events only: the message whose turn this run was (`metadata.message_id` of its task: a chat message, or the one a
-   * trigger or an A2A call sent; `null` for a task that has none).
-   * A client that sent the message and already showed the turn's answer can tell this run's end is that turn's
-   * by the id, not by when it ended: a run ends after its last answer, sometimes minutes after.
-   */
-  message_id?: string | null;
-  trigger_id: string | null;
-  title: string;
-  summary: string;
-  link: string;
-  /** Present on `approval.requested` only. */
-  approval?: ApprovalInfo;
-  /**
-   * `assistant_item`: an `approval.requested` held by the worker of an assistant's work item (`assistant/holds.ts`), sent only to a
-   * subscription that lists that source. Absent on every other event.
-   */
-  source?: "assistant_item";
-  /** With `source`: the work item that waits, as an assistant event draws it. */
-  item?: AssistantItemSnapshot;
-  /**
-   * With `source`, when what waits is a question (`approval.tool` is `ask_user_question`): what it asks. Answered as a client
-   * answers any question (`messageType: "answer"`), not with a decision.
-   */
-  questions?: HeldQuestion[];
-}
-
-/** One question of an `ask_user_question`, as a channel shows it: masked and clipped. */
-export interface HeldQuestion {
-  id: string;
-  question: string;
-  options: Array<{ id: string; label: string }>;
-  allow_multiple: boolean;
-}
-
-/** Everything an outbox row can carry. Run events keep `NotificationPayload`; an assistant event has its own. */
-export type OutboundPayload = NotificationPayload | AssistantEventPayload;
+// The payloads are the HTTP API's contract, defined in @claw/protocol (`claw-api/notifications.ts`) so that the receivers of these
+// events share them; re-exported here so the API's own modules keep one import path.
+export type { ApprovalInfo, HeldQuestion, NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
 
 /** Same inputs, same id: the receiver's dedup key. */
 export function deterministicEventId(type: string, sessionId: string, taskId: string): string {

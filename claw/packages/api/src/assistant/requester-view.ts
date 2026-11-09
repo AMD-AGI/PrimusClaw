@@ -21,25 +21,10 @@
 import { redactPublicJson } from "../events/redaction.js";
 import { latestPrSummary } from "../github-review/pr-summary.js";
 import type { StatementRunner } from "../infra/db.js";
+import type { AskedOfOther, RequesterView } from "@claw/protocol";
 
-export interface RequesterView {
-  /** `queued`: made, and waiting for a slot (`ReviewParams.queued`); it starts by itself, and then reads `in_progress`. */
-  status: "queued" | "in_progress" | "waiting_for_reviewer" | "done" | "stopped";
-  pr_url: string | null;
-  verdict: "approve" | "request_changes" | "comment" | null;
-  merged: boolean;
-  /** Only while `status` is `waiting_for_reviewer`, else null. */
-  waiting_for: "confirm_merge" | "confirm_review" | "failed" | "reviewer" | null;
-  /** Open findings the review posted on the pull request; null when it posted none (no record yet). */
-  findings: number | null;
-  /** The first open finding, one line, at most NOTE_MAX characters, credentials masked; null when there is none. */
-  note: string | null;
-  /**
-   * What the pull request does, in one sentence the review session gave with its review or merge call (`pr_summary`, pr-summary.ts):
-   * one line, credentials masked, at most about 80 Chinese or 160 English characters; null when the session gave none.
-   */
-  pr_summary: string | null;
-}
+// The view's shape is the HTTP API's contract, defined in @claw/protocol (`claw-api/reviews.ts`); re-exported for the API's own modules.
+export type { AskedOfOther, RequesterView } from "@claw/protocol";
 
 /** The longest `note` R is shown: one line of a finding, as a summary names it. */
 export const NOTE_MAX = 160;
@@ -179,11 +164,8 @@ export async function requestedItemOf(q: StatementRunner, userId: string, itemId
   return row ?? null;
 }
 
-/**
- * One review the user asked of someone else, as their own assistant and their channel's board may know it: its item_id, the name of
- * who reviews it (the person the user asked), and the view, nothing more.
- */
-export interface AskedOfOther { item_id: string; reviewer: string | null; view: RequesterView }
+// One review the user asked of someone else, as their own assistant and their channel's board may know it: its item_id, the name of
+// who reviews it (the person the user asked), and the view, nothing more (`AskedOfOther`, @claw/protocol).
 
 /** How many reviews this user asked of others are open, or closed within the window, in all: what a list cut at its latest can count from. */
 export interface AskedOfOthersTotals {

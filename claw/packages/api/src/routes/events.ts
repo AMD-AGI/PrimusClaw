@@ -12,6 +12,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import { TOOL_TEXT_DELTA_EVENT } from "../events/consumer.js";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { SSE_HISTORY_TAIL } from "../config.js";
+import { HISTORY_COMPLETE_EVENT, type HistoryCompleteData } from "@claw/protocol";
 /**
  * V2-native SSE event stream: Brain events are forwarded verbatim (raw V2
  * `type` as the SSE `event` field, full payload as `data`); the historical V1
@@ -86,7 +87,8 @@ export async function isRepeatOfStoredAppEvent(
   return kept !== undefined && kept.event_id !== liveId;
 }
 
-export const HISTORY_COMPLETE_EVENT = "historyComplete";
+// The marker is the HTTP API's contract, defined in @claw/protocol (`claw-api/session-events.ts`); re-exported for the API's own modules.
+export { HISTORY_COMPLETE_EVENT } from "@claw/protocol";
 
 interface HistorySegment {
   frames: string[];
@@ -130,7 +132,7 @@ export function historySegment(
  */
 export function historyCompleteFrame(count: number, hasMore: boolean): string {
   return `event: ${HISTORY_COMPLETE_EVENT}\n`
-    + `data: ${JSON.stringify({ type: HISTORY_COMPLETE_EVENT, count, has_more: hasMore })}\n\n`;
+    + `data: ${JSON.stringify({ type: HISTORY_COMPLETE_EVENT, count, has_more: hasMore } satisfies HistoryCompleteData)}\n\n`;
 }
 
 /** One page of history as SSE frames, with no marker. */

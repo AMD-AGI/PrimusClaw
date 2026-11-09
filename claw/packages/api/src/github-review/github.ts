@@ -15,6 +15,7 @@
  * caller's decision, and a write that may have landed is checked for first.
  */
 import { redactSecrets } from "@claw/utils";
+import type { PrRef } from "@claw/protocol";
 
 export class GithubError extends Error {
   readonly status: number;
@@ -66,11 +67,7 @@ export interface GithubAnswer<T = unknown> {
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
 
-export interface PrRef {
-  owner: string;
-  repo: string;
-  number: number;
-}
+export type { PrRef } from "@claw/protocol";
 
 /** `https://github.com/o/r/pull/N` or `o/r#N`, or null. Nothing else names a pull request. */
 export function parsePrRef(input: unknown): PrRef | null {

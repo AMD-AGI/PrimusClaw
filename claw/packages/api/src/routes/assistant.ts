@@ -35,6 +35,7 @@
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
+import type { WorkItemDetail } from "@claw/protocol";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
@@ -148,12 +149,12 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       ok: true,
       data: {
         ...itemView(row),
-        worker_session_id: row.worker_session_id,
+        worker_session_id: row.worker_session_id as string,
         repo: row.repo ?? null,
-        created_at: row.created_at,
-        closed_at: row.closed_at ?? null,
+        created_at: row.created_at as Date,
+        closed_at: (row.closed_at ?? null) as Date | null,
         events: await recentEvents(row.item_id as string),
-      },
+      } satisfies WorkItemDetail<Date>,
     });
   });
 

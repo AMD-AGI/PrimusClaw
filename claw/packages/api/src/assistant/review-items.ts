@@ -25,6 +25,7 @@ import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-pr
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
 import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
+import type { StartedReview, StartedReviewForRequester } from "@claw/protocol";
 import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import { REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
@@ -483,47 +484,8 @@ async function checkPullRequests(actor: Omit<ReviewActor, "sessionId">, prs: Arr
 
 // ------------------------------------------------------------------------------------------------ making the items
 
-export interface CreatedReview {
-  item_id: string;
-  seq: number;
-  title: string;
-  session_id: string;
-  pr: PrRef;
-  /** The turn id of the session's first message (`claw-pending-<id>`), for a caller that follows that turn's stream. */
-  message_id: string | null;
-  /**
-   * What the request named that the review does not take: a review asked of someone else runs on the reviewer's default model and
-   * effort, never on ones the requester chose (`startReviews`). Absent when nothing was set aside.
-   */
-  ignored?: Array<"model" | "effort">;
-  /** The review never merges: it was asked for a review only (or a handoff whose message asked for no merge). */
-  review_only: boolean;
-  /**
-   * Present when every merge (and every approval GitHub would turn into one) of this review waits for the acting user's own
-   * confirmation, the card's button or `批准 #<ref>`, whatever their review mode: a review the assistant's router started
-   * (`config.merge_needs_confirmation`). Absent: the acting user's review mode decides, as for any review of theirs, including one the
-   * assistant handed to a channel. A channel that tells the person how the merge will be made reads it here.
-   */
-  merge_needs_confirmation?: true;
-  /**
-   * Present on a review asked of someone else that may merge: once the reviewer's approval of the head is on GitHub and the gates are
-   * open, the requester's own GitHub account merges it when it wrote the pull request (`followReviewItems`), without the reviewer
-   * confirming the merge. A channel that tells the person how the merge will be made reads it here.
-   */
-  merge_by_requester?: true;
-  /**
-   * With model choice on (`model-choice.ts`): the model the review runs on (null: the deployment's default), and the one it was to run
-   * on when the payer's key could not use it. Absent with model choice off.
-   */
-  model?: string | null;
-  fell_back_from?: string;
-  /**
-   * Present when the limit it would go over (`reason`: `too_many_active_items`, `too_many_requested_reviews`, `too_many_from_requester`)
-   * was full, or it is past the first `REVIEWS_STARTED_AT_ONCE` of its request (`too_many_in_request`): the item is made and waits for a slot, and starts by itself, oldest first, once one is free (`startQueuedReviews`). Nothing of
-   * it has run. Absent: it started.
-   */
-  queued?: { reason: string };
-}
+/** One review `startReviews` made, as its owner is answered: the HTTP API's contract (`StartedReview`, @claw/protocol `claw-api/reviews.ts`). */
+export type CreatedReview = StartedReview;
 
 interface Planned {
   pr: PrRef;
@@ -758,7 +720,7 @@ async function reviewModelFor(owner: UserInfo, asked: unknown): Promise<Resolved
 }
 
 /** What a review created for someone else is answered with: not the session's ids, which are the reviewer's. */
-export function asRequesterAnswer(c: CreatedReview): Omit<CreatedReview, "session_id" | "message_id"> {
+export function asRequesterAnswer(c: CreatedReview): StartedReviewForRequester {
   const { session_id: _s, message_id: _m, ...rest } = c;
   return rest;
 }

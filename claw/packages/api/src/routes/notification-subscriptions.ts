@@ -25,7 +25,7 @@ import { resendUnreachedSays } from "../assistant/outbound.js";
 import { getUser } from "../auth/middleware.js";
 import { encryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
-import { ASSISTANT_EVENT_TYPES } from "../notifications/assistant-events.js";
+import { NOTIFICATION_SOURCES, NOTIFICATION_SUBSCRIPTION_EVENT_TYPES, type NotificationSubscription } from "@claw/protocol";
 import { adoptOrphanedRows, newSubscriptionId } from "../notifications/outbox.js";
 import { guardWebhookUrl, parseAllowedHosts } from "../notifications/url-guard.js";
 
@@ -36,8 +36,8 @@ const MAX_SUBSCRIPTIONS_PER_USER = 5;
 // reaches every subscription that lists its type. `assistant_item` is the one source that is
 // not a run's: an `approval.requested` that an assistant's work item holds (`assistant/holds.ts`).
 // It is not in the default set either, so only a receiver that can draw such a request gets one.
-const EVENT_TYPES: string[] = ["run.completed", "run.failed", "approval.requested", ...ASSISTANT_EVENT_TYPES];
-const SOURCES = ["trigger", "long_run", "assistant_item"];
+const EVENT_TYPES: string[] = [...NOTIFICATION_SUBSCRIPTION_EVENT_TYPES];
+const SOURCES: string[] = [...NOTIFICATION_SOURCES];
 const logger = pino({ name: "notification-subscriptions" });
 /** The assistant's events a say goes out as. */
 const SAY_TYPES = ["assistant.say", "work_item.needs_you"];
@@ -84,14 +84,15 @@ function pickList(value: unknown, allowed: string[]): string[] | null | undefine
   return [...new Set(value as string[])];
 }
 
-const view = (r: Record<string, unknown>) => ({
-  subscription_id: r.subscription_id,
-  url: r.url,
-  event_types: r.event_types,
-  sources: r.sources,
-  enabled: r.enabled,
-  consecutive_failures: r.consecutive_failures,
-  created_at: r.created_at,
+/** A subscription as the API answers with it (`NotificationSubscription`, @claw/protocol), read from its row. */
+const view = (r: Record<string, unknown>): NotificationSubscription<Date> => ({
+  subscription_id: r.subscription_id as string,
+  url: r.url as string,
+  event_types: r.event_types as string[],
+  sources: r.sources as string[],
+  enabled: r.enabled as boolean,
+  consecutive_failures: r.consecutive_failures as number,
+  created_at: r.created_at as Date,
 });
 
 export async function registerNotificationSubscriptionRoutes(app: FastifyInstance): Promise<void> {
