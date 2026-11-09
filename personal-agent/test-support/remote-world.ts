@@ -34,6 +34,8 @@ import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 import { type FakeCommand, FakeRemote, KEYS } from "./remote-fake.js";
 import { type Recorded, FakeSurface } from "./surface.js";
+import { parseAgentCommand } from "../packages/core/src/commands/agent-args.js";
+import { commandArgs } from "../packages/core/src/commands/parse.js";
 import { openTestStore } from "./store.js";
 
 export const USER_A = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
@@ -225,21 +227,21 @@ export class RemoteWorld {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
-    const trimmed = text.trim();
-    const command = (trimmed.split(/\s/u)[0] ?? "").toLowerCase(); // (the router reads a command's word in any case)
-    const words = command + trimmed.slice(command.length);
-    if (command === "/agents") return this.remote.agents(sender, key, to);
-    if (command === "/agent") {
+    // (as the router reads it: `/agents` alone or with words that are no subcommand is the list; `/agents new` is `/agent new`)
+    const agents = commandArgs(text, "agents");
+    if (agents !== null && parseAgentCommand(agents) === null) return this.remote.agents(sender, key, to);
+    const args = agents ?? commandArgs(text, "agent");
+    if (args !== null) {
       return this.remote.agent({
         chat: sender,
         credential: key,
-        args: words.slice(6).trim(),
+        args,
         conversation: to,
         message: undefined,
         provider: undefined,
       });
     }
-    if (command === "/stop") {
+    if (commandArgs(text, "stop") !== null) {
       await this.remote.stop(sender, key, to);
       return;
     }

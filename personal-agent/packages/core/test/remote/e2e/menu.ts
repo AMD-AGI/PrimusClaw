@@ -6,8 +6,8 @@
 import assert from "node:assert/strict";
 
 import { assertValidCard, buttonsOf, elements } from "../../../../../test-support/adaptive-card.js";
-import { type RemoteWorld, USER_A } from "../../../../../test-support/remote-world.js";
-import { AAD } from "./helpers.js";
+import { ALICE, type RemoteWorld, Script, USER_A } from "../../../../../test-support/remote-world.js";
+import { AAD, TWO_AGENTS } from "./helpers.js";
 
 export type Json = Record<string, unknown>;
 
@@ -145,3 +145,23 @@ export async function pressData(
 
 /** The commands' bodies that started a session. */
 export const starts = (w: RemoteWorld): Json[] => w.server.commandsOf("session.new").map((c) => c.body);
+
+/** A world whose user has started a session on dev-pod by typing, and has been told it is ready. */
+export async function attachedWith(
+  w: RemoteWorld,
+  options: { agent?: string; cwd?: string; script?: Script; caps?: Record<string, Json>; online?: boolean } = {},
+): Promise<{ cid: string; sid: string }> {
+  const cid = w.server.addConnector(ALICE, "dev-pod", TWO_AGENTS, {
+    online: options.online ?? true,
+    ...(options.caps ? { caps: options.caps } : {}),
+  });
+  w.server.onCommand = (options.script ?? new Script()).hook;
+  await w.say(`/agent new ${options.agent ?? "codex"} ${options.cwd ?? "/home/me/repo"}`);
+  const state = w.test.store.remoteState.attachedRemote(AAD);
+  assert.ok(state, w.said().join("\n"));
+  return { cid, sid: state.sessionId ?? "" };
+}
+
+export const STATUS_TITLES = ["Switch", "Back to assistant", "Stop", "Mode"];
+export const MODES = ["default", "plan", "bypassPermissions"];
+export const FLAGS: Readonly<Record<string, boolean>> = { default: false, plan: false, bypassPermissions: true };
