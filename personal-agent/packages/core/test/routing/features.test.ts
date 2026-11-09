@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { InboundMessage, JsonObject, UserRef } from "@primusclaw/personal-agent";
+import type { InboundMessage, JsonObject } from "@primusclaw/personal-agent";
 
 import type {
   AssistantRouteRequest,
@@ -78,7 +78,7 @@ test("a person the assistant understands is sent as themselves with the chat's c
   await w.router.handle(message("/whoami"));
   assert.equal(understood.length, 1);
   assert.equal(understood[0]?.credential, "tok-a");
-  assert.equal(understood[0]?.modelKey, "ak-alice");
+  assert.equal(understood[0].modelKey, "ak-alice");
   assert.ok(said(w).at(-1)?.startsWith("This chat is connected, but SaFE could not tell me"));
   w.exchange.tokens.delete(ALICE.id);
   await w.router.handle(message("again please"));
@@ -294,7 +294,6 @@ test("unlink with chats on the exchange: the key goes, and the person is told th
 
 test("a group's review-stop words stop the person's own reviews in Claw at once", async () => {
   const w = world({ assistant: { understands: () => true } });
-  w.deps.reviewStop; // (set below through the deps the router reads)
   const stops: string[] = [];
   Object.assign(w.deps, { reviewStop: () => [["", 825]] as const });
   Object.assign(w.deps.claw.workItems, {
@@ -308,7 +307,7 @@ test("a group's review-stop words stop the person's own reviews in Claw at once"
   const interceptor = w.router.group.reviewStopInterceptor();
   const m = message("停 825", { kind: "group", conversation: "g-1" });
   const taken = await interceptor.intercept({
-    sender: ALICE as UserRef,
+    sender: ALICE,
     conversation: w.surface.conversation(m.conversation),
     scope: "g-1",
     lang: () => "zh",
