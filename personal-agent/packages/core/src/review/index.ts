@@ -7,3 +7,4 @@
  */
 export * from "./views.js";
 export { REVIEW_MODE_NAMES, isReviewMode, type ReviewMode } from "./review-turn.js";
+export { INTENT_PROMPT, MODE_PROMPT } from "../locales/review-github.js";
