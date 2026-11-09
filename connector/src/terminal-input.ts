@@ -22,7 +22,6 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
-import type { AgentConfig } from "./config.js";
 import { errMessage } from "./util.js";
 
 /** Runs the tmux client against one server socket. The seam the tests replace. */
@@ -138,7 +137,11 @@ export type BoxState = "empty" | "typed" | "unknown";
 const SGR_RE = /\x1b\[[0-9;:]*m/g;
 /** Claude Code's prompt glyph (2.1.x); `>` in older versions. */
 const PROMPT_RE = /^(?:❯|>)[  ]?/;
-const RULE_RE = /^─{8,}$/;
+/**
+ * A rule above or below the box. Claude Code writes a conversation's name (`/rename`, or the name a session was started with) into
+ * the rule above the box: `──────── clean ─`. That rule is still the box's edge.
+ */
+const RULE_RE = /^─{8,}(?: +\S(?:.*\S)? +─+)?$/;
 
 /**
  * What Claude Code's input box holds, read from a `capture-pane -e` of its screen: a rule, the prompt line, a rule. `empty`
@@ -195,19 +198,12 @@ export function terminalMode(screen: string): string | null {
   return found.size === 1 ? [...found][0]! : null;
 }
 
-export type ModeVerdict = { ok: true } | { ok: false; reason: "terminal_mode_unknown" | "terminal_mode_not_allowed" };
-
 /**
- * Whether a message from the phone may be typed into a terminal in `mode`, by the rule a phone session of this agent runs under
- * (session.ts `modeAllowed`, `noteMode`): a mode in the agent's `safeModes`, or any mode once the owner opted out of per-step
- * approval (`approval = "never"`, `allowUnsafeModes`). A read-only agent (its ask mode is one that cannot write) only into a
- * terminal in one of those read-only modes. A mode that cannot be read is refused.
+ * The modes in which Claude Code acts without asking first: a message typed from the phone into a terminal in one of these runs
+ * its tools at once. The terminal's mode is its owner's choice and a message is typed in any of them; the session says the mode
+ * (`session_started.terminal_mode`) so the chat can say so.
  */
-export function modeVerdict(agent: Pick<AgentConfig, "safeModes" | "allowUnsafeModes" | "askMode" | "readOnlyModes">, mode: string | null): ModeVerdict {
-  if (mode === null) return { ok: false, reason: "terminal_mode_unknown" };
-  if (agent.readOnlyModes.includes(agent.askMode)) return agent.readOnlyModes.includes(mode) ? { ok: true } : { ok: false, reason: "terminal_mode_not_allowed" };
-  return agent.safeModes.includes(mode) || agent.allowUnsafeModes ? { ok: true } : { ok: false, reason: "terminal_mode_not_allowed" };
-}
+export const MODES_THAT_DO_NOT_ASK: readonly string[] = ["auto", "bypassPermissions", "dontAsk", "acceptEdits"];
 
 /**
  * Whether a message would act as a command in Claude Code's input box instead of being a prompt: `!` runs the rest as a shell

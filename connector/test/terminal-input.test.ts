@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { CLAUDE_MODE_INDICATORS, actsAsCommand, cleanInput, inputBox, findPane, modeVerdict, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -71,25 +71,17 @@ describe("the terminal's permission mode, and whether the agent's policy lets th
     assert.equal(terminalMode(screenIn("  ? for shortcuts", "❯ please turn bypass permissions on")), null);
   });
 
-  const agentOf = (extra: string) => parseConfig(`[[agents]]\nid = "a"\npreset = "claude-attach"\nroots = ["/tmp"]\n${extra}\n`).agents[0]!;
-  test("approval \"ask\": only a mode in safeModes; every other mode Claude Code has is refused", () => {
-    const a = agentOf("");
-    const allowed = MODES.filter((m) => modeVerdict(a, m).ok);
-    assert.deepEqual(allowed.sort(), ["default", "plan"]);
-    for (const m of MODES.filter((x) => !allowed.includes(x))) assert.deepEqual(modeVerdict(a, m), { ok: false, reason: "terminal_mode_not_allowed" }, m);
-    assert.deepEqual(modeVerdict(agentOf('approval = "ask"'), "bypassPermissions"), { ok: false, reason: "terminal_mode_not_allowed" });
+  test("a conversation's name in the rule above the box (/rename) is still the box: empty, typed and the mode read as without it", () => {
+    const named = (box: string, footer: string) => `  ready\n${"─".repeat(50)} clean ─\n${box}\n${"─".repeat(60)}\n${footer}`;
+    assert.equal(inputBox(named("❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)")), "empty");
+    assert.equal(inputBox(named("❯ half typed", "  ⏸ manual mode on")), "typed");
+    assert.equal(terminalMode(named("❯ ", "  ⏵⏵ bypass permissions on (shift+tab to cycle)")), "bypassPermissions");
+    // A rule is still dashes on both sides of the name: a line of words with dashes in it is not.
+    assert.equal(inputBox(`  ready\n─── not a rule, words\n❯ \n${"─".repeat(60)}\n  ⏸ manual mode on`), "unknown");
   });
-  test("approval \"never\" (or allow_unsafe_modes): every mode, the unsafe ones too", () => {
-    for (const m of MODES) assert.deepEqual(modeVerdict(agentOf('approval = "never"'), m), { ok: true }, m);
-    const file = parseConfig(`allow_unsafe_modes = true\n[[agents]]\nid = "a"\npreset = "claude-attach"\nroots = ["/tmp"]\n`).agents[0]!;
-    for (const m of MODES) assert.deepEqual(modeVerdict(file, m), { ok: true }, m);
-  });
-  test("a read-only agent (its ask mode cannot write): only a read-only mode", () => {
-    const a = agentOf('ask_mode = "plan"');
-    assert.deepEqual(MODES.filter((m) => modeVerdict(a, m).ok), ["plan"]);
-  });
-  test("a mode that cannot be read is refused, whatever the approval", () => {
-    for (const extra of ["", 'approval = "never"']) assert.deepEqual(modeVerdict(agentOf(extra), null), { ok: false, reason: "terminal_mode_unknown" });
+  test("the modes in which a message typed from the phone runs without asking are the ones Claude Code names so", () => {
+    assert.deepEqual([...MODES_THAT_DO_NOT_ASK].sort(), ["acceptEdits", "auto", "bypassPermissions", "dontAsk"]);
+    for (const m of MODES_THAT_DO_NOT_ASK) assert.ok(MODES.includes(m), m);
   });
   test("a message that would run a shell command (!) or a slash command (/) there is not a prompt", () => {
     for (const t of ["!rm -rf ~", "  !ls", "/permissions", " /add-dir /", "/clear\nmore"]) assert.equal(actsAsCommand(t), true, t);
@@ -135,7 +127,7 @@ after(async () => {
 });
 
 /** A tmux server on a socket of its own, with the stand-in interface in its one pane, working in `work`. */
-function terminal(work: string, claudeDir: string, workMs = 300): {
+function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Record<string, string> = {}): {
   socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string; setMode: (m: string) => void;
 } {
   const dir = tmpdir("cc-tmux-");
@@ -150,7 +142,7 @@ function terminal(work: string, claudeDir: string, workMs = 300): {
   fs.mkdirSync(path.dirname(row), { recursive: true });
   const tmux = (...a: string[]) => execFileSync("tmux", ["-S", socket, ...a], { encoding: "utf8" });
   // The pane's own environment is what the connector reads: the test's own TMUX (if any) is not passed on.
-  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs), FAKE_MODE_FILE: modeFile } as Record<string, string>;
+  const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs), FAKE_MODE_FILE: modeFile, ...extraEnv } as Record<string, string>;
   delete env.TMUX; delete env.TMUX_PANE;
   execFileSync("tmux", ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "120", "-y", "30", "-c", work,
     `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TERMINAL)}`], { env });
@@ -368,7 +360,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
   const throughModes = async (approval: "ask" | "never") => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
-      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalModeWaitMs: 300 } as never,
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
       ...(approval === "never" ? { approval, askMode: "bypassPermissions" } : { approval }),
       attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
     });
@@ -398,21 +390,69 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     return out;
   };
 
-  test("approval \"ask\": typed only in a mode in safeModes; an unsafe mode is refused with the mode named; an unread mode is refused", async () => {
-    const out = await throughModes("ask");
-    const want: typeof out = {};
-    for (const m of MODES) {
-      want[m] = ["default", "plan"].includes(m) ? { typed: true } : { typed: false, error: "terminal_mode_not_allowed", reason: "terminal_mode_not_allowed", mode: m };
-    }
-    want.none = { typed: false, error: "terminal_mode_unknown", reason: "terminal_mode_unknown", mode: null };
-    assert.deepEqual(out, want);
+  // The terminal's mode is its owner's choice: whatever the agent's approval, a message is typed in every mode, and in a terminal
+  // whose footer names none (Yihan, 2026-11-09).
+  for (const approval of ["ask", "never"] as const) {
+    test(`approval "${approval}": typed in every mode Claude Code has, and where the footer names none`, async () => {
+      const out = await throughModes(approval);
+      assert.deepEqual(out, Object.fromEntries([...MODES, "none"].map((m) => [m, { typed: true }])));
+    });
+  }
+
+  test("session_started names the terminal's mode, so the chat can say a message runs without asking", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    t.setMode("bypassPermissions");
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("the bypass footer", () => terminalMode(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "bypassPermissions");
+    const sid = await h.attach(REF);
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.live_terminal, started.terminal_mode], [true, "bypassPermissions"]);
   });
 
-  test("approval \"never\": typed in every mode, the unsafe ones too; an unread mode is still refused", async () => {
-    const out = await throughModes("never");
-    const want: typeof out = Object.fromEntries(MODES.map((m) => [m, { typed: true }]));
-    want.none = { typed: false, error: "terminal_mode_unknown", reason: "terminal_mode_unknown", mode: null };
-    assert.deepEqual(out, want);
+  test("a conversation with a name in its rule (/rename) in bypass mode: typed at once, not held as an unreadable screen", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clean", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_TITLE: "clean" });
+    t.setMode("bypassPermissions");
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty named box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.equal(end.data.error, undefined);
+    assert.ok(typed(t.transcript).includes("from the phone"));
+  });
+
+  test("a screen that cannot be read is refused by name after terminalScreenWaitMs, not held for terminalWaitMs", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalScreenWaitMs: 500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    const sid = await h.attach(REF);
+    t.setMode("nobox");
+    await until("no box on the screen", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "unknown");
+    const t0 = Date.now();
+    const seq = h.prompt(sid, "not typed");
+    const end = await h.claw.until("the refusal", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 10_000);
+    assert.equal(end.data.error, "terminal_screen_unknown");
+    assert.ok(Date.now() - t0 < 8_000, `refused in ${Date.now() - t0} ms`);
+    const queued = h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq);
+    assert.equal(queued?.data.reason, "terminal_screen", "the phone was told it waits, before the refusal");
+    assert.deepEqual(typed(t.transcript).filter((x) => x === "not typed"), []);
   });
 
   test("the owner can turn it off: then the same conversation is only watched", async () => {

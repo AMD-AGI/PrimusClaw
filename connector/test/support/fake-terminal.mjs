@@ -10,7 +10,9 @@
  * FAKE_TRANSCRIPT: the transcript file. FAKE_ROW: the registry row (written by the test; only its status is changed here).
  * FAKE_SESSION: the session id. FAKE_WORK_MS: how long a turn takes. FAKE_MODE_FILE: a file holding the permission mode the footer
  * below the box names, as Claude Code names it (`manual mode on` for `default`, `accept edits on`...); `none` draws a footer that
- * names no mode. Read again every 50 ms, so the test can switch it as shift+tab would.
+ * names no mode; `nobox` draws a screen with no input box at all (another program, a layout the connector does not know). Read
+ * again every 50 ms, so the test can switch it as shift+tab would. FAKE_TITLE: a conversation name Claude Code writes into the rule
+ * above the box (`/rename`).
  */
 import fs from "node:fs";
 
@@ -42,9 +44,11 @@ const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionI
 
 function draw() {
   const rule = "─".repeat(60);
+  const top = process.env.FAKE_TITLE ? `${"─".repeat(50)} ${process.env.FAKE_TITLE} ─` : rule;
+  if (mode === "nobox") { process.stdout.write("\x1b[2J\x1b[H  another program\r\n  nothing to type into here\r\n"); return; }
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
-  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${rule}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}\r\n`);
+  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}\r\n`);
 }
 
 function submit() {

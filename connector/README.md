@@ -462,18 +462,17 @@ idle for 5 seconds; a message that does not appear in the transcript within 20 s
 `cancel` presses Esc in the terminal, which stops the turn there. A mode change is refused (`terminal_session`): the terminal keeps
 its own mode.
 
-**The agent's approval policy applies to what is typed, as it does to a phone session.** A message runs in the terminal's own
-permission mode, so it is typed only when that mode is one this agent allows from the phone: one of its `safe_modes` (for Claude
-Code `default`, shown as "manual mode", and `plan`), or any mode once the owner set `approval = "never"` on the agent (or
-`allow_unsafe_modes = true` in the file); for a read-only agent (its `ask_mode` cannot write) only a read-only mode. The mode is read
-from the line Claude Code draws below its input box (`⏸ manual mode on`, `⏵⏵ accept edits on`, `⏵⏵ bypass permissions on`,
-`⏵⏵ auto mode on`, `⏵⏵ don't ask on`, `⏸ plan mode on`), on the same screen that shows the box empty and again right before the
-keys go: the transcript records a mode only with the next prompt, so a switch with shift+tab at an idle terminal is not in it.
-In any other mode the message is refused and nothing is typed (`command_rejected` and `turn_end` with `terminal_mode_not_allowed`
-and `terminal_mode` naming the mode); the terminal is never switched to another mode for it. When that line names no mode (another
-screen in its place for 3 seconds, or a Claude Code too old to name its default mode) it is refused as `terminal_mode_unknown`.
-So with `approval = "ask"` (the default) and a terminal in `auto`, `acceptEdits` or `bypassPermissions` mode, switch the terminal
-to manual or plan mode, or set `approval = "never"` on the agent, to type into it from the phone. A message that starts with `!`
+**The terminal's own permission mode applies to what is typed.** The terminal's owner chose that mode, and a message from the phone
+is typed in any of them (`default`/manual, `plan`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`), whatever the agent's
+`approval`: in `auto`, `acceptEdits`, `dontAsk` and `bypassPermissions` it runs its tools without asking, as a message typed at the
+terminal would. The mode is read from the line Claude Code draws below its input box (`⏸ manual mode on`, `⏵⏵ bypass permissions on`...)
+when the session starts, and `session_started` names it (`terminal_mode`, null when that line names none) so the chat can say so;
+the audit log records it with each message typed. The terminal is never switched to another mode for it. A conversation with a name
+(`/rename`) has it in the rule above the box; that rule is still the box's edge. A screen that is neither the idle box nor a Claude
+Code that says it is working or waiting (another program, a layout the connector does not know) is read again for 30 seconds, then
+the message is refused (`terminal_screen_unknown`) instead of waiting the 10 minutes a busy terminal gets; while it waits the phone is
+told why (`terminal_input_queued`). Connectors 0.1.8 to 0.1.13 refused a mode the agent's approval did not allow
+(`terminal_mode_not_allowed`, `terminal_mode_unknown`); this one no longer sends those. A message that starts with `!`
 (Claude Code runs the rest as a shell command, with no question) or `/` (a slash command such as `/permissions` or `/add-dir`) is
 never typed, in any mode (`terminal_command_refused`). The audit log records each message typed (`terminal_input`: the pid, the pane, its length, line count and a digest,
 never its words). The heartbeat marks such a conversation `input: "terminal"` and the agent's capabilities say `terminal_input: true`.
