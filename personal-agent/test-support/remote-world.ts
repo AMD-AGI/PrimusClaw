@@ -30,6 +30,7 @@ import { RemoteAgents } from "../packages/core/src/remote/remote-agents.js";
 import { RENDERERS } from "../packages/teams/src/views/index.js";
 import { DEFAULT_STYLE } from "../packages/teams/src/config/style.js";
 import { activityOf } from "../packages/teams/src/messenger/render.js";
+import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 import { type FakeCommand, FakeRemote, KEYS } from "./remote-fake.js";
 import { type Recorded, FakeSurface } from "./surface.js";
@@ -101,7 +102,8 @@ export interface WorldOptions {
 export class RemoteWorld {
   readonly surface = new FakeSurface({ caps: { streaming: false } });
   readonly virtual = new VirtualClock();
-  readonly test = openTestStore();
+  /** The store, on a wall clock a test can move (`advanceSeconds`); it starts at the real time. */
+  readonly test = openTestStore({ clock: new FakeClock(Date.now()) });
   readonly remote: RemoteAgents;
   /** Claw's remote-agents port as the agent calls it. */
   readonly claw: ClawRemoteAgentsPort;
@@ -142,7 +144,12 @@ export class RemoteWorld {
       guard: guardOf(new Guardrails(systemClock, () => undefined)),
       audit: () => undefined,
       errors,
-      clock: systemClock,
+      // (wall time is the store's, which a test moves; waits and durations are real)
+      clock: {
+        epochMs: () => this.test.clock.epochMs(),
+        monotonicMs: () => systemClock.monotonicMs(),
+        sleep: (ms, signal) => systemClock.sleep(ms, signal),
+      },
       paceClock: this.virtual,
       random: new SeededRandom(11),
       logger: silentLogger,
@@ -311,6 +318,13 @@ export class RemoteWorld {
 
   last(): string {
     return this.said().at(-1) ?? "";
+  }
+
+  /** The cards of some recorded operations, as Teams is sent them. */
+  renderedCards(records: readonly Recorded[]): Json[] {
+    return records.flatMap((r) =>
+      "message" in r ? cardsOf(activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json) : [],
+    );
   }
 
   /** Every Adaptive Card sent or edited in, as its content, in order. */
