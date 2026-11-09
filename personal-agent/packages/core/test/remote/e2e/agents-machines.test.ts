@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { ALICE, type RemoteWorld, Script, USER_B, remoteWorld } from "../../../../../test-support/remote-world.js";
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { AAD, BOB, TWO_AGENTS, attached, oneTurn } from "./helpers.js";
+import { remoteAgentText } from "../../../src/locales/remote-agents.js";
 
 type Json = Record<string, unknown>;
 const actionsOf = (card: Json | undefined): Json[] => (card?.["actions"] ?? []) as Json[];
@@ -237,5 +238,64 @@ test("a long remote turn ends in one new message not an answer and a notice", ()
         const first = ((c["body"] ?? []) as Json[])[0]?.["text"];
         return typeof first === "string" && /(?:finished|stopped)$/u.test(first);
       }),
+    );
+  }));
+
+// --- from teams/tests/test_remote_agents.py: an agent that never reports in, a connector too old -----------------------------
+
+test("an agent that does not report in does not leave the user waiting in silence", () =>
+  remoteWorld(
+    async (w) => {
+      w.server.addConnector(ALICE, "dev-pod", TWO_AGENTS);
+      w.server.onCommand = new Script({ started: false }).hook;
+      await w.say("/agent new codex /repo");
+      const edit = w.statusEdits().at(-1)?.[1] ?? "";
+      assert.ok(edit.includes("The agent has not reported in yet. You can send your message anyway."), edit);
+      assert.notEqual(w.test.store.remoteState.attachedRemote(AAD), null);
+    },
+    { watchSeconds: { start: 0.3, mode: 0.3 } },
+  ));
+
+test("a new session on a connector too old is refused in the chat language", () =>
+  remoteWorld(async (w) => {
+    const outdated = remoteAgentText.in("en").outdated;
+    w.setLang(AAD, "zh");
+    w.server.addConnector(ALICE, "dev-pod", TWO_AGENTS, { version: "0.1.2", versionStatus: "unsupported" });
+    await w.say("/agent new claude /home/me/repo");
+    assert.equal(w.last(), remoteAgentText.in("zh").outdated);
+    assert.notEqual(w.last(), outdated);
+    assert.ok(w.last().startsWith("那台机器的连接器太旧，开不了新会话，什么都没有启动。"), w.last());
+    assert.ok(
+      w
+        .last()
+        .includes(
+          "`npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`",
+        ),
+    );
+    assert.deepEqual(w.server.commandsOf("session.new"), []);
+    w.setLang(AAD, "en");
+    await w.say("/agent new claude /home/me/repo");
+    assert.equal(w.last(), outdated);
+  }));
+
+test("agents says a connector too old in the chat language", () =>
+  remoteWorld(async (w) => {
+    w.server.addConnector(ALICE, "dev-pod", TWO_AGENTS, { version: "0.1.2", versionStatus: "unsupported" });
+    w.setLang(AAD, "zh");
+    await w.say("/agents");
+    const zh = JSON.stringify(w.cards().at(-1));
+    assert.ok(
+      zh.includes("连接器版本 0.1.2 太旧，不能开新会话。") && zh.includes("(在线)") && zh.includes("你的 agent"),
+      zh,
+    );
+    assert.ok(!zh.includes("too old") && !zh.includes("(online)") && !zh.includes("Your agents"));
+    w.setLang(AAD, "en");
+    await w.say("/agents");
+    const en = JSON.stringify(w.cards().at(-1));
+    assert.ok(
+      en.includes("Its connector (0.1.2) is too old for a new session.") &&
+        en.includes("(online)") &&
+        en.includes("Your agents"),
+      en,
     );
   }));

@@ -13,6 +13,10 @@ export interface FollowTimings {
   readonly maxAgeMs: number;
   /** First wait before reading again after a stream ended (it doubles, up to `RECONNECT_MAX_MS`). */
   readonly reconnectMs: number;
+  /** After a message failed to go out, the wait before it is tried again (`RETRY_MS` when not given). */
+  readonly retryMs?: number;
+  /** How long a stop waits for the reader to deliver what it read (`STOP_WAIT_MS` when not given). */
+  readonly stopWaitMs?: number;
 }
 
 export const DEFAULT_TIMINGS: FollowTimings = {

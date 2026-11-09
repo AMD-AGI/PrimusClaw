@@ -24,7 +24,7 @@ import { createHash } from "node:crypto";
 import { DirectChat } from "../packages/core/src/direct-chat/direct-chat.js";
 import { Guardrails } from "../packages/core/src/guardrails/guardrails.js";
 import { ConnectorSetup, setupFrom } from "../packages/core/src/remote/connector/setup.js";
-import type { RemoteContext, RemoteErrors, RemoteGuard } from "../packages/core/src/remote/context.js";
+import type { RemoteContext, RemoteErrors, RemoteGuard, RemoteSettings } from "../packages/core/src/remote/context.js";
 import type { FollowTimings } from "../packages/core/src/remote/follow/timings.js";
 import { RemoteAgents } from "../packages/core/src/remote/remote-agents.js";
 import { RENDERERS } from "../packages/teams/src/views/index.js";
@@ -34,6 +34,9 @@ import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 import { type FakeCommand, FakeRemote, KEYS } from "./remote-fake.js";
 import { type Recorded, FakeSurface } from "./surface.js";
+import { parseAgentCommand } from "../packages/core/src/commands/agent-args.js";
+import { commandArgs, menuCommand } from "../packages/core/src/commands/parse.js";
+import { naturalCommand } from "../packages/core/src/capabilities/natural.js";
 import { openTestStore } from "./store.js";
 
 export const USER_A = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
@@ -72,7 +75,7 @@ export class VirtualClock implements Clock {
   }
 }
 
-const errors: RemoteErrors = {
+export const WORLD_ERRORS: RemoteErrors = {
   looksInternal: (text) => /gateway|brain/u.test(text),
   withhold: () => "0123abcd",
   publicReason: (reason) => (typeof reason === "string" ? reason : ""),
@@ -92,11 +95,24 @@ export function* wordsOf(blocks: unknown): Generator<string> {
   }
 }
 
+/** One operation on a message, as `RemoteWorld.operations` lists it. */
+export interface Operation {
+  readonly op: Recorded["op"];
+  readonly id: string;
+  readonly card: Json | undefined;
+  /** The message's own text ("" for none). */
+  readonly text: string;
+  /** The conversation it went to. */
+  readonly conversation: string;
+}
+
 export interface WorldOptions {
   readonly enabled?: boolean;
   readonly watchSeconds?: { readonly start: number; readonly mode: number };
   readonly windowDefault?: "card" | "chat";
   readonly direct?: boolean;
+  /** The follower's timings (TEST_TIMINGS when not given). */
+  readonly timings?: FollowTimings;
 }
 
 export class RemoteWorld {
@@ -109,6 +125,20 @@ export class RemoteWorld {
   readonly claw: ClawRemoteAgentsPort;
   /** A message the channel refuses to post (Teams said no), when this says so. */
   refuse: ((message: OutMessage) => boolean) | null = null;
+  /** While set, every edit waits for it first (a test holds an edit in flight, then lets it go). */
+  gate: Promise<void> | null = null;
+  /** A message a test says Teams never answers for: its send hangs (until the test ends). */
+  hang: ((message: OutMessage) => boolean) | null = null;
+  /** The credential the remote agents read with for a person (their linked key here; a test may make it fail). */
+  credential: (person: string) => Promise<string | null> = (person) => Promise.resolve(KEY_OF[person] ?? null);
+  /** What went to the assistant (or Claw) instead of the attached agent, as the router would send it on. */
+  readonly toAssistant: string[] = [];
+  /** Whether the chat may be told something now (false: muted hours, as a test says). */
+  reachable = true;
+  /** What the follower held for later, since the chat could not be told (the assistant's quiet hours keep it). */
+  readonly held: { chatKey: string; label: string; text: string; eventId: string }[] = [];
+  /** The worker's settings, which a test may change (remote agents turned off under a card). */
+  readonly settings: { -readonly [K in keyof RemoteSettings]: RemoteSettings[K] };
   private n = 0;
   private langs = new Map<string, "zh" | "en">();
 
@@ -119,17 +149,18 @@ export class RemoteWorld {
     const store = this.test.store;
     const claw = createClawClient({ baseUrl: server.url, clock: systemClock });
     this.claw = claw.remoteAgents;
+    this.settings = {
+      enabled: options.enabled ?? true,
+      follow: true,
+      windowDefault: options.windowDefault ?? "chat",
+      timings: options.timings ?? TEST_TIMINGS,
+      watchTimings: TEST_TIMINGS,
+      botName: "Clawy",
+      streaming: false,
+      ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
+    };
     const ctx: RemoteContext = {
-      settings: {
-        enabled: options.enabled ?? true,
-        follow: true,
-        windowDefault: options.windowDefault ?? "chat",
-        timings: TEST_TIMINGS,
-        watchTimings: TEST_TIMINGS,
-        botName: "Clawy",
-        streaming: false,
-        ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
-      },
+      settings: this.settings,
       claw: claw.remoteAgents,
       clawBaseUrl: server.url,
       setup: new ConnectorSetup(setupFrom(null, server.url)),
@@ -139,11 +170,17 @@ export class RemoteWorld {
       prefs: store.prefs,
       references: store.references,
       conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
-      credentialFor: (person) => Promise.resolve(KEY_OF[person] ?? null),
-      reach: { reachable: () => true, muted: () => null, holdRemote: () => undefined },
+      credentialFor: (person) => this.credential(person),
+      reach: {
+        reachable: () => this.reachable,
+        muted: () => null,
+        holdRemote: (chatKey, label, text, eventId) => {
+          this.held.push({ chatKey, label, text, eventId });
+        },
+      },
       guard: guardOf(new Guardrails(systemClock, () => undefined)),
       audit: () => undefined,
-      errors,
+      errors: WORLD_ERRORS,
       // (wall time is the store's, which a test moves; waits and durations are real)
       clock: {
         epochMs: () => this.test.clock.epochMs(),
@@ -183,15 +220,21 @@ export class RemoteWorld {
 
   /** The conversation as the channel posts to it, refusing what a test says Teams refuses. */
   private wrap(to: Conversation): Conversation {
-    const refused = (message: OutMessage): Promise<never> | null =>
-      this.refuse?.(message) === true ? Promise.reject(new Error("Teams said no")) : null;
+    const refused = (message: OutMessage): Promise<never> | null => {
+      if (this.hang?.(message) === true) return new Promise<never>(() => undefined);
+      return this.refuse?.(message) === true ? Promise.reject(new Error("Teams said no")) : null;
+    };
     return {
       ref: to.ref,
       edited: to.edited,
       typing: () => to.typing(),
       send: (message) => refused(message) ?? to.send(message),
       post: (message) => refused(message) ?? to.post(message),
-      update: (id, message, options) => refused(message) ?? to.update(id, message, options),
+      update: (id, message, options) => {
+        const gate = this.gate;
+        if (gate !== null) return gate.then(() => refused(message) ?? to.update(id, message, options));
+        return refused(message) ?? to.update(id, message, options);
+      },
       delete: (id) => to.delete(id),
       outgoing: (message) => to.outgoing(message),
       deliver: (envelope) => to.deliver(envelope),
@@ -203,43 +246,69 @@ export class RemoteWorld {
   }
 
   /** One message from the user, routed as the router routes it for remote agents, then until the worker is quiet. */
-  async say(text: string, user = USER_A): Promise<void> {
-    await this.send(text, user);
+  async say(text: string, user = USER_A, quotes: readonly string[] = []): Promise<void> {
+    await this.send(text, user, quotes);
     await this.idle();
   }
 
   /** One message from the user, without waiting for the turn it starts. */
-  async send(text: string, user = USER_A): Promise<void> {
+  async send(typed: string, user = USER_A, quotes: readonly string[] = []): Promise<void> {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
-    const words = text.trim();
-    if (words === "/agents") return this.remote.agents(sender, key, to);
-    if (words === "/agent" || words.startsWith("/agent ")) {
+    const text = this.asTheRouterReadsIt(typed, user.id);
+    // (as the router reads it: `/agents` alone or with words that are no subcommand is the list; `/agents new` is `/agent new`)
+    const agents = commandArgs(text, "agents");
+    if (agents !== null && parseAgentCommand(agents) === null) return this.remote.agents(sender, key, to);
+    const args = agents ?? commandArgs(text, "agent");
+    if (args !== null) {
       return this.remote.agent({
         chat: sender,
         credential: key,
-        args: words.slice(6).trim(),
+        args,
         conversation: to,
         message: undefined,
         provider: undefined,
       });
     }
-    if (words === "/stop") {
+    if (commandArgs(text, "stop") !== null) {
       await this.remote.stop(sender, key, to);
       return;
     }
-    if (this.remote.attached(user.id)) {
-      const message = { id: this.id("act"), text, quotes: [] } as unknown as InboundMessage;
-      await this.remote.prompt({
-        message,
-        chat: sender,
-        credential: key,
-        prompt: text,
-        conversation: to,
-        provider: undefined,
-      });
+    const message = {
+      id: this.id("act"),
+      text,
+      quotes: quotes.map((messageId) => ({ messageId })),
+    } as unknown as InboundMessage;
+    // (as the router sends it on: a chat whose session card is the window keeps its chat box for the assistant, and only a reply
+    // that quotes the card goes to the session)
+    const toAgent =
+      this.remote.attached(user.id) &&
+      (this.remote.windowMode(user.id) !== "card" || this.remote.quotesWindow(user.id, message));
+    if (!toAgent) {
+      this.toAssistant.push(text);
+      return;
     }
+    await this.remote.prompt({
+      message,
+      chat: sender,
+      credential: key,
+      prompt: text,
+      conversation: to,
+      provider: undefined,
+    });
+  }
+
+  /**
+   * What a 1:1 message says as the router reads it (routing/personal-text.ts): a menu word or a sentence that is a command is that
+   * command, with the words that are not commands here left as words (no assistant, no GitHub in this world).
+   */
+  private asTheRouterReadsIt(text: string, userId: string): string {
+    const attached = this.remote.attached(userId);
+    const off = new Set(["github", "board", "brief", "brief now"]);
+    if (!this.settings.enabled) for (const word of ["agents", "agent"]) off.add(word);
+    if (!attached) for (const word of ["agent detach", "stop it"]) off.add(word);
+    return naturalCommand(menuCommand(text, false), false, off);
   }
 
   /** A tap on a card's button. */
@@ -304,6 +373,21 @@ export class RemoteWorld {
         ];
       }
       return [];
+    });
+  }
+
+  /**
+   * Every operation on a message, in order, as Teams is sent it: `id` the message an update or delete changes, or the id a post was
+   * given ("" for a plain send); `card` the card it carries, if any.
+   */
+  operations(): Operation[] {
+    return this.surface.outbox.flatMap((r): Operation[] => {
+      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined, text: "", conversation: r.conversation }];
+      if (r.op !== "send" && r.op !== "post" && r.op !== "update") return [];
+      const activity = activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json;
+      const text = typeof activity["text"] === "string" ? activity["text"] : "";
+      const id = r.op === "send" ? "" : r.id;
+      return [{ op: r.op, id, card: cardsOf(activity)[0], text, conversation: r.conversation }];
     });
   }
 

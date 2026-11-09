@@ -161,7 +161,11 @@ export interface InboundMessage extends InboundBase {
 /** A button pressed on a card the bot posted. */
 export interface InboundAction extends InboundBase {
   readonly type: "action";
-  /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
+  /**
+   * Which action: the `primusclaw` field of the button's data, the worker's own kind that routing dispatches on
+   * (Python `activity._card_data`'s kind: "decision", "answer", "remote", ...). The adapter copies it, never interprets
+   * it; "" when the data names none.
+   */
   readonly verb: string;
   /**
    * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
@@ -234,8 +238,11 @@ export type ViewButton =
   | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
   | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
 
-/** How a button is emphasised (Teams: the action's `style`); none is the channel's default look. */
-export type ButtonStyle = "positive" | "destructive";
+/**
+ * How a button is emphasised (Teams: the action's `style`), carried as written so card JSON matches the Python worker
+ * byte for byte: an explicit "default" (the feedback offer's No) is not the same JSON as no style at all.
+ */
+export type ButtonStyle = "default" | "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
@@ -294,6 +301,12 @@ export interface StreamRefused {
  * thing the way it would without a stream.
  */
 export interface LiveStream {
+  /**
+   * The id of the stream's message (Teams: the id the first stream request was answered with), so that what the same
+   * turn later amends or replaces after the stream closed edits this message instead of posting a new one (the Python
+   * worker keeps the stream id for that). "" when the channel did not say it.
+   */
+  readonly id: MessageId;
   /** Informative status lines ("Thinking…", the step in progress). */
   inform(text: string): Promise<Result<void, StreamRefused>>;
   /** The answer text so far; each call carries the whole text, which must start with the previous one. */

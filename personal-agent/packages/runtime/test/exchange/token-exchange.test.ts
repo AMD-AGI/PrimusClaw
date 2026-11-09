@@ -344,3 +344,11 @@ test("a stalled exchange or binding request ends at its deadline, as an error", 
   const binding = await c.bindingRequest("aad-a", "");
   assert.equal(binding.ok, false);
 });
+
+test("an exchange error keeps only an OAuth error word, never other text from the answer", async () => {
+  const answer = (error: string) => () => Promise.resolve(json(401, { error }));
+  const word = await new HttpTokenExchange(CFG, new FakeClock(), answer("invalid_client")).tokenFor("aad-a");
+  assert.ok(!word.ok && word.error.kind === "exchange_failed" && word.error.reason.endsWith(" invalid_client"));
+  const leak = await new HttpTokenExchange(CFG, new FakeClock(), answer("eyJhbGciOi.eyJzdWIi.c2ln")).tokenFor("aad-a");
+  assert.ok(!leak.ok && leak.error.kind === "exchange_failed" && !leak.error.reason.includes("eyJ"));
+});

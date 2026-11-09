@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 
 import { remoteAgentText } from "../../../src/locales/remote-agents.js";
+import { newTurn } from "../../../src/remote/chats.js";
 import type { FakeCommand, FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE, type RemoteWorld, Script, USER_A } from "../../../../../test-support/remote-world.js";
 
@@ -39,3 +40,21 @@ export async function oneTurn(srv: FakeRemote, sid: string, _cmd: FakeCommand, t
 
 /** A time `secondsAgo` before now, as Claw writes it. */
 export const seen = (secondsAgo: number): string => new Date(Date.now() - secondsAgo * 1000).toISOString();
+
+/** The worker's own books of the turns it watches, for a test that puts one there that never ends. */
+export function turnsOf(w: RemoteWorld): Map<string, unknown> {
+  return (w.remote as unknown as { chats: { turns: Map<string, unknown> } }).chats.turns;
+}
+
+/** A turn in the worker's books that nothing runs. */
+export const idleTurn = (): unknown => newTurn();
+
+/** An agent that answers each prompt with `text`, `chunks` times, and ends its turn. */
+export function promptScript(chunks = 1, text = "Done."): Script {
+  const script = new Script();
+  script.onPrompt = async (srv, sid) => {
+    for (let i = 0; i < chunks; i += 1) await srv.say(sid, text);
+    await srv.end(sid);
+  };
+  return script;
+}

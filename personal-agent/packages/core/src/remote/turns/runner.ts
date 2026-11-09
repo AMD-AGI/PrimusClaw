@@ -15,7 +15,7 @@ import type { RemoteState } from "../../ports/store/remote.js";
 import { type Conversation, textMessage } from "../../ports/surface.js";
 import { type RemoteStep, RemoteTurnState, queuedLine, recoveredLine } from "../../remote-view/index.js";
 import type { StatusBoard } from "../board.js";
-import type { RemoteTurn } from "../chats.js";
+import { type RemoteTurn, newTurn } from "../chats.js";
 import type { RemoteContext } from "../context.js";
 import { type EndedWords, type Provider, credentialOf } from "../ended.js";
 import { saysModes } from "../follow/follower.js";
@@ -73,7 +73,7 @@ export class TurnRunner {
 
   /** Watch the turn that is open on the chat's session. */
   start(request: TurnRequest): void {
-    const turn: RemoteTurn = { task: null, stopRequested: false, waitsForTerminal: false };
+    const turn = newTurn();
     this.state.chats.turns.set(request.chatKey, turn);
     turn.task = new Task((signal) => this.guarded(request, turn, signal), this.ctx.logger, "a remote turn");
   }

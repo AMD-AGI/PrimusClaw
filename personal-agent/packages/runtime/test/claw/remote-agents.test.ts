@@ -100,7 +100,7 @@ describe("remote agent sessions", () => {
 describe("hiding a machine's conversations", () => {
   it("hides or shows again by ref, and says what changed and what was refused", async () => {
     const wire = new Wire(() =>
-      json(200, { ok: true, data: { changed: ["r1"], refused: [{ ref: "r2", reason: "live" }, "junk"] } }),
+      json(200, { ok: true, data: { changed: ["r1"], refused: [{ ref: "r2", reason: "live" }] } }),
     );
     const claw = wire.client();
     assert.deepEqual(await claw.remoteAgents.hide("ak-a", "c1", ["r1", "r2"], true), {
@@ -117,6 +117,14 @@ describe("hiding a machine's conversations", () => {
     );
     wire.answer = () => json(404, { ok: false, error: "not_found" });
     await assert.rejects(claw.remoteAgents.hide("ak-a", "c9", ["r1"], true), { name: "ClawError", status: 404 });
+    for (const data of [
+      { changed: ["r1"] },
+      { changed: ["r1"], refused: [{ ref: "r2", reason: "gone" }] },
+      { changed: "r1", refused: [] },
+    ]) {
+      wire.answer = () => json(200, { ok: true, data });
+      await assert.rejects(claw.remoteAgents.hide("ak-a", "c1", ["r1"], true), { name: "ClawAnswerInvalid" });
+    }
   });
 
   it("the listing leaves hidden conversations out unless asked to include them", async () => {

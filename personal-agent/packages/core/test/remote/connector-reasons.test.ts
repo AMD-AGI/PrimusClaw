@@ -195,3 +195,18 @@ test("a revoked connector is given the whole login command", () => {
     );
   }
 });
+
+// Names an object has of its own in JavaScript are reasons like any other (Python's dict.get finds nothing for them).
+test("a reason named like an object's own property is told as Python tells it", () => {
+  assert.equal(
+    describe("constructor", "en"),
+    "The connector gave a reason I do not know (constructor). Run `claw-connector status` on that machine, or upgrade the connector and try again.",
+  );
+  assert.equal(
+    describe("constructor", "zh"),
+    "连接器给出了一个我不认识的原因（constructor）。在那台机器上运行 `claw-connector status` 看看，或升级连接器后再试。",
+  );
+  for (const name of ["__proto__", "toString", "hasOwnProperty"]) {
+    for (const lang of ["en", "zh"] as const) assert.equal(describe(name, lang), `${name}.`);
+  }
+});

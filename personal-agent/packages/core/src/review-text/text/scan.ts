@@ -1,6 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { isPySpace } from "../../text/py-text.js";
+
 /**
  * Linear scans for the few patterns of the Python worker whose regular expressions backtrack polynomially on hostile input
  * (a run of "<" with no ">", a long word with no ":"). Each gives exactly the matches Python's `re` gives (leftmost first,
@@ -98,7 +100,7 @@ const urlAt: Alternative = (text, at) => {
   const rest = text.startsWith("https://", at) ? 8 : text.startsWith("http://", at) ? 7 : 0;
   if (!rest) return 0;
   let i = at + rest;
-  while (i < text.length && !/\s/u.test(text.charAt(i))) i += 1;
+  while (i < text.length && !isPySpace(text.charAt(i))) i += 1; // Python's \S: \x1c-\x1f and \x85 are white space
   return i > at + rest ? i - at : 0;
 };
 

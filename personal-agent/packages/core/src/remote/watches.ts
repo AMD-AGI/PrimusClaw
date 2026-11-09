@@ -22,7 +22,7 @@ import { type EndedWords, type Provider, credentialOf } from "./ended.js";
 import type { FollowControl } from "./follow/control.js";
 import { saysModes } from "./follow/follower.js";
 import { saidIn } from "./refusals.js";
-import { type ChatState, isTransport } from "./state.js";
+import { type ChatState, isTransport, modeFlagOf } from "./state.js";
 import { Task } from "./tasks.js";
 
 /** How long `/agent new` waits to say the agent is ready. */
@@ -200,7 +200,7 @@ export class Watches {
     const wanted = want === "unattended";
     if (state.unattended === wanted) return "";
     const words = remoteAgentText.in(this.state.lang(w.chatKey));
-    const target = state.modes.find((m) => state.modeFlags[m] === wanted);
+    const target = state.modes.find((m) => modeFlagOf(state.modeFlags, m) === wanted);
     if (target === undefined) return words.noModeSays({ which: wanted ? words.doNotAsk : words.ask });
     const ticket = {};
     if (wanted) {

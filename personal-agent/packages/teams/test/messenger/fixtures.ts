@@ -12,6 +12,7 @@ import { TeamsConversation } from "../../src/messenger/conversation.js";
 import type { Masker } from "../../src/messenger/masker.js";
 import type { Outbox } from "../../src/outbound/outbox.js";
 import { BusyConversations } from "../../src/stream/busy.js";
+import { RENDERERS } from "../../src/views/index.js";
 import type { Renderers } from "../../src/views/registry.js";
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 
@@ -58,7 +59,7 @@ export function build(outbox: Outbox, options: BuildOptions = {}): Built {
     acks,
     clock,
     random: new SeededRandom(7),
-    render: { style, renderers: options.renderers ?? ({} as Renderers), masker: options.masker },
+    render: { style, renderers: options.renderers ?? RENDERERS, masker: options.masker },
     stream: { style, clock, busy, logger },
     logger,
     ...(options.ackTimeoutMs === undefined ? {} : { ackTimeoutMs: options.ackTimeoutMs }),

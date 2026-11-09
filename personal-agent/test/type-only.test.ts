@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
-import { missingFromReport, packagesToCheck } from "../scripts/coverage.js";
+import { codeOutsideSrc, missingFromReport, packagesToCheck } from "../scripts/coverage.js";
 import { isTypeOnly, sourceFiles, symlinksUnder, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -170,4 +170,70 @@ test("a file with runtime code that c8's report does not hold is named, wherever
     [],
   );
   assert.deepEqual(missingFromReport(expected, expected, base), []);
+});
+
+test("the judgement reads statements, not emitted text: what only looks like compiler output still counts", () => {
+  assert.equal(isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\n', "a.ts"), false);
+  assert.equal(
+    isTypeOnly('Object.defineProperty(exports, "__esModule", { value: true });\nexport {};\n', "a.cts"),
+    false,
+  );
+  assert.equal(isTypeOnly('"use strict";\n'), false);
+  assert.equal(isTypeOnly("#!/usr/bin/env node\nexport interface A {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly('import { type A } from "./a.js";\nexport type B = A;\n'), false);
+  assert.equal(isTypeOnly('export { type A } from "./a.js";\n'), false);
+  assert.equal(isTypeOnly('import type { A } from "./a.js";\nexport { type A };\n'), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export type X = string;\n}\n"), true);
+  assert.equal(isTypeOnly("export namespace N {\n  export const x = 1;\n}\n"), false);
+  assert.equal(isTypeOnly("declare global {\n  interface Window { x: string }\n}\nexport {};\n"), true);
+  assert.equal(isTypeOnly("export declare enum E { A }\nexport const enum F { B }\n"), false);
+  assert.equal(isTypeOnly("export default interface D {\n  readonly x: string;\n}\n"), true);
+  assert.equal(isTypeOnly("const x = 1;\nexport default x;\n"), false);
+  assert.equal(isTypeOnly("export = {};\n", "a.cts"), false);
+});
+
+test("a package whose entry points or source files lie outside src is refused", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  const pkg = path.join(packages, "core");
+  fs.mkdirSync(path.join(pkg, "src"), { recursive: true });
+  fs.mkdirSync(path.join(pkg, "test"));
+  fs.mkdirSync(path.join(pkg, "lib"));
+  fs.mkdirSync(path.join(pkg, "node_modules", "x"), { recursive: true });
+  const manifest = {
+    exports: { ".": { types: "./src/index.ts", default: "./outside.js" }, "./more": "./src/more.ts" },
+    main: "./src/index.ts",
+    bin: { tool: "./bin/tool.js" },
+  };
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify(manifest));
+  for (const f of ["src/index.ts", "test/a.test.ts", "outside.js", "lib/helper.ts", "node_modules/x/index.js"]) {
+    fs.writeFileSync(path.join(pkg, f), "export const x = 1;\n");
+  }
+  fs.writeFileSync(path.join(pkg, "README.md"), "# core\n");
+  assert.deepEqual(codeOutsideSrc(packages, "core"), [
+    "packages/core/package.json points at ./outside.js, outside src (the floor would not see it)",
+    "packages/core/package.json points at ./bin/tool.js, outside src (the floor would not see it)",
+    "packages/core/lib/helper.ts is source outside src/ and test/",
+    "packages/core/outside.js is source outside src/ and test/",
+  ]);
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ exports: { ".": "./src/index.ts" } }));
+  fs.rmSync(path.join(pkg, "outside.js"));
+  fs.rmSync(path.join(pkg, "lib"), { recursive: true });
+  assert.deepEqual(codeOutsideSrc(packages, "core"), []);
+});
+
+test("a source extension in another case is refused anywhere in a package, node_modules aside", (t) => {
+  const dir = scratch(t);
+  const packages = path.join(dir, "packages");
+  const pkg = path.join(packages, "core");
+  fs.mkdirSync(path.join(pkg, "src", "deep"), { recursive: true });
+  fs.mkdirSync(path.join(pkg, "node_modules", "x"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ exports: { ".": "./src/index.ts" } }));
+  for (const f of ["src/index.ts", "src/probe.JS", "src/deep/x.Ts", "src/notes.TXT", "node_modules/x/index.JS"]) {
+    fs.writeFileSync(path.join(pkg, f), "export const x = 1;\n");
+  }
+  assert.deepEqual(codeOutsideSrc(packages, "core").sort(), [
+    "packages/core/src/deep/x.Ts has a source extension in upper case (use lower case)",
+    "packages/core/src/probe.JS has a source extension in upper case (use lower case)",
+  ]);
 });

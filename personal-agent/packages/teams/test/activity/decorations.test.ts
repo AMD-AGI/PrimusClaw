@@ -115,3 +115,17 @@ test("a stream's requests and its final carry the stream entity", () => {
   assert.deepEqual(streamInfo(final), { type: "streaminfo", streamType: "final", streamId: "s-1" });
   assert.equal(streamInfo({ type: "message" }), undefined);
 });
+
+test("a root entity's field named like an object's prototype is kept as a field", () => {
+  // (Python's dict keeps "__proto__" as a key like any other; an assignment would have set the merged object's prototype)
+  const root = JSON.parse(
+    '{"type":"https://schema.org/Message","__proto__":{"polluted":true},"usageInfo":{"n":1}}',
+  ) as Record<string, unknown>;
+  const labelled = withAiLabel({ type: "message", entities: [root] } as never);
+  const [merged] = rootEntities(labelled);
+  assert.ok(merged);
+  assert.ok(Object.hasOwn(merged, "__proto__"));
+  assert.deepEqual(Object.getPrototypeOf(merged), Object.prototype);
+  assert.equal((merged as { polluted?: unknown }).polluted, undefined);
+  assert.equal(JSON.stringify(merged).includes('"__proto__":{"polluted":true}'), true);
+});

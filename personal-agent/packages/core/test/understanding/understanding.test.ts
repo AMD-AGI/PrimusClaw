@@ -20,7 +20,7 @@ import {
   type Mention,
   type PersonRecord,
 } from "../../src/index.js";
-import { similarity } from "../../src/text/sequence-matcher.js";
+import { similarity } from "../../src/understanding/sequence-matcher.js";
 
 /** The commands of the 1:1 chat that these cases use (the command module's own table is W4's). */
 const COMMANDS: CommandBook = {

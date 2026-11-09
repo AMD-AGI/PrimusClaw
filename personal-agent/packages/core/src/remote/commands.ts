@@ -25,7 +25,7 @@ import { resolveAgent } from "./machines.js";
 import { failureText, saidIn } from "./refusals.js";
 import type { SessionOps } from "./session-ops.js";
 import type { SessionStarts } from "./sessions.js";
-import { type ChatState, isTransport } from "./state.js";
+import { type ChatState, isTransport, modeFlagOf } from "./state.js";
 import { type Target, type Targets, sessionsByRef } from "./targets.js";
 import { MODE_ID_MAX, type Watches } from "./watches.js";
 import { isWindowMode, modeSetLine } from "./window/index.js";
@@ -265,7 +265,7 @@ export class AgentCommands {
     const refused = this.p.ops.modeRefusal(call.chatKey, state, mode, lang);
     if (refused) return refused;
     // A mode that runs without asking is the agent's widest authority: limited per person. Only a mode the session said asks is free.
-    const counted = state.modeFlags[mode] !== false;
+    const counted = modeFlagOf(state.modeFlags, mode) !== false;
     const ticket = {};
     const sid = state.sessionId ?? "";
     if (counted) {

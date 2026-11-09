@@ -72,6 +72,11 @@ class TeamsLiveStream implements LiveStream {
     private readonly render: (message: OutMessage) => JsonObject,
   ) {}
 
+  /** The stream's message id (the id Teams answered its first request with; Python's `stream_id`), "" until then. */
+  get id(): string {
+    return this.stream.streamId;
+  }
+
   inform(text: string): Promise<Result<void, StreamRefused>> {
     return attempt(() => this.stream.inform(informativeText([text])));
   }

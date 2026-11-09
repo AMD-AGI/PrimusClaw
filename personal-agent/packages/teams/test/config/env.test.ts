@@ -63,3 +63,35 @@ test("a namespace without the worker identity refuses to start", () => {
     ),
   );
 });
+
+test("the install link is read from the environment and must be https", () => {
+  const base = {
+    SERVICEBUS_LISTEN_CONNECTION_STRING: "x",
+    SERVICEBUS_SEND_CONNECTION_STRING: "y",
+  };
+  assert.equal(teamsSettingsFromEnv(base).installHintUrl, "");
+  assert.equal(
+    teamsSettingsFromEnv({ ...base, TEAMS_INSTALL_HINT_URL: " https://teams.microsoft.com/l/app/x " }).installHintUrl,
+    "https://teams.microsoft.com/l/app/x",
+  );
+  assert.throws(
+    () => teamsSettingsFromEnv({ ...base, TEAMS_INSTALL_HINT_URL: "teams.microsoft.com/l/app/x" }),
+    /TEAMS_INSTALL_HINT_URL/,
+  );
+});
+
+test("a word of teams streaming that only an object's prototype knows is a typo that stops the worker", () => {
+  // (Python: named.get("constructor", "") is "", so the setting is refused)
+  for (const word of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.throws(
+      () =>
+        teamsSettingsFromEnv({
+          SERVICEBUS_LISTEN_CONNECTION_STRING: "l",
+          SERVICEBUS_SEND_CONNECTION_STRING: "s",
+          TEAMS_STREAMING: word,
+        }),
+      TeamsConfigError,
+      word,
+    );
+  }
+});

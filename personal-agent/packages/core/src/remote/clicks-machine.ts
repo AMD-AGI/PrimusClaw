@@ -57,8 +57,8 @@ export class MachineClicks {
     );
     const titles = new Map(entries.map((e) => [e.ref, e.title]));
     const words = remoteText.in(lang);
-    const lines = [words.hidN({ n: (out.changed ?? []).length })];
-    for (const refused of out.refused ?? []) {
+    const lines = [words.hidN({ n: out.changed.length })];
+    for (const refused of out.refused) {
       if (refused.reason === "live")
         lines.push(words.hideLive({ title: neutral(titles.get(refused.ref) ?? "", 60) || "?" }));
     }
@@ -83,7 +83,7 @@ export class MachineClicks {
     const lang = this.c.lang(click);
     if (refs.length === 0) return this.c.home(click, saidIn(lang, "conversationGone"));
     const out = await this.p.ctx.claw.hide(click.key, connector.connectorId, refs, false);
-    await this.c.home(click, remoteText.in(lang).unhidN({ n: (out.changed ?? []).length }));
+    await this.c.home(click, remoteText.in(lang).unhidN({ n: out.changed.length }));
   }
 
   /**

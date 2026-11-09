@@ -118,3 +118,25 @@ test("a name that is a machine's means its only agent or a choice among its agen
     "gone is offline. Start its connector again, then try again.",
   );
 });
+
+test("resolve agent reads a machines name where an agents is wanted", () => {
+  const one = machine("c1", "dev-pod", true, [agent("a1", { kind: "codex", name: "A" })]);
+  const two = machine("c2", "lab", true, [agent("a1"), agent("a2")]);
+  const off = machine("c3", "old", false, [agent("a9")]);
+  const bare = machine("c4", "bare", true, []);
+  const twin1 = machine("c5", "twin", true, [agent("t1")]);
+  const twin2 = machine("c6", "twin", true, [agent("t2")]);
+  const pool = [one, two, off, bare, twin1, twin2];
+  const first = resolveAgent(pool, "DEV-POD", NOW);
+  assert.ok(first.kind === "agent" && first.connector === one && first.agent === one.agents[0]);
+  const chosen = resolveAgent(pool, "lab", NOW);
+  assert.ok(chosen.kind === "machine" && chosen.connector === two && chosen.agents.length === 2);
+  const offline = "old is offline. Start its connector again, then try again.";
+  assert.equal(textOf(resolveAgent(pool, "old", NOW)), offline);
+  assert.ok(textOf(resolveAgent(pool, "bare", NOW)).startsWith("bare has not reported an agent yet"));
+  assert.ok(textOf(resolveAgent(pool, "twin", NOW)).startsWith("More than one machine is called `twin`"));
+  assert.ok(textOf(resolveAgent(pool, "nope", NOW)).startsWith("I could not find an agent called `nope`"));
+  // a named machine with a wrong agent
+  assert.ok(textOf(resolveAgent(pool, "lab/nope", NOW)).startsWith("I could not find an agent called `lab/nope`"));
+  assert.equal(textOf(resolveAgent(pool, "a9", NOW)), offline); // (an agent id, as before)
+});

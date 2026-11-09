@@ -22,6 +22,20 @@ export interface RemoteTurn {
   stopRequested: boolean;
   /** Its message waits for the machine's terminal and has not been typed there yet. */
   waitsForTerminal: boolean;
+  /** Nothing runs it any more (or nothing ever did): a Stop card's press for it stops nothing. */
+  readonly ended: boolean;
+}
+
+/** A turn about to be watched (its task is set right after). */
+export function newTurn(): RemoteTurn {
+  return {
+    task: null,
+    stopRequested: false,
+    waitsForTerminal: false,
+    get ended() {
+      return this.task?.running !== true;
+    },
+  };
 }
 
 /** The confirmation card for taking over a conversation a terminal has open: only its own Take over carries the ticket. */
