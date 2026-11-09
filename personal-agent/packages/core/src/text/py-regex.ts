@@ -65,11 +65,8 @@ function translateEscape(escape: string, state: State): string {
 function closeClass(state: State, ignoreCase: boolean): void {
   const body = state.out.slice(state.classStart);
   if (ignoreCase) {
-    const negated = body.startsWith("[^");
-    const positive = negated ? `[${body.slice(2)}]` : `${body}]`;
-    // (first in the class, never last: after a trailing "-" they would make a range)
-    const at = state.classStart + (negated ? 2 : 1);
-    if (new RegExp(positive, "iu").test("i")) state.out = state.out.slice(0, at) + DOTTED_I + state.out.slice(at);
+    const positive = body.startsWith("[^") ? `[${body.slice(2)}]` : `${body}]`;
+    if (new RegExp(positive, "iu").test("i")) state.out += DOTTED_I;
   }
   state.out += "]";
   state.inClass = false;
