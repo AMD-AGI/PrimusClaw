@@ -54,6 +54,7 @@ import { devenvToolsOn } from "./devenv-tools.js";
 import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
+import { commandLanguage } from "./typed-commands.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { disciplineOn } from "./discipline.js";
 import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
@@ -213,13 +214,16 @@ async function earlierUserMessages(sessionId: string): Promise<string[]> {
  * language, so for it the language is the one they last wrote in. Only the request changes: the turn that is stored
  * and shown is the user's words as they sent them.
  */
-async function addReplyLanguage(task: Record<string, unknown>, sessionId: string): Promise<void> {
+async function replyLanguageOf(task: Record<string, unknown>, sessionId: string): Promise<string | null> {
   const prompt = stringField(task, "prompt");
-  if (!prompt) return;
-  const language = await languageToAnswerIn(
-    prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, () => earlierUserMessages(sessionId),
-  );
-  if (language) task.prompt = withReplyLanguage(prompt, language);
+  if (!prompt) return null;
+  return languageToAnswerIn(prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, () => earlierUserMessages(sessionId));
+}
+
+/** The line `replyLanguageOf` worked out, put beside the message. */
+function addReplyLanguage(task: Record<string, unknown>, language: string | null): void {
+  const prompt = stringField(task, "prompt");
+  if (prompt && language) task.prompt = withReplyLanguage(prompt, language);
 }
 
 export function tokenTtlSeconds(): number {
@@ -321,6 +325,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // A research report is a work item, never text the router writes from what it knows: after the writing section, which it narrows.
     const research = assistantResearchOn(role.userId);
     if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
+    // The language this turn answers in (`language.ts`), worked out once: beside the message, and in every command the turn's state
+    // tells the router the user can type back (`typed-commands.ts`), so that a hint repeated to the user is in their language.
+    const replyLanguage = await replyLanguageOf(task, sessionId);
+    const commands = commandLanguage(replyLanguage);
     const asked = await askedOfOthersManifest(role.userId);
     const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
@@ -347,7 +355,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
         review.confirmations.map((c) => ({ ref: confirmationRef(c.id), since: c.created_at })));
       state.push(renderReviewState({
         confirmations: review.confirmations.map((c) => ({ ...c, told_at: told.get(confirmationRef(c.id)) ?? null })), reviewMode: review.reviewMode,
-        people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
+        people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [], commands,
       }));
     }
     const memory = await routerMemoryParts(role.userId, sessionId);
@@ -371,7 +379,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     };
     const proactiveSection = renderRouterProactiveSection(proactive);
     if (proactiveSection) withSystemAppend(task, proactiveSection);
-    if (proactive.schedules) state.push(await renderScheduleState(role.userId));
+    if (proactive.schedules) state.push(await renderScheduleState(role.userId, commands));
     const choice = modelChoiceOn();
     if (choice) {
       // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take. In the
@@ -388,7 +396,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // Little thinking, and the say streamed while it is written (`router-speed.ts`); for the users who have it, the turn's own text
     // too, when it answers them (a worker's report is not theirs: what the turn writes then is not for them).
     applyRouterTurnSpeed(task, undefined, streamTextOn(role.userId) && !stringField(task, "prompt").startsWith(WORK_EVENT_PREFIX));
-    await addReplyLanguage(task, sessionId);
+    addReplyLanguage(task, replyLanguage);
     // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
     task.prompt = withTurnState(stringField(task, "prompt"), state);
     logger.info({

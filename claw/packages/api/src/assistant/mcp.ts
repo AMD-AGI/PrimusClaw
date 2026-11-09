@@ -190,7 +190,7 @@ function registerScheduleTools(mcp: McpServer, claims: AssistantTokenClaims, ans
       { decision: z.enum(["allow", "deny"]), confirmation_id: z.string().optional().describe("The id of the card.") },
       (args) => answer(claims, "confirmation_answer", async () => {
         const out = await scheduleConfirmationAnswer(claims, args);
-        if (!out) throw new ToolRefused("confirmation_not_found", "that is no waiting card: allow only when the user's whole message is 批准 #<ref> of a listed card; deny names its confirmation_id");
+        if (!out) throw new ToolRefused("confirmation_not_found", "that is no waiting card: allow only when the user's whole message is approve #<ref> (批准 #<ref>) of a listed card; deny names its confirmation_id");
         return out;
       }),
     );
@@ -265,7 +265,7 @@ function registerReviewTools(mcp: McpServer, claims: AssistantTokenClaims, choic
     `Start a review of each pull request the user named, as a work item each, all in one call (up to ${MAX_PRS}; the first ${REVIEWS_STARTED_AT_ONCE} start, the rest wait for a slot and start by themselves). Merges only with merge=true.`,
     {
       prs: z.array(z.string()).describe("Each as owner/repo#number or its URL; only numbers the user wrote."),
-      merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). For the user's own review even true merges nothing by itself: the merge waits for their confirmation (the card's button or 批准 #<ref>)."),
+      merge: z.boolean().describe("true only when the user clearly asked to merge after the review; otherwise false (review only). For the user's own review even true merges nothing by itself: the merge waits for their confirmation (the card's button or approve #<ref>, 批准 #<ref> in Chinese)."),
       reviewer: z.string().optional().describe("Whose GitHub account reviews: leave out for the user. Someone else's (a user_id from People) is handed to the user's channel when it can start it with that person's credentials (handed_off: say nothing about it, the user's chat answers them), and otherwise refused as acting_as_credentials_required: tell the user what the refusal says to do. When the user's whole message is 确认 <name> (confirm <name>) answering which reviewer they meant, call it with the prs and merge of their request just before it and that person's user_id."),
       model: z.string().optional().describe(choice ? MODEL_PARAM_CHOICE : "Only when the user named a model."),
       effort: z.enum(["low", "medium", "high"]).optional().describe("Only when the user asked for one."),
@@ -514,7 +514,7 @@ export function createAssistantMcpServer(
       mcp.tool(
         "github_comment",
         "Put a comment you drafted on a GitHub pull request or issue to the user as a card: nothing is posted by the call. It is posted "
-        + "as the user's GitHub account, exactly as shown, only when they press the card or reply 批准 #<ref>. Use it when the user "
+        + "as the user's GitHub account, exactly as shown, only when they press the card or reply approve #<ref> (批准 #<ref> in Chinese). Use it when the user "
         + "asks you to comment, after you have read what the comment is about; never start a work item just to post a comment.",
         {
           pr: z.string().describe("owner/repo#number, or the pull request's or issue's https://github.com URL."),

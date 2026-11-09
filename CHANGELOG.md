@@ -155,6 +155,12 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant tells a person the commands they can type back in the language it answers them in: approve #ref and deny #ref for a
+  card, undo #N after something is remembered, and 批准 / 拒绝 / 撤销 only in a Chinese conversation. The tool results (a memory save,
+  a scheduled task, a GitHub comment or a devenv_send instruction card put to the person), what waits for them in the router's state
+  and the refusals all spelt them in Chinese only, and the router repeated them word for word into English answers ("Say 撤销 #1343 to
+  undo it", "or reply 批准 #5ec155"). Both forms are still read whatever the language. Router prompt router-v21 (review router-v27,
+  router-memory-v3, router-proactive-v4). Router prompt router-devenv-v13.
 - `channel_context.via` on a message to the person's assistant: `on_behalf` (the only value kept; anything else is dropped) says the
   channel posted the message into the person's own chat for them (Clawy's on-behalf endpoint, their coordinator's review request)
   rather than their typing it. It is stored with the message (`claw_assistant_messages.channel_context`) so that what counts the

@@ -22,6 +22,8 @@ import {
   approvalCommand, confirmationRef, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded, typedActionCommand,
 } from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
+import { detectLanguage } from "../../src/assistant/language.js";
+import { commandLanguage } from "../../src/assistant/typed-commands.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
 import { promptFor, userTurn } from "./assistant-router-eval-lib.js";
 import type { ExpectedCall, ReviewEvalCase } from "./assistant-review-eval-cases.js";
@@ -59,6 +61,8 @@ export function systemFor(c: ReviewEvalCase): string {
     people: c.attended === false ? [] : c.people ?? [],
     actions: c.attended === false ? [] : c.actions ?? [],
     repos: c.attended === false ? [] : c.repos ?? [],
+    // (the commands to type in the language of the case's message, as `applySessionRoleToTask` gives them)
+    commands: commandLanguage(c.text ? detectLanguage(c.text) : null),
   })}`;
 }
 

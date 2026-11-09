@@ -37,6 +37,7 @@ import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import { typedCommand } from "./typed-commands.js";
 
 const logger = pino({ name: "assistant-devenv" });
 
@@ -1094,8 +1095,8 @@ export function sendCardText(
       ? (zh ? `接管它在那台机器上已有的对话 ${plan.label}（带着那段对话的上下文）` : `taking over its own conversation ${plan.label} on that machine (with that conversation's history)`)
       : (zh ? "新会话" : "a new session");
   return zh
-    ? `要让 ${plan.machine} 上的 ${plan.agent_id} 执行这条指令吗？\n${text}\n会话：${where}；目录：${plan.cwd}\n点下面的「发送」确认，或回复 批准 #${ref}。`
-    : `Send this to ${plan.agent_id} on ${plan.machine}?\n${text}\nSession: ${where}; folder: ${plan.cwd}\nPress "Send" below to confirm, or reply approve #${ref}.`;
+    ? `要让 ${plan.machine} 上的 ${plan.agent_id} 执行这条指令吗？\n${text}\n会话：${where}；目录：${plan.cwd}\n点下面的「发送」确认，或回复 ${typedCommand("approve", ref, "zh")}。`
+    : `Send this to ${plan.agent_id} on ${plan.machine}?\n${text}\nSession: ${where}; folder: ${plan.cwd}\nPress "Send" below to confirm, or reply ${typedCommand("approve", ref, "en")}.`;
 }
 
 /**
@@ -1170,7 +1171,7 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
   });
   if (out.announce) await out.announce();
   return {
-    ...proposed(out.row, out.subscribers, "sent"), machine: plan.machine, agent: plan.agent_id,
+    ...proposed(out.row, out.subscribers, "sent", zh ? "zh" : "en"), machine: plan.machine, agent: plan.agent_id,
     why_card: refusal?.code ?? "confirm_first",
   };
 }
