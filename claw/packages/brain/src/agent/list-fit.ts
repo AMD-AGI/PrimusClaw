@@ -9,7 +9,7 @@
  * model then counted what it saw, or said the count was uncertain. Here the counts are taken over the whole result before anything
  * is cut: each list's length (`in_result`), and per list how its items fall by the fields that group them (`by`: a pool, a
  * repository, a status), and then each list keeps only its first items, as many as fit, side by side (`shown`). A page that says
- * how many there are in all (SaFE's `totalCount`) keeps that number, and the note says the counts are of the page. The note says which
+ * how many there are in all (SaFE's `totalCount`, Pulse's `matched`) keeps that number, and the note says the counts are of the page. The note says which
  * numbers are whole and how to read the rest. A result that is not JSON, or holds no list, is left to the generic cap.
  */
 
@@ -97,10 +97,14 @@ export function countBy(items: readonly unknown[]): Record<string, Record<string
   return out;
 }
 
-/** The count of every match a paged answer gives beside its page (SaFE's totalCount), if it gives one. */
+/**
+ * The count of every match a paged answer gives beside its page (SaFE's totalCount, Pulse's matched), if it gives one. Pulse's
+ * upstream_prs answers {matched, shown, items} with the latest `limit` items: without its matched named here, the note called the 50
+ * of 193 "all of them", and "现在有几个 upstream PR" was answered from the page's by.state (44 for 193, 2026-11-08 G0).
+ */
 function ownTotal(value: unknown): { key: string; value: number } | null {
   if (!isObj(value)) return null;
-  for (const key of ["totalCount", "total_count", "total", "count"]) {
+  for (const key of ["totalCount", "total_count", "total", "count", "matched"]) {
     const v = value[key];
     if (typeof v === "number" && Number.isFinite(v)) return { key, value: v };
   }

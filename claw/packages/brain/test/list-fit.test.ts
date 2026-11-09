@@ -11,6 +11,8 @@
  *   L3  a result that fits once written compactly is returned whole; one that is not JSON, or holds no list, is cut head and tail
  *   L4  the API's GitHub lists and non-MCP tools are not fitted
  *   L5  a field each item has its own value of is not counted, and neither are times, links or titles
+ *   L6  Pulse's page ({matched, shown, items}) keeps its matched as the count of every match, and the note says by is of this page;
+ *       a page whose matched is all of it (state submitted: 42 of 42) is not called one page
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -98,4 +100,28 @@ test("L5 ids, times, links and titles are not counted; groupings are, most frequ
   assert.deepEqual(by.repo, { "AMD-AGI/PrimusClaw": 7, "ROCm/spur": 3 });
   assert.deepEqual(by.draft, { false: 9, true: 1 });
   for (const k of ["id", "title", "url", "updated_at"]) assert.equal(by[k], undefined, k);
+});
+
+test("L6 Pulse's upstream_prs page keeps its matched as the count of every match, and by is of the page", () => {
+  // The shape Pulse answered on 2026-11-09 (limit 50 of 193 matched, 27066 characters): the latest items, every state mixed.
+  const states = ["submitted", "merged", "closed", "draft", "created"];
+  const items = Array.from({ length: 50 }, (_, i) => ({
+    id: 300 - i, repo: ["vllm", "sglang", "aiter", "spur"][i % 4], state: i < 23 ? "submitted" : states[1 + (i % 4)], scope: "upstream",
+    updated_at: `2026-11-0${1 + (i % 8)}T00:00:00Z`, rebase_status: i % 3 ? "clean" : "conflict", title: `[ROCm] change ${i} ${"t".repeat(400)}`,
+  }));
+  const raw = JSON.stringify({ matched: 193, shown: 50, items });
+  assert.ok(raw.length > LIST_FIT_MAX_CHARS);
+  const fit = JSON.parse(truncateToolResult(raw, "mcp__pulse__upstream_prs"));
+  assert.equal(fit.complete, false);
+  assert.equal(fit.result.matched, 193);
+  assert.deepEqual(fit.in_result, { items: 50 });
+  assert.equal(fit.by.items.state.submitted, 23);
+  assert.match(fit.note, /result\.matched \(193\) is the server's count of every match, of which these 50 are one page, so by covers this page only/);
+  assert.match(fit.note, /call the tool with that filter \(a phase, a user\) and read its matched/);
+
+  // Filtered to one state, matched is the page's own length: the page is all of it, and the note does not call it one.
+  const open = items.slice(0, 23).map((it, i) => ({ ...it, id: 400 + i }));
+  const whole = JSON.parse(truncateToolResult(JSON.stringify({ matched: 23, shown: 23, items: open }), "mcp__pulse__upstream_prs"));
+  assert.deepEqual(whole.in_result, { items: 23 });
+  assert.doesNotMatch(whole.note, /one page/);
 });
