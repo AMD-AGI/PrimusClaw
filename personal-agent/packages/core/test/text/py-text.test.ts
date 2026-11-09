@@ -7,6 +7,7 @@ import {
   clipLine,
   decimalInt,
   isDigits,
+  isPySpace,
   isUpper,
   splitOnce,
   cpHead,
@@ -191,4 +192,37 @@ test("a digit of any script is read as Python's int reads it", () => {
   assert.ok(Number.isNaN(decimalInt("")) && Number.isNaN(decimalInt("1a")));
   assert.ok(isDigits("١٢") && !isDigits("") && !isDigits("²"));
   assert.ok(isUpper("7KQ3") && !isUpper("1234") && !isUpper("Ab") && !isUpper("ß"));
+});
+
+test("isPySpace agrees with the white-space class on every BMP code unit", () => {
+  const space = new RegExp(`^[${PY_SPACE}]$`, "u");
+  for (let c = 0; c < 0x10000; c += 1) {
+    const ch = String.fromCharCode(c);
+    if (isPySpace(ch) !== space.test(ch)) assert.fail(`U+${c.toString(16)}`);
+  }
+  assert.equal(isPySpace(""), false);
+  assert.equal(isPySpace("  "), false);
+  assert.equal(isPySpace("😀"), false);
+});
+
+/** The fastest of a few runs, in milliseconds (the minimum is the least disturbed by other work on the machine). */
+function fastest(run: () => void): number {
+  let best = Infinity;
+  for (let i = 0; i < 5; i += 1) {
+    const start = performance.now();
+    run();
+    best = Math.min(best, performance.now() - start);
+  }
+  return Math.max(best, 0.05);
+}
+
+test("stripping takes time linear in the text, also with long white space inside", () => {
+  // A run of white space that something follows is what an end-anchored regular expression rescans from every start.
+  const text = (n: number): string => `${" ".repeat(n)}x${" ".repeat(n)}y`;
+  const small = text(20_000);
+  const large = text(80_000);
+  for (const strip of [pyStrip, pyRstrip, pyLstrip, (t: string) => pyStrip(t, " "), (t: string) => clipLine(t, 10)]) {
+    const ratio = fastest(() => strip(large)) / fastest(() => strip(small));
+    assert.ok(ratio < 12, `4x the text took ${ratio.toFixed(1)}x the time`); // linear ~4, quadratic ~16
+  }
 });
