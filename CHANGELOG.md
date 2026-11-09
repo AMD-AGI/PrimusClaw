@@ -170,6 +170,14 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant can tell where a public pull request stands for a person with no GitHub here when the deployment has a read-only
+  GitHub App. `pr_state` read such a pull request with no credential, which GitHub allows 60 times an hour for the deployment's whole
+  address; once that was used up every read failed (403), so a request to review pull requests merged days before was not answered as
+  merged, and "#99999" was "could not be read" rather than "does not exist". With `CLAW_GITHUB_PUBLIC_READ_APP_ID`,
+  `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` and `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` set, those reads use an installation token of
+  that App asked for with `metadata: read` alone (one that comes back with more is not used), kept until shortly before it expires, and
+  only a pull request or repository GitHub says is public is answered. A person with GitHub here is still read for as themselves;
+  without the App, reads stay anonymous.
 - The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
   with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
   which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation

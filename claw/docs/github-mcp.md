@@ -78,6 +78,9 @@ A failed read is the tool's own error (`isError`), and Brain marks its result ev
 | `CLAW_GITHUB_MCP_URL` | `<INTERNAL_BACKEND_URL>/v1/internal/github/mcp` | Where Brain reaches the tools |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | Shared with GitHub review |
 | `CLAW_GITHUB_MCP_BINDING_ENABLED` | `false` | An owner with no `GH_TOKEN` is served with their GitHub binding; the API does not start with it on unless `IDENTITY_CLIENT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED` are on too |
+| `CLAW_GITHUB_PUBLIC_READ_APP_ID` | none | A read-only GitHub App of the deployment's own, used for reads of public repositories made for a person with no GitHub here (the assistant's `pr_state`), instead of reading with no credential (60 reads an hour for the deployment's whole address). Set all three or none; the API does not start with only some of them |
+| `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` | none | The App's installation. Give the App `metadata: read` alone and install it where it reaches only public repositories: its tokens are asked for with `metadata: read` alone, one that comes back with more is not used, and only what GitHub says is public is answered |
+| `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` | none | The App's private key (PEM), read whenever a token is made (about once an hour) |
 
 The tools call GitHub's REST and GraphQL API themselves rather than GitHub's own remote MCP server, so they need
 nothing reachable but `CLAW_GITHUB_API_URL`.

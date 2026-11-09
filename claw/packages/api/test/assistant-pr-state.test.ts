@@ -14,6 +14,10 @@
  *      one GitHub will not show anonymously is unknown, and nothing is audited
  *   P6 a number its repository has no pull request of (404 on the pull request, the repository read) is not_found, not a failed
  *      read; a 404 where the repository cannot be read either stays unknown; the repository is read once for several such numbers
+ *   P7 a person with no GitHub here, in a deployment with a read-only App, is read for with the App's token: a pull request of a
+ *      repository GitHub says is public comes back, one whose repository is private (or not said to be public) is unknown, a missing
+ *      number is not_found only in a public repository; a token that cannot be made reads anonymously, a 401 drops the token; a person
+ *      with GitHub here is read for as themselves, never with the App
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -149,5 +153,62 @@ describe("merged pull requests of a review request", () => {
     const anon = world({ anonymous: true });
     assert.deepEqual(await pullStates("u-alice", "sess-1", missing.slice(0, 1), { ...anon.deps, settings: anon.settings({ binding: false }) }),
       [{ pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" }]);
+  });
+
+  test("P7 with the deployment's read-only App a public pull request is read with its token, and nothing private is answered", async () => {
+    const APP = "ghs_app0123456789abcdefghijklmnopqrstuvw";
+    const log: string[] = [];
+    const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+    const pub = { private: false };
+    const fetchImpl = (async (input: URL | string, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init.headers).get("authorization");
+      log.push(`${auth === `Bearer ${APP}` ? "APP" : auth === null ? "ANON" : "OTHER"} ${url.pathname}`);
+      switch (url.pathname) {
+        case "/repos/AMD-AGI/PrimusClaw/pulls/306": return json({ number: 306, state: "closed", merged: true, merged_at: "2026-11-06T09:50:16Z", merge_commit_sha: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", base: { repo: pub } });
+        case "/repos/AMD-AGI/PrimusClaw/pulls/578": return json({ number: 578, state: "open", draft: false, base: { repo: pub } });
+        case "/repos/AMD-AGI/PrimusClaw/pulls/99999": return json({ message: "Not Found" }, 404);
+        case "/repos/AMD-AGI/PrimusClaw": return json({ full_name: "AMD-AGI/PrimusClaw", private: false });
+        // A repository the App's installation can see but that is private: its metadata reads, nothing of it is answered.
+        case "/repos/Org/Internal/pulls/292": return json({ number: 292, state: "closed", merged: true, merged_at: "2026-11-06T09:50:16Z", base: { repo: { private: true } } });
+        case "/repos/Org/Internal/pulls/9999": return json({ message: "Not Found" }, 404);
+        case "/repos/Org/Internal": return json({ full_name: "Org/Internal", private: true });
+        case "/repos/Org/Unsaid/pulls/1": return json({ number: 1, state: "open", base: { repo: {} } });
+        case "/repos/Org/Expired/pulls/1": return json({ message: "Bad credentials" }, 401);
+        default: return json({ message: "boom" }, 502);
+      }
+    }) as typeof fetch;
+    let made = 0;
+    const dropped: string[] = [];
+    const app = { token: async () => { made++; return APP; }, drop: (t: string) => { dropped.push(t); } };
+    const settings = (over: Row = {}) => () => ({ enabled: true, binding: false, secret: "s".repeat(40), mcpUrl: "http://api.test/mcp", apiUrl: API, ...over }) as never;
+    const db = { query: async (text: string) => { if (/FROM claw_user_env_vars/.test(text)) return { rows: [] }; throw new Error(`unexpected query: ${text}`); } };
+    const deps = { db: db as never, fetchImpl, settings: settings(), publicRead: app };
+    const ref = (repo: string, number: number) => ({ owner: repo.split("/")[0]!, repo: repo.split("/")[1]!, number });
+    const states = await pullStates("u-alice", "sess-1", [ref("AMD-AGI/PrimusClaw", 306), ref("AMD-AGI/PrimusClaw", 578), ref("AMD-AGI/PrimusClaw", 99999),
+      ref("Org/Internal", 292), ref("Org/Internal", 9999), ref("Org/Unsaid", 1)], deps);
+    assert.deepEqual(states, [
+      { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+      { pr: "AMD-AGI/PrimusClaw#578", state: "open", draft: false },
+      { pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" },
+      { pr: "Org/Internal#292", state: "unknown", reason: "read_failed" },
+      { pr: "Org/Internal#9999", state: "unknown", reason: "read_failed" },
+      { pr: "Org/Unsaid#1", state: "unknown", reason: "read_failed" },
+    ]);
+    assert.ok(log.every((l) => l.startsWith("APP ")), `every read with the App's token: ${log.join(", ")}`);
+    assert.equal(made, 1, "one token for the whole check");
+    // GitHub no longer takes the token: it is dropped, so the next check makes another.
+    assert.equal((await pullStates("u-alice", "sess-1", [ref("Org/Expired", 1)], deps))[0]!.state, "unknown");
+    assert.deepEqual(dropped, [APP]);
+    // No token can be made: read as anyone, as before the App.
+    log.length = 0;
+    const broken = { token: async () => { throw Object.assign(new Error("GitHub answered 500"), { status: 500 }); }, drop: () => undefined };
+    assert.equal((await pullStates("u-alice", "sess-1", [ref("AMD-AGI/PrimusClaw", 578)], { ...deps, publicRead: broken }))[0]!.state, "open");
+    assert.deepEqual(log, ["ANON /repos/AMD-AGI/PrimusClaw/pulls/578"]);
+    // A person with GitHub here is read for as themselves: the App is never asked.
+    made = 0;
+    const bound = world();
+    await pullStates("u-alice", "sess-1", prs.slice(0, 1), { ...bound.deps, publicRead: app });
+    assert.equal(made, 0);
   });
 });

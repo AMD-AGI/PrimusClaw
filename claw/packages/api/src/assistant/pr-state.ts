@@ -14,12 +14,16 @@
  *
  * Read with the person's own GitHub (their `GH_TOKEN`, else the account they bound, as the router's GitHub reads are), and a read with
  * a binding is written to GitHub review's audit log first, as every such read is (`github-mcp/mcp.ts`). A person with no GitHub here
- * is read for as anyone on the internet is: only a public repository answers. Best effort: a read that fails, or an audit row that
- * cannot be written, is `unknown` and leaves the request as it was before this check, never refused for it.
+ * is read for as anyone on the internet is: only a public repository answers. With no credential GitHub allows 60 such reads an hour
+ * for the deployment's whole address, and they ran out (parity 2026-11-09: G3 and H2 read nothing, `pr_state_read_failed status=403`),
+ * so a deployment with a read-only App of its own (`github-mcp/public-read.ts`) reads them with its token instead: it asks only for
+ * `metadata: read`, and what it reads is answered only when GitHub says the repository is public. Best effort: a read that fails, or an
+ * audit row that cannot be written, is `unknown` and leaves the request as it was before this check, never refused for it.
  */
 import pino from "pino";
 import { db as defaultDb } from "../infra/db.js";
 import { resolveGithubToken, type ResolveBinding } from "../github-mcp/mcp.js";
+import { publicReadTokens } from "../github-mcp/public-read.js";
 import { readGithubMcpSettings, type GithubMcpSettings } from "../github-mcp/settings.js";
 import { GithubClient, repoPath, type PrRef } from "../github-review/github.js";
 import { auditFinish, auditStart, GITHUB_MCP_AUDIT_TOOL_PREFIX, type Queryable } from "../github-review/store.js";
@@ -64,7 +68,12 @@ export interface PrStateDeps {
   settings?: () => GithubMcpSettings;
   resolveBinding?: ResolveBinding;
   fetchImpl?: typeof fetch;
+  /** The deployment's read-only App for a person with no GitHub here (`publicReadTokens` by default); null reads anonymously. */
+  publicRead?: { token(): Promise<string>; drop(token: string): void } | null;
 }
+
+/** Whether GitHub says, of a repository or a pull request's base repository, that it is public: `private` is false, nothing else. */
+const isPublic = (repo: unknown): boolean => Boolean(repo && typeof repo === "object" && (repo as { private?: unknown }).private === false);
 
 const nameOf = (p: PrRef): string => `${p.owner}/${p.repo}#${p.number}`;
 /** A GitHub timestamp (`2026-11-06T09:50:16Z`), or null: nothing else is passed on as a time. */
@@ -113,10 +122,23 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   let read: (path: string) => Promise<Record<string, any>>;
   let gh: GithubClient | null = null;
   let audit: { id: number } | null = null;
+  // Read with the deployment's App: only what GitHub says is public is answered, whatever else its installation could reach.
+  let appToken: string | null = null;
+  const publicRead = deps.publicRead !== undefined ? deps.publicRead : publicReadTokens(s.apiUrl);
   try {
     const cred = await resolveGithubToken(q, userId, { binding: s.binding, purpose: `github_mcp:${PR_STATE_TOOL}`, resolve: deps.resolveBinding });
     if (cred.token === null) {
       read = anonymousReader(s.apiUrl, deps.fetchImpl ?? fetch);
+      if (publicRead) {
+        try {
+          const token = await publicRead.token();
+          const client = new GithubClient({ token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
+          read = async (path) => (await client.get<Record<string, any>>(path)).json;
+          appToken = token;
+        } catch (err) {   // (no token now: read as anyone, as without the App)
+          logger.warn({ sessionId, errorClass: (err as Error)?.constructor?.name, status: (err as { status?: number })?.status }, "assistant.pr_state_public_read_unavailable");
+        }
+      }
     } else {
       const client = new GithubClient({ token: cred.token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
       gh = client;
@@ -144,7 +166,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
     const key = `${p.owner}/${p.repo}`.toLowerCase();
     let seen = repoSeen.get(key);
     if (!seen) {
-      seen = read(repoPath(p)).then((r) => Boolean(r && typeof r === "object"), () => false);
+      seen = read(repoPath(p)).then((r) => (appToken ? isPublic(r) : Boolean(r && typeof r === "object")), () => false);
       repoSeen.set(key, seen);
     }
     return seen;
@@ -152,9 +174,12 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   for (let i = 0; i < prs.length; i += READ_PARALLEL) {
     states.push(...await Promise.all(prs.slice(i, i + READ_PARALLEL).map(async (p): Promise<PullState> => {
       try {
-        return stateOf(p, await read(repoPath(p, `/pulls/${p.number}`)));
+        const pr = await read(repoPath(p, `/pulls/${p.number}`));
+        if (appToken && !isPublic(pr?.base?.repo)) throw Object.assign(new Error("not a public repository"), { status: 0 });
+        return stateOf(p, pr);
       } catch (err) {
         const status = (err as { status?: number })?.status;
+        if (status === 401 && appToken && publicRead) publicRead.drop(appToken);
         if (status === 404 && await repoReadable(p)) return { pr: nameOf(p), state: "not_found" };
         failed++;
         logger.warn({ sessionId, pr: nameOf(p), status }, "assistant.pr_state_read_failed");
