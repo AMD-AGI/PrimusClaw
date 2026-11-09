@@ -140,9 +140,10 @@ test("the group hears when the reviewer chose fully automatic", async () => {
     lang: () => "zh",
   });
   const [turn] = world.started;
-  assert.ok(turn?.review.ack.includes("Bob 已设为全自动合入"), turn?.review.ack);
+  assert.ok(turn !== undefined);
+  assert.ok(turn.review.ack.includes("Bob 已设为全自动合入"), turn.review.ack);
   const line = turn.turn.onGithubResult(["gh_pr_merge", "merged", ""], "m");
-  assert.ok(line?.includes("按 Bob 的全自动设置，无需人工确认"), line);
+  assert.ok(line?.includes("按 Bob 的全自动设置，无需人工确认"), String(line));
 });
 
 test("the review prompt asks the model to say a write was made under the fully automatic setting", async () => {

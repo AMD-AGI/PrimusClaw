@@ -109,14 +109,14 @@ test("only the reviewer can answer, and allowing merges as them and tells the gr
   const others = await press(world, "allow", ALICE);
   assert.ok(others[0]?.includes("Only the person this was asked of can answer it."));
   const settled = await press(world, "allow");
-  assert.ok(settled[0]?.includes("Merged AMD-AGI/Hyperloom#12 (01234567)."), settled[0]);
+  assert.ok(settled[0]?.includes("Merged AMD-AGI/Hyperloom#12 (01234567)."), String(settled[0]));
   assert.deepEqual(
     world.claw.calls.find((c) => c[0] === "decide"),
     ["decide", "tok-aad-b", "conf-1", "allow"],
   );
   assert.ok(saidIn(world.surface, CONV).includes("Bob 已确认，AMD-AGI/Hyperloom#12 已合入（01234567）。"));
   const again = await press(world, "allow");
-  assert.ok(again[0]?.includes("already answered"), again[0]);
+  assert.ok(again[0]?.includes("already answered"), String(again[0]));
 });
 
 test("a typed answer decides as a press does", async () => {
