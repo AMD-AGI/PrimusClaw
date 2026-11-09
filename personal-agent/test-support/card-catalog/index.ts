@@ -7,12 +7,13 @@
  */
 import { APPROVAL_CARDS } from "./approval.js";
 import type { CatalogEntry } from "./catalog.js";
+import { COMMAND_CARDS } from "./commands.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS];
+export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...COMMAND_CARDS];
 
 const BY_LINE = {
-  W4: ["binding", "link", "onboarding", "repo"],
-  W4b: ["changes", "error_note", "inactive_note", "session", "show_here_note"],
+  W4: [],
+  W4b: ["changes", "error_note", "inactive_note", "show_here_note"],
   W5: [
     "answered",
     "approval_decided",

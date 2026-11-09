@@ -6,12 +6,9 @@
  * state, no I/O. What each command does is in `routing/`.
  */
 import { decimalInt, isUpper, pyLower, pySplit, pyStrip, splitOnce, squashSpaces } from "../text/py-text.js";
+import { CODE_ALPHABET, CODE_LENGTH } from "../ports/store/policy.js";
 import { pyFullmatch } from "../text/py-regex.js";
 import { isCommand, type Command } from "./names.js";
-
-/** The letters a link code is made of (no 0/O/1/I) and its length: the store's generator and this reader agree on them. */
-export const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-export const CODE_LENGTH = 8;
 
 /** The command name if `text` is exactly a known command, else null. */
 export function parseCommand(text: string): Command | null {
