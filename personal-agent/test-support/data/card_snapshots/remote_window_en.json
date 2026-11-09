@@ -1,146 +1,146 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "actions": [
-          {
-            "data": {
-              "op": "send",
-              "primusclaw": "remote",
-              "session_id": "rs-1"
-            },
-            "style": "positive",
-            "title": "Send",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_send"
-          },
-          {
-            "data": {
-              "op": "stop",
-              "primusclaw": "remote",
-              "session_id": "rs-1"
-            },
-            "title": "Stop",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_stop"
-          },
-          {
-            "data": {
-              "op": "detach",
-              "primusclaw": "remote",
-              "session_id": "rs-1"
-            },
-            "title": "Back to assistant",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_detach"
-          },
-          {
-            "data": {
-              "op": "switch",
-              "primusclaw": "remote",
-              "session_id": "rs-1"
-            },
-            "title": "Switch",
-            "type": "Action.Execute",
-            "verb": "primusclaw.remote_switch"
-          }
-        ],
-        "body": [
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "color": "Accent",
-                    "size": "Large",
-                    "text": "┃",
-                    "type": "TextBlock",
-                    "weight": "Bolder"
-                  }
-                ],
-                "spacing": "None",
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "size": "Medium",
-                    "text": "🔌 Session window · robin-dev · Codex",
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "type": "ColumnSet"
-          },
-          {
-            "isSubtle": true,
-            "size": "Small",
-            "spacing": "None",
-            "text": "/root/ws/active",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "spacing": "Small",
-            "text": "Status: the terminal is busy; your message waits (a turn is running in the terminal)",
-            "type": "TextBlock",
-            "weight": "Bolder",
-            "wrap": true
-          },
-          {
-            "id": "window_tail",
-            "items": [
-              {
-                "fontType": "Monospace",
-                "size": "Small",
-                "spacing": "None",
-                "text": "Done: the build is green.",
-                "type": "TextBlock",
-                "wrap": true
-              }
-            ],
-            "spacing": "Small",
-            "style": "emphasis",
-            "type": "Container"
-          },
-          {
-            "id": "window_text",
-            "isMultiline": true,
-            "maxLength": 4000,
-            "placeholder": "A message for this session…",
-            "spacing": "Medium",
-            "type": "Input.Text"
-          },
-          {
-            "isSubtle": true,
-            "size": "Small",
-            "text": "What you type in the chat box goes to Clawy; to write to this session use the box on this card, or reply quoting this card. To send the chat box to the session instead: /agent mode chat",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "isSubtle": true,
-            "size": "Small",
-            "spacing": "None",
-            "text": "Updated 08:00:00Z",
-            "type": "TextBlock",
-            "wrap": true
-          }
-        ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "op": "send",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
       },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+      "style": "positive",
+      "title": "Send",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_send"
+     },
+     {
+      "data": {
+       "op": "stop",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "Stop",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_stop"
+     },
+     {
+      "data": {
+       "op": "detach",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "Back to assistant",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_detach"
+     },
+     {
+      "data": {
+       "op": "switch",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "Switch",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_switch"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔌 Session window · robin-dev · Codex",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "/root/ws/active",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "spacing": "Small",
+      "text": "Status: the terminal is busy; your message waits (a turn is running in the terminal)",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "id": "window_tail",
+      "items": [
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "Done: the build is green.",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "Small",
+      "style": "emphasis",
+      "type": "Container"
+     },
+     {
+      "id": "window_text",
+      "isMultiline": true,
+      "maxLength": 4000,
+      "placeholder": "A message for this session…",
+      "spacing": "Medium",
+      "type": "Input.Text"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "What you type in the chat box goes to Clawy; to write to this session use the box on this card, or reply quoting this card. To send the chat box to the session instead: /agent mode chat",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "Updated 08:00:00Z",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }

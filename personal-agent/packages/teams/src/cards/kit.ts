@@ -21,9 +21,7 @@
 import { clip, unbroken, zh } from "./cjk.js";
 import type { CardElement, Json, JsonObject } from "./json.js";
 import { walk } from "./json.js";
-import { pyStrip } from "@primusclaw/personal-agent";
-
-import { pyStr } from "../text/py-extra.js";
+import { pyStr, pyStrip } from "@primusclaw/personal-agent";
 
 export const CARD_VERSION = "1.5";
 export const SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json";

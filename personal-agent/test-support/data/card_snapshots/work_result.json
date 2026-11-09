@@ -1,92 +1,92 @@
 {
-  "attachments": [
-    {
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "actions": [
-          {
-            "data": {
-              "card": "card-2",
-              "op": "accept",
-              "primusclaw": "work"
-            },
-            "style": "positive",
-            "title": "接受 v2",
-            "type": "Action.Execute",
-            "verb": "primusclaw.work_accept"
-          },
-          {
-            "data": {
-              "card": "card-2",
-              "op": "stop",
-              "primusclaw": "work"
-            },
-            "title": "停止",
-            "type": "Action.Execute",
-            "verb": "primusclaw.work_stop"
-          }
-        ],
-        "body": [
-          {
-            "columns": [
-              {
-                "items": [
-                  {
-                    "color": "Warning",
-                    "size": "Large",
-                    "text": "┃",
-                    "type": "TextBlock",
-                    "weight": "Bolder"
-                  }
-                ],
-                "spacing": "None",
-                "type": "Column",
-                "width": "auto"
-              },
-              {
-                "items": [
-                  {
-                    "size": "Medium",
-                    "text": "⚠️ #12 审 AMD-AGI/Primus-SaFE#481",
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "wrap": true
-                  },
-                  {
-                    "isSubtle": true,
-                    "size": "Small",
-                    "spacing": "None",
-                    "text": "结果 v2 等你确认",
-                    "type": "TextBlock",
-                    "wrap": true
-                  }
-                ],
-                "spacing": "Small",
-                "type": "Column",
-                "verticalContentAlignment": "Center",
-                "width": "stretch"
-              }
-            ],
-            "type": "ColumnSet"
-          },
-          {
-            "text": "审完了：一处需要改（凭据轮换没有加锁），其余没有问题。\n\n要我按这个结论在 GitHub 上提交 review 吗？",
-            "type": "TextBlock",
-            "wrap": true
-          },
-          {
-            "isSubtle": true,
-            "size": "Small",
-            "text": "在这里回复即可要求修改。",
-            "type": "TextBlock",
-            "wrap": true
-          }
-        ],
-        "type": "AdaptiveCard",
-        "version": "1.5"
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-2",
+       "op": "accept",
+       "primusclaw": "work"
       },
-      "contentType": "application/vnd.microsoft.card.adaptive"
-    }
-  ],
-  "type": "message"
+      "style": "positive",
+      "title": "接受 v2",
+      "type": "Action.Execute",
+      "verb": "primusclaw.work_accept"
+     },
+     {
+      "data": {
+       "card": "card-2",
+       "op": "stop",
+       "primusclaw": "work"
+      },
+      "title": "停止",
+      "type": "Action.Execute",
+      "verb": "primusclaw.work_stop"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Warning",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "⚠️ #12 审 AMD-AGI/Primus-SaFE#481",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "结果 v2 等你确认",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "审完了：一处需要改（凭据轮换没有加锁），其余没有问题。\n\n要我按这个结论在 GitHub 上提交 review 吗？",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "在这里回复即可要求修改。",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
 }
