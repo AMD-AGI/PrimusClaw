@@ -7,6 +7,7 @@ import type { PullRef } from "../claw/model.js";
 import { pyRegExp } from "../text/py-regex.js";
 
 export { MARK_CLOSE, MARK_OPEN } from "./markers.js";
+import { decimalInt } from "../text/py-text.js";
 
 export type PullKey = string;
 
@@ -50,10 +51,10 @@ export function samePull(a: PullRef, b: PullRef): boolean {
 }
 
 export const PR_URL_SOURCE =
-  "https?://github\\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,7})(?![0-9])";
+  "https?://github\\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/pull/(\\p{Nd}{1,7})(?!\\p{Nd})";
 // (an ASCII lookbehind: "合入AMD-AGI/x#1" or "，AMD-AGI/x#1" with no space between is still one)
 export const PR_SHORT_SOURCE =
-  "(?<![A-Za-z0-9_/.-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})#([0-9]{1,7})(?![0-9])";
+  "(?<![A-Za-z0-9_/.-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})#(\\p{Nd}{1,7})(?!\\p{Nd})";
 
 export function prUrlPattern(): RegExp {
   return pyRegExp(PR_URL_SOURCE, "gi");
@@ -81,7 +82,7 @@ export function pullsIn(text: string): PullRef[] {
   hits.sort((a, b) => a.at - b.at || compareTuple(a, b));
   const found: PullRef[] = [];
   for (const hit of hits) {
-    const ref = pullRef(hit.owner, withoutGit(hit.repo), Number(hit.number));
+    const ref = pullRef(hit.owner, withoutGit(hit.repo), decimalInt(hit.number));
     if (found.every((r) => !samePull(r, ref))) found.push(ref);
   }
   return found;

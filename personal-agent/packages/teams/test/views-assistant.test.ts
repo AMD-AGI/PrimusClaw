@@ -10,15 +10,12 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
-  INLINE_IMAGE_MAX_BYTES,
   cpLength,
   WORK_TEXT_MAX,
   ago,
   askedLine,
-  assistantDeliveries,
   boardLine,
   cardParagraphs,
-  deliveryOf,
   fitsWorkCard,
   retryable,
   workEventText,
@@ -63,69 +60,6 @@ function texts(node: unknown): string[] {
 
 const body = (card: JsonObject) => card["body"] as JsonObject[];
 const actions = (card: JsonObject) => (card["actions"] ?? []) as JsonObject[];
-
-// --- deliveries --------------------------------------------------------------------------------------------------------------
-
-const ID = "0f8fad5b-d9cb-469f-a165-70867728950e";
-const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300)]);
-const B64 = PNG.toString("base64");
-const GOOD = { id: ID, name: "report.xlsx", size: 10, content_type: "application/vnd.ms-excel", caption: "Q3" };
-
-test("the files of an assistant message are each read like a delivery, with their session, at most five", () => {
-  const file = (n: number, extra: Record<string, unknown> = {}) => ({ ...GOOD, session_id: `s${String(n)}`, ...extra });
-  const got = assistantDeliveries({
-    files: [
-      file(1),
-      "x",
-      file(2, { session_id: " " }),
-      file(3, { id: "bad" }),
-      file(4, { session_id: 4 }),
-      file(5),
-      file(6),
-      file(7),
-      file(8),
-      file(9),
-    ],
-  });
-  assert.deepEqual(
-    got.map((g) => g.sessionId),
-    ["s1", "s5", "s6", "s7", "s8"],
-  );
-  assert.deepEqual(got[0]?.delivery, {
-    id: ID,
-    name: "report.xlsx",
-    size: 10,
-    contentType: "application/vnd.ms-excel",
-    caption: "Q3",
-    image: "",
-  });
-  assert.deepEqual(assistantDeliveries({ files: "nope" }), []);
-  assert.equal(deliveryOf("deliver_file", "start", { delivery: GOOD }), null, "only a delivery that succeeded");
-  assert.equal(deliveryOf("deliver_file", "success", { delivery: [GOOD] }), null);
-});
-
-test("a file of an assistant message keeps its small image only when it is exactly the image it says it is", () => {
-  const image = (raw: Record<string, unknown>) =>
-    assistantDeliveries({
-      files: [{ id: ID, name: "c.png", size: PNG.length, content_type: " Image/PNG ", session_id: "s1", ...raw }],
-    })[0]?.delivery.image;
-  assert.equal(image({ data_base64: B64 }), `data:image/png;base64,${B64}`);
-  assert.equal(image({}), "");
-  assert.equal(image({ data_base64: `!!!${B64}` }), "");
-  assert.equal(image({ data_base64: PNG.subarray(0, -1).toString("base64") }), "");
-  assert.equal(image({ content_type: "image/svg+xml", data_base64: B64 }), "");
-  const big = Buffer.alloc(INLINE_IMAGE_MAX_BYTES + 1, "x");
-  assert.equal(image({ size: big.length, data_base64: big.toString("base64") }), "");
-  for (const bytes of [[1], [1, 2]]) {
-    const data = Buffer.from(bytes).toString("base64"); // ("AQ==", "AQI=": either padding)
-    assert.equal(
-      image({ size: bytes.length, content_type: "image/gif", data_base64: data }),
-      `data:image/gif;base64,${data}`,
-    );
-  }
-  const typeless = assistantDeliveries({ files: [{ id: ID, name: "a", size: 0, session_id: "s1", caption: 7 }] })[0];
-  assert.deepEqual([typeless?.delivery.contentType, typeless?.delivery.caption], ["application/octet-stream", "7"]);
-});
 
 // --- the work cards and the board -----------------------------------------------------------------------------------------------
 

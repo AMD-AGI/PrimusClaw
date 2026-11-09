@@ -9,7 +9,7 @@
 import { refreshAutoReply } from "../assistant/auto-reply.js";
 import { remoteNoticeOf, type RemoteNotice } from "../assistant/events.js";
 import { parseWorkItem } from "../assistant/item-of.js";
-import { assistantDeliveries } from "../assistant/deliveries.js";
+import { assistantDeliveries } from "../turn/deliveries.js";
 import { messageWords } from "../assistant/receipt.js";
 import { workEventText } from "../assistant/work-items.js";
 import { QUESTION_TOOL } from "../approvals/questions.js";
