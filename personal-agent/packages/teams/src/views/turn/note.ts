@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { NoteModel, NoteTone, ViewButton } from "@primusclaw/personal-agent";
+import type { NoteButton, NoteModel, NoteTone } from "@primusclaw/personal-agent";
 
 import type { CardElement, JsonObject } from "../../cards/json.js";
 import { execute, header, message, openUrl, text, type Meaning } from "../../cards/kit.js";
@@ -14,7 +14,7 @@ const MEANING: Readonly<Partial<Record<NoteTone, Meaning>>> = {
 };
 
 /** A view's button as a card action. */
-export function action(button: ViewButton): CardElement {
+export function action(button: NoteButton): CardElement {
   // (the click data is core's read-only JSON; the card holds its own copy)
   const built =
     "url" in button

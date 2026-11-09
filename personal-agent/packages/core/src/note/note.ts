@@ -7,16 +7,10 @@
  * button" message (render.py's note_card). Every line uses this view for that shape.
  */
 
-import type { JsonObject } from "../json.js";
-import type { OutMessage } from "../ports/surface.js";
+import type { OutMessage, ViewButton } from "../ports/surface.js";
 
-/**
- * A button of a view: one that sends its `verb` and `data` back to the worker (the worker's own click protocol), or one
- * that opens `url`. `style` marks the primary (or a destructive) choice. INTERIM here until W0-b adds it to the ports.
- */
-export type ViewButton =
-  | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
-  | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
+/** A view's button, marked as the primary (or a destructive) choice when it is one. INTERIM: `style` until W0-b has it. */
+export type NoteButton = ViewButton & { readonly style?: ButtonStyle };
 
 export type ButtonStyle = "positive" | "destructive";
 
@@ -28,7 +22,7 @@ export interface NoteModel {
   /** A headline over the note (none: the note alone). */
   readonly title?: string;
   readonly tone?: NoteTone;
-  readonly buttons?: readonly ViewButton[];
+  readonly buttons?: readonly NoteButton[];
 }
 
 declare module "../ports/surface.js" {
