@@ -275,16 +275,31 @@ test("an option kind that names a property of every object is an unknown kind", 
   for (const kind of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
     assert.equal(remoteView.buttonTitle({ optionId: "odd-id", name: "", kind }), "odd-id", kind);
     assert.equal(remoteView.decidedVerdict({ optionId: "odd-id", name: "Later", kind }), "Later", kind);
-    const options = remoteView.parseOptions([
-      { optionId: "x", name: "X", kind },
-      { optionId: "r", name: "Reject", kind: "reject_once" },
-      { optionId: "y", name: "Y", kind },
-      { optionId: "a", name: "Allow", kind: "allow_once" },
-    ]);
-    assert.deepEqual(
-      remoteView.optionButtons(options, "s", "a").map((b) => b.optionId),
-      ["a", "r", "x", "y"],
-      kind,
+  }
+});
+
+test("an option kind that names a property of every object sorts as an unknown kind", () => {
+  // Python: sorted(options, key=lambda o: _KIND_RANK.get(o["kind"], 4)): known kinds by rank, every other kind after them in
+  // the order the agent sent
+  const cases: [string[], string[]][] = [
+    [
+      ["constructor", "reject_once", "__proto__", "allow_once"],
+      ["allow_once", "reject_once", "constructor", "__proto__"],
+    ],
+    [
+      ["__proto__", "allow_always", "constructor", "reject_always", "allow_once"],
+      ["allow_once", "allow_always", "reject_always", "__proto__"],
+    ],
+    [
+      ["toString", "valueOf", "reject_once", "constructor", "allow_always", "__proto__", "allow_once"],
+      ["allow_once", "allow_always", "reject_once", "toString"],
+    ],
+  ];
+  for (const [kinds, expected] of cases) {
+    const options = remoteView.parseOptions(
+      kinds.map((kind, i) => ({ optionId: `${kind}-${String(i)}`, name: kind, kind })),
     );
+    const shown = remoteView.optionButtons(options, "s", "a").map((b) => b.optionId.replace(/-\d+$/, ""));
+    assert.deepEqual(shown, expected, kinds.join(","));
   }
 });
