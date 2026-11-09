@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { err } from "../../src/index.js";
 import { ALICE, reviewWorld, saidIn, type ReviewWorld } from "../../../../test-support/review-world.js";
 
 const DM = `personal:${ALICE.id}`;
@@ -119,4 +120,27 @@ test("unbind with nothing connected says so", async () => {
   world.identity.know("aad-a", "u-alice", null);
   await command(world, "unbind");
   assert.ok(said(world).includes("No GitHub account was connected."), said(world));
+});
+
+test("a status read while the identity service cannot exchange a token says what could not be asked", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-a", "u-alice", "alice-gh");
+  const exchange = world.deps.exchange as { tokenFor: ReviewWorld["deps"]["exchange"]["tokenFor"] };
+  exchange.tokenFor = () => Promise.resolve(err({ kind: "exchange_failed" as const, reason: "down" }));
+  await command(world, "status");
+  const text = said(world);
+  assert.ok(text.includes("not known just now (PrimusClaw did not answer)"), text);
+  assert.ok(text.includes("Whether Clawy reads your GitHub with it: PrimusClaw could not be asked just now"), text);
+});
+
+test("a choice that cannot be written for want of a token is said as not saved", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-a", "u-alice");
+  world.github.script = [];
+  await command(world, "bind");
+  const exchange = world.deps.exchange as { tokenFor: ReviewWorld["deps"]["exchange"]["tokenFor"] };
+  exchange.tokenFor = () => Promise.resolve(err({ kind: "exchange_unavailable" as const }));
+  world.github.script = ["ok"];
+  await waitForBinding(world);
+  assert.ok(said(world).includes("could not save your choice"), said(world));
 });
