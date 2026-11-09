@@ -8,7 +8,7 @@
  */
 import pino from "pino";
 import {
-  activeAbort, gracefulStopRemainingMs, resolveAbortTargets, resolveSessionEndTargets, SIGTERM_ABORT_REASON,
+  activeAbort, clearActiveAbort, gracefulStopRemainingMs, resolveAbortTargets, resolveSessionEndTargets, SIGTERM_ABORT_REASON,
 } from "./abort-registry.js";
 import { cutDrainedCalls } from "../agent/drain-shield.js";
 import { releaseTaskLock } from "./lock.js";
@@ -34,7 +34,7 @@ export function interruptRunsAt(address: string, forceReleaseAfterMs = 30_000): 
       const left = gracefulStopRemainingMs(ctrl);
       if (left > 0) { setTimeout(forceRelease, left).unref(); return; }
       logger.error({ address, lockKey }, "task.interrupt_force_release");
-      activeAbort.delete(lockKey);
+      clearActiveAbort(lockKey, ctrl);
       releaseTaskLock(lockKey, ctrl).catch(() => {});
     };
     setTimeout(forceRelease, forceReleaseAfterMs).unref();

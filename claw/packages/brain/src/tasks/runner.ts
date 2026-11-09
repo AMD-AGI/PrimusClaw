@@ -91,7 +91,7 @@ import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
+  clearActiveAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
 import { transientNatsErrorIn } from "../infra/nats-transient.js";
@@ -908,7 +908,7 @@ async function replayPendingCallback(
   } catch (err) {
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_lookup_failed");
     msg.nak(5_000);
-    activeAbort.delete(lockKey);
+    clearActiveAbort(lockKey, run);
     await fx().releaseTaskLock(lockKey, run).catch(() => {});
     return true;
   }
@@ -948,7 +948,7 @@ async function replayPendingCallback(
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_failed");
     msg.nak(5_000);
   } finally {
-    activeAbort.delete(lockKey);
+    clearActiveAbort(lockKey, run);
     await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
   return true;
@@ -1028,7 +1028,7 @@ async function maybeRunSandboxlessTask(
   } finally {
     // Drop the in-process abort handle and release the per-task lock so
     // the next DAG step (or unrelated task) can be picked up immediately.
-    activeAbort.delete(lockKey);
+    clearActiveAbort(lockKey, abortCtrl);
     await fx().releaseTaskLock(lockKey, abortCtrl).catch(() => {});
   }
   return true;
@@ -1103,7 +1103,7 @@ async function refuseBeforeRun(
       throw err;
     }
   } finally {
-    activeAbort.delete(lockKey);
+    clearActiveAbort(lockKey, run);
     await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
 }
@@ -5155,7 +5155,7 @@ class TaskRunner {
     if (this.selfFence) clearInterval(this.selfFence);
     if (leaseTimer) clearInterval(leaseTimer);
     endRun(this.runIdentity.key);
-    activeAbort.delete(this.lockKey);
+    clearActiveAbort(this.lockKey, this.abortCtrl);
     await fx().releaseTaskLock(this.lockKey, this.abortCtrl);
     await this.hands?.close().catch(() => {});
   }
