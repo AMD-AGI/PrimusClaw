@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cli = ["click>=8.4.2"]
-dev = ["pytest>=9.1.1", "pytest-asyncio", "click>=8.4.2"]
+dev = ["pytest>=9.2.0", "pytest-asyncio", "click>=8.4.2"]
 
 [project.scripts]
 sandbox-cli = "sandbox_cli.main:main"
