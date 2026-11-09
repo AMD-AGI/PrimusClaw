@@ -127,7 +127,7 @@ export async function fetchChanges(
 ): Promise<Changes | undefined> {
   let reply: unknown;
   try {
-    reply = await claw.sessionChanges(key, sessionId, CHANGES_TIMEOUT_SECONDS);
+    reply = await claw.changes(key, sessionId, CHANGES_TIMEOUT_SECONDS * 1000);
   } catch (err) {
     // 409 sandbox_not_running and 404 are the contract's ordinary answers; anything else is worth a line in the log
     if (err instanceof ClawError && (err.status === 404 || err.status === 409)) {

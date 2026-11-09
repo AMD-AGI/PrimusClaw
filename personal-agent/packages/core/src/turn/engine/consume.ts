@@ -153,8 +153,7 @@ type Read = "finished-ok" | "finished-error" | "again" | "dropped";
 async function readOnce(ctx: TurnContext, args: ConsumeArgs, cursor: Cursor, told: { n: number }): Promise<Read> {
   const { sessionId, state, status, signal } = args;
   const after = cursor.legacy ? undefined : cursor.lastId || cursor.start;
-  const options = { ...(after === undefined ? {} : { after }), ...(signal ? { signal } : {}) };
-  const events: AsyncIterable<SseEvent> = ctx.deps.claw.stream(await credential(ctx), sessionId, options);
+  const events: AsyncIterable<SseEvent> = ctx.deps.claw.stream(await credential(ctx), sessionId, after, signal);
   for await (const event of events) {
     signal?.throwIfAborted();
     if (event.name === HISTORY_COMPLETE && !cursor.known) {

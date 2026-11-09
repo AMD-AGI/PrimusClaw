@@ -16,7 +16,7 @@ import { plainMessage } from "../progress/answer-messages.js";
 import { StatusMessage } from "../progress/status-message.js";
 import { detach, Task } from "../task.js";
 import { TurnState } from "../turn-state.js";
-import { ClawError, ClawUnreachable, errorKind, splitErrorTail, withhold } from "../upstream.js";
+import { ClawError, ClawUnreachable, errorKind, splitErrorTail } from "../upstream.js";
 import { consume, noteRunning, StreamKeptDropping } from "./consume.js";
 import { langOf, type TurnContext } from "./context.js";
 import { offerChanges, offerDeliveries, offerReport, offerThumbs } from "./extras.js";
@@ -166,7 +166,7 @@ class TurnRun {
     if (ok && !state.failed) return [state.answer, ok];
     const [answer, error] = splitErrorTail(state.answer);
     if (error || !ok) {
-      const ref = withhold("turn_failed", error, { session: this.sessionId, message: state.messageId });
+      const ref = this.ctx.deps.errors.withhold("turn_failed", error, { session: this.sessionId, message: state.messageId });
       this.ctx.deps.log.info("the user is told the task failed", { ref });
     }
     return [answer, error ? false : ok]; // (told as the failure it is: no thumbs, the Report a problem card)
@@ -255,7 +255,7 @@ class TurnRun {
     this.tell("failed");
     const review = Boolean(ctx.request.actingAs);
     ctx.record.refusal = review && err.status === 401 ? err : undefined;
-    await this.status.finish([resultLead(ctx, this.state) + clawFailure(err, review)]);
+    await this.status.finish([resultLead(ctx, this.state) + clawFailure(ctx.deps.errors, err, review)]);
     await offerReport(ctx);
   }
 

@@ -11,59 +11,15 @@
  */
 
 import { clipWithEllipsis, collapseSpaces, pySlice, pyStrip } from "../text/python-str.js";
-import type { JsonObject } from "./json.js";
 
 // --- Claw (W2) -------------------------------------------------------------------------------------------------------
 
-/** One event of a session's stream. */
-export interface SseEvent {
-  readonly id: string;
-  readonly name: string;
-  readonly data: JsonObject;
-}
+export { HISTORY_COMPLETE_EVENT as HISTORY_COMPLETE } from "../protocol.js";
+export { ClawAnswerInvalid, ClawError, ClawUnreachable, errorKind, ReplayRefused } from "../claw/errors.js";
+export type { SseEvent } from "../claw/model.js";
 
-/** The SSE frame that ends the replay of history. */
-export const HISTORY_COMPLETE = "historyComplete";
-/** The message id of a turn Claw runs from its queue. */
+/** The message id of a turn Claw runs from its queue (api tasks/chat-run.ts). */
 export const QUEUED_PREFIX = "claw-pending-";
-
-/** Claw answered with an error status; `code` is its plain error word ('' none). */
-export class ClawError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code = "",
-  ) {
-    super(code ? `HTTP ${String(status)} ${code}` : `HTTP ${String(status)}`);
-    this.name = "ClawError";
-  }
-}
-
-/** The request never got an answer (connection refused, reset, timed out): Python's httpx.HTTPError. */
-export class ClawUnreachable extends Error {
-  constructor(
-    readonly kind: string,
-    readonly connect = false,
-  ) {
-    super(kind);
-    this.name = "ClawUnreachable";
-  }
-}
-
-/** Claw answered with something that is not what its contract says (a body that is not JSON, a field of the wrong type). */
-export class ClawReplyInvalid extends Error {
-  constructor(what: string) {
-    super(what);
-    this.name = "ClawReplyInvalid";
-  }
-}
-
-/** What a log line says about a failed call: Claw's status (and error word), or only the kind of error. */
-export function errorKind(err: unknown): string {
-  if (err instanceof ClawError) return err.message;
-  if (err instanceof ClawUnreachable) return err.kind;
-  if (err instanceof ClawReplyInvalid) return err.name;
-  return err instanceof Error ? err.name : typeof err;
-}
 
 export const SERVICE_REFUSAL_REASONS: Readonly<Record<string, string>> = {
   service_client_not_allowed:
@@ -72,12 +28,13 @@ export const SERVICE_REFUSAL_REASONS: Readonly<Record<string, string>> = {
   only_the_acting_user_can_decide: "PrimusClaw says this answer is not yours to give.",
 };
 
-export function serviceRefusal(err: ClawError, undone: string): string {
-  const reason = SERVICE_REFUSAL_REASONS[err.code] ?? SERVICE_REFUSAL_REASONS["only_the_acting_user_can_decide"];
+/** The sentence for a refusal of Claw's: its reason (a word it does not name is the last one) and what was not done. */
+export function serviceRefusal(code: string, undone: string): string {
+  const reason = SERVICE_REFUSAL_REASONS[code] ?? SERVICE_REFUSAL_REASONS["only_the_acting_user_can_decide"];
   return `${reason ?? ""} ${undone}`;
 }
 
-const CJK = /[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿\u{20000}-\u{2fa1f}]/u;
+const CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\u{20000}-\u{2fa1f}]/u;
 const SUMMARY_MARKUP: Readonly<Record<string, string>> = { "[": "［", "]": "］", "<": "‹", ">": "›" };
 
 /** A review's sentence of what the pull request does, as shown (interim: without credential masking). */
@@ -90,17 +47,7 @@ export function clipPrSummary(value: unknown): string {
 
 // --- language (W5) ---------------------------------------------------------------------------------------------------
 
-export function hasCjk(text: unknown): boolean {
-  return CJK.test(typeof text === "string" ? text : "");
-}
-
-/** Chinese when the first text that has any letters has Chinese in it, else English. */
-export function pickLang(...texts: unknown[]): "en" | "zh" {
-  for (const text of texts) {
-    if (typeof text === "string" && pyStrip(text)) return hasCjk(text) ? "zh" : "en";
-  }
-  return "en";
-}
+export { hasCjk, pickLang } from "../language/detect.js";
 
 // --- step labels (W2) ------------------------------------------------------------------------------------------------
 
@@ -214,13 +161,3 @@ export function splitErrorTail(text: unknown): [string, string] {
   }
   return [text, ""];
 }
-
-/** A new reference id for the user's sentence (interim: W2's `withhold` also logs the detail under it). */
-export function withhold(where: string, detail: unknown = "", ids: Record<string, unknown> = {}): string {
-  const ref = globalThis.crypto.randomUUID().replaceAll("-", "").slice(0, 8);
-  WITHHELD.push({ ref, where, detail, ids });
-  return ref;
-}
-
-/** What `withhold` was given (interim, for tests: W2's logs it). */
-export const WITHHELD: Array<{ ref: string; where: string; detail: unknown; ids: Record<string, unknown> }> = [];

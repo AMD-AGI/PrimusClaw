@@ -40,14 +40,11 @@ export interface QuestionModel {
   readonly note: string;
 }
 
-/** The worker's own thumbs under a final answer. */
-export type ThumbsModel = Readonly<Record<string, never>>;
 
 declare module "../ports/surface.js" {
   interface ViewMap {
     approval: ApprovalModel;
     question: QuestionModel;
-    thumbs: ThumbsModel;
   }
 }
 

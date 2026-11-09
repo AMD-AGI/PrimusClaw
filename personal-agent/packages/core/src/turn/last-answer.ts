@@ -9,7 +9,8 @@ import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import { sleepSeconds, type TurnClaw } from "./ports.js";
 import { TurnState, messageIdOf } from "./turn-state.js";
-import { ClawError, errorKind, pickLang, type SseEvent, splitErrorTail, withhold } from "./upstream.js";
+import type { PublicErrors } from "../public-error/public-errors.js";
+import { ClawError, errorKind, pickLang, type SseEvent, splitErrorTail } from "./upstream.js";
 import { isClawFailure } from "./engine/claw-errors.js";
 
 export const READ_OVERALL_SECONDS = 20;
@@ -77,7 +78,7 @@ async function streamedTurns(claw: TurnClaw, clock: Clock, key: string, sessionI
     },
     () => undefined,
   );
-  const iterator = claw.stream(key, sessionId, { signal: overall.signal })[Symbol.asyncIterator]();
+  const iterator = claw.stream(key, sessionId, undefined, overall.signal)[Symbol.asyncIterator]();
   try {
     for (;;) {
       const next = await nextWithin(iterator, clock, turns.lastDone ? READ_IDLE_SECONDS : undefined, overall.signal);
@@ -128,17 +129,24 @@ async function nextWithin(
   }
 }
 
-function answerOf(lastDone: TurnState | undefined, sessionId: string, log: Logger): string | undefined {
+function answerOf(lastDone: TurnState | undefined, sessionId: string, deps: LastAnswerDeps): string | undefined {
   if (!lastDone) return undefined;
   const answer = lastDone.answer;
   if (!lastDone.failed) return answer;
   // as in a turn: the error that ended it is cut off and logged, the model's words stay
   const [words, error] = splitErrorTail(answer);
   if (!error) return answer;
-  const ref = withhold("last_answer_failed", error, { session: sessionId });
-  log.info("the user is told the task failed", { ref });
+  const ref = deps.errors.withhold("last_answer_failed", error, { session: sessionId });
+  deps.log.info("the user is told the task failed", { ref });
   const told = turnText.in(pickLang(words)).taskFailed;
   return words ? `${words}\n\n${told}` : told;
+}
+
+export interface LastAnswerDeps {
+  readonly claw: TurnClaw;
+  readonly clock: Clock;
+  readonly log: Logger;
+  readonly errors: PublicErrors;
 }
 
 /**
@@ -148,13 +156,13 @@ function answerOf(lastDone: TurnState | undefined, sessionId: string, log: Logge
  * own, which is what stops anybody reading somebody else's session.
  */
 export async function lastAnswer(
-  deps: { readonly claw: TurnClaw; readonly clock: Clock; readonly log: Logger },
+  deps: LastAnswerDeps,
   key: string,
   sessionId: string,
 ): Promise<string | undefined> {
   let turns: Turns;
   try {
-    const rows = await deps.claw.sessionEvents(key, sessionId, {
+    const rows = await deps.claw.events(key, sessionId, {
       tail: LAST_ANSWER_TAIL,
       maxBytes: LAST_ANSWER_MAX_BYTES,
     });
@@ -166,5 +174,5 @@ export async function lastAnswer(
     deps.log.info("the last answer is read from the stream: the replay was not used", { error: errorKind(err) });
     turns = await streamedTurns(deps.claw, deps.clock, key, sessionId);
   }
-  return answerOf(turns.lastDone, sessionId, deps.log);
+  return answerOf(turns.lastDone, sessionId, deps);
 }

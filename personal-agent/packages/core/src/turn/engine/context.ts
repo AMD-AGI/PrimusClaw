@@ -4,9 +4,11 @@
 /** Everything one turn runs with: who it acts for, what it sends, where it answers, and what it reports back. */
 
 import type { Lang } from "../../locales/lang.js";
+import type { PullRef } from "../../claw/model.js";
 import type { ModelRefusalPolicy } from "../../plugins/model-refusal-policy.js";
 import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
+import type { PublicErrors } from "../../public-error/public-errors.js";
 import type { Envelope, FetchedFile, InboundFile, OutMessage, UserRef } from "../../ports/surface.js";
 import type { GithubOutcome } from "../github-outcome.js";
 import type { TurnClaw, TurnSurface } from "../ports.js";
@@ -35,8 +37,8 @@ export interface TurnRequest {
   readonly ownThumbs?: boolean;
   /** A review turn: the id of the user whose GitHub account the session's tools use (always a new session). */
   readonly actingAs?: string;
-  /** A review turn: the one pull request (owner, repo, number) the session is bound to. */
-  readonly reviewTarget?: readonly [string, string, number];
+  /** A review turn: the one pull request the session is bound to. */
+  readonly reviewTarget?: PullRef;
   /** A review turn: the requester's own linked key, sent beside `key` as the model key. Never logged. */
   readonly modelKey?: string;
   /** A review turn: the model its request named. */
@@ -126,6 +128,8 @@ export interface TurnDeps {
   readonly clock: Clock;
   readonly log: Logger;
   readonly refusals: ModelRefusalPolicy;
+  /** What a person is told of a failure, and what is kept back for the log. */
+  readonly errors: PublicErrors;
   readonly style: TurnStyle;
 }
 

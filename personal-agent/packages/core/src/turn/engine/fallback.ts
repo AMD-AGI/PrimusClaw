@@ -32,16 +32,17 @@ async function moveToFallback(
 ): Promise<boolean> {
   const fallback = ctx.request.fallbackModel ?? "";
   try {
-    await ctx.deps.claw.setSessionModel(await credential(ctx), sessionId, fallback);
+    await ctx.deps.claw.setModel(await credential(ctx), sessionId, fallback);
   } catch (err) {
     if (!isClawOrNetwork(err)) throw err;
     ctx.deps.log.warn("could not move the session to the fallback model; the user is told to upload the key", {
       session: sessionId,
       error: statusOrKind(err),
     });
-    if (err instanceof ClawUnreachable && !err.connect) {
+    if (err instanceof ClawUnreachable) {
       // No answer came, and the request may have: the session may be on the fallback now. The record says so, so the
-      // next message pins the worker's model again, which is no harm if the move never happened.
+      // next message pins the worker's model again, which is no harm if the move never happened. (The port does not
+      // tell a refused connection from a lost answer; the Python worker skipped this only for the former.)
       ctx.record.sessionModel = fallback;
       onSession(sessionId);
     }
@@ -55,7 +56,7 @@ async function moveToFallback(
 async function moveBack(ctx: TurnContext, sessionId: string, onSession: (sessionId: string) => void): Promise<void> {
   const model = ctx.request.model ?? "";
   try {
-    await ctx.deps.claw.setSessionModel(await credential(ctx), sessionId, model);
+    await ctx.deps.claw.setModel(await credential(ctx), sessionId, model);
     ctx.record.sessionModel = model;
   } catch (err) {
     if (!isClawOrNetwork(err)) throw err;
@@ -92,7 +93,7 @@ export async function rerunOnFallback(
       messageOf(ctx),
       sendOptions(ctx),
     );
-    const state = new TurnState(messageId, behind, false, ctx.deps.refusals);
+    const state = new TurnState(messageId ?? undefined, behind, false, ctx.deps.refusals);
     state.writes = ctx.record.wrote; // (one list for the turn: what the first run wrote is not forgotten by the second)
     const ok = await consume(ctx, { sessionId, state, status, running });
     return { state, ok };
