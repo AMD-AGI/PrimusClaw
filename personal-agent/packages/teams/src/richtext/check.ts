@@ -7,6 +7,7 @@
  */
 import { LABEL_PX, LEAD_PX, RichTextError, STATUS_COLORS } from "./constants.js";
 import { safeUrl } from "./url.js";
+import { own } from "@primusclaw/personal-agent";
 
 /** An HTML tag: closing slash, name, attributes. */
 export const TAG = /<(\/?)([A-Za-z0-9]+)((?:[^<>A-Za-z0-9][^<>]*)?)>/gu;
@@ -33,7 +34,7 @@ const ENTITY_TEXT: Readonly<Record<string, string>> = {
  * this matters).
  */
 function unescapeEntities(text: string): string {
-  return text.replace(ENTITY, (entity) => ENTITY_TEXT[entity] ?? entity);
+  return text.replace(ENTITY, (entity) => own(ENTITY_TEXT, entity) ?? entity);
 }
 
 function checkText(text: string): void {

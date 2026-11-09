@@ -44,3 +44,9 @@ export function wrongGuard(table: Readonly<Table>, other: Readonly<Table>, key: 
 export function elseBranch(table: Readonly<Table>, key: string): string | undefined {
   return Object.hasOwn(table, key) ? undefined : table[key]; // REPORTED: the branch where it is not own
 }
+
+export function reassigned(reset: boolean, key: string): string | undefined {
+  let table = Object.create(null) as Table;
+  if (reset) table = {};
+  return table[key]; // REPORTED: a let may hold a plain object by now
+}

@@ -14,7 +14,7 @@
  * are never logged.
  */
 import { readFileSync } from "node:fs";
-import { type Clock, type Logger, pyRstrip, silentLogger } from "@primusclaw/personal-agent";
+import { type Clock, type Logger, pyRstrip, silentLogger, own } from "@primusclaw/personal-agent";
 import { TokenError } from "../connector/errors.js";
 import { reasonOf } from "../connector/timer.js";
 import { loadAssertionKey } from "../connector/tokens/assertion.js";
@@ -60,7 +60,7 @@ export interface WorkerIdentity {
 
 /** The identity from the environment; `why` (the setting that needs it) is named when something is missing. */
 export function workerIdentityFromEnv(env: Readonly<Record<string, string | undefined>>, why: string): WorkerIdentity {
-  const get = (name: string): string => (env[name] ?? "").trim();
+  const get = (name: string): string => (own(env, name) ?? "").trim();
   const missing = Object.values(SETTINGS).filter((name) => !get(name));
   if (missing.length) throw new WorkerIdentityError(`${why} needs the worker identity: set ${missing.join(", ")}`);
   const issuer = get(SETTINGS.issuer);

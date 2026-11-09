@@ -8,7 +8,7 @@
  * Reply blockquote (`quotes-html.ts`). Both are read; one quote said both ways is one quote. What a quote says never
  * becomes part of the person's own text.
  */
-import { cpHead, pyStr, pyStrip, squashSpaces, type Logger } from "@primusclaw/personal-agent";
+import { cpHead, pyStr, pyStrip, squashSpaces, type Logger, own } from "@primusclaw/personal-agent";
 import { quotedIds } from "./markup.js";
 import { htmlQuotes, type Quote } from "./quotes-html.js";
 import { entitiesOf, isFields, type Activity, type Fields } from "./schema.js";
@@ -103,7 +103,7 @@ export function kindsOf(items: unknown, key: string): string[] {
     .filter(isFields)
     .slice(0, 10)
     .map((item) =>
-      Array.from(cpHead(pyStr(item[key]), 40))
+      Array.from(cpHead(pyStr(own(item, key)), 40))
         .filter((ch) => KIND_CHAR.test(ch))
         .join(""),
     );

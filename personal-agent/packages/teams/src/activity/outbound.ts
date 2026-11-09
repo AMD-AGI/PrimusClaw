@@ -5,7 +5,7 @@
  * Outbound activities and the envelopes they travel in. The envelope is the contract of the outbound queue (and what the
  * store keeps for a card sent later), byte for byte the Python worker's: keys in its order, values as it wrote them.
  */
-import { pySplit } from "@primusclaw/personal-agent";
+import { pySplit, own } from "@primusclaw/personal-agent";
 
 import { isObject, type JsonObject } from "../cards/json.js";
 import type { Operation, TeamsEnvelope } from "../outbound/outbox.js";
@@ -21,7 +21,7 @@ export function textActivity(text: string): JsonObject {
 }
 
 function copy(activity: JsonObject, key: string): JsonObject {
-  const value = activity[key];
+  const value = own(activity, key);
   return value === undefined ? {} : { [key]: value };
 }
 
@@ -35,7 +35,7 @@ export function referenceOf(activity: JsonObject): JsonObject {
     activityId: activity["id"] ?? null,
   };
   for (const optional of ["channelId", "locale"]) {
-    if (activity[optional]) Object.assign(ref, copy(activity, optional));
+    if (own(activity, optional)) Object.assign(ref, copy(activity, optional));
   }
   return ref;
 }
@@ -55,7 +55,7 @@ export function activityOfReference(reference: JsonObject, activityId: string): 
     text: "",
   };
   for (const optional of ["channelId", "locale"]) {
-    if (reference[optional]) Object.assign(activity, copy(reference, optional));
+    if (own(reference, optional)) Object.assign(activity, copy(reference, optional));
   }
   return activity;
 }

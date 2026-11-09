@@ -18,7 +18,7 @@
  *  - the access under an `Object.hasOwn(obj, key)` check of the same object and key: in the true branch of an `if`,
  *    a `? :` or an `&&`, or after an `if (!Object.hasOwn(obj, key)) return|throw|continue|break;` earlier in the
  *    same block;
- *  - an object made by `Object.create(null)` (the variable's own initialiser), or typed as core's `Dict<V>`;
+ *  - a `const` whose initialiser is `Object.create(null)` (a `let` could be given a plain object later);
  *  - core's `own(table, key)`, which does the check.
  */
 import ts from "typescript";
@@ -63,11 +63,6 @@ function arrayOrString(checker, type) {
   );
 }
 
-/** Typed as core's `Dict<V>`: its phantom `nullPrototype` brand says it was made without a prototype. */
-function nullPrototypeType(type) {
-  return parts(type).every((t) => t.getProperties().some((p) => String(p.escapedName).startsWith("__@nullPrototype")));
-}
-
 function isNullPrototypeCall(source, init) {
   const call = init && unwrap(init);
   return (
@@ -79,13 +74,15 @@ function isNullPrototypeCall(source, init) {
   );
 }
 
-/** The object is a variable whose own initialiser is `Object.create(null)`. */
+/** The object is a `const` whose initialiser is `Object.create(null)`. */
 function madeWithNullPrototype(source, object) {
   const target = unwrap(object);
   if (target.type !== "Identifier") return false;
   for (let scope = source.getScope(target); scope; scope = scope.upper) {
     const variable = scope.set.get(target.name);
-    if (variable) return variable.defs.some((def) => isNullPrototypeCall(source, def.node?.init));
+    if (variable) {
+      return variable.defs.some((def) => def.parent?.kind === "const" && isNullPrototypeCall(source, def.node?.init));
+    }
   }
   return false;
 }
@@ -155,7 +152,7 @@ export default {
     messages: {
       lookup:
         "A plain-object lookup by an arbitrary string key reaches Object.prototype ('constructor', '__proto__', ...). " +
-        "Use a Map, own(table, key), an Object.hasOwn check first, or an Object.create(null) / Dict<V> table.",
+        "Use a Map, own(table, key), an Object.hasOwn check first, or a const Object.create(null) table.",
     },
     schema: [],
   },
@@ -168,7 +165,7 @@ export default {
     const check = (node, object, key) => {
       if (isStaticKey(key) || !arbitraryString(checker, typeOf(unwrap(key)))) return;
       const objectType = typeOf(object);
-      if (arrayOrString(checker, objectType) || nullPrototypeType(objectType)) return;
+      if (arrayOrString(checker, objectType)) return;
       if (madeWithNullPrototype(source, object)) return;
       const guard = { object: source.getText(unwrap(object)), key: source.getText(unwrap(key)) };
       if (guarded(source, node, guard)) return;

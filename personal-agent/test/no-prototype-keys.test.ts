@@ -35,7 +35,7 @@ function markedLines(file: string): number[] {
 test("every marked lookup in the bad fixture is reported, and only those", async () => {
   const file = path.join(fixtures, "bad.ts");
   const marked = markedLines(file);
-  assert.equal(marked.length, 10);
+  assert.equal(marked.length, 11);
   assert.deepEqual(await reportedLines(file), marked);
 });
 
