@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defineCatalog, LANGS, toLang } from "../src/index.js";
 
-test("toLang reads zh and every Chinese locale as zh, anything else as en", () => {
-  for (const zh of ["zh", "ZH", " zh ", "zh-CN", "zh-tw", "zh_Hans"]) assert.equal(toLang(zh), "zh", zh);
-  for (const en of ["en", "en-US", "", undefined, "fr", "zhx", "chinese"]) assert.equal(toLang(en), "en", String(en));
+test("toLang reads exactly zh as zh and anything else as en, as the Python worker does", () => {
+  assert.equal(toLang("zh"), "zh");
+  for (const en of ["en", "ZH", " zh ", "zh-CN", "zh_Hans", "", undefined, "fr", "zhx"]) {
+    assert.equal(toLang(en), "en", String(en));
+  }
 });
 
 test("a catalog gives each language its own text, with parameters", () => {

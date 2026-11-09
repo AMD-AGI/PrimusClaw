@@ -32,7 +32,7 @@ export default tseslint.config(
   importX.flatConfigs.typescript,
   {
     languageOptions: {
-      parserOptions: { projectService: { allowDefaultProject: ["*.js", "*.cjs", "scripts/*.mjs"] } },
+      parserOptions: { projectService: { allowDefaultProject: ["*.js", "*.cjs"] } },
     },
     settings: {
       "import-x/resolver-next": [createTypeScriptImportResolver({ project: "./tsconfig.json" })],
@@ -64,7 +64,7 @@ export default tseslint.config(
   },
   {
     // Config files and scripts are plain JavaScript run by Node.
-    files: ["*.js", "*.cjs", "scripts/*.mjs"],
+    files: ["*.js", "*.cjs"],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: { process: "readonly", console: "readonly", module: "writable", require: "readonly" } },
   },
