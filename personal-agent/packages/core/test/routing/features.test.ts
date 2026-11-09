@@ -318,3 +318,36 @@ test("a group's review-stop words stop the person's own reviews in Claw at once"
   assert.deepEqual(stops, ["it-1"]);
   assert.equal(said(w).at(-1), "o/r#825：代审已停下。");
 });
+
+test("test_a_handler_that_crashes_is_also_said_in_a_new_message", async () => {
+  const w = world({
+    handlers: {
+      clicks: [{ verbs: ["work"], withCredential: () => Promise.reject(new Error("boom")) }],
+    },
+  });
+  link(w, ALICE.id, "ak");
+  await assert.rejects(w.router.handle(clickOf("work", {})), /boom/u);
+  assert.deepEqual(said(w), [
+    "note::I could not finish that. Please send me a message to carry on.",
+    "I could not finish that. Please send me a message to carry on.",
+  ]);
+});
+
+test("a vote goes to the feedback handler, and is dropped when there is none", async () => {
+  const votes: string[] = [];
+  const vote = {
+    type: "vote" as const,
+    id: "v1",
+    sender: ALICE,
+    conversation: message("x").conversation,
+    locale: "",
+    clientPlatform: "",
+    messageId: "m1",
+    reaction: "like" as const,
+    comment: "",
+  };
+  const w = world({ handlers: { votes: { vote: (route) => (votes.push(route.vote.reaction), Promise.resolve()) } } });
+  await w.router.handle(vote);
+  await world().router.handle({ ...vote, id: "v2" });
+  assert.deepEqual(votes, ["like"]);
+});

@@ -99,10 +99,13 @@ export class FakeTurns implements TurnRunner {
   answers: string[] = [];
   /** A run holds until released when set. */
   hold: Promise<void> | undefined;
+  /** A run holds before Claw takes its message (no session yet, not running) until released when set. */
+  holdBeforeRunning: Promise<void> | undefined;
   fail = false;
 
   async run(run: TurnRun, hooks: TurnHooks): Promise<TurnOutcome> {
     this.runs.push(run);
+    if (this.holdBeforeRunning !== undefined) await this.holdBeforeRunning;
     const sessionId = run.sessionId ?? `sess-${run.credential}`;
     if (run.sessionId === null) this.calls.push(["create", run.credential, run.text]);
     else this.calls.push(["send", run.credential, run.sessionId, run.text]);
