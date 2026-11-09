@@ -21,30 +21,30 @@ export interface PermissionOption {
 }
 
 /** The order the buttons come in: allow once, allow always, then the rejections and anything else. */
-const KIND_RANK: Readonly<Record<string, number>> = {
-  allow_once: 0,
-  allow_always: 1,
-  reject_once: 2,
-  reject_always: 3,
-};
+const KIND_RANK: ReadonlyMap<string, number> = new Map([
+  ["allow_once", 0],
+  ["allow_always", 1],
+  ["reject_once", 2],
+  ["reject_always", 3],
+]);
 /** The words of each kind, for an option the agent gave no name. */
 type Words = ReturnType<typeof remoteText.in>;
 type KindWord = "allowOnce" | "allowAlways" | "rejectOnce" | "rejectAlways";
 type VerdictWord = "allowedOnce" | "allowedAlways" | "rejectedOnce" | "rejectedAlways";
 
-const KIND_WORDS: Readonly<Record<string, KindWord>> = {
-  allow_once: "allowOnce",
-  allow_always: "allowAlways",
-  reject_once: "rejectOnce",
-  reject_always: "rejectAlways",
-};
+const KIND_WORDS: ReadonlyMap<string, KindWord> = new Map([
+  ["allow_once", "allowOnce"],
+  ["allow_always", "allowAlways"],
+  ["reject_once", "rejectOnce"],
+  ["reject_always", "rejectAlways"],
+]);
 /** What each kind came to, once chosen. */
-const KIND_VERDICT: Readonly<Record<string, VerdictWord>> = {
-  allow_once: "allowedOnce",
-  allow_always: "allowedAlways",
-  reject_once: "rejectedOnce",
-  reject_always: "rejectedAlways",
-};
+const KIND_VERDICT: ReadonlyMap<string, VerdictWord> = new Map([
+  ["allow_once", "allowedOnce"],
+  ["allow_always", "allowedAlways"],
+  ["reject_once", "rejectedOnce"],
+  ["reject_always", "rejectedAlways"],
+]);
 
 function usableId(id: unknown, seen: ReadonlySet<string>): id is string {
   return typeof id === "string" && id !== "" && length(id) <= OPTION_ID_MAX && !seen.has(id) && !hasControl(id);
@@ -79,14 +79,16 @@ export function buttonTitle(option: PermissionOption, lang: Lang = "en"): string
       BUTTON_TITLE_MAX,
     );
   }
-  const plain = KIND_WORDS[option.kind];
+  const plain = KIND_WORDS.get(option.kind);
   const words: Words = remoteText.in(lang);
   return name || (plain ? words[plain] : "") || neutral(option.optionId, BUTTON_TITLE_MAX);
 }
 
 /** The options a card shows, in the fixed order, at most OPTION_BUTTONS_MAX. */
 export function shownOptions(options: readonly PermissionOption[]): PermissionOption[] {
-  return [...options].sort((a, b) => (KIND_RANK[a.kind] ?? 4) - (KIND_RANK[b.kind] ?? 4)).slice(0, OPTION_BUTTONS_MAX);
+  return [...options]
+    .sort((a, b) => (KIND_RANK.get(a.kind) ?? 4) - (KIND_RANK.get(b.kind) ?? 4))
+    .slice(0, OPTION_BUTTONS_MAX);
 }
 
 /** The one primary button is allow once; a rejection is a plain one. */
@@ -101,6 +103,6 @@ export function offersAlways(options: readonly PermissionOption[]): boolean {
 
 /** What an option came to, once chosen ("Allowed once"), or its button's words for a kind with no verdict of its own. */
 export function decidedVerdict(option: PermissionOption, lang: Lang = "en"): string {
-  const key = KIND_VERDICT[option.kind];
+  const key = KIND_VERDICT.get(option.kind);
   return key ? remoteText.in(lang)[key] : buttonTitle(option, lang);
 }

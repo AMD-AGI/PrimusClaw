@@ -25,6 +25,7 @@ import {
   terminalClosedLine,
   typedLine,
 } from "../../src/remote-view/lines.js";
+import { healthLines } from "../../src/remote-view/health.js";
 import { agentsText, sessionsText } from "../../src/remote-view/listing.js";
 import { PLAIN_ERRORS, frame } from "./frames.js";
 
@@ -214,4 +215,37 @@ test("what was typed at the terminal cannot make a link or a tag in the chat", (
   const line = typedLine("[Open](https://attacker.example) ![x](https://e/p.png) <a href=x>y</a>", "en");
   for (const bad of ["](", "<a", "</"]) assert.ok(!line.includes(bad), bad);
   assert.ok(line.includes("Open") && line.includes("https://attacker.example")); // (shown, only inert)
+});
+
+test("a word that names a property of every object is no key of our tables", () => {
+  // (Python reads these tables with `dict.get`/`in`: `constructor`, `__proto__` and `toString` are no entries)
+  for (const word of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.equal(
+      queuedLine(word, "en"),
+      "⏳ The terminal cannot take input right now (a menu or a dialog is on its screen); your message is queued.",
+      word,
+    );
+    assert.equal(noAskLine(word, "en"), null, word);
+    assert.equal(isStopReason(word), false, word);
+    assert.equal(decode(frame(word, { text: "x" }), PLAIN_ERRORS).chunk, null, word);
+    const text = sessionsText(
+      [session({ sessionId: "s", connectorId: "c", status: word, updatedAt: "" })],
+      [],
+      null,
+      0,
+    ).text;
+    assert.ok(text.includes(`(${word})`), text);
+  }
+  const health = healthLines(
+    connector({
+      connectorId: "c",
+      agents: [
+        agent({
+          agentId: "a",
+          capabilities: { health: { problems: [{ code: "constructor", severity: "fail", detail: "odd" }] } },
+        }),
+      ],
+    }),
+  );
+  assert.deepEqual(health, ["⛔ odd"]);
 });

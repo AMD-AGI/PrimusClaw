@@ -269,3 +269,22 @@ test("a request with no input is still a card", () => {
   assert.equal(lines[1], "Codex on dev-pod asks permission.");
   assert.ok(lines.includes("Action: Think hard"), lines.join(" | "));
 });
+
+test("an option kind that names a property of every object is an unknown kind", () => {
+  // (Python: `_KIND_RANK.get(kind, 4)`, `_KIND_TITLE.get(kind)`, `_KIND_VERDICT.get(kind)`: a dict has no `constructor`)
+  for (const kind of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
+    assert.equal(remoteView.buttonTitle({ optionId: "odd-id", name: "", kind }), "odd-id", kind);
+    assert.equal(remoteView.decidedVerdict({ optionId: "odd-id", name: "Later", kind }), "Later", kind);
+    const options = remoteView.parseOptions([
+      { optionId: "x", name: "X", kind },
+      { optionId: "r", name: "Reject", kind: "reject_once" },
+      { optionId: "y", name: "Y", kind },
+      { optionId: "a", name: "Allow", kind: "allow_once" },
+    ]);
+    assert.deepEqual(
+      remoteView.optionButtons(options, "s", "a").map((b) => b.optionId),
+      ["a", "r", "x", "y"],
+      kind,
+    );
+  }
+});
