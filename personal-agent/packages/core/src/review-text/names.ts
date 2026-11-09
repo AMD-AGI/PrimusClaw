@@ -162,6 +162,16 @@ export function personOf(who: string, mentions: readonly Mention[]): string {
 }
 
 /**
+ * `re.sub(r"[0-9]+$", "", text)`: the trailing ASCII digits taken off, scanned from the end (as a pattern, a long run of
+ * digits that does not end the text takes quadratic time).
+ */
+function withoutTrailingDigits(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) >= 48 && text.charCodeAt(end - 1) <= 57) end -= 1;
+  return text.slice(0, end);
+}
+
+/**
  * Every way a person's name may be written, flat: the display name with or without its bracketed part, its words in either
  * order, given name and surname, and the account name of their address with or without its digits.
  */
@@ -184,7 +194,7 @@ export function memberKeys(member: RosterMember): Set<string> {
     const local = flat(address.split("@")[0] ?? "");
     if (local) {
       keys.add(local);
-      keys.add(local.replace(/[0-9]+$/u, ""));
+      keys.add(withoutTrailingDigits(local));
     }
   }
   keys.delete("");
