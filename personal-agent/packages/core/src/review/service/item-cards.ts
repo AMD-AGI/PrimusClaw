@@ -171,7 +171,7 @@ export class ItemCards {
     if (!this.deps.store.assistantCards.endAssistantCard(card.cardId, ended)) return false;
     const conversation = stored(this.deps, card.reference);
     if (conversation === undefined) return true;
-    const render = prSummary ? { ...card.render, pr_summary: clipPrSummary(prSummary, this.deps.mask) } : card.render;
+    const render = prSummary ? { ...card.render, pr_summary: clipPrSummary(prSummary) } : card.render;
     try {
       await conversation.update(card.activityId, endedItemMessage({ render, ended, cardId: card.cardId }));
       return true;

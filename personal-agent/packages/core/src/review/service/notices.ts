@@ -145,7 +145,7 @@ export class Notices {
       item !== undefined
         ? `点下面卡片上的按钮，或直接回复「批准 ${ref}」确认、「拒绝 ${ref}」不同意。`
         : `直接回复「批准 ${ref}」确认、「拒绝 ${ref}」不同意。`;
-    const line = prSummaryLine(prSummary, this.deps.mask);
+    const line = prSummaryLine(prSummary);
     return `${question ? `${lead}：${question}` : `${lead}。`}${line ? `\n${line}` : ""}\n\n${how}`;
   }
 

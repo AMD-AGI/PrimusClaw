@@ -157,7 +157,7 @@ export class HeldWrites {
           base,
           login: review.actorLogin,
           lang: review.lang,
-          summary: clipPrSummary(item.pr_summary, this.deps.mask) || clipPrSummary(review.prSummary, this.deps.mask),
+          summary: clipPrSummary(item.pr_summary) || clipPrSummary(review.prSummary),
         }),
       );
       return true;

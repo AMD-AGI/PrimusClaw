@@ -340,7 +340,7 @@ export class AskerFollow {
     const [first] = told;
     try {
       if (first !== undefined)
-        await this.sayToAsker(first[0].review, conversation, progressText(entries, told, this.deps.mask));
+        await this.sayToAsker(first[0].review, conversation, progressText(entries, told));
     } catch (err) {
       for (const [entry] of told) {
         entry.said = before.get(followedItemId(entry)) ?? "";
@@ -354,7 +354,7 @@ export class AskerFollow {
       if (viewFinished(view)) this.deps.store.reviewDelegation.dropAskerFollow(followedItemId(entry));
     const ended = told.filter(([, v]) => viewFinished(v));
     const [one] = ended;
-    if (one !== undefined) await this.notices.tellReviewer(one[0].review, reviewerEndedText(ended, this.deps.mask));
+    if (one !== undefined) await this.notices.tellReviewer(one[0].review, reviewerEndedText(ended));
   }
 
   /** A line for the asker where they asked: in a group it @mentions them (and only them). */

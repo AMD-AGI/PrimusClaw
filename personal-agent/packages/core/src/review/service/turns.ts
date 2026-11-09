@@ -85,7 +85,7 @@ export class ReviewTurns {
       lead: review.ack,
       mention,
       shapeAnswer: (answer, link, model, results, comments, prSummary) =>
-        reviewAnswer(review, answer, { link, model, results, comments, prSummary }, this.deps.mask),
+        reviewAnswer(review, answer, { link, model, results, comments, prSummary }),
       onGithubResult: (outcome, model) => this.noteResult(review, outcome, model),
       ...(review.asItem === undefined ? {} : { asItem: review.asItem }),
     };

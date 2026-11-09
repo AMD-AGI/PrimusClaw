@@ -19,7 +19,7 @@ import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import type { GithubOutcome } from "../turn/github-outcome.js";
 import { shortName, pullUrl } from "../review-text/pull-ref.js";
 import { autoOf, type ReviewTurn, reviewerName } from "./review-turn.js";
-import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
+import { prSummaryLine, withSummaryLine } from "./summary.js";
 import { hasFileLine } from "../review-text/text/scan.js";
 import { pickLang } from "../review-text/text/unicode.js";
 
@@ -168,10 +168,10 @@ export interface AnswerParts {
 }
 
 /** A review's ONE message where it was asked: the headline, the summary line, then the answer in plain words. */
-export function reviewAnswer(review: ReviewTurn, answer: string, parts: AnswerParts, mask: Redact): string {
+export function reviewAnswer(review: ReviewTurn, answer: string, parts: AnswerParts): string {
   const lang = pyStrip(answer) ? pickLang(answer) : review.lang;
   const headline = reviewHeadline(review, parts.results ?? [], parts.comments ?? 0, parts.model ?? "", lang);
-  const head = withSummaryLine(headline, prSummaryLine(parts.prSummary ?? "", mask, lang));
+  const head = withSummaryLine(headline, prSummaryLine(parts.prSummary ?? "", lang));
   const body = withoutVerdict(answer);
   if (!body) return head;
   return `${head}\n\n${clipSummary(plainWords(body), Math.max(SUMMARY_CHARS - cpLength(head) - 2, 200), parts.link)}`;

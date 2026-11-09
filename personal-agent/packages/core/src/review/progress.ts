@@ -11,7 +11,7 @@ import type { AskerView } from "../claw/model.js";
 import { pullUrl, shortName } from "../review-text/pull-ref.js";
 import { oneLine } from "../review-text/names.js";
 import { askerName, type ReviewTurn, reviewerName, viewFinished, viewWaitsForReviewer } from "./review-turn.js";
-import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
+import { prSummaryLine, withSummaryLine } from "./summary.js";
 
 const VERDICT_ZH: Readonly<Record<string, string>> = {
   approve: "批准",
@@ -58,10 +58,10 @@ function viewLink(review: ReviewTurn, view: AskerView): string {
 }
 
 /** What the asker of a review someone else ran hears of it, once. */
-export function requesterResultText(review: ReviewTurn, view: AskerView, mask: Redact): string {
+export function requesterResultText(review: ReviewTurn, view: AskerView): string {
   return withSummaryLine(
     `${shortName(review.pull)}（${reviewerName(review)} 代审）：${viewWords(view)}\n${viewLink(review, view)}`,
-    prSummaryLine(view.prSummary, mask),
+    prSummaryLine(view.prSummary),
   );
 }
 
@@ -83,8 +83,8 @@ export function ownItemEndText(review: ReviewTurn): string {
 }
 
 /** What the reviewer hears when a review asked of them ends. */
-export function reviewerResultText(review: ReviewTurn, view: AskerView, mask: Redact): string {
-  const line = prSummaryLine(view.prSummary, mask);
+export function reviewerResultText(review: ReviewTurn, view: AskerView): string {
+  const line = prSummaryLine(view.prSummary);
   return `${askerName(review)}请你代审的 ${shortName(review.pull)}：${viewWords(view)}。${line ? `\n${line}\n` : ""}详情在你的看板上（/board）。`;
 }
 
@@ -152,14 +152,13 @@ function settledWords(review: ReviewTurn, view: AskerView): string {
 export function progressText(
   entries: readonly Followed[],
   told: readonly (readonly [Followed, AskerView])[],
-  mask: Redact,
 ): string {
   const [first] = told;
   if (entries.length === 1 && first !== undefined) {
     const [entry, view] = first;
     return withSummaryLine(
       `${shortName(entry.review.pull)}（${reviewerName(entry.review)} 代审）：${progressWords(entry.review, view, entry.said === "started")}\n${viewLink(entry.review, view)}`,
-      prSummaryLine(view.prSummary, mask),
+      prSummaryLine(view.prSummary),
     );
   }
   const who = entries[0] ? reviewerName(entries[0].review) : "对方";
@@ -170,7 +169,7 @@ export function progressText(
     `${who} 代审进度（${String(entries.length)} 个 PR：${String(concluded)} 个有结论，${String(ended)} 个已结束）：`,
   ];
   for (const [entry, view] of told) {
-    const line = prSummaryLine(view.prSummary, mask);
+    const line = prSummaryLine(view.prSummary);
     lines.push(
       `- ${shortName(entry.review.pull)}：${progressWords(entry.review, view, entry.said === "started")}  ${viewLink(entry.review, view)}` +
         (line ? `\n  ${line}` : ""),
@@ -195,12 +194,12 @@ export function unfinishedText(left: readonly Followed[]): string {
 }
 
 /** What the reviewer hears when reviews asked of them end. */
-export function reviewerEndedText(ended: readonly (readonly [Followed, AskerView])[], mask: Redact): string {
+export function reviewerEndedText(ended: readonly (readonly [Followed, AskerView])[]): string {
   const [first] = ended;
   if (first === undefined) return "";
-  if (ended.length === 1) return reviewerResultText(first[0].review, first[1], mask);
+  if (ended.length === 1) return reviewerResultText(first[0].review, first[1]);
   const lines = ended.map(([e, v]) => {
-    const line = prSummaryLine(v.prSummary, mask);
+    const line = prSummaryLine(v.prSummary);
     return `- ${shortName(e.review.pull)}：${viewWords(v)}${line ? `\n  ${line}` : ""}`;
   });
   return `${askerName(first[0].review)}请你代审的 ${String(ended.length)} 个 PR 结束了：\n${lines.join("\n")}\n详情在你的看板上（/board）。`;
