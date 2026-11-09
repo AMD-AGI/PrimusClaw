@@ -61,12 +61,16 @@ function translateEscape(escape: string, state: State): string {
   return escape;
 }
 
-/** With `i`: a class that takes `i` or `I` takes `ı` and `İ` as well (a negated one then refuses them too). */
+/**
+ * With `i`: a class that takes `i` or `I` takes `ı` and `İ` as well (a negated one then refuses them too). They go
+ * first in the class, so a class ending in a literal `-` keeps it literal.
+ */
 function closeClass(state: State, ignoreCase: boolean): void {
   const body = state.out.slice(state.classStart);
-  if (ignoreCase) {
-    const positive = body.startsWith("[^") ? `[${body.slice(2)}]` : `${body}]`;
-    if (new RegExp(positive, "iu").test("i")) state.out += DOTTED_I;
+  const negated = body.startsWith("[^");
+  if (ignoreCase && new RegExp(negated ? `[${body.slice(2)}]` : `${body}]`, "iu").test("i")) {
+    const at = state.classStart + (negated ? 2 : 1);
+    state.out = state.out.slice(0, at) + DOTTED_I + state.out.slice(at);
   }
   state.out += "]";
   state.inClass = false;

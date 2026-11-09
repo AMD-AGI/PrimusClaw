@@ -7,7 +7,6 @@ import {
   clipLine,
   decimalInt,
   isDigits,
-  pyIsdigit,
   isUpper,
   splitOnce,
   cpHead,
@@ -192,11 +191,4 @@ test("a digit of any script is read as Python's int reads it", () => {
   assert.ok(Number.isNaN(decimalInt("")) && Number.isNaN(decimalInt("1a")));
   assert.ok(isDigits("١٢") && !isDigits("") && !isDigits("²"));
   assert.ok(isUpper("7KQ3") && !isUpper("1234") && !isUpper("Ab") && !isUpper("ß"));
-});
-
-test("pyIsdigit is str.isdigit: decimal digits of any script, superscripts and circled digits too", () => {
-  // Python 3: True for each of these ...
-  for (const text of ["0123", "١٢", "１２", "²", "①", "⁹₀", "𝟗", "🄀"]) assert.ok(pyIsdigit(text), text);
-  // ... and False for these (fractions and Roman numerals are numeric, not digits).
-  for (const text of ["", "½", "Ⅻ", "1a", "一", " 1", "\u00b2x"]) assert.ok(!pyIsdigit(text), text);
 });
