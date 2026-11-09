@@ -130,16 +130,14 @@ test("a typed answer decides as a press does", async () => {
     wire: { conversation: { id: "personal:aad-b" } },
   });
   assert.equal(
-    await world.service
-      .routeHandlers()
-      .personalInterceptors[0]?.intercept({
-        message: groupMessage("确认 #12", BOB, [], "t1", "personal"),
-        text: "确认 #12",
-        sender: BOB,
-        conversation: dm,
-        scope: "",
-        lang: () => "zh",
-      }),
+    await world.service.routeHandlers().personalInterceptors[0]?.intercept({
+      message: groupMessage("确认 #12", BOB, [], "t1", "personal"),
+      text: "确认 #12",
+      sender: BOB,
+      conversation: dm,
+      scope: "",
+      lang: () => "zh",
+    }),
     true,
   );
   assert.ok(saidIn(world.surface, "personal:aad-b").includes("AMD-AGI/Hyperloom#12: Merged"));
