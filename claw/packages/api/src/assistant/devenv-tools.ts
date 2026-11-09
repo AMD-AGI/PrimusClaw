@@ -1381,9 +1381,22 @@ export async function devenvHide(claims: AssistantTokenClaims, args: DevenvHideA
   return { ...proposed(out.row, out.subscribers, "done", zh ? "zh" : "en"), machine: params.machine, hide: params.hide.length, show: params.show.length, disconnect: params.close.length, not_hidden_live: params.live };
 }
 
+/**
+ * Text a machine reported (a conversation's title, a folder, the machine's own name), made inert for a card the user reads as
+ * markdown: every character markdown or HTML reads as markup is escaped, and a scheme's "://" is broken so nothing autolinks. A
+ * title like "[Confirm](https://x)" is shown as those characters, never as a link or a button-looking word.
+ */
+export function inertMd(text: string | null | undefined): string {
+  return String(text ?? "")
+    .replace(/[\\`*_[\]()<>|~]/g, (ch) => `\\${ch}`)
+    .replace(/:\/\//g, ":/\u200b/")
+    .replace(/\bwww\./gi, (m) => `${m.slice(0, 3)}\u200b.`);
+}
+
 /** What the card of a `devenv_hide` says: each conversation by its title, what happens to it, and that nothing on the machine is deleted. */
-export function hideCardText(p: { machine: string | null; hide: Array<{ title: string }>; show: Array<{ title: string }>; close: Array<{ agent_id: string | null; cwd: string | null }>; live: string[] }, ref: string, zh: boolean): string {
-  const list = (xs: string[]) => xs.map((x) => `- ${x || (zh ? "（未命名）" : "(untitled)")}`).join("\n");
+export function hideCardText(p0: { machine: string | null; hide: Array<{ title: string }>; show: Array<{ title: string }>; close: Array<{ agent_id: string | null; cwd: string | null }>; live: string[] }, ref: string, zh: boolean): string {
+  const p = { ...p0, machine: inertMd(p0.machine) };
+  const list = (xs: string[]) => xs.map((x) => `- ${inertMd(x) || (zh ? "（未命名）" : "(untitled)")}`).join("\n");
   const parts: string[] = [];
   if (p.hide.length) parts.push(zh ? `在 ${p.machine} 上隐藏这些对话（不删除，/agents 不再列出；说"显示隐藏的会话"可以恢复）：\n${list(p.hide.map((x) => x.title))}`
     : `Hide these conversations on ${p.machine} (nothing is deleted; /agents stops listing them; "show hidden sessions" brings them back):\n${list(p.hide.map((x) => x.title))}`);

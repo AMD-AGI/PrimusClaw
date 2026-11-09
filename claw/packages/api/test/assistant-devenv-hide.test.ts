@@ -113,6 +113,14 @@ describe("devenv_hide", { skip }, () => {
     assert.equal(closes.length, 1, "a close was queued for the chat's session");
   });
 
+  test("H4 a title a machine reported cannot make a link or markup on the card", () => {
+    const text = tools.hideCardText({ machine: "box](https://x.example)", hide: [{ title: "[Confirm](https://attacker.example) <b>x</b> *y*" }],
+      show: [], close: [], live: [] }, "ab12", true);
+    assert.doesNotMatch(text, /\]\(|https:\/\/|<b>/);
+    assert.match(text, /\\\[Confirm\\\]\\\(https:\/\u200b\/attacker\.example\\\)/);
+    assert.equal(tools.inertMd("pwd 与 ls -la"), "pwd 与 ls -la", "plain words stay as they are");
+  });
+
   test("H3 refused: a name that matches nothing, several machines with none named, a report's turn", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
