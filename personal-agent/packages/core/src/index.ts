@@ -57,4 +57,3 @@ export * from "./claw/py-value.js";
 export * from "./observability/metrics-catalog.js";
 export * from "./routing/index.js";
 export * from "./language/detect.js";
-export * from "./inbound-text/index.js";
