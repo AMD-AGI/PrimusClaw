@@ -6,9 +6,10 @@
  * member list. Only an exact way of writing a member's name ever counts; a resemblance is offered back, never acted on.
  */
 
-import { cpHead, squashSpaces } from "../text/py-text.js";
+import { cpHead, decimalInt, squashSpaces } from "../text/py-text.js";
 import type { InboundMention, RosterMember } from "../ports/surface.js";
 import { MARK_CLOSE, MARK_OPEN } from "./pull-ref.js";
+import { withoutBracketed } from "./text/scan.js";
 import { casefold, codePoints, flat, unique } from "./text/unicode.js";
 
 /** One person @mentioned in a message: the channel's id for them, their directory id ('' not given) and display name. */
@@ -18,18 +19,17 @@ export type { RosterMember };
 
 export const MAX_CANDIDATES = 5;
 
-export const PAREN = /[(（][^)）]*[)）]/gu;
 const MARKUP = /[`<>*_[\]()#|\\]/gu;
 const CJK = /[一-鿿]/u;
 const SCRIPT_RUN = /[一-鿿]+|[^一-鿿]+/gu;
 
 export function markerPattern(): RegExp {
-  return new RegExp(`${MARK_OPEN}([0-9]+)${MARK_CLOSE}`, "gu");
+  return new RegExp(`${MARK_OPEN}(\\p{Nd}+)${MARK_CLOSE}`, "gu");
 }
 
 /** The mention indexes a text's markers name, in order. */
 export function markerIndexes(text: string): number[] {
-  return [...text.matchAll(markerPattern())].map((m) => Number(m[1]));
+  return [...text.matchAll(markerPattern())].map((m) => decimalInt(m[1] ?? ""));
 }
 
 export function withoutMarkers(text: string): string {
@@ -37,7 +37,7 @@ export function withoutMarkers(text: string): string {
 }
 
 export function withoutParens(text: string): string {
-  return text.replace(PAREN, "");
+  return withoutBracketed(text);
 }
 
 export function hasCjk(text: string): boolean {

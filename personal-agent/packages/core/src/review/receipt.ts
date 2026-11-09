@@ -18,6 +18,7 @@ import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import { shortName, pullUrl } from "./pull-ref.js";
 import { autoOf, type ReviewTurn, reviewerName } from "./review-turn.js";
 import { type Redact, prSummaryLine, withSummaryLine } from "./summary.js";
+import { hasFileLine } from "./text/scan.js";
 import { pickLang } from "./text/unicode.js";
 
 export const SUMMARY_CHARS = 1200;
@@ -25,7 +26,6 @@ export const DM_SUMMARY_CHARS = 700;
 
 const VERDICT = /^\s*VERDICT:\s*(CLEAN|BLOCKING|NOT_REVIEWED)\s*$/iu;
 const CJK = /[一-鿿]/u;
-const FILE_LINE = /[\p{L}\p{N}_./-]+\.[\p{L}\p{N}_]{1,8}:\p{Nd}+/u;
 const NAMES = Object.keys(PLAIN_WORDS)
   .sort((a, b) => b.length - a.length)
   .map((n) => n.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
@@ -50,7 +50,7 @@ export function plainWords(text: string): string {
     PLAIN_WORDS[quoted ?? bare ?? ""]?.[zh ? 0 : 1] ?? "";
   return text
     .split("\n")
-    .map((line) => (FILE_LINE.test(line) ? line : line.replace(RAW_NAME, say)))
+    .map((line) => (hasFileLine(line) ? line : line.replace(RAW_NAME, say)))
     .join("\n");
 }
 

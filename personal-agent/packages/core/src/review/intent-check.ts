@@ -8,11 +8,12 @@
  */
 
 import { reviewRequestText } from "../locales/review-request.js";
-import { pyStrip, squashSpaces } from "../text/py-text.js";
+import { decimalInt, pyStrip, squashSpaces } from "../text/py-text.js";
 import { type BareGroup, bareGroups } from "./bare-numbers.js";
 import { displayName, type Mention, mentionId, personOf, writtenIn } from "./names.js";
 import { MARK_CLOSE, MARK_OPEN, type PullRef, pullKey, pullsIn, keyParts, type PullKey } from "./pull-ref.js";
 import { MODEL_ID, type ReviewAsk, reviewAsk } from "./request-parse.js";
+import { wordHashNumbers } from "./text/scan.js";
 import { casefold, flat, unique } from "./text/unicode.js";
 
 export const INTENTS = ["review_merge", "review", "none"] as const;
@@ -68,15 +69,15 @@ export function pullsWritten(item: string, keys: ReadonlySet<PullKey>): Set<Pull
   const refs = pullsIn(item);
   if (refs.length) return new Set(refs.map(pullKey).filter((k) => keys.has(k)));
   let groups: BareGroup[];
-  if (/^#?\s*[0-9]{1,7}$/u.test(item)) {
-    groups = [{ spans: [[0, 0]], numbers: [Number(item.replace(/^#+/u, "").trim())], repo: "", explicit: true }];
+  if (/^#?\s*\p{Nd}{1,7}$/u.test(item)) {
+    groups = [{ spans: [[0, 0]], numbers: [decimalInt(pyStrip(item.replace(/^#+/u, "")))], repo: "", explicit: true }];
   } else {
     groups = bareGroups(item);
     if (!groups.length) {
-      groups = [...item.matchAll(/([A-Za-z][A-Za-z0-9._-]{0,99})#([0-9]{1,7})(?![0-9])/gu)].map((m) => ({
+      groups = wordHashNumbers(item).map(([repo, digits]) => ({
         spans: [[0, 0]],
-        numbers: [Number(m[2])],
-        repo: m[1] ?? "",
+        numbers: [decimalInt(digits)],
+        repo,
         explicit: true,
       }));
     }

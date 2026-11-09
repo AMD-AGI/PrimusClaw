@@ -60,16 +60,104 @@ export function reviewAsk(fields: Partial<ReviewAsk> & Pick<ReviewAsk, "who" | "
 }
 
 const REVIEW_AND_MERGE = "review\\s*(?:(?:并且|并|和|与|、|然后)\\s*)?合入";
-const NAMED_ASK = new RegExp(
-  `^\\s*请\\s*(?:让|叫)?\\s*(?<who>.*?)\\s*(?<help>帮(?:我|忙)?(?:一下)?\\s*)?${REVIEW_AND_MERGE}(?<rest>.*)$`,
-  "isud",
-);
-const ASK_AGAIN_SOURCE = `请\\s*(?:让|叫)?\\s*(?<who>[^\\n请]*?)\\s*(?:帮(?:我|忙)?(?:一下)?\\s*)?${REVIEW_AND_MERGE}`;
+const HELP = "帮(?:我|忙)?(?:一下)?\\s*";
+/** Where the reviewer's name ends in "请 XX [帮我] review 合入": the help words (optional) and "review 合入". */
+const NAMED_END = new RegExp(`(?:${HELP})?${REVIEW_AND_MERGE}`, "giu");
+/** ... and in "请 XX 帮我 review" (help required). */
+const REVIEW_ONLY_END = new RegExp(`${HELP}review`, "giu");
 const REVIEW_MERGE = new RegExp(REVIEW_AND_MERGE, "iu");
-const REVIEW_ONLY_ASK = /^\s*请(?!问)\s*(?:让|叫)?\s*(?<who>.*?)\s*帮(?:我|忙)?(?:一下)?\s*review(?<rest>.*)$/isu;
+const SPACE = /\s/u;
+const isSpace = (ch: string | undefined): boolean => ch !== undefined && SPACE.test(ch);
+
+/** A match of "请 <who> <end> <rest>": who (as the text writes it, spaces around it left out), whether help words came, the rest. */
+interface Asked {
+  readonly who: string;
+  readonly help: boolean;
+  /** Where the rest starts, and the rest. */
+  readonly restAt: number;
+  readonly rest: string;
+  /** Where the whole match ends ("合入" / "review"). */
+  readonly end: number;
+}
+
+/** Past "请", spaces, an optional 让 / 叫 and spaces: where the name starts. */
+function afterPlease(text: string, at: number): number {
+  let i = at;
+  while (isSpace(text[i])) i += 1;
+  if (text[i] === "让" || text[i] === "叫") i += 1;
+  while (isSpace(text[i])) i += 1;
+  return i;
+}
+
+/**
+ * The shortest name that `end` follows (the lazy `(?P<who>.*?)\s*<end>` of the Python worker's patterns), scanned rather
+ * than backtracked: the leftmost place `end` matches after the name's start, with the spaces before it left out.
+ */
+function nameBefore(text: string, start: number, end: RegExp): Asked | undefined {
+  end.lastIndex = start;
+  const found = end.exec(text);
+  if (found === null) return undefined;
+  let stop = found.index;
+  while (stop > start && isSpace(text[stop - 1])) stop -= 1;
+  const restAt = found.index + found[0].length;
+  return {
+    who: text.slice(start, stop),
+    help: text[found.index] === "帮",
+    restAt,
+    rest: text.slice(restAt),
+    end: restAt,
+  };
+}
+
+/** "请 XX [帮我] review 合入 <rest>" at the start of the text (spaces before 请 allowed). */
+function namedAskAt(text: string): Asked | undefined {
+  let i = 0;
+  while (isSpace(text[i])) i += 1;
+  if (text[i] !== "请") return undefined;
+  return nameBefore(text, afterPlease(text, i + 1), NAMED_END);
+}
+
+/** "请 XX 帮我 review <rest>" at the start of the text, not "请问". */
+function reviewOnlyAt(text: string): Asked | undefined {
+  let i = 0;
+  while (isSpace(text[i])) i += 1;
+  if (text[i] !== "请" || text[i + 1] === "问") return undefined;
+  return nameBefore(text, afterPlease(text, i + 1), REVIEW_ONLY_END);
+}
+
+/** Who each later "请 XX ... review 合入" of the text names, from `from` on (a name is on one line and has no 请 in it). */
+function askedAgain(text: string, from: number): string[] {
+  const whos: string[] = [];
+  let i = text.indexOf("请", from);
+  while (i >= 0) {
+    const start = afterPlease(text, i + 1);
+    const asked = nameBefore(text, start, NAMED_END);
+    if (asked !== undefined && !/[\n请]/u.test(asked.who)) {
+      whos.push(asked.who);
+      i = text.indexOf("请", asked.end);
+    } else {
+      i = text.indexOf("请", i + 1);
+    }
+  }
+  return whos;
+}
+
 export const MODEL_ID = "[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,99}";
 const MODEL_FIELD_SOURCE = `(?<![A-Za-z0-9_])(?:model|模型)\\s*[:：=]\\s*(?<model>${MODEL_ID})`;
-const USE_MODEL = new RegExp(`(?:^|(?<=\\s)|(?<=${MARK_CLOSE}))用\\s*(?<model>${MODEL_ID})\\s*$`, "u");
+const MODEL_ALONE = new RegExp(`^(?:${MODEL_ID})\\s*$`, "u");
+
+/** "用 X" at the end of a name (after its start, a space or a mention): where 用 is, and the model. */
+function useModel(who: string): { readonly at: number; readonly model: string } | undefined {
+  for (let at = who.indexOf("用"); at >= 0; at = who.indexOf("用", at + 1)) {
+    const before = who[at - 1];
+    if (at > 0 && !isSpace(before) && before !== MARK_CLOSE) continue;
+    let i = at + 1;
+    while (isSpace(who[i])) i += 1;
+    const rest = who.slice(i);
+    if (MODEL_ALONE.test(rest)) return { at, model: pyStrip(rest) };
+  }
+  return undefined;
+}
 
 export function modelFieldPattern(): RegExp {
   return new RegExp(MODEL_FIELD_SOURCE, "giu");
@@ -87,23 +175,23 @@ function modelsWritten(text: string): string[] {
 /** A name with the model taken out of it: "model: X" anywhere, or "用 X" at its end. */
 function nameAndModel(who: string): { readonly who: string; readonly model: string | undefined } {
   const named = pyStrip(who.replace(modelFieldPattern(), " "));
-  const used = USE_MODEL.exec(named);
-  if (!used) return { who: named, model: undefined };
-  return { who: pyStrip(named.slice(0, used.index)), model: used.groups?.model ?? "" };
+  const used = useModel(named);
+  if (used === undefined) return { who: named, model: undefined };
+  return { who: pyStrip(named.slice(0, used.at)), model: used.model };
 }
 
-/** "请 XX 帮我 review ..." that names someone and says nothing of merging. */
-export function asksReviewOnly(text: string): RegExpExecArray | undefined {
-  const match = REVIEW_ONLY_ASK.exec(text);
-  if (!match || REVIEW_MERGE.test(text)) return undefined;
-  return bareName((match.groups?.who ?? "").replace(modelFieldPattern(), " ")) ? match : undefined;
+/** "请 XX 帮我 review ..." that names someone and says nothing of merging: who, and what follows "review". */
+export function asksReviewOnly(text: string): { readonly who: string; readonly rest: string } | undefined {
+  const asked = reviewOnlyAt(text);
+  if (asked === undefined || REVIEW_MERGE.test(text)) return undefined;
+  return bareName(asked.who.replace(modelFieldPattern(), " ")) ? { who: asked.who, rest: asked.rest } : undefined;
 }
 
 function reviewOnlyAsk(text: string, mentions: readonly Mention[]): ReviewAsk | undefined {
   const match = asksReviewOnly(text);
-  const pulls = match ? pullsIn(match.groups?.rest ?? "") : [];
-  if (!match || !pulls.length) return undefined;
-  const { who, model } = nameAndModel(match.groups?.who ?? "");
+  const pulls = match ? pullsIn(match.rest) : [];
+  if (match === undefined || !pulls.length) return undefined;
+  const { who, model } = nameAndModel(match.who);
   const models = [...modelsWritten(text), ...(model === undefined ? [] : [model])];
   return reviewAsk({ who, mentions, pulls, models: unique(models), merge: false });
 }
@@ -113,36 +201,20 @@ function reviewOnlyAsk(text: string, mentions: readonly Mention[]): ReviewAsk | 
  * "review 合入" and points at a pull request; a review only when it says 请 XX 帮我 review <PR> with no word of merging.
  */
 export function parseReviewAsk(text: string, mentions: readonly Mention[]): ReviewAsk | undefined {
-  const named = namedAsk(text);
-  if (!named && !(REVIEW_MERGE.test(text) && pullsIn(text).length)) {
-    return reviewOnlyAsk(text, mentions);
-  }
-  const pulls = named ? named.pulls : pullsIn(text);
+  const named = namedAskAt(text);
+  const pulls = pullsIn(named === undefined ? text : named.rest);
+  // ("请 XX review 并合入 <PR>" without 帮我 is one only with a pull request, so "请问 review 合入的流程是什么？" stays chat;
+  // such a match leaves no pull request for the second reading either)
+  const asked = named !== undefined && (named.help || pulls.length) ? named : undefined;
+  if (asked === undefined && !(REVIEW_MERGE.test(text) && pulls.length)) return reviewOnlyAsk(text, mentions);
   const models = modelsWritten(text);
-  const read = (named ? named.whos : [""]).map((w) => {
+  const whos = asked === undefined ? [""] : [asked.who, ...askedAgain(text, asked.restAt)];
+  const read = whos.map((w) => {
     const { who, model } = nameAndModel(w);
     if (model !== undefined) models.push(model);
     return who;
   });
   return reviewAsk({ who: read[0] ?? "", mentions, pulls, models: unique(models), again: read.slice(1) });
-}
-
-/**
- * "请 XX [帮我] review 合入 <rest>": who each "请 XX ... review 合入" of the message names, and the pull requests after the
- * first. undefined: not written so. ("请 XX review 并合入 <PR>" without 帮我 is one only with a pull request, so that
- * "请问 review 合入的流程是什么？" stays chat.)
- */
-function namedAsk(text: string): { readonly whos: string[]; readonly pulls: PullRef[] } | undefined {
-  const named = NAMED_ASK.exec(text);
-  if (!named) return undefined;
-  const restAt = named.indices?.groups?.rest?.[0] ?? 0;
-  const pulls = pullsIn(text.slice(restAt));
-  if (!named.groups?.help && !pulls.length) return undefined;
-  const whos = [named.groups?.who ?? ""];
-  const again = new RegExp(ASK_AGAIN_SOURCE, "giu");
-  again.lastIndex = restAt;
-  for (let m = again.exec(text); m; m = again.exec(text)) whos.push(m.groups?.who ?? "");
-  return { whos, pulls };
 }
 
 function personKeys(who: string, mentions: readonly Mention[]): { ids: Set<string>; names: Set<string> } {
