@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import {
+  clipLine,
   cpHead,
   cpLength,
   cpSlice,
@@ -64,8 +65,7 @@ export function plainLine(value: string, limit: number): string {
   const kept = Array.from(value)
     .filter((c) => isPyPrintable(c) || isPySpace(c))
     .join("");
-  const text = squashSpaces(kept);
-  return cpLength(text) <= limit ? text : `${pyRstrip(cpSlice(text, 0, limit - 1))}…`;
+  return clipLine(squashSpaces(kept), limit);
 }
 
 export function reporterName(value: string): string {

@@ -5,8 +5,8 @@
  * Reading a chat message as one of the commands (`/help`, `/timezone Asia/Shanghai`, a word of Teams' commands menu). Pure: no
  * state, no I/O. What each command does is in `routing/`.
  */
-import { squashSpaces } from "../text/py-text.js";
-import { decimalInt, isUpper, pyFullmatch, splitOnce, strip, words } from "../text/words.js";
+import { decimalInt, isUpper, pyLower, pySplit, pyStrip, splitOnce, squashSpaces } from "../text/py-text.js";
+import { pyFullmatch } from "../text/py-regex.js";
 import { isCommand, type Command } from "./names.js";
 
 /** The letters a link code is made of (no 0/O/1/I) and its length: the store's generator and this reader agree on them. */
@@ -15,7 +15,7 @@ export const CODE_LENGTH = 8;
 
 /** The command name if `text` is exactly a known command, else null. */
 export function parseCommand(text: string): Command | null {
-  const word = strip(text).toLowerCase();
+  const word = pyLower(pyStrip(text));
   if (!word.startsWith("/")) return null;
   const name = word.slice(1);
   return isCommand(name) ? name : null;
@@ -23,9 +23,9 @@ export function parseCommand(text: string): Command | null {
 
 /** The argument text of `/name ARGS` ("" when there is none), or null when `text` is not that command. */
 export function commandArgs(text: string, name: string): string | null {
-  const [head, rest] = splitOnce(strip(text));
-  if (head === undefined || head.toLowerCase() !== `/${name}`) return null;
-  return rest === undefined ? "" : strip(rest);
+  const [head, rest] = splitOnce(pyStrip(text));
+  if (head === undefined || pyLower(head) !== `/${name}`) return null;
+  return rest === undefined ? "" : pyStrip(rest);
 }
 
 /**
@@ -69,7 +69,7 @@ function looksLikeACode(word: string): boolean {
  */
 export function menuCommand(text: string, group = false): string {
   const said = squashSpaces(text);
-  const lower = said.toLowerCase();
+  const lower = pyLower(said);
   const command = MENU_COMMANDS[lower];
   if (command !== undefined && (!group || (GROUP_MENU_COMMANDS as readonly string[]).includes(lower))) return command;
   const found = group ? null : LINK_WITH_CODE.exec(said);
@@ -80,16 +80,16 @@ export function menuCommand(text: string, group = false): string {
 
 /** The code of a `/link CODE` message, else null. */
 export function parseLinkCode(text: string): string | null {
-  const parts = words(strip(text));
+  const parts = pySplit(pyStrip(text));
   const [head, code] = parts;
-  if (parts.length === 2 && head?.toLowerCase() === "/link" && code !== undefined) return code;
+  if (parts.length === 2 && head !== undefined && pyLower(head) === "/link" && code !== undefined) return code;
   return null;
 }
 
 /** Whether `text` is a /timezone message, and its argument: null for none, "" for more than one word. */
 export function parseTimezone(text: string): { isTimezone: boolean; arg: string | null } {
-  const parts = words(strip(text));
-  if (parts[0]?.toLowerCase() !== "/timezone") return { isTimezone: false, arg: null };
+  const parts = pySplit(pyStrip(text));
+  if (pyLower(parts[0] ?? "") !== "/timezone") return { isTimezone: false, arg: null };
   if (parts.length === 2) return { isTimezone: true, arg: parts[1] ?? null };
   return { isTimezone: true, arg: parts.length === 1 ? null : "" };
 }
@@ -102,7 +102,7 @@ const UNIT_SECONDS: Readonly<Record<string, number>> = { m: 60, h: 3600, d: 8640
 
 /** '8:30' to '08:30'; null unless it is a real 24-hour time. */
 export function parseClock(text: string): string | null {
-  const found = CLOCK.exec(strip(text));
+  const found = CLOCK.exec(pyStrip(text));
   if (found === null) return null;
   const hour = decimalInt(found[1] ?? "");
   const minute = decimalInt(found[2] ?? "");
@@ -113,7 +113,7 @@ export function parseClock(text: string): string | null {
 
 /** '22:00-08:00' to ['22:00', '08:00']; null when malformed or empty (start equals end). */
 export function parseQuietWindow(text: string): readonly [string, string] | null {
-  const found = QUIET.exec(strip(text));
+  const found = QUIET.exec(pyStrip(text));
   if (found === null) return null;
   const start = parseClock(`${found[1] ?? ""}:${found[2] ?? ""}`);
   const end = parseClock(`${found[3] ?? ""}:${found[4] ?? ""}`);
@@ -122,8 +122,8 @@ export function parseQuietWindow(text: string): readonly [string, string] | null
 
 /** '2h', '30m', '1d' to seconds, at most 30 days; null when malformed. */
 export function parseDurationSeconds(text: string): number | null {
-  const found = DURATION.exec(strip(text));
+  const found = DURATION.exec(pyStrip(text));
   if (found === null) return null;
-  const seconds = decimalInt(found[1] ?? "") * (UNIT_SECONDS[(found[2] ?? "").toLowerCase()] ?? 0);
+  const seconds = decimalInt(found[1] ?? "") * (UNIT_SECONDS[pyLower(found[2] ?? "")] ?? 0);
   return seconds > 0 && seconds <= MAX_PAUSE_SECONDS ? seconds : null;
 }

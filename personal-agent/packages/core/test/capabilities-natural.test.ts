@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { isKnownCommand } from "../src/commands/names.js";
 import { naturalCommand } from "../src/capabilities/natural.js";
 import { CAPABILITIES } from "../src/capabilities/registry.js";
-import { words } from "../src/text/words.js";
+import { pySplit } from "../src/text/py-text.js";
 
 const EXAMPLES = CAPABILITIES.filter((c) => c.sayZh !== "");
 
@@ -75,7 +75,7 @@ test("test_every_command_a_sentence_means_is_one_the_worker_handles", () => {
       for (const group of [false, true]) {
         const command = naturalCommand(say, group);
         if (command === say) continue;
-        const word = words(command.slice(1))[0] ?? "";
+        const word = pySplit(command.slice(1))[0] ?? "";
         assert.ok(isKnownCommand(word) || word === "github" || word === "board", `${say} -> ${command}`);
       }
     }

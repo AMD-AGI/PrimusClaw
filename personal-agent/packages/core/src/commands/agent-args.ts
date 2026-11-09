@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** `/agent ARGS`: the remote-agent subcommands, read here and carried out by the remote-agent feature. */
-import { splitOnce, strip } from "../text/words.js";
+import { pyLower, pyStrip, splitOnce } from "../text/py-text.js";
 
 export const AGENT_SUBCOMMANDS = ["new", "attach", "detach", "mode", "sessions", "close", "off", "pair"] as const;
 
@@ -20,8 +20,8 @@ function isSubcommand(word: string): word is AgentSubcommand {
 
 /** The arguments of `/agent ARGS`; null when ARGS is empty or names no subcommand (the caller shows the usage). */
 export function parseAgentCommand(arg: string): AgentCommand | null {
-  const [head, rest] = splitOnce(strip(arg));
-  const verb = head?.toLowerCase();
+  const [head, rest] = splitOnce(pyStrip(arg));
+  const verb = head === undefined ? undefined : pyLower(head);
   if (verb === undefined || !isSubcommand(verb)) return null;
-  return { verb, rest: rest === undefined ? "" : strip(rest) };
+  return { verb, rest: rest === undefined ? "" : pyStrip(rest) };
 }
