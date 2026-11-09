@@ -53,12 +53,12 @@ export type Attached = undefined | null | Readonly<Record<string, unknown>>;
 export function attachedContext(attached: Attached): { attached?: JsonObject | null } {
   if (attached === undefined) return {};
   if (attached === null || typeof attached !== "object" || Array.isArray(attached)) return { attached: null };
-  const kept: Record<string, JsonValue> = {};
-  for (const [k, v] of Object.entries(attached)) {
-    if (typeof v === "string") kept[k] = clip(v);
-    else if (typeof v === "boolean") kept[k] = v;
-  }
-  return { attached: kept };
+  // Object.fromEntries keeps every key as the dict comprehension does, "__proto__" included (an assignment would set
+  // the prototype instead and drop it).
+  const kept = Object.entries(attached).flatMap(([k, v]): [string, JsonValue][] =>
+    typeof v === "string" ? [[k, clip(v)]] : typeof v === "boolean" ? [[k, v]] : [],
+  );
+  return { attached: Object.fromEntries(kept) };
 }
 
 /** What a channel context is made of. */

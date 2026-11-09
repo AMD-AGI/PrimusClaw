@@ -15,6 +15,7 @@ import {
   type HeldRow,
   type Pending,
 } from "../../src/index.js";
+import { own } from "../../src/own.js";
 
 const CLAW = "AMD-AGI/PrimusClaw";
 const SAFE = "AMD-AGI/Primus-SaFE";
@@ -213,7 +214,7 @@ const PARITY = JSON.parse(readFileSync(new URL("python-parity.json", import.meta
 
 test("the rules read every message of the Python worker's corpus as it did", () => {
   const differ = PARITY.answers.filter((row) => {
-    const got = readTypedAnswer(row.text, PARITY.pending[row.pending] ?? [], row.strict);
+    const got = readTypedAnswer(row.text, own(PARITY.pending, row.pending) ?? [], row.strict);
     return (
       JSON.stringify(got === null ? null : { decisions: got.decisions, question: got.question }) !==
       JSON.stringify(row.answer)

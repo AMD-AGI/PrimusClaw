@@ -21,10 +21,11 @@ import {
   type PersonRecord,
 } from "../../src/index.js";
 import { similarity } from "../../src/understanding/sequence-matcher.js";
+import { own } from "../../src/own.js";
 
 /** The commands of the 1:1 chat that these cases use (the command module's own table is W4's). */
 const COMMANDS: CommandBook = {
-  menuCommand: (text) => (({ help: "/help" }) as Record<string, string>)[text.trim().toLowerCase()] ?? text,
+  menuCommand: (text) => own({ help: "/help" }, text.trim().toLowerCase()) ?? text,
   isKnownCommand: (name) => ["help", "new", "stop", "brief", "quiet", "memory"].includes(name),
 };
 
@@ -112,7 +113,7 @@ interface Parity {
 }
 
 const PARITY = JSON.parse(readFileSync(new URL("python-parity.json", import.meta.url), "utf8")) as Parity;
-const userIdOf = (aad: string): string | undefined => PARITY.linked[aad];
+const userIdOf = (aad: string): string | undefined => own(PARITY.linked, aad);
 const aadOf = (teamsId: string): string | undefined => (teamsId === "29:m2" ? "aad-m2" : undefined);
 
 test("the people a message names are read as the Python worker read them", () => {
@@ -212,5 +213,15 @@ test("what waits, the attached session and the whole context are said as the con
       via: "on_behalf",
       attached: null,
     },
+  );
+});
+
+test("attachedContext keeps keys named like Object.prototype's, as the Python dict comprehension does", () => {
+  // Measured on the Python worker (26d66d75): json.dumps(attached_context(json.loads(
+  //   '{"__proto__":"s1","constructor":true,"name":"n","n2":3}'))) == '{"attached": {"__proto__": "s1", "constructor": true, "name": "n"}}'
+  const attached = JSON.parse('{"__proto__":"s1","constructor":true,"name":"n","n2":3}') as Record<string, unknown>;
+  assert.equal(
+    JSON.stringify(attachedContext(attached)),
+    '{"attached":{"__proto__":"s1","constructor":true,"name":"n"}}',
   );
 });

@@ -129,7 +129,7 @@ test("the code, not the sender, decides whose key is bound", () => {
 test("no store method makes a code from a chat identity: stashPending takes the key alone", () => {
   const { store } = openTestStore();
   const links = store.links as unknown as Record<string, unknown>;
-  for (const name of ["issueCode", "peekCode", "redeemCode"]) assert.equal(links[name], undefined);
+  for (const name of ["issueCode", "peekCode", "redeemCode"]) assert.equal(Reflect.get(links, name), undefined);
   assert.equal(store.links.stashPending.length, 1);
 });
 

@@ -3,6 +3,7 @@
 
 import { InvariantError } from "../errors.js";
 import { SECURITY_FIELDS } from "./security-fields.js";
+import { own } from "../own.js";
 
 /** The security events, their log levels (a closed list: SIEM rules match on these names). */
 export const SECURITY_EVENTS = {
@@ -36,18 +37,18 @@ export function securityEventRecord(
   fields: Readonly<Record<string, unknown>> = {},
 ): SecurityEventRecord {
   if (!Object.hasOwn(SECURITY_EVENTS, event)) throw new InvariantError("unknown security event");
-  const record: Record<string, unknown> = { event };
+  const kept: [string, unknown][] = [["event", event]];
   const dropped = new Set<string>();
   for (const [name, value] of Object.entries(fields)) {
     if (value === null || value === undefined) continue;
-    const check = Object.hasOwn(SECURITY_FIELDS, name) ? SECURITY_FIELDS[name] : undefined;
+    const check = own(SECURITY_FIELDS, name);
     const safe = check?.(value);
     if (safe === undefined) {
       dropped.add(check ? name : "<unknown_field>");
       continue;
     }
-    record[name] = safe;
+    kept.push([name, safe]);
   }
-  if (dropped.size > 0) record["dropped"] = [...dropped].sort();
-  return record as SecurityEventRecord;
+  if (dropped.size > 0) kept.push(["dropped", [...dropped].sort()]);
+  return Object.fromEntries(kept) as SecurityEventRecord;
 }

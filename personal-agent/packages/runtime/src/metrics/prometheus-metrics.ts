@@ -13,6 +13,7 @@ import {
   LIMIT_REASONS,
   SECURITY_EVENTS,
   SECURITY_EVENT_LABELS,
+  own,
   type Clock,
   type MetricsPort,
   type SecurityEventRecord,
@@ -176,7 +177,7 @@ export class PrometheusMetrics implements MetricsPort {
   render(): string {
     const lines: string[] = [];
     const head = (name: string): void => {
-      const [kind, text] = HELP[name] ?? ["untyped", ""];
+      const [kind, text] = own(HELP, name) ?? ["untyped", ""];
       lines.push(`# HELP ${name} ${text}`, `# TYPE ${name} ${kind}`);
     };
     head("clawy_security_events_total");

@@ -3,6 +3,7 @@
 
 import { InvariantError } from "../errors.js";
 import { PY_SPACE } from "./py-text.js";
+import { own } from "../own.js";
 
 /**
  * Python `re` escapes (in a `str` pattern) as JavaScript `u`-mode pattern text: the classes, anchors and character
@@ -70,7 +71,7 @@ function refuse(what: string): never {
 /** `\xhh`, `\uhhhh`, `\Uhhhhhhhh`: the character they name. */
 function hexEscape(source: string, i: number, context: EscapeContext): Escape {
   const kind = source.charAt(i + 1);
-  const digits = HEX[kind] ?? 0;
+  const digits = own(HEX, kind) ?? 0;
   const hex = source.slice(i + 2, i + 2 + digits);
   if (!new RegExp(`^[0-9a-fA-F]{${String(digits)}}$`).test(hex)) refuse(`the escape \\${kind}${hex}`);
   return { text: literal(String.fromCodePoint(parseInt(hex, 16)), context), length: 2 + digits };
@@ -97,14 +98,14 @@ function propertyEscape(source: string, i: number): Escape | undefined {
 function letterEscape(letter: string, context: EscapeContext): string | undefined {
   if (SAME.has(letter)) return `\\${letter}`;
   if (letter === "a") return "\\x07";
-  return (context.inClass ? INSIDE : OUTSIDE)[letter];
+  return own(context.inClass ? INSIDE : OUTSIDE, letter);
 }
 
 /** The escape that starts at `source[i]` (a backslash), as JavaScript pattern text. */
 export function translateEscape(source: string, i: number, context: EscapeContext): Escape {
   const next = source.charAt(i + 1);
   if (next === "") refuse("a trailing backslash");
-  if (next in HEX) return hexEscape(source, i, context);
+  if (Object.hasOwn(HEX, next)) return hexEscape(source, i, context);
   if (/[0-9]/.test(next)) return digitEscape(source, i, context);
   if (next === "p" || next === "P") return propertyEscape(source, i) ?? refuse(`the escape \\${next}`);
   if (next === "N") refuse("a named character \\N{...}");

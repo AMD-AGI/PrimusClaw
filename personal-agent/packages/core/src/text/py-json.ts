@@ -92,10 +92,9 @@ function encode(value: unknown, options: JsonDumpsOptions, depth: number): strin
     );
   }
   if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).filter((k) => record[k] !== undefined);
-    if (options.sortKeys) keys.sort(byCodePoint);
-    const items = keys.map((k) => `${jsonString(k)}: ${encode(record[k], options, depth + 1)}`);
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined);
+    if (options.sortKeys) entries.sort(([a], [b]) => byCodePoint(a, b));
+    const items = entries.map(([k, v]) => `${jsonString(k)}: ${encode(v, options, depth + 1)}`);
     return container("{", "}", items, options, depth);
   }
   if (typeof value === "number") return pyNumber(value, "json");

@@ -68,7 +68,7 @@ export class Guardrails {
     const merged = new Map<SensitiveOperation, Limit>(
       Object.entries(DEFAULT_LIMITS) as Array<[SensitiveOperation, Limit]>,
     );
-    const unknown = [...limits.keys()].filter((op) => !(op in SENSITIVE_OPERATIONS)).sort();
+    const unknown = [...limits.keys()].filter((op) => !Object.hasOwn(SENSITIVE_OPERATIONS, op)).sort();
     if (unknown.length) throw new RangeError(`no such sensitive operation: ${unknown.join(", ")}`);
     for (const [op, limit] of limits) merged.set(op as SensitiveOperation, limit);
     this.limits = merged;

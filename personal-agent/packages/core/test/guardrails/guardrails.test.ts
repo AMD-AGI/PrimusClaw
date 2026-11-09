@@ -15,6 +15,7 @@ import {
 } from "../../src/index.js";
 import { sha256Hex } from "../../src/guardrails/sha256.js";
 import { FakeClock } from "../../../../test-support/index.js";
+import { own } from "../../src/own.js";
 
 const ALICE_AAD = "6f1c2a4e-1b2d-4c3e-9f80-1a2b3c4d5e6f";
 
@@ -107,7 +108,7 @@ test("a limit of zero is off and the defaults are on", () => {
 
 test("the limits are read from the environment and a typo stops the worker", () => {
   const env: Record<string, string> = { TEAMS_LIMIT_PR_MERGE: "5/600", TEAMS_LIMIT_APPROVAL: "0" };
-  const limits = parseLimits((name) => env[name] ?? "");
+  const limits = parseLimits((name) => own(env, name) ?? "");
   assert.deepEqual(limits.get("pr_merge"), { count: 5, windowSeconds: 600 });
   assert.equal(limits.get("approval")?.count, 0);
   assert.deepEqual(limits.get("pr_review"), DEFAULT_LIMITS.pr_review);
@@ -176,5 +177,16 @@ test("the correlation id is the Python worker's: the first 32 hex of the sha256 
   assert.equal(correlationId(), "e3b0c44298fc1c149afbf4c8996fb924");
   for (const text of ["", "abc", "a".repeat(55), "a".repeat(56), "a".repeat(1000), "é😀\u001f"]) {
     assert.equal(sha256Hex(text), createHash("sha256").update(text, "utf8").digest("hex"));
+  }
+});
+
+test("a limit for a name that only Object.prototype has is refused, as Python's dict refuses it", () => {
+  // Python: Guardrails(limits={"constructor": (1, 60)}) raises ValueError "no such sensitive operation: constructor".
+  for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.throws(
+      () => new Guardrails(new FakeClock(0), () => undefined, new Map([[name, { count: 1, windowSeconds: 60 }]])),
+      new RegExp(`no such sensitive operation: ${name}`),
+      name,
+    );
   }
 });
