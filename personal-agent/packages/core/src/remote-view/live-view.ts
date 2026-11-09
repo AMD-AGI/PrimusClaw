@@ -7,9 +7,9 @@
  * newest part that fits is kept). Credentials are masked at render time over the whole text, so a secret split across two
  * chunks is still caught.
  */
-import { splitErrorTail } from "./pending-public-error.js";
 import { redactText } from "./pending-redact.js";
-import { type RemoteStep } from "./events.js";
+import type { RemoteStep } from "./events.js";
+import { splitErrorTail } from "./pending-public-error.js";
 import { neutral } from "./inert.js";
 import type { Lang } from "../locales/lang.js";
 import { ACTIVE_STEPS_MAX, BLOCK_KEEP_CHARS, THOUGHT_MAX, TOOL_TITLE_MAX } from "./limits.js";
@@ -143,7 +143,7 @@ export class RemoteLiveView {
   private paragraph(block: Block): string {
     switch (block.kind) {
       case "message": // (the raw error of a failed model call is cut off here as in the answer)
-        return strip(splitErrorTail(redactText(block.text))[0]);
+        return strip(splitErrorTail(redactText(block.text)).kept);
       case "thought": {
         const flat = squash(redactText(block.text).replace(STYLE_CHARS, " "));
         const clipped = length(flat) <= THOUGHT_MAX ? flat : "…" + lstrip(slice(flat, -(THOUGHT_MAX - 1)));

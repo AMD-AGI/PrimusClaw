@@ -28,3 +28,4 @@ export * from "./status-view.js";
 export type { Reported } from "./reported.js";
 export * from "./setup.js";
 export * from "./turn-state.js";
+import "./views.js";

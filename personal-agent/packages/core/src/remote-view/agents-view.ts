@@ -9,7 +9,8 @@
 import type { Lang } from "../locales/lang.js";
 import { remoteText } from "../locales/remote.js";
 import { type RemoteButton, remoteButton } from "./actions.js";
-import { type Approval, agentRoots, approvalChoice, kindLabel, startsUnattended } from "./agents.js";
+import { agentRoots, kindLabel, startsUnattended } from "./agents.js";
+import { type ApprovalInput, approvalInput } from "./machine-views.js";
 import { type ConversationItem, conversationItems } from "./conversations-view.js";
 import { healthLines } from "./health.js";
 import { lit, neutral, plain } from "./inert.js";
@@ -35,14 +36,6 @@ export interface FolderInput {
   readonly maxLength: number;
 }
 
-/** The choice between asking for approval and not, for an agent that reports modes of both kinds. */
-export interface ApprovalChoice {
-  readonly label: string;
-  readonly value: Approval;
-  readonly ask: string;
-  readonly unattended: string;
-}
-
 /** One online agent's block. Input ids carry the slot: a card's inputs all come back with every button. */
 export interface AgentBlock {
   readonly kind: "agent";
@@ -53,7 +46,7 @@ export interface AgentBlock {
   /** null for an agent of kind `attach`, which starts no conversation of its own. */
   readonly start: {
     readonly folder: StartFolder;
-    readonly approval: ApprovalChoice | null;
+    readonly approval: ApprovalInput | null;
     readonly button: RemoteButton;
   } | null;
   readonly conversations: readonly ConversationItem[];
@@ -120,10 +113,7 @@ function startOf(connector: RemoteConnector, agent: RemoteAgent, slot: number, l
           subfolder: { label: words.subfolder, placeholder: words.subfolderExample, maxLength: SUBFOLDER_MAX },
         }
       : { kind: "folder", input: { label: words.folderOnMachine, placeholder: "/home/me/repo", maxLength: ROOT_MAX } };
-  const choice = approvalChoice(agent);
-  const approval = choice
-    ? { label: words.approval, value: choice.default, ask: words.askMe, unattended: words.noApproval }
-    : null;
+  const approval = approvalInput(agent, slot, lang);
   const button = remoteButton(words.newSession, "new", "positive", {
     connector_id: connector.connectorId,
     agent_id: agent.agentId,
