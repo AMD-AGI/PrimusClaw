@@ -30,7 +30,8 @@ record it.
 ### Added
 - `CLAW_MEMORY_DEFAULT_ON` (default `false`): whether long-term memory is on for a user who has never turned it on or off (no
   row in `claw_user_memory_prefs`). A user's own choice still wins either way, so one who turned memory off keeps it off, and
-  `CLAW_MEMORY_ENABLED` is still the deployment-wide switch. With the default nothing changes: memory stays opt-in. The session
+  `CLAW_MEMORY_ENABLED` is still the deployment-wide switch (with it off, the default turns no one on, REST writes included).
+  With the default nothing changes: memory stays opt-in. The session
   access, `GET /v1/users/:userId/memory-settings`, the REST writes and the assistant's memory all read the preference through
   the one function that applies it.
 - `pr_summary` on `gh_review_submit` and `gh_pr_merge`: the review session's one sentence of what the pull request does, read from
