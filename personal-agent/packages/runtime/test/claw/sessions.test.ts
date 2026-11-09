@@ -198,9 +198,12 @@ describe("reading a session", () => {
     await assert.rejects(slow.client().sessions.changes("ak-a", "s", 20), ClawUnreachable);
   });
 
-  it("a delivered file's link is Claw's own, only over https", () => {
+  it("the link is claw's own and only over https", () => {
     const claw = new Wire().client();
-    assert.equal(claw.sessions.deliveryLink("s 1", "d/2"), "https://claw.test/v1/sessions/s%201/deliveries/d%2F2");
+    assert.equal(
+      claw.sessions.deliveryLink("s 1/x", "d/2"),
+      "https://claw.test/v1/sessions/s%201%2Fx/deliveries/d%2F2",
+    );
     assert.equal(new Wire().client({ baseUrl: "http://claw.local" }).sessions.deliveryLink("s", "d"), null);
   });
 
@@ -214,4 +217,30 @@ describe("reading a session", () => {
     assert.equal(err.kind, "network");
     assert.ok(!err.message.includes("token"));
   });
+});
+
+describe("how Claw was not reached", () => {
+  const failed = (cause: Error): TypeError => new TypeError("fetch failed", { cause });
+  const coded = (code: string): Error => Object.assign(new Error(`connect ${code} 10.0.0.1:443`), { code });
+  const cases: Array<[string, () => unknown, string]> = [
+    ["a refused connection", () => failed(coded("ECONNREFUSED")), "connect"],
+    ["no such host", () => failed(coded("ENOTFOUND")), "connect"],
+    ["a connection not made in time", () => failed(coded("UND_ERR_CONNECT_TIMEOUT")), "timeout"],
+    ["an answer not in time", () => new DOMException("timed out", "TimeoutError"), "timeout"],
+    ["a connection reset after sending", () => failed(coded("ECONNRESET")), "network"],
+    ["an error without a code", () => new TypeError("fetch failed"), "network"],
+    ["a thrown string", () => "x", "network"],
+  ];
+  for (const [what, error, kind] of cases) {
+    it(`a request that never went out is told apart: ${what}`, async () => {
+      const wire = new Wire(() => Promise.reject(error()));
+      const err = await wire
+        .client()
+        .sessions.turn("ak-a", "s1")
+        .catch((e: unknown) => e);
+      assert.ok(err instanceof ClawUnreachable);
+      assert.equal(err.kind, kind);
+      assert.equal(err.message.includes("10.0.0.1"), false);
+    });
+  }
 });

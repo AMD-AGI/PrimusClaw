@@ -10,6 +10,7 @@ import {
   isApiKey,
   notAClawId,
   type ClawCredential,
+  type UnreachableKind,
 } from "@primusclaw/personal-agent";
 
 /** What every call waits for at most, unless it says otherwise (the Python worker's client timeout). */
@@ -119,9 +120,10 @@ export class ClawHttp {
    * reply that comes content-encoded all the same is refused unread. An error reply is only quoted (512 bytes).
    */
   async boundedJson(request: ClawRequest, maxBytes: number, signal?: AbortSignal): Promise<unknown> {
+    const deadline = signal ?? AbortSignal.timeout(request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const response = await this.send(
       { ...request, headers: { ...request.headers, "Accept-Encoding": "identity" } },
-      signal === undefined ? {} : { signal },
+      { signal: deadline },
     );
     const encoding = (response.headers.get("content-encoding") ?? "identity").trim().toLowerCase();
     if (encoding !== "" && encoding !== "identity") {
@@ -129,7 +131,8 @@ export class ClawHttp {
       throw new ReplayRefused("the reply is content-encoded");
     }
     const failed = response.status >= 400;
-    const bytes = await readBounded(response, failed ? 512 : maxBytes, !failed, request.path);
+    const limit = { bytes: failed ? 512 : maxBytes, refuse: !failed };
+    const bytes = await readBounded(response, limit, deadline, request.path);
     const text = new TextDecoder().decode(bytes);
     if (failed) throw new ClawError(response.status, head(text));
     return parseJson(text);
@@ -159,31 +162,45 @@ function parseJson(text: string): unknown {
 }
 
 /**
- * The body, read in pieces up to `limit` bytes: past it, `refuse` (a success) throws ReplayRefused; otherwise (an error
- * reply, only quoted) what was read is cut there.
+ * The body, read in pieces up to `limit.bytes`: past it, a success (`refuse`) throws ReplayRefused; an error reply,
+ * only quoted, is cut there. The whole read ends when `deadline` does, whatever the pieces do.
  */
-async function readBounded(response: Response, limit: number, refuse: boolean, what: string): Promise<Uint8Array> {
+async function readBounded(
+  response: Response,
+  limit: { bytes: number; refuse: boolean },
+  deadline: AbortSignal,
+  what: string,
+): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let size = 0;
   const reader = response.body?.getReader();
+  if (reader === undefined) return new Uint8Array();
+  const aborted = new Promise<never>((_, reject) => {
+    const fail = (): void => {
+      reject(unreachable(deadline.reason, what));
+    };
+    if (deadline.aborted) fail();
+    else deadline.addEventListener("abort", fail, { once: true });
+  });
+  aborted.catch(() => undefined);
   try {
     for (;;) {
-      if (reader === undefined) break;
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), aborted]);
       if (done) break;
       chunks.push(value);
       size += value.byteLength;
-      if (size > limit) {
-        await reader.cancel();
-        if (refuse) throw new ReplayRefused(`the reply is larger than ${String(limit)} bytes`);
+      if (size > limit.bytes) {
+        if (limit.refuse) throw new ReplayRefused(`the reply is larger than ${String(limit.bytes)} bytes`);
         break;
       }
     }
   } catch (err) {
-    if (err instanceof ReplayRefused) throw err;
+    if (err instanceof ReplayRefused || err instanceof ClawUnreachable) throw err;
     throw unreachable(err, what);
+  } finally {
+    void reader.cancel().catch(() => undefined);
   }
-  return concat(chunks).subarray(0, limit);
+  return concat(chunks).subarray(0, limit.bytes);
 }
 
 function concat(chunks: readonly Uint8Array[]): Uint8Array {
@@ -196,9 +213,35 @@ function concat(chunks: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** A failure to reach Claw, as core's error: a timeout or an abort is "timeout", anything else "network". */
+/** The socket errors that mean no connection was made, so the request never went out (Python's `httpx.ConnectError`). */
+const CONNECT_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  "UND_ERR_SOCKET_CONNECT",
+]);
+/** A connection that was not made in time is a timeout, as in httpx (`ConnectTimeout`). */
+const TIMEOUT_CODES = new Set(["UND_ERR_CONNECT_TIMEOUT", "ETIMEDOUT"]);
+
+/** The `code` of an error or of the error it was caused by (undici wraps socket errors as `TypeError: fetch failed`). */
+function codeOf(err: unknown): string {
+  for (let at: unknown = err, depth = 0; at instanceof Error && depth < 4; depth++) {
+    const code = (at as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    at = at.cause;
+  }
+  return "";
+}
+
+/** A failure to reach Claw, as core's error: never connected, timed out (or aborted), or broken after it was sent. */
 export function unreachable(err: unknown, what: string): ClawUnreachable {
   const name = err instanceof Error ? err.name : "";
-  const kind = name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
+  const code = codeOf(err);
+  let kind: UnreachableKind = "network";
+  if (name === "TimeoutError" || name === "AbortError" || TIMEOUT_CODES.has(code)) kind = "timeout";
+  else if (CONNECT_CODES.has(code)) kind = "connect";
   return new ClawUnreachable(kind, what.split("?")[0] ?? what);
 }
