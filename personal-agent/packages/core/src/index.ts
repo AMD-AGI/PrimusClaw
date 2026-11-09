@@ -9,6 +9,7 @@
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
 export * from "./errors.js";
+export * from "./json.js";
 export * from "./locales/index.js";
 export * from "./plugins/index.js";
 export * from "./ports/index.js";

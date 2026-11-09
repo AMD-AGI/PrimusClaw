@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import type { JsonObject } from "../json.js";
 import type { Result } from "../result.js";
 
 /**
@@ -147,6 +148,15 @@ export interface Citation {
   readonly abstract: string;
 }
 
+/**
+ * A reply to tap: the button's `title` and the text it sends as the person's message, `value` (they differ: "Back to
+ * Clawy" sends "back to Clawy"; Teams: an imBack action).
+ */
+export interface SuggestedReply {
+  readonly title: string;
+  readonly value: string;
+}
+
 /** What a message is. */
 export type OutBody =
   /** Plain text, sent as markdown. */
@@ -166,7 +176,7 @@ export interface OutMessage {
   /** People to @mention, in the order given. */
   readonly mentions?: readonly UserRef[];
   /** Replies to tap (at most three are shown). */
-  readonly suggestions?: readonly string[];
+  readonly suggestions?: readonly SuggestedReply[];
   readonly citations?: readonly Citation[];
 }
 
@@ -212,6 +222,14 @@ export interface LiveStream {
 }
 
 /**
+ * A message built for one conversation and not yet sent: the channel's own envelope (Teams: the Python worker's
+ * `{"operation": "send", "reference": ..., "activity": ...}`), opaque to core. A flow that must keep what it is about to
+ * send until it has been sent (an approval card, a question card) stores it first and `deliver`s it after; another
+ * worker can deliver a stored one again. Stored as JSON, byte-for-byte what the Python worker stored.
+ */
+export type Envelope = JsonObject;
+
+/**
  * One conversation's outbound side (the Python `Messenger`). In a group conversation the adapter masks credential
  * shapes in everything it posts, since every member sees it.
  */
@@ -226,13 +244,24 @@ export interface Conversation {
   post(message: OutMessage): Promise<MessageId | undefined>;
   update(id: MessageId, message: OutMessage): Promise<void>;
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>>;
-  /** A live stream that answers `replyTo` (the person's message); refused when the channel cannot stream here. */
+  /** The envelope `send` would publish for `message` (masked in a group), built without sending it. */
+  outgoing(message: OutMessage): Envelope;
+  /** Publish an envelope `outgoing` built (possibly in another process, from storage). */
+  deliver(envelope: Envelope): Promise<void>;
+  /**
+   * A live stream that answers `replyTo` (the person's message), showing `status` as its first informative update.
+   * Success means that first update has been sent and the channel took it; refused when the channel cannot stream here
+   * or did not take it. What a caller tracks about the stream (whether text was streamed, its age, whether it can still
+   * be closed) is kept by core's own stream wrapper, not by the port.
+   */
   openStream(replyTo: MessageId, status: string): Promise<Result<LiveStream, StreamRefused>>;
 }
 
 /** A file's bytes, fetched by the adapter; refused when the channel would not give them. */
 export interface FetchedFile {
   readonly name: string;
+  /** The media type the file is uploaded with (e.g. "image/png", "text/plain"). */
+  readonly mediaType: string;
   readonly bytes: Uint8Array;
 }
 
