@@ -79,4 +79,3 @@ export function parseReviewHandoff(raw: unknown): ReviewHandoff | undefined {
     said,
   };
 }
-
