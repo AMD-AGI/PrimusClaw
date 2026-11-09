@@ -313,3 +313,29 @@ test("the invoke returns at once while github is slow", async () => {
   await world.thumbs.settled();
   assert.equal(world.issues.issues.length, 1);
 });
+
+test("a vote's message id is the python voted message id: prefixed, hashed when claw would refuse it, none when empty", async () => {
+  // Python: voted_message_id({"replyToId": ...}) for each; a missing replyToId reaches core as "" (the adapter's pyStr).
+  const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
+  for (const [replyTo, stored] of [
+    ["1730880000123", "teams:1730880000123"],
+    ["1:abc/def ghi", `teams:${sha("1:abc/def ghi").slice(0, 40)}`],
+    ["", undefined],
+    ["   ", undefined],
+  ] as const) {
+    const world = linkedWorld();
+    vote(world, "like", "", "", replyTo);
+    await world.thumbs.settled();
+    assert.deepEqual(
+      world.claw.votes.map((v) => v[2]),
+      stored === undefined ? [] : [stored],
+      replyTo,
+    );
+    if (stored === undefined) {
+      assert.equal(
+        world.log.lines.find((l) => l.message === "feedback vote")?.fields["outcome"],
+        "no message to vote on",
+      );
+    }
+  }
+});
