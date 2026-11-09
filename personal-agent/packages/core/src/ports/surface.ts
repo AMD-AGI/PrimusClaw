@@ -88,7 +88,11 @@ export interface InboundQuote {
   readonly fromBot: boolean;
   /** When it was written, as the channel said it ("" when not said). */
   readonly sentAt: string;
-  /** The quoted message was deleted (its text is then ""), as opposed to a quote whose text the channel did not give. */
+  /**
+   * The channel says the quoted message was deleted. Independent of `text`: a deleted quote may still carry a preview,
+   * which is shown as any quote's text; only when `text` is empty does `deleted` decide what is said instead ("the
+   * quoted message was deleted" rather than "its text is not available"), as Python `quote_block` does.
+   */
   readonly deleted: boolean;
   /**
    * Where the adapter read the quote (for a log line, never the text): a structured entity, the message's HTML, or a
