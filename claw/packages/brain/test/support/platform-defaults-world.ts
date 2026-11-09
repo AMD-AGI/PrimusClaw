@@ -10,8 +10,8 @@
  */
 import http from "node:http";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tmpDir } from "../../../utils/test/tmp-dirs.js";
 import type { AddressInfo } from "node:net";
 import AdmZip from "adm-zip";
 
@@ -119,7 +119,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
   process.env.ANTHROPIC_API_KEY = "test-key";
   process.env.WEB_SEARCH_PROVIDER = "disabled";
   if (defaultsFile) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claw-pd-test-"));
+    const dir = tmpDir("claw-pd-test-");
     const f = path.join(dir, "defaults.json");
     fs.writeFileSync(f, JSON.stringify(defaultsFile));
     process.env.PLATFORM_DEFAULTS_FILE = f;

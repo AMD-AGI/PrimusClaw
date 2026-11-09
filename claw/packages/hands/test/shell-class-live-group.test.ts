@@ -20,18 +20,18 @@
 
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { existsSync } from "node:fs";
 import { isolatingSandbox } from "./support/sandbox-isolation.js";
 import { until } from "./support/group-settled.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 isolatingSandbox();
 
 process.env.WORKSPACE_PATH = tmpdir();
-const STATE_ROOT_FOR_CLEANUP = mkdtempSync(join(tmpdir(), "shell-class-live-group-"));
+const STATE_ROOT_FOR_CLEANUP = tmpDir("shell-class-live-group-");
 process.env.HANDS_STATE_DIR = STATE_ROOT_FOR_CLEANUP;
 process.env.BG_SHELL_ENABLED = "true";
 process.env.BG_SHELL_REAP_DELAY_MS = "60000";

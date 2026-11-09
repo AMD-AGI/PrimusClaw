@@ -77,7 +77,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { JUDGE_RETRY_NOTE } from "./e2e/sa-eval-lib.js";
-import { tmpDir } from "./tmp-dirs.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const API_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = join(API_DIR, "test", "e2e", "sa-eval.ts");

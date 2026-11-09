@@ -301,7 +301,7 @@ const MTIME_RESTORES: MtimeRestore[] = [
     name: "tar x of an archive built with that mtime",
     rewrite: (sb) => {
       const stage = `${sb.root}-stage`;
-      created.push(stage);
+      created.push(stage, `${stage}.tar`);
       sh(`mkdir -p ${stage}/pkg && printf 1.2.4 > ${stage}/pkg/VERSION && touch -d @${T_FIXED} ${stage}/pkg/VERSION`
         + ` && tar -C ${stage} -cf ${stage}.tar pkg && tar -C ${sb.root} -xf ${stage}.tar`);
     },

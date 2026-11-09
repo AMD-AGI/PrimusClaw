@@ -161,3 +161,16 @@ test("no scratch directory is left behind by a download that failed", async () =
   const after = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("claw-skill-50-"));
   assert.equal(after.length, before.length);
 });
+
+test("no scratch directory is left behind by a download that succeeded, or by a turn served from the held copy", async () => {
+  tools.set(51, tool(51));
+  const scratch = () => fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("claw-skill-51-"));
+  const before = scratch();
+  const first = await turn([51]);
+  assert.deepEqual(first.downloads, [51]);
+  const second = await turn([51]);
+  assert.deepEqual(second.downloads, [], "the second turn is served from the held copy");
+  // What the turns installed is still there: only the scratch copy is gone.
+  for (const t of [first, second]) assert.ok(Object.keys(skillFiles(t.sessionDir, "skill51")).length > 0);
+  assert.deepEqual(scratch(), before);
+});
