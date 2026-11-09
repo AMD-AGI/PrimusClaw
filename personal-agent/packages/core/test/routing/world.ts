@@ -30,6 +30,7 @@ import { FakeSurface } from "../../../../test-support/surface.js";
 import type { RouterConfig, RouterDeps, RouterLimits } from "../../src/routing/deps.js";
 import type { AssistantChat, RemoteChat } from "../../src/routing/features.js";
 import { Router } from "../../src/routing/router.js";
+import { StopButtons } from "../../src/turn/stop-buttons.js";
 import type { TurnHooks, TurnOutcome, TurnRun, TurnRunner } from "../../src/routing/turn-runner.js";
 import { ALICE, FakeExchange, note } from "./fixtures.js";
 
@@ -225,6 +226,7 @@ export function world(options: WorldOptions = {}) {
     assistant: { ...OFF_ASSISTANT, ...options.assistant },
     remote: { ...OFF_REMOTE, ...options.remote },
     turns,
+    stopCards: new StopButtons({ clock, random: new SeededRandom(5), log: silent }),
     proactive: { muted: () => null, release: () => Promise.resolve() },
     observing: { forward: () => Promise.resolve(), mayTurnOn: () => false, board: () => Promise.resolve() },
     github: undefined,
