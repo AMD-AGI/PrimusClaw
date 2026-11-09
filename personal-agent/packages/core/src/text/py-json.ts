@@ -39,7 +39,10 @@ function reprString(text: string): string {
   return `${quote}${body.join("")}${quote}`;
 }
 
-/** `repr(value)` for a value parsed from JSON (`None`, `True`, `'text'`, `[1, 2]`, `{'a': 1}`). */
+/**
+ * `repr(value)` for a value parsed from JSON (`None`, `True`, `'text'`, `[1, 2]`, `{'a': 1}`). An object's keys are in
+ * its order, which JavaScript keeps for every key but integer-like ones ("2", "10"): those come first, ascending.
+ */
 export function pyRepr(value: unknown): string {
   if (value === null || value === undefined) return "None";
   if (typeof value === "boolean") return value ? "True" : "False";
@@ -99,6 +102,7 @@ function encode(value: unknown, options: JsonDumpsOptions, depth: number): strin
     return container("{", "}", items, options, depth);
   }
   if (typeof value === "number") return pyNumber(value, "json");
+  if (typeof value === "bigint") return value.toString();
   if (typeof value === "string") return jsonString(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   return "null";

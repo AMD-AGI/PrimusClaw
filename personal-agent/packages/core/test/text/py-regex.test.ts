@@ -17,8 +17,9 @@ import {
 import { InvariantError } from "../../src/errors.js";
 
 /**
- * (pattern, flags, text, what Python 3's re.fullmatch said). `\\p{Lu}` was checked in Python with the class of the
- * capitals in the text, since Python's re has no \\p.
+ * (pattern, flags, text, what Python 3's re.fullmatch said). Two spellings are JavaScript's, accepted as extensions for
+ * hand-built patterns and checked in Python in Python's spelling: `(?<name>...)` as `(?P<name>...)`, and `\\p{Lu}` as
+ * the class of the capitals in the text (Python's re has no \\p).
  */
 const CASES: readonly (readonly [string, string, string, boolean])[] = [
   ["[a._-]", "i", "-", true],
@@ -205,4 +206,36 @@ test("what has no JavaScript form is refused when the pattern is built, never re
     assert.throws(() => pyRegExp(pattern, flags), InvariantError, pattern);
   }
   // In Python a(?s:.)b matches "a\nb" and (?i:link) matches "LİNK": refusing is the only answer that is not wrong.
+});
+
+/** Round-3 review cases: (pattern, flags, text, how, what CPython 3 said). */
+const FOLLOW_UP: readonly (readonly [string, string, string, string, boolean])[] = [
+  ["\\w", "i", "\u0345", "full", false],
+  ["\\W", "i", "\u0345", "full", true],
+  ["\\bA", "i", "\u0345A", "search", true],
+  ["[\\w]", "i", "\u0345", "full", false],
+  ["[^\\w]", "i", "\u0345", "full", true],
+  ["[\\w\u0345]", "i", "\u0345", "full", true],
+  ["[\\w-]+", "i", "Ab-c", "full", true],
+  ["(?#c)(?i)a", "", "A", "full", true],
+  ["(?i)(?#c)(?m)^a$", "", "x\nA", "search", true],
+  ["(?im)^a", "", "b\nA", "search", true],
+];
+
+test("U+0345 is no word character under IGNORECASE and flag groups may follow a leading comment, as in Python", () => {
+  for (const [pattern, flags, text, how, python] of FOLLOW_UP) {
+    const regex = how === "search" ? pyRegExp(pattern, flags) : pyFullmatch(pattern, flags);
+    assert.equal(regex.test(text), python, `${how} ${pattern} /${flags} ${JSON.stringify(text)}`);
+  }
+});
+
+test("a full match is the same on every call and Python's own errors are refused, never thrown raw", () => {
+  assert.throws(() => pyFullmatch("a", "g"), InvariantError); // g/y would make test() stateful
+  assert.throws(() => pyFullmatch("a", "y"), InvariantError);
+  const again = pyFullmatch("a");
+  assert.ok(again.test("a") && again.test("a"));
+  assert.equal(pyRegExp("a", "gi").flags, "giu"); // searching for every match keeps g
+  for (const pattern of ["(?g)a", "[\\777]", "\\U00110000", "[\\p{NoSuch}]", "(?x)a"]) {
+    assert.throws(() => pyRegExp(pattern), InvariantError, pattern);
+  }
 });

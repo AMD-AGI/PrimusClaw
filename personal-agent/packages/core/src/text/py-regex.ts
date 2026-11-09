@@ -2,7 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 import { InvariantError } from "../errors.js";
-import { END, I_VARIANTS, START, literal, translateEscape, type EscapeContext } from "./py-regex-escapes.js";
+import {
+  COMBINING_IOTA,
+  END,
+  I_VARIANTS,
+  PY_W_CHARS,
+  START,
+  literal,
+  translateEscape,
+  type EscapeContext,
+} from "./py-regex-escapes.js";
 
 export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes.js";
 
@@ -53,17 +62,24 @@ interface Step {
 
 /**
  * With `i`: a class that takes any of `i`, `I`, `ı`, `İ` takes all four (a negated one then refuses them all). They go
- * first in the class, so a class ending in a literal `-` keeps it literal.
+ * first in the class, so a class ending in a literal `-` keeps it literal. And a class with `\w` would take U+0345
+ * (JavaScript folds it to ι), which Python's does not: unless the class names it itself, it is kept out (a negated
+ * one lets it through).
  */
 function closeClass(state: State, ignoreCase: boolean): void {
   const body = state.out.slice(state.classStart);
   const negated = body.startsWith("[^");
-  const positive = new RegExp(negated ? `[${body.slice(2)}]` : `${body}]`, "iu");
-  if (ignoreCase && Array.from(I_VARIANTS).some((ch) => positive.test(ch))) {
-    const at = state.classStart + (negated ? 2 : 1);
-    state.out = state.out.slice(0, at) + I_VARIANTS + state.out.slice(at);
+  const positive = negated ? `[${body.slice(2)}]` : `${body}]`;
+  let inner = body;
+  if (ignoreCase && Array.from(I_VARIANTS).some((ch) => compile(positive, "iu").test(ch))) {
+    const at = negated ? 2 : 1;
+    inner = inner.slice(0, at) + I_VARIANTS + inner.slice(at);
   }
-  state.out += "]";
+  inner += "]";
+  if (ignoreCase && body.includes(PY_W_CHARS) && !compile(positive, "u").test("\u0345")) {
+    inner = negated ? `(?:${COMBINING_IOTA}|${inner})` : `(?:(?!${COMBINING_IOTA})${inner})`;
+  }
+  state.out = state.out.slice(0, state.classStart) + inner;
   state.inClass = false;
 }
 
@@ -154,13 +170,28 @@ function translate(source: string, flags: Flags): string {
 }
 
 /** A leading `(?ims)` of the source as flags; the rest of the source. */
-function leadingFlags(source: string, flags: string): { source: string; flags: Flags } {
-  const inline = /^\(\?([a-zA-Z]+)\)/.exec(source);
-  const letters = flags + (inline?.[1] ?? "");
-  const unknown = Array.from(letters).filter((f) => !"imsgy".includes(f));
+/**
+ * The flags at the start of the source (`(?ims)` groups, with comments between them, as Python allows), then the rest.
+ * Inline: only `i`, `m`, `s` (Python's `a`, `L`, `u`, `x` have no JavaScript form; anything else is no Python flag).
+ * Given: those, and JavaScript's `g`/`y` for searching (`pyRegExp` only: they make a full match stateful).
+ */
+function leadingFlags(source: string, flags: string, given: string): { source: string; flags: Flags } {
+  let rest = source;
+  let inline = "";
+  for (;;) {
+    const lead = /^\((?:\?#[^)]*|\?([a-zA-Z]+))\)/.exec(rest);
+    if (lead === null) break;
+    inline += lead[1] ?? "";
+    rest = rest.slice(lead[0].length);
+  }
+  const unknown = [
+    ...Array.from(inline).filter((f) => !"ims".includes(f)),
+    ...Array.from(flags).filter((f) => !given.includes(f)),
+  ];
   if (unknown.length) throw new InvariantError(`the flags ${unknown.join("")} have no JavaScript form here`);
+  const letters = flags + inline;
   return {
-    source: inline ? source.slice(inline[0].length) : source,
+    source: rest,
     flags: { ignoreCase: letters.includes("i"), multiline: letters.includes("m"), dotAll: letters.includes("s") },
   };
 }
@@ -179,14 +210,20 @@ function compile(pattern: string, flags: string): RegExp {
   }
 }
 
-/** `re.compile(source, flags)` used with `search`: `regex.exec(text)` finds the first match anywhere. */
+/**
+ * `re.compile(source, flags)` used with `search`: `regex.exec(text)` finds the first match anywhere. `flags`: `i`, `m`,
+ * `s`, and JavaScript's `g`/`y` for finding every match.
+ */
 export function pyRegExp(source: string, flags = ""): RegExp {
-  const read = leadingFlags(source, flags.replaceAll("u", ""));
+  const read = leadingFlags(source, flags.replaceAll("u", ""), "imsgy");
   return compile(translate(read.source, read.flags), jsFlags(flags, read.flags));
 }
 
-/** `re.fullmatch(source, text, flags)` as a RegExp: `regex.test(text)` / `regex.exec(text)` match the whole text. */
+/**
+ * `re.fullmatch(source, text, flags)` as a RegExp: `regex.test(text)` / `regex.exec(text)` match the whole text, the same
+ * on every call (`g`/`y` would make it stateful, so they are refused). `flags`: `i`, `m`, `s`.
+ */
 export function pyFullmatch(source: string, flags = ""): RegExp {
-  const read = leadingFlags(source, flags.replaceAll("u", ""));
+  const read = leadingFlags(source, flags.replaceAll("u", ""), "ims");
   return compile(`${START}(?:${translate(read.source, read.flags)})${END}`, jsFlags(flags, read.flags));
 }

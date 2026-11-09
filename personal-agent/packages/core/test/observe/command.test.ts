@@ -35,6 +35,7 @@ test("a suggestion shows a reply's text, a task's title and brief, else the call
   assert.equal(toolOf("mcp__assistant__say"), "say");
   assert.equal(toolOf("say"), "say");
   assert.equal(toolOf(undefined), "");
+  assert.equal(toolOf(5), "5"); // Python: str(raw or "")
   assert.deepEqual(describeCall("say", { text: "on it" }), { kind: "在群里回复 / Reply in the group", what: "on it" });
   assert.deepEqual(describeCall("say", "not an object"), { kind: "在群里回复 / Reply in the group", what: "" });
   assert.deepEqual(describeCall("work_create", { title: "Fix CI", brief: "" }), {

@@ -70,14 +70,18 @@ export function objectOf(value: unknown): Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/** A timestamp as Claw writes it (epoch seconds or milliseconds, or ISO 8601), in seconds. */
+/** ISO 8601's fraction of a second, which `Date.parse` cuts to milliseconds and Python keeps to microseconds. */
+const FRACTION = /^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$/;
+
+/** A timestamp as Claw writes it (epoch seconds or milliseconds, or ISO 8601 to the microsecond), in seconds. */
 export function secondsOf(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value > 1e11 ? value / 1000 : value;
-  if (typeof value === "string" && value) {
-    const ms = Date.parse(value);
-    return Number.isNaN(ms) ? undefined : ms / 1000;
-  }
-  return undefined;
+  if (typeof value !== "string" || !value) return undefined;
+  const parts = FRACTION.exec(value);
+  const ms = Date.parse(parts ? `${parts[1] ?? ""}${parts[3] ?? ""}` : value);
+  if (Number.isNaN(ms)) return undefined;
+  const fraction = parts ? Number(`0.${(parts[2] ?? "").slice(0, 6)}`) : 0;
+  return ms / 1000 + fraction;
 }
 
 function eventOf(row: HistoryRow): TurnEvent {

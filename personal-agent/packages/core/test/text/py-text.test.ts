@@ -280,3 +280,12 @@ test("isupper, repr and str of containers, exact integers and fixed decimals of 
   assert.equal(fixedN(1.25, 101), `1.25${"0".repeat(99)}`);
   assert.equal(pyJsonDumps("\ud800x"), '"\ud800x"'); // a lone surrogate is written raw, as Python's ensure_ascii=False does
 });
+
+test("negative zero and big integers are written as Python writes them", () => {
+  // CPython 3: json.dumps(-0.0) and repr(-0.0) are -0.0; json.dumps(9007199254740993) is the integer.
+  assert.equal(pyJsonDumps(-0), "-0.0");
+  assert.equal(pyRepr(-0), "-0.0");
+  assert.equal(pyStr(-0), ""); // -0.0 is falsy
+  assert.equal(pyJsonDumps(9007199254740993n), "9007199254740993");
+  assert.equal(pyJsonDumps({ n: 1, z: -0 }), '{"n": 1, "z": -0.0}');
+});

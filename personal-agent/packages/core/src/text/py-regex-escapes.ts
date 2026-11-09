@@ -26,6 +26,19 @@ export const END = String.raw`(?![\s\S])`;
 export const I_VARIANTS = "iIıİ";
 const I_SET: ReadonlySet<string> = new Set(Array.from(I_VARIANTS));
 
+/**
+ * Under IGNORECASE JavaScript folds a class's letters and finds U+0345 (which folds to the letter ι) in `\p{L}`; Python
+ * does not count it a word character. These are `\w`, `\W` and the boundaries with it left out.
+ */
+export const COMBINING_IOTA = "\\u{345}";
+const PY_W_I = `(?:(?!${COMBINING_IOTA})${PY_W})`;
+const OUTSIDE_I: Readonly<Record<string, string>> = {
+  w: PY_W_I,
+  W: `(?:${COMBINING_IOTA}|[^${PY_W_CHARS}])`,
+  b: `(?:(?<=${PY_W_I})(?!${PY_W_I})|(?<!${PY_W_I})(?=${PY_W_I}))`,
+  B: `(?:(?<=${PY_W_I})(?=${PY_W_I})|(?<!${PY_W_I})(?!${PY_W_I}))`,
+};
+
 const OUTSIDE: Readonly<Record<string, string>> = {
   s: `[${PY_SPACE}]`,
   S: `[^${PY_SPACE}]`,
@@ -57,6 +70,12 @@ export interface Escape {
   readonly length: number;
 }
 
+/** A code point a Python escape names, refused past U+10FFFF (or past `max`). */
+function codePoint(value: number, what: string, max = 0x10ffff): string {
+  if (!Number.isInteger(value) || value > max) refuse(what);
+  return String.fromCodePoint(value);
+}
+
 /** One character as a JavaScript literal; under IGNORECASE, outside a class, `i`, `I`, `ı`, `İ` are one another. */
 export function literal(ch: string, context: EscapeContext): string {
   if (context.ignoreCase && !context.inClass && I_SET.has(ch)) return `[${I_VARIANTS}]`;
@@ -73,15 +92,17 @@ function hexEscape(source: string, i: number, context: EscapeContext): Escape {
   const digits = HEX[kind] ?? 0;
   const hex = source.slice(i + 2, i + 2 + digits);
   if (!new RegExp(`^[0-9a-fA-F]{${String(digits)}}$`).test(hex)) refuse(`the escape \\${kind}${hex}`);
-  return { text: literal(String.fromCodePoint(parseInt(hex, 16)), context), length: 2 + digits };
+  return { text: literal(codePoint(parseInt(hex, 16), `the escape \\${kind}${hex}`), context), length: 2 + digits };
 }
 
 /** `\0`, `\012`, `\101` (octal) and, outside a class, `\1`-`\99` (a group's text again). */
 function digitEscape(source: string, i: number, context: EscapeContext): Escape {
   const rest = source.slice(i + 1);
   const octal = /^(?:0[0-7]{0,2}|[0-3][0-7]{2})/.exec(rest) ?? (context.inClass ? /^[0-7]{1,3}/.exec(rest) : null);
-  if (octal)
-    return { text: literal(String.fromCodePoint(parseInt(octal[0], 8)), context), length: 1 + octal[0].length };
+  if (octal) {
+    const ch = codePoint(parseInt(octal[0], 8), `the octal escape \\${octal[0]} (past \\377)`, 0o377);
+    return { text: literal(ch, context), length: 1 + octal[0].length };
+  }
   const group = /^[1-9][0-9]?/.exec(rest);
   if (!group || context.inClass) refuse(`the escape \\${rest.charAt(0)}`);
   // JavaScript compares a group's text again with its own case folding, which keeps ı and İ apart from i
@@ -99,7 +120,8 @@ function propertyEscape(source: string, i: number): Escape | undefined {
 function letterEscape(letter: string, context: EscapeContext): string | undefined {
   if (SAME.has(letter)) return `\\${letter}`;
   if (letter === "a") return "\\x07";
-  return (context.inClass ? INSIDE : OUTSIDE)[letter];
+  if (context.inClass) return INSIDE[letter]; // (\w in a class under IGNORECASE: see `closeClass`)
+  return (context.ignoreCase ? OUTSIDE_I[letter] : undefined) ?? OUTSIDE[letter];
 }
 
 /** The escape that starts at `source[i]` (a backslash), as JavaScript pattern text. */
