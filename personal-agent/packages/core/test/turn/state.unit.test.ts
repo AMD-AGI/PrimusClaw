@@ -16,7 +16,6 @@ import { lastAnswer } from "../../src/turn/last-answer.js";
 import { LiveView } from "../../src/turn/live-view.js";
 import { planHead } from "../../src/turn/plan.js";
 import { TurnState } from "../../src/turn/turn-state.js";
-import { clipPrSummary, looksLikeFailure, serviceRefusal, splitErrorTail } from "../../src/turn/upstream.js";
 import { fakeRefusals, RAW403 } from "./fake-refusals.js";
 import { play } from "./play.js";
 import { Timeline } from "./timeline.js";
@@ -187,25 +186,6 @@ it("a session that cannot be put back on its model for a reason that is not Claw
     }),
     TypeError,
   );
-});
-
-it("the stand-ins: a refusal word Claw does not name reads as the last one, a summary is one clipped line", () => {
-  assert.equal(
-    serviceRefusal("unknown_word", "Nothing."),
-    "PrimusClaw says this answer is not yours to give. Nothing.",
-  );
-  assert.equal(clipPrSummary(5), "");
-  assert.equal(clipPrSummary("  "), "");
-  assert.equal(clipPrSummary("中".repeat(100)), `${"中".repeat(79)}…`);
-  assert.equal(clipPrSummary("a".repeat(200)).length, 160);
-  assert.equal(looksLikeFailure(5), false);
-  assert.equal(looksLikeFailure("API Error: 500 boom"), true);
-  assert.deepEqual(splitErrorTail(5), ["", ""]);
-  assert.deepEqual(splitErrorTail("words\n\nmore\n\nAPI Error: 500 x\n\ntail"), [
-    "words\n\nmore",
-    "API Error: 500 x\n\ntail",
-  ]);
-  assert.deepEqual(splitErrorTail("just words"), ["just words", ""]);
 });
 
 it("the plan's count is a status line in a 1:1 chat, with the agent's newest words, and none in a group", () => {

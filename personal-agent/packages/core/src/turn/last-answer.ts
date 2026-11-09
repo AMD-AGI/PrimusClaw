@@ -10,7 +10,10 @@ import type { Logger } from "../ports/logger.js";
 import { sleepSeconds, type TurnClaw } from "./ports.js";
 import { TurnState, messageIdOf } from "./turn-state.js";
 import type { PublicErrors } from "../public-error/public-errors.js";
-import { ClawError, errorKind, pickLang, type SseEvent, splitErrorTail } from "./upstream.js";
+import { ClawError, errorKind } from "../claw/errors.js";
+import type { SseEvent } from "../claw/model.js";
+import { pickLang } from "../language/detect.js";
+import { splitErrorTail } from "../public-error/classify.js";
 import { isClawFailure } from "./engine/claw-errors.js";
 
 export const READ_OVERALL_SECONDS = 20;
@@ -134,7 +137,7 @@ function answerOf(lastDone: TurnState | undefined, sessionId: string, deps: Last
   const answer = lastDone.answer;
   if (!lastDone.failed) return answer;
   // as in a turn: the error that ended it is cut off and logged, the model's words stay
-  const [words, error] = splitErrorTail(answer);
+  const { kept: words, tail: error } = splitErrorTail(answer);
   if (!error) return answer;
   const ref = deps.errors.withhold("last_answer_failed", error, { session: sessionId });
   deps.log.info("the user is told the task failed", { ref });

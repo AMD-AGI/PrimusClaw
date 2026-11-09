@@ -8,7 +8,9 @@ import { turnEnglish, turnText } from "../../locales/turn.js";
 import { answerParts } from "../answer-parts.js";
 import type { TurnState } from "../turn-state.js";
 import type { PublicErrors } from "../../public-error/public-errors.js";
-import { type ClawError, errorKind, SERVICE_REFUSAL_REASONS, serviceRefusal } from "../upstream.js";
+import { type ClawError, errorKind } from "../../claw/errors.js";
+import { serviceRefusal } from "../../claw/service-refusal.js";
+import { clawText } from "../../locales/claw.js";
 import { langOf, type TurnContext } from "./context.js";
 
 /** The chat stops following a turn after this; the run itself does not stop. */
@@ -23,8 +25,8 @@ export function stillRunningText(ctx: TurnContext, deadlineSeconds = TURN_DEADLI
 
 /** What a Claw refusal before the turn ran is said as. The log gets the status and Claw's error word only, never the body. */
 export function clawFailure(errors: PublicErrors, err: ClawError, review = false): string {
-  if (err.status === 403 && Object.hasOwn(SERVICE_REFUSAL_REASONS, err.code)) {
-    return serviceRefusal(err.code, turnEnglish.nothingStarted);
+  if (err.status === 403 && Object.hasOwn(clawText.in("en"), err.code)) {
+    return serviceRefusal(err, turnEnglish.nothingStarted);
   }
   // (the group is not told to /unlink and link again: that is for the asker alone, who is messaged)
   if (review && err.status === 401) return turnEnglish.reviewRefused;
