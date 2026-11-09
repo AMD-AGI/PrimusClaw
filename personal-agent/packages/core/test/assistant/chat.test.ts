@@ -67,6 +67,7 @@ function world(options: Partial<AssistantChatOptions> & { streaming?: boolean } 
     legacyTurn: () => legacy,
     files: undefined,
     onFilesDropped: (_path, count) => dropped.push(count),
+    board: { show: () => Promise.resolve() },
     commands: {
       parse: (t) => /^\/(\w+)/.exec(t)?.[1],
       args: (t, name) => (t.startsWith(`/${name}`) ? t.slice(name.length + 1).trim() : undefined),
