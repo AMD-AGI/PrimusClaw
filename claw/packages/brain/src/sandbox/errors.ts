@@ -166,6 +166,37 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
 }
 
 /**
+ * What SaFE writes when the platform, not the container, ended a pod: the
+ * DisruptionTarget condition it records on the pod ("DisruptionTarget:
+ * <reason> ...", or "pod <name> was taken away by a disruption, ..." for a pod
+ * that then reported success), and the pod-level reasons Kubernetes gives a pod
+ * it killed from above the container (NodeLost, Evicted, Preempted, NodeShutdown).
+ * The CamelCase tokens are matched as written, so ordinary prose does not match.
+ */
+const WORKLOAD_DISRUPTION = new RegExp([
+  String.raw`\bDisruptionTarget\b`,
+  "taken away by a disruption",
+  String.raw`\b(?:NodeLost|Evicted|Preempted|NodeShutdown|PreemptionByScheduler|DeletionByTaintManager|DeletionByPodGC|TerminationByKubelet|EvictionByEvictionAPI)\b`,
+].join("|"));
+
+/**
+ * Whether a terminal SaFE workload detail says the platform took its pod away
+ * (its node lost, an eviction, a preemption) rather than its container failing.
+ * Reads every condition's message, the top-level message and each pod's
+ * `failedMessage`; a payload that says nothing of the kind is false.
+ */
+export function workloadDisrupted(info: Record<string, unknown>): boolean {
+  const texts: string[] = [String(info.message ?? "")];
+  if (Array.isArray(info.conditions)) {
+    for (const c of info.conditions as Array<Record<string, unknown> | null>) texts.push(String(c?.message ?? ""));
+  }
+  if (Array.isArray(info.pods)) {
+    for (const p of info.pods as Array<Record<string, unknown> | null>) texts.push(String(p?.failedMessage ?? ""));
+  }
+  return texts.some((t) => WORKLOAD_DISRUPTION.test(t));
+}
+
+/**
  * The sandbox this call targeted does not exist any more.
  *
  * Distinct from a transport failure on purpose. Keepalive tolerates several

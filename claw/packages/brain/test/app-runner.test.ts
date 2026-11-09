@@ -227,11 +227,14 @@ test("T11 a manifest with no restart policy fails the run on the first non-final
   assert.equal(h.world.rec.restarts, 0);
 });
 
-for (const phase of ["terminal", "absent"] as const) {
-  test(`T12 sandbox lost (${phase}) while running -> provisioning, counted as a restart, then a new sandbox`, async () => {
+// The application's own container failing; a sandbox the platform took is in app-platform-loss.test.ts.
+const CONTAINER_FAILED = { reason: "sandbox_container_failed" } as const;
+
+for (const reason of ["sandbox_container_failed", "sandbox_envd_exited", "sandbox_timed_out"]) {
+  test(`T12 sandbox lost (${reason}) while running -> provisioning, counted as a restart, then a new sandbox`, async () => {
     const h = harness();
     const wl = await toRunning(h);
-    h.world.killWorkload(wl, phase);
+    h.world.killWorkload(wl, "terminal", { reason });
     await h.runner.reconcile();
     assert.equal(h.world.rec.state, "provisioning");
     assert.equal(h.world.rec.restarts, 1);
@@ -249,7 +252,7 @@ for (const phase of ["terminal", "absent"] as const) {
 test("T13 sandbox lost in starting and in restarting also goes to provisioning, counted", async () => {
   const h = harness();
   await until(h, "starting");
-  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
+  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal", CONTAINER_FAILED);
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "provisioning");
   assert.equal(h.world.rec.restarts, 1);
@@ -259,7 +262,7 @@ test("T13 sandbox lost in starting and in restarting also goes to provisioning, 
   g.world.appExits(wl);
   await g.runner.reconcile();
   assert.equal(g.world.rec.state, "restarting");
-  g.world.killWorkload(wl, "absent");
+  g.world.killWorkload(wl, "terminal", CONTAINER_FAILED);
   await g.runner.reconcile();
   assert.equal(g.world.rec.state, "provisioning");
   assert.equal(g.world.rec.restarts, 2);
@@ -268,12 +271,12 @@ test("T13 sandbox lost in starting and in restarting also goes to provisioning, 
 test("T14 a lost sandbox past max_restarts ends the run as failed, never above the bound, never starting again", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 1, backoff_sec: [1] } } });
   let wl = await toRunning(h);
-  h.world.killWorkload(wl, "terminal");
+  h.world.killWorkload(wl, "terminal", CONTAINER_FAILED);
   await h.runner.reconcile();
   await until(h, "running");
   wl = h.world.rec.sandbox_workload_id!;
   assert.equal(h.world.rec.restarts, 1);
-  h.world.killWorkload(wl, "terminal");
+  h.world.killWorkload(wl, "terminal", CONTAINER_FAILED);
   await h.runner.reconcile();
   // The budget is spent and the reader found no final: finishing, restarts unchanged,
   // and no application-sized sandbox made only to look.
@@ -306,7 +309,7 @@ test("T14b a final exit hidden by a lost sandbox is found even with the budget s
 test("T14c a reader that cannot be made is retried; after three failed looks the loss is counted without one", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
   const wl = await toRunning(h);
-  h.world.killWorkload(wl, "terminal");
+  h.world.killWorkload(wl, "terminal", CONTAINER_FAILED);
   h.world.failReader = 3;
   await assert.rejects(h.runner.reconcile(), /reader could not be created/);
   assert.equal(h.world.rec.state, "running", "a look that failed changes nothing");
@@ -333,7 +336,7 @@ test("T14c' a reader that fails once and then reads a final ends the run as the 
 test("T14d a sandbox lost before the app ever started (no state dir) has nothing to recover", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
   await h.runner.reconcile(); // provisioning -> starting, state_dir still null
-  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
+  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal", CONTAINER_FAILED);
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
   assert.deepEqual(h.world.readers, [], "no state directory, nothing to read");
@@ -1116,7 +1119,9 @@ test("a grant restart whose sandbox is already gone takes the lost-sandbox road"
   await runner.reconcile();
   assert.equal(world.rec.last_exit?.grant_restart, undefined);
   assert.equal(world.rec.state, "provisioning");
-  assert.equal(world.rec.restarts, 1);
+  // A workload that vanished is the platform's loss, not the application's restart.
+  assert.equal(world.rec.restarts, 0);
+  assert.equal(world.rec.last_exit?.platform_losses, 1);
 });
 
 test("a revoked grant is not signed again", async () => {

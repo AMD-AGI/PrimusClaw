@@ -14,8 +14,9 @@
  *   provisioning -> starting -> running -> finishing -> ended
  *                       ^           |
  *                       +-restarting+      (process exited without `final`)
- *   a lost sandbox, in any state, goes back to provisioning and counts as a restart,
- *   unless `exit.json` (read through a small reader sandbox) says the app already ended
+ *   a lost sandbox, in any state, goes back to provisioning, unless `exit.json` (read
+ *   through a small reader sandbox) says the app already ended; it counts as a restart
+ *   only when the application's own container failed ({@link platformLoss})
  *
  * Three rules carry the safety of it, each of them in one place:
  *
@@ -26,7 +27,10 @@
  *    could not be made is not "no `final`": the tick ends and tries again.
  *  - A restart is always counted before it is acted on, and the count is bounded
  *    by `max_restarts` on every road into provisioning or restarting
- *    ({@link AppRunner.countedRestart}).
+ *    ({@link AppRunner.countedRestart}). A sandbox the platform took away (its node
+ *    lost, the site out of nodes) is not the application failing and does not spend
+ *    `max_restarts`; those losses have their own, larger bound
+ *    ({@link PLATFORM_LOSSES_MAX}), so a site that never comes back still ends the run.
  *  - A second process is never started beside a live one: ticks do not overlap,
  *    the probe runs before every start, and the start command checks again inside
  *    the sandbox ({@link startCommand}).
@@ -75,6 +79,47 @@ const START_FAILURES_BEFORE_RESTART = 3;
 const UNPARSEABLE_EXIT_READS = 3;
 /** Consecutive failed looks at shared storage after a lost sandbox before the loss is counted without one. */
 const LOST_SANDBOX_LOOKS = 3;
+/**
+ * Sandboxes the platform may take from one run before the run gives up on it.
+ *
+ * Losses the platform causes are not the application's restarts: a site outage
+ * that downs node after node (2026-11-09: 134 of 219 nodes down, then none usable)
+ * moved one app about six times in an hour and spent its whole `max_restarts`
+ * without the application ever failing. This bound is only there so a run whose
+ * sandbox can never be kept (a site that does not come back, no deadline set) still
+ * ends. A wait for a node that runs out is one loss, and that wait is long (the
+ * start ceiling, 15 minutes, or the queue ceiling), so 24 covers hours of outage.
+ */
+export const PLATFORM_LOSSES_MAX = 24;
+
+/**
+ * The provisioning and sandbox endings that say the platform could not give the
+ * run a sandbox or keep it: no node took it, the queue or start ceiling ran out,
+ * SaFE could not be read, the workload vanished or ended with no failure of its
+ * container named. Everything else (a container that failed, envd exiting, the
+ * sandbox's own TTL, a container that exited before ready) may be the
+ * application or its image, and still counts against `max_restarts`.
+ */
+const PLATFORM_LOSS_REASONS: ReadonlySet<string> = new Set([
+  "sandbox_unschedulable",
+  "sandbox_pending_timeout",
+  "sandbox_start_timeout",
+  "sandbox_status_unreadable",
+  "sandbox_gone",
+  "sandbox_workload_terminal",
+]);
+
+/**
+ * Whether a lost sandbox was the platform's doing rather than the application's.
+ * `reason` is the stable sandbox reason (absent from SaFE reads as `sandbox_gone`, a
+ * terminal workload with no reason as `sandbox_workload_terminal`); `disrupted` is
+ * SaFE saying a disruption (node lost, eviction, preemption) took the pod away,
+ * which wins over whatever the container's exit looked like.
+ */
+export function platformLoss(reason: string | undefined, disrupted = false): boolean {
+  if (disrupted) return true;
+  return PLATFORM_LOSS_REASONS.has(reason ?? "sandbox_workload_terminal");
+}
 /** Attempts at each finishing step before it is given up on, so a run is never held open for ever. */
 const FINISH_STEP_ATTEMPTS = 5;
 /** Consecutive failed ticks, with the store or SaFE unreachable, before finishNow gives up. */
@@ -688,7 +733,11 @@ export class AppRunner {
       // A workload that ended while it was being created is a lost sandbox; any
       // other failure (SaFE unreachable) is transient and the next tick retries,
       // which cannot duplicate a sandbox because ensure adopts a live one.
-      if (provisionTerminalOf(err)) return this.countedRestart("sandbox_lost");
+      const terminal = provisionTerminalOf(err);
+      if (terminal) {
+        logger.warn({ runId: this.runId, reason: terminal.reason }, "app_run.sandbox_not_provisioned");
+        return this.countedRestart("sandbox_lost", undefined, platformLoss(terminal.reason));
+      }
       throw err;
     }
     await this.move({ state: "starting", sandbox_workload_id: sandbox.workloadId }, "provisioning");
@@ -930,13 +979,38 @@ export class AppRunner {
    * The one road to `restarting` or back to `provisioning`: counted, and bounded
    * by `max_restarts`. At the bound the run is finishing, as failed -- after one
    * look for a `final` that a lost sandbox may have hidden.
+   *
+   * `platform` (a sandbox the platform took away, see {@link platformLoss}) goes
+   * back to provisioning without spending `max_restarts`: it is counted in
+   * `last_exit.platform_losses` instead, bounded by {@link PLATFORM_LOSSES_MAX}. The
+   * count is carried on every later `last_exit` this road writes, so a takeover
+   * keeps it.
    */
   private async countedRestart(
     cause: "exit" | "sandbox_lost" | "start_failed",
     last?: AppLastExit,
+    platform = false,
   ): Promise<TickResult> {
     const rec = this.rec;
-    const lastExit: AppLastExit = last ?? { at: this.iso(), cause, final: false };
+    const losses = rec.last_exit?.platform_losses ?? 0;
+    const lastExit: AppLastExit = {
+      ...(last ?? { at: this.iso(), cause, final: false }),
+      ...(losses > 0 ? { platform_losses: losses } : {}),
+    };
+    if (platform) {
+      if (losses >= PLATFORM_LOSSES_MAX) {
+        await this.move({
+          state: "finishing",
+          last_exit: { ...lastExit, cause: "restarts_exhausted", stop_reason: `the platform lost the app's sandbox ${losses} times` },
+        });
+        return { done: false };
+      }
+      logger.warn({ runId: this.runId, platformLosses: losses + 1, restarts: rec.restarts }, "app_run.platform_loss_not_counted");
+      await this.move({
+        state: "provisioning", sandbox_workload_id: null, last_exit: { ...lastExit, platform_losses: losses + 1 },
+      });
+      return { done: false };
+    }
     if (rec.restarts >= maxRestarts(rec.manifest)) {
       // A lost sandbox has already been looked behind (`finalAfterLoss`, through a small
       // reader sandbox): no application-sized sandbox is made only to read `exit.json`.
@@ -972,12 +1046,13 @@ export class AppRunner {
       return null;
     }
     if (status.state !== "terminal" && status.state !== "absent") return null;
-    logger.warn({ runId: this.runId, workloadId: inst.id, state: status.state, reason: status.reason }, "app_run.sandbox_lost");
+    logger.warn({ runId: this.runId, workloadId: inst.id, state: status.state, reason: status.reason, disrupted: status.disrupted }, "app_run.sandbox_lost");
     // A sandbox can be lost after the application finished (its node preempted, its pod gone
     // with no exit status): `final` is on shared storage and decides, as it does for an exit.
     const exit = await this.finalAfterLoss();
     if (exit) return this.finishFromExit(exit);
-    return this.countedRestart("sandbox_lost");
+    const reason = status.state === "absent" ? "sandbox_gone" : status.reason;
+    return this.countedRestart("sandbox_lost", undefined, platformLoss(reason, status.disrupted === true));
   }
 
   /**
