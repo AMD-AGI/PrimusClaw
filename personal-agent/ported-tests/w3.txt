@@ -168,3 +168,12 @@ teams/tests/test_message_links.py::test_the_marked_text_of_a_review_request_keep
 teams/tests/test_message_links.py::test_the_words_a_command_is_read_from_never_carry_an_address -> packages/teams/test/activity/message-links.test.ts::the words a command is read from never carry an address
 teams/tests/test_message_links.py::test_a_group_masks_a_credential_in_the_address_behind_the_words_and_a_1on1_chat_does_not -> packages/teams/test/activity/message-links.test.ts::a group masks a credential in the address behind the words and a 1on1 chat does not
 teams/tests/test_transport.py::test_mention_markup_is_stripped -> packages/teams/test/activity/transport.test.ts::mention markup is stripped
+teams/tests/test_direct_connector.py::test_the_default_outbound_mode_is_the_queue_and_changes_nothing -> packages/teams/test/assembly/outbound.test.ts::the default outbound mode is the queue and changes nothing
+teams/tests/test_direct_connector.py::test_direct_mode_uses_the_connector_with_the_queue_behind_it -> packages/teams/test/assembly/outbound.test.ts::direct mode uses the connector with the queue behind it
+teams/tests/test_direct_connector.py::test_direct_mode_without_the_identity_and_an_unknown_mode_refuse_to_start -> packages/teams/test/assembly/outbound.test.ts::direct mode without the identity and an unknown mode refuse to start
+teams/tests/test_federated_token.py::test_the_token_source_defaults_to_imds -> packages/teams/test/assembly/outbound.test.ts::the token source defaults to imds
+teams/tests/test_federated_token.py::test_federated_selects_the_federated_provider_with_the_mounted_key -> packages/teams/test/assembly/outbound.test.ts::federated selects the federated provider with the mounted key
+teams/tests/test_federated_token.py::test_federated_settings_that_cannot_work_refuse_to_start -> packages/teams/test/assembly/outbound.test.ts::federated settings that cannot work refuse to start
+teams/tests/test_reply_style.py::test_each_kind_of_chat_has_its_own_switch -> packages/teams/test/assembly/outbound.test.ts::each kind of chat has its own switch
+teams/tests/test_reply_style.py::test_the_teams_streaming_setting_is_read_and_a_typo_stops_the_worker -> packages/teams/test/assembly/outbound.test.ts::the teams streaming setting is read and a typo stops the worker
+teams/tests/test_federated_token.py::test_an_attached_image_is_fetched_with_the_federated_token -> packages/teams/test/assembly/outbound.test.ts::an attached image is fetched with the federated token
