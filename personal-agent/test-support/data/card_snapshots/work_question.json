@@ -1,0 +1,75 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "data": {
+              "card": "card-3",
+              "op": "stop",
+              "primusclaw": "work"
+            },
+            "style": "destructive",
+            "title": "停止",
+            "type": "Action.Execute",
+            "verb": "primusclaw.work_stop"
+          }
+        ],
+        "body": [
+          {
+            "columns": [
+              {
+                "items": [
+                  {
+                    "color": "Warning",
+                    "size": "Large",
+                    "text": "┃",
+                    "type": "TextBlock",
+                    "weight": "Bolder"
+                  }
+                ],
+                "spacing": "None",
+                "type": "Column",
+                "width": "auto"
+              },
+              {
+                "items": [
+                  {
+                    "size": "Medium",
+                    "text": "⚠️ #11 给 fleetpilot 加超时告警",
+                    "type": "TextBlock",
+                    "weight": "Bolder",
+                    "wrap": true
+                  },
+                  {
+                    "isSubtle": true,
+                    "size": "Small",
+                    "spacing": "None",
+                    "text": "等你回复",
+                    "type": "TextBlock",
+                    "wrap": true
+                  }
+                ],
+                "spacing": "Small",
+                "type": "Column",
+                "verticalContentAlignment": "Center",
+                "width": "stretch"
+              }
+            ],
+            "type": "ColumnSet"
+          },
+          {
+            "text": "告警发到哪个 Teams 频道？",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive"
+    }
+  ],
+  "type": "message"
+}
