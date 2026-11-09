@@ -6,7 +6,7 @@
  * member list. Only an exact way of writing a member's name ever counts; a resemblance is offered back, never acted on.
  */
 
-import { cpHead, decimalInt, squashSpaces } from "../text/py-text.js";
+import { cpHead, decimalBigInt, squashSpaces } from "../text/py-text.js";
 import type { InboundMention, RosterMember } from "../ports/surface.js";
 import { MARK_CLOSE, MARK_OPEN } from "./pull-ref.js";
 import { withoutBracketed } from "./text/scan.js";
@@ -29,7 +29,13 @@ export function markerPattern(): RegExp {
 
 /** The mention indexes a text's markers name, in order. */
 export function markerIndexes(text: string): number[] {
-  return [...text.matchAll(markerPattern())].map((m) => decimalInt(m[1] ?? ""));
+  // (a marker number past what a number holds exactly is no mention's: it is past every list)
+  return markerKeys(text).map((k) => (k.length > 15 ? Number.POSITIVE_INFINITY : Number(k)));
+}
+
+/** The markers' numbers as exact decimal strings (Python's `int` of each), to compare markers of any length. */
+export function markerKeys(text: string): string[] {
+  return [...text.matchAll(markerPattern())].map((m) => (decimalBigInt(m[1] ?? "") ?? 0n).toString());
 }
 
 export function withoutMarkers(text: string): string {
@@ -140,9 +146,9 @@ export function samePerson(a: string, b: string, mentions: readonly Mention[]): 
 /** The reviewer a reading gives is the one the rules' span names: the same person, or written inside that span. */
 export function namedWithin(who: string, span: string, mentions: readonly Mention[]): boolean {
   if (samePerson(span, who, mentions)) return true;
-  const refs = markerIndexes(who);
+  const refs = markerKeys(who);
   if (refs.length) {
-    const inSpan = new Set(markerIndexes(span));
+    const inSpan = new Set(markerKeys(span));
     return refs.every((r) => inSpan.has(r));
   }
   return writtenIn(who, withoutMarkers(span));
