@@ -1,0 +1,51 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * What was typed at the shared terminal, as the chat gets it: the cases shared with the Python worker's fix
+ * (test-support/data/typed-line-cases.json, every one byte for byte), and the rich message it is sent as, which makes no link of it.
+ */
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+
+import { remoteView } from "@primusclaw/personal-agent";
+
+import { richTextActivity } from "../../src/richtext/index.js";
+
+interface Case {
+  readonly input: string;
+  readonly lang: "en" | "zh";
+  readonly expected: string;
+}
+
+const CASES = (
+  JSON.parse(readFileSync(new URL("../../../../test-support/data/typed-line-cases.json", import.meta.url), "utf8")) as {
+    cases: Case[];
+  }
+).cases;
+
+test("a typed line is what the shared cases say, every one", () => {
+  assert.ok(CASES.length >= 16);
+  for (const c of CASES) assert.equal(remoteView.typedLine(c.input, c.lang), c.expected, `${c.lang}: ${c.input}`);
+});
+
+test("the rich message of a typed line links nothing", () => {
+  const typed = [
+    "https://attacker.example",
+    "go to HTTP://attacker.example/x now",
+    "[Open](https://attacker.example)",
+    "[ref]: https://attacker.example",
+    "[Open](https://attacker\n.example)",
+    "<https://attacker.example>",
+    "see ‹http://attacker.example›",
+  ];
+  for (const text of typed) {
+    for (const lang of ["en", "zh"] as const) {
+      const sent = richTextActivity(remoteView.typedLine(text, lang))["text"];
+      assert.ok(typeof sent === "string");
+      assert.ok(!/<a\b|href=/i.test(sent), `${text}: ${sent}`);
+      assert.ok(sent.toLowerCase().includes("attacker"), sent); // (shown, only inert)
+    }
+  }
+});

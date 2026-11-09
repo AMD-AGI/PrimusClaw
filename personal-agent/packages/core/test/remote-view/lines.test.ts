@@ -214,7 +214,7 @@ test("the lines of an attached chat in either language", () => {
 test("what was typed at the terminal cannot make a link or a tag in the chat", () => {
   const line = typedLine("[Open](https://attacker.example) ![x](https://e/p.png) <a href=x>y</a>", "en");
   for (const bad of ["](", "<a", "</"]) assert.ok(!line.includes(bad), bad);
-  assert.ok(line.includes("Open") && line.includes("https://attacker.example")); // (shown, only inert)
+  assert.ok(line.includes("Open") && line.includes("attacker.example")); // (shown, only inert)
 });
 
 test("a word that names a property of every object is no key of our tables", () => {

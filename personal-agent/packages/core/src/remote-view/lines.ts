@@ -65,10 +65,19 @@ export function placeOf(cwd: unknown, lit: (text: unknown, limit: number) => str
   return lit(tail || path, 40);
 }
 
+const SCHEME = /\b(https?):(?=\/\/)/gi;
+
+/** `text` with no address the chat's rich text would make a link by itself (it links a bare `http(s)://...`): a zero-width space
+ * after the scheme's colon. */
+function noAutolink(text: string): string {
+  return text.replace(SCHEME, "$1:\u{200b}");
+}
+
 /** How a prompt typed at the terminal shows in the chat: said as the terminal's, quoted, credentials masked, and unable to make a
- * link or a tag (the text reaches the chat through the connector: it is shown, never followed). */
+ * link, an image or a tag, nor an address the rich text links by itself (whoever types at that terminal reaches the chat through the
+ * connector: what they typed is shown, never followed). */
 export function typedLine(text: string, lang: Lang): string {
-  const quoted = splitlines(inertLinks(redactText(strip(text))))
+  const quoted = splitlines(noAutolink(inertLinks(redactText(strip(text)))))
     .slice(0, TYPED_LINES_MAX)
     .map((line) => (strip(line) ? `> ${line}` : ">"))
     .join("\n");
