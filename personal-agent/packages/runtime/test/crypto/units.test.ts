@@ -17,12 +17,12 @@ import {
 
 const text = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
-test("base64 decodes as Python's urlsafe_b64decode: both alphabets, junk skipped, padding required", () => {
+test("base64 decodes as Python 3.12's urlsafe_b64decode: both alphabets, junk skipped, padding required", () => {
   assert.equal(text(urlsafeB64Decode("aGVsbG8=")), "hello");
   assert.equal(text(urlsafeB64Decode("aGV sbG8=\n")), "hello");
   assert.deepEqual(urlsafeB64Decode("-_8="), Uint8Array.from([0xfb, 0xff]));
   assert.deepEqual(urlsafeB64Decode("+/8="), Uint8Array.from([0xfb, 0xff]));
-  assert.equal(text(urlsafeB64Decode("aGk=trailing")), "hi"); // stops at a completed pad sequence
+  assert.equal(text(urlsafeB64Decode("aGk=trailing")), "hi"); // Python 3.12 (the worker image) stops at a completed pad sequence
   assert.equal(text(urlsafeB64Decode(new TextEncoder().encode("aGk="))), "hi");
   assert.equal(text(urlsafeB64Decode("a=Gk=")), "hi"); // a pad too early is skipped
   assert.throws(() => urlsafeB64Decode("aGVsbG8"), Base64Error);
