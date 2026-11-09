@@ -51,3 +51,11 @@ path = "personal-agent/test-support/data/fernet-spec/**"
 precedence = "override"
 SPDX-FileCopyrightText = "Individual contributors to cryptography"
 SPDX-License-Identifier = "Apache-2.0 OR BSD-3-Clause"
+
+# The Adaptive Card 1.5 JSON schema, as Microsoft publishes it (adaptivecards.io, from the MIT-licensed
+# microsoft/AdaptiveCards repository), copied unchanged so every card the personal agent sends is validated against it.
+[[annotations]]
+path = "personal-agent/test-support/data/adaptive-card-1.5.schema.json"
+precedence = "override"
+SPDX-FileCopyrightText = "Microsoft Corporation"
+SPDX-License-Identifier = "MIT"
