@@ -8,6 +8,7 @@
  * but itself, zod and the Claw wire contract (through ./protocol.ts). Everything else reaches it through a port
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
+export * from "./approvals/index.js";
 export * from "./errors.js";
 export * from "./feedback/index.js";
 export * from "./json.js";
