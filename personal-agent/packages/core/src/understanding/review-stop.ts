@@ -3,7 +3,7 @@
 
 import { pullsIn } from "../review-text/pull-ref.js";
 import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-regex.js";
-import { decimalInt as pyInt } from "../text/py-text.js";
+import { decimalInt } from "../text/py-text.js";
 
 /**
  * A stop is read only when the message says nothing but that: once the pull requests are taken out, what is left must
@@ -40,7 +40,7 @@ export function reviewStop(text: string): StoppedPull[] {
       .map((part) => (part.toLowerCase().includes(repo) ? " " : part))
       .join("");
   }
-  const numbers = [...rest.matchAll(NUMBER)].map((m): StoppedPull => ["", pyInt(m[1] ?? "0")]);
+  const numbers = [...rest.matchAll(NUMBER)].map((m): StoppedPull => ["", decimalInt(m[1] ?? "0")]);
   const words = rest.replace(NUMBER, " ");
   if (words.search(STOP) === -1 || words.replace(STOP, "").replace(AROUND, "") !== "") return [];
   const all: StoppedPull[] = [
