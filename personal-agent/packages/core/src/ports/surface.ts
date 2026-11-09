@@ -150,14 +150,33 @@ export interface InboundMessage extends InboundBase {
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
   readonly files: readonly InboundFile[];
+  /**
+   * The names of attachments the channel gave no way to fetch (a file shared as a link), told back to the person
+   * (Python `inbound.inbound_files`' second result, said with `inbound.unreadable_line`).
+   */
+  readonly unreadableFiles: readonly string[];
   readonly provenance: Provenance;
 }
 
 /** A button pressed on a card the bot posted. */
 export interface InboundAction extends InboundBase {
   readonly type: "action";
-  /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
+  /**
+   * Which action: the `primusclaw` field of the button's data, the worker's own kind that routing dispatches on
+   * (Python `activity._card_data`'s kind: "decision", "answer", "remote", ...). The adapter copies it, never interprets
+   * it; "" when the data names none.
+   */
   readonly verb: string;
+  /**
+   * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
+   * must replace (Python `activity.is_card_click`); false for an Action.Submit message.
+   */
+  readonly invoke: boolean;
+  /**
+   * The channel's own verb of the click, for a log line only: clipped to 40 characters, "unknown" when absent (Python
+   * `activity.card_verb`). It comes from the client: never dispatch on it.
+   */
+  readonly clickVerb: string;
   /** The data the card attached to the button: unvalidated, each handler reads it through its own schema. */
   readonly data: Readonly<Record<string, unknown>>;
   /** The message that holds the card, which the handler replaces to settle the click ("" when not said). */
@@ -219,8 +238,11 @@ export type ViewButton =
   | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
   | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
 
-/** How a button is emphasised (Teams: the action's `style`); none is the channel's default look. */
-export type ButtonStyle = "positive" | "destructive";
+/**
+ * How a button is emphasised (Teams: the action's `style`), carried as written so card JSON matches the Python worker
+ * byte for byte: an explicit "default" (the feedback offer's No) is not the same JSON as no style at all.
+ */
+export type ButtonStyle = "default" | "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
