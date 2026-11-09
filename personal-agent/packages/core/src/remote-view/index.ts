@@ -35,6 +35,8 @@ export type { Reported } from "./reported.js";
 export * from "./setup.js";
 export * from "./turn-state.js";
 export * from "./window-view.js";
+export { remoteHealthText, remoteOffText, remoteQueuedText, remoteStopText, remoteText } from "../locales/remote.js";
+export { remoteWindowCardText } from "../locales/remote-window-card.js";
 
 declare module "../ports/surface.js" {
   interface ViewMap {
