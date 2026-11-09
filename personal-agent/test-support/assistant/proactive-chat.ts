@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * What the proactive tests read of a chat and do to it, beside the delivery world (`packages/core/test/proactive/world.ts`): a
+ * What the proactive tests read of a chat and do to it, beside the delivery world (`test-support/assistant/proactive-world.ts`): a
  * second person, the views that were sent, a chat whose sends of approval cards fail or wait, and a turn that shows an approval
  * card the way the turn engine records it (`turnApprovalsFor`).
  */

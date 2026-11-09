@@ -21,7 +21,7 @@ import {
 import { FakeClock } from "../../../../test-support/clock.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openFileTestStore, openTestStore, tempDir } from "../../../../test-support/store.js";
-import { ALICE, at, link, world } from "../proactive/world.js";
+import { ALICE, at, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const SESSION = "sess-ak-alice";
 const ENVELOPE = {

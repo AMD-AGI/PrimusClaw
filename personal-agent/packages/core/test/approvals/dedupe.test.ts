@@ -17,7 +17,7 @@ import {
   turnShowsApproval,
 } from "../../../../test-support/assistant/proactive-chat.js";
 import { openTestStore } from "../../../../test-support/store.js";
-import { ALICE, at, link, world } from "../proactive/world.js";
+import { ALICE, at, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const SESSION = "sess-ak-alice"; // what the fake Claw names Alice's first session
 

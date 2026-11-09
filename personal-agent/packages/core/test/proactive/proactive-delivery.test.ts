@@ -14,7 +14,7 @@ import { pythonIsoUtc } from "../../src/proactive/proactive.js";
 import { approvalEvent } from "../../../../test-support/assistant/approval-presses.js";
 import { BOB, approvalCards, referenceOf, sentViews } from "../../../../test-support/assistant/proactive-chat.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
-import { ALICE, at, event, link, world } from "./world.js";
+import { ALICE, at, event, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 /** Alice linked, Bob only known by his chat; `changes` says whether the session's sandbox still has its changes. */
 function two(changes: boolean | Error = true) {

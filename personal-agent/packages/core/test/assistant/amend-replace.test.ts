@@ -11,7 +11,7 @@ import { it } from "node:test";
 
 import type { Recorded } from "../../../../test-support/surface.js";
 import type { JsonObject } from "../../src/json.js";
-import { ALICE, world } from "../proactive/world.js";
+import { ALICE, world } from "../../../../test-support/assistant/proactive-world.js";
 
 function say(eventId: string, text: string, extra: JsonObject = {}): JsonObject {
   return {

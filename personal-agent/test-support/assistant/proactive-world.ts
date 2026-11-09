@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: MIT
 
 /** A delivery world for the proactive tests: a real store, a recording surface, and the services wired as the worker wires them. */
-import { FakeClock } from "../../../../test-support/clock.js";
-import { openTestStore } from "../../../../test-support/store.js";
+import { FakeClock } from "../clock.js";
+import { openTestStore } from "../store.js";
 import type { SqliteStore } from "@primusclaw/personal-agent-runtime";
-import { FakeSurface, type Recorded } from "../../../../test-support/surface.js";
-import { Receipts } from "../../src/assistant/receipts.js";
-import { SayPlanner } from "../../src/assistant/say.js";
-import { DirectChat } from "../../src/direct-chat/direct-chat.js";
-import type { JsonObject } from "../../src/json.js";
-import { silentLogger } from "../../src/ports/logger.js";
-import type { ConversationRef, OutMessage } from "../../src/ports/surface.js";
-import type { ProactiveDeps, RunFollowUps } from "../../src/proactive/deps.js";
-import { Proactive } from "../../src/proactive/proactive.js";
-import { Release } from "../../src/proactive/release.js";
-import { SaidMessages } from "../../src/proactive/said-memory.js";
+import { FakeSurface, type Recorded } from "../surface.js";
+import { Receipts } from "../../packages/core/src/assistant/receipts.js";
+import { SayPlanner } from "../../packages/core/src/assistant/say.js";
+import { DirectChat } from "../../packages/core/src/direct-chat/direct-chat.js";
+import type { JsonObject } from "../../packages/core/src/json.js";
+import { silentLogger } from "../../packages/core/src/ports/logger.js";
+import type { ConversationRef, OutMessage } from "../../packages/core/src/ports/surface.js";
+import type { ProactiveDeps, RunFollowUps } from "../../packages/core/src/proactive/deps.js";
+import { Proactive } from "../../packages/core/src/proactive/proactive.js";
+import { Release } from "../../packages/core/src/proactive/release.js";
+import { SaidMessages } from "../../packages/core/src/proactive/said-memory.js";
 
 export const ALICE = "aad-a";
 export const PUBLIC = "https://claw.example.com";

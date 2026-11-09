@@ -13,7 +13,11 @@ import {
   UPGRADE_RETRY_SECONDS,
   type SubscriptionsOptions,
 } from "../../src/subscriptions/subscriptions.js";
-import { ClawStatusError, FakeClawSubscriptions, FakeSubscriptionStore } from "./fakes.js";
+import {
+  ClawStatusError,
+  FakeClawSubscriptions,
+  FakeSubscriptionStore,
+} from "../../../../test-support/assistant/subscription-fakes.js";
 
 const BASE = "http://agent.example.svc/claw-events";
 

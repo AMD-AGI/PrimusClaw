@@ -12,7 +12,7 @@ import { ALICE, AssistantWorld, BOB } from "../../../../test-support/assistant/a
 import { ClawError } from "../../src/claw/errors.js";
 import { APPROVAL_SOURCES, APPROVALS_TYPES_VERSION } from "../../src/subscriptions/event-types.js";
 import { RETRY_SECONDS, UPGRADE_RETRY_SECONDS } from "../../src/subscriptions/subscriptions.js";
-import type { FakeClawSubscriptions } from "./fakes.js";
+import type { FakeClawSubscriptions } from "../../../../test-support/assistant/subscription-fakes.js";
 
 const APPROVAL_SUBSCRIPTION_TYPES = [
   "run.completed",

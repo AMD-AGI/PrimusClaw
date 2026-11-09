@@ -13,7 +13,7 @@ import { sentMessages, sentTexts, sentViews } from "../../../../test-support/ass
 import { FakeClock } from "../../../../test-support/clock.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openFileTestStore } from "../../../../test-support/store.js";
-import { ALICE, at, link, world } from "./world.js";
+import { ALICE, at, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const ASKED = "现在哪个model 跑agentX效果最好";
 const SESSION = "sess-ak-alice";

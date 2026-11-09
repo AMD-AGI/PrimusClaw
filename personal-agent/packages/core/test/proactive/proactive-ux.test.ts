@@ -11,7 +11,7 @@ import { PAUSE_FOREVER } from "../../src/ports/store/policy.js";
 import { approvalEvent } from "../../../../test-support/assistant/approval-presses.js";
 import { BOB, linkUser, referenceOf, sentViews } from "../../../../test-support/assistant/proactive-chat.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
-import { ALICE, at, event, link, world } from "./world.js";
+import { ALICE, at, event, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const QUIET: readonly [string, string] = ["22:00", "08:00"];
 

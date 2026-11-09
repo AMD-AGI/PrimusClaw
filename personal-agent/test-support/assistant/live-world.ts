@@ -8,7 +8,7 @@
  */
 import type { JsonObject } from "@primusclaw/personal-agent";
 
-import { world as proactiveWorld } from "../../packages/core/test/proactive/world.js";
+import { world as proactiveWorld } from "./proactive-world.js";
 import type { Recorded } from "../surface.js";
 import { flushMicrotasks } from "../clock.js";
 import { ALICE, AssistantWorld, type AssistantWorldOptions } from "./assistant-world.js";

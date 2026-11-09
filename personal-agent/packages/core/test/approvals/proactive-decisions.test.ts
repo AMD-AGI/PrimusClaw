@@ -20,7 +20,7 @@ import {
   settledModel,
 } from "../../../../test-support/assistant/approval-presses.js";
 import { BOB, linkUser, referenceOf } from "../../../../test-support/assistant/proactive-chat.js";
-import { ALICE, at, link, world } from "../proactive/world.js";
+import { ALICE, at, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 function two() {
   const w = world({ now: at(12) });

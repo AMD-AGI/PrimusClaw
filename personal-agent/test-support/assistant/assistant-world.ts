@@ -16,7 +16,7 @@ import { DirectChat } from "../../packages/core/src/direct-chat/direct-chat.js";
 import { silentLogger } from "../../packages/core/src/ports/logger.js";
 import type { Conversation, InboundFile } from "../../packages/core/src/ports/surface.js";
 import { Subscriptions } from "../../packages/core/src/subscriptions/subscriptions.js";
-import { FakeClawSubscriptions } from "../../packages/core/test/subscriptions/fakes.js";
+import { FakeClawSubscriptions } from "./subscription-fakes.js";
 import { FakeClock } from "../clock.js";
 import { SeededRandom } from "../random.js";
 import { advanceSeconds, openTestStore } from "../store.js";

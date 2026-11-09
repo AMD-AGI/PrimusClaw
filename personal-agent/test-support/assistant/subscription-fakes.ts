@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 /** In-memory stand-ins for the store slices and Claw's subscription endpoints the subscription keeper uses. */
-import type { NotifySubscription } from "../../src/ports/store/index.js";
-import type { ClawSubscription } from "../../src/ports/claw/index.js";
-import type { ClawSubscriptions, SubscriptionStore } from "../../src/subscriptions/ports.js";
+import type { NotifySubscription } from "../../packages/core/src/ports/store/index.js";
+import type { ClawSubscription } from "../../packages/core/src/ports/claw/index.js";
+import type { ClawSubscriptions, SubscriptionStore } from "../../packages/core/src/subscriptions/ports.js";
 
-export { ClawError as ClawStatusError } from "../../src/claw/errors.js";
-import { ClawError as ClawStatusError } from "../../src/claw/errors.js";
+export { ClawError as ClawStatusError } from "../../packages/core/src/claw/errors.js";
+import { ClawError as ClawStatusError } from "../../packages/core/src/claw/errors.js";
 
 interface Row {
   subscription_id: string;

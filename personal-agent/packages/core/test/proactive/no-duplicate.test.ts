@@ -11,7 +11,7 @@ import type { JsonObject } from "../../src/json.js";
 import { pythonIsoUtc } from "../../src/proactive/proactive.js";
 import { sentViews } from "../../../../test-support/assistant/proactive-chat.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
-import { ALICE, link, world } from "./world.js";
+import { ALICE, link, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const SESSION = "sess-ak-alice";
 

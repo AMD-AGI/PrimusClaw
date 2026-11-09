@@ -12,7 +12,7 @@ import { it } from "node:test";
 import { modelOf, viewsOf } from "../../../../test-support/assistant/view-of.js";
 import type { JsonObject } from "../../src/json.js";
 import { PAUSE_FOREVER } from "../../src/ports/store/policy.js";
-import { ALICE, at, event, shown, world } from "../proactive/world.js";
+import { ALICE, at, event, shown, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const MINUTE = 60;
 const WINDOW = 30 * MINUTE;
