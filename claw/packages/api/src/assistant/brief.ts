@@ -167,7 +167,11 @@ const T = {
   zh: {
     head: (d: string) => `每日简报 ${d}`, weekHead: (from: string, d: string) => `周报 ${from} 至 ${d}`, sep: "：",
     period: { day: "过去一天", week: "过去一周" } as Record<BriefRange, string>,
-    held: { merge: "合入", review: "批准", schedule: "创建定时任务", cancel: "取消定时任务" },
+    held: {
+      merge: "合入", review: "批准", schedule: "创建定时任务", cancel: "取消定时任务", scheduleBrief: "创建定时简报", cancelBrief: "取消定时简报",
+      comment: (where: string) => `在 ${where} 上发表评论`, send: (agent: string, machine: string) => `发给机器 ${machine} 上的 ${agent} 的指令`,
+      other: (kind: string) => `一张待确认卡（${kind}）`,
+    },
     items: "事项", pull_requests: "PR", notifications: "通知", jobs: "作业", safe: "SaFE", needs: "需要你：",
     couldNot: (why: string) => `没能检查（${why}）`,
     itemSummary: (n: number, p: number, d: number, per = "过去一天") => `${n} 个等你，${p} 个进行中，${per}结束 ${d} 个`,
@@ -195,7 +199,11 @@ const T = {
   en: {
     head: (d: string) => `Daily brief, ${d}`, weekHead: (from: string, d: string) => `Weekly brief, ${from} to ${d}`, sep: ": ",
     period: { day: "in the last day", week: "in the last week" } as Record<BriefRange, string>,
-    held: { merge: "merge", review: "approval", schedule: "schedule", cancel: "cancel" },
+    held: {
+      merge: "merge", review: "approval", schedule: "schedule", cancel: "cancel", scheduleBrief: "schedule brief", cancelBrief: "cancel brief",
+      comment: (where: string) => `comment on ${where}`, send: (agent: string, machine: string) => `instruction to ${agent} on the machine ${machine}`,
+      other: (kind: string) => `a card (${kind})`,
+    },
     items: "Items", pull_requests: "Pull requests", notifications: "Notifications", jobs: "Jobs", safe: "SaFE", needs: "Needs you:",
     couldNot: (why: string) => `could not check (${why})`,
     itemSummary: (n: number, p: number, d: number, per = "in the last day") => `${n} need you, ${p} in progress, ${d} ended ${per}`,
@@ -322,10 +330,10 @@ async function notificationSection(q: Querier, userId: string, w: Words, needs: 
     )).rows as Array<{ repo: string; pr: number; kind: string }>) waiting.push(`${c.kind === "review" ? w.held.review : w.held.merge} ${c.repo}#${c.pr}`);
   }
   for (const c of (await q(
-    `SELECT kind, params->>'name' AS name FROM claw_assistant_confirmations
+    `SELECT kind, params FROM claw_assistant_confirmations
       WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW() ORDER BY created_at`,
     [userId],
-  )).rows as Array<{ kind: string; name: string | null }>) waiting.push(`${c.kind === "trigger_cancel" ? w.held.cancel : w.held.schedule} "${oneLine(c.name, 60)}"`);
+  )).rows as Array<{ kind: string; params: Record<string, unknown> | null }>) waiting.push(heldCard(w, c.kind, c.params ?? {}));
   const failed = sent.filter((s) => s.type === "run.failed");
   const lines = [...failed.map((s) => w.noteFailed(oneLine(s.title, 80))), ...waiting.map((t) => w.noteWaiting(t))];
   needs.push(...waiting.map((t) => w.noteWaiting(t)));
@@ -333,6 +341,21 @@ async function notificationSection(q: Querier, userId: string, w: Words, needs: 
     key: "notifications", title: w.notifications, checked: true, lines: lines.slice(0, SECTION_LINES_MAX[r]),
     summary: w.noteSummary(sent.filter((s) => s.type === "run.completed").length, failed.length, sent.filter((s) => s.type === "approval.requested").length, waiting.length),
   };
+}
+
+/**
+ * A card of the user's assistant waiting for their press, by its own kind. A comment card was once listed as a scheduled task with an
+ * empty name (it has none), 2026-11-09.
+ */
+function heldCard(w: Words, kind: string, p: Record<string, unknown>): string {
+  const brief = p.action === "brief";
+  switch (kind) {
+    case "trigger_create": return `${brief ? w.held.scheduleBrief : w.held.schedule} "${oneLine(p.name, 60)}"`;
+    case "trigger_cancel": return `${brief ? w.held.cancelBrief : w.held.cancel} "${oneLine(p.name, 60)}"`;
+    case "github_comment": return w.held.comment(`${oneLine(p.repo, 100)}#${oneLine(p.number, 12)}`);
+    case "devenv_send": return w.held.send(`"${oneLine(p.agent_id, 40)}"`, `"${oneLine(p.machine, 60)}"`);
+    default: return w.held.other(oneLine(kind, 40));
+  }
 }
 
 async function jobSection(q: Querier, userId: string, w: Words, r: BriefRange): Promise<BriefSection> {
