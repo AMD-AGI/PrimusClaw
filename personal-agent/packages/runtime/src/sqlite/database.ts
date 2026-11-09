@@ -53,9 +53,10 @@ export class Database {
     );
   }
 
+  /** Idempotent. */
   close(): void {
     this.#statements.clear();
-    this.#db.close();
+    if (this.#db.isOpen) this.#db.close();
   }
 
   private statement(sql: string): ReturnType<DatabaseSync["prepare"]> {
