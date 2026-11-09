@@ -408,7 +408,7 @@ const undelivered = (e: MovingEvent): boolean => e.data.by === "claw" && e.data.
  * A message the connector would not type into a terminal (connector session.ts `pumpTerminal`): what to do about it, with the
  * terminal's permission mode when the connector named it (`terminal_mode`). Anything else is said by its code, as before.
  */
-function terminalRefusal(error: string, mode: string, lang: RemoteLang): string | null {
+export function terminalRefusal(error: string, mode: string, lang: RemoteLang): string | null {
   const m = mode || (lang === "zh" ? "未知模式" : "an unknown mode");
   if (error === "terminal_mode_not_allowed") {
     return lang === "zh"
@@ -419,6 +419,11 @@ function terminalRefusal(error: string, mode: string, lang: RemoteLang): string 
     return lang === "zh"
       ? "看不出终端会话现在处于哪种权限模式，没有输入；确认那台机器上的 Claude Code 在输入框下方显示模式后再试"
       : "could not tell which permission mode the terminal's conversation is in, so nothing was typed; make sure Claude Code there shows its mode below the input box, then try again";
+  }
+  if (error === "terminal_screen_unknown") {
+    return lang === "zh"
+      ? "连接器 30 秒内都认不出那个终端的画面（不是 Claude Code 的输入框，它也没说自己在忙），没有输入；看一眼终端、关掉上面的东西后再发"
+      : "the connector could not read the terminal's screen for 30 seconds (no Claude Code input box, and it did not say it was busy), so nothing was typed; look at the terminal, close whatever is on it, then send again";
   }
   if (error === "terminal_command_refused") {
     return lang === "zh"

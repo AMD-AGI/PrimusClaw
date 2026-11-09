@@ -75,6 +75,7 @@ const HINTS: Record<string, string> = {
   session_closed: "the session has already ended: start a new one",
   terminal_mode_not_allowed: `the conversation's terminal is in a permission mode this agent's approval setting does not allow from the phone (terminal_mode names it): switch the terminal to a mode that asks (shift+tab in Claude Code, for example manual or plan mode), or set approval = "never" for this agent in agents.toml on that machine, then send again`,
   terminal_mode_unknown: "the connector could not read which permission mode the conversation's terminal is in, so nothing was typed: make sure Claude Code there is up to date and shows its mode below the input box, then send again",
+  terminal_screen_unknown: "the connector could not read the conversation's terminal (no Claude Code input box on its screen, and Claude Code did not say it was working) for 30 seconds, so nothing was typed: look at the terminal, close whatever is on it, then send again",
   terminal_command_refused: "a message that starts with ! or / would run a shell command or a slash command in that terminal, so it is not typed from the phone: rephrase it, or run the command at the terminal",
 };
 

@@ -21,7 +21,7 @@
 import path from "node:path";
 import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
-import { TerminalInput, actsAsCommand, cleanInput, modeVerdict, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
+import { TerminalInput, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
 import { AdapterProcess, AuthenticateFailed, isAuthRequiredError, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
@@ -63,13 +63,17 @@ export interface SessionTiming {
   terminalEchoMs: number;
   /** A typed message's turn also ends once the terminal has said it is idle for this long (a turn stopped with Esc writes no end). */
   terminalIdleMs: number;
-  /** A terminal whose footer names no permission mode is read again for this long, then the message is refused (`terminal_mode_unknown`). */
-  terminalModeWaitMs: number;
+  /**
+   * A terminal whose Claude Code says it is idle but whose screen is not its input box (a screen this connector cannot read:
+   * another program, a layout it does not know) is read again for this long, then the message is refused (`terminal_screen_unknown`)
+   * instead of waiting `terminalWaitMs`. A Claude Code that says it is working or waiting, or whose word cannot be read, keeps that wait.
+   */
+  terminalScreenWaitMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
-  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalModeWaitMs: 3_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalScreenWaitMs: 30_000,
 };
 
 /**
@@ -314,9 +318,14 @@ export class Session {
    * could write to the transcript. When the terminal no longer has the conversation open the session ends
    * (`terminal_closed`): taking it over then is a new session, through the full check.
    */
-  private spectate(support: AttachSupport, title: string, detail: string, pane: { ok: true; pane: PaneRef } | { ok: false; why: string }): void {
+  private async spectate(support: AttachSupport, title: string, detail: string, pane: { ok: true; pane: PaneRef } | { ok: false; why: string }): Promise<void> {
     this.readOnly = true;
     if (pane.ok) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket));
+    // The terminal's permission mode now, as its footer names it (null when the screen does not say): the chat tells the person
+    // when a message from the phone will run without asking (`MODES_THAT_DO_NOT_ASK`).
+    let terminalMode: string | null = null;
+    if (this.terminal) { try { const r = await this.terminal.readiness(); terminalMode = r.ready ? r.mode : null; } catch { /* unread */ } }
+    if (this.closed) return;
     this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
     const backlog = this.tail.backlog();
     this.env.store.put(this.id, {
@@ -324,11 +333,11 @@ export class Session {
       ...(pane.ok ? { terminal_input: true } : {}), created_at: new Date().toISOString(),
     });
     if (pane.ok) {
-      this.audit("session_terminal_input", { cwd: this.cwd, acp_session_id: this.acpId, pid: pane.pane.pid, pane: pane.pane.pane, detail: detail.slice(0, 300) });
+      this.audit("session_terminal_input", { cwd: this.cwd, acp_session_id: this.acpId, pid: pane.pane.pid, pane: pane.pane.pane, terminal_mode: terminalMode, detail: detail.slice(0, 300) });
       // Not read-only: what is sent is typed into the terminal. The terminal keeps its own mode; it is not the phone's to set.
       this.emit("session_started", {
         acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
-        live_terminal: true, input: "terminal", modes: [], currentMode: null,
+        live_terminal: true, input: "terminal", modes: [], currentMode: null, terminal_mode: terminalMode,
       });
     } else {
       this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300), why_not_typed: pane.why.slice(0, 300) });
@@ -442,11 +451,10 @@ export class Session {
         const waitBy = Date.now() + this.env.timing.terminalWaitMs;
         let told = "";
         let ready = false;
-        // The terminal's permission mode, read with the empty box: a message is typed only in a mode this agent's policy allows
-        // (the rule a phone session of it runs under), never in whatever mode the terminal happens to be in.
-        let mode: string | null = null;
-        let modeRefused: string | null = null;
-        let unknownSince: number | null = null;
+        // Typed in any permission mode (the terminal's owner chose it); the mode is recorded with what was typed.
+        // Since when the screen has been one this connector cannot read (neither the idle box nor a Claude Code that says it works).
+        let unreadableSince: number | null = null;
+        let unreadable = false;
         while (!this.closed && this.terminalQueue[0] === next) {
           // Claude Code's own word first (a turn running, a question on its screen), then the screen itself: both must say free.
           const status = this.holderStatus(term);
@@ -456,19 +464,17 @@ export class Session {
             why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
           } else {
             const r = await term.readiness();
-            if (r.ready) {
-              const verdict = modeVerdict(this.agent, r.mode);
-              if (verdict.ok) { ready = true; mode = r.mode; break; }
-              if (verdict.reason === "terminal_mode_not_allowed") { mode = r.mode; modeRefused = verdict.reason; break; }
-              // Not named on the screen (a notice in the footer's place for a moment): read again briefly, then refused.
-              unknownSince ??= Date.now();
-              if (Date.now() - unknownSince >= this.env.timing.terminalModeWaitMs) { modeRefused = verdict.reason; break; }
-              await sleep(Math.max(100, Math.min(500, this.env.timing.spectateMs * 5)));
-              continue;
-            }
-            unknownSince = null;
+            if (r.ready) { ready = true; break; }
             why = WAIT_WHY[r.why];
             if (r.why === "gone") { told = why; break; }
+          }
+          // A busy or typed-in terminal is worth waiting for (the phone is told it is queued); one that cannot be read is not.
+          // (Only the screen itself read as unreadable: a Claude Code whose status row cannot be read now keeps the long wait.)
+          if (why === WAIT_WHY.screen) {
+            unreadableSince ??= Date.now();
+            if (Date.now() - unreadableSince >= this.env.timing.terminalScreenWaitMs) { unreadable = true; told = why; break; }
+          } else {
+            unreadableSince = null;
           }
           if (why !== told) {
             told = why;
@@ -478,7 +484,7 @@ export class Session {
           await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
-        if (modeRefused) { refused(modeRefused, "", { terminal_mode: mode }); continue; }
+        if (unreadable) { refused("terminal_screen_unknown", told); continue; }
         if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
         // Still live (connector.ts `gateFor`: Claw is asked if the connector stalled since the message came): if not, it was
         // reported as refused already and is only dropped here.
@@ -524,9 +530,6 @@ export class Session {
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
         const again = await term.readiness();
         if (!again.ready || this.holderStatus(term) !== "idle") { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
-        // The mode asked again on this screen too: a switch since (shift+tab) is not typed into.
-        const verdictNow = modeVerdict(this.agent, again.mode);
-        if (!verdictNow.ok) { giveUp(verdictNow.reason, { terminal_mode: again.mode }); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
