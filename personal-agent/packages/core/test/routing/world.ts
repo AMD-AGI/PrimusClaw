@@ -151,6 +151,8 @@ const OFF_REMOTE: RemoteChat = {
   agent: () => Promise.resolve(),
   forgetPerson: () => undefined,
   groupChatKey: (userId, scope) => `${userId}|${scope}`,
+  currentTurn: () => undefined,
+  windowed: () => false,
 };
 
 export interface WorldOptions {
