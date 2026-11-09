@@ -155,11 +155,7 @@ export interface LastAnswerDeps {
  * history is read, keeping only the newest turns' states. Claw refuses either (401/403/404) for a session the key does not
  * own, which is what stops anybody reading somebody else's session.
  */
-export async function lastAnswer(
-  deps: LastAnswerDeps,
-  key: string,
-  sessionId: string,
-): Promise<string | undefined> {
+export async function lastAnswer(deps: LastAnswerDeps, key: string, sessionId: string): Promise<string | undefined> {
   let turns: Turns;
   try {
     const rows = await deps.claw.events(key, sessionId, {

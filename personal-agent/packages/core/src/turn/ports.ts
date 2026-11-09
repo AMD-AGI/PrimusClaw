@@ -29,5 +29,14 @@ export type TurnSurface = Pick<
 /** The calls of Claw's sessions port a turn makes. */
 export type TurnClaw = Pick<
   ClawSessionsPort,
-  "create" | "sendMessage" | "setModel" | "lastEventId" | "turn" | "stream" | "uploadFiles" | "events" | "deliveryLink" | "changes"
+  | "create"
+  | "sendMessage"
+  | "setModel"
+  | "lastEventId"
+  | "turn"
+  | "stream"
+  | "uploadFiles"
+  | "events"
+  | "deliveryLink"
+  | "changes"
 >;

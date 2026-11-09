@@ -19,7 +19,11 @@ const MODEL_REFUSALS = new Set<string>();
  * The id of the newest event the session holds, read just before the message is sent: the turn's events come after it, so
  * its stream starts there and not with the session's history. Best effort: undefined starts where Claw starts it.
  */
-export async function turnStart(ctx: TurnContext, sessionId: string, signal?: AbortSignal): Promise<string | undefined> {
+export async function turnStart(
+  ctx: TurnContext,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
     return (await unlessAborted(ctx.deps.claw.lastEventId(await credential(ctx), sessionId), signal)) ?? undefined;
   } catch (err) {
@@ -35,7 +39,11 @@ export async function turnStart(ctx: TurnContext, sessionId: string, signal?: Ab
  * The turn Claw is running on the session just before this message is sent, if any: a message sent now is queued behind
  * it, and the queued turn is told from older ones by starting after it. Best effort.
  */
-export async function turnInFront(ctx: TurnContext, sessionId: string, signal?: AbortSignal): Promise<string | undefined> {
+export async function turnInFront(
+  ctx: TurnContext,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
     const held = await unlessAborted(ctx.deps.claw.turn(await credential(ctx), sessionId), signal);
     return held.running ? (held.messageId ?? undefined) : undefined;

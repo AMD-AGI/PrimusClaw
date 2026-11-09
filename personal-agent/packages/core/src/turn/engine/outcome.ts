@@ -30,7 +30,10 @@ export function clawFailure(errors: PublicErrors, err: ClawError, review = false
   if (review && err.status === 401) return turnEnglish.reviewRefused;
   if (err.status === 401 || err.status === 403) return turnEnglish.keyRejected;
   if (err.status === 429) return turnEnglish.clawBusy;
-  return turnEnglish.clawRequestFailed(err.status, errors.withhold("claw_request", errorKind(err), { status: err.status }));
+  return turnEnglish.clawRequestFailed(
+    err.status,
+    errors.withhold("claw_request", errorKind(err), { status: err.status }),
+  );
 }
 
 /**

@@ -166,7 +166,10 @@ class TurnRun {
     if (ok && !state.failed) return [state.answer, ok];
     const [answer, error] = splitErrorTail(state.answer);
     if (error || !ok) {
-      const ref = this.ctx.deps.errors.withhold("turn_failed", error, { session: this.sessionId, message: state.messageId });
+      const ref = this.ctx.deps.errors.withhold("turn_failed", error, {
+        session: this.sessionId,
+        message: state.messageId,
+      });
       this.ctx.deps.log.info("the user is told the task failed", { ref });
     }
     return [answer, error ? false : ok]; // (told as the failure it is: no thumbs, the Report a problem card)

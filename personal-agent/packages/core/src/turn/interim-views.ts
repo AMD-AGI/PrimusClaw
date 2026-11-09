@@ -40,7 +40,6 @@ export interface QuestionModel {
   readonly note: string;
 }
 
-
 declare module "../ports/surface.js" {
   interface ViewMap {
     approval: ApprovalModel;
