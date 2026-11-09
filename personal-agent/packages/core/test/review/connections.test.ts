@@ -56,7 +56,7 @@ test("whoami lists each connection and what connects the missing ones", () => {
   assert.ok(text.startsWith("Connections:\n- SaFE: connected (Alice Safe)"), text);
   assert.ok(text.includes("- GitHub: not connected; send `/github bind` to connect it"));
   assert.ok(text.split("- FleetPilot: default")[0]?.includes("- GitHub: not connected"));
-  assert.ok(text.includes("- Memory: off; turn it on at https://") && text.includes("memory=1"));
+  assert.match(text, /^- Memory: off; turn it on at https:\/\/claw\.test\/settings\?memory=1$/m);
 });
 
 test("whoami when everything is connected", () => {

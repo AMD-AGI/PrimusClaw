@@ -226,5 +226,5 @@ test("whoami in chinese", () => {
   });
   assert.ok(text.startsWith("连接状态：\n- SaFE：已连接（爱丽丝）"));
   assert.ok(text.includes("- GitHub：已连接 `alice-gh`（只用于代审"));
-  assert.ok(text.includes("- 记忆：关，在这里打开：https://m"));
+  assert.ok(text.split("\n").some((line) => line === "- 记忆：关，在这里打开：https://m"));
 });

@@ -121,6 +121,8 @@ export class Identity {
 export class Github {
   script: string[] = ["ok"];
   readonly polls: Record<string, string>[] = [];
+  /** What each device flow was started with (its client id and the scope asked for). */
+  readonly starts: Record<string, string>[] = [];
   startStatus = 200;
   verificationUri = "https://github.com/login/device";
   authors = new Map<string, string>();
@@ -136,6 +138,7 @@ export class Github {
   handle(url: string, form: Record<string, string>): Response {
     const path = new URL(url).pathname;
     if (path === "/login/device/code") {
+      this.starts.push(form);
       if (this.startStatus !== 200) return Response.json({}, { status: this.startStatus });
       return Response.json({
         device_code: "dc-secret",

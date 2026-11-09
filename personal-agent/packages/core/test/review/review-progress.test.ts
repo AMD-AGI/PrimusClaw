@@ -75,8 +75,14 @@ test("handed over reviews tell the asker the conclusion while the merge waits fo
   const [summary = "", ...more] = summaries(world);
   assert.equal(more.length, 0);
   assert.ok(summary.startsWith("Bob 代审进度（3 个 PR：3 个有结论，0 个已结束）："), summary);
-  for (const pr of [PR, PR2, PR3])
-    assert.ok(summary.includes(`- ${pr}：结论：批准，合入在等 Bob 确认  ${LINK[pr] ?? ""}`));
+  const lines = summary.split("\n");
+  for (const pr of [PR, PR2, PR3]) {
+    const line = `- ${pr}：结论：批准，合入在等 Bob 确认  ${LINK[pr] ?? ""}`;
+    assert.ok(
+      lines.some((l) => l === line),
+      summary,
+    );
+  }
   // Bob: once for each, each with the card that answers it
   assert.equal(saidIn(world.surface, "personal:aad-b").split("在等你确认").length - 1, 3);
 });
