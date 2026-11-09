@@ -179,3 +179,21 @@ it("files with no link to give and no words are named", () => {
   );
   assert.ok(shape(linked).length >= 1);
 });
+
+it("a held write with a long text says it whole once then its card", () => {
+  const { say } = planner();
+  const long = `${"要创建定时任务「PR 早报」吗？".repeat(60)}\n\n点下面的「创建」确认。`;
+  const out = say.messages(ALICE, {
+    type: "assistant.say",
+    text: long,
+    confirm_write: { confirmation_id: "cf-1", kind: "trigger_create", allow_label: "创建" },
+  });
+  assert.deepEqual(
+    shape(out).map((s) => s.split(":")[0]),
+    ["rich", "view"],
+  );
+  assert.equal(out[0]?.body.type === "rich" ? out[0].body.markdown : "", long);
+  const card = out[1]?.body;
+  assert.ok(card?.type === "view" && card.view.name === "confirmWrite");
+  assert.equal(card.view.model.text, "创建");
+});

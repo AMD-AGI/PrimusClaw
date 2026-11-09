@@ -13,7 +13,7 @@ import { it } from "node:test";
 
 import { ALICE, BOB, CardsWorld } from "../../../../test-support/assistant/cards-world.js";
 import { boardText } from "../../src/locales/assistant-board.js";
-import { workClickText } from "../../src/locales/work-clicks.js";
+import { workClickText } from "../../src/locales/assistant-work-clicks.js";
 import type { JsonObject } from "../../src/json.js";
 import type { TokenExchange } from "../../src/plugins/token-exchange.js";
 import { err, ok } from "../../src/result.js";
