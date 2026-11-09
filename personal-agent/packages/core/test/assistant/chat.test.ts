@@ -368,3 +368,17 @@ it("a stop for one message interrupts only the turn answering it", async () => {
   assert.equal(await w.chat.stop(ALICE, "ak-alice", w.conversation, "msg-7"), false);
   assert.equal(said(w.surface.outbox).length, 1);
 });
+
+it("new sessions and repo answer in the chats language", () => {
+  const w = world();
+  for (const [command, mentions] of [
+    ["/new", "没有会话需要新建或切换"],
+    ["/sessions", "没有会话需要新建或切换"],
+    ["/repo AMD-AGI/PrimusClaw main", "在消息里直接说是哪个仓库"],
+  ] as const) {
+    const said = w.chat.hiddenCommand(command, "zh") ?? "";
+    assert.ok(said.includes(mentions), said);
+    assert.ok(!said.includes("sessions to start or switch") && !said.includes("Just say which repository"));
+  }
+  assert.deepEqual(w.claw.calls, []);
+});
