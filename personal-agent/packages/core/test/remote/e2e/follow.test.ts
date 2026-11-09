@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import type { FollowTimings } from "../../../src/remote/follow/timings.js";
 import { RemoteTurnState } from "../../../src/remote-view/turn-state.js";
-import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
+import { CODEX_OPTIONS, type FakeRemote } from "../../../../../test-support/remote-fake.js";
 import {
   ALICE,
   type RemoteWorld,
@@ -558,4 +558,16 @@ test("a worker that restarts in the middle of a turn delivers the rest of it and
     assert.deepEqual(prompts(w), ["next"]);
     assert.ok(!w.said().some((t) => t.includes("lost track")));
     assert.ok(w.answer().includes("Fresh answer."));
+  }));
+
+test("a permission request with no prompt open gets its card and in quiet hours none", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    await w.server.ask(sid, "act-1", "Run: rm -rf build", CODEX_OPTIONS, { kind: "execute" });
+    await w.until(() => w.permissionCards().length > 0);
+    assert.equal(w.permissionCards().length, 1);
+    w.reachable = false; // (quiet hours, long after the person last wrote: the assistant's rule says nobody may be woken)
+    await w.server.ask(sid, "act-2", "Run: make", CODEX_OPTIONS, { kind: "execute" });
+    await settle();
+    assert.equal(w.permissionCards().length, 1); // an approval is never pushed to wake someone
   }));
