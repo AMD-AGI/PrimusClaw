@@ -195,3 +195,13 @@ for (const origin of ["group", "1:1"] as const) {
     assert.ok(mentioned.every((m) => m.channelUserId !== "29:b"));
   });
 }
+
+test("a chat with the reviewer the channel fails to open is said as no chat", async () => {
+  const world = reviewWorld();
+  world.surface.openPersonal = () => Promise.reject(new Error("Teams said 502"));
+  await askAndEnd(world, "group", wrote("merged"), "结论：没有必须修改的问题。\nVERDICT: CLEAN");
+  assert.ok(
+    saidIn(world.surface, CONV).includes(`${PR}：未能通知到 Bob（TA 还没和 Clawy 私聊过）`),
+    saidIn(world.surface, CONV),
+  );
+});

@@ -144,3 +144,28 @@ test("a choice that cannot be written for want of a token is said as not saved",
   await waitForBinding(world);
   assert.ok(said(world).includes("could not save your choice"), said(world));
 });
+
+test("a bind whose end cannot be said either stores nothing and leaves nothing waiting", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-a", "u-alice");
+  world.github.script = ["access_denied"];
+  const surface = world.surface;
+  const open = surface.conversation.bind(surface);
+  surface.conversation = (ref) => {
+    const conversation = open(ref);
+    const send = conversation.send.bind(conversation);
+    conversation.send = (message) =>
+      message.body.type === "text" && message.body.text.includes("denied")
+        ? Promise.reject(new Error("Teams refused it"))
+        : send(message);
+    return conversation;
+  };
+  await command(world, "bind");
+  await waitForBinding(world);
+  assert.deepEqual(binds(world), []);
+  assert.ok(!said(world).includes("denied")); // (it could not be said)
+  world.github.script = ["authorization_pending"];
+  const starts = world.github.starts.length;
+  await command(world, "bind"); // (nothing waits any more: a new code is given)
+  assert.equal(world.github.starts.length, starts + 1);
+});

@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ClawError, err } from "../../src/index.js";
+import { ClawError, err, type JsonObject } from "../../src/index.js";
 import { GithubReview } from "../../src/review/service/github-review.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import {
@@ -85,6 +85,19 @@ test("a record a later worker cannot read is let go", () => {
     reference: { conversation: { id: ALICE_DM } },
     deadline: world.store.now() + 3600,
   });
+  const fresh = new GithubReview(world.deps, new SeededRandom(7), () => Promise.resolve());
+  assert.equal(fresh.resume(), 0);
+  assert.deepEqual(follows(world), []);
+});
+
+test("a record whose chat a later worker cannot read is let go", async () => {
+  const world = handoffWorld();
+  world.claw.views.set("item-1", [{ status: "waiting_for_reviewer", prUrl: LINK, verdict: "approve", merged: false }]);
+  await handedBack(world);
+  const [row] = follows(world);
+  assert.ok(row);
+  world.store.reviewDelegation.dropAskerFollow(row.itemId);
+  world.store.reviewDelegation.addAskerFollow({ ...row, review: row.review as JsonObject, reference: {} });
   const fresh = new GithubReview(world.deps, new SeededRandom(7), () => Promise.resolve());
   assert.equal(fresh.resume(), 0);
   assert.deepEqual(follows(world), []);

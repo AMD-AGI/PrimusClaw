@@ -123,3 +123,64 @@ test("a model written in another case is the one the key can use", async () => {
   await ask(world, `请 {Bob} 用 Claude-Opus-5.5 帮我 review 合入 ${PR}`);
   assert.equal(world.started[0]?.turn.reviewModel, "claude-opus-5.5");
 });
+
+test("a reviewer who has not allowed it is told for a review only too", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await refused(
+    world,
+    `请 {Bob} 帮我 review ${PR}`,
+    "Bob 还没有授权我代 TA review（需要 TA 在 1:1 里发 `/github auto-merge on`",
+  );
+});
+
+test("asking oneself needs no authorization of ones own", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-a", "u-alice", "alice-gh", false);
+  world.store.members.rememberMember("29:a", "aad-a", "Alice");
+  world.github.defaultAuthor = "carol-gh";
+  const message = groupMessage(`请 {Alice} 帮我 review 合入 ${PR}`, ALICE, [ALICE]);
+  await world.service.request({
+    message,
+    text: message.text,
+    sender: ALICE,
+    conversation: world.surface.conversation(message.conversation),
+    scope: CONV,
+    lang: () => "zh",
+  });
+  assert.deepEqual(
+    world.started.map((s) => s.turn.actingAs),
+    ["u-alice"],
+  );
+});
+
+test("a reviewer with no name the worker knows is called the other person", async () => {
+  const world = reviewWorld();
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  world.store.members.rememberMember("29:b", "aad-b", "");
+  const message = groupMessage(`请 {Bob} 帮我 review 合入 ${PR}`);
+  const nameless = { ...message, mentions: message.mentions.map((m) => ({ ...m, name: "" })) };
+  await world.service.request({
+    message: nameless,
+    text: nameless.text,
+    sender: ALICE,
+    conversation: world.surface.conversation(nameless.conversation),
+    scope: CONV,
+    lang: () => "zh",
+  });
+  assert.equal(world.started.length, 0);
+  assert.ok(saidIn(world.surface, CONV).includes("还没有授权我代 TA review 合入"), saidIn(world.surface, CONV));
+});
+
+test("a reviewer whose token the exchange is not set up to give starts nothing", async () => {
+  const world = reviewWorld();
+  const exchange = world.deps.exchange as { tokenFor: ReviewWorld["deps"]["exchange"]["tokenFor"] };
+  const real = exchange.tokenFor;
+  exchange.tokenFor = (userId) =>
+    userId === "aad-b" ? Promise.resolve(err({ kind: "exchange_unavailable" as const })) : real(userId);
+  await refused(
+    world,
+    `请 {Bob} 帮我 review 合入 ${PR}`,
+    "我暂时联系不上 Primus 平台，没能确认 Bob 的身份，所以没有开始 review。",
+  );
+});
