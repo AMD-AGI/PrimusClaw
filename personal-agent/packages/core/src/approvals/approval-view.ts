@@ -12,7 +12,8 @@
 import { pickLang } from "../language/detect.js";
 import type { Lang } from "../locales/lang.js";
 import { redactText } from "../security/redact.js";
-import { clip, cpHead, cpLen, cpTail, flat, pyJson } from "../text/plain.js";
+import { clip, cpTail, pyJson } from "../text/plain.js";
+import { cpHead, cpLength, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { credentialValues, maskValue, scrub } from "./sensitive.js";
 
 export const TITLE_ID = "approval-title";
@@ -41,14 +42,14 @@ export interface ArgumentLines {
 
 /** `mcp__<server>__<tool>` -> `tool words (server)`; any other name with its separators turned into spaces. */
 export function humanizeTool(tool: string): string {
-  let name = tool.trim();
+  let name = pyStrip(tool);
   let server = "";
   const match = /^mcp__(.+?)__(.+)$/s.exec(name);
   if (match) {
     server = match[1] ?? "";
     name = match[2] ?? "";
   }
-  const spaced = name.split(/[_\-\s]+/).join(" ").trim() || name;
+  const spaced = name.split(/[_\-\s]+/).join(" ") || name;
   return server ? `${spaced} (${server})` : spaced;
 }
 
@@ -65,7 +66,7 @@ function isEmptyInput(input: unknown): boolean {
 
 /** A value as one line of text: strings flattened, everything else as compact JSON. */
 function show(value: unknown): string {
-  if (typeof value === "string") return flat(value);
+  if (typeof value === "string") return squashSpaces(value);
   return pyJson(value, { compact: true });
 }
 
@@ -74,9 +75,9 @@ function show(value: unknown): string {
  * `git push` sits at the end, so a plain cut at the front would hide the part that is being approved).
  */
 export function clipCommand(text: string): string {
-  const line = flat(text);
-  if (cpLen(line) <= COMMAND_MAX) return line;
-  return `${cpHead(line, COMMAND_EDGE).trimEnd()} … ${cpTail(line, COMMAND_EDGE).trimStart()}`;
+  const line = squashSpaces(text);
+  if (cpLength(line) <= COMMAND_MAX) return line;
+  return `${pyRstrip(cpHead(line, COMMAND_EDGE))} … ${pyStrip(cpTail(line, COMMAND_EDGE))}`;
 }
 
 /** The call's key arguments, its reason and how many fields did not fit. A credential-named field shows as [hidden]. */
@@ -90,19 +91,26 @@ export function argumentLines(tool: string, toolInput: unknown): ArgumentLines {
   let reason: ArgumentLine | undefined;
   for (const [name, value] of Object.entries(masked)) {
     const lower = name.toLowerCase();
-    const pair: ArgumentLine = [clip(name, NAME_MAX), lower === "command" ? clipCommand(show(value)) : clip(show(value), VALUE_MAX)];
+    const pair: ArgumentLine = [
+      clip(name, NAME_MAX),
+      lower === "command" ? clipCommand(show(value)) : clip(show(value), VALUE_MAX),
+    ];
     if (lower === "reason") reason ??= pair;
     else if (bare.includes(`_${lower}_`)) about.push(pair);
     else others.push(pair);
   }
   about.sort((a, b) => bare.indexOf(`_${a[0].toLowerCase()}_`) - bare.indexOf(`_${b[0].toLowerCase()}_`));
-  return { lines: [...about, ...others.slice(0, MAX_OTHER_ARGS)], reason, more: Math.max(0, others.length - MAX_OTHER_ARGS) };
+  return {
+    lines: [...about, ...others.slice(0, MAX_OTHER_ARGS)],
+    reason,
+    more: Math.max(0, others.length - MAX_OTHER_ARGS),
+  };
 }
 
 /** The call as JSON for the collapsed section: credential-named fields and secret shapes already masked. */
 export function rawDetails(tool: string, toolInput: unknown): string {
   const body = pyJson(maskValue(toolInput, credentialValues(toolInput)));
-  return `${tool}\n${cpLen(body) <= RAW_MAX ? body : `${cpHead(body, RAW_MAX - 1)}…`}`;
+  return `${tool}\n${cpLength(body) <= RAW_MAX ? body : `${cpHead(body, RAW_MAX - 1)}…`}`;
 }
 
 /** The semantic content of an approval card; the buttons are the caller's. */
@@ -139,10 +147,15 @@ export interface ApprovalRequest {
 }
 
 /** One line from text Claw or the model wrote: scrubbed of typed credentials, masked by shape, then clipped (in that order). */
-function eventField(event: Readonly<Record<string, unknown>>, name: string, limit: number, secrets: readonly string[]): string {
+function eventField(
+  event: Readonly<Record<string, unknown>>,
+  name: string,
+  limit: number,
+  secrets: readonly string[],
+): string {
   const value = event[name];
   if (typeof value !== "string") return "";
-  return clip(redactText(flat(scrub(flat(value), secrets))).text, limit);
+  return clip(redactText(squashSpaces(scrub(squashSpaces(value), secrets))).text, limit);
 }
 
 export function approvalView(request: ApprovalRequest): ApprovalView {
@@ -152,7 +165,7 @@ export function approvalView(request: ApprovalRequest): ApprovalView {
   const description = eventField(event, "tool_description", DESCRIPTION_MAX, secrets);
   const intent = eventField(event, "intent", INTENT_MAX, secrets);
   const lang: Lang = request.lang === "zh" || request.lang === "en" ? request.lang : pickLang(summary, intent);
-  const name = request.tool.trim() ? humanizeTool(request.tool) : "";
+  const name = pyStrip(request.tool) ? humanizeTool(request.tool) : "";
   const base = {
     lang,
     group: request.group,
@@ -161,7 +174,17 @@ export function approvalView(request: ApprovalRequest): ApprovalView {
     ruleLabel: eventField(event, "approval_label", INTENT_MAX, secrets),
   };
   if (request.group) {
-    return { ...base, intent: "", action: name, description: "", args: [], reason: undefined, moreFields: 0, details: "", ruleLabel: "" };
+    return {
+      ...base,
+      intent: "",
+      action: name,
+      description: "",
+      args: [],
+      reason: undefined,
+      moreFields: 0,
+      details: "",
+      ruleLabel: "",
+    };
   }
   const { lines, reason, more } = argumentLines(request.tool, request.toolInput);
   return {

@@ -11,6 +11,7 @@
 
 import type { Lang } from "../locales/lang.js";
 import { neutral } from "../text/neutral.js";
+import { pyStrip } from "../text/py-text.js";
 
 /** A suggested reply: (what the button says, what it sends). */
 export type SuggestedReply = readonly [title: string, value: string];
@@ -30,11 +31,11 @@ function escapeRegExp(text: string): string {
 
 /** `text` with nothing markdown reads as markup: a name inside the bold of a head. */
 function plain(text: string, limit: number): string {
-  return neutral(text, limit).replace(MARKUP, "").trim();
+  return pyStrip(neutral(text, limit).replace(MARKUP, ""));
 }
 
 function splitLabel(label: string): [icon: string, name: string] {
-  const trimmed = label.trim();
+  const trimmed = pyStrip(label);
   const space = trimmed.indexOf(" ");
   return space < 0 ? [trimmed, ""] : [trimmed.slice(0, space), trimmed.slice(space + 1)];
 }
@@ -54,7 +55,9 @@ export function agentHead(label: string, host: string): string {
 /** The first line of the second and later messages of one answer: the agent's icon and where it is in the answer. */
 export function continuedHead(label: string, n: number, total: number, lang: string): string {
   const icon = agentHead(label, "").split(" ", 1)[0] ?? NEUTRAL_ICON;
-  return lang === "zh" ? `${icon} （续 ${n}/${total}）` : `${icon} (cont. ${n}/${total})`;
+  return lang === "zh"
+    ? `${icon} （续 ${String(n)}/${String(total)}）`
+    : `${icon} (cont. ${String(n)}/${String(total)})`;
 }
 
 /** The agent's words with every line that would read as a head escaped (its bold shown as asterisks). */
@@ -71,7 +74,13 @@ export function signed(head: string, text: string): string {
 }
 
 /** The messages of one thing an agent said, each headed: the first with who said it (and `suffix`), the others with where they are. */
-export function signedParts(label: string, host: string, parts: readonly string[], lang: string, suffix = ""): string[] {
+export function signedParts(
+  label: string,
+  host: string,
+  parts: readonly string[],
+  lang: string,
+  suffix = "",
+): string[] {
   return parts.map((part, i) =>
     signed(i === 0 ? agentHead(label, host) + suffix : continuedHead(label, i + 1, parts.length, lang), part),
   );
@@ -82,7 +91,10 @@ export const TYPED_SUFFIX: Readonly<Record<Lang, string>> = {
   zh: "（回复终端里的输入）",
   en: " (replying to what was typed in the terminal)",
 };
-export const BACK: Readonly<Record<Lang, SuggestedReply>> = { zh: ["回到 Clawy", "回到 Clawy"], en: ["Back to Clawy", "back to Clawy"] };
+export const BACK: Readonly<Record<Lang, SuggestedReply>> = {
+  zh: ["回到 Clawy", "回到 Clawy"],
+  en: ["Back to Clawy", "back to Clawy"],
+};
 const GO_ON: Readonly<Record<Lang, SuggestedReply>> = { zh: ["继续", "继续"], en: ["Continue", "Continue"] };
 
 function lang2(lang: string): Lang {
@@ -100,11 +112,11 @@ export function backReply(lang: string): SuggestedReply {
 
 /** The reply that attaches the chat to the agent it last talked to again (`/agent attach MACHINE/AGENT`); undefined when none. */
 export function returnReply(label: string, host: string, agentId: string, lang: string): SuggestedReply | undefined {
-  const id = agentId.trim();
+  const id = pyStrip(agentId);
   if (!id || /\s/u.test(id)) return undefined;
   const [, rest] = splitLabel(label);
   const name = plain(rest || label, 24) || "agent";
-  const machine = host.trim();
+  const machine = pyStrip(host);
   const ref = machine && !/\s/u.test(machine) ? `${machine}/${id}` : id;
   return [lang === "zh" ? `切回 ${name}` : `Back to ${name}`, `/agent attach ${ref}`];
 }
@@ -124,9 +136,10 @@ export function enteredLine(entered: EnteredLine): string {
   const zh = entered.lang === "zh";
   const where = `${neutral(entered.host, 80)} · ${neutral(entered.label, 80)}`;
   const mode = neutral(entered.mode, 40);
-  const extra = [entered.cwd ? `\`${neutral(entered.cwd, 120)}\`` : "", entered.mode ? (zh ? `${mode} 模式` : `${mode} mode`) : ""].filter(
-    Boolean,
-  );
+  const extra = [
+    entered.cwd ? `\`${neutral(entered.cwd, 120)}\`` : "",
+    entered.mode ? (zh ? `${mode} 模式` : `${mode} mode`) : "",
+  ].filter(Boolean);
   const detail = extra.length ? (zh ? `（${extra.join("，")}）` : ` (${extra.join(", ")})`) : "";
   const lines = [
     zh
@@ -179,19 +192,19 @@ export class DirectChat {
   private readonly users: ReadonlySet<string> | undefined;
 
   constructor(on: boolean, users: Iterable<string> = []) {
-    this.users = on ? new Set([...users].map((u) => u.trim().toLowerCase()).filter(Boolean)) : undefined;
+    this.users = on ? new Set([...users].map((u) => pyStrip(u).toLowerCase()).filter(Boolean)) : undefined;
   }
 
   /** Whether the chat of this person (or a group binding of theirs: the part before '|') is an agent's window when attached. */
   on(aadId: string): boolean {
     if (this.users === undefined) return false;
-    const person = (aadId.split("|", 1)[0] ?? "").trim().toLowerCase();
+    const person = pyStrip(aadId.split("|", 1)[0] ?? "").toLowerCase();
     return this.users.size === 0 || this.users.has(person);
   }
 
   describe(): string {
     if (this.users === undefined) return "off";
-    return this.users.size === 0 ? "on for everybody" : `on for ${this.users.size} people`;
+    return this.users.size === 0 ? "on for everybody" : `on for ${String(this.users.size)} people`;
   }
 
   /**
