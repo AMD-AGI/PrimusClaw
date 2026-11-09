@@ -214,3 +214,11 @@ test("what waits, the attached session and the whole context are said as the con
     },
   );
 });
+
+test("an attached session's fields named like Object.prototype's are kept as Python keeps them", () => {
+  // (`JSON.parse` makes `__proto__` an own field, as a session read from Claw or the store has it)
+  const parsed = attachedContext(
+    JSON.parse('{"__proto__":"x","constructor":"y","a":true,"n":1}') as Record<string, unknown>,
+  );
+  assert.equal(JSON.stringify(parsed), '{"attached":{"__proto__":"x","constructor":"y","a":true}}');
+});

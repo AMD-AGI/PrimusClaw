@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { SecretsSourceName } from "../ports/secret-source.js";
+import type { LinkLimits } from "../ports/store/link.js";
 
 /**
  * The worker's channel-neutral settings, read once at start (the runtime's `readSettings` from the environment; the
@@ -38,11 +39,8 @@ export interface Settings {
   readonly observeUsers: ReadonlySet<string>;
   /** TEAMS_LIMIT_<OPERATION>: the per-person limits of operations that act with someone's authority. */
   readonly sensitiveLimits: ReadonlyMap<string, Limit>;
-  /**
-   * TEAMS_LINK_MAX_FAILURES_PER_USER (5) / TEAMS_LINK_MAX_FAILURES_GLOBAL (100) / TEAMS_LINK_ATTEMPT_WINDOW_SECONDS (600).
-   * The shape of the store's `LinkLimits` (ports/store/link.ts), which it is handed to as it is.
-   */
-  readonly linkLimits: { readonly perUser: number; readonly global: number; readonly windowSeconds: number };
+  /** TEAMS_LINK_MAX_FAILURES_PER_USER (5) / TEAMS_LINK_MAX_FAILURES_GLOBAL (100) / TEAMS_LINK_ATTEMPT_WINDOW_SECONDS (600). */
+  readonly linkLimits: LinkLimits;
   readonly userLimits: UserLimits;
   /** SECRETS_SOURCE (env | keyvault). */
   readonly secretsSource: SecretsSourceName;

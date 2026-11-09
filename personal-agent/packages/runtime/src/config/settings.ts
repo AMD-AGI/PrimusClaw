@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_CONCURRENT_TASKS,
   DEFAULT_MESSAGE_LIMIT,
   DEFAULT_MESSAGE_WINDOW_SECONDS,
+  decimalBigInt,
   parseLimits,
   type AssistantSettings,
   type ExchangeSettings,
@@ -143,7 +144,9 @@ function githubReviewSettings(read: EnvReader, publicBaseUrl: string): GithubRev
 
 function assistantSettings(read: EnvReader): AssistantSettings {
   const window = read.text("ASSISTANT_REPLY_WINDOW_SECONDS");
-  if (window !== "" && !(/^[0-9]+$/.test(window) && Number(window) > 0)) {
+  // Python's `raw.isdigit() and int(raw) > 0`: decimal digits of any script
+  const seconds = window === "" ? undefined : decimalBigInt(window);
+  if (window !== "" && (seconds === undefined || seconds <= 0n)) {
     throw new ConfigError(`ASSISTANT_REPLY_WINDOW_SECONDS must be a positive number of seconds, not ${pyRepr(window)}`);
   }
   const enabled = read.isOn("ASSISTANT_ENABLED");
@@ -165,7 +168,7 @@ function assistantSettings(read: EnvReader): AssistantSettings {
   return {
     enabled,
     users,
-    replyWindowSeconds: window === "" ? ASSISTANT_REPLY_WINDOW_SECONDS : Number(window),
+    replyWindowSeconds: seconds === undefined ? ASSISTANT_REPLY_WINDOW_SECONDS : Number(seconds),
     understandingUsers,
   };
 }

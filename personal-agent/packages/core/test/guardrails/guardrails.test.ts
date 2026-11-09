@@ -178,3 +178,15 @@ test("the correlation id is the Python worker's: the first 32 hex of the sha256 
     assert.equal(sha256Hex(text), createHash("sha256").update(text, "utf8").digest("hex"));
   }
 });
+
+test("a name of Object.prototype is no sensitive operation (Python: ValueError, KeyError)", () => {
+  for (const op of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.throws(
+      () => new Guardrails(new FakeClock(1_000_000), () => undefined, new Map([[op, { count: 1, windowSeconds: 1 }]])),
+      /no such sensitive operation/,
+      op,
+    );
+    const guard = new Guardrails(new FakeClock(1_000_000), () => undefined);
+    assert.throws(() => guard.take("aad-a", op as never), RangeError, op);
+  }
+});
