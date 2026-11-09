@@ -23,6 +23,7 @@ import type { Clock } from "../../ports/clock.js";
 import type { Logger } from "../../ports/logger.js";
 import type { OutMessage, StreamRefused } from "../../ports/surface.js";
 import type { Result } from "../../result.js";
+import { type Integrations, noIntegrations } from "../../plugins/integrations.js";
 import { LiveView } from "../live-view.js";
 import { nowSeconds, sleepSeconds, type TurnSurface } from "../ports.js";
 import type { Step } from "../step.js";
@@ -34,11 +35,14 @@ import { defaultStreamFinish, type StatusPolicy, TurnStatusPolicy } from "./stat
 export interface TurnStatusOptions extends Omit<StatusOptions<Step>, "policy"> {
   /** The agent's text is streamed into the answer's bubble. */
   readonly streamText?: boolean;
+  /** A deployment's MCP servers, named in progress lines. */
+  readonly integrations?: Integrations;
 }
 
 /** The status message of a Claw turn (`TurnStatusPolicy`). */
 export function turnStatusMessage(surface: TurnSurface, options: TurnStatusOptions): StatusMessage<Step> {
-  const policy = new TurnStatusPolicy(new LiveView(options.lang ?? "en"), options.streamText ?? false);
+  const view = new LiveView(options.lang ?? "en", options.integrations ?? noIntegrations);
+  const policy = new TurnStatusPolicy(view, options.streamText ?? false);
   return new StatusMessage(surface, { ...options, policy });
 }
 import { statusText } from "./status-text.js";

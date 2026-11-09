@@ -313,6 +313,7 @@ export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise
     streamReplyTo: replyTo,
     group: ctx.request.group ?? false,
     streamText: ctx.deps.style.streamText && !ctx.request.group,
+    ...(ctx.deps.integrations ? { integrations: ctx.deps.integrations } : {}),
   });
   status.begin();
   const run = new TurnRun(ctx, controls, status);

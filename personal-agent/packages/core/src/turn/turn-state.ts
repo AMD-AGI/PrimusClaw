@@ -13,14 +13,8 @@ import { isObject, type JsonObject, objectOr, textOf, truthy } from "./json.js";
 import { todosOf } from "./plan.js";
 import { type ModelRefusalPolicy, noModelRefusalPolicy } from "../plugins/model-refusal-policy.js";
 import { NOTHING, type Step } from "./step.js";
-import {
-  HISTORY_COMPLETE,
-  isShell,
-  looksLikeFailure,
-  QUEUED_PREFIX,
-  skillInCommand,
-  type SseEvent,
-} from "./upstream.js";
+import { isShell, skillInCommand } from "./step-labels.js";
+import { HISTORY_COMPLETE, looksLikeFailure, QUEUED_PREFIX, type SseEvent } from "./upstream.js";
 
 /** Brain's setup steps before the first model call: never listed as steps, one "Preparing" line while it takes long. */
 export const PREPARATION_TOOLS: ReadonlySet<string> = new Set([
