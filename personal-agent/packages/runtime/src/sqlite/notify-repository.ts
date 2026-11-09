@@ -11,7 +11,10 @@ import { forgetNotifySub } from "./forget.js";
 export class SqliteNotifySubscriptionRepository implements NotifySubscriptionRepository {
   constructor(private readonly ctx: StoreContext) {}
 
-  saveNotifySub(userId: string, sub: NotifySubscription & { readonly secret: string; readonly typesVersion?: number }): void {
+  saveNotifySub(
+    userId: string,
+    sub: NotifySubscription & { readonly secret: string; readonly typesVersion?: number },
+  ): void {
     this.ctx.db.run(
       "INSERT OR REPLACE INTO notify_subs (aad_id, route, subscription_id, secret_enc, created_at, types_version) " +
         "VALUES (?, ?, ?, ?, ?, ?)",

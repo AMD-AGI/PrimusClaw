@@ -79,7 +79,11 @@ export interface FeedbackRepository {
   addFeedbackOffer(userId: string, issueNumber: number, sessionId: string, turnId: string): string;
   getFeedbackOffer(offerId: string): FeedbackOffer | null;
   /** `onlyFrom` defaults to 'open'; null moves from any state. */
-  moveFeedbackOffer(offerId: string, state: FeedbackOfferState, options?: { readonly onlyFrom?: FeedbackOfferState | null }): boolean;
+  moveFeedbackOffer(
+    offerId: string,
+    state: FeedbackOfferState,
+    options?: { readonly onlyFrom?: FeedbackOfferState | null },
+  ): boolean;
   /** A "Report a problem" button; its owner is kept here, not on the card. */
   addFeedbackPrompt(userId: string, scope: string): string;
   /** Null once older than FEEDBACK_PROMPT_TTL_SECONDS. */

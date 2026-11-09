@@ -178,7 +178,10 @@ export class SqliteHeldEventRepository implements HeldEventRepository {
   }
 
   takeHeld(userId: string): JsonObject[] {
-    const rows = this.ctx.db.all("SELECT event_id, event_json FROM held_events WHERE aad_id = ? ORDER BY held_at, rowid", userId);
+    const rows = this.ctx.db.all(
+      "SELECT event_id, event_json FROM held_events WHERE aad_id = ? ORDER BY held_at, rowid",
+      userId,
+    );
     this.ctx.db.run("DELETE FROM held_events WHERE aad_id = ?", userId);
     return rows.map((r) => storedObject(col.str(r, "event_json"))).filter((e): e is JsonObject => e !== null);
   }

@@ -122,5 +122,10 @@ export interface RemotePermissionRepository {
   pendingRemotePermissions(userId: string, sessionId: string): RemotePermission[];
   waitingRemoteSessions(userId: string): Set<string>;
   forgetRemotePermission(sessionId: string, actionId: string): void;
-  closeRemotePermission(sessionId: string, actionId: string, state: RemotePermissionState, options?: { readonly onlyIfPending?: boolean }): boolean;
+  closeRemotePermission(
+    sessionId: string,
+    actionId: string,
+    state: RemotePermissionState,
+    options?: { readonly onlyIfPending?: boolean },
+  ): boolean;
 }

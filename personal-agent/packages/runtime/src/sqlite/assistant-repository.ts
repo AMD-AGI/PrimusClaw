@@ -231,7 +231,12 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
 export class SqliteAssistantMessageRepository implements AssistantMessageRepository {
   constructor(private readonly ctx: StoreContext) {}
 
-  noteAssistantMessage(channelMessageId: string, userId: string, actions: readonly string[], people: readonly string[] = []): void {
+  noteAssistantMessage(
+    channelMessageId: string,
+    userId: string,
+    actions: readonly string[],
+    people: readonly string[] = [],
+  ): void {
     const now = this.ctx.now();
     this.ctx.db.run("DELETE FROM assistant_messages WHERE sent_at < ?", now - ASSISTANT_MESSAGE_KEEP_SECONDS);
     this.ctx.db.run(

@@ -113,7 +113,12 @@ export class SqliteApprovalRepository implements ApprovalRepository {
     };
   }
 
-  closeApproval(sessionId: string, toolUseId: string, state: ApprovalState, options: { readonly onlyIfPending?: boolean } = {}): boolean {
+  closeApproval(
+    sessionId: string,
+    toolUseId: string,
+    state: ApprovalState,
+    options: { readonly onlyIfPending?: boolean } = {},
+  ): boolean {
     const onlyIfPending = options.onlyIfPending ?? true;
     return (
       this.ctx.db.run(

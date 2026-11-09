@@ -20,7 +20,10 @@ import { pyJsonDumps, storedObject } from "./py-json.js";
 export class SqliteObserveRepository implements ObserveRepository {
   constructor(private readonly ctx: StoreContext) {}
 
-  observeGroup(conversationId: string, observer: GroupObserver & { readonly reference: JsonObject; readonly name?: string }): void {
+  observeGroup(
+    conversationId: string,
+    observer: GroupObserver & { readonly reference: JsonObject; readonly name?: string },
+  ): void {
     const now = this.ctx.now();
     this.ctx.db.run(
       "INSERT INTO observed_groups (conversation_id, aad_id, scope, reference_json, name, on_since, updated_at) " +
@@ -31,7 +34,9 @@ export class SqliteObserveRepository implements ObserveRepository {
       observer.userId,
       observer.scope,
       pyJsonDumps(observer.reference),
-      [...(observer.name ?? "")].slice(0, 200).join(""),
+      Array.from(observer.name ?? "")
+        .slice(0, 200)
+        .join(""),
       now,
       now,
     );
@@ -134,8 +139,13 @@ export class SqliteObserveRepository implements ObserveRepository {
 
   moveObserveCard(cardId: string, state: ObserveCardState, onlyFrom?: ObserveCardState): boolean {
     const { db } = this.ctx;
-    if (onlyFrom === undefined) return db.run("UPDATE observe_cards SET state = ? WHERE card_id = ?", state, cardId) === 1;
-    const row = db.get("SELECT aad_id, run_id, seq FROM observe_cards WHERE card_id = ? AND state = ?", cardId, onlyFrom);
+    if (onlyFrom === undefined)
+      return db.run("UPDATE observe_cards SET state = ? WHERE card_id = ?", state, cardId) === 1;
+    const row = db.get(
+      "SELECT aad_id, run_id, seq FROM observe_cards WHERE card_id = ? AND state = ?",
+      cardId,
+      onlyFrom,
+    );
     if (!row) return false;
     if (
       state === "busy" &&

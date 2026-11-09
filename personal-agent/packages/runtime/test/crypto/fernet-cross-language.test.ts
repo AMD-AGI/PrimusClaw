@@ -83,17 +83,23 @@ function tsSamples(): Sample[] {
 /** Python with `cryptography`, or why there is none. In CI its absence is a failure, never a skip. */
 function python(): string | undefined {
   const probe = spawnSync("python3", ["-c", "import cryptography"], { encoding: "utf8" });
-  return probe.status === 0 ? undefined : `python3 with cryptography is not available (${probe.stderr.trim() || String(probe.error)})`;
+  return probe.status === 0
+    ? undefined
+    : `python3 with cryptography is not available (${probe.stderr.trim() || String(probe.error)})`;
 }
 
 const missing = python();
 
-test("tokens made here decrypt in Python (100/100), and Python refuses every tampered copy", { skip: missing !== undefined && process.env["CI"] === undefined ? missing : false }, () => {
-  assert.equal(missing, undefined, missing);
-  const run = spawnSync("python3", [SCRIPT.pathname, "verify"], {
-    input: JSON.stringify({ fernet: tsSamples() }),
-    encoding: "utf8",
-  });
-  assert.equal(run.status, 0, run.stderr);
-  assert.deepEqual(JSON.parse(run.stdout), { samples: 100, equal: 100, tampered: 500, refused: 500 });
-});
+test(
+  "tokens made here decrypt in Python (100/100), and Python refuses every tampered copy",
+  { skip: missing !== undefined && process.env["CI"] === undefined ? missing : false },
+  () => {
+    assert.equal(missing, undefined, missing ?? "");
+    const run = spawnSync("python3", [SCRIPT.pathname, "verify"], {
+      input: JSON.stringify({ fernet: tsSamples() }),
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(run.stdout), { samples: 100, equal: 100, tampered: 500, refused: 500 });
+  },
+);

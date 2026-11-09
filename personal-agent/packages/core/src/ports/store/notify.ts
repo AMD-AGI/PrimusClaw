@@ -18,7 +18,10 @@ export interface NotifyRoute {
 }
 
 export interface NotifySubscriptionRepository {
-  saveNotifySub(userId: string, sub: NotifySubscription & { readonly secret: string; readonly typesVersion?: number }): void;
+  saveNotifySub(
+    userId: string,
+    sub: NotifySubscription & { readonly secret: string; readonly typesVersion?: number },
+  ): void;
   /** Which set of event types the subscription was made or changed for (0: the original two); null: none. */
   notifyTypesVersion(userId: string): number | null;
   setNotifyTypesVersion(userId: string, typesVersion: number): void;

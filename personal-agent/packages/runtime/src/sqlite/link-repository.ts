@@ -114,7 +114,10 @@ export class SqliteLinkRepository implements LinkRepository {
     if (row === undefined) return "wrong";
     if (col.bool(row, "used")) return "used";
     if (col.num(row, "expires_at") <= now) return "expired";
-    const spent = this.ctx.db.run("UPDATE pending_keys SET used = 1 WHERE code_hash = ? AND used = 0", col.str(row, "code_hash"));
+    const spent = this.ctx.db.run(
+      "UPDATE pending_keys SET used = 1 WHERE code_hash = ? AND used = 0",
+      col.str(row, "code_hash"),
+    );
     return spent === 1 ? "success" : "used";
   }
 
@@ -137,7 +140,10 @@ export class SqliteLinkRepository implements LinkRepository {
 
   takeExpiredPending(): string[] {
     const { db, secrets } = this.ctx;
-    const rows = db.all("SELECT code_hash, key_enc FROM pending_keys WHERE expires_at <= ? AND used = 0", this.ctx.now());
+    const rows = db.all(
+      "SELECT code_hash, key_enc FROM pending_keys WHERE expires_at <= ? AND used = 0",
+      this.ctx.now(),
+    );
     for (const row of rows) db.run("DELETE FROM pending_keys WHERE code_hash = ?", col.str(row, "code_hash"));
     return rows.map((row) => secrets.decrypt(col.bytes(row, "key_enc"))).filter((key): key is string => key !== null);
   }
@@ -184,6 +190,8 @@ export class SqliteLinkRepository implements LinkRepository {
   }
 
   usersForClawUser(clawUserId: string): string[] {
-    return this.ctx.db.all("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId).map((r) => col.str(r, "aad_id"));
+    return this.ctx.db
+      .all("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId)
+      .map((r) => col.str(r, "aad_id"));
   }
 }

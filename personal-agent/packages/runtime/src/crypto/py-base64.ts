@@ -11,7 +11,7 @@ const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 const PAD = 61; // "="
 
 const VALUES: ReadonlyMap<number, number> = new Map([
-  ...[...ALPHABET].map((ch, i): [number, number] => [ch.charCodeAt(0), i]),
+  ...Array.from({ length: ALPHABET.length }, (_, i): [number, number] => [ALPHABET.charCodeAt(i), i]),
   ["-".charCodeAt(0), 62],
   ["_".charCodeAt(0), 63],
 ]);

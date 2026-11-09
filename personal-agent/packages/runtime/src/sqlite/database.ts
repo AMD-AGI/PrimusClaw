@@ -36,16 +36,21 @@ export class Database {
   }
 
   get(sql: string, ...params: readonly SqlValue[]): Row | undefined {
-    return this.statement(sql).get(...params) as Row | undefined;
+    return this.statement(sql).get(...params);
   }
 
   all(sql: string, ...params: readonly SqlValue[]): Row[] {
-    return this.statement(sql).all(...params) as Row[];
+    return this.statement(sql).all(...params);
   }
 
   /** The column names of `table` (`PRAGMA table_info`). */
   columns(table: string): Set<string> {
-    return new Set(this.#db.prepare(`PRAGMA table_info(${table})`).all().map((r) => String(r["name"])));
+    return new Set(
+      this.#db
+        .prepare(`PRAGMA table_info(${table})`)
+        .all()
+        .map((r) => String(r["name"])),
+    );
   }
 
   close(): void {
@@ -63,32 +68,39 @@ export class Database {
   }
 }
 
+/** A column value as text: numbers in their decimal form, a BLOB as UTF-8, NULL as ''. */
+function asText(value: SqlValue | undefined): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint") return value.toString();
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  return "";
+}
+
+/** A column value as a number: text is parsed as SQLite would compare it, NULL is 0. */
+function asNumber(value: SqlValue | undefined): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") return Number(value);
+  return 0;
+}
+
 /** Typed reads of a column; a value of another type is a corrupt row, not a case to handle. */
 export const col = {
-  str(row: Row, name: string): string {
-    const value = row[name];
-    return typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
-  },
-  strOrNull(row: Row, name: string): string | null {
-    const value = row[name];
-    return value === null || value === undefined ? null : String(value);
-  },
-  num(row: Row, name: string): number {
-    const value = row[name];
-    return typeof value === "number" ? value : typeof value === "bigint" ? Number(value) : Number(value ?? 0);
-  },
-  numOrNull(row: Row, name: string): number | null {
-    const value = row[name];
-    return value === null || value === undefined ? null : col.num(row, name);
-  },
+  str: (row: Row, name: string): string => asText(row[name]),
+  strOrNull: (row: Row, name: string): string | null =>
+    row[name] === null || row[name] === undefined ? null : asText(row[name]),
+  num: (row: Row, name: string): number => asNumber(row[name]),
+  numOrNull: (row: Row, name: string): number | null =>
+    row[name] === null || row[name] === undefined ? null : asNumber(row[name]),
+  /** Python's truthiness of the value. */
   bool(row: Row, name: string): boolean {
     const value = row[name];
+    if (value instanceof Uint8Array) return value.length > 0;
     return value !== null && value !== undefined && value !== 0 && value !== "" && value !== 0n;
   },
   bytes(row: Row, name: string): Uint8Array {
     const value = row[name];
-    if (value instanceof Uint8Array) return value;
-    return new TextEncoder().encode(typeof value === "string" ? value : "");
+    return value instanceof Uint8Array ? value : new TextEncoder().encode(asText(value));
   },
 };
 

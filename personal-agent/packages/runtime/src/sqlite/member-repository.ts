@@ -9,8 +9,9 @@ import { col } from "./database.js";
 
 /** Python's `str(m.get(k) or "")`. */
 function text(value: unknown): string {
-  if (value === null || value === undefined || value === "" || value === false || value === 0) return "";
-  return typeof value === "string" ? value : String(value);
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return value === 0 ? "" : value.toString();
+  return "";
 }
 
 export class SqliteMemberDirectoryRepository implements MemberDirectoryRepository {
@@ -34,7 +35,12 @@ export class SqliteMemberDirectoryRepository implements MemberDirectoryRepositor
       const channelUserId = text(member.id);
       const email = (text(member.email) || text(member.userPrincipalName)).trim();
       if (channelUserId && email.includes("@")) {
-        this.ctx.db.run("UPDATE teams_users SET email = ? WHERE teams_id = ? AND email <> ?", email, channelUserId, email);
+        this.ctx.db.run(
+          "UPDATE teams_users SET email = ? WHERE teams_id = ? AND email <> ?",
+          email,
+          channelUserId,
+          email,
+        );
       }
     }
   }

@@ -18,7 +18,10 @@ export interface TurnRun {
 }
 
 export interface TurnAnswerRepository {
-  turnStarted(sessionId: string, turn?: { readonly prompt?: string; readonly messageId?: string; readonly turnId?: string }): void;
+  turnStarted(
+    sessionId: string,
+    turn?: { readonly prompt?: string; readonly messageId?: string; readonly turnId?: string },
+  ): void;
   /** With `turnId`, the row is updated only while it is still that turn's. */
   turnDelivered(sessionId: string, turn?: { readonly messageId?: string; readonly turnId?: string }): void;
   turnNotDelivered(sessionId: string, turnId?: string): void;

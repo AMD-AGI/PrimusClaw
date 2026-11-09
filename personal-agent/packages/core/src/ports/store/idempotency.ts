@@ -4,8 +4,7 @@
 /** Work done at most once: activity ids and Claw events (tables `processed`, `event_claims`). */
 
 export type EventClaim =
-  | { readonly state: "claimed"; readonly holder: string }
-  | { readonly state: "done" | "busy"; readonly holder: "" };
+  { readonly state: "claimed"; readonly holder: string } | { readonly state: "done" | "busy"; readonly holder: "" };
 
 export interface IdempotencyRepository {
   /** Marks `activityId` processed; true only for the one caller that marked it. */
