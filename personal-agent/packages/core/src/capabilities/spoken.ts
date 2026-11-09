@@ -1,8 +1,12 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Numbers, times of day and durations as people say them ("晚上 10 点", "八点半", "两小时"), for the sentences that set quiet hours,
  * a pause or the brief (`natural.ts`).
  */
-import { decimalInt, isDigits, rstripChars, stripChars } from "../text/words.js";
+import { pySplit } from "../text/py-text.js";
+import { decimalInt, isDigits, pyFullmatch, rstripChars, strip, stripChars } from "../text/words.js";
 
 /** The punctuation and spacing a whole message may carry at either end without changing what it says. */
 export const PUNCT = " \t\r\n。．.！!？?～~，,、；;：:\"'“”‘’（）()";
@@ -25,24 +29,23 @@ const CN_DIGITS: Readonly<Record<string, number>> = {
 };
 
 /** One or two digits, or a Chinese number up to 99. */
-export const NUM = String.raw`(?:\p{Nd}{1,2}|[零〇一二两三四五六七八九十]{1,3})`;
+export const NUM = String.raw`(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})`;
 export const PERIOD = String.raw`(?:早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|凌晨|半夜)`;
 /** A time of day: "22:00", "晚上 10 点", "8 点半", "九点十五分". No capturing groups: it is used inside other patterns. */
-export const TIME = String.raw`(?:${PERIOD})?\s*${NUM}\s*(?:[:：]\s*\p{Nd}{2}|(?:点|點)\s*(?:半|${NUM}\s*分?)?)`;
+export const TIME = String.raw`(?:${PERIOD})?\s*${NUM}\s*(?:[:：]\s*\d{2}|(?:点|點)\s*(?:半|${NUM}\s*分?)?)`;
 
-const TIME_PARTS = new RegExp(
-  String.raw`^(?:(?<p>${PERIOD})?\s*(?<h>${NUM})\s*(?:[:：]\s*(?<m>\p{Nd}{2})|(?:点|點)\s*(?:(?<half>半)|(?<m2>${NUM})\s*分?)?))$`,
-  "u",
+const TIME_PARTS = pyFullmatch(
+  String.raw`(?<p>${PERIOD})?\s*(?<h>${NUM})\s*(?:[:：]\s*(?<m>\d{2})|(?:点|點)\s*(?:(?<half>半)|(?<m2>${NUM})\s*分?)?)`,
 );
 
 /** A whole message as a phrase to look up: lower case, no spaces between the words, no punctuation at either end. */
 export function phraseKey(text: string): string {
-  return stripChars(text, PUNCT).toLowerCase().replace(/\s+/gu, "");
+  return pySplit(stripChars(text, PUNCT).toLowerCase()).join("");
 }
 
 /** A whole message as it is matched against a sentence pattern: no spacing at either end, no closing punctuation. */
 export function flatten(text: string): string {
-  return rstripChars(text.trim(), TRAILING).trim();
+  return strip(rstripChars(strip(text), TRAILING));
 }
 
 /** A number as written ("12", "十二", "两"); null when it is none. */
@@ -68,7 +71,7 @@ function afternoon(period: string, hour: number): number {
 
 /** '晚上 10 点' / '早上 8 点半' / '22:00' / '九点' as '22:00' / '08:30' / '22:00' / '09:00'; null when it is no time of day. */
 export function clockOf(text: string): string | null {
-  const groups = TIME_PARTS.exec(text.trim())?.groups;
+  const groups = TIME_PARTS.exec(strip(text))?.groups;
   if (groups === undefined) return null;
   const hour = spokenNumber(groups["h"] ?? "");
   const minute = groups["half"] !== undefined ? 30 : spokenNumber(groups["m"] ?? groups["m2"] ?? "0");

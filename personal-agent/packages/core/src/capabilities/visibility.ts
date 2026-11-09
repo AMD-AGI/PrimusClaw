@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /** Which capabilities a chat offers: what help shows and what the assistant may ask a chat to do. */
 import { words } from "../text/words.js";
 import { CAPABILITIES, type Capability, type Part } from "./registry.js";
@@ -30,7 +33,7 @@ export const NOT_ACTIONS: ReadonlySet<string> = new Set(["link", "unlink", "gith
  */
 export const AGENT_ACTION_VERBS = ["attach", "detach", "sessions"] as const;
 export const AGENT_ACTION_USAGE =
-  "/agent attach MACHINE/AGENT (switch the chat to that agent's session, e.g. /agent attach rohan-dev-pod/claude; " +
+  "/agent attach MACHINE/AGENT (switch the chat to that agent's session, e.g. /agent attach robin-dev-pod/claude; " +
   "a session's number or id also works) | /agent detach (back to the assistant) | /agent sessions (every session, " +
   "to tap one)";
 const AGENT_ACTION_SUMMARY = "开发环境：切到某台机器上的 agent 会话、回到助理、看会话列表";

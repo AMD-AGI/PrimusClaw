@@ -1,9 +1,12 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Plain words as the command they mean: the sentences help teaches (and a few ways of saying the same) read as the command, so
  * `晚上 10 点到早上 8 点别打扰我` sets quiet hours just as `/quiet 22:00-08:00` does. A sentence is read only when it is the whole
  * message and says exactly that; anything else is a request for Claw, as before.
  */
-import { lstripChars, rstripChars, words } from "../text/words.js";
+import { lstrip, lstripChars, pyFullmatch, rstripChars, strip, words } from "../text/words.js";
 import * as P from "./phrases.js";
 import { sessionControl, switchCommand } from "./sessions-words.js";
 import { clockOf, flatten, NUM, phraseKey, PUNCT, spokenDuration, TIME } from "./spoken.js";
@@ -14,8 +17,8 @@ function keys(phrases: readonly string[]): ReadonlySet<string> {
   return new Set(phrases.map(phraseKey));
 }
 
-function whole(source: string, flags = "u"): RegExp {
-  return new RegExp(`^(?:${source})$`, flags);
+function whole(source: string, flags = ""): RegExp {
+  return pyFullmatch(source, flags);
 }
 
 const BY_LONGEST = (a: string, b: string): number => b.length - a.length;
@@ -52,7 +55,7 @@ const QUIET_PATTERNS: readonly RegExp[] = [
   whole(
     String.raw`(?:把)?\s*免打扰(?:时间|时段)?\s*(?:改成|设成|设为|设置为|改为|是)?\s*(?<a>${TIME})${TO}(?<b>${TIME})`,
   ),
-  whole(String.raw`quiet hours\s+(?<a>\p{Nd}{1,2}:\p{Nd}{2})\s*-\s*(?<b>\p{Nd}{1,2}:\p{Nd}{2})`, "iu"),
+  whole(String.raw`quiet hours\s+(?<a>\d{1,2}:\d{2})\s*-\s*(?<b>\d{1,2}:\d{2})`, "i"),
 ];
 const PAUSE_PATTERNS: readonly RegExp[] = [
   whole(
@@ -61,19 +64,19 @@ const PAUSE_PATTERNS: readonly RegExp[] = [
   whole(
     String.raw`(?<n>${NUM}|半)\s*(?<u>分钟|个小时|小时|个钟头|钟头|天)\s*(?:内|之内)?\s*(?:别|不要)\s*(?:打扰|给我发消息|通知)\s*我?`,
   ),
-  whole(String.raw`pause notifications for (?<n>\p{Nd}{1,4}) ?(?<u>minutes?|hours?|days?)`, "iu"),
+  whole(String.raw`pause notifications for (?<n>\d{1,4}) ?(?<u>minutes?|hours?|days?)`, "i"),
 ];
 const BRIEF_PATTERNS: readonly RegExp[] = [
   whole(
     String.raw`(?:每个?)?\s*(?:工作日|每天|每日)?\s*(?<t>${TIME})\s*(?:给我)?\s*发\s*(?:一份)?\s*(?:简报|日报|每日简报)(?:给我)?`,
   ),
-  whole(String.raw`send me a brief every (?:week)?day at (?<t>\p{Nd}{1,2}:\p{Nd}{2})`, "iu"),
+  whole(String.raw`send me a brief every (?:week)?day at (?<t>\d{1,2}:\d{2})`, "i"),
 ];
 const TIMEZONE_PATTERNS: readonly RegExp[] = [
   whole(
     String.raw`(?:把)?\s*(?:我的)?\s*时区\s*(?:改成|设成|设为|设置为|改为|是)\s*(?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`,
   ),
-  whole(String.raw`set my time ?zone to (?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`, "iu"),
+  whole(String.raw`set my time ?zone to (?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`, "i"),
 ];
 const LANG_PATTERNS: readonly RegExp[] = [
   whole(
@@ -83,7 +86,7 @@ const LANG_PATTERNS: readonly RegExp[] = [
   whole(
     String.raw`(?:please\s+)?(?:reply|answer|talk|speak|respond)(?:\s+to\s+me)?\s+in\s+(?<l>english|chinese)` +
       String.raw`(?:\s+from\s+now\s+on)?(?:\s+please)?`,
-    "iu",
+    "i",
   ),
 ];
 const LANG_WORDS: Readonly<Record<string, string>> = {
@@ -102,9 +105,9 @@ const REPO_PATTERNS: readonly RegExp[] = [
     String.raw`(?:切到|换到|进到)\s*(?:仓库)?\s*(?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?:\s*仓库)?` +
       String.raw`(?:\s+(?<b>${BRANCH_CHARS}+)\s*分支)?`,
   ),
-  whole(String.raw`switch to repo (?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?: (?<b>${BRANCH_CHARS}+))?`, "iu"),
+  whole(String.raw`switch to repo (?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?: (?<b>${BRANCH_CHARS}+))?`, "i"),
 ];
-const FEEDBACK = /^(?:(?:我要)?(?:反馈|报告问题|报个问题|feedback)\s*[:：]\s*(?<t>[\s\S]+))$/iu;
+const FEEDBACK = whole(String.raw`(?:我要)?(?:反馈|报告问题|报个问题|feedback)\s*[:：]\s*(?<t>.+)`, "is");
 
 /** Phrase lists that are read in a group chat too (what a group may do), in the order they are tried. */
 const GROUP_PHRASES: readonly (readonly [ReadonlySet<string>, string])[] = [
@@ -155,24 +158,36 @@ function firstMatch(flat: string, patterns: readonly RegExp[]): Record<string, s
   return null;
 }
 
-/** The settings said as sentences with a value in them (quiet hours, a pause, the brief, the time zone, the language). */
-function sentenceWithValue(flat: string): string | null {
+function quietCommand(flat: string): string | null {
   for (const pattern of QUIET_PATTERNS) {
     const groups = pattern.exec(flat)?.groups;
-    const start = groups ? clockOf(groups["a"] ?? "") : null;
-    const end = groups ? clockOf(groups["b"] ?? "") : null;
+    if (groups === undefined) continue;
+    const start = clockOf(groups["a"] ?? "");
+    const end = clockOf(groups["b"] ?? "");
     if (start !== null && end !== null && start !== end) return `/quiet ${start}-${end}`;
   }
+  return null;
+}
+
+function pauseCommand(flat: string): string | null {
   for (const pattern of PAUSE_PATTERNS) {
     const groups = pattern.exec(flat)?.groups;
-    const span = groups ? spokenDuration(groups["n"] ?? "", groups["u"] ?? "") : null;
+    const span = groups === undefined ? null : spokenDuration(groups["n"] ?? "", groups["u"] ?? "");
     if (span !== null) return `/pause ${span}`;
   }
+  return null;
+}
+
+function briefCommand(flat: string): string | null {
   for (const pattern of BRIEF_PATTERNS) {
     const groups = pattern.exec(flat)?.groups;
-    const at = groups ? clockOf(groups["t"] ?? "") : null;
+    const at = groups === undefined ? null : clockOf(groups["t"] ?? "");
     if (at !== null) return `/brief on ${at}`;
   }
+  return null;
+}
+
+function settingCommand(flat: string): string | null {
   const zone = firstMatch(flat, TIMEZONE_PATTERNS);
   if (zone !== null) return `/timezone ${zone["z"] ?? ""}`;
   const lang = firstMatch(flat, LANG_PATTERNS);
@@ -180,25 +195,40 @@ function sentenceWithValue(flat: string): string | null {
   return null;
 }
 
+function repoCommand(flat: string): string | null {
+  const repo = firstMatch(flat, REPO_PATTERNS);
+  if (repo === null) return null;
+  const branch = repo["b"];
+  return `/repo ${repo["r"] ?? ""}${branch ? ` ${branch}` : ""}`;
+}
+
+/** The sentences with a value in them, in the order they are tried. */
+const VALUED: readonly ((flat: string) => string | null)[] = [
+  quietCommand,
+  pauseCommand,
+  briefCommand,
+  settingCommand,
+  switchCommand,
+  repoCommand,
+];
+
 function personal(text: string, flat: string, key: string): string {
   if (STOP_IT.has(key)) return "/stop";
   if (DETACH.has(detachKey(key))) return "/agent detach";
   const phrase = lookUp(key, PERSONAL_PHRASES);
   if (phrase !== null) return phrase;
-  const valued = sentenceWithValue(flat);
-  if (valued !== null) return valued;
-  const switched = switchCommand(flat);
-  if (switched !== null) return switched;
-  const repo = firstMatch(flat, REPO_PATTERNS);
-  if (repo !== null) return `/repo ${repo["r"] ?? ""}${repo["b"] ? ` ${repo["b"]}` : ""}`;
+  for (const read of VALUED) {
+    const command = read(flat);
+    if (command !== null) return command;
+  }
   return text;
 }
 
 function natural(text: string, group: boolean): string {
-  if (text === "" || text.trimStart().startsWith("/")) return text;
+  if (text === "" || lstrip(text).startsWith("/")) return text;
   const flat = flatten(text);
   const key = phraseKey(text);
-  const feedback = FEEDBACK.exec(flat)?.groups?.["t"]?.trim();
+  const feedback = strip(FEEDBACK.exec(flat)?.groups?.["t"] ?? "");
   if (feedback) return `/feedback ${feedback}`;
   if (FEEDBACK_ALONE.has(key)) return "/feedback";
   const command = lookUp(key, GROUP_PHRASES);

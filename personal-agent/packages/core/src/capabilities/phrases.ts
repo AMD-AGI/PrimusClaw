@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * The plain sentences help teaches, and close ways of saying the same, each read as the command it means (`natural.ts`). A whole
  * message is looked up as a phrase: lower case, no spaces between the words, no punctuation at either end (`phraseKey`).
@@ -44,10 +47,24 @@ export const STOP_IT = [
   "stop the agent",
   "stop the run",
 ];
-export const NEW = ["开个新会话", "新会话", "新开一个会话", "换个话题", "重新开始", "start a new session", "new session"];
+export const NEW = [
+  "开个新会话",
+  "新会话",
+  "新开一个会话",
+  "换个话题",
+  "重新开始",
+  "start a new session",
+  "new session",
+];
 export const SESSIONS = ["我之前的会话", "之前的会话", "最近的会话", "我的会话", "my sessions"];
 export const BOARD = ["看看我的任务", "我的任务", "任务板", "看看任务", "show my tasks", "my tasks"];
-export const WHOAMI = ["我连的是哪个账号", "我连的哪个账号", "连的是哪个账号", "我是谁", "which account am i connected to"];
+export const WHOAMI = [
+  "我连的是哪个账号",
+  "我连的哪个账号",
+  "连的是哪个账号",
+  "我是谁",
+  "which account am i connected to",
+];
 export const MEMORY = ["你记得我什么", "你记住了我什么", "你记得我哪些事", "what do you remember about me"];
 export const MEMORY_ON = ["打开记忆", "开启记忆", "把记忆打开", "turn memory on", "turn on memory"];
 export const MEMORY_OFF = ["关掉记忆", "关闭记忆", "把记忆关掉", "turn memory off", "turn off memory"];
@@ -132,7 +149,14 @@ export const DETACH_TAIL = [
 ];
 export const RESUME = ["恢复通知", "继续通知", "可以发通知了", "可以打扰我了", "resume notifications"];
 export const QUIET_SHOW = ["免打扰", "免打扰时间", "免打扰时段", "quiet hours"];
-export const QUIET_OFF = ["关掉免打扰", "关闭免打扰", "取消免打扰", "不要免打扰", "turn off quiet hours", "quiet hours off"];
+export const QUIET_OFF = [
+  "关掉免打扰",
+  "关闭免打扰",
+  "取消免打扰",
+  "不要免打扰",
+  "turn off quiet hours",
+  "quiet hours off",
+];
 export const BRIEF_OFF = [
   "关掉简报",
   "关闭简报",
@@ -174,7 +198,14 @@ export const GITHUB_UNBIND = [
   "取消绑定github",
   "disconnect my github",
 ];
-export const GITHUB_STATUS = ["我的github", "github状态", "我的github状态", "我的github连上了吗", "github连上了吗", "my github"];
+export const GITHUB_STATUS = [
+  "我的github",
+  "github状态",
+  "我的github状态",
+  "我的github连上了吗",
+  "github连上了吗",
+  "my github",
+];
 export const DELEGATION_ON = [
   "允许同事请我代审合入",
   "同事可以请我代审合入",

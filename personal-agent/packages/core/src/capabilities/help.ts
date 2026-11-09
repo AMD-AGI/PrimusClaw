@@ -1,10 +1,13 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * Help, rendered from the capability registry: the capabilities a chat shows, by category, one short line each with the example to
  * type; the current value of a setting where it is known; what the bot can do and as whom; and what to know about answers and data.
  * No list of commands.
  */
-import { DEFAULT_BOT_NAME } from "../branding.js";
-import { langOf, type Lang } from "../locales/phrase.js";
+import { BOT_NAME } from "../branding.js";
+import { toLang, type Lang } from "../locales/lang.js";
 import { dataStatement } from "../locales/transparency.js";
 import { CAPABILITIES, CATEGORIES, type Capability, type Part } from "./registry.js";
 import { shown, type ChatShape } from "./visibility.js";
@@ -105,32 +108,34 @@ function categoryBlocks(lang: Lang, chat: ChatShape, values: Readonly<Record<str
   return blocks;
 }
 
-/** The help for a chat, in `lang` ("zh" or anything else for English). */
-export function renderHelp(language: string, options: HelpOptions = {}): string {
-  const lang = langOf(language);
-  const zh = lang === "zh";
-  const group = options.group ?? false;
-  const parts = options.parts ?? new Set<Part>();
-  const bot = options.bot ?? DEFAULT_BOT_NAME;
-  const chat: ChatShape = {
-    group,
+function chatOf(options: HelpOptions): ChatShape {
+  return {
+    group: options.group ?? false,
     assistant: options.assistant ?? false,
-    parts,
+    parts: options.parts ?? new Set<Part>(),
     understanding: options.understanding ?? false,
   };
+}
+
+function groupLead(zh: boolean, bot: string): string {
+  return zh
+    ? `在群里先 @${bot}，再说要做什么。我以你自己的身份做事，第一次用请先在和我的 1:1 聊天里连上账号。`
+    : `In a group, @mention ${bot} first. I act as you, with your own account: connect it once in a 1:1 chat with me.`;
+}
+
+/** The help for a chat, in `language` ("zh", or anything else for English). */
+export function renderHelp(language: string, options: HelpOptions = {}): string {
+  const lang = toLang(language);
+  const zh = lang === "zh";
+  const chat = chatOf(options);
+  const bot = options.bot ?? BOT_NAME;
   const out = [zh ? `**${bot} 能帮你做什么**` : `**What ${bot} can do for you**`];
   if (options.lead) out.push(options.lead);
-  if (group) {
-    out.push(
-      zh
-        ? `在群里先 @${bot}，再说要做什么。我以你自己的身份做事，第一次用请先在和我的 1:1 聊天里连上账号。`
-        : `In a group, @mention ${bot} first. I act as you, with your own account: connect it once in a 1:1 chat with me.`,
-    );
-  }
+  if (chat.group) out.push(groupLead(zh, bot));
   out.push(...categoryBlocks(lang, chat, options.values ?? {}));
-  out.push(authorityText(zh, parts));
-  if (group) out.push(zh ? "设置只能在和我的 1:1 聊天里改。" : "Settings are changed in a 1:1 chat with me.");
-  out.push(dataStatement(lang, !group && parts.has("remote"))); // (every help: 1:1, group and the assistant's)
+  out.push(authorityText(zh, chat.parts));
+  if (chat.group) out.push(zh ? "设置只能在和我的 1:1 聊天里改。" : "Settings are changed in a 1:1 chat with me.");
+  out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"))); // (every help: 1:1, group and the assistant's)
   out.push(
     zh
       ? "随时问我「你能做什么」看这份说明。底部菜单里也有常用的按钮。"

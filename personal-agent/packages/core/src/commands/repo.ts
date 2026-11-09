@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * `/repo owner/name [branch]`. Claw is sent `config.repo = {url, branch?}` and clones it, so what is accepted is a name GitHub
  * itself allows and a branch git itself allows, and nothing else: no URL, no credential, no shell or option text.
@@ -31,9 +34,7 @@ export function validRepo(repo: string): boolean {
   if (slash < 0) return false;
   const owner = repo.slice(0, slash);
   const name = repo.slice(slash + 1);
-  return (
-    OWNER.test(owner) && NAME.test(name) && name !== "." && name !== ".." && !name.toLowerCase().endsWith(".git")
-  );
+  return OWNER.test(owner) && NAME.test(name) && name !== "." && name !== ".." && !name.toLowerCase().endsWith(".git");
 }
 
 /**

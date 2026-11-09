@@ -1,5 +1,8 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /** `/agent ARGS`: the remote-agent subcommands, read here and carried out by the remote-agent feature. */
-import { splitOnce } from "../text/words.js";
+import { splitOnce, strip } from "../text/words.js";
 
 export const AGENT_SUBCOMMANDS = ["new", "attach", "detach", "mode", "sessions", "close", "off", "pair"] as const;
 
@@ -17,8 +20,8 @@ function isSubcommand(word: string): word is AgentSubcommand {
 
 /** The arguments of `/agent ARGS`; null when ARGS is empty or names no subcommand (the caller shows the usage). */
 export function parseAgentCommand(arg: string): AgentCommand | null {
-  const [head, rest] = splitOnce(arg.trim());
+  const [head, rest] = splitOnce(strip(arg));
   const verb = head?.toLowerCase();
   if (verb === undefined || !isSubcommand(verb)) return null;
-  return { verb, rest: rest === undefined ? "" : rest.trim() };
+  return { verb, rest: rest === undefined ? "" : strip(rest) };
 }

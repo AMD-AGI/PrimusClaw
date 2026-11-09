@@ -1,15 +1,19 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
- * Sentences about the remote-agent sessions themselves: switching the chat to an agent's session ("切到 rohan-dev-pod 的 claude")
+ * Sentences about the remote-agent sessions themselves: switching the chat to an agent's session ("切到 robin-dev-pod 的 claude")
  * and the words that ask to switch or open a session while a chat is attached to one.
  */
+import { pyFullmatch } from "../text/words.js";
 import { flatten } from "./spoken.js";
 
 /** Python's Unicode `\b` before a word character: no word character behind, one ahead. */
 const WORD = String.raw`[\p{L}\p{N}_]`;
 const BOUNDARY = String.raw`(?:(?<!${WORD})(?=${WORD})|(?<=${WORD})(?!${WORD}))`;
 
-function whole(source: string, flags = "iu"): RegExp {
-  return new RegExp(`^(?:${source})$`, flags);
+function whole(source: string): RegExp {
+  return pyFullmatch(source, "i");
 }
 
 /**
@@ -27,7 +31,9 @@ const CONTROL: readonly RegExp[] = [
     String.raw`(?:请|帮我|麻烦)?\s*(?:新开|新建|另开|再开|开)\s*(?:一个|个)?\s*(?:新的?)?\s*(?:会话|session)` +
       String.raw`(?:(?:\s*[，,]\s*|\s*(?=在|到|用|里|去))[^\n]{1,60}|\s+(?=[~/])[^\n]{1,60})?`,
   ),
-  whole(String.raw`(?:please\s+)?(?:switch|go|connect|attach|move)\s+(?:back\s+)?to\s+[^\n.!?]{0,40}?${BOUNDARY}session`),
+  whole(
+    String.raw`(?:please\s+)?(?:switch|go|connect|attach|move)\s+(?:back\s+)?to\s+[^\n.!?]{0,40}?${BOUNDARY}session`,
+  ),
   // "open a new (codex) session", alone or followed by where and what; only an agent's name before "session".
   whole(
     String.raw`(?:please\s+)?(?:open|start|begin)\s+(?:a\s+)?(?:new|fresh|another|second)\s+(?:(?:claude(?:\s+code)?|codex|cursor|agent)\s+)?session` +
@@ -56,7 +62,7 @@ const SWITCH: readonly RegExp[] = [
 
 /**
  * `/agent attach MACHINE/AGENT` (or `/agent attach AGENT`) when the whole message asks to switch the chat to an agent's session, as
- * people say it ("切到 rohan-dev-pod 的 claude", "switch to claude on rohan-dev-pod"); else null.
+ * people say it ("切到 robin-dev-pod 的 claude", "switch to claude on robin-dev-pod"); else null.
  */
 export function switchCommand(text: string): string | null {
   const flat = flatten(text);

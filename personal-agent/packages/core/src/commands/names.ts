@@ -1,3 +1,6 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
 /**
  * The chat's command words. Anything else, unknown `/words` included, goes on as the person's text.
  *
