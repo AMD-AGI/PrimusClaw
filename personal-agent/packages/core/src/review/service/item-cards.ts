@@ -211,7 +211,12 @@ export class ItemCards {
     const item = await this.deps.claw.workItems.get(key, card.itemId);
     if (item.boardState !== "done") return undefined;
     const outcome = item.outcome ?? "";
-    return [outcome === "stopped" ? ITEM_STOPPED_ZH : `已结束：${BOARD_OUTCOME_ZH[outcome] ?? "已完成"}`, ""];
+    return [
+      outcome === "stopped"
+        ? ITEM_STOPPED_ZH
+        : `已结束：${(Object.hasOwn(BOARD_OUTCOME_ZH, outcome) ? BOARD_OUTCOME_ZH[outcome] : undefined) ?? "已完成"}`,
+      "",
+    ];
   }
 
   /**

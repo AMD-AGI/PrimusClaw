@@ -9,8 +9,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { GithubConfirmView } from "@primusclaw/personal-agent";
-import { endedItemCard, githubConfirmCard, reviewItemCard } from "../../src/views/review/index.js";
+import type { GithubConfirmView, ReviewModeView } from "@primusclaw/personal-agent";
+import { endedItemCard, githubConfirmCard, reviewItemCard, reviewModeCard } from "../../src/views/review/index.js";
 
 /** Every text a card shows and every fact's value, wherever they sit. */
 function texts(node: unknown): string[] {
@@ -169,3 +169,22 @@ test("the confirmation card says what the pull request does", () => {
     assert.ok(texts(githubConfirmCard(view({ review, summary: EN, lang: "en" }))).some((t) => t.includes(EN)));
   }
 });
+
+for (const word of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+  test(`a setting named like an object property is no setting on the mode card (${word})`, () => {
+    // (Python's review_mode_card: `suggested in REVIEW_MODES`, `current in REVIEW_MODES`)
+    const model = { current: word, suggested: word, lead: "", hint: "", installUrl: "" } as unknown as ReviewModeView;
+    const card = reviewModeCard(model);
+    const shown = texts(card);
+    assert.ok(
+      JSON.stringify(card).includes("还没有设置，默认是第一项"),
+      "a word that is not a setting is not the one in force",
+    );
+    assert.ok(!JSON.stringify(card).includes("native code"));
+    assert.ok(!shown.some((t) => t.includes("（当前）")));
+    assert.deepEqual(
+      actions(card).map((a) => a.data.mode),
+      ["high_risk_confirm", "fully_auto"],
+    );
+  });
+}

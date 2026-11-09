@@ -204,3 +204,30 @@ test("a card the channel refuses to edit gets the plain end", async () => {
   assert.equal(ended, ITEM_CARD_ENDED_PLAIN_ZH);
   assert.equal(cardState(world), "ended");
 });
+
+for (const outcome of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+  test(`an item that ended with an outcome named like an object property ends its card as done (${outcome})`, async () => {
+    // (Python's BOARD_OUTCOME_ZH.get(outcome, "已完成"): a word Claw sends is a key of the table or nothing)
+    const world = reviewWorld();
+    const conversation = world.surface.conversation({
+      id: BOB_DM,
+      kind: "personal",
+      tenantId: "tenant-1",
+      wire: { conversation: { id: BOB_DM } },
+    });
+    const cardId = world.store.assistantCards.addAssistantCard("aad-b", "item-9", 1, false);
+    const id = await conversation.post({
+      body: { type: "view", view: { name: "reviewItem", model: {} as never }, fallbackText: "work" },
+    });
+    world.store.assistantCards.placeAssistantCard(cardId, {
+      activityId: id ?? "",
+      reference: conversation.ref.wire as JsonObject,
+      render: { kind: "work" },
+    });
+    world.claw.workItem = (_key, itemId) => ({ ...bobsItem(itemId), boardState: "done", outcome });
+    const sweep = (world.service as unknown as { cards: { closeEnded: () => Promise<number> } }).cards.closeEnded();
+    assert.equal(await sweep, 1);
+    const [ended = ""] = endedWithoutButtons(world, BOB_DM);
+    assert.equal(ended, "已结束：已完成");
+  });
+}

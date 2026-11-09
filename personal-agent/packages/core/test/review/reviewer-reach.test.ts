@@ -163,3 +163,20 @@ test("when bobs item cannot be read as him he still hears how to answer", async 
   assert.ok(bob.includes("直接回复「批准 #1」确认"), bob);
   assert.deepEqual(posted, []);
 });
+
+for (const why of ["constructor", "__proto__", "toString"]) {
+  test(`a reason named like an object property is said as the subscription not set up (${why})`, async () => {
+    // (Python's REACH_WORDS.get(why, REACH_WORDS["no_subscription"]))
+    const { world } = reachWorld(why);
+    await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+    const notes = world.surface
+      .of(CONV)
+      .flatMap((r) => (r.op === "send" && r.message.body.type === "text" ? [r.message.body.text] : []))
+      .filter((t) => t.includes("收不到"));
+    assert.equal(notes.length, 1);
+    const [note = ""] = notes;
+    assert.ok(note.includes("（TA 的 PrimusClaw 通知订阅还没开通）"), note);
+    assert.ok(note.includes("请提醒 TA 在和我的私聊里给我发一条消息，我会再开通一次"), note);
+    assert.ok(!note.includes("function") && !note.includes("native code"), note);
+  });
+}

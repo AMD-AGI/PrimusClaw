@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { shapeGroupAnswer } from "../../src/review/receipt.js";
+import { plainWords, shapeGroupAnswer } from "../../src/review/receipt.js";
 import {
   ALICE,
   CONV,
@@ -115,4 +115,11 @@ test("the group summary is at most 1200 characters", async () => {
     "";
   assert.ok(cpLength(text) < 1500, String(cpLength(text)));
   assert.ok(text.includes("... (shortened)"), text.slice(-80));
+});
+
+test("words named like an object property are not tool names and are left as they are", () => {
+  // (Python's plain_words: only a name of the table is said in plain words)
+  for (const word of ["constructor", "__proto__", "toString", "hasOwnProperty"])
+    assert.equal(plainWords(`x ${word} y`), `x ${word} y`);
+  assert.equal(plainWords("x `constructor` y"), "x `constructor` y");
 });

@@ -61,9 +61,11 @@ function addAppButton(installUrl: string): CardElement[] {
 }
 
 export function reviewModeCard(model: ReviewModeView): CardMessage {
-  const first = model.suggested || "high_risk_confirm";
+  // (a mode that is not one of them, "constructor" included, is no mode: as Python's `in REVIEW_MODES`)
+  const known = (mode: string): boolean => Object.hasOwn(REVIEW_MODES, mode);
+  const first = known(model.suggested) ? model.suggested : "high_risk_confirm";
   const order = [first, ...Object.keys(REVIEW_MODES).filter((m) => m !== first)];
-  const now = model.current ? `当前：${MODE_BUTTON[model.current] ?? ""}` : "还没有设置，默认是第一项";
+  const now = known(model.current) ? `当前：${MODE_BUTTON[model.current] ?? ""}` : "还没有设置，默认是第一项";
   const body: CardElement[] = [header("选择代审合入的确认方式", { tone: "accent", subtitle: now, emoji: "settings" })];
   if (model.lead) body.push(text(model.lead));
   const english: CardElement[] = [];

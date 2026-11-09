@@ -154,7 +154,8 @@ export class Notices {
     if (review === undefined || this.deps.host.reviewerReach === undefined) return "";
     const why = await this.deps.host.reviewerReach(review.actorId);
     if (!why) return "";
-    const [cause, fix] = REACH_WORDS[why] ?? REACH_WORDS.no_subscription ?? ["", ""];
+    const [cause, fix] = (Object.hasOwn(REACH_WORDS, why) ? REACH_WORDS[why] : undefined) ??
+      REACH_WORDS.no_subscription ?? ["", ""];
     return `注意：${reviewerName(review)} 现在收不到这项代审在等 TA 确认时的提醒和确认卡片（${cause}）。需要 TA 确认的步骤会一直等着，请提醒 TA ${fix}。`;
   }
 
