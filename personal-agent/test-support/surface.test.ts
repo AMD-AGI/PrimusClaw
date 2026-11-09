@@ -86,3 +86,24 @@ test("an envelope built by outgoing is sent only when delivered, as the send it 
   const other = surface.conversation(testConversation("c2"));
   await assert.rejects(other.deliver(stored), /not an envelope of this conversation/);
 });
+
+test("openPersonal opens a 1:1 only with a reachable person; members lists only a known roster", async () => {
+  const member = {
+    channelUserId: "29:1",
+    userId: "u1",
+    name: "Ada Lovelace",
+    givenName: "Ada",
+    surname: "Lovelace",
+    email: "ada@example.com",
+    userPrincipalName: "ada@example.com",
+  };
+  const surface = new FakeSurface({ reachable: ["u1"], rosters: { g1: [member] } });
+  const group = testConversation("g1", "group");
+  const personal = await surface.openPersonal(group, { channelUserId: "29:1", userId: "u1" });
+  assert.equal(personal?.ref.id, "personal:u1");
+  assert.equal(personal.ref.kind, "personal");
+  assert.equal(personal.ref.tenantId, "tenant-1");
+  assert.equal(await surface.openPersonal(group, { channelUserId: "29:2", userId: "u2" }), undefined);
+  assert.deepEqual(await surface.members(group), [member]);
+  assert.equal(await surface.members(testConversation("g2", "group")), undefined);
+});

@@ -20,9 +20,13 @@ import type { Result } from "../result.js";
 /** The kinds of conversation core tells apart: a 1:1 chat with the bot, a group chat, a channel of a team. */
 export type ConversationKind = "personal" | "group" | "channel";
 
-/** A person on the channel. `id` is the channel's stable user id (Teams: the Entra object id, stored as `aad_id`). */
+/**
+ * A person on the channel. `id` is the person's stable directory id (Teams: the Entra object id, stored as `aad_id`);
+ * `channelUserId` is the channel's own id of them in this bot's conversations (Teams: the "29:..." id).
+ */
 export interface UserRef {
   readonly id: string;
+  readonly channelUserId: string;
   /** The display name the channel gave, as given ("" when none). */
   readonly name: string;
   /** Only when the channel supplied one (never looked up); "" otherwise. */
@@ -81,6 +85,17 @@ export interface InboundQuote {
   readonly sentAt: string;
 }
 
+/** Someone the message @mentions (never the bot itself: the adapter removes its own mention). */
+export interface InboundMention {
+  /** The channel's id of the person (Teams: "29:..."). */
+  readonly channelUserId: string;
+  /** Their directory id (Teams: the Entra object id); "" when the channel did not give it. */
+  readonly userId: string;
+  readonly name: string;
+  /** The mention as it appears in the message text. */
+  readonly shown: string;
+}
+
 /** A file that came with a message. The bytes are fetched through `Surface.fetchFile`, never by core directly. */
 export interface InboundFile {
   readonly name: string;
@@ -96,6 +111,10 @@ export interface InboundMessage extends InboundBase {
   readonly text: string;
   /** In a group or channel: whether the bot was @mentioned or the message otherwise addressed to it. Always true in 1:1. */
   readonly addressedToBot: boolean;
+  /** The conversation's name (a group chat's title; "" in 1:1 or when the channel gave none). */
+  readonly conversationName: string;
+  /** The people the message @mentions, in order, the bot excluded. */
+  readonly mentions: readonly InboundMention[];
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
   readonly files: readonly InboundFile[];
@@ -271,11 +290,32 @@ export interface FileRefused {
   readonly reason: string;
 }
 
+/** A member of a conversation, as the channel's roster lists them ("" for what it does not give). */
+export interface RosterMember {
+  readonly channelUserId: string;
+  readonly userId: string;
+  readonly name: string;
+  readonly givenName: string;
+  readonly surname: string;
+  readonly email: string;
+  readonly userPrincipalName: string;
+}
+
 /** The channel. */
 export interface Surface {
   readonly caps: SurfaceCaps;
   conversation(ref: ConversationRef): Conversation;
   fetchFile(file: InboundFile): Promise<Result<FetchedFile, FileRefused>>;
+  /**
+   * The bot's 1:1 conversation with `user`, created through the organisation of `via` (a conversation both are in);
+   * undefined when the channel cannot open it (the bot is not in their roster, the channel refuses).
+   */
+  openPersonal(
+    via: ConversationRef,
+    user: { readonly channelUserId: string; readonly userId: string },
+  ): Promise<Conversation | undefined>;
+  /** The members of `conversation`; undefined when the channel cannot list them. */
+  members(conversation: ConversationRef): Promise<readonly RosterMember[] | undefined>;
 }
 
 /** A plain-text message: the common case. */

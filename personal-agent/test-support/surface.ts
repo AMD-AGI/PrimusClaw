@@ -14,6 +14,7 @@ import {
   type LiveStream,
   type MessageId,
   type OutMessage,
+  type RosterMember,
   type Result,
   type StreamRefused,
   type Surface,
@@ -44,6 +45,10 @@ export const ALL_CAPS: SurfaceCaps = {
 
 export interface FakeSurfaceOptions {
   readonly caps?: Partial<SurfaceCaps>;
+  /** Rosters `members` returns, by conversation id; any other conversation cannot be listed (undefined). */
+  readonly rosters?: Readonly<Record<string, readonly RosterMember[]>>;
+  /** The people `openPersonal` can open a 1:1 with, by directory id ("u1" opens "personal:u1"); others give undefined. */
+  readonly reachable?: readonly string[];
   /** Files `fetchFile` returns, by name; any other file is refused as "unreachable". */
   readonly files?: Readonly<Record<string, { readonly mediaType: string; readonly bytes: Uint8Array }>>;
 }
@@ -57,11 +62,30 @@ export class FakeSurface implements Surface {
   readonly caps: SurfaceCaps;
   readonly outbox: Recorded[] = [];
   private readonly files: NonNullable<FakeSurfaceOptions["files"]>;
+  private readonly rosters: NonNullable<FakeSurfaceOptions["rosters"]>;
+  private readonly reachable: ReadonlySet<string>;
   private nextId = 1;
 
   constructor(options: FakeSurfaceOptions = {}) {
     this.caps = { ...ALL_CAPS, ...options.caps };
     this.files = options.files ?? {};
+    this.rosters = options.rosters ?? {};
+    this.reachable = new Set(options.reachable ?? []);
+  }
+
+  openPersonal(
+    via: ConversationRef,
+    user: { readonly channelUserId: string; readonly userId: string },
+  ): Promise<Conversation | undefined> {
+    if (!this.reachable.has(user.userId)) return Promise.resolve(undefined);
+    const id = `personal:${user.userId}`;
+    return Promise.resolve(
+      this.conversation({ id, kind: "personal", tenantId: via.tenantId, wire: { conversation: { id } } }),
+    );
+  }
+
+  members(conversation: ConversationRef): Promise<readonly RosterMember[] | undefined> {
+    return Promise.resolve(this.rosters[conversation.id]);
   }
 
   conversation(ref: ConversationRef): Conversation {
