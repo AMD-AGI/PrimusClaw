@@ -6,8 +6,8 @@
  * categories take only listed values; values that look like credentials or like a `/link` code are dropped even when
  * they fit a shape. So message text, link codes, keys and tokens cannot reach the log through a security event.
  */
-import { pyStrip } from "../text/py-text.js";
-import { B_END, S } from "../security/py-regex.js";
+import { PY_SPACE, pyStrip } from "../text/py-text.js";
+import { PY_B_END as B_END } from "../text/py-regex.js";
 import { parseIpAddress } from "./ip-address.js";
 
 /** A field's check: the value to log, or undefined when it must not be logged. */
@@ -27,7 +27,7 @@ const HOST = /^(?=[^\n]{1,253}$)[a-z0-9](?:[a-z0-9-]{0,62})(?:\.[a-z0-9](?:[a-z0
 // segments between separators adds up to 8 characters that upper-cased are a code. The price: a real 8-character
 // segment made only of code letters ("deadbeef", "releases") is dropped too.
 const LINK_CODE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/u;
-const SEGMENTS = new RegExp(`(?:${S}|[_.:;@=+/-])+`, "u");
+const SEGMENTS = new RegExp(`[${PY_SPACE}_.:;@=+/-]+`, "u");
 const GUIDS = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu;
 const TEAMS_SUFFIXES = new RegExp(`@(?:thread\\.(?:v2|tacv2|skype)|unq\\.gbl\\.spaces)${B_END}`, "giu");
 
@@ -99,7 +99,7 @@ function ip(value: unknown): unknown {
 }
 
 /** Category field -> the values it takes. Categories are chosen by the code, never by a person. */
-export const CATEGORIES: Readonly<Record<string, ReadonlySet<string>>> = {
+export const SECURITY_FIELD_CATEGORIES: Readonly<Record<string, ReadonlySet<string>>> = {
   outcome: new Set([
     "success",
     "failure",
@@ -151,7 +151,7 @@ export const CATEGORIES: Readonly<Record<string, ReadonlySet<string>>> = {
 };
 
 /** Field name -> its check. */
-export const FIELDS: Readonly<Record<string, FieldCheck>> = {
+export const SECURITY_FIELDS: Readonly<Record<string, FieldCheck>> = {
   // ids
   aad_object_id: shaped(GUID, true), // the channel user's directory object id
   activity_id: shaped(ID),
@@ -161,7 +161,7 @@ export const FIELDS: Readonly<Record<string, FieldCheck>> = {
   approval_id: shaped(ID),
   correlation_id: shaped(CORRELATION), // ties the records of one operation together
   // categories
-  ...Object.fromEntries(Object.entries(CATEGORIES).map(([name, values]) => [name, oneOf(values)])),
+  ...Object.fromEntries(Object.entries(SECURITY_FIELD_CATEGORIES).map(([name, values]) => [name, oneOf(values)])),
   // shaped values
   repo: shaped(REPO), // owner/name
   pr_number: count,

@@ -1,8 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { pullsIn } from "../review-text/pulls.js";
-import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-word.js";
+import { pullsIn } from "../review-text/pull-ref.js";
+import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-regex.js";
 import { decimalInt as pyInt } from "../text/py-text.js";
 
 /**

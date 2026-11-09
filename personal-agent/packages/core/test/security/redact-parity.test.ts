@@ -18,22 +18,34 @@ interface Row {
   readonly m: boolean;
 }
 
-const corpus = JSON.parse(readFileSync(new URL("data/redact-parity.json", import.meta.url), "utf8")) as { rows: Row[] };
-const decode = (text: string): string => Buffer.from(text, "base64").toString("utf8");
+/** A corpus file: each text and Python's answer as base64 of UTF-16LE (lone surrogates included, as Python wrote them). */
+function corpus(name: string): Row[] {
+  return (JSON.parse(readFileSync(new URL(`data/${name}`, import.meta.url), "utf8")) as { rows: Row[] }).rows;
+}
+const decode = (text: string): string => {
+  const bytes = Buffer.from(text, "base64");
+  return String.fromCharCode(...new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2));
+};
 
 describe("redaction parity with the Python worker", () => {
-  it("masks exactly what the Python worker masks, byte for byte", () => {
-    const differences = corpus.rows.filter((row) => {
-      const got = redactText(decode(row.t));
-      return got.text !== decode(row.o) || got.masked !== row.m;
+  for (const [name, masked] of [
+    ["redact-parity.json", 1000],
+    ["redact-parity-2.json", 400],
+  ] as const) {
+    it(`masks exactly what the Python worker masks, byte for byte: ${name}`, () => {
+      const rows = corpus(name);
+      const differences = rows.filter((row) => {
+        const got = redactText(decode(row.t));
+        return got.text !== decode(row.o) || got.masked !== row.m;
+      });
+      assert.equal(rows.length, 6000);
+      assert.ok(rows.filter((r) => r.m).length > masked, "the corpus masks something");
+      assert.deepEqual(
+        differences.slice(0, 5).map((r) => [decode(r.t), decode(r.o)]),
+        [],
+      );
     });
-    assert.equal(corpus.rows.length, 6000);
-    assert.ok(corpus.rows.filter((r) => r.m).length > 1000, "the corpus masks something");
-    assert.deepEqual(
-      differences.slice(0, 5).map((r) => [decode(r.t), decode(r.o)]),
-      [],
-    );
-  });
+  }
 });
 
 describe("Python's re.I, as Unicode", () => {

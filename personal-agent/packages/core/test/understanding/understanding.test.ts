@@ -9,6 +9,7 @@ import {
   channelContext,
   exactCommand,
   memberKeys,
+  rosterOf,
   nearPeople,
   peopleOf,
   pendingOf,
@@ -135,7 +136,7 @@ test("the people a message names are read as the Python worker read them", () =>
       label,
     );
   }
-  for (const { person, keys } of PARITY.keys) assert.deepEqual([...memberKeys(person)].sort(), keys);
+  for (const { person, keys } of PARITY.keys) assert.deepEqual([...memberKeys(rosterOf(person))].sort(), keys);
 });
 
 test("a stop is read as the Python worker read it", () => {

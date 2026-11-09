@@ -1,10 +1,12 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { REVIEW_MERGE, asksReviewOnly } from "../review-text/asks.js";
-import { flat, memberKeys, namedIn, textOf, tokens, writtenIn, type PersonRecord } from "../review-text/names.js";
-import { MODEL_FIELD, PR_SHORT, PR_URL, pullsIn } from "../review-text/pulls.js";
-import { isAsciiAlpha } from "../text/py-word.js";
+import { asksReviewOnly, modelFieldPattern, saysReviewAndMerge } from "../review-text/asks.js";
+import { memberKeys, namedIn, tokens, writtenIn } from "../review-text/names.js";
+import { prShortPattern, prUrlPattern, pullsIn } from "../review-text/pull-ref.js";
+import { flat } from "../review-text/text/unicode.js";
+import { rosterOf, textOf, type PersonRecord } from "./record.js";
+import { isAsciiAlpha } from "../text/py-regex.js";
 import { cpLength, pyCasefold } from "../text/py-text.js";
 import { similarity } from "../text/sequence-matcher.js";
 import { CONTEXT_ITEMS_MAX, CONTEXT_TEXT_MAX, clip } from "./limits.js";
@@ -19,7 +21,7 @@ export interface NamedPerson {
 }
 
 /** A channel mention (`{mentioned: {name, aadObjectId, id}}`). */
-export type Mention = Readonly<Record<string, unknown>>;
+export type MentionRecord = Readonly<Record<string, unknown>>;
 
 /** The Claw user id of a person by their channel id (null: not linked, or no id recorded). */
 export type UserIdOf = (channelUserId: string) => string | null | undefined;
@@ -33,7 +35,7 @@ const NEAR_WORD_MIN = 4;
 
 /** The text with its pull requests (links, owner/repo#N) and "model: X" fields left out: what may name a person. */
 export function withoutRefs(text: string): string {
-  return text.replace(PR_URL, " ").replace(PR_SHORT, " ").replace(MODEL_FIELD, " ");
+  return text.replace(prUrlPattern(), " ").replace(prShortPattern(), " ").replace(modelFieldPattern(), " ");
 }
 
 class People {
@@ -64,7 +66,7 @@ const field = (record: unknown, name: string): unknown =>
  * (`nearPeople`). `user_id` only for a linked person. A mention without its Entra id is looked up by its channel id.
  */
 export function peopleOf(
-  mentions: readonly Mention[],
+  mentions: readonly MentionRecord[],
   text: string,
   known: readonly PersonRecord[],
   userIdOf: UserIdOf,
@@ -81,7 +83,7 @@ export function peopleOf(
   const words = tokens(plain);
   for (const person of known) {
     const name = textOf(person["name"]);
-    if (name && (writtenIn(name, plain) || namedIn(words, person).size > 0)) {
+    if (name && (writtenIn(name, plain) || namedIn(words, rosterOf(person)).size > 0)) {
       people.add(name, textOf(person["objectId"]), "known", textOf(person["email"]));
     }
   }
@@ -117,13 +119,13 @@ function written(person: PersonRecord, keys: ReadonlySet<string>, text: string):
  * theirs is written in the message. Empty for a message that asks for no review.
  */
 export function nearPeople(text: string, known: readonly PersonRecord[], userIdOf: UserIdOf): PersonRecord[] {
-  if (!REVIEW_MERGE.test(text) && asksReviewOnly(text) === null) return [];
+  if (!saysReviewAndMerge(text) && asksReviewOnly(text) === undefined) return [];
   const words = candidateWords(text);
   if (words.length === 0) return [];
   const scored: Array<{ best: number; index: number; person: PersonRecord }> = [];
   known.forEach((person, index) => {
     const aad = textOf(person["objectId"]);
-    const keys = new Set([...memberKeys(person)].filter((k) => cpLength(k) >= NEAR_WORD_MIN));
+    const keys = new Set([...memberKeys(rosterOf(person))].filter((k) => cpLength(k) >= NEAR_WORD_MIN));
     if (keys.size === 0 || !aad || !userIdOf(aad) || written(person, keys, text)) return;
     const best = Math.max(...words.flatMap((w) => [...keys].map((k) => similarity(w, k))));
     if (best >= NEAR_RATIO) scored.push({ best, index, person });
