@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ClawError, type WorkItem } from "../../src/index.js";
+import { ClawError, type JsonObject, type WorkItem } from "../../src/index.js";
 import type { ItemCards } from "../../src/review/service/item-cards.js";
 import { ITEM_STOPPED_ZH } from "../../src/review/progress.js";
 import {
@@ -173,4 +173,67 @@ test("a card of someone with no key left is not read", async () => {
   world.store.links.unlink("aad-a");
   world.claw.workItem = () => assert.fail("read without a key");
   assert.equal(await cardsOf(world).closeEnded(), 0);
+});
+
+function placeReviewCard(world: ReviewWorld, render: JsonObject): string {
+  const cardId = world.store.assistantCards.addAssistantCard("aad-a", "item-r", 0, false);
+  world.store.assistantCards.placeAssistantCard(cardId, {
+    activityId: "teams-9",
+    reference: { conversation: { id: "personal:aad-a" } },
+    render,
+  });
+  return cardId;
+}
+
+test("a queued card whose record lacks fields starts with what it has", async () => {
+  const world = reviewWorld();
+  placeReviewCard(world, { kind: "review", queued: true, pull: PR });
+  await cardsOf(world).started("item-r");
+  const [view] = edits(world);
+  assert.deepEqual(view?.model, {
+    seq: 0,
+    pull: PR,
+    who: "",
+    reviewOnly: false,
+    model: "",
+    cardId: (view?.model as { cardId?: string } | undefined)?.cardId,
+    lang: "zh",
+    queued: false,
+  });
+});
+
+test("a queued card the channel will not edit stays queued and is tried again", async () => {
+  const world = reviewWorld();
+  placeReviewCard(world, { kind: "review", queued: true, pull: PR, seq: 3, who: "Bob", model: "m", lang: "en" });
+  const surface = world.surface;
+  const open = surface.conversation.bind(surface);
+  let refuse = true;
+  surface.conversation = (ref) => {
+    const conversation = open(ref);
+    const update = conversation.update.bind(conversation);
+    conversation.update = (id, message, options) =>
+      refuse ? Promise.reject(new Error("Teams said 400")) : update(id, message, options);
+    return conversation;
+  };
+  await cardsOf(world).started("item-r");
+  assert.equal(world.store.assistantCards.placedAssistantCards({ itemId: "item-r" })[0]?.render.queued, true);
+  refuse = false;
+  await cardsOf(world).started("item-r");
+  assert.equal(world.store.assistantCards.placedAssistantCards({ itemId: "item-r" })[0]?.render.queued, false);
+});
+
+test("a card that cannot be edited at all still ends, and its buttons say so", async () => {
+  const world = reviewWorld();
+  const cardId = placeReviewCard(world, { kind: "review", pull: PR, seq: 3 });
+  const surface = world.surface;
+  const open = surface.conversation.bind(surface);
+  surface.conversation = (ref) => {
+    const conversation = open(ref);
+    conversation.update = () => Promise.reject(new Error("Teams said 400"));
+    return conversation;
+  };
+  await cardsOf(world).end("item-r", "已结束：结论：批准，已合入");
+  assert.equal(world.store.assistantCards.getAssistantCard(cardId)?.state, "ended");
+  await cardsOf(world).end("item-r", "again"); // (ended once: not again)
+  assert.equal(world.store.assistantCards.getAssistantCard(cardId)?.ended, "已结束：结论：批准，已合入");
 });
