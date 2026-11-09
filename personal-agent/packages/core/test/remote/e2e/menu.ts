@@ -254,3 +254,19 @@ export class Watching extends Script {
     }
   }
 }
+
+/** Take over… as the status card of a watch offers it: the confirmation card it opens. */
+export function openTakeover(w: RemoteWorld, cid: string, resume = "r-live"): Promise<Json> {
+  return pressData(w, { op: "takeover", connector_id: cid, agent_id: "claude-attach", resume });
+}
+
+/** A connector that closes every session it is asked to start, saying `reason`. */
+export class Refusing extends Script {
+  constructor(private readonly reason: string) {
+    super();
+  }
+
+  protected override async handle(srv: FakeRemote, cmd: FakeCommand): Promise<void> {
+    if (cmd.type === "session.new") await srv.emit(cmd.session_id, "session_closed", { reason: this.reason });
+  }
+}
