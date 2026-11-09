@@ -61,12 +61,12 @@ export interface StopButtonsDeps {
   readonly delaySeconds?: number;
 }
 
-/** Python's `secrets.token_urlsafe(12)`: 12 random bytes as unpadded base64url (16 characters). */
+/** Python's `secrets.token_urlsafe(12)`: 12 random bytes as base64url (16 characters; 12 bytes need no padding). */
 function tokenOf(random: Random): string {
   const bytes = random.bytes(12);
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_");
 }
 
 /** The card as a message; a client that cannot draw it shows its words. */
