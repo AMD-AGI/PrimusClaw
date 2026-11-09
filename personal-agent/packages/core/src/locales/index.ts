@@ -9,6 +9,7 @@ export * from "./assistant-cards.js";
 export * from "./assistant-chat.js";
 export * from "./assistant.js";
 export * from "./catalog.js";
+export * from "./devenv-hide.js";
 export * from "./lang.js";
 export * from "./limits.js";
 export * from "./guardrails.js";

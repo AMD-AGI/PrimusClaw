@@ -82,12 +82,16 @@ export interface AssistantChatOptions {
   };
 }
 
+/** Told (session id, message id; null when Claw queued it) once Claw has taken a message (the Stop card of a phone's message). */
+export type OnSent = (sessionId: string, messageId: string | null) => void;
+
 /** What a message to the assistant needs, beside its text. */
 interface Handing {
   readonly userId: string;
   readonly credential: string;
   readonly conversation: Conversation;
   readonly lang: Lang;
+  readonly onSent?: OnSent | undefined;
 }
 
 export class AssistantChat {
@@ -154,6 +158,7 @@ export class AssistantChat {
     lang: Lang;
     conversation: Conversation;
     files: readonly InboundFile[];
+    onSent?: OnSent;
   }): Promise<boolean> {
     const notUnderstood = assistantChatText.in(request.lang).notUnderstood;
     if (!this.reachable(request.userId)) {
@@ -199,6 +204,7 @@ export class AssistantChat {
     conversation: Conversation;
     files: readonly InboundFile[];
     attached?: JsonObject | null;
+    onSent?: OnSent;
   }): Promise<boolean> {
     if (!(await this.takes(request.userId, request.credential))) return false;
     return this.sayTo(request);
@@ -236,6 +242,7 @@ export class AssistantChat {
     conversation: Conversation;
     files: readonly InboundFile[];
     attached?: JsonObject | null;
+    onSent?: OnSent;
   }): Promise<boolean> {
     const t = assistantChatText.in("en");
     let sessionId: string;
@@ -294,7 +301,9 @@ export class AssistantChat {
     try {
       const sessionId = knownSession ?? (await this.o.claw.assistant.session(handing.credential)).sessionId;
       follower = this.follow(handing, sessionId, await this.acknowledge(handing));
-      messageId = (await send(sessionId)) ?? undefined;
+      const sent = await send(sessionId);
+      messageId = sent ?? undefined;
+      this.tellSent(handing.onSent, sessionId, sent);
       return { ok: true };
     } catch (error) {
       if (!clawFailure(error)) throw error;
@@ -306,6 +315,16 @@ export class AssistantChat {
       return { ok: false, error: refused ? { status: refused.status } : undefined };
     } finally {
       follower?.answers(messageId);
+    }
+  }
+
+  /** Tell `onSent` that Claw took a message; what it does with that never fails the message. */
+  private tellSent(onSent: OnSent | undefined, sessionId: string, messageId: string | null): void {
+    if (onSent === undefined) return;
+    try {
+      onSent(sessionId, messageId);
+    } catch (error) {
+      this.o.logger.warn("what follows a message the assistant took failed", { error: errorName(error) });
     }
   }
 
@@ -397,20 +416,27 @@ export class AssistantChat {
     return this.o.board.show(userId, credential, conversation);
   }
 
-  /** `/stop`: interrupts what the assistant is doing this moment; a task is stopped by name. */
-  async stop(_userId: string, credential: string, conversation: Conversation): Promise<void> {
+  /**
+   * `/stop`: interrupts what the assistant is doing this moment; a task is stopped by name. `onlyMessage`: interrupt only while
+   * Claw's running turn answers that message (a Stop card's turn, read just before the interrupt goes); false, with nothing said
+   * or interrupted, when it does not.
+   */
+  async stop(_userId: string, credential: string, conversation: Conversation, onlyMessage?: string): Promise<boolean> {
     const t = assistantChatText.in("en");
     let running: boolean;
     try {
       const { sessionId } = await this.o.claw.assistant.session(credential);
-      running = (await this.o.claw.sessions.turn(credential, sessionId)).running;
+      const turn = await this.o.claw.sessions.turn(credential, sessionId);
+      running = turn.running;
+      if (onlyMessage !== undefined && !(running && turn.messageId === onlyMessage)) return false;
       if (running) await this.o.claw.sessions.interrupt(credential, sessionId);
     } catch (error) {
       if (!clawFailure(error)) throw error;
       await conversation.send(text(t.stopFailed));
-      return;
+      return true;
     }
     await conversation.send(text((running ? t.stopped : t.notBusy) + t.stopHint));
+    return true;
   }
 }
 

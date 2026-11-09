@@ -2,7 +2,7 @@
 # direct_chat.py, approval_view.py, agent.py's approval decisions and assistant actions, and the assistant/approval/proactive cards of render.py.
 # Python ids are internal-repo paths; parametrized tests are listed by their base function. Lines starting '# ... -> LATER' are
 # tests whose behaviour belongs to a line not merged yet (router W4, endpoint W3, turn engine W4b, ...): they are ported when it is.
-python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+python-baseline: f5fcc07e387ab633cbe8ea918abe1cb76dc4ee53
 
 teams/tests/test_approval_card.py::test_the_card_leads_with_what_will_change_then_the_action_then_the_arguments_then_the_reason -> packages/teams/test/views-approval.test.ts::the card leads with what will change then the action then the arguments then the reason
 teams/tests/test_approval_card.py::test_the_raw_call_is_collapsed_behind_a_details_toggle -> packages/teams/test/views-approval.test.ts::the raw call is collapsed behind a details toggle

@@ -323,3 +323,48 @@ it("the attached session is told with its text clipped", () => {
   assert.deepEqual(attachedOf({ a: "x".repeat(300), b: false, c: 1 }), { a: "x".repeat(200), b: false });
   assert.equal(attachedOf(null), null);
 });
+
+it("claw taking a message is told once and a failure of what follows never fails the message", async () => {
+  const w = world();
+  const told: (string | null)[] = [];
+  assert.equal(
+    await w.chat.route({
+      userId: ALICE,
+      credential: "ak-alice",
+      prompt: "hi",
+      conversation: w.conversation,
+      files: [],
+      onSent: (sessionId, messageId) => {
+        told.push(`${sessionId} ${String(messageId)}`);
+        throw new Error("the stop card could not be sent");
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(told, ["asst-ak-alice msg-1"]);
+  w.claw.queue = true;
+  await w.chat.understand({
+    userId: ALICE,
+    credential: "ak-alice",
+    modelKey: "",
+    prompt: "again",
+    context: {},
+    lang: "en",
+    conversation: w.conversation,
+    files: [],
+    onSent: (sessionId, messageId) => told.push(`${sessionId} ${String(messageId)}`),
+  });
+  assert.deepEqual(told, ["asst-ak-alice msg-1", "asst-ak-alice null"]);
+});
+
+it("a stop for one message interrupts only the turn answering it", async () => {
+  const w = world();
+  w.claw.running.add("asst-ak-alice");
+  w.claw.turnMessage = "msg-7";
+  assert.equal(await w.chat.stop(ALICE, "ak-alice", w.conversation, "msg-6"), false);
+  assert.ok(w.claw.running.has("asst-ak-alice"));
+  assert.equal(await w.chat.stop(ALICE, "ak-alice", w.conversation, "msg-7"), true);
+  assert.ok(!w.claw.running.has("asst-ak-alice"));
+  assert.equal(await w.chat.stop(ALICE, "ak-alice", w.conversation, "msg-7"), false);
+  assert.equal(said(w.surface.outbox).length, 1);
+});
