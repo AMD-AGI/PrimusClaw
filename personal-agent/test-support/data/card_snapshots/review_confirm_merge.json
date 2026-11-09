@@ -75,7 +75,7 @@
       "type": "ColumnSet"
      },
      {
-      "text": "确认后：把 AMD-AGI/Primus-SaFE#481 合入 `main`，用你的 GitHub 账号 @huirui-amd。",
+      "text": "确认后：把 AMD-AGI/Primus-SaFE#481 合入 `main`，用你的 GitHub 账号 @linmei-amd。",
       "type": "TextBlock",
       "wrap": true
      },
@@ -146,7 +146,7 @@
          },
          {
           "title": "账⁠号",
-          "value": "你的 GitHub 账号 @huirui-amd"
+          "value": "你的 GitHub 账号 @linmei-amd"
          }
         ],
         "type": "FactSet"

@@ -34,8 +34,8 @@ export interface GithubConfirmView {
   readonly checks: string;
   readonly requester: string;
   readonly room: string;
-  /** The review Claw holds (`{event, body, comments}`), or undefined for a merge. */
-  readonly review: JsonObject | undefined;
+  /** The review Claw holds (its event, its text masked, how many inline comments), or undefined for a merge. */
+  readonly review: HeldReviewView | undefined;
   readonly model: string;
   readonly hint: boolean;
   readonly installUrl: string;
@@ -44,6 +44,12 @@ export interface GithubConfirmView {
   readonly login: string;
   readonly lang: "zh" | "en";
   readonly summary: string;
+}
+
+export interface HeldReviewView {
+  readonly event: string;
+  readonly body: string;
+  readonly comments: number;
 }
 
 export interface ReviewItemView {

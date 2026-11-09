@@ -117,104 +117,122 @@ interface ConfirmWords {
   readonly more: [string, string][];
 }
 
-function confirmWordsZh(m: GithubConfirmView, account: string, inline: number, event: string): ConfirmWords {
-  const pull = `${clip(m.repo, 100)}#${clip(String(m.number), 10)}`;
-  const into = m.base ? `\`${clip(m.base.replaceAll("`", ""), 100)}\`` : "";
-  const held = m.review !== undefined;
-  const sub =
-    (m.room ? `${clip(m.requester, 60)} 在 ${clip(m.room, 60)} 请求` : `${clip(m.requester, 60)} 请求`) +
-    (held ? "，我以你的身份发布" : "，我以你的身份合入");
-  const impact = held
-    ? `确认后：在 ${pull} 上以${account} 发布 ${event} review。`
-    : `确认后：把 ${pull} 合入 ${into || "它的目标分支（没读到，请在 PR 上核对）"}，用${account}。`;
+/** The labels of the confirmation card, by language. */
+const CONFIRM_LABELS = {
+  zh: {
+    pull: "PR",
+    author: "作者",
+    verdict: "结论",
+    summary: "概述",
+    text: "内容",
+    target: "分支",
+    checks: "检查",
+    why: "原因",
+    notRead: "没读到",
+    reasonsJoin: "；",
+    noReasons: "在总是需要人确认的变更清单上",
+    repo: "仓库",
+    model: "模型",
+    defaultModel: "默认模型",
+    account: "账号",
+    inline: (n: number) => `，${String(n)} 条行内评论`,
+  },
+  en: {
+    pull: "Pull request",
+    author: "Author",
+    verdict: "Review",
+    summary: "What it does",
+    text: "Text",
+    target: "Target",
+    checks: "Checks",
+    why: "Why",
+    notRead: "not read",
+    reasonsJoin: "; ",
+    noReasons: "It is on the list of changes that always need a person.",
+    repo: "Repository",
+    model: "Model",
+    defaultModel: "the default",
+    account: "Acts as",
+    inline: (n: number) => `, ${String(n)} inline comment${n !== 1 ? "s" : ""}`,
+  },
+} as const;
+
+function confirmRows(m: GithubConfirmView, account: string): Pick<ConfirmWords, "rows" | "more"> {
+  const l = CONFIRM_LABELS[m.lang];
   const rows: [string, string][] = [
-    ["PR", `#${clip(String(m.number), 10)} ${clip(m.title, 120)}`],
-    ["作者", clip(m.author, 60)],
+    [l.pull, `#${clip(String(m.number), 10)} ${clip(m.title, 120)}`],
+    [l.author, clip(m.author, 60)],
   ];
-  if (held) {
-    rows.push(["结论", event + (inline ? `，${String(inline)} 条行内评论` : "")]);
-    if (m.summary) rows.push(["概述", m.summary]);
-    rows.push(["内容", clip(String(m.review?.body ?? ""), 200)]);
-  } else {
-    if (m.summary) rows.push(["概述", m.summary]);
-    rows.push(["分支", m.base ? clip(m.base, 100) : "没读到"], ["检查", clip(m.checks, 80)]);
-  }
+  const held = m.review;
+  if (held !== undefined) rows.push([l.verdict, clip(held.event, 20) + (held.comments ? l.inline(held.comments) : "")]);
+  if (m.summary) rows.push([l.summary, m.summary]);
+  if (held !== undefined) rows.push([l.text, clip(held.body, 200)]);
+  else rows.push([l.target, m.base ? clip(m.base, 100) : l.notRead], [l.checks, clip(m.checks, 80)]);
   const reasons = m.reasons
     .slice(0, 5)
     .filter(Boolean)
     .map((r) => clip(r, 100));
-  rows.push(["原因", m.reasons.some(Boolean) ? reasons.join("；") : "在总是需要人确认的变更清单上"]);
+  rows.push([l.why, m.reasons.some(Boolean) ? reasons.join(l.reasonsJoin) : l.noReasons]);
   const more: [string, string][] = [
-    ["仓库", clip(m.repo, 100)],
+    [l.repo, clip(m.repo, 100)],
     ["Head", clip(m.headSha, 12)],
-    ["模型", m.model ? clip(m.model, 100) : "默认模型"],
-    ["账号", account],
+    [l.model, m.model ? clip(m.model, 100) : l.defaultModel],
+    [l.account, account],
   ];
-  return { heading: held ? "发布 review 前需要你确认" : "合入前需要你确认", sub, impact, rows, more };
+  return { rows, more };
 }
 
-function confirmWordsEn(m: GithubConfirmView, account: string, inline: number, event: string): ConfirmWords {
+function confirmHeadZh(m: GithubConfirmView, account: string): Omit<ConfirmWords, "rows" | "more"> {
   const pull = `${clip(m.repo, 100)}#${clip(String(m.number), 10)}`;
   const into = m.base ? `\`${clip(m.base.replaceAll("`", ""), 100)}\`` : "";
-  const held = m.review !== undefined;
-  const asker = clip(m.requester, 60) + (m.room ? ` in ${clip(m.room, 60)}` : "");
-  const impact = held
-    ? `If you confirm: a ${event} review is posted on ${pull} with ${account}.`
-    : `If you confirm: ${pull} is merged into ${into || "its base branch (not read from GitHub; check it on the pull request)"}, by ${account}.`;
-  const rows: [string, string][] = [
-    ["Pull request", `#${clip(String(m.number), 10)} ${clip(m.title, 120)}`],
-    ["Author", clip(m.author, 60)],
-  ];
-  if (held) {
-    rows.push(["Review", event + (inline ? `, ${String(inline)} inline comment${inline !== 1 ? "s" : ""}` : "")]);
-    if (m.summary) rows.push(["What it does", m.summary]);
-    rows.push(["Text", clip(String(m.review?.body ?? ""), 200)]);
-  } else {
-    if (m.summary) rows.push(["What it does", m.summary]);
-    rows.push(["Target", m.base ? clip(m.base, 100) : "not read"], ["Checks", clip(m.checks, 80)]);
+  const asked = m.room ? `${clip(m.requester, 60)} 在 ${clip(m.room, 60)} 请求` : `${clip(m.requester, 60)} 请求`;
+  if (m.review !== undefined) {
+    return {
+      heading: "发布 review 前需要你确认",
+      sub: `${asked}，我以你的身份发布`,
+      impact: `确认后：在 ${pull} 上以${account} 发布 ${clip(m.review.event, 20)} review。`,
+    };
   }
-  const reasons = m.reasons
-    .slice(0, 5)
-    .filter(Boolean)
-    .map((r) => clip(r, 100));
-  rows.push([
-    "Why",
-    m.reasons.some(Boolean) ? reasons.join("; ") : "It is on the list of changes that always need a person.",
-  ]);
-  const more: [string, string][] = [
-    ["Repository", clip(m.repo, 100)],
-    ["Head", clip(m.headSha, 12)],
-    ["Model", m.model ? clip(m.model, 100) : "the default"],
-    ["Acts as", account],
-  ];
   return {
-    heading: held ? "This review needs your confirmation" : "This merge needs your confirmation",
-    sub: `Asked by ${asker}. I act as you, so the ${held ? "review is posted as yours" : "merge is yours"}`,
-    impact,
-    rows,
-    more,
+    heading: "合入前需要你确认",
+    sub: `${asked}，我以你的身份合入`,
+    impact: `确认后：把 ${pull} 合入 ${into || "它的目标分支（没读到，请在 PR 上核对）"}，用${account}。`,
   };
 }
 
-export function githubConfirmCard(m: GithubConfirmView): CardMessage {
-  const zh = m.lang === "zh";
+function confirmHeadEn(m: GithubConfirmView, account: string): Omit<ConfirmWords, "rows" | "more"> {
+  const pull = `${clip(m.repo, 100)}#${clip(String(m.number), 10)}`;
+  const into = m.base ? `\`${clip(m.base.replaceAll("`", ""), 100)}\`` : "";
+  const asker = clip(m.requester, 60) + (m.room ? ` in ${clip(m.room, 60)}` : "");
+  if (m.review !== undefined) {
+    return {
+      heading: "This review needs your confirmation",
+      sub: `Asked by ${asker}. I act as you, so the review is posted as yours`,
+      impact: `If you confirm: a ${clip(m.review.event, 20)} review is posted on ${pull} with ${account}.`,
+    };
+  }
+  return {
+    heading: "This merge needs your confirmation",
+    sub: `Asked by ${asker}. I act as you, so the merge is yours`,
+    impact: `If you confirm: ${pull} is merged into ${into || "its base branch (not read from GitHub; check it on the pull request)"}, by ${account}.`,
+  };
+}
+
+function accountOf(m: GithubConfirmView): string {
   const who = clip(m.login, 40);
-  const account = zh
-    ? who
-      ? `你的 GitHub 账号 @${who}`
-      : "你的 GitHub 账号"
-    : who
-      ? `your GitHub account @${who}`
-      : "your GitHub account";
-  const comments = m.review?.comments;
-  const inline = Array.isArray(comments) ? comments.length : 0;
-  const event = m.review === undefined ? "" : clip(String(m.review.event ?? ""), 20);
-  const words = zh ? confirmWordsZh(m, account, inline, event) : confirmWordsEn(m, account, inline, event);
+  if (m.lang === "zh") return who ? `你的 GitHub 账号 @${who}` : "你的 GitHub 账号";
+  return who ? `your GitHub account @${who}` : "your GitHub account";
+}
+
+export function githubConfirmCard(m: GithubConfirmView): CardMessage {
+  const account = accountOf(m);
+  const head = m.lang === "zh" ? confirmHeadZh(m, account) : confirmHeadEn(m, account);
+  const { rows, more } = confirmRows(m, account);
   const body: CardElement[] = [
-    header(words.heading, { tone: "warning", subtitle: words.sub, emoji: "needs_you" }),
-    text(words.impact),
-    ...facts(words.rows, 400),
-    ...fold("confirm-more", facts(words.more), zh ? "更多信息" : "More"),
+    header(head.heading, { tone: "warning", subtitle: head.sub, emoji: "needs_you" }),
+    text(head.impact),
+    ...facts(rows, 400),
+    ...fold("confirm-more", facts(more), m.lang === "zh" ? "更多信息" : "More"),
   ];
   if (m.hint) body.push(note(typedConfirmHint(m.number, m.lang)));
   const actions = buttons(githubConfirmButtons(m.confirmationId, m.review !== undefined, m.lang).map(action));
@@ -233,83 +251,90 @@ export function endedTone(ended: string): "attention" | "good" | "default" | "ac
 
 const SUMMARY_LABEL = { zh: "PR 概述：", en: "What it does: " } as const;
 
+const ITEM_WORDS = {
+  zh: {
+    ended: "代审结束：",
+    queued: "排队中：",
+    running: "代审中：",
+    as: "身份",
+    mode: "方式",
+    model: "模型",
+    nobody: "对方",
+    reviewOnly: "只 review，不合入",
+    merge: "review，通过就合入",
+    stop: "停止",
+    hintQueued: "名额空出后会自动开始；点「停止」随时取消。",
+    hint: "点「停止」随时停下；已经合入的不会撤回。",
+  },
+  en: {
+    ended: "Review ended: ",
+    queued: "Queued: ",
+    running: "Reviewing: ",
+    as: "As",
+    mode: "Mode",
+    model: "Model",
+    nobody: "the reviewer",
+    reviewOnly: "review only, no merge",
+    merge: "review, and merge when it passes",
+    stop: "Stop",
+    hintQueued: "It starts by itself when a slot frees up; press Stop to cancel it.",
+    hint: "Press Stop at any time; a merge already done is not undone.",
+  },
+} as const;
+
+const ENDED_MEANING = { good: "good", attention: "failed", default: "stopped", accent: "review" } as const;
+
 export function reviewItemCard(m: ReviewItemView, ended = "", summary = ""): CardMessage {
-  const zh = m.lang === "zh";
+  const w = ITEM_WORDS[m.lang];
   const queued = m.queued && !ended;
   const who = plain(clip(m.who, 60));
-  const model = plain(clip(m.model, 80));
   const pr = plain(clip(m.seq ? `#${String(m.seq)} ${m.pull}` : m.pull, 120));
-  const title =
-    (zh
-      ? ended
-        ? "代审结束："
-        : queued
-          ? "排队中："
-          : "代审中："
-      : ended
-        ? "Review ended: "
-        : queued
-          ? "Queued: "
-          : "Reviewing: ") + pr;
-  const rows: [string, string][] = zh
-    ? [
-        ["身份", who || "对方"],
-        ["方式", m.reviewOnly ? "只 review，不合入" : "review，通过就合入"],
-        ["模型", model],
-      ]
-    : [
-        ["As", who || "the reviewer"],
-        ["Mode", m.reviewOnly ? "review only, no merge" : "review, and merge when it passes"],
-        ["Model", model],
-      ];
-  const hint = zh
-    ? queued
-      ? "名额空出后会自动开始；点「停止」随时取消。"
-      : "点「停止」随时停下；已经合入的不会撤回。"
-    : queued
-      ? "It starts by itself when a slot frees up; press Stop to cancel it."
-      : "Press Stop at any time; a merge already done is not undone.";
+  const title = (ended ? w.ended : queued ? w.queued : w.running) + pr;
+  const rows: [string, string][] = [
+    [w.as, who || w.nobody],
+    [w.mode, m.reviewOnly ? w.reviewOnly : w.merge],
+    [w.model, plain(clip(m.model, 80))],
+  ];
   const tone = ended ? endedTone(ended) : "accent";
-  const meaning = ended
-    ? (({ good: "good", attention: "failed", default: "stopped" } as const)[tone as "good"] ?? "review")
-    : "review";
-  const body: CardElement[] = [header(title, { tone, emoji: meaning }), ...facts(rows)];
-  body.push(ended ? text(plain(clip(ended, 200)), { weight: "Bolder" }) : note(hint));
+  const body: CardElement[] = [header(title, { tone, emoji: ENDED_MEANING[tone] }), ...facts(rows)];
+  body.push(ended ? text(plain(clip(ended, 200)), { weight: "Bolder" }) : note(queued ? w.hintQueued : w.hint));
   if (ended && summary) body.push(text(plain(SUMMARY_LABEL[m.lang] + summary)));
-  const stop = execute(zh ? "停止" : "Stop", "primusclaw.work_stop", {
-    primusclaw: "work",
-    op: "stop",
-    card: m.cardId,
-  });
+  const stop = execute(w.stop, "primusclaw.work_stop", { primusclaw: "work", op: "stop", card: m.cardId });
   return message(body, ended ? [] : buttons([stop], "destructive"));
 }
 
 export const ITEM_CARD_ENDED_PLAIN_ZH = "已结束，见上方结果";
 
+/** A review card's model again, from what it showed; undefined when `render` is not a complete one. */
+function reviewOfRender(render: Readonly<Record<string, unknown>>, cardId: string): ReviewItemView | undefined {
+  const seq = Number(render.seq ?? 0);
+  if (render.kind !== "review" || typeof render.pull !== "string" || !Number.isInteger(seq)) return undefined;
+  return {
+    seq,
+    pull: render.pull,
+    who: typeof render.who === "string" ? render.who : "",
+    reviewOnly: Boolean(render.review_only),
+    model: typeof render.model === "string" ? render.model : "",
+    cardId,
+    lang: render.lang === "en" ? "en" : "zh",
+    queued: false,
+  };
+}
+
 export function endedItemCard(m: EndedItemView): CardMessage {
   const render = m.render;
-  const lang = render.lang === "en" ? "en" : "zh";
-  if (render.kind === "review" && m.ended !== ITEM_CARD_ENDED_PLAIN_ZH && typeof render.pull === "string") {
-    const seq = Number(render.seq ?? 0);
-    if (Number.isInteger(seq)) {
-      return reviewItemCard(
-        {
-          seq,
-          pull: render.pull,
-          who: String(render.who ?? ""),
-          reviewOnly: Boolean(render.review_only),
-          model: String(render.model ?? ""),
-          cardId: m.cardId,
-          lang,
-          queued: false,
-        },
-        m.ended,
-        typeof render.pr_summary === "string" ? render.pr_summary : "",
-      );
-    }
+  const review = m.ended === ITEM_CARD_ENDED_PLAIN_ZH ? undefined : reviewOfRender(render, m.cardId);
+  if (review !== undefined) {
+    return reviewItemCard(review, m.ended, typeof render.pr_summary === "string" ? render.pr_summary : "");
   }
-  let label = plain(clip(String(render.title || render.pull || ""), 120));
-  const seq = render.seq;
+  const shown =
+    typeof render.title === "string" && render.title
+      ? render.title
+      : typeof render.pull === "string"
+        ? render.pull
+        : "";
+  let label = plain(clip(shown, 120));
+  const seq = typeof render.seq === "number" || typeof render.seq === "string" ? render.seq : "";
   if (seq && label && !label.startsWith("#")) label = `#${String(seq)} ${label}`;
   const title = label ? (render.kind === "review" ? "代审结束：" : "已结束：") + label : "已结束";
   return message([header(title, { tone: endedTone(m.ended) }), text(plain(clip(m.ended, 200)), { weight: "Bolder" })]);
