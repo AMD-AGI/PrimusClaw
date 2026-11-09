@@ -26,20 +26,6 @@ export const END = String.raw`(?![\s\S])`;
 export const I_VARIANTS = "iIıİ";
 const I_SET: ReadonlySet<string> = new Set(Array.from(I_VARIANTS));
 
-/**
- * Under IGNORECASE JavaScript folds a class's letters and finds U+0345 (which folds to the letter ι) in `\p{L}`; Python
- * does not count it a word character. These are `\w`, `\W` and the boundaries with it left out.
- */
-/** U+0345 alone, compared without case: under IGNORECASE a plain `\\u{345}` would also be ι, which IS a word character. */
-export const COMBINING_IOTA = "(?-i:\\u{345})";
-const PY_W_I = `(?:(?!${COMBINING_IOTA})${PY_W})`;
-const OUTSIDE_I: Readonly<Record<string, string>> = {
-  w: PY_W_I,
-  W: `(?:${COMBINING_IOTA}|[^${PY_W_CHARS}])`,
-  b: `(?:(?<=${PY_W_I})(?!${PY_W_I})|(?<!${PY_W_I})(?=${PY_W_I}))`,
-  B: `(?:(?<=${PY_W_I})(?=${PY_W_I})|(?<!${PY_W_I})(?!${PY_W_I}))`,
-};
-
 const OUTSIDE: Readonly<Record<string, string>> = {
   s: `[${PY_SPACE}]`,
   S: `[^${PY_SPACE}]`,
@@ -121,8 +107,7 @@ function propertyEscape(source: string, i: number): Escape | undefined {
 function letterEscape(letter: string, context: EscapeContext): string | undefined {
   if (SAME.has(letter)) return `\\${letter}`;
   if (letter === "a") return "\\x07";
-  if (context.inClass) return INSIDE[letter]; // (\w in a class under IGNORECASE: see `closeClass`)
-  return (context.ignoreCase ? OUTSIDE_I[letter] : undefined) ?? OUTSIDE[letter];
+  return (context.inClass ? INSIDE : OUTSIDE)[letter];
 }
 
 /** The escape that starts at `source[i]` (a backslash), as JavaScript pattern text. */
