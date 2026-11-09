@@ -6,34 +6,23 @@
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).
  */
 import { APPROVAL_CARDS } from "./approval.js";
+import { ASSISTANT_CARDS } from "./assistant.js";
 import type { CatalogEntry } from "./catalog.js";
 import { COMMAND_CARDS } from "./commands.js";
+import { PROACTIVE_CARDS } from "./proactive.js";
 import { REVIEW_CARDS } from "./review.js";
 import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...TURN, ...COMMAND_CARDS, ...REVIEW_CARDS];
+export const CATALOG: readonly CatalogEntry[] = [
+  ...APPROVAL_CARDS,
+  ...ASSISTANT_CARDS,
+  ...COMMAND_CARDS,
+  ...PROACTIVE_CARDS,
+  ...TURN,
+  ...REVIEW_CARDS,
+];
 
 const BY_LINE = {
-  W4: [],
-  W5: [
-    "answered",
-    "approval_decided",
-    "approval_expired",
-    "approval_item",
-    "approval_proactive",
-    "assistant_action",
-    "assistant_confirm",
-    "board",
-    "board_asked",
-    "digest",
-    "question_item",
-    "run_completed",
-    "run_failed",
-    "work_done",
-    "work_question",
-    "work_result",
-    "work_stopped",
-  ],
   W6b: [
     "remote_agents",
     "remote_disconnect",

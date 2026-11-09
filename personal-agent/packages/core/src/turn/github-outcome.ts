@@ -6,7 +6,7 @@
  * `description` (the tool's JSON answer, cut at 2000 characters, so it is searched rather than parsed).
  */
 
-import { clipPrSummary } from "./upstream.js";
+import { clipPrSummary } from "../claw/requester-view.js";
 
 const GITHUB_WRITE_TOOLS: ReadonlySet<string> = new Set(["gh_review_submit", "gh_pr_merge"]);
 const WROTE_STATUSES: ReadonlySet<string> = new Set(["submitted", "merged", "queued"]);

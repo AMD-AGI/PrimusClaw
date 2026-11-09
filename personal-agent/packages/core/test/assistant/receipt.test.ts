@@ -210,3 +210,25 @@ it("informative text keeps the newest end within both limits", () => {
   assert.ok(new TextEncoder().encode(wide).length <= INFORMATIVE_MAX_BYTES && wide.startsWith("…节"));
   assert.equal(informativeText(["á".repeat(600)]).charAt(1), "a");
 });
+
+it("the answer of a handed back review passes everything else to its conversation", async () => {
+  const { FakeSurface, testConversation } = await import("../../../../test-support/surface.js");
+  const surface = new FakeSurface();
+  const inner = surface.conversation(testConversation("c9"));
+  const receipts = new Receipts(new FakeClock(), silentLogger);
+  const answer = new ReceiptConversation(inner, receipts, undefined);
+  assert.equal(answer.ref.id, "c9");
+  assert.equal(answer.edited, inner.edited);
+  await answer.typing();
+  const id = await answer.post(text("posted"));
+  assert.ok(id);
+  await answer.update(id, text("edited"));
+  assert.equal((await answer.delete(id)).ok, true);
+  const envelope = answer.outgoing(text("queued"));
+  await answer.deliver(envelope);
+  assert.equal((await answer.openStream("act-1", "status")).ok, true);
+  assert.deepEqual(
+    surface.outbox.map((r) => r.op),
+    ["typing", "post", "update", "delete", "send", "stream.open"],
+  );
+});

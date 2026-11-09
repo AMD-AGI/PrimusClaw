@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { cpHead } from "../text/py-text.js";
-import { textOf } from "../review-text/names.js";
+import { textOf } from "./record.js";
 
 /** Each list of the channel context holds at most this many entries. */
 export const CONTEXT_ITEMS_MAX = 50;

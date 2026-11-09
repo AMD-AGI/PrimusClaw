@@ -9,6 +9,7 @@
  */
 import { pyStrip } from "@primusclaw/personal-agent";
 
+import { workerIdentityFromEnv, type WorkerIdentity } from "../azure/workload-identity.js";
 import type { OutboundMode } from "../caps.js";
 import { DEFAULT_STYLE, STREAM_SCOPES, type Style } from "./style.js";
 
@@ -22,14 +23,6 @@ const ON = ["1", "true", "yes", "on"];
 const OFF = ["0", "false", "no", "off"];
 
 export type BotTokenSource = "imds" | "federated";
-
-export interface WorkerIdentitySettings {
-  readonly clientId: string;
-  readonly tenantId: string;
-  readonly issuer: string;
-  readonly subject: string;
-  readonly keyFile: string;
-}
 
 export interface BotSettings {
   readonly tokenSource: BotTokenSource;
@@ -55,7 +48,7 @@ export interface TeamsSettings {
   readonly bot: BotSettings;
   readonly bus: BusSettings;
   /** The worker's own identity, when SERVICEBUS_NAMESPACE or SECRETS_SOURCE=keyvault needs it. */
-  readonly workerIdentity: WorkerIdentitySettings | undefined;
+  readonly workerIdentity: WorkerIdentity | undefined;
   readonly installHintUrl: string;
   readonly style: Style;
 }
@@ -143,26 +136,6 @@ export function busNamespace(raw: string): string {
   return value;
 }
 
-/** The worker's own identity; `why` (the setting that needs it) is named when something is missing. */
-export function workerIdentityFromEnv(env: Env, why: string): WorkerIdentitySettings {
-  const names = {
-    clientId: "WORKER_IDENTITY_CLIENT_ID",
-    tenantId: "BOT_TENANT_ID",
-    issuer: "BOT_ASSERTION_ISSUER",
-    subject: "WORKER_IDENTITY_SUBJECT",
-    keyFile: "BOT_ASSERTION_KEY_FILE",
-  } as const;
-  const missing = Object.values(names).filter((name) => !get(env, name));
-  if (missing.length) throw new TeamsConfigError(`${why} needs the worker identity: set ${missing.join(", ")}`);
-  return {
-    clientId: get(env, names.clientId),
-    tenantId: get(env, names.tenantId),
-    issuer: httpsIssuer(env),
-    subject: get(env, names.subject),
-    keyFile: get(env, names.keyFile),
-  };
-}
-
 function botFromEnv(env: Env, mode: OutboundMode): BotSettings {
   const tokenSource = oneOf<BotTokenSource>(env, "BOT_TOKEN_SOURCE", ["imds", "federated"], "imds");
   const federated = tokenSource === "federated";
@@ -171,7 +144,7 @@ function botFromEnv(env: Env, mode: OutboundMode): BotSettings {
     throw new TeamsConfigError("BOT_TOKEN_SOURCE=federated needs OUTBOUND_MODE=direct");
   return {
     tokenSource,
-    msiClientId: get(env, "BOT_MSI_CLIENT_ID"),
+    msiClientId: mode === "direct" ? required(env, "BOT_MSI_CLIENT_ID") : "",
     tenantId: federated ? required(env, "BOT_TENANT_ID") : get(env, "BOT_TENANT_ID"),
     assertionKeyFile: federated ? required(env, "BOT_ASSERTION_KEY_FILE") : get(env, "BOT_ASSERTION_KEY_FILE"),
     assertionIssuer: federated ? httpsIssuer(env) : "",
@@ -207,6 +180,17 @@ function busFromEnv(env: Env, namespace: string): BusSettings {
   };
 }
 
+/** The worker's own identity, as a settings error when it is incomplete. */
+function identityFor(env: Env, why: string): WorkerIdentity {
+  try {
+    return workerIdentityFromEnv(env, why);
+  } catch (error) {
+    throw new TeamsConfigError(error instanceof Error ? error.message : "the worker identity is incomplete", {
+      cause: error,
+    });
+  }
+}
+
 /**
  * The Teams settings from `env`. `queues` false (the release gate's test entry: no Service Bus at all) skips the queue
  * settings, which are then empty.
@@ -225,7 +209,7 @@ export function teamsSettingsFromEnv(env: Env, options: { readonly queues?: bool
     outboundMode: mode,
     bot: botFromEnv(env, mode),
     bus: queues ? busFromEnv(env, namespace) : NO_QUEUES,
-    workerIdentity: why ? workerIdentityFromEnv(env, why) : undefined,
+    workerIdentity: why ? identityFor(env, why) : undefined,
     installHintUrl,
     style: styleFromEnv(env),
   };

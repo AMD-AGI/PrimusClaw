@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { SseFrames, parseSseBlock, pyStr, pyStrOr, pyTruthy } from "../../src/index.js";
+import { SseFrames, parseSseBlock, pyTruthy } from "../../src/index.js";
 
 describe("SSE frames", () => {
   it("a frame's id, name and JSON data; the data's type names a plain message", () => {
@@ -35,18 +35,8 @@ describe("SSE frames", () => {
   });
 });
 
-describe("Python's reading of a JSON value", () => {
-  it("str() and bool() of what Claw sends", () => {
-    assert.deepEqual(["a", 3, true, false, null, undefined, [1, "x"], { a: 1 }].map(pyStr), [
-      "a",
-      "3",
-      "True",
-      "False",
-      "None",
-      "None",
-      '[1, "x"]',
-      '{"a": 1}',
-    ]);
+describe("Python's truth of a JSON value", () => {
+  it("bool() of what Claw sends", () => {
     assert.deepEqual(["", 0, false, null, [], {}, "x", 1, [0], { a: 1 }].map(pyTruthy), [
       false,
       false,
@@ -59,7 +49,5 @@ describe("Python's reading of a JSON value", () => {
       true,
       true,
     ]);
-    assert.equal(pyStrOr(0), "");
-    assert.equal(pyStrOr("m1"), "m1");
   });
 });

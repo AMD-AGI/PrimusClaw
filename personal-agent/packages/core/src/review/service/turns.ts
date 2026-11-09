@@ -12,7 +12,7 @@ import { errorName } from "../../errors.js";
 import { REVIEW_MODES } from "../views.js";
 import type { Conversation } from "../../ports/surface.js";
 import type { GithubOutcome } from "../../turn/github-outcome.js";
-import type { ReviewTurnOptions } from "../../turn/runner.js";
+import type { ReviewTurnOptions, ReviewTurnOutcome } from "../../turn/runner.js";
 import { displayName } from "../names.js";
 import { ownItemEndText, ITEM_STOPPED_ZH } from "../progress.js";
 import { pullUrl, shortName, slug } from "../pull-ref.js";
@@ -25,18 +25,6 @@ import type { AskerFollow } from "./follow.js";
 import type { ItemCards } from "./item-cards.js";
 import type { Notices } from "./notices.js";
 import type { Settled } from "./start.js";
-
-/** What a review's turn left, as the turn engine collects it. */
-export interface ReviewTurnOutcome {
-  readonly finalAnswer: string;
-  /** The review moved to the reviewer's item during the turn (`asItem`). */
-  readonly moved: boolean;
-  /** Claw did not take the asker's credentials (401). */
-  readonly refusal: { readonly status: number; readonly code: string } | null;
-  readonly ranModel: string;
-  readonly wrote: readonly GithubOutcome[];
-  readonly prSummary: string;
-}
 
 const WROTE_ZH: Readonly<Record<string, string>> = {
   "merged:": "合入",
@@ -139,7 +127,7 @@ export class ReviewTurns {
   }
 
   /** The turn has ended: what follows it, by how it ended. */
-  async afterTurn(review: ReviewTurn, outcome: ReviewTurnOutcome, asked: Conversation): Promise<void> {
+  async afterTurn(review: ReviewTurn, finalAnswer: string, outcome: ReviewTurnOutcome, asked: Conversation): Promise<void> {
     if (outcome.moved) return; // (followed as the reviewer's item now)
     if (outcome.refusal !== null) {
       await this.notices.tellRequesterRefused(review, outcome.refusal.code);
@@ -148,7 +136,7 @@ export class ReviewTurns {
     review.ranModel = outcome.ranModel;
     review.wrote = [...outcome.wrote];
     review.prSummary = outcome.prSummary;
-    await this.followUp(review, outcome.finalAnswer, asked);
+    await this.followUp(review, finalAnswer, asked);
   }
 
   /** Held writes go to the reviewer as cards; and the reviewer, who typed nothing, is told what was done as them. */

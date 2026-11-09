@@ -249,6 +249,20 @@ it("a review run carries its own options: acting as, the pull request, its lead,
     { id: "aad-a", name: "Alice", email: "", channelUserId: "29:a" },
   ]);
   assert.equal(outcome.finalAnswer, "Looks good.");
+  // what the review service reads of the turn afterwards (agent.py, after run_turn)
+  assert.deepEqual(outcome.review, {
+    moved: false,
+    refusal: null,
+    ranModel: "m-1", // (no routed model said: the session's, which the create gave it: the run's model)
+    wrote: [["gh_review_submit", "submitted", ""]],
+    prSummary: "",
+  });
+});
+
+it("a chat turn carries no review outcome", async () => {
+  const chatTurn = await go({ script: [[0.1, result("Hi.")]] });
+  assert.equal(chatTurn.outcome.finalAnswer, "Hi.");
+  assert.equal(chatTurn.outcome.review, undefined);
 });
 
 it("a review with only what it must carry, a repository for a new session, and a deployment's integrations in the progress", async () => {

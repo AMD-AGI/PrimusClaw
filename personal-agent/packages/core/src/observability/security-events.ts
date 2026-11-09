@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { InvariantError } from "../errors.js";
-import { FIELDS } from "./security-fields.js";
+import { SECURITY_FIELDS } from "./security-fields.js";
 
 /** The security events, their log levels (a closed list: SIEM rules match on these names). */
 export const SECURITY_EVENTS = {
@@ -29,7 +29,7 @@ export const SECURITY_LOGGER = "clawy.security";
 /**
  * The record of one security event. `event` must be one of SECURITY_EVENTS (anything else is a bug: InvariantError). A
  * field whose value is null or undefined is left out. A field whose value does not fit its shape is dropped and its
- * name listed in `dropped`; a field that is not one of FIELDS is listed as `<unknown_field>` (its name could be text).
+ * name listed in `dropped`; a field that is not one of SECURITY_FIELDS is listed as `<unknown_field>` (its name could be text).
  */
 export function securityEventRecord(
   event: SecurityEventName,
@@ -40,7 +40,7 @@ export function securityEventRecord(
   const dropped = new Set<string>();
   for (const [name, value] of Object.entries(fields)) {
     if (value === null || value === undefined) continue;
-    const check = Object.hasOwn(FIELDS, name) ? FIELDS[name] : undefined;
+    const check = Object.hasOwn(SECURITY_FIELDS, name) ? SECURITY_FIELDS[name] : undefined;
     const safe = check?.(value);
     if (safe === undefined) {
       dropped.add(check ? name : "<unknown_field>");

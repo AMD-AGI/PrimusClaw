@@ -11,11 +11,14 @@ import { redactText } from "../security/redact.js";
 import { clip } from "./plain.js";
 import { squashSpaces } from "./py-text.js";
 
-// eslint-disable-next-line no-control-regex -- the control characters are what this removes
-const CONTROL = /[\u0000-\u001f\u007f]/g;
+/** A C0 control character or DEL (Python's `[\u0000-\u001f\u007f]`). */
+function isControl(ch: string): boolean {
+  const code = ch.codePointAt(0) ?? 0;
+  return code <= 0x1f || code === 0x7f;
+}
 
 export function neutral(text: string, limit = 200): string {
-  const line = redactText(squashSpaces(text.replace(CONTROL, " ")))
+  const line = redactText(squashSpaces(Array.from(text, (ch) => (isControl(ch) ? " " : ch)).join("")))
     .text.replaceAll("[", "(")
     .replaceAll("]", ")")
     .replaceAll("<", "‹")

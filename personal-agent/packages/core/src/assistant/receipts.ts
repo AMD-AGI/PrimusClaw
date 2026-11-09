@@ -111,6 +111,10 @@ export class ReceiptConversation implements Conversation {
     return this.inner.edited;
   }
 
+  markSettled(id: MessageId): void {
+    this.inner.markSettled(id);
+  }
+
   typing(): Promise<void> {
     return this.inner.typing();
   }

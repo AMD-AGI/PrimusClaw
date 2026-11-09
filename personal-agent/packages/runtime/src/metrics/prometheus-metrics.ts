@@ -7,7 +7,7 @@
  * the Python worker's, line for line: the alert queries and dashboards read these names and labels.
  */
 import {
-  CATEGORIES,
+  SECURITY_FIELD_CATEGORIES,
   DELIVERED_EVENT_TYPES,
   FILES_DROPPED_PATHS,
   LIMIT_REASONS,
@@ -129,7 +129,9 @@ export class PrometheusMetrics implements MetricsPort {
     if (!Object.hasOwn(SECURITY_EVENTS, event)) return;
     const labels: Labels = SECURITY_EVENT_LABELS.flatMap((name) => {
       const value = record[name];
-      return typeof value === "string" && CATEGORIES[name]?.has(value) === true ? [[name, value] as const] : [];
+      return typeof value === "string" && SECURITY_FIELD_CATEGORIES[name]?.has(value) === true
+        ? [[name, value] as const]
+        : [];
     });
     const key = keyOf(event, labels);
     const found = this.events.get(key) ?? { event, labels, value: 0 };

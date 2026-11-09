@@ -7,7 +7,6 @@ import {
   cpHead,
   notAClawId,
   pyStr,
-  pyStrOr,
   pyTruthy,
   type ClawCredential,
   type ClawMergeConfirmationsPort,
@@ -76,7 +75,7 @@ export class HttpSettings implements ClawSettingsPort {
     const out = await this.http.json({ method: "GET", path: "/v1/github-review/settings", key: token });
     const data: unknown = isObject(out) ? ("data" in out ? out["data"] : out) : {};
     const mode = isObject(data) ? data["review_mode"] : undefined;
-    return pyStrOr(mode);
+    return pyStr(mode);
   }
 
   async setReviewMode(token: ClawCredential, mode: string): Promise<void> {
@@ -96,8 +95,8 @@ export class HttpSettings implements ClawSettingsPort {
     const reads = data["reads_with"];
     return {
       readsWith: reads === "env" || reads === "binding" ? reads : "",
-      login: cpHead(pyStrOr(data["login"]), 100),
-      missing: cpHead(pyStrOr(data["missing"]), 20),
+      login: cpHead(pyStr(data["login"]), 100),
+      missing: cpHead(pyStr(data["missing"]), 20),
       bindingReads: data["binding_reads"] === true,
     };
   }
