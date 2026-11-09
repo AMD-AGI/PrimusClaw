@@ -129,6 +129,8 @@ export class RemoteWorld {
   hang: ((message: OutMessage) => boolean) | null = null;
   /** The credential the remote agents read with for a person (their linked key here; a test may make it fail). */
   credential: (person: string) => Promise<string | null> = (person) => Promise.resolve(KEY_OF[person] ?? null);
+  /** What went to the assistant (or Claw) instead of the attached agent, as the router would send it on. */
+  readonly toAssistant: string[] = [];
   /** Whether the chat may be told something now (false: muted hours, as a test says). */
   reachable = true;
   /** What the follower held for later, since the chat could not be told (the assistant's quiet hours keep it). */
@@ -238,13 +240,13 @@ export class RemoteWorld {
   }
 
   /** One message from the user, routed as the router routes it for remote agents, then until the worker is quiet. */
-  async say(text: string, user = USER_A): Promise<void> {
-    await this.send(text, user);
+  async say(text: string, user = USER_A, quotes: readonly string[] = []): Promise<void> {
+    await this.send(text, user, quotes);
     await this.idle();
   }
 
   /** One message from the user, without waiting for the turn it starts. */
-  async send(typed: string, user = USER_A): Promise<void> {
+  async send(typed: string, user = USER_A, quotes: readonly string[] = []): Promise<void> {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
@@ -267,17 +269,28 @@ export class RemoteWorld {
       await this.remote.stop(sender, key, to);
       return;
     }
-    if (this.remote.attached(user.id)) {
-      const message = { id: this.id("act"), text, quotes: [] } as unknown as InboundMessage;
-      await this.remote.prompt({
-        message,
-        chat: sender,
-        credential: key,
-        prompt: text,
-        conversation: to,
-        provider: undefined,
-      });
+    const message = {
+      id: this.id("act"),
+      text,
+      quotes: quotes.map((messageId) => ({ messageId })),
+    } as unknown as InboundMessage;
+    // (as the router sends it on: a chat whose session card is the window keeps its chat box for the assistant, and only a reply
+    // that quotes the card goes to the session)
+    const toAgent =
+      this.remote.attached(user.id) &&
+      (this.remote.windowMode(user.id) !== "card" || this.remote.quotesWindow(user.id, message));
+    if (!toAgent) {
+      this.toAssistant.push(text);
+      return;
     }
+    await this.remote.prompt({
+      message,
+      chat: sender,
+      credential: key,
+      prompt: text,
+      conversation: to,
+      provider: undefined,
+    });
   }
 
   /**
