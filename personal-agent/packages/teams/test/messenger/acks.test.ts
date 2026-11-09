@@ -10,7 +10,7 @@ import { textMessage } from "@primusclaw/personal-agent";
 import { FakeClock, flushMicrotasks } from "../../../../test-support/clock.js";
 import { AckRegistry, LATE_ACKS_REMEMBERED } from "../../src/messenger/acks.js";
 import { RecordingQueue } from "../helpers/outboxes.js";
-import { RecordingLogger } from "../helpers/recording-logger.js";
+import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { build } from "./fixtures.js";
 
 test("an ack that arrives after the wait is logged as late", async () => {

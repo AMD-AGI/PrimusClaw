@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { richMessage, textMessage, type OutMessage } from "@primusclaw/personal-agent";
 
+import { flushMicrotasks } from "../../../../test-support/clock.js";
 import { DEFAULT_STYLE } from "../../src/config/style.js";
 import { teamsMasker } from "../../src/activity/redact-activity.js";
 import type { Renderers } from "../../src/views/registry.js";
@@ -29,7 +30,12 @@ test("an answer carries the AI label, the people it names, Teams' thumbs, its re
     ],
     suggestions: [{ title: "Back to Clawy", value: "back to Clawy" }],
     citations: [
-      { title: "The PR", url: "https://github.com/o/r/pull/1", abstract: "GitHub pull request · github.com" },
+      {
+        position: 1,
+        title: "The PR",
+        url: "https://github.com/o/r/pull/1",
+        abstract: "GitHub pull request · github.com",
+      },
     ],
   };
   await conversation.send(message);
@@ -147,4 +153,44 @@ test("in a group chat what is posted is masked, and an answer's markdown before 
   const rich = queue.sent[1]?.activity["text"];
   assert.ok(typeof rich === "string");
   assert.ok(rich.includes("sk-***") && !rich.includes("sk-secret") && rich.includes("(a credential was masked)"));
+});
+
+test("messenger masks every post kind in a group only", async () => {
+  const secret = "sk-secret-value";
+  const masker = teamsMasker(MASK, "(a credential was masked)");
+  async function sent(kind: "groupChat" | "personal"): Promise<string> {
+    const queue = new RecordingQueue();
+    const { conversation, clock } = build(queue, {
+      ref: ref("c", kind),
+      masker: kind === "groupChat" ? masker : undefined,
+      ackTimeoutMs: 10,
+    } as Parameters<typeof build>[1]);
+    await conversation.send(textMessage(`a ${secret}`));
+    const posted = conversation.post(textMessage(`b ${secret}`));
+    await flushMicrotasks();
+    await clock.advance(10);
+    await posted;
+    await conversation.update("id1", textMessage(`c ${secret}`));
+    await conversation.typing();
+    assert.equal(queue.sent.length, 4);
+    return JSON.stringify(queue.sent);
+  }
+  assert.ok(!(await sent("groupChat")).includes("sk-secret"));
+  assert.ok((await sent("personal")).includes(secret)); // 1:1 and proactive posts are unchanged
+});
+
+test("a group chat shows the plan through the same redaction as everything else", async () => {
+  const secret = "ghp_" + "A1b2C3d4".repeat(4) + "wxyz";
+  const ghp = (text: string) => ({
+    text: text.replace(/ghp_[A-Za-z0-9]{36}/g, "ghp_***"),
+    masked: /ghp_[A-Za-z0-9]{36}/.test(text),
+  });
+  const queue = new RecordingQueue();
+  const { conversation } = build(queue, { ref: ref("g", "groupChat"), masker: teamsMasker(ghp, "(masked)") });
+  const plan = `**Plan: 0 of 2 done**\n- Push with ${secret}\n- Open the PR`;
+  await conversation.send(richMessage(plan, { lead: true }));
+  await conversation.update("m-1", richMessage(plan, { lead: true }));
+  const everything = JSON.stringify(queue.sent);
+  assert.ok(everything.includes("Plan: 0 of 2 done") && everything.includes("Open the PR"));
+  assert.ok(!everything.includes(secret));
 });
