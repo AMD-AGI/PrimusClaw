@@ -93,7 +93,7 @@ than start a new conversation.
 The convention the connector in this repository uses for `resumable`, newest first and at most twelve entries:
 `[{ref, title, cwd, updated_at, state}]` with `ref` the value to send back as `resume_ref`, `updated_at` in seconds since the
 epoch, and `state` one of `idle`, `live` (something else has it open: not offered for takeover; a session for it is opened
-read-only, see below), `attached` (this connector already holds it) or `unknown`; a `live` entry may add `activity`
+read-only, see below), `attached` (this connector already holds it) or `unknown` (the connector cannot tell, for one a Claude Code whose registry row it cannot read may have open); a `live` entry may add `activity`
 (`working`, `waiting` for the person at that terminal, or `idle`) and, with `waiting`, `waiting_for` (a short phrase in the
 agent's words). `devenv_list` shows `activity` as `terminal_state` and `waiting_for` only with `detail: "activity"`.
 
