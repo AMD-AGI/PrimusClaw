@@ -2,3 +2,4 @@ node_modules/
 coverage/
 .c8-tmp/
 dist/
+test-names.jsonl
