@@ -159,6 +159,7 @@ export interface WorldOptions {
   readonly handlers?: Partial<RouteHandlers>;
   readonly limits?: Partial<RouterLimits>;
   readonly reachable?: readonly string[];
+  readonly linkLimits?: { readonly perUser: number; readonly global: number; readonly windowSeconds: number };
 }
 
 function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
@@ -179,7 +180,7 @@ function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
 }
 
 export function world(options: WorldOptions = {}) {
-  const { store, clock } = openTestStore();
+  const { store, clock } = openTestStore(options.linkLimits ? { linkLimits: options.linkLimits } : {});
   const surface = new FakeSurface({ reachable: options.reachable ?? [] });
   const claw = new FakeClaw();
   const turns = new FakeTurns();
