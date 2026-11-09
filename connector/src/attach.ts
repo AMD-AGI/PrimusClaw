@@ -472,7 +472,9 @@ export class AttachSupport {
     }
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
     // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
-    const summary = (rows === null ? "unreadable;" : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
+    // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
+    const blind = (await blindHolders(this.configDir).catch(() => [] as BlindHolder[])).map((b) => b.pid).sort().join(".");
+    const summary = (rows === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
       return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
     }).join(",");

@@ -639,7 +639,9 @@ describe("attach end to end", () => {
     await new Promise((r) => setTimeout(r, 100));
     emptyRow(h.attachDir, blind.pid!);
     await h.online();
-    const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    // (the connector may have reported once before the row was written: the report after it is the one that counts)
+    const hb = await h.claw.until("a heartbeat that says REF is unknown", () => h.claw.heartbeats.find((b) =>
+      b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF && r.state === "unknown")));
     // REF was "idle" (offered to take over); REF2 is still the live one its own row names
     assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state]), [[REF, "unknown"], [REF2, "live"]]);
   });
