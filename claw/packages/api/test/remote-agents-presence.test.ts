@@ -123,7 +123,7 @@ describe("remote connector presence", { skip }, () => {
     const hhmm = new Date(seen).toISOString().slice(11, 16);
     const texts = await says("alice");
     assert.equal(texts.length, 1);
-    assert.equal(texts[0], `你的开发环境 dev-box 离线了（最后在线 ${hhmm}Z，心跳停止，多半是机器或 pod 重启、连接器进程退出）。在那台机器上运行 \`claw-connector run\` 恢复。`);
+    assert.equal(texts[0], `你的开发环境 dev-box 离线了（最后在线 ${hhmm}Z，心跳停止，多半是机器或 pod 重启、连接器进程退出）。在那台机器上运行 \`claw-connector service install\` 恢复。`);
     // Every later sweep while it stays down says nothing more.
     await offlineFor(id, 30);
     for (let i = 0; i < 3; i++) assert.deepEqual((await sweep()).notices, []);
@@ -193,7 +193,7 @@ describe("remote connector presence", { skip }, () => {
     await sweep();
     const [text] = await says("alice");
     assert.match(text, /登录已过期或被撤销/);
-    assert.match(text, /`claw-connector login`.*`claw-connector run`/);
+    assert.match(text, /`claw-connector login`.*`claw-connector service install`/);
     assert.equal((await row(id)).offline_reason, "auth_expired");
   });
 
@@ -284,7 +284,7 @@ describe("remote connector presence", { skip }, () => {
     assert.deepEqual(await says("alice"), []);
     const [text] = await says("bob");
     assert.match(text, /^Your dev environment box is offline \(last online \d\d:\d\dZ; heartbeats stopped/);
-    assert.match(text, /`claw-connector run`/);
+    assert.match(text, /`claw-connector service install`/);
     assert.equal((await row(a)).presence_state, "online");
     // Someone with no assistant has nobody to be told through, and the sweep goes on.
     const c = await connector("carol", "box", true);

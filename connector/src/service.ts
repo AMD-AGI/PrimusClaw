@@ -365,10 +365,19 @@ function readPidRec(file: string): PidRec | null {
   } catch { /* none */ }
   return null;
 }
-/** The supervisor recorded in supervisor.pid, if that very process (same start time) still lives. */
+/** Whether `pid` is a zombie: ended, but not reaped by its parent (Linux /proc; false where that cannot be read). */
+function isZombie(pid: number): boolean {
+  try { return /^\d+ \(.*\) Z /s.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return false; }
+}
+
+/**
+ * The supervisor recorded in supervisor.pid, if that very process (same start time) still lives. A zombie does not: the
+ * supervisor is detached, so in a container it is a child of PID 1, which there is often `tail -f /dev/null` or `sleep` and
+ * never reaps it, and an ended supervisor would otherwise be taken for a running one for good (keepalive.sh would start none).
+ */
 export function supervisorPid(ctx: Ctx): number | null {
   const r = readPidRec(supervisorPidFile(ctx.dirs));
-  return r && processStart(r.pid) === r.start ? r.pid : null;
+  return r && processStart(r.pid) === r.start && !isZombie(r.pid) ? r.pid : null;
 }
 
 export interface SuperviseOptions {
@@ -637,12 +646,36 @@ async function install(ctx: Ctx, d: ServiceDeps, h: ServiceHelpers, sup: Supervi
     const script = keepaliveFile(ctx.dirs);
     writeFile600(script, keepaliveScript(d, vars), 0o700);
     recordInstalled(ctx, "script", vars);
+    // As `systemctl --user restart` does above: a supervisor that is already running keeps the agents.toml and the
+    // environment it was started with, so after an edit of either (a root added, a key renewed) an install that left it
+    // be would change nothing. It is stopped (it passes the signal to its run) and started again.
+    const old = supervisorPid(ctx);
+    if (old !== null) {
+      if (!await stopSupervisor(ctx, old)) {
+        ctx.err(`the running supervisor (pid ${old}) did not stop within 20 s; run "claw-connector stop", then install again`);
+        return 1;
+      }
+      ctx.out(`stopped the running supervisor (pid ${old}) so the connector starts again with this agents.toml and environment`);
+    }
     const code = await ensure(ctx, d, h, { byInstall: true });
     if (code !== 0) return code;
     ctx.out(`wrote ${script}. This machine has no systemd: the supervisor restarts the connector 5 s after it dies.`);
     scheduleKeepalive(ctx, d, script);
   }
   return 0;
+}
+
+/**
+ * SIGTERM to a script supervisor (it passes the signal to its run, ends its loop and removes its pid file); whether it ended
+ * within 20 s. Ended is: its pid file no longer names it, or the process is gone or a zombie (see `supervisorPid`; kill(pid, 0)
+ * still succeeds on a zombie).
+ */
+async function stopSupervisor(ctx: Ctx, pid: number): Promise<boolean> {
+  const running = () => supervisorPid(ctx) === pid && isAlive(pid);
+  try { process.kill(pid, "SIGTERM"); } catch { return true; }   // (gone already)
+  const end = Date.now() + 20_000;
+  while (Date.now() < end && running()) await sleep(100);
+  return !running();
 }
 
 /** The two crontab lines that call keepalive.sh: at boot, and every 5 minutes (it does nothing while the supervisor lives). */
@@ -792,11 +825,7 @@ async function uninstall(ctx: Ctx, d: ServiceDeps, sup: Supervisor): Promise<num
     ctx.out(had ? `stopped and removed ${plist}` : `no LaunchAgent at ${plist}`);
   } else {
     const pid = supervisorPid(ctx);
-    if (pid !== null) {
-      process.kill(pid, "SIGTERM");
-      const end = Date.now() + 20_000;
-      while (Date.now() < end && isAlive(pid) && processStart(pid) !== null) await sleep(100);
-    }
+    if (pid !== null) await stopSupervisor(ctx, pid);
     const script = keepaliveFile(ctx.dirs);
     const had = fs.existsSync(script);
     fs.rmSync(script, { force: true });

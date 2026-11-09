@@ -70,7 +70,10 @@ export function clock(at: Date | null, now: Date = new Date()): string {
   return iso.slice(0, 10) === now.toISOString().slice(0, 10) ? hm : `${iso.slice(5, 10)} ${hm}`;
 }
 
-const RUN = "claw-connector run";
+// What brings it back and keeps it up: the service (systemd, launchd, or the keep-alive supervisor in a container) is
+// started again; idempotent where it is already installed. `claw-connector run` would be a foreground process that ends
+// with the terminal it was typed in.
+const RUN = "claw-connector service install";
 const LOGIN = "claw-connector login";
 
 export const PRESENCE_WORDS = {

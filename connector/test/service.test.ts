@@ -47,6 +47,24 @@ function fakeExec(answers: Record<string, ExecResult> = {}) {
   return { calls, exec };
 }
 
+/** A process recorded as this home's script supervisor (pid and start time, as `supervise` records itself) that ends on SIGTERM. */
+async function fakeSupervisor(home: string, code = "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)", args: string[] = []) {
+  const p = spawn(process.execPath, ["-e", code, ...args], { stdio: "ignore" });
+  const { processStart } = await import("../src/children.js");
+  let start: string | null = null;
+  for (let i = 0; i < 50 && !start; i++) { start = processStart(p.pid!); if (!start) await new Promise((r) => setTimeout(r, 20)); }
+  const dirs = ctx(home).c.dirs;
+  fs.mkdirSync(dirs.state, { recursive: true });
+  fs.writeFileSync(supervisorPidFile(dirs), JSON.stringify({ pid: p.pid, start }));
+  return p;
+}
+
+/** Whether a child process has ended (within 5 s). */
+async function exited(p: ReturnType<typeof spawn>): Promise<boolean> {
+  if (p.exitCode !== null || p.signalCode !== null) return true;
+  return await Promise.race([new Promise<boolean>((r) => p.once("exit", () => r(true))), new Promise<boolean>((r) => setTimeout(() => r(false), 5_000))]);
+}
+
 const D = (over: Partial<ServiceDeps> = {}): Partial<ServiceDeps> => {
   const cli = path.join(tmpdir("cli-"), "cli.js");
   fs.writeFileSync(cli, "");
@@ -243,15 +261,13 @@ describe("the units", () => {
     const home = tmpdir();
     writeConfig(home, tmpdir("w-"));
     await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
-    fs.mkdirSync(ctx(home).c.dirs.state, { recursive: true });
-    const { processStart } = await import("../src/children.js");
-    fs.writeFileSync(supervisorPidFile(ctx(home).c.dirs), JSON.stringify({ pid: process.ppid, start: processStart(process.ppid) }));
-    const a = ctx(home, { service: { ...D({ systemdBooted: () => false }), readCrontab: () => "", writeCrontab: () => false } }, { PATH: "/bin" });
+    await fakeSupervisor(home);
+    const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), readCrontab: () => "", writeCrontab: () => false } }, { PATH: "/bin" });
     assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
     assert.match(a.errText(), /could not write your crontab/);
     assert.match(a.errText(), /\*\/5 \* \* \* \* sh .*keepalive\.sh/);
     assert.doesNotMatch(a.text(), /No cron daemon runs here/);
-    fs.rmSync(supervisorPidFile(a.c.dirs));
+    fs.rmSync(supervisorPidFile(a.c.dirs), { force: true });
   });
 
   test("the container-home note reads only the mount table, never a mount itself", () => {
@@ -418,13 +434,16 @@ describe("service install / uninstall / status", () => {
     const home = tmpdir();
     writeConfig(home, tmpdir("w-"));
     await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
-    // A supervisor that is already alive (this test process) makes install leave it be instead of spawning one.
-    fs.mkdirSync(ctx(home).c.dirs.state, { recursive: true });
-    fs.writeFileSync(supervisorPidFile(ctx(home).c.dirs), JSON.stringify({ pid: process.pid, start: (await import("../src/children.js")).processStart(process.pid) }));
+    // A supervisor that is already alive: install stops it and starts one again (as systemctl restart does), so that an
+    // edited agents.toml or environment is read. The new one runs an empty cli.js, which ends at once.
+    const old = await fakeSupervisor(home);
     // What this very container answers: systemctl exits 0 and does nothing, and there is no /run/systemd/system.
     const chroot = fakeExec({ "systemctl": { code: 0, out: "Running in chroot, ignoring command 'is-system-running'" } });
-    const a = ctx(home, { service: { ...D({ systemdBooted: () => false }), exec: chroot.exec } }, { PATH: "/bin" });
+    const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), exec: chroot.exec } }, { PATH: "/bin" });
     assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+    assert.equal(await exited(old), true, "the supervisor that was running was stopped");
+    assert.match(a.text(), new RegExp(`stopped the running supervisor \\(pid ${old.pid}\\)`));
+    assert.match(a.text(), /started the supervisor \(pid \d+\)/);
     const script = keepaliveFile(a.c.dirs);
     const fd = fs.openSync(script, "r");
     const mode = fs.fstatSync(fd).mode & 0o777;
@@ -433,7 +452,6 @@ describe("service install / uninstall / status", () => {
     assert.equal(mode, 0o700);
     assert.match(body, /export PATH='\/bin'/);
     assert.match(body, /service ensure\n$/);
-    assert.match(a.text(), /supervisor running \(pid \d+\)/);
     assert.deepEqual(chroot.calls, [], "systemctl was not even asked");
     // Installing is not "something calls keepalive.sh": doctor must not take the install's own start for a schedule.
     const { keepaliveStampFile } = await import("../src/paths.js");
@@ -441,20 +459,44 @@ describe("service install / uninstall / status", () => {
     // No cron daemon (the fake's default, and the usual container): said plainly, with the line a startup hook needs.
     assert.match(a.text(), /No cron daemon runs here: after a reboot or a container restart NOTHING starts the connector again/);
     assert.match(a.text(), /^  sh '.*keepalive\.sh' >\/dev\/null 2>&1$/m);
-    fs.rmSync(supervisorPidFile(a.c.dirs));
+    fs.rmSync(supervisorPidFile(a.c.dirs), { force: true });
+  });
+
+  test("script: a stopped supervisor that no parent reaps (a container's PID 1) counts as stopped once its pid file is gone", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    // Stands for the zombie: on SIGTERM it removes its pid file as supervise() does, but the process stays (kill(pid, 0) succeeds).
+    const pidf = supervisorPidFile(ctx(home).c.dirs);
+    const old = await fakeSupervisor(home, "process.on('SIGTERM', () => require('fs').rmSync(process.argv[1], { force: true })); setInterval(() => {}, 1000)", [pidf]);
+    try {
+      const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), exec: fakeExec().exec } }, { PATH: "/bin" });
+      const t0 = Date.now();
+      assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+      assert.ok(Date.now() - t0 < 10_000, "not the 20 s wait");
+      assert.match(a.text(), /started the supervisor \(pid \d+\)/);
+    } finally { old.kill("SIGKILL"); fs.rmSync(pidf, { force: true }); }
+  });
+
+  test("script: with no supervisor running, install starts one and stops nothing", async () => {
+    const home = tmpdir();
+    writeConfig(home, tmpdir("w-"));
+    await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
+    const a = ctx(home, { service: { ...D({ systemdBooted: () => false, node: process.execPath }), exec: fakeExec().exec } }, { PATH: "/bin" });
+    assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
+    assert.doesNotMatch(a.text(), /stopped the running supervisor/);
+    assert.match(a.text(), /started the supervisor \(pid \d+\)/);
+    fs.rmSync(supervisorPidFile(a.c.dirs), { force: true });
   });
 
   test("script: where a cron daemon runs, the two lines go into the crontab once, beside the user's own, and uninstall takes them out", async () => {
     const home = tmpdir();
     writeConfig(home, tmpdir("w-"));
     await main(["login", "--server", "https://claw.example", "--key", "k"], ctx(home).c);
-    fs.mkdirSync(ctx(home).c.dirs.state, { recursive: true });
-    const { processStart } = await import("../src/children.js");
-    const alive = () => fs.writeFileSync(supervisorPidFile(ctx(home).c.dirs), JSON.stringify({ pid: process.ppid, start: processStart(process.ppid) }));
-    alive();
+    await fakeSupervisor(home);
     const script = keepaliveFile(ctx(home).c.dirs);
     let tab = `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n`;
-    const svc = { ...D({ systemdBooted: () => false }), readCrontab: () => tab, writeCrontab: (t: string) => { tab = t; return true; } };
+    const svc = { ...D({ systemdBooted: () => false, node: process.execPath }), readCrontab: () => tab, writeCrontab: (t: string) => { tab = t; return true; } };
     for (let i = 0; i < 2; i++) {
       const a = ctx(home, { service: svc }, { PATH: "/bin" });
       assert.equal(await main(["service", "install"], a.c), EXIT.ok, a.errText());
@@ -462,7 +504,7 @@ describe("service install / uninstall / status", () => {
     }
     assert.equal(tab, `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n${cronLines(script).join("\n")}\n`, "installed twice, listed once; the user's lines kept, blank ones too");
     // uninstall would stop the recorded supervisor: point the record at nothing alive.
-    fs.rmSync(supervisorPidFile(ctx(home).c.dirs));
+    fs.rmSync(supervisorPidFile(ctx(home).c.dirs), { force: true });
     const u = ctx(home, { service: svc });
     assert.equal(await main(["service", "uninstall"], u.c), EXIT.ok);
     assert.equal(tab, `MAILTO=me\n\n0 3 * * * backup.sh\n# my note about ${script}\n\n`, "only the lines install wrote are removed");
