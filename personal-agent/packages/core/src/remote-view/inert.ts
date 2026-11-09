@@ -7,7 +7,8 @@
  * from it); `defang` keeps a JSON value whole but inert; `lit` is `neutral` for a card TextBlock, which reads markdown.
  */
 import { redactText as redact } from "../security/redact.js";
-import { controlsToBlanks, length, orEmpty, pyStr, rstrip, slice, squash } from "./py-text.js";
+import { neutral as neutralText } from "../text/neutral.js";
+import { orEmpty, pyStr } from "./py-text.js";
 
 const MARKDOWN = /([\\`*_[\]<])/g;
 
@@ -19,12 +20,7 @@ export function plain(text: string): string {
 /** One short line of untrusted text, safe in a card or a list (`text/neutral`), from whatever a connector reported: a value that
  * is not text is read as Python's `str(value or "")` would. */
 export function neutral(text: unknown, limit = 200): string {
-  const flat = redact(squash(controlsToBlanks(orEmpty(text))))
-    .text.replaceAll("[", "(")
-    .replaceAll("]", ")")
-    .replaceAll("<", "\u{2039}")
-    .replaceAll(">", "\u{203a}");
-  return length(flat) <= limit ? flat : rstrip(slice(flat, 0, limit - 1)) + "…";
+  return neutralText(orEmpty(text), limit);
 }
 
 /** `neutral`, then markup escaped: text supplied by an agent, a machine or a session as it goes into a card TextBlock. */

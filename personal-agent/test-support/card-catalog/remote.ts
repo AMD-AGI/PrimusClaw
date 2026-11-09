@@ -5,9 +5,9 @@
 import { remoteView } from "../../packages/core/src/index.js";
 import { ConnectorSetup, setupFrom } from "../../packages/core/src/remote/connector/setup.js";
 import type { Agent, Connector, Session } from "../../packages/core/src/remote/model.js";
-import { agentsCard, sessionsCard, statusCard } from "../../packages/teams/src/views/remote/index.js";
+import { agentsCard, permissionCard, sessionsCard, statusCard } from "../../packages/teams/src/views/remote/index.js";
 import { disconnectCard } from "../../packages/teams/src/views/remote/small-cards.js";
-import { type CatalogEntry, NOW, entries } from "./catalog.js";
+import { type CatalogEntry, NOW, TZ, entries } from "./catalog.js";
 
 /** What the worker's tests configure: the address it reaches Claw at. */
 export const SETUP = new ConnectorSetup(setupFrom(null, "https://claw.example.com/claw-api"));
@@ -71,6 +71,24 @@ const sessions = (
   );
 
 export const REMOTE: readonly CatalogEntry[] = entries(
+  [
+    "remote_permission",
+    () =>
+      permissionCard(
+        remoteView.permissionView(
+          { actionId: "ac-1", tool: "Bash", kind: "execute", input: { command: "npm test" } },
+          [
+            { optionId: "o1", kind: "allow_once", name: "Allow" },
+            { optionId: "o2", kind: "allow_always", name: "Always" },
+            { optionId: "o3", kind: "reject_once", name: "Reject" },
+          ],
+          "rs-1",
+          "Claude Code on robin-dev",
+          NOW + 600,
+          TZ,
+        ),
+      ),
+  ],
   [
     "remote_agents",
     () =>

@@ -56,13 +56,6 @@ export function hasControl(text: string): boolean {
   return false;
 }
 
-/** `text` with every control character replaced by a blank. */
-export function controlsToBlanks(text: string): string {
-  let out = "";
-  for (let i = 0; i < text.length; i += 1) out += isControl(text.charCodeAt(i)) ? " " : text.charAt(i);
-  return out;
-}
-
 /** Python `len(text)`. */
 export function length(text: string): number {
   return ASTRAL.test(text) ? Array.from(text).length : text.length;
@@ -88,14 +81,6 @@ export function orEmpty(value: unknown): string {
   return truthy(value) ? pyStr(value) : "";
 }
 
-/** Python truthiness of a JSON value. */
-export function truthy(value: unknown): boolean {
-  if (value === null || value === undefined || value === false || value === 0 || value === "") return false;
-  if (Array.isArray(value)) return value.length > 0;
-  if (typeof value === "object") return Object.keys(value).length > 0;
-  return true;
-}
-
 function pyNumber(value: number): string {
   if (Number.isInteger(value) && Math.abs(value) < 1e16) return String(value);
   return String(value);
@@ -106,4 +91,12 @@ export function lstripChars(text: string, chars: string): string {
   let i = 0;
   while (i < text.length && chars.includes(text.charAt(i))) i += 1;
   return text.slice(i);
+}
+
+/** Python truthiness of a JSON value. */
+function truthy(value: unknown): boolean {
+  if (value === null || value === undefined || value === false || value === 0 || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }

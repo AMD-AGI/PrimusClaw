@@ -9,8 +9,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { pyJsonDumps } from "@primusclaw/personal-agent";
-import { remoteView } from "@primusclaw/personal-agent";
+import { pyJsonDumps, remoteView } from "@primusclaw/personal-agent";
 import { Ajv } from "ajv";
 
 import { CJK } from "../src/cards/cjk.js";
