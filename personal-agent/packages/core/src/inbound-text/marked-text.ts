@@ -12,11 +12,11 @@
  */
 import type { InboundLink, InboundMention } from "../ports/surface.js";
 import { pyStrip } from "../text/py-text.js";
+import { MARK_CLOSE, MARK_OPEN } from "../review-text/markers.js";
 import { withLinks, type WithLinksOptions } from "./with-links.js";
 
-/** What a mention is replaced with: ⟦0⟧, ⟦1⟧, ... */
-export const MARK_OPEN = "⟦";
-export const MARK_CLOSE = "⟧";
+/** What a mention is replaced with (⟦0⟧, ⟦1⟧, ...): the markers are the review text's own. */
+export { MARK_CLOSE, MARK_OPEN };
 
 export interface MarkedText {
   readonly text: string;

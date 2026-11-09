@@ -12,6 +12,7 @@ import type { JsonObject } from "../json.js";
 import { errorName } from "../errors.js";
 import type { Lang } from "../locales/lang.js";
 import { assistantChatText } from "../locales/assistant-chat.js";
+import { commandText } from "../locales/commands.js";
 import { answerLang } from "../language/detect.js";
 import type { ClawAssistantPort, ClawSessionsPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
@@ -382,13 +383,13 @@ export class AssistantChat {
 
   /**
    * What to say to `/new`, `/sessions` and `/repo`, which the assistant makes needless (it keeps one conversation and a task of its
-   * own for each thing asked); undefined for anything else. Nothing is done for them. (Said in English, as the Python worker did.)
+   * own for each thing asked), in the chat's language (the router's `said_in`); undefined for anything else. Nothing is done.
    */
   hiddenCommand(said: string, lang: Lang): string | undefined {
-    const t = assistantChatText.in(lang);
+    const t = commandText.in(lang);
     const command = this.o.commands.parse(said);
-    if (command === "new" || command === "sessions") return t.noSessions;
-    return this.o.commands.args(said, "repo") === undefined ? undefined : t.noRepo;
+    if (command === "new" || command === "sessions") return t.assistantNoSessions;
+    return this.o.commands.args(said, "repo") === undefined ? undefined : t.assistantNoRepo;
   }
 
   /** `/board`: the person's work items, and a card for each one that waits for them. */

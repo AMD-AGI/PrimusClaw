@@ -233,7 +233,7 @@ it("with the switch off or the person not listed nothing asks for the assistant"
 it("new sessions and repo are not commands with the assistant", () => {
   const w = world();
   assert.ok(w.chat.hiddenCommand("/new", "en")?.startsWith("I keep one conversation"));
-  assert.ok(w.chat.hiddenCommand("/sessions", "zh")?.startsWith("I keep one conversation"));
+  assert.ok(w.chat.hiddenCommand("/sessions", "zh")?.includes("会话"));
   assert.ok(w.chat.hiddenCommand("/repo AMD-AGI/PrimusClaw", "en")?.startsWith("Just say which repository"));
   assert.equal(w.chat.hiddenCommand("/board", "en"), undefined);
 });

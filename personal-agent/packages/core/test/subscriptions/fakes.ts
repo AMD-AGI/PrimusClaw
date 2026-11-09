@@ -148,7 +148,10 @@ export class FakeSubscriptionStore implements SubscriptionStore {
         const sub = this.subs.get(u);
         return sub ? { route: sub.route, subscriptionId: sub.subscriptionId } : null;
       },
-      forgetNotifySub: (u) => void this.subs.delete(u),
+      forgetNotifySub: (u) => {
+        this.subs.delete(u);
+        this.attempts.delete(u); // (as the store does: a forgotten subscription is made again at once)
+      },
       claimNotifyAttempt: (u, minInterval) => {
         const last = this.attempts.get(u);
         if (last !== undefined && this.now - last < minInterval) return false;
