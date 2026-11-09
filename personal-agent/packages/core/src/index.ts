@@ -9,7 +9,6 @@
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
 export * from "./approvals/index.js";
-export * from "./assistant/deliveries.js";
 export type * from "./assistant/views.js";
 export * from "./assistant/work-items.js";
 export * from "./errors.js";
