@@ -351,9 +351,7 @@ function githubWord(
 }
 
 /** The setting a model reading asks for: a mode, "show" to see it, or null when the reading is not about it. */
-function modeWanted(
-  raw: Readonly<Record<string, unknown>>,
-): "high_risk_confirm" | "fully_auto" | "show" | null {
+function modeWanted(raw: Readonly<Record<string, unknown>>): "high_risk_confirm" | "fully_auto" | "show" | null {
   if (raw.intent === "show_review_mode") return "show";
   if (raw.intent !== "set_review_mode" || !isReviewMode(raw.mode)) return null;
   return raw.mode;

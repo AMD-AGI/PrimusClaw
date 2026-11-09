@@ -334,7 +334,9 @@ export class GithubAccount {
       return;
     }
     const lead =
-      suggested !== "" && suggested === current ? t.alreadyThisOne(REVIEW_MODES[suggested][0]) + t.pressToChange : t.pressToChange;
+      suggested !== "" && suggested === current
+        ? t.alreadyThisOne(REVIEW_MODES[suggested][0]) + t.pressToChange
+        : t.pressToChange;
     await conversation.send(this.modeCard(sender.id, current, suggested, lead));
   }
 
