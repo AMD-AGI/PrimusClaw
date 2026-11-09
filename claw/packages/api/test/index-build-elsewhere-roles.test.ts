@@ -5,7 +5,8 @@
  * What another role's index build means to the API, which runs as an ordinary (non-superuser) role and so reads
  * NULL for the index and table of every build in `pg_stat_progress_create_index` it may not inspect. Over a real
  * Postgres, skipped without DATABASE_URL (and a skip is not a pass). Its own file because the API's role is fixed
- * when the db module loads.
+ * when the db module loads. Progress rows are read for this file's database only: other suites build indexes in
+ * theirs on the same server at the same time.
  *
  *   R1 a required index (the chat-turn claim index assertSchema checks) left INVALID is dropped and rebuilt, and
  *      the replica starts, while another role builds an unrelated index it cannot see into
@@ -64,7 +65,7 @@ describe("index builds by other roles", { skip }, () => {
     await writer.query(`INSERT INTO ${table} VALUES (1)`);
     const build = builder.query(`CREATE INDEX CONCURRENTLY ${index} ON ${table} (x)`);
     for (let i = 0; ; i++) {
-      const rows = (await admin.query("SELECT 1 FROM pg_stat_progress_create_index WHERE relid = $1::regclass", [table])).rows;
+      const rows = (await admin.query("SELECT 1 FROM pg_stat_progress_create_index WHERE datname = current_database() AND relid = $1::regclass", [table])).rows;
       if (rows.length) break;
       if (i > 300) throw new Error(`the build on ${table} never started`);
       await sleep(100);
@@ -114,7 +115,7 @@ describe("index builds by other roles", { skip }, () => {
     await invalidate(dbm.CHAT_TURN_CLAIM_INDEX);
     const other = await heldBuild(OTHER, "other_s.t", "t_x");
     try {
-      const seen = (await dbm.db.query("SELECT relid, index_relid FROM pg_stat_progress_create_index")).rows;
+      const seen = (await dbm.db.query("SELECT relid, index_relid FROM pg_stat_progress_create_index WHERE datname = current_database()")).rows;
       assert.deepEqual(seen, [{ relid: null, index_relid: null }], "the API's role sees the other build only as NULLs");
       await dbm.initDb();
       const now = await state(dbm.CHAT_TURN_CLAIM_INDEX);
@@ -146,7 +147,7 @@ describe("index builds by other roles", { skip }, () => {
     const leftover = await state("idx_events_memory_saved");
     const mine = await heldBuild(APP, "public.app_t", "app_t_x");
     try {
-      const seen = (await dbm.db.query("SELECT relid::regclass::text AS relid FROM pg_stat_progress_create_index")).rows;
+      const seen = (await dbm.db.query("SELECT relid::regclass::text AS relid FROM pg_stat_progress_create_index WHERE datname = current_database()")).rows;
       assert.deepEqual(seen, [{ relid: "app_t" }], "this build is readable");
       assert.equal(await dbm.indexBuildInProgress(dbm.db, "idx_events_memory_saved"), false);
       assert.equal(await dbm.buildDeferredIndexes(), "built");
