@@ -180,20 +180,34 @@ const WORKLOAD_DISRUPTION = new RegExp([
 ].join("|"));
 
 /**
+ * The kubelet's words for evicting a pod over what the pod itself used: past its
+ * own ephemeral-storage limit (the pod's, a container's, an emptyDir's), or the
+ * pod picked because it used more than it asked for when the node ran short
+ * ("The node was low on resource: memory ... has larger consumption of memory").
+ * Those come as Evicted / TerminationByKubelet / EvictionByEvictionAPI too, and
+ * are the application's doing, not the platform's.
+ */
+const RESOURCE_EVICTION = /exceeds? (?:the |its )?(?:total )?limit|exceeded its .{0,80}limit|low on resource/i;
+
+/**
  * Whether a terminal SaFE workload detail says the platform took its pod away
- * (its node lost, an eviction, a preemption) rather than its container failing.
- * Reads every condition's message, the top-level message and each pod's
- * `failedMessage`; a payload that says nothing of the kind is false.
+ * (its node lost, a preemption, a drain) rather than its container failing or
+ * the pod being evicted for what it used itself (`RESOURCE_EVICTION`).
+ *
+ * Reads the terminal condition's message only, the one
+ * {@link classifyWorkloadTerminalReason} reads (it carries the failed pods'
+ * details): never the top-level message, which the scheduler writes and never
+ * clears, so an old "Preempted" there would make a later failure of the
+ * container look like a disruption. No terminal condition is false.
  */
 export function workloadDisrupted(info: Record<string, unknown>): boolean {
-  const texts: string[] = [String(info.message ?? "")];
-  if (Array.isArray(info.conditions)) {
-    for (const c of info.conditions as Array<Record<string, unknown> | null>) texts.push(String(c?.message ?? ""));
-  }
-  if (Array.isArray(info.pods)) {
-    for (const p of info.pods as Array<Record<string, unknown> | null>) texts.push(String(p?.failedMessage ?? ""));
-  }
-  return texts.some((t) => WORKLOAD_DISRUPTION.test(t));
+  const conds = Array.isArray(info.conditions) ? (info.conditions as Array<Record<string, unknown> | null>) : [];
+  const terminal = conds.find((c) => {
+    const t = String(c?.type ?? "").toLowerCase();
+    return t === "adminfailed" || t === "adminstopped";
+  });
+  const text = String(terminal?.message ?? "");
+  return WORKLOAD_DISRUPTION.test(text) && !RESOURCE_EVICTION.test(text);
 }
 
 /**

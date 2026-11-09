@@ -29,7 +29,8 @@
  *    by `max_restarts` on every road into provisioning or restarting
  *    ({@link AppRunner.countedRestart}). A sandbox the platform took away (its node
  *    lost, the site out of nodes) is not the application failing and does not spend
- *    `max_restarts`; those losses have their own, larger bound
+ *    `max_restarts` (a manifest with `max_restarts` 0 is still never started again);
+ *    those losses have their own, larger bound
  *    ({@link PLATFORM_LOSSES_MAX}), so a site that never comes back still ends the run.
  *  - A second process is never started beside a live one: ticks do not overlap,
  *    the probe runs before every start, and the start command checks again inside
@@ -981,7 +982,8 @@ export class AppRunner {
    * look for a `final` that a lost sandbox may have hidden.
    *
    * `platform` (a sandbox the platform took away, see {@link platformLoss}) goes
-   * back to provisioning without spending `max_restarts`: it is counted in
+   * back to provisioning without spending `max_restarts`, for a manifest that
+   * allows restarts at all (one with `max_restarts` 0 ends, as before): it is counted in
    * `last_exit.platform_losses` instead, bounded by {@link PLATFORM_LOSSES_MAX}. The
    * count is carried on every later `last_exit` this road writes, so a takeover
    * keeps it.
@@ -997,7 +999,9 @@ export class AppRunner {
       ...(last ?? { at: this.iso(), cause, final: false }),
       ...(losses > 0 ? { platform_losses: losses } : {}),
     };
-    if (platform) {
+    // A manifest that allows no restart (max_restarts 0, or no restart block) is never started a second time, whoever lost its
+    // sandbox: it ends here as it always did. Only a run that may restart at all is spared spending one on the platform.
+    if (platform && maxRestarts(rec.manifest) > 0) {
       if (losses >= PLATFORM_LOSSES_MAX) {
         await this.move({
           state: "finishing",

@@ -16,7 +16,9 @@
  *   L3 the application's own container failing still counts; a disruption wins over
  *      what the container's exit looked like
  *   L4 a Brain that takes the run over keeps the platform-loss count
- *   L5 SaFE's workload detail: a disrupted pod is told apart from a failed container
+ *   L5 SaFE's workload detail: a disrupted pod is told apart from a failed container, from a pod evicted for what it
+ *      used itself, and from a stale top-level message
+ *   L6 a manifest that allows no restart is never started again, whoever lost its sandbox
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -169,8 +171,9 @@ test("L5 SaFE's detail: a disrupted or node-lost pod is disrupted; a container t
   const disrupted = [
     { conditions: [{ type: "AdminFailed", message: "Pod phase is Failed, details: [{\"pod\":\"p\",\"node\":\"v3-185\",\"message\":\"DisruptionTarget: DeletionByTaintManager (2026-11-09T08:12:00Z): Taint manager: deleting due to NoExecute taint key node.kubernetes.io/unreachable\"}]" }] },
     { conditions: [{ type: "AdminFailed", message: "pod p was taken away by a disruption, DisruptionTarget: PreemptionByScheduler: preempted" }] },
-    { message: "", pods: [{ podId: "p", phase: "Failed", failedMessage: "NodeLost, Node v3-106 which was running pod p is unresponsive" }] },
-    { pods: [{ failedMessage: "Evicted, The node was low on resource: ephemeral-storage." }] },
+    { conditions: [{ type: "AdminFailed", message: "Pod phase is Failed, details: [{\"pod\":\"p\",\"message\":\"NodeLost, Node v3-106 which was running pod p is unresponsive\"}]" }] },
+    { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: TerminationByKubelet: Pod was terminated in response to imminent node shutdown." }] },
+    { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: EvictionByEvictionAPI: Eviction API: evicting (node drain)" }] },
   ];
   for (const info of disrupted) assert.equal(workloadDisrupted(info), true, JSON.stringify(info));
   const own = [
@@ -179,6 +182,13 @@ test("L5 SaFE's detail: a disrupted or node-lost pod is disrupted; a container t
     { conditions: [{ type: "AdminFailed", message: "the app was evicted from its cache, node lost its mind" }] },
     { message: "In queue - insufficient resources" },
     {},
+    // Evicted for what the pod used itself: the application's doing.
+    { conditions: [{ type: "AdminFailed", message: "Evicted, Pod ephemeral local storage usage exceeds the total limit of containers 10Gi." }] },
+    { conditions: [{ type: "AdminFailed", message: "DisruptionTarget: TerminationByKubelet: Container main exceeded its local ephemeral storage limit \"1Gi\"." }] },
+    { conditions: [{ type: "AdminFailed", message: "Evicted, The node was low on resource: memory. Container main was using 60Gi, request is 8Gi, has larger consumption of memory." }] },
+    // A stale top-level "Preempted" and a pod record do not make a container failure a disruption: only the terminal condition is read.
+    { message: "Preempted by a higher-priority workload", pods: [{ failedMessage: "Preempted" }],
+      conditions: [{ type: "AdminFailed", message: "Pod phase is Failed, details: [{\"container\":{\"reason\":\"OOMKilled\",\"exitCode\":137}}]" }] },
   ];
   for (const info of own) assert.equal(workloadDisrupted(info), false, JSON.stringify(info));
 
@@ -190,11 +200,39 @@ test("L5 SaFE's detail: a disrupted or node-lost pod is disrupted; a container t
     globalThis.fetch = (async () => new Response(JSON.stringify(body), { status: 200 })) as typeof fetch;
     const provider = new SafeWorkloadProvider();
     const inst = { provider: "safe-workload", id: "wl-x", sandboxName: "wl-x", namespace: "ws", handsBaseUrl: "", platformKey: "pk" } as const;
-    body = { phase: "Failed", ...disrupted[2] };
-    assert.deepEqual(await provider.get(inst), { running: false, healthy: false, state: "terminal", reason: "sandbox_workload_terminal", disrupted: true });
+    body = { phase: "Failed", ...disrupted[0] };
+    assert.deepEqual(await provider.get(inst), { running: false, healthy: false, state: "terminal", reason: "sandbox_container_failed", disrupted: true });
     body = { phase: "Failed", ...own[0] };
     assert.deepEqual(await provider.get(inst), { running: false, healthy: false, state: "terminal", reason: "sandbox_container_failed" });
   } finally {
     globalThis.fetch = realFetch;
   }
 });
+
+for (const [label, manifest] of [
+  ["max_restarts 0", { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } }],
+  ["no restart block", { ...MANIFEST, restart: undefined }],
+] as const) {
+  test(`L6 ${label}: a node lost, a vanished workload or a wait for a node that ran out ends the run; nothing is started again`, async () => {
+    for (const lose of [
+      (h: H) => h.world.killWorkload(h.world.liveWorkload(), "terminal", NODE_LOST),
+      (h: H) => h.world.killWorkload(h.world.liveWorkload(), "absent"),
+      (h: H) => h.world.killWorkload(h.world.liveWorkload(), "terminal"),
+    ]) {
+      const h = harness(manifest as AppManifestV1);
+      await until(h, "running");
+      lose(h);
+      await h.runner.reconcile();
+      assert.equal(h.world.rec.state, "finishing");
+      assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+      assert.equal(h.world.rec.last_exit?.platform_losses, undefined, "not counted as a platform loss either");
+      assert.equal(h.world.created.length, 1, "no second sandbox");
+      assert.equal(h.world.starts.length, 1, "the application is never started again");
+    }
+    const g = harness(manifest as AppManifestV1);
+    noNodeFor(g, 1);
+    await g.runner.reconcile();
+    assert.equal(g.world.rec.state, "finishing");
+    assert.equal(g.world.starts.length, 0);
+  });
+}

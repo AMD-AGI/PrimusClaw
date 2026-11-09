@@ -309,7 +309,7 @@ test("T14b a final exit hidden by a lost sandbox is found even with the budget s
 test("T14c a reader that cannot be made is retried; after three failed looks the loss is counted without one", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
   const wl = await toRunning(h);
-  h.world.killWorkload(wl, "terminal", CONTAINER_FAILED);
+  h.world.killWorkload(wl, "terminal");
   h.world.failReader = 3;
   await assert.rejects(h.runner.reconcile(), /reader could not be created/);
   assert.equal(h.world.rec.state, "running", "a look that failed changes nothing");
@@ -336,7 +336,7 @@ test("T14c' a reader that fails once and then reads a final ends the run as the 
 test("T14d a sandbox lost before the app ever started (no state dir) has nothing to recover", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [] } } });
   await h.runner.reconcile(); // provisioning -> starting, state_dir still null
-  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal", CONTAINER_FAILED);
+  h.world.killWorkload(h.world.rec.sandbox_workload_id!, "terminal");
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
   assert.deepEqual(h.world.readers, [], "no state directory, nothing to read");
