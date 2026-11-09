@@ -117,7 +117,10 @@ test("the message to an unlinked user puts the link on a line of its own", () =>
   const page = "https://claw.example.test/primus-claw/teams-link";
   for (const lang of ["zh", "en"] as const) {
     const text = linkText.in(lang).linkSteps({ lead: "", bot: "Clawy", page, notice: "AI notice" });
-    assert.ok(text.split("\n").includes(page), lang); // (alone on its line)
+    assert.ok(
+      text.split("\n").some((line) => line === page),
+      lang,
+    ); // (alone on its line)
     assert.deepEqual(textAfterLinks(text), [], lang);
   }
 });
