@@ -20,6 +20,7 @@ import type {
   Random,
   Result,
   StreamRefused,
+  UpdateOptions,
 } from "@primusclaw/personal-agent";
 import { err, ok, silentLogger } from "@primusclaw/personal-agent";
 
@@ -69,6 +70,11 @@ export class TeamsConversation implements Conversation {
 
   constructor(private readonly parts: ConversationParts) {
     this.logger = parts.logger ?? silentLogger;
+  }
+
+  /** A message the bot removed or replaced elsewhere is settled: an unsettled click on it then leaves it alone. */
+  markSettled(id: MessageId): void {
+    this.edited.add(id);
   }
 
   get ref(): ConversationRef {
@@ -159,7 +165,7 @@ export class TeamsConversation implements Conversation {
   }
 
   /** Replace the message `id`. With `signal`: a caller that was cancelled while it waited sends nothing. */
-  async update(id: MessageId, message: OutMessage, options: PublishOptions = {}): Promise<void> {
+  async update(id: MessageId, message: OutMessage, options: UpdateOptions = {}): Promise<void> {
     this.edited.add(id);
     const activity = this.prepare(activityOf(message, this.parts.render));
     await this.publish(envelope("update", reference(this.ref), activity, { activityId: id }), options);
