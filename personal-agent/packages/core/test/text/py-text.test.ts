@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   clipLine,
+  decimalBigInt,
   decimalInt,
   isDigits,
   isPySpace,
@@ -21,6 +22,7 @@ import {
   PY_SPACE,
   pyCasefold,
   pyJsonDumps,
+  pyRepr,
   pyLower,
   pyLstrip,
   pyStr,
@@ -133,7 +135,7 @@ test('lstrip and str(value or "") are Python\'s', () => {
   assert.equal(pyStr(12), "12");
   assert.equal(pyStr(0n), "");
   assert.equal(pyStr(7n), "7");
-  assert.equal(pyStr({ a: 1 }), "");
+  assert.equal(pyStr({ a: 1 }), "{'a': 1}"); // a container is its repr, as str() shows it
 });
 
 test("json dumps with indent and sorted keys is json.dumps(indent=1, sort_keys=True)", () => {
@@ -251,4 +253,30 @@ test("numbers are written as Python writes them, and the edges of clip, rfind an
   assert.equal(cpRfind("a😀b", "b"), 2);
   assert.equal(cpRfind("x\ud83d\ude00", "\ud83d"), -1);
   assert.equal(cpRfind("\ud83dx", "\ud83d"), 0);
+});
+
+test("isupper, repr and str of containers, exact integers and fixed decimals of any size are Python's", () => {
+  // Each right-hand side is what CPython 3 printed.
+  for (const [text, python] of [
+    ["ℂϒ", true],
+    ["\u{1d400}", true], // MATHEMATICAL BOLD CAPITAL A
+    ["Aĸ", false],
+    ["Aª", false],
+    ["AB1", true],
+    ["ǅ", false],
+    ["1", false],
+  ] as const) {
+    assert.equal(isUpper(text), python, text);
+  }
+  assert.equal(pyStr([1, "a'b", { k: null }]), "[1, \"a'b\", {'k': None}]");
+  assert.equal(pyStr([]), "");
+  assert.equal(pyStr({}), "");
+  assert.equal(pyRepr("tab\there \\ 中 \u200b \ud800"), "'tab\\there \\\\ 中 \\u200b \\ud800'");
+  assert.equal(pyRepr({ a: [true, false, 1.5] }), "{'a': [True, False, 1.5]}");
+  assert.equal(decimalBigInt("9007199254740993"), 9007199254740993n);
+  assert.equal(decimalBigInt("x"), undefined);
+  assert.throws(() => decimalInt("9007199254740993"), RangeError);
+  assert.equal(decimalInt("9007199254740991"), 9007199254740991);
+  assert.equal(fixedN(1.25, 101), `1.25${"0".repeat(99)}`);
+  assert.equal(pyJsonDumps("\ud800x"), '"\ud800x"'); // a lone surrogate is written raw, as Python's ensure_ascii=False does
 });
