@@ -826,6 +826,29 @@ async function readIndexValidity(
 }
 
 /**
+ * Whether another backend is building the index `name` right now, read from `pg_stat_progress_create_index`.
+ * Exported for tests.
+ *
+ * Asked only about an index that exists and is not valid, which a concurrent build has already entered in the
+ * catalog and reported as its `index_relid` (both happen in its first transaction, before anyone else can see the
+ * entry). A row whose details are hidden -- a build by a role whose progress this one may not read shows NULLs --
+ * counts as in progress too: leaving a leftover until the next start costs a slower query, dropping a live build
+ * costs the whole build.
+ */
+export async function indexBuildInProgress(q: StatementRunner, name: string): Promise<boolean> {
+  const r = await q.query(
+    `SELECT 1 FROM pg_stat_progress_create_index p
+      WHERE p.pid <> pg_backend_pid()
+        AND p.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        AND (p.index_relid IS NULL OR p.index_relid = (
+          SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relname = $1 AND n.nspname = CURRENT_SCHEMA()))`,
+    [name],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
  * One stored row per application progress event (hosting design 5.7): the
  * forwarding is at least once, so the same (session, app run, producer epoch,
  * CloudEvents id) can be published again under a new stream sequence. Exported so a test builds
@@ -851,7 +874,7 @@ export const APP_EVENT_DEDUP_SQL = `DELETE FROM claw_session_events a
     AND a.id > b.id`;
 
 /** The app-event unique index, repairing stored repeats first if they are what stops it. */
-export function buildAppEventIndex(client: pg.PoolClient): Promise<void> {
+export function buildAppEventIndex(client: pg.ClientBase): Promise<void> {
   return ensureConcurrentIndexOrWarn(client, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL, {
     onUniqueViolation: async () => { await client.query(APP_EVENT_DEDUP_SQL); },
   });
@@ -1041,7 +1064,7 @@ export interface ConcurrentIndexOptions {
 }
 
 async function ensureConcurrentIndex(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   name: string,
   createSql: string,
   opts: ConcurrentIndexOptions = {},
@@ -1052,6 +1075,13 @@ async function ensureConcurrentIndex(
   const readValidity = () => readIndexValidity(client, name);
   let existing = await readValidity();
   if (existing.rowCount && existing.rows[0].indisvalid) return;
+  if (existing.rowCount && await indexBuildInProgress(client, name)) {
+    // Not a leftover: another backend is building it right now (a replica, a release job, an operator). Dropping
+    // it would throw that build away, and building it here would only wait behind it; the next start finds it
+    // valid, or a real leftover if that build died.
+    logger.info({ index: name }, "db.concurrent_index_build_in_progress_elsewhere");
+    return;
+  }
   if (existing.rowCount) {
     // Interrupted concurrent builds leave an INVALID index that IF NOT EXISTS
     // would skip forever. Remove only that unusable object before rebuilding.
@@ -1141,7 +1171,7 @@ async function ensureConcurrentIndex(
  * to reconcile and try again rather than to give up.
  */
 export async function ensureConcurrentIndexOrWarn(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   name: string,
   createSql: string,
   opts: ConcurrentIndexOptions = {},
@@ -1189,7 +1219,7 @@ export async function ensureConcurrentIndexOrWarn(
  * by the next boot.
  */
 export async function dropSupersededIndexWhenReplaced(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   superseded: string,
   replacement: string,
 ): Promise<void> {
@@ -1802,21 +1832,6 @@ export async function initDb(): Promise<void> {
     // until then (events/consumer.ts, `processCompletionEvent`).
     await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS run_notification_owed JSONB DEFAULT NULL").catch(() => {});
 
-    // An application's progress event is forwarded at least once (hosting design
-    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
-    //
-    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
-    // on the table the event-consumer writes for every Brain event. And not fatal:
-    // a build that fails (a lock or statement timeout) is logged and the API starts
-    // without it; a build stopped by repeats already stored deletes the later copies
-    // (keeping the earliest) and builds again, so the degraded mode ends; an INVALID
-    // leftover of a killed build is dropped before the build. Until the index is valid the
-    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
-    // app event is stored twice, which is the degraded mode and not an outage.
-    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
-    // skips; dropping only that leftover lets the next boot retry.
-    await buildAppEventIndex(client);
-
     // The turn a completion produced, named by the message that asked for it.
     //
     // The gate above recognises one published event delivered twice, which is
@@ -1905,15 +1920,6 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_sessions_cleanup_oldest
          ON claw_sessions(deleted_at) WHERE cleanup_state = 'pending'`,
     ).catch(() => {});
-    // The retention purge's walk over deleted sessions (sessions/retention.ts),
-    // in exactly its keyset order, so each page is an index range read from the
-    // cursor rather than a scan and sort of every deleted session.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_sessions_deleted_walk",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
-         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
-    );
     // Sessions deleted before this existed had their cleanup attempted exactly
     // once, inside the request, and whatever failed there was logged and left.
     // The objects of those sessions are still in the bucket, which is the leak
@@ -1939,35 +1945,6 @@ export async function initDb(): Promise<void> {
     await sealPlaintextSessionCredentials(client).then(
       (n) => { if (n > 0) logger.info({ sessions: n }, "db.session_credentials_sealed"); },
       (err) => logger.warn({ err: (err as Error)?.message }, "db.session_credentials_seal_failed"),
-    );
-
-    // Per-session recency lookup. The sweeper's stuck-session reaper asks
-    // "has this session emitted an event lately", which without this index is a
-    // scan of the whole event table per candidate row.
-    //
-    // CONCURRENTLY so the first build does not take SHARE and block INSERT:
-    // the event-consumer writes this table for every Brain event, and a lock
-    // here is a conversation that stops producing tokens. Each statement in
-    // this function commits on its own, which is what CONCURRENTLY requires.
-    // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
-    // dropping only that leftover lets the next boot retry.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_events_session_recent",
-      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
-    );
-
-    // The chat notices of saved memories, by memory id: deleting or undoing an entry removes the title from the
-    // notices that announced it (memory/service.ts, ERASE_NOTICE_TITLES_SQL). They are a sliver of this table, and
-    // without this index that update reads every event -- a sequential scan of the whole table, or of every event
-    // of the user's sessions, either of which outlives the request's statement timeout on a large deployment.
-    // Text, as `->>` returns it, so that no stored value can make the index expression raise on an insert.
-    // CONCURRENTLY and not fatal, for the reasons given above.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_events_memory_saved",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_memory_saved
-         ON claw_session_events ((data->>'memory_id')) WHERE event = 'memory_saved'`,
     );
 
     // E2: skill sub-files (multi-file skill support).
@@ -2351,46 +2328,6 @@ export async function initDb(): Promise<void> {
        WHERE lease_expires_at IS NOT NULL
          AND status IN ('preparing','running','cancelling')`,
     ).catch(() => {});
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_tasks_platform_facts_pending_v3",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
-         ON claw_tasks(
-           platform_facts_next_retry_at ASC NULLS FIRST,
-           completed_at ASC,
-           task_id ASC
-         )
-       WHERE status = 'failed'
-         AND failure_reason IN (
-           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
-           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
-           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
-           'sandbox_start_timeout'
-         )
-         AND platform_facts_resolved_at IS NULL`,
-    );
-    // The names this one replaced, removed once the replacement is provably
-    // there. Safe to remove at all because each version strictly widens the one
-    // before: identical key columns in identical order, and a failure-reason
-    // `IN` list that only grows (v2 added eight reasons and dropped
-    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
-    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
-    // indexes, and its predicate implies v3's, so a pod still running older code
-    // has its narrower scan served by v3 throughout a rolling upgrade rather
-    // than falling back to a sequential one.
-    //
-    // The retention rule below still holds for the indexes it names; what it
-    // refuses is an *unguarded* drop, and the guard is what these calls add.
-    await dropSupersededIndexWhenReplaced(
-      client,
-      "idx_tasks_platform_facts_pending",
-      "idx_tasks_platform_facts_pending_v3",
-    );
-    await dropSupersededIndexWhenReplaced(
-      client,
-      "idx_tasks_platform_facts_pending_v2",
-      "idx_tasks_platform_facts_pending_v3",
-    );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
     ).catch(() => {});
@@ -2503,29 +2440,6 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON claw_tasks(batch_id) WHERE batch_id IS NOT NULL",
     ).catch(() => {});
-    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
-    // statuses and ordered by the exact keyset cursor. The task id is the stable
-    // tiebreaker when one statement completes many rows at the same timestamp.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_tasks_terminal_completed_task_v2",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
-         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
-       WHERE status IN ('completed','failed','cancelled')`,
-    );
-    // Older variants are intentionally retained during this rolling upgrade.
-    // The hazard is specifically an *unguarded* drop: the create above is
-    // issued through a wrapper that swallows a raised build, so a drop that
-    // merely follows it in program order can run after nothing was built and
-    // leave the route with no ordered index.
-    //
-    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
-    // retained -- it reads the replacement back from `pg_index` and drops only
-    // against a valid one -- and the platform-facts pair above has been moved
-    // onto it. This index and `idx_tasks_occupying` have not: each needs its
-    // own check that the newer predicate really does subsume the older, since
-    // the guard protects the ordering and not the claim that the replacement
-    // covers every row the old index did.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
@@ -2746,6 +2660,177 @@ export async function initDb(): Promise<void> {
     // not worth being clever about.
     client.release(true);
   }
+}
+
+/**
+ * Advisory lock id held by the one replica building {@link buildDeferredIndexes}. Same namespace as the ids
+ * above; never reuse it.
+ */
+export const DEFERRED_INDEX_LOCK_ID = 8_264_179_233_004;
+
+/**
+ * The indexes {@link initDb} does not wait for: performance only, built `CONCURRENTLY` over tables that are large
+ * in production (`claw_session_events`, `claw_tasks`, `claw_sessions`). Run once after the server listens, in the
+ * background (index.ts).
+ *
+ * Why not in initDb: initDb runs before `listen`, so nothing answers the startup probe while it does. A concurrent
+ * build scans its table twice and waits out every older transaction, so on a large table it outlives the probe's
+ * window; the pod is killed mid-build, the next one finds the INVALID leftover, drops it and starts again from
+ * nothing, and the build never finishes. Here the replica serves while the index is built, and every query these
+ * indexes serve works without them, only slower. The indexes a request's correctness needs (the unique ones
+ * `assertSchema` checks) stay in initDb.
+ *
+ * One replica at a time: the others find {@link DEFERRED_INDEX_LOCK_ID} taken and leave it to the holder (a
+ * replica that started together with it, or one still building from an earlier start), so no replica drops an
+ * index another one is building. A build started outside this process -- by hand, by a release job, by a replica
+ * of an older version that still builds in initDb -- does not take that lock, and {@link ensureConcurrentIndex}
+ * leaves an index alone while `pg_stat_progress_create_index` shows a build in progress on its table.
+ *
+ * On its own connection, outside the pools: the hold can last as long as the slowest build, and a pooled client
+ * would keep the pool from ending at shutdown. Answers whether this replica ran the builds or another one holds them.
+ */
+export async function buildDeferredIndexes(): Promise<"built" | "held_elsewhere"> {
+  const client = dedicatedClient();
+  client.on("error", (err) => logger.warn({ err }, "db.deferred_indexes_connection_lost"));
+  await client.connect();
+  try {
+    await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
+    const got = (await client.query("SELECT pg_try_advisory_lock($1) AS got", [DEFERRED_INDEX_LOCK_ID])).rows[0]?.got === true;
+    if (!got) {
+      logger.info("db.deferred_indexes_held_elsewhere");
+      return "held_elsewhere";
+    }
+    try {
+      await buildDeferredIndexesOn(client);
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [DEFERRED_INDEX_LOCK_ID]).catch(() => {});
+    }
+    logger.info("db.deferred_indexes_done");
+    return "built";
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
+    // An application's progress event is forwarded at least once (hosting design
+    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
+    //
+    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
+    // on the table the event-consumer writes for every Brain event. And not fatal:
+    // a build that fails (a lock or statement timeout) is logged and the API starts
+    // without it; a build stopped by repeats already stored deletes the later copies
+    // (keeping the earliest) and builds again, so the degraded mode ends; an INVALID
+    // leftover of a killed build is dropped before the build. Until the index is valid the
+    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
+    // app event is stored twice, which is the degraded mode and not an outage.
+    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
+    // skips; dropping only that leftover lets the next boot retry.
+    await buildAppEventIndex(client);
+
+    // The retention purge's walk over deleted sessions (sessions/retention.ts),
+    // in exactly its keyset order, so each page is an index range read from the
+    // cursor rather than a scan and sort of every deleted session.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_sessions_deleted_walk",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
+         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+    );
+
+    // Per-session recency lookup. The sweeper's stuck-session reaper asks
+    // "has this session emitted an event lately", which without this index is a
+    // scan of the whole event table per candidate row.
+    //
+    // CONCURRENTLY so the first build does not take SHARE and block INSERT:
+    // the event-consumer writes this table for every Brain event, and a lock
+    // here is a conversation that stops producing tokens. Each statement in
+    // this function commits on its own, which is what CONCURRENTLY requires.
+    // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
+    // dropping only that leftover lets the next boot retry.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_session_recent",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
+    );
+
+    // The chat notices of saved memories, by memory id: deleting or undoing an entry removes the title from the
+    // notices that announced it (memory/service.ts, ERASE_NOTICE_TITLES_SQL). They are a sliver of this table, and
+    // without this index that update reads every event -- a sequential scan of the whole table, or of every event
+    // of the user's sessions, either of which outlives the request's statement timeout on a large deployment.
+    // Text, as `->>` returns it, so that no stored value can make the index expression raise on an insert.
+    // CONCURRENTLY and not fatal, for the reasons given above.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_memory_saved",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_memory_saved
+         ON claw_session_events ((data->>'memory_id')) WHERE event = 'memory_saved'`,
+    );
+
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_tasks_platform_facts_pending_v3",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
+         ON claw_tasks(
+           platform_facts_next_retry_at ASC NULLS FIRST,
+           completed_at ASC,
+           task_id ASC
+         )
+       WHERE status = 'failed'
+         AND failure_reason IN (
+           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
+           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
+           'sandbox_start_timeout'
+         )
+         AND platform_facts_resolved_at IS NULL`,
+    );
+    // The names this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because each version strictly widens the one
+    // before: identical key columns in identical order, and a failure-reason
+    // `IN` list that only grows (v2 added eight reasons and dropped
+    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
+    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
+    // indexes, and its predicate implies v3's, so a pod still running older code
+    // has its narrower scan served by v3 throughout a rolling upgrade rather
+    // than falling back to a sequential one.
+    //
+    // The retention rule below still holds for the indexes it names; what it
+    // refuses is an *unguarded* drop, and the guard is what these calls add.
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending_v2",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+
+    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
+    // statuses and ordered by the exact keyset cursor. The task id is the stable
+    // tiebreaker when one statement completes many rows at the same timestamp.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_tasks_terminal_completed_task_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
+         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
+       WHERE status IN ('completed','failed','cancelled')`,
+    );
+    // Older variants are intentionally retained during this rolling upgrade.
+    // The hazard is specifically an *unguarded* drop: the create above is
+    // issued through a wrapper that swallows a raised build, so a drop that
+    // merely follows it in program order can run after nothing was built and
+    // leave the route with no ordered index.
+    //
+    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
+    // retained -- it reads the replacement back from `pg_index` and drops only
+    // against a valid one -- and the platform-facts pair above has been moved
+    // onto it. This index and `idx_tasks_occupying` have not: each needs its
+    // own check that the newer predicate really does subsume the older, since
+    // the guard protects the ordering and not the claim that the replacement
+    // covers every row the old index did.
 }
 
 /** Row shapes from tools/plugins/resources (JSONB columns parsed). */
