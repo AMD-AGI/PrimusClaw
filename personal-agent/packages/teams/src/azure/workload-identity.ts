@@ -14,12 +14,11 @@
  * are never logged.
  */
 import { readFileSync } from "node:fs";
-import { silentLogger, type Clock, type Logger } from "@primusclaw/personal-agent";
+import { type Clock, type Logger, pyRstrip, silentLogger } from "@primusclaw/personal-agent";
 import { TokenError } from "../connector/errors.js";
 import { reasonOf } from "../connector/timer.js";
 import { loadAssertionKey } from "../connector/tokens/assertion.js";
 import { FederatedTokenProvider } from "../connector/tokens/federated.js";
-import { stripTrailing } from "../text/trim.js";
 
 /** An Azure SDK access token: the bearer token and when it expires (milliseconds since the epoch). */
 export interface AccessToken {
@@ -73,7 +72,7 @@ export function workerIdentityFromEnv(env: Readonly<Record<string, string | unde
   return {
     clientId: get(SETTINGS.clientId),
     tenantId: get(SETTINGS.tenantId),
-    issuer: stripTrailing(issuer, "/"),
+    issuer: pyRstrip(issuer, "/"),
     subject: get(SETTINGS.subject),
     keyFile: get(SETTINGS.keyFile),
   };

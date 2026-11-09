@@ -5,8 +5,7 @@
  * The Python built-ins the Bot Connector client relied on, with their semantics: `urllib.parse.quote`, `float(text)`,
  * `int(value)`, truthiness, and `str.rstrip("/")`.
  */
-import { pyStrip } from "@primusclaw/personal-agent";
-import { stripTrailing } from "../text/trim.js";
+import { pyRstrip, pyStrip } from "@primusclaw/personal-agent";
 
 const ALWAYS_SAFE = /[A-Za-z0-9_.\-~]/;
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
@@ -60,5 +59,5 @@ export function pyTruthy(value: unknown): boolean {
 
 /** `text.rstrip("/")`. */
 export function rstripSlash(text: string): string {
-  return stripTrailing(text, "/");
+  return pyRstrip(text, "/");
 }
