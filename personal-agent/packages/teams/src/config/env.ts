@@ -7,12 +7,11 @@
  * Azure identity (WORKER_IDENTITY_*), the install hint and the reply style (TEAMS_*). A value that is not one the worker
  * knows stops it at start: a typo must never quietly pick a path. Core's settings (Claw, store, limits) are read by core.
  */
-import { pyStrip } from "@primusclaw/personal-agent";
+import { pyRstrip, pyStrip } from "@primusclaw/personal-agent";
 
 import { workerIdentityFromEnv, type WorkerIdentity } from "../azure/workload-identity.js";
 import type { OutboundMode } from "../caps.js";
 import { DEFAULT_STYLE, STREAM_SCOPES, type Style } from "./style.js";
-import { stripTrailing } from "../text/trim.js";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -117,7 +116,7 @@ function oneOf<T extends string>(env: Env, name: string, allowed: readonly T[], 
 }
 
 function httpsIssuer(env: Env): string {
-  const issuer = stripTrailing(required(env, "BOT_ASSERTION_ISSUER"), "/");
+  const issuer = pyRstrip(required(env, "BOT_ASSERTION_ISSUER"), "/");
   if (!issuer.startsWith("https://")) {
     throw new TeamsConfigError(
       "BOT_ASSERTION_ISSUER must be the https issuer URL registered in the federated credential",
