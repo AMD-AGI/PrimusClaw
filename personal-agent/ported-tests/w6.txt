@@ -1,0 +1,12 @@
+# W6: the remote-agent domain (Python teams_agent/remote.py, remote_follow.py, connector_setup.py, connector_reasons.py; the test
+# fakes remote_fake.py and remote_world.py). Includes #454 (a terminal that does not ask; terminal_screen_unknown in words) and
+# #461 (/agents lists terminal sessions first), which are in the baseline. Work in progress: tests are added as they are ported.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+
+tests/test_connector_reasons.py::test_the_closed_set_is_all_known -> packages/core/test/remote/connector-reasons.test.ts::the closed set is all known
+tests/test_connector_reasons.py::test_every_code_is_said_in_words_not_as_the_code -> packages/core/test/remote/connector-reasons.test.ts::every code is said in words not as the code
+tests/test_connector_reasons.py::test_an_old_or_unknown_connector_is_told_to_upgrade_and_how_to_get_by -> packages/core/test/remote/connector-reasons.test.ts::an old or unknown connector is told to upgrade and how to get by
+tests/test_connector_reasons.py::test_a_fixed_connector_is_not_told_to_upgrade -> packages/core/test/remote/connector-reasons.test.ts::a fixed connector is not told to upgrade
+tests/test_connector_reasons.py::test_an_unknown_code_gets_a_generic_sentence_that_names_it_and_words_stay_as_they_are -> packages/core/test/remote/connector-reasons.test.ts::an unknown code gets a generic sentence that names it and words stay as they are
+tests/test_connector_reasons.py::test_ended_puts_the_lead_first_in_the_language -> packages/core/test/remote/connector-reasons.test.ts::ended puts the lead first in the language
+tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
