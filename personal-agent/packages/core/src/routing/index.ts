@@ -28,4 +28,3 @@ export * from "./onboarding.js";
 export * from "./router.js";
 export * from "./turn-start.js";
 export * from "./time.js";
-export * from "../commands/exact.js";

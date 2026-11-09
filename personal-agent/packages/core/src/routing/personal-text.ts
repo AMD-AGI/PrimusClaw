@@ -3,7 +3,6 @@
 
 import { naturalCommand } from "../capabilities/natural.js";
 import { sessionControl } from "../capabilities/sessions-words.js";
-import { exactCommand } from "../commands/exact.js";
 import { menuCommand, parseCommand } from "../commands/parse.js";
 import { hasCjk } from "../language/detect.js";
 import { routingText } from "../locales/routing.js";
@@ -283,11 +282,6 @@ export class PersonalText {
       files,
     });
     if (!sent && held) this.ctx.admission.dropLastHandoff(userId);
-  }
-
-  /** Whether a message goes the fast way (an exact command) rather than to the assistant that reads every message. */
-  exact(message: InboundMessage): boolean {
-    return exactCommand(message.text);
   }
 }
 
