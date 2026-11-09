@@ -24,6 +24,9 @@ function wrap(conversation: Conversation, overrides: Partial<Pick<Conversation, 
   return {
     ref: conversation.ref,
     edited: conversation.edited,
+    markSettled: (id) => {
+      conversation.markSettled(id);
+    },
     typing: () => conversation.typing(),
     send: overrides.send ?? ((m) => conversation.send(m)),
     post: (m) => conversation.post(m),

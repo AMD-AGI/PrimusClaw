@@ -15,7 +15,7 @@ import {
   type UserRef,
 } from "@primusclaw/personal-agent";
 
-import type { NoteFactory } from "../../src/routing/chat.js";
+import type { NoteFactory } from "../../src/routing/features.js";
 
 export const ALICE: UserRef = { id: "aad-a", channelUserId: "29:a", name: "Alice", email: "" };
 export const BOB: UserRef = { id: "aad-b", channelUserId: "29:b", name: "Bob", email: "bob@example.com" };
