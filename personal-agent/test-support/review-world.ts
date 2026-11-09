@@ -11,6 +11,8 @@ import {
   type Conversation,
   type InboundMessage,
   type InboundMention,
+  type IntentReader,
+  type RosterMember,
   type JsonObject,
   type ReviewStart,
   type StartReviewTurn,
@@ -126,6 +128,8 @@ export class Github {
     ["amd-agi/hyperloom", "AMD-AGI/Hyperloom"],
   ]);
   readonly reads: string[] = [];
+  /** What every api.github.com read answers instead (a rate limit, say); undefined: the reads above. */
+  reply: { status: number; body: unknown } | undefined;
 
   handle(url: string, form: Record<string, string>): Response {
     const path = new URL(url).pathname;
@@ -149,6 +153,7 @@ export class Github {
   api(url: string): Response {
     const parts = new URL(url).pathname.split("/");
     this.reads.push(new URL(url).pathname);
+    if (this.reply !== undefined) return Response.json(this.reply.body, { status: this.reply.status });
     if (parts.length === 4) {
       const full = this.repos.get(`${parts[2] ?? ""}/${parts[3] ?? ""}`.toLowerCase());
       return full ? Response.json({ full_name: full, private: false }) : Response.json({}, { status: 404 });
@@ -290,12 +295,21 @@ function recordingHost(
 }
 
 /** The review service with everything it talks to faked, as `test_github_review.world` builds it. */
-export function reviewWorld(owners: readonly string[] = ["AMD-AGI"]) {
+/** What a test sets up beyond the defaults: the groups' member lists, and the model that reads a request. */
+export interface WorldOptions {
+  readonly rosters?: Readonly<Record<string, readonly RosterMember[]>>;
+  readonly intent?: IntentReader;
+}
+
+export function reviewWorld(owners: readonly string[] = ["AMD-AGI"], options: WorldOptions = {}) {
   const { store, clock } = openTestStore({ clock: new FakeClock(Date.UTC(2026, 10, 9)) });
   const identity = new Identity();
   const github = new Github();
   const claw = new ReviewClaw();
-  const surface = new FakeSurface({ reachable: ["aad-a", "aad-b", "aad-c"] });
+  const surface = new FakeSurface({
+    reachable: ["aad-a", "aad-b", "aad-c"],
+    ...(options.rosters === undefined ? {} : { rosters: options.rosters }),
+  });
   const bound = new Set(["aad-a", "aad-b"]);
   const started: Started[] = [];
   const said = { onboard: 0, askLink: [] as string[], connect: [] as string[] };
@@ -320,7 +334,7 @@ export function reviewWorld(owners: readonly string[] = ["AMD-AGI"]) {
     }),
     device: new GithubDeviceFlow({ clientId: "cli-id", clock, fetch: fetchGithub }),
     pulls: new PublicPullReader(new GithubApi({ fetch: (input) => Promise.resolve(github.api(input)) }), silentLogger),
-    intent: undefined,
+    intent: options.intent,
     surface,
     exchange: {
       enabled: true,
