@@ -76,17 +76,15 @@ function hexEscape(source: string, i: number, context: EscapeContext): Escape {
   return { text: literal(String.fromCodePoint(parseInt(hex, 16)), context), length: 2 + digits };
 }
 
-/** `\0`, `\012`, `\101` (octal) and, outside a class, `\1`-`\99` (a group's text again). */
+/** `\0`, `\012`, `\101` (octal); `\1`-`\99` (a group's text again) is refused. */
 function digitEscape(source: string, i: number, context: EscapeContext): Escape {
   const rest = source.slice(i + 1);
   const octal = /^(?:0[0-7]{0,2}|[0-3][0-7]{2})/.exec(rest) ?? (context.inClass ? /^[0-7]{1,3}/.exec(rest) : null);
   if (octal)
     return { text: literal(String.fromCodePoint(parseInt(octal[0], 8)), context), length: 1 + octal[0].length };
-  const group = /^[1-9][0-9]?/.exec(rest);
-  if (!group || context.inClass) refuse(`the escape \\${rest.charAt(0)}`);
-  // JavaScript compares a group's text again with its own case folding, which keeps ı and İ apart from i
-  if (context.ignoreCase) refuse("a backreference under IGNORECASE");
-  return { text: `\\${group[0]}`, length: 1 + group[0].length };
+  // \1-\99 outside a class is a backreference: JavaScript matches one to a group that took no part as the empty
+  // string, where Python fails the match, and nothing in a JavaScript pattern can tell the two apart.
+  refuse(context.inClass ? `the escape \\${rest.charAt(0)}` : "a backreference");
 }
 
 /** A JavaScript property escape `\p{..}`/`\P{..}` (not Python syntax: accepted for hand-built patterns). */
