@@ -101,8 +101,11 @@ export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
  * worker-v8: v6 with a write the task asks for made when the worker reaches it, never first asked about in a report: the hold puts it
  * to the user on a card (G0 2026-11-07, nightly sa-eval-bot-2 cat-items-wr-001: the worker asked "Confirm I should push ... and open
  * the PR?" as a waiting question, so a user who had asked for the PR was asked again in words, and once more on the card after yes).
+ * worker-v10: v8 with a GitHub write no tool makes (a star) made with gh in the workspace, where the shell holds it for a card
+ * (`bash-approval-defaults.ts` in Brain), never reported failed for want of a tool (E232, nightly 2026-11-08 cat-github-edge-001: "star
+ * vllm" failed in 6 s with "no star tool; the sandbox token cannot go around the card", so the user got no card at all).
  */
-export const WORKER_PROMPT_VERSION = "worker-v8";
+export const WORKER_PROMPT_VERSION = "worker-v10";
 /**
  * worker-v7 (`CLAW_ASSISTANT_ROUTE_DISCIPLINE`, `discipline.ts`): v6 with a task that changed nothing outside the workspace (it found
  * something out, or it only made files or a written result it delivered) reported as an answer, which closes the item with nothing to
@@ -110,8 +113,9 @@ export const WORKER_PROMPT_VERSION = "worker-v8";
  * result.refs. Only an external change waits for Accept; an informational result completes by itself (super-agent polish plan Q2, decided
  * 2026-11-05; G0 2026-11-07: real-items-it-104 and real-general-it-114/119 showed Accept for a file the worker had delivered).
  * worker-v9: v7 with the write the task asks for made, not asked about first (as worker-v8).
+ * worker-v11: v9 with a GitHub write no tool makes made with gh in the workspace (as worker-v10).
  */
-export const WORKER_DISCIPLINE_PROMPT_VERSION = "worker-v9";
+export const WORKER_DISCIPLINE_PROMPT_VERSION = "worker-v11";
 
 /**
  * The longest `say` text (the API's `SAY_TEXT_MAX`): a channel shows a long one as up to three messages, whole. The norm is
@@ -486,6 +490,7 @@ ${WORKER_RESULT_KINDS}
 - report(kind="failed", summary) when the work cannot be done; say why.
 - Before a write the user approves (a comment, a review, a merge, a push, an issue, a message to someone), when the task also asked you to find things out (what a pull request changes, how many files, its CI, its open threads): first report(kind="progress", summary) with everything you found that answers what was asked, with the numbers, then make the write. The user is told that report first, then asked to approve the write, so they decide knowing what you found.
 - A write the task asks for (pushing your branch, opening a pull request, a comment, a merge, another write to another system) is made when you reach it, without asking first: each one that needs the user's approval is held and put to them on a card, and runs only when they approve it there. Never report(kind="waiting") or report(kind="blocked") with a question that only asks whether to make it (Confirm I should push and open the PR?): the user already asked for it, and would be asked twice. Ask only what the task leaves open (which repository, which branch, which of two plans). When you cannot make it (no GitHub login, no write access), report(kind="blocked") with what is missing, such as connecting GitHub with /github bind.
+- A GitHub write that none of your tools makes (starring a repository, a label, a release) is made in your workspace as the user, with one gh command that spells it out: gh api with its method and path written in the command (gh api -X PUT user/starred/<owner>/<repo>), or gh label or gh release. The shell holds such a command for the user's approval just as a tool's write is held, so that is how it is put to them on a card. Never build the call from a variable, a file or a script, and never make it with another program: a write the command does not spell out is not put to the user. Never report(kind="failed") or report(kind="blocked") only because no tool of yours makes the write.
 - report(kind="dropped", summary) when the work turns out not to be needed.
 summary is at most ${REPORT_SUMMARY_MAX} characters, except an answer's: an answer is given whole, up to ${REPORT_ANSWER_MAX} characters, never cut short. An answer longer than that goes into a file you deliver (below), with the gist in the summary. A report that is refused tells you why: fix it and report again.
 

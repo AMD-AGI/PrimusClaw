@@ -10,6 +10,7 @@
  *   P2  the router is told plain output reaches nobody, and the limit it is told is the limit the server enforces
  *   P3  the worker is told to report, to finish with a report, and to check before repeating an effect
  *   P3b the worker makes a write the task asks for and lets its hold ask the user; it never asks first in a report (both prompts)
+ *   P3c a GitHub write no tool makes (a star) is made with gh, whose shell hold asks the user; never failed for want of a tool
  *   P4  the work event that wakes the router begins with the marker the prompt names, and says what the router needs
  *   P5  the item list the router sees is one line per item and says "none" when there are none
  *   P6  what workers and models wrote reaches the router only as quoted data inside the untrusted block, under its preamble
@@ -101,6 +102,23 @@ test("P3b the worker makes the write the task asks for and lets the hold ask; it
     assert.match(prompt, /Never report\(kind="waiting"\) or report\(kind="blocked"\) with a question that only asks whether to make it/);
     assert.match(prompt, /Ask only what the task leaves open/);
     assert.match(prompt, /When you cannot make it \(no GitHub login, no write access\), report\(kind="blocked"\) with what is missing, such as connecting GitHub with \/github bind/);
+  }
+});
+
+// E232 2026-11-08 (nightly sa-eval-bot-2, cat-github-edge-001): asked to star vllm, the worker reported failed in 6 s ("no star tool;
+// the sandbox token cannot go around the card"), so the user got no card. A GitHub write no tool makes goes through gh, which the shell
+// holds for a card (Brain's bash-approval-defaults.ts; its engine test holds `gh api -X PUT user/starred/...`).
+test("P3c a GitHub write no tool makes is made with gh, whose hold asks the user; never failed for want of a tool (both prompts)", () => {
+  for (const prompt of [WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT]) {
+    assert.match(prompt, /A GitHub write that none of your tools makes \(starring a repository, a label, a release\) is made in your workspace as the user, with one gh command that spells it out/);
+    assert.match(prompt, /gh api with its method and path written in the command \(gh api -X PUT user\/starred\/<owner>\/<repo>\), or gh label or gh release/);
+    assert.match(prompt, /The shell holds such a command for the user's approval just as a tool's write is held, so that is how it is put to them on a card/);
+    // Only what the default bash rules hold is invited: a GraphQL mutation built from a variable runs unheld (codex r1 on #551).
+    assert.match(prompt, /Never build the call from a variable, a file or a script, and never make it with another program/);
+    assert.doesNotMatch(prompt, /another GitHub API call/);
+    assert.match(prompt, /Never report\(kind="failed"\) or report\(kind="blocked"\) only because no tool of yours makes the write/);
+    // The missing login stays a blocked report: the new line never overrides it.
+    assert.match(prompt, /When you cannot make it \(no GitHub login, no write access\), report\(kind="blocked"\)/);
   }
 });
 
