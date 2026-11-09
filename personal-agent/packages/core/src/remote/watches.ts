@@ -117,7 +117,7 @@ export class Watches {
         w.sessionId,
         credential,
         (s) => s.started,
-        this.ctx.settings.watchSeconds?.start ?? WATCH_SECONDS,
+        this.seconds("start"),
         signal,
       );
       const state = this.state.attached(w.chatKey);
@@ -224,14 +224,7 @@ export class Watches {
       return remoteAgentText.in(this.state.lang(w.chatKey)).switchFailed;
     }
     const credential = (): Promise<string> => credentialOf(w.key, w.provider);
-    const step = await this.watch(
-      w.chatKey,
-      w.sessionId,
-      credential,
-      modeAnswer,
-      this.ctx.settings.watchSeconds?.mode ?? MODE_WATCH_SECONDS,
-      signal,
-    );
+    const step = await this.watch(w.chatKey, w.sessionId, credential, modeAnswer, this.seconds("mode"), signal);
     if (!step?.rejected) return null;
     const connectorId = this.state.attached(w.chatKey)?.connectorId ?? "";
     const why = await this.ended.said(
@@ -255,14 +248,7 @@ export class Watches {
   ): Promise<void> {
     try {
       const credential = (): Promise<string> => credentialOf(w.key, w.provider);
-      const step = await this.watch(
-        chatKey,
-        sessionId,
-        credential,
-        modeAnswer,
-        this.ctx.settings.watchSeconds?.mode ?? MODE_WATCH_SECONDS,
-        signal,
-      );
+      const step = await this.watch(chatKey, sessionId, credential, modeAnswer, this.seconds("mode"), signal);
       const lang = this.state.lang(chatKey);
       const words = remoteAgentText.in(lang);
       const shown = neutral(mode, MODE_ID_MAX);
