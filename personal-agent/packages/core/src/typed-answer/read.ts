@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { typedAnswerText } from "../locales/typed-answer.js";
-import { pyInt } from "../text/py-regex.js";
+import { decimalInt as pyInt } from "../text/py-text.js";
 import { ALL, ALLOW, CLAUSE_END, DENY, FILLER, PULL, QUESTION, WEAK, WORD, has } from "./patterns.js";
 import { withoutModes } from "./mode.js";
 

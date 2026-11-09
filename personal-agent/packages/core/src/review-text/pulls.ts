@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import type { PullRef } from "../claw/model.js";
-import { PY_D as D, pyInt } from "../text/py-regex.js";
+import { PY_D as D } from "../text/py-word.js";
+import { decimalInt as pyInt } from "../text/py-text.js";
 
 /** A pull request's link. */
 export const PR_URL = new RegExp(

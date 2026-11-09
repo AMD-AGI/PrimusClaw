@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-regex.js";
+import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-word.js";
 
 /**
  * The words of a typed answer, with Python's `re` semantics (`../text/py-regex.ts`): every pattern is global and

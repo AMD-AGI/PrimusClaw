@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { pyCasefold, pyIsAlnum } from "../text/py-regex.js";
+import { pyIsAlnum } from "../text/py-word.js";
+import { pyCasefold } from "../text/py-text.js";
 
 /**
  * How a person's name is found in what someone wrote (github_review.py's name reading, shared by the review request

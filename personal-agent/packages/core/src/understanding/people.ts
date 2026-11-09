@@ -4,8 +4,8 @@
 import { REVIEW_MERGE, asksReviewOnly } from "../review-text/asks.js";
 import { flat, memberKeys, namedIn, textOf, tokens, writtenIn, type PersonRecord } from "../review-text/names.js";
 import { MODEL_FIELD, PR_SHORT, PR_URL, pullsIn } from "../review-text/pulls.js";
-import { isAsciiAlpha, pyCasefold } from "../text/py-regex.js";
-import { cpLength } from "../text/py-text.js";
+import { isAsciiAlpha } from "../text/py-word.js";
+import { cpLength, pyCasefold } from "../text/py-text.js";
 import { similarity } from "../text/sequence-matcher.js";
 import { CONTEXT_ITEMS_MAX, CONTEXT_TEXT_MAX, clip } from "./limits.js";
 

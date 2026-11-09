@@ -9,7 +9,6 @@ import {
   isApiKey,
   parseStartedReviews,
   pyStr,
-  pyStrOr,
   pyStrip,
   pyTruthy,
   cpHead,
@@ -163,7 +162,7 @@ function refusal(status: number, text: string): ClawError {
   if (!isObject(payload) || typeof payload["error"] !== "string") return new ClawError(status, head(text));
   const message = payload["message"];
   const data = payload["data"];
-  const said = pyStrOr(message);
+  const said = pyStr(message);
   return new ReviewsRefused(status, payload["error"], said, isObject(data) ? data : {});
 }
 

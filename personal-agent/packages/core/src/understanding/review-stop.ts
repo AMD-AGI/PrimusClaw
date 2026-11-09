@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 import { pullsIn } from "../review-text/pulls.js";
-import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W, pyInt } from "../text/py-regex.js";
+import { PY_B_END as E, PY_B_START as B, PY_D as D, PY_W_CHARS as W } from "../text/py-word.js";
+import { decimalInt as pyInt } from "../text/py-text.js";
 
 /**
  * A stop is read only when the message says nothing but that: once the pull requests are taken out, what is left must

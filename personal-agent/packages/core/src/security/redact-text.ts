@@ -18,6 +18,13 @@ export const MASK = "[hidden]";
 export const NOTE = "Some sensitive-looking values were hidden. Ask me in a 1:1 chat if you need them.";
 
 const B64 = "[A-Za-z0-9+/=_\\-]";
+/** Under Python's `re.I`, `i` and `I` also match the dotted and dotless i (`İ`, `ı`); JavaScript's `iu` does not. */
+const DOTTED_I = "\u0130\u0131";
+/** `B64` and the letters `[A-Za-z]` as an `re.I` pattern reads them. */
+const B64_I = `[A-Za-z${DOTTED_I}0-9+/=_\\-]`;
+const ALPHA_I = `[A-Za-z${DOTTED_I}]`;
+/** The letter i in a word an `re.I` pattern matches. */
+const I = `[iI${DOTTED_I}]`;
 
 /** A rule: the pattern (global, Unicode) and whether only its last group is masked (else the whole match). */
 interface Rule {
@@ -33,7 +40,7 @@ const RULES: readonly Rule[] = [
   // A PEM private key block, to its end or, cut off, to the end of the text (Python `re.S` and `\Z`).
   rule("-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\\s\\S]*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$)"),
   rule(`${B_START}(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`),
-  rule(`${B_START}Bearer${S}+[A-Za-z0-9._~+/=\\-]{16,}`, "i"),
+  rule(`${B_START}Bearer${S}+[A-Za-z${DOTTED_I}0-9._~+/=\\-]{16,}`, "i"),
   rule(`${B_START}ak-[A-Za-z0-9_\\-]{16,}`), // platform API keys
   rule(`${B_START}sk-[A-Za-z0-9_\\-]{16,}`),
   rule(`${B_START}(?:AKIA|ASIA)[A-Z0-9]{16}${B_END}`),
@@ -45,8 +52,8 @@ const RULES: readonly Rule[] = [
   rule(`${B_START}eyJ[A-Za-z0-9_\\-]{5,}\\.[A-Za-z0-9_\\-]{5,}\\.[A-Za-z0-9_\\-]{5,}`), // JWT
   // A long opaque value right after a word like token/secret/key/password (NAME=value, "name": "value", name is value).
   rule(
-    `(?:token|secret|api[_\\-]?key|password|passwd|${B_START}key)(?:${W}|-)*["']?${S}*` +
-      `(?::|=|${B_START}is${B_END})${S}*["']?(?=${B64}*\\d)(?=${B64}*[A-Za-z])(${B64}{32,})`,
+    `(?:token|secret|ap${I}[_\\-]?key|password|passwd|${B_START}key)(?:${W}|-)*["']?${S}*` +
+      `(?::|=|${B_START}${I}s${B_END})${S}*["']?(?=${B64_I}*\\p{Nd})(?=${B64_I}*${ALPHA_I})(${B64_I}{32,})`,
     "i",
     true,
   ),
@@ -71,11 +78,24 @@ export function redactText(text: string): { text: string; masked: boolean } {
 // In a log line only: the value of a URL query parameter that is a credential by its name (SharePoint's `tempauth`, an
 // Azure SAS `sig`, an OAuth `access_token` or `code`, a signed S3 or GCS link). The value can have any shape, so the name
 // decides. Not applied to chat messages, where a link the person shares is their own.
-const URL_SECRET_PARAM = new RegExp(
-  "([?&](?:tempauth|access_token|id_token|refresh_token|token|code|sig|signature|x-amz-signature|x-amz-credential" +
-    `|x-amz-security-token|x-goog-signature|x-goog-credential)=)([^&#${S.slice(1, -1)}"'<>]+)`,
-  "giu",
-);
+const URL_SECRET_NAMES = [
+  "tempauth",
+  "access_token",
+  "id_token",
+  "refresh_token",
+  "token",
+  "code",
+  "sig",
+  "signature",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "x-goog-signature",
+  "x-goog-credential",
+]
+  .join("|")
+  .replaceAll("i", I);
+const URL_SECRET_PARAM = new RegExp(`([?&](?:${URL_SECRET_NAMES})=)([^&#${S.slice(1, -1)}"'<>]+)`, "giu");
 
 /** A log line with credential shapes masked, and the values of credential-named URL query parameters. */
 export function redactLogLine(text: string): string {

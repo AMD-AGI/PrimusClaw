@@ -1,9 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { pyStrip } from "../text/py-text.js";
+import { pyStr, pyStrip } from "../text/py-text.js";
 import { isObject } from "./lenient.js";
-import { pyStrOr } from "./py-value.js";
 import type { JsonObject } from "../json.js";
 import type { SseEvent } from "./model.js";
 
@@ -25,7 +24,7 @@ export function parseSseBlock(block: string): SseEvent | null {
     return null;
   }
   if (!isObject(parsed)) return null;
-  const fallback = pyStrOr(parsed["type"]);
+  const fallback = pyStr(parsed["type"]);
   return { id, name: name !== "" && name !== "message" ? name : fallback, data: parsed as JsonObject };
 }
 
