@@ -28,6 +28,14 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `CLAW_MEMORY_DEFAULT_ON` (default `false`): whether long-term memory is on for a user who has never turned it on or off (no
+  row in `claw_user_memory_prefs`). A user's own choice still wins either way, so one who turned memory off keeps it off, and
+  `CLAW_MEMORY_ENABLED` is still the deployment-wide switch: with it off, the default turns no one on, and `POST`/`PUT
+  /v1/users/:userId/memories` now refuse `memory_disabled` for everyone, a user whose own row says on included (before, such a
+  user could store entries that nothing would read).
+  With the default nothing changes: memory stays opt-in. The session
+  access, `GET /v1/users/:userId/memory-settings`, the REST writes and the assistant's memory all read the preference through
+  the one function that applies it.
 - `pr_summary` on `gh_review_submit` and `gh_pr_merge`: the review session's one sentence of what the pull request does, read from
   the diff, in the language of its answer (one line, credentials masked, cut at 80 characters when Chinese and 160 otherwise). It is
   part of the review's own output, not a model call of its own: the tools' answers carry it next to their `status`, the audit keeps it,

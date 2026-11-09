@@ -79,7 +79,8 @@ describe("errorKind", () => {
   it("says which way Claw was not reached", () => {
     assert.equal(new ClawUnreachable("network", "x").kind, "network");
     assert.match(new ClawUnreachable("timeout", "x").message, /in time/);
-    assert.match(new ClawUnreachable("network", "x").message, /not reached/);
+    assert.match(new ClawUnreachable("network", "x").message, /dropped the connection/);
+    assert.match(new ClawUnreachable("connect", "x").message, /could not be connected to/);
   });
 });
 

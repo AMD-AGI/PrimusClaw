@@ -506,7 +506,7 @@ test("K4 a takeover where the old Brain's app wrote final during the grace keeps
 test("K5 a lost sandbox is a restart of the same run: the new Brain makes one new sandbox, not two", async () => {
   const h = harness();
   const wl = await toRunning(h);
-  h.world.killWorkload(wl, "terminal");
+  h.world.killWorkload(wl, "terminal", { reason: "sandbox_container_failed" });
   const b = h.newRunner();
   await b.reconcile();
   assert.equal(h.world.rec.state, "provisioning");

@@ -15,15 +15,17 @@
  */
 export const PY_SPACE = "\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
 const SPACE_RUN = new RegExp(`[${PY_SPACE}]+`, "u");
-const SPACE_ONE = new RegExp(`^[${PY_SPACE}]$`, "u");
-const LEADING = new RegExp(`^[${PY_SPACE}]+`, "u");
-const TRAILING = new RegExp(`[${PY_SPACE}]+$`, "u");
+/** The same set, as code points (what `isPySpace` looks up: one hash lookup per character). */
+const SPACE_POINTS: ReadonlySet<number> = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003,
+  0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
 /** What `str.isprintable()` is false for: other (Cc, Cf, Cs, Co, Cn) and separators (Zl, Zp, Zs), except the space. */
 const UNPRINTABLE = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$/u;
 
 /** `ch.isspace()` for one code point. */
 export function isPySpace(ch: string): boolean {
-  return SPACE_ONE.test(ch);
+  return ch.length === 1 && SPACE_POINTS.has(ch.charCodeAt(0));
 }
 
 /** `ch.isprintable()` for one code point. */
@@ -41,12 +43,27 @@ export function squashSpaces(text: string): string {
   return pySplit(text).join(" ");
 }
 
-function charSet(chars: string): ReadonlySet<string> {
-  return new Set(Array.from(chars));
+/**
+ * The bounds of `text` once the code units `strip` says are white space are taken off its ends, scanned from each end
+ * (linear; a regular expression anchored at the end is quadratic on a long text with white space inside).
+ */
+function bounds(text: string, strip: (unit: string) => boolean, left: boolean, right: boolean): [number, number] {
+  let start = 0;
+  let end = text.length;
+  while (left && start < end && strip(text.charAt(start))) start += 1;
+  while (right && end > start && strip(text.charAt(end - 1))) end -= 1;
+  return [start, end];
 }
 
-function stripEnds(text: string, chars: string, left: boolean, right: boolean): string {
-  const set = charSet(chars);
+/** Python's white space is in the BMP, so a code unit test is a code point test (a surrogate is never space). */
+function trimSpace(text: string, left: boolean, right: boolean): string {
+  const [start, end] = bounds(text, isPySpace, left, right);
+  return text.slice(start, end);
+}
+
+/** `chars` as a set of code points; ends are compared by code point, so an astral `chars` strips whole pairs. */
+function trimChars(text: string, chars: string, left: boolean, right: boolean): string {
+  const set = new Set(Array.from(chars));
   const points = Array.from(text);
   let start = 0;
   let end = points.length;
@@ -57,18 +74,17 @@ function stripEnds(text: string, chars: string, left: boolean, right: boolean): 
 
 /** `text.strip()`, or `text.strip(chars)`. */
 export function pyStrip(text: string, chars?: string): string {
-  if (chars !== undefined) return stripEnds(text, chars, true, true);
-  return text.replace(LEADING, "").replace(TRAILING, "");
+  return chars === undefined ? trimSpace(text, true, true) : trimChars(text, chars, true, true);
 }
 
 /** `text.lstrip()`, or `text.lstrip(chars)`. */
 export function pyLstrip(text: string, chars?: string): string {
-  return chars === undefined ? text.replace(LEADING, "") : stripEnds(text, chars, true, false);
+  return chars === undefined ? trimSpace(text, true, false) : trimChars(text, chars, true, false);
 }
 
 /** `text.rstrip()`, or `text.rstrip(chars)`. */
 export function pyRstrip(text: string, chars?: string): string {
-  return chars === undefined ? text.replace(TRAILING, "") : stripEnds(text, chars, false, true);
+  return chars === undefined ? trimSpace(text, false, true) : trimChars(text, chars, false, true);
 }
 
 /**
