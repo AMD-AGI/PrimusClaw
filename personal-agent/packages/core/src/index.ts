@@ -9,6 +9,7 @@
  * (`ports/`) or a plugin (`plugins/`), implemented by the runtime package, a channel package or a deployment.
  */
 export * from "./errors.js";
+export * from "./feedback/index.js";
 export * from "./json.js";
 export * from "./locales/index.js";
 export * from "./plugins/index.js";
@@ -17,3 +18,10 @@ export * from "./protocol.js";
 export * from "./result.js";
 export * from "./text/py-text.js";
 export * from "./validate.js";
+export * from "./claw/credential.js";
+export * from "./claw/errors.js";
+export * from "./claw/model.js";
+export * from "./claw/remote.js";
+export * from "./config/settings.js";
+export * from "./observability/security-events.js";
+export * from "./public-error/public-errors.js";

@@ -1,0 +1,9 @@
+# W8: feedback (feedback.py, agent.py's feedback entry, render.py's feedback cards, activity.py's thumbs), observe
+# (observe.py) and /brief. Python ids are internal-repo paths; parametrized tests are listed by their base function.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+teams/tests/test_feedback_reporter.py::test_the_title_suffix_and_its_clipping -> packages/core/test/feedback/issue-text.test.ts::the title suffix and its clipping
+teams/tests/test_feedback_reporter.py::test_the_reporter_line -> packages/core/test/feedback/issue-text.test.ts::the reporter line
+teams/tests/test_feedback.py::test_title_takes_the_first_60_characters_of_the_text_on_one_line_then_the_reporter -> packages/core/test/feedback/issue-text.test.ts::the title takes the first 60 characters of the text on one line then the reporter
+teams/tests/test_feedback.py::test_turn_status_is_finished_failed_stopped_stuck_or_running -> packages/core/test/feedback/scene.test.ts::turn status is finished failed stopped stuck or running
+teams/tests/test_feedback.py::test_only_the_last_two_turns_are_listed -> packages/core/test/feedback/scene.test.ts::only the last two turns are listed
+teams/tests/test_feedback.py::test_nothing_the_scene_reads_can_carry_a_message_body_or_an_error_text -> packages/core/test/feedback/scene.test.ts::nothing the scene reads can carry a message body or an error text

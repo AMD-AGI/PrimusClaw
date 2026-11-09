@@ -10,6 +10,8 @@ import {
   fixed1,
   isPyPrintable,
   pyJsonDumps,
+  pyLstrip,
+  pyStr,
   pySplit,
   pyStrip,
   squashSpaces,
@@ -58,4 +60,30 @@ test("json dumps uses Python's separators and keeps non-ASCII", () => {
     pyJsonDumps(() => 1),
     "null",
   );
+});
+
+test('lstrip and str(value or "") are Python\'s', () => {
+  assert.equal(pyLstrip("\x1c a "), "a ");
+  assert.equal(pyStr("x"), "x");
+  assert.equal(pyStr(""), "");
+  assert.equal(pyStr(undefined), "");
+  assert.equal(pyStr(null), "");
+  assert.equal(pyStr(false), "");
+  assert.equal(pyStr(true), "True");
+  assert.equal(pyStr(0), "");
+  assert.equal(pyStr(Number.NaN), "");
+  assert.equal(pyStr(12), "12");
+  assert.equal(pyStr(0n), "");
+  assert.equal(pyStr(7n), "7");
+  assert.equal(pyStr({ a: 1 }), "");
+});
+
+test("json dumps with indent and sorted keys is json.dumps(indent=1, sort_keys=True)", () => {
+  const value = { b: [1, { "\u{1f600}": null, "\uffff": true }], a: {}, c: [], d: undefined, é: "中" };
+  assert.equal(
+    pyJsonDumps(value, { indent: 1, sortKeys: true }),
+    '{\n "a": {},\n "b": [\n  1,\n  {\n   "\uffff": true,\n   "\u{1f600}": null\n  }\n ],\n "c": [],\n "é": "中"\n}',
+  );
+  assert.equal(pyJsonDumps({ b: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "b": 1}');
+  assert.equal(pyJsonDumps({ ab: 1, a: 2 }, { sortKeys: true }), '{"a": 2, "ab": 1}');
 });
