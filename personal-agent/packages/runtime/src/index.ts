@@ -8,3 +8,7 @@
 export * from "./crypto-random.js";
 export * from "./line-logger.js";
 export * from "./system-clock.js";
+export * from "./claw/index.js";
+export * from "./metrics/index.js";
+export * from "./exchange/index.js";
+export * from "./config/index.js";
