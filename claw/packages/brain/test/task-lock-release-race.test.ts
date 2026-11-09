@@ -24,11 +24,17 @@
 //   X4 a later acquisition in this process: never deleted (INV-13)
 //   X5 another holder's lock from the start: never deleted (INV-13)
 //   X6 an entry that keeps moving: the release gives up after a bounded number of tries
+//   X7 a late release by a run whose lock was force-released leaves the next run's lock alone
+//   X8 ...the same through the real Stop path (interruptRunsAt's force release)
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type { ExecuteRequest } from "@claw/protocol";
 import type { KV } from "nats";
 
-import { acquireTaskLock, bindTaskLockKv, refreshTaskLock, releaseTaskLock } from "../src/tasks/lock.js";
+import { activeAbort, forgetRunAddresses, registerRunAddressesFor } from "../src/tasks/abort-registry.js";
+import { interruptRunsAt } from "../src/tasks/interrupt.js";
+
+import { acquireTaskLock, bindLockRun, bindTaskLockKv, refreshTaskLock, releaseTaskLock } from "../src/tasks/lock.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -207,4 +213,73 @@ test("X6 an entry that keeps moving: the release gives up after a bounded number
   assert.ok(b.deletes.length >= 2 && b.deletes.length <= 8, `bounded: ${b.deletes.length} tries`);
   assert.ok(b.deletes.every((d) => !d.ok));
   assert.deepEqual(b.held(), ours);
+});
+
+test("X7 a late release by a run whose lock was force-released leaves the next run's lock alone", async () => {
+  const b = bucket();
+  bindTaskLockKv(b.kv);
+
+  // Run A takes the key; a Stop it ignores force-releases its lock
+  // (interrupt.ts), and run B of the same key -- same process, same holder id
+  // -- takes it next.
+  const runA = new AbortController();
+  assert.equal(await acquireTaskLock("ws.late", 101), true);
+  bindLockRun("ws.late", runA);
+  await releaseTaskLock("ws.late", runA);
+  assert.equal(b.current()!.operation, "DEL");
+
+  const runB = new AbortController();
+  assert.equal(await acquireTaskLock("ws.late", 102), true);
+  bindLockRun("ws.late", runB);
+  const bLock = b.held();
+
+  // A's pending work finally returns and its finishRun releases again.
+  await releaseTaskLock("ws.late", runA);
+
+  assert.deepEqual(b.held(), bLock, "B's lock is not A's to give back");
+  assert.equal(await refreshTaskLock("ws.late"), "renewed", "and B's local record survived A's release");
+
+  await releaseTaskLock("ws.late", runB);
+  assert.equal(b.current()!.operation, "DEL", "B's own release still frees it");
+});
+
+test("X8 the same through the real Stop path: interruptRunsAt's force release, then the run's own late release", async (t) => {
+  const b = bucket();
+  bindTaskLockKv(b.kv);
+  const key = "ws.kws_stop";
+  const request = { task_id: "chat-a", session_id: "sess-stop", files_workspace_id: "kws_stop" } as unknown as ExecuteRequest;
+
+  // What dispatch does for run A.
+  assert.equal(await acquireTaskLock(key, 201), true);
+  const runA = new AbortController();
+  bindLockRun(key, runA);
+  activeAbort.set(key, runA);
+  registerRunAddressesFor(key, request);
+  try {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    assert.deepEqual(interruptRunsAt("sess-stop", 30_000), [key]);
+    // A ignores the abort; the force release fires.
+    t.mock.timers.tick(30_000);
+    t.mock.timers.reset();
+    for (let i = 0; i < 20 && b.current()!.operation !== "DEL"; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(b.current()!.operation, "DEL", "the Stop freed the key");
+
+    // Run B of the key starts.
+    assert.equal(await acquireTaskLock(key, 202), true);
+    const runB = new AbortController();
+    bindLockRun(key, runB);
+    activeAbort.set(key, runB);
+    const bLock = b.held();
+
+    // A finally returns and finishRun releases with A's controller.
+    await releaseTaskLock(key, runA);
+    assert.deepEqual(b.held(), bLock, "B's lock survives A's late release");
+    assert.equal(await refreshTaskLock(key), "renewed");
+
+    await releaseTaskLock(key, runB);
+    assert.equal(b.current()!.operation, "DEL");
+  } finally {
+    activeAbort.delete(key);
+    forgetRunAddresses(key);
+  }
 });

@@ -124,6 +124,23 @@ const lockProvenAt = new Map<string, number>();
 // these stand down at the self-fence; any other lock keeps the proof deadline.
 const lockFenceable = new Set<string>();
 
+// Run -> the acquisition it took (LockValue.acq), recorded by the dispatcher
+// right after acquireTaskLock succeeds (`bindLockRun`). A run's release has to
+// name the acquisition it is giving back rather than read it from the per-key
+// map above: once a run's lock has been force-released (interrupt.ts) a later
+// run of the key may hold it, and the per-key map then describes that later
+// run. Keyed weakly by the run's AbortController, so nothing has to clear it.
+const runAcquisitions = new WeakMap<object, string>();
+
+/**
+ * Remember which acquisition `run` holds under `lockKey`. Call synchronously
+ * after a successful acquireTaskLock, before anything else can touch the key.
+ */
+export function bindLockRun(lockKey: string, run: object): void {
+  const acq = lockAcquisitions.get(lockKey);
+  if (acq !== undefined) runAcquisitions.set(run, acq);
+}
+
 /** Drop all local memory of a lock we no longer hold. */
 function forgetLock(lockKey: string): void {
   lockRevisions.delete(lockKey);
@@ -768,11 +785,22 @@ const LOCK_RELEASE_ATTEMPTS = 4;
  * The local record is dropped before the first read, not after the delete, so
  * that no renewal of this acquisition writes from here on: an in-flight renewal
  * that answers now finds it gone and neither records nor adopts its write.
+ *
+ * `run` is the object the dispatcher bound the acquisition to (`bindLockRun`,
+ * the run's AbortController). Callers that have it pass it: without it the
+ * release can only assume the key's current local acquisition is the one being
+ * given back.
  */
-export async function releaseTaskLock(lockKey: string): Promise<void> {
+export async function releaseTaskLock(lockKey: string, run?: object): Promise<void> {
   const key = `lock.${lockKey}`;
-  const acq = lockAcquisitions.get(lockKey);
-  forgetLock(lockKey);
+  const local = lockAcquisitions.get(lockKey);
+  // The acquisition being given back: the run's own when the caller names its
+  // run (a late release of a run whose lock was force-released must not be
+  // mistaken for the release of whichever run holds the key now), else
+  // whatever this process holds under the key.
+  const acq = (run !== undefined ? runAcquisitions.get(run) : undefined) ?? local;
+  // Only this acquisition's local record is ours to drop; a later run's stays.
+  if (local === undefined || local === acq) forgetLock(lockKey);
 
   for (let attempt = 1; ; attempt++) {
     let entry;
@@ -802,7 +830,7 @@ export async function releaseTaskLock(lockKey: string): Promise<void> {
       return;
     }
 
-    const otherAcquisition = acq !== undefined && value?.acq !== undefined && value.acq !== acq;
+    const otherAcquisition = acq !== undefined && value?.acq !== acq;
     if (value?.holderId !== BRAIN_HOLDER_ID || otherAcquisition) {
       // INV-13 protection: the lock now belongs to someone else (e.g. our
       // event loop hung past the bucket TTL and a new pod grabbed it, or a
