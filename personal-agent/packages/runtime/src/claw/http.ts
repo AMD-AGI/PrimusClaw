@@ -49,10 +49,7 @@ export function segment(value: string | number): string {
 
 /** Python's `urllib.parse.quote(value, safe="")`: everything but letters, digits and `_.-~` percent-encoded (UTF-8). */
 export function pyQuote(value: string): string {
-  return encodeURIComponent(value).replace(
-    /[!'()*]/g,
-    (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
-  );
+  return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 /** The bearer header of a credential. */
@@ -71,7 +68,8 @@ export function requireToken(key: ClawCredential, what: string): void {
  */
 export function modelKeyHeader(key: ClawCredential, modelKey: string | undefined): Record<string, string> {
   if (modelKey === undefined || modelKey === "") return {};
-  if (isApiKey(key)) throw new CredentialMisuse("a model key goes next to the exchanged token, never next to an API key");
+  if (isApiKey(key))
+    throw new CredentialMisuse("a model key goes next to the exchanged token, never next to an API key");
   return { "x-api-key": modelKey };
 }
 

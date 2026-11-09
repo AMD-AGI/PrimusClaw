@@ -5,6 +5,8 @@ import {
   ClawAnswerInvalid,
   cpHead,
   messageContent,
+  pyStr,
+  pyTruthy,
   type ClawCredential,
   type ClawSessionsPort,
   type JsonObject,
@@ -55,11 +57,14 @@ export class HttpSessions implements ClawSessionsPort {
       name: cpHead(session.text, 50),
       mode: "claw",
       config: sessionConfig(session),
-      ...(withMessage ? { message: await this.textMessage(key, session.text, acting) } : {}),
+      ...(withMessage ? { message: await this.#textMessage(key, session.text, acting) } : {}),
     };
     const model = session.model !== undefined && session.model !== "" ? session.model : this.defaults.model;
     const sent = model === "" ? body : { ...body, model };
-    const data = dataOf(await this.http.json({ method: "POST", path: "/v1/sessions", key, body: sent, headers }), "a session");
+    const data = dataOf(
+      await this.http.json({ method: "POST", path: "/v1/sessions", key, body: sent, headers }),
+      "a session",
+    );
     const sessionId = data["session_id"];
     const message = data["message"];
     const messageId = withMessage && isObject(message) ? message["message_id"] : "";
@@ -77,7 +82,11 @@ export class HttpSessions implements ClawSessionsPort {
   ): Promise<{ paths: string[]; refused: string[] }> {
     const form = new FormData();
     for (const file of files) {
-      form.append("file", new Blob([file.content], { type: file.mediaType }), `${folder}/${file.name}`);
+      form.append(
+        "file",
+        new Blob([Uint8Array.from(file.content)], { type: file.mediaType }),
+        `${folder}/${file.name}`,
+      );
     }
     const path = `/v1/sessions/${segment(sessionId)}/upload?ttl_days=${String(UPLOAD_TTL_DAYS)}`;
     const out = objectOf(await this.http.json({ method: "POST", path, key, timeoutMs: 120_000, form }), "an upload");
@@ -93,19 +102,26 @@ export class HttpSessions implements ClawSessionsPort {
     await this.http.json({ method: "PATCH", path: `/v1/sessions/${segment(sessionId)}`, key, body: { model } });
   }
 
-  async sendMessage(key: ClawCredential, sessionId: string, text: string, options: SendOptions = {}): Promise<string | null> {
+  async sendMessage(
+    key: ClawCredential,
+    sessionId: string,
+    text: string,
+    options: SendOptions = {},
+  ): Promise<string | null> {
     const headers = modelKeyHeader(key, options.modelKey);
-    const body = await this.textMessage(key, text, options.acting ?? false);
+    const body = await this.#textMessage(key, text, options.acting ?? false);
     const path = `/v1/sessions/${segment(sessionId)}/messages`;
     return messageIdOf(await this.http.json({ method: "POST", path, key, body, headers }));
   }
 
   async turn(key: ClawCredential, sessionId: string): Promise<{ running: boolean; messageId: string | null }> {
-    const data = dataOf(await this.http.json({ method: "GET", path: `/v1/sessions/${segment(sessionId)}`, key }), "a session");
+    const data = dataOf(
+      await this.http.json({ method: "GET", path: `/v1/sessions/${segment(sessionId)}`, key }),
+      "a session",
+    );
     const running = data["agent_status"] === "running";
     const gate = data["agent_gate_message_id"];
-    const said = gate !== undefined && gate !== null && gate !== "" && gate !== 0 && gate !== false;
-    return { running, messageId: running && said ? String(gate) : null };
+    return { running, messageId: running && pyTruthy(gate) ? pyStr(gate) : null };
   }
 
   async events(
@@ -120,7 +136,8 @@ export class HttpSessions implements ClawSessionsPort {
       path += `&tail=${String(Math.trunc(tail))}`;
     }
     const request = { method: "GET", path, key };
-    const answer = maxBytes === undefined ? await this.http.json(request) : await this.http.boundedJson(request, maxBytes);
+    const answer =
+      maxBytes === undefined ? await this.http.json(request) : await this.http.boundedJson(request, maxBytes);
     const rows = rowsOf(answer, "replay");
     return tail === undefined ? rows : rows.slice(-tail);
   }
@@ -142,7 +159,7 @@ export class HttpSessions implements ClawSessionsPort {
   }
 
   async interrupt(key: ClawCredential, sessionId: string): Promise<void> {
-    await this.say(key, sessionId, { messageType: "interrupt" }, false);
+    await this.#say(key, sessionId, { messageType: "interrupt" }, false);
   }
 
   async decide(
@@ -153,7 +170,7 @@ export class HttpSessions implements ClawSessionsPort {
     options: { acting?: boolean } = {},
   ): Promise<void> {
     const body = { messageType: "decision", extData: { tool_use_id: toolUseId, action } };
-    await this.say(key, sessionId, body, options.acting ?? false);
+    await this.#say(key, sessionId, body, options.acting ?? false);
   }
 
   async answer(
@@ -165,10 +182,16 @@ export class HttpSessions implements ClawSessionsPort {
     options: { acting?: boolean } = {},
   ): Promise<void> {
     const body = { messageType: "answer", extData: { tool_use_id: toolUseId, answers, skipped } };
-    await this.say(key, sessionId, body, options.acting ?? false);
+    await this.#say(key, sessionId, body, options.acting ?? false);
   }
 
-  async vote(key: ClawCredential, sessionId: string, messageId: string, vote: "up" | "down", reason?: string): Promise<void> {
+  async vote(
+    key: ClawCredential,
+    sessionId: string,
+    messageId: string,
+    vote: "up" | "down",
+    reason?: string,
+  ): Promise<void> {
     const body = { message_id: messageId, vote, ...(reason === undefined || reason === "" ? {} : { reason }) };
     await this.http.json({ method: "PUT", path: `/v1/sessions/${segment(sessionId)}/feedback`, key, body });
   }
@@ -177,7 +200,7 @@ export class HttpSessions implements ClawSessionsPort {
     return sseEvents(this.http, `/v1/chat/sessions/${segment(sessionId)}/messages`, key, after, signal);
   }
 
-  private async say(key: ClawCredential, sessionId: string, body: JsonObject, acting: boolean): Promise<void> {
+  async #say(key: ClawCredential, sessionId: string, body: JsonObject, acting: boolean): Promise<void> {
     if (acting) requireToken(key, "an answer in a session that acts as a user");
     await this.http.json({ method: "POST", path: `/v1/sessions/${segment(sessionId)}/messages`, key, body });
   }
@@ -187,7 +210,7 @@ export class HttpSessions implements ClawSessionsPort {
    * text alone: no plugin (its tools act with the requester's own key, and such a session reads a stranger's pull
    * request) and nothing appended.
    */
-  private async textMessage(key: ClawCredential, text: string, acting: boolean): Promise<JsonObject> {
+  async #textMessage(key: ClawCredential, text: string, acting: boolean): Promise<JsonObject> {
     if (acting) return { content: text, messageType: "text" };
     const { rule, pluginId } = this.defaults;
     const ruleText = rule === null ? "" : await rule.text(key);
@@ -217,4 +240,3 @@ function sessionConfig(session: NewSession): JsonObject {
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-

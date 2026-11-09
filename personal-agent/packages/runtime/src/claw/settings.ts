@@ -6,6 +6,9 @@ import {
   ClawError,
   cpHead,
   notAClawId,
+  pyStr,
+  pyStrOr,
+  pyTruthy,
   type ClawCredential,
   type ClawMergeConfirmationsPort,
   type ClawNotificationsPort,
@@ -26,27 +29,43 @@ export class HttpSettings implements ClawSettingsPort {
   constructor(private readonly http: ClawHttp) {}
 
   async memory(key: ClawCredential, limit = 5): Promise<MemoryState> {
-    const settings = dataOf(await this.http.json({ method: "GET", path: "/v1/users/me/memory-settings", key }), "memory");
+    const settings = dataOf(
+      await this.http.json({ method: "GET", path: "/v1/users/me/memory-settings", key }),
+      "memory",
+    );
     const items = rowsOf(await this.http.json({ method: "GET", path: "/v1/users/me/memories", key }), "memories");
-    const texts = items.filter((m) => m["category"] !== "user_profile").map((m) => ("content" in m ? pyStr(m["content"]) : ""));
-    return { enabled: Boolean(settings["enabled"]), available: availableOf(settings), items: texts.slice(0, limit) };
+    const texts = items
+      .filter((m) => m["category"] !== "user_profile")
+      .map((m) => ("content" in m ? pyStr(m["content"]) : ""));
+    return {
+      enabled: Boolean(settings["enabled"]),
+      available: "available" in settings ? pyTruthy(settings["available"]) : true,
+      items: texts.slice(0, limit),
+    };
   }
 
   async setMemory(key: ClawCredential, enabled: boolean): Promise<{ enabled: boolean; available: boolean }> {
-    const answer = await this.http.json({ method: "PUT", path: "/v1/users/me/memory-settings", key, body: { enabled } });
+    const answer = await this.http.json({
+      method: "PUT",
+      path: "/v1/users/me/memory-settings",
+      key,
+      body: { enabled },
+    });
     const data = dataOf(answer, "memory");
-    return { enabled: Boolean(data["enabled"]), available: availableOf(data) };
+    return { enabled: Boolean(data["enabled"]), available: "available" in data ? pyTruthy(data["available"]) : true };
   }
 
   async models(key: ClawCredential): Promise<string[]> {
     const out = await this.http.json({ method: "GET", path: "/v1/models", key });
     const data = isObject(out) ? out["data"] : undefined;
     if (!Array.isArray(data)) throw new ClawError(502, "not a model list");
-    return data.flatMap((m: unknown) => (isObject(m) && typeof m["id"] === "string" && m["id"] !== "" ? [m["id"]] : []));
+    return data.flatMap((m: unknown) =>
+      isObject(m) && typeof m["id"] === "string" && m["id"] !== "" ? [m["id"]] : [],
+    );
   }
 
   async assistantSettings(token: ClawCredential): Promise<JsonObject | null> {
-    const out = await this.optional(token, "/v1/assistant/settings");
+    const out = await this.#optional(token, "/v1/assistant/settings");
     if (out === null) return null;
     const data = out["data"];
     if (!isObject(data)) throw new ClawError(502, "not the assistant's settings");
@@ -57,29 +76,34 @@ export class HttpSettings implements ClawSettingsPort {
     const out = await this.http.json({ method: "GET", path: "/v1/github-review/settings", key: token });
     const data: unknown = isObject(out) ? ("data" in out ? out["data"] : out) : {};
     const mode = isObject(data) ? data["review_mode"] : undefined;
-    return textOr(mode);
+    return pyStrOr(mode);
   }
 
   async setReviewMode(token: ClawCredential, mode: string): Promise<void> {
-    await this.http.json({ method: "PUT", path: "/v1/github-review/settings", key: token, body: { review_mode: mode } });
+    await this.http.json({
+      method: "PUT",
+      path: "/v1/github-review/settings",
+      key: token,
+      body: { review_mode: mode },
+    });
   }
 
   async githubConnection(token: ClawCredential): Promise<GithubConnection | null> {
-    const out = await this.optional(token, "/v1/github/connection");
+    const out = await this.#optional(token, "/v1/github/connection");
     if (out === null) return null;
     const data = out["data"];
     if (!isObject(data)) throw new ClawError(502, "not a GitHub connection");
     const reads = data["reads_with"];
     return {
       readsWith: reads === "env" || reads === "binding" ? reads : "",
-      login: cpHead(textOr(data["login"]), 100),
-      missing: cpHead(textOr(data["missing"]), 20),
+      login: cpHead(pyStrOr(data["login"]), 100),
+      missing: cpHead(pyStrOr(data["missing"]), 20),
       bindingReads: data["binding_reads"] === true,
     };
   }
 
   /** A GET that a Claw without the route answers 404 (null); other failures are ClawError. */
-  private async optional(token: ClawCredential, path: string): Promise<Record<string, unknown> | null> {
+  async #optional(token: ClawCredential, path: string): Promise<Record<string, unknown> | null> {
     const response = await this.http.send({ method: "GET", path, key: token });
     const text = await readText(response, path);
     if (response.status === 404) return null;
@@ -98,7 +122,7 @@ export class HttpNotifications implements ClawNotificationsPort {
 
   async list(key: ClawCredential): Promise<ClawSubscription[]> {
     const path = "/v1/notification-subscriptions";
-    return rowsOf(await this.http.json({ method: "GET", path, key }), "the subscriptions") as ClawSubscription[];
+    return rowsOf(await this.http.json({ method: "GET", path, key }), "the subscriptions");
   }
 
   async create(
@@ -113,7 +137,7 @@ export class HttpNotifications implements ClawNotificationsPort {
       ...(sources.length === 0 ? {} : { sources }),
     };
     const path = "/v1/notification-subscriptions";
-    return dataOf(await this.http.json({ method: "POST", path, key, body }), "a subscription") as ClawSubscription;
+    return dataOf(await this.http.json({ method: "POST", path, key, body }), "a subscription");
   }
 
   async updateTypes(
@@ -129,7 +153,7 @@ export class HttpNotifications implements ClawNotificationsPort {
       ...(enable ? { enabled: true } : {}),
     };
     const path = `/v1/notification-subscriptions/${segment(subscriptionId)}`;
-    return dataOf(await this.http.json({ method: "PATCH", path, key, body }), "a subscription") as ClawSubscription;
+    return dataOf(await this.http.json({ method: "PATCH", path, key, body }), "a subscription");
   }
 
   async delete(key: ClawCredential, subscriptionId: string): Promise<void> {
@@ -181,35 +205,12 @@ export class HttpMergeConfirmations implements ClawMergeConfirmationsPort {
     requireToken(token, "a merge decision");
     if (confirmationId === "." || confirmationId === "..") throw notAClawId();
     const path = `/v1/github-review/confirmations/${pyQuote(confirmationId)}/decision`;
-    return dataOrSelf(objectOf(await this.http.json({ method: "POST", path, key: token, body: { decision } }), "a decision"));
+    return dataOrSelf(
+      objectOf(await this.http.json({ method: "POST", path, key: token, body: { decision } }), "a decision"),
+    );
   }
-}
-
-/** Python's `str(value or "")`: a falsy value is "". */
-function textOr(value: unknown): string {
-  return value === undefined || value === null || value === "" || value === 0 || value === false ? "" : pyStr(value);
-}
-
-/** `settings.get("available", True)` as a truth value: absent is true, anything else its Python truth. */
-function availableOf(settings: Record<string, unknown>): boolean {
-  if (!("available" in settings)) return true;
-  const value = settings["available"];
-  if (Array.isArray(value)) return value.length > 0;
-  if (isObject(value)) return Object.keys(value).length > 0;
-  return Boolean(value);
-}
-
-/** Python's `str()` of a JSON value read as text. */
-function pyStr(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return String(value);
-  if (value === true) return "True";
-  if (value === false) return "False";
-  if (value === null) return "None";
-  return JSON.stringify(value);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-

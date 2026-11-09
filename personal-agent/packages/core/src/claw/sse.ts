@@ -1,7 +1,10 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { pyStrip } from "../text/py-text.js";
 import { isObject } from "./lenient.js";
+import { pyStrOr } from "./py-value.js";
+import type { JsonObject } from "../json.js";
 import type { SseEvent } from "./model.js";
 
 /** One SSE frame ("id:/event:/data:" lines) to an event; null for comments and anything whose data is not a JSON object. */
@@ -10,9 +13,9 @@ export function parseSseBlock(block: string): SseEvent | null {
   let name = "";
   const data: string[] = [];
   for (const line of block.split("\n")) {
-    if (line.startsWith("id:")) id = line.slice(3).trim();
-    else if (line.startsWith("event:")) name = line.slice(6).trim();
-    else if (line.startsWith("data:")) data.push(line.slice(5).trim());
+    if (line.startsWith("id:")) id = pyStrip(line.slice(3));
+    else if (line.startsWith("event:")) name = pyStrip(line.slice(6));
+    else if (line.startsWith("data:")) data.push(pyStrip(line.slice(5)));
   }
   if (data.length === 0) return null;
   let parsed: unknown;
@@ -22,9 +25,8 @@ export function parseSseBlock(block: string): SseEvent | null {
     return null;
   }
   if (!isObject(parsed)) return null;
-  const type = parsed["type"];
-  const fallback = type === undefined || type === null || type === "" || type === false || type === 0 ? "" : String(type);
-  return { id, name: name !== "" && name !== "message" ? name : fallback, data: parsed };
+  const fallback = pyStrOr(parsed["type"]);
+  return { id, name: name !== "" && name !== "message" ? name : fallback, data: parsed as JsonObject };
 }
 
 /**

@@ -8,7 +8,10 @@ import {
   ReviewsRefused,
   isApiKey,
   parseStartedReviews,
+  pyStr,
+  pyStrOr,
   pyStrip,
+  pyTruthy,
   cpHead,
   type AssistantMessageOptions,
   type ClawAssistantPort,
@@ -33,10 +36,13 @@ export class HttpAssistant implements ClawAssistantPort {
   constructor(private readonly http: ClawHttp) {}
 
   async session(key: ClawCredential): Promise<{ sessionId: string; created: boolean }> {
-    const data = dataOf(await this.http.json({ method: "POST", path: "/v1/assistant", key, body: {} }), "the assistant");
+    const data = dataOf(
+      await this.http.json({ method: "POST", path: "/v1/assistant", key, body: {} }),
+      "the assistant",
+    );
     const sessionId = data["session_id"];
     if (sessionId === undefined || sessionId === null) throw new ClawAnswerInvalid("the assistant without its session");
-    return { sessionId: String(sessionId as string), created: Boolean(data["created"]) };
+    return { sessionId: pyStr(sessionId), created: pyTruthy(data["created"]) };
   }
 
   async send(
@@ -54,7 +60,9 @@ export class HttpAssistant implements ClawAssistantPort {
     };
     const path = `/v1/sessions/${segment(sessionId)}/messages`;
     const headers = modelKeyHeader(key, modelKey);
-    return messageIdOf(await this.http.json({ method: "POST", path, key, body, headers, timeoutMs: ASSISTANT_SEND_TIMEOUT_MS }));
+    return messageIdOf(
+      await this.http.json({ method: "POST", path, key, body, headers, timeoutMs: ASSISTANT_SEND_TIMEOUT_MS }),
+    );
   }
 
   async brief(key: ClawCredential, lang: string, timezone: string): Promise<JsonObject> {
@@ -73,7 +81,9 @@ export class HttpAssistant implements ClawAssistantPort {
     requireToken(token, "a review for someone");
     const { actingToken = "", actingKey = "" } = request;
     if (actingToken !== "" && (isApiKey(actingToken) || !isApiKey(actingKey))) {
-      throw new CredentialMisuse("a review asked of someone else carries their exchanged token and their own linked key");
+      throw new CredentialMisuse(
+        "a review asked of someone else carries their exchanged token and their own linked key",
+      );
     }
     const asked = actingToken !== "";
     const headers = asked
@@ -97,7 +107,10 @@ export class HttpAssistant implements ClawAssistantPort {
 
   async observe(key: ClawCredential, scope: string, content: string, messageId: string): Promise<JsonObject> {
     const body = { scope, content, message_id: messageId };
-    return dataOf(await this.http.json({ method: "POST", path: "/v1/assistant/observations", key, body }), "an observation");
+    return dataOf(
+      await this.http.json({ method: "POST", path: "/v1/assistant/observations", key, body }),
+      "an observation",
+    );
   }
 
   async observations(key: ClawCredential, scope: string, limit = 20): Promise<JsonObject[]> {
@@ -117,7 +130,16 @@ export class HttpAssistant implements ClawAssistantPort {
 
 /** The body of a request for reviews. */
 function reviewsBody(request: StartReviews): JsonObject {
-  const { prs, actingAs, actingAsName, reviewOnly, model, actingToken = "", requesterNote = "", handoffId = "" } = request;
+  const {
+    prs,
+    actingAs,
+    actingAsName,
+    reviewOnly,
+    model,
+    actingToken = "",
+    requesterNote = "",
+    handoffId = "",
+  } = request;
   const note = pyStrip(requesterNote);
   return {
     prs: prs.map(({ pull, message }) => ({
@@ -141,7 +163,7 @@ function refusal(status: number, text: string): ClawError {
   if (!isObject(payload) || typeof payload["error"] !== "string") return new ClawError(status, head(text));
   const message = payload["message"];
   const data = payload["data"];
-  const said = message === undefined || message === null || message === "" ? "" : String(message as string);
+  const said = pyStrOr(message);
   return new ReviewsRefused(status, payload["error"], said, isObject(data) ? data : {});
 }
 

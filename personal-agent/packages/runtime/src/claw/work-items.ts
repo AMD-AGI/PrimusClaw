@@ -46,31 +46,31 @@ export class HttpWorkItems implements ClawWorkItemsPort {
   }
 
   async get(key: ClawCredential, itemId: string): Promise<WorkItem> {
-    const item = parseWorkItem(await this.data(key, itemId));
+    const item = parseWorkItem(await this.#data(key, itemId));
     if (item === null) throw new ClawAnswerInvalid("a work item without an id");
     return item;
   }
 
   async requesterView(key: ClawCredential, itemId: string): Promise<AskerView> {
-    const view = parseRequesterView(await this.data(key, itemId), itemId);
+    const view = parseRequesterView(await this.#data(key, itemId), itemId);
     if (view === null) throw new ClawAnswerInvalid("an answer without the asker's view of the item");
     return view;
   }
 
   accept(key: ClawCredential, itemId: string, version: number): Promise<Decision> {
-    return this.decide(key, itemId, "accept", { version });
+    return this.#decide(key, itemId, "accept", { version });
   }
 
   retry(key: ClawCredential, itemId: string): Promise<Decision> {
-    return this.decide(key, itemId, "retry", {});
+    return this.#decide(key, itemId, "retry", {});
   }
 
   stop(key: ClawCredential, itemId: string): Promise<Decision> {
-    return this.decide(key, itemId, "stop", {});
+    return this.#decide(key, itemId, "stop", {});
   }
 
   async pulls(key: ClawCredential, itemId: string): Promise<{ item: WorkItem; pulls: string[] }> {
-    const data = await this.data(key, itemId);
+    const data = await this.#data(key, itemId);
     const item = parseWorkItem(data);
     if (item === null) throw new ClawAnswerInvalid("a work item without an id");
     return { item, pulls: reportedPulls(data) };
@@ -92,12 +92,15 @@ export class HttpWorkItems implements ClawWorkItemsPort {
     return dataOf(await this.http.json({ method: "DELETE", path, key }), "a watch");
   }
 
-  private async data(key: ClawCredential, itemId: string): Promise<unknown> {
-    return anyDataOf(await this.http.json({ method: "GET", path: `/v1/work-items/${segment(itemId)}`, key }), "an item");
+  async #data(key: ClawCredential, itemId: string): Promise<unknown> {
+    return anyDataOf(
+      await this.http.json({ method: "GET", path: `/v1/work-items/${segment(itemId)}`, key }),
+      "an item",
+    );
   }
 
   /** An accept, stop or retry; a 409 says why not and carries the item as it is now. */
-  private async decide(key: ClawCredential, itemId: string, action: string, body: JsonObject): Promise<Decision> {
+  async #decide(key: ClawCredential, itemId: string, action: string, body: JsonObject): Promise<Decision> {
     const path = `/v1/work-items/${segment(itemId)}/${action}`;
     const response = await this.http.send({ method: "POST", path, key, body });
     const text = await readText(response, path);

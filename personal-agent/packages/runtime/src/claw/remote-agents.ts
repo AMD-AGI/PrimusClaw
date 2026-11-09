@@ -32,19 +32,27 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   ) {}
 
   async setup(key: ClawCredential): Promise<RemoteSetup> {
-    return dataOf(await this.call("GET", "/setup", key), "the remote setup");
+    return dataOf(await this.#call("GET", "/setup", key), "the remote setup");
   }
 
   async connectors(key: ClawCredential): Promise<RemoteConnector[]> {
-    return read(remoteConnectorsSchema, anyDataOf(await this.call("GET", "/connectors", key), "connectors"), "connectors");
+    return read(
+      remoteConnectorsSchema,
+      anyDataOf(await this.#call("GET", "/connectors", key), "connectors"),
+      "connectors",
+    );
   }
 
   async pair(key: ClawCredential): Promise<RemotePairing> {
-    return read(remotePairingSchema, anyDataOf(await this.call("POST", "/pairings", key, {}), "a pairing"), "a pairing");
+    return read(
+      remotePairingSchema,
+      anyDataOf(await this.#call("POST", "/pairings", key, {}), "a pairing"),
+      "a pairing",
+    );
   }
 
   async revoke(key: ClawCredential, connectorId: string): Promise<void> {
-    await this.call("DELETE", `/connectors/${segment(connectorId)}`, key);
+    await this.#call("DELETE", `/connectors/${segment(connectorId)}`, key);
   }
 
   async createSession(key: ClawCredential, session: NewRemoteSession): Promise<RemoteSession> {
@@ -57,15 +65,19 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
       ...(resumeRef === "" ? {} : { resume_ref: resumeRef }),
       ...(takeover && resumeRef !== "" ? { takeover: true } : {}),
     };
-    return read(remoteSessionSchema, anyDataOf(await this.call("POST", "/sessions", key, body), "a session"), "a session");
+    return read(
+      remoteSessionSchema,
+      anyDataOf(await this.#call("POST", "/sessions", key, body), "a session"),
+      "a session",
+    );
   }
 
   async sessions(key: ClawCredential): Promise<RemoteSession[]> {
-    return read(remoteSessionsSchema, anyDataOf(await this.call("GET", "/sessions", key), "sessions"), "sessions");
+    return read(remoteSessionsSchema, anyDataOf(await this.#call("GET", "/sessions", key), "sessions"), "sessions");
   }
 
   async session(key: ClawCredential, sessionId: string): Promise<RemoteSession> {
-    const answer = await this.call("GET", `/sessions/${segment(sessionId)}`, key);
+    const answer = await this.#call("GET", `/sessions/${segment(sessionId)}`, key);
     return read(remoteSessionSchema, anyDataOf(answer, "a session"), "a session");
   }
 
@@ -76,18 +88,23 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
     idempotencyKey?: string,
   ): Promise<JsonObject> {
     const headers = idempotencyKey === undefined || idempotencyKey === "" ? {} : { "Idempotency-Key": idempotencyKey };
-    const answer = await this.call("POST", `/sessions/${segment(sessionId)}/commands`, key, body, headers);
+    const answer = await this.#call("POST", `/sessions/${segment(sessionId)}/commands`, key, body, headers);
     return dataOf(answer, "a command");
   }
 
   async decide(key: ClawCredential, sessionId: string, actionId: string, optionId: string): Promise<JsonObject> {
     const body = { action_id: actionId, option_id: optionId };
-    return dataOf(await this.call("POST", `/sessions/${segment(sessionId)}/decisions`, key, body), "a decision");
+    return dataOf(await this.#call("POST", `/sessions/${segment(sessionId)}/decisions`, key, body), "a decision");
   }
 
   async events(key: ClawCredential, sessionId: string, after?: string, limit = 1000): Promise<RemoteEventRow[]> {
-    const query = `?mode=replay&limit=${String(Math.trunc(limit))}` + (after === undefined || after === "" ? "" : `&after=${pyQuote(after)}`);
-    const rows = anyDataOf(await this.call("GET", `/sessions/${segment(sessionId)}/events${query}`, key), "remote replay");
+    const query =
+      `?mode=replay&limit=${String(Math.trunc(limit))}` +
+      (after === undefined || after === "" ? "" : `&after=${pyQuote(after)}`);
+    const rows = anyDataOf(
+      await this.#call("GET", `/sessions/${segment(sessionId)}/events${query}`, key),
+      "remote replay",
+    );
     if (!Array.isArray(rows)) throw new ClawAnswerInvalid("remote replay is not a list");
     return remoteEventRowsSchema.parse(rows);
   }
@@ -96,7 +113,7 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
     return sseEvents(this.http, `/v1/remote-agents/sessions/${segment(sessionId)}/events`, key, after, signal);
   }
 
-  private call(
+  #call(
     method: string,
     path: string,
     key: ClawCredential,

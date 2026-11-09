@@ -46,7 +46,12 @@ export async function* sseEvents(
   }
 }
 
-async function* readFrames(response: Response, watchdog: Watchdog, idleMs: number, path: string): AsyncGenerator<SseEvent> {
+async function* readFrames(
+  response: Response,
+  watchdog: Watchdog,
+  idleMs: number,
+  path: string,
+): AsyncGenerator<SseEvent> {
   const frames = new SseFrames();
   const decoder = new TextDecoder();
   const reader = response.body?.getReader();

@@ -3,6 +3,7 @@
 
 import { ClawAnswerInvalid } from "./errors.js";
 import { isObject, someText, wholeNumber } from "./lenient.js";
+import { pyTruthy } from "./py-value.js";
 import type { PullRef, ReviewStart } from "./model.js";
 
 /** `{owner, repo, number}` as Claw wrote it, or null. */
@@ -28,28 +29,25 @@ function heldOf(raw: Record<string, unknown>): boolean | null {
 /** The limit that was full when Claw queued the item ("queued" when it did not say which; "" it started). */
 function queuedOf(raw: Record<string, unknown>): string {
   const queued = raw["queued"];
-  if (!isTruthy(queued)) return "";
+  if (!pyTruthy(queued)) return "";
   const reason = isObject(queued) ? queued["reason"] : undefined;
   return typeof reason === "string" && reason !== "" ? reason : "queued";
 }
 
-/** Python's truth of a JSON value. */
-function isTruthy(value: unknown): boolean {
-  if (Array.isArray(value)) return value.length > 0;
-  if (isObject(value)) return Object.keys(value).length > 0;
-  return Boolean(value);
+/** The review's session: required when it is followed; "" when it is someone else's and Claw gave none. */
+function sessionOf(row: Record<string, unknown>, followed: boolean): string | null {
+  const sessionId = row["session_id"];
+  if (!followed && (sessionId === undefined || sessionId === null)) return "";
+  if (typeof sessionId !== "string" || (followed && sessionId === "")) return null;
+  return sessionId;
 }
 
 function readOne(raw: unknown, followed: boolean): ReviewStart {
   const row = isObject(raw) ? raw : {};
   const target = targetOf(row["pr"]);
   const itemId = row["item_id"];
-  let sessionId = row["session_id"];
-  if (!followed && (sessionId === undefined || sessionId === null)) sessionId = "";
-  if (target === null || typeof sessionId !== "string" || (followed && sessionId === "")) {
-    throw new ClawAnswerInvalid("a review item without its pull request, item or session");
-  }
-  if (typeof itemId !== "string" || itemId === "") {
+  const sessionId = sessionOf(row, followed);
+  if (target === null || sessionId === null || typeof itemId !== "string" || itemId === "") {
     throw new ClawAnswerInvalid("a review item without its pull request, item or session");
   }
   const { message_id: messageId, fell_back_from: fellBack, ignored } = row;
