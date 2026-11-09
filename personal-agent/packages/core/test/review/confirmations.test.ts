@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { ClawUnreachable } from "../../src/index.js";
 import { ALICE, CONV, reviewWorld } from "../../../../test-support/review-world.js";
 import {
   ClawError,
@@ -239,3 +240,59 @@ for (const [name, changes] of [
     assert.equal(`${card?.repo ?? ""}#${String(card?.number)}`, "AMD-AGI/Hyperloom#12");
   });
 }
+
+test("when claw cannot be reached the card comes back and nothing was decided", async () => {
+  const world = await held();
+  world.claw.decision = new ClawUnreachable("timeout", "decision");
+  const [settled = NOTHING] = await press(world, "allow");
+  assert.ok(
+    settled.text.includes("I could not reach PrimusClaw. Please press a button again in a moment.") && settled.buttons,
+    settled.text,
+  );
+  assert.equal(row(world)?.state, "pending");
+});
+
+for (const status of [409, 410]) {
+  test(`a merge claw no longer holds says nothing was merged (${String(status)})`, async () => {
+    const world = await held();
+    world.claw.decision = new ClawError(status);
+    const [settled = NOTHING] = await press(world, "allow");
+    assert.ok(settled.text.includes("This confirmation is no longer active, so nothing was merged."), settled.text);
+    assert.equal(row(world)?.state, "done");
+  });
+}
+
+test("an error claw names no reason for keeps the card usable", async () => {
+  const world = await held();
+  world.claw.decision = new ClawError(500);
+  const [settled = NOTHING] = await press(world, "allow");
+  assert.ok(
+    settled.text.includes("PrimusClaw did not accept the answer (error 500).") && settled.buttons,
+    settled.text,
+  );
+  assert.equal(row(world)?.state, "pending");
+});
+
+test("a retry claw gives no reason for still says the confirmation is open", async () => {
+  const world = await held();
+  world.claw.decision = { status: "retry" };
+  const [settled = NOTHING] = await press(world, "allow");
+  assert.ok(
+    settled.text.includes("could not try the merge just now, and the confirmation is still open"),
+    settled.text,
+  );
+  assert.equal(row(world)?.state, "pending");
+});
+
+test("a press that names no confirmation is no longer active", async () => {
+  const world = await held();
+  const [settled = NOTHING] = await press(world, "allow", undefined, "");
+  assert.equal(settled.text, "That choice is no longer active.");
+  assert.deepEqual(decisions(world), []);
+});
+
+test("a confirmation whose reasons and checks are not what claw says is still one card", async () => {
+  const world = await held({ reasons: "touches CI", checks: null, title: 7, author: null, head_sha: null });
+  const [card] = cards(world, "personal:aad-b");
+  assert.deepEqual([card?.reasons, card?.title, card?.author, card?.headSha], [[], "7", "", ""]); // (as Python reads str(x or ""))
+});

@@ -180,7 +180,8 @@ export class ReviewClaw {
   /** What `startReviews` answers: 404 (a Claw without items) unless a test sets the items. */
   starts: ((token: string, request: Record<string, unknown>) => ReviewStart[]) | undefined;
   confirmations: JsonObject[] = [];
-  decision: JsonObject | ClawError = { status: "merged", merge_sha: "0123456789abcdef" };
+  /** What deciding a held write answers; an Error: the call fails with it. */
+  decision: JsonObject | Error = { status: "merged", merge_sha: "0123456789abcdef" };
   connection: JsonObject | null = null;
   /** Refusals by pull request ("owner/repo#n", lower case): [status, error, data]. */
   refuse = new Map<string, [number, string, Record<string, unknown>]>();
@@ -245,7 +246,7 @@ export class ReviewClaw {
         },
         decide: (token: string, id: string, decision: string) => {
           this.calls.push(["decide", token, id, decision]);
-          return this.decision instanceof ClawError ? Promise.reject(this.decision) : Promise.resolve(this.decision);
+          return this.decision instanceof Error ? Promise.reject(this.decision) : Promise.resolve(this.decision);
         },
       },
       workItems: {
