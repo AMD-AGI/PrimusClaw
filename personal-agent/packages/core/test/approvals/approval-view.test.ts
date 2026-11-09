@@ -329,3 +329,24 @@ it("answer lang prefers what was said then the client then the texts", () => {
   assert.equal(answerLang("", "en-US", "中文"), "en");
   assert.equal(answerLang("", "", "中文"), "zh");
 });
+
+it("an mcp name is read as the shortest server and the rest without a line break", async () => {
+  const { mcpParts } = await import("../../src/approvals/approval-view.js");
+  assert.deepEqual(mcpParts("mcp__a___b"), ["a", "_b"]);
+  assert.deepEqual(mcpParts("mcp_____x"), ["_", "x"]);
+  assert.deepEqual(mcpParts("mcp__a____"), ["a", "__"]);
+  assert.equal(mcpParts("mcp__ab__"), undefined);
+  assert.equal(mcpParts("mcp__a__b\nc"), undefined);
+  assert.equal(mcpParts("bash"), undefined);
+  assert.equal(humanizeTool("_bash_"), "bash");
+  const started = Date.now();
+  assert.ok(humanizeTool(`mcp__${"_".repeat(50000)}`).endsWith(" (_)"));
+  assert.ok(Date.now() - started < 2000);
+});
+
+it("a long run of separators reads in linear time", () => {
+  const started = Date.now();
+  assert.equal(writtenLang(`${"!".repeat(100000)} fix the test`), "en");
+  assert.equal(writtenLang("x".repeat(50000) + "1"), undefined);
+  assert.ok(Date.now() - started < 2000);
+});

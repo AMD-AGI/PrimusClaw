@@ -8,7 +8,7 @@
  */
 
 import type { Lang } from "../locales/lang.js";
-import { pyStrip } from "../text/py-text.js";
+import { isPySpace, pyStrip } from "../text/py-text.js";
 
 export type { Lang };
 
@@ -18,8 +18,10 @@ export function hasCjk(text: unknown): boolean {
   return CJK.test(asText(text));
 }
 
-/** What is not prose, whatever language it is in: links, code, words with a digit or a separator in them. */
-const NOT_PROSE = /https?:\/\/\S+|`[^`]*`|\S*(?:[/#@\\_:=\d]|[A-Za-z][.-][A-Za-z])\S*/g;
+/** A separator that makes a word a name rather than prose (`owner/repo`, `#228`, `a@b`, a path, a time, `k=v`). */
+const SEPARATORS = new Set(["/", "#", "@", "\\", "_", ":", "="]);
+const DIGIT = /^\p{Nd}$/u;
+const ASCII_LETTER = /^[A-Za-z]$/;
 const EN_WORD = /[A-Za-z]+(?:'[A-Za-z]+)?/g;
 const EN_GLUE = new Set(
   `a an the is are was were be been am do does did not no to of in on at for from with by about and or but if
@@ -40,7 +42,7 @@ install upgrade revert rebase compare describe clean set send start stop try dra
  */
 export function writtenLang(text: unknown): Lang | undefined {
   if (hasCjk(text)) return "zh";
-  const written = asText(text).replace(NOT_PROSE, " ").match(EN_WORD) ?? [];
+  const written = withoutNotProse(asText(text)).match(EN_WORD) ?? [];
   const words = written.map((w) => w.toLowerCase());
   if (words.length < 3) return undefined;
   const first = words[0] ?? "";
@@ -70,11 +72,86 @@ export function answerLang(said: string, clientLocale: string, ...texts: unknown
 export function asText(value: unknown): string {
   if (value === null || value === undefined || value === false || value === 0 || value === "") return "";
   if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return pyStr(value);
+  if (typeof value === "number") return String(value);
+  if (value === true) return "True";
   return JSON.stringify(value);
 }
 
-function pyStr(value: number | boolean): string {
-  if (typeof value === "boolean") return value ? "True" : "False";
-  return String(value);
+/** Whether `run` (a run of non-space characters) holds what makes it a name: a digit, a separator, or `x.y` / `x-y` between letters. */
+function namelike(run: readonly string[]): boolean {
+  return run.some(
+    (ch, i) =>
+      SEPARATORS.has(ch) ||
+      DIGIT.test(ch) ||
+      ((ch === "." || ch === "-") &&
+        i > 0 &&
+        ASCII_LETTER.test(run[i - 1] ?? "") &&
+        ASCII_LETTER.test(run[i + 1] ?? "")),
+  );
+}
+
+/** The length of a link (`https?://` and what follows up to a space) starting at `i`, or 0. */
+function linkAt(chars: readonly string[], i: number): number {
+  const head = chars.slice(i, i + 8).join("");
+  const scheme = head.startsWith("https://") ? 8 : head.startsWith("http://") ? 7 : 0;
+  if (!scheme) return 0;
+  let end = i + scheme;
+  while (end < chars.length && !isPySpace(chars[end] ?? "")) end += 1;
+  return end > i + scheme ? end - i : 0;
+}
+
+/** The length of a code span (`` `...` ``) starting at `i`, or 0. */
+function codeAt(chars: readonly string[], i: number): number {
+  if (chars[i] !== "`") return 0;
+  const close = chars.indexOf("`", i + 1);
+  return close < 0 ? 0 : close + 1 - i;
+}
+
+/**
+ * `text` with what is not prose made a space (Python's `_NOT_PROSE.sub(" ", text)`: links, code spans, and every run of non-space
+ * characters that holds a digit or a separator), in one linear pass: a run that is no name is skipped at once, and only a link or
+ * a code span can then start inside it.
+ */
+function withoutNotProse(text: string): string {
+  const chars = Array.from(text);
+  let out = "";
+  let i = 0;
+  while (i < chars.length) {
+    const at = linkAt(chars, i) || codeAt(chars, i);
+    if (at) {
+      out += " ";
+      i += at;
+      continue;
+    }
+    const ch = chars[i] ?? "";
+    if (isPySpace(ch)) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    let end = i;
+    while (end < chars.length && !isPySpace(chars[end] ?? "")) end += 1;
+    if (namelike(chars.slice(i, end))) {
+      out += " ";
+      i = end;
+      continue;
+    }
+    i = keepUntilLinkOrCode(chars, i, end, (kept) => {
+      out += kept;
+    });
+  }
+  return out;
+}
+
+/** Keep the run's characters up to the first link or code span inside it (or its end); returns where to go on. */
+function keepUntilLinkOrCode(
+  chars: readonly string[],
+  from: number,
+  end: number,
+  keep: (kept: string) => void,
+): number {
+  let k = from;
+  while (k < end && (k === from || !(linkAt(chars, k) || codeAt(chars, k)))) k += 1;
+  keep(chars.slice(from, k).join(""));
+  return k;
 }
