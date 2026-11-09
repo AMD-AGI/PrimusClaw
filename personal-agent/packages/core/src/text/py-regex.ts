@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { InvariantError } from "../errors.js";
-import { END, I_VARIANTS, START, literal, translateEscape, type EscapeContext } from "./py-regex-escapes.js";
-
-export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes.js";
+import { PY_SPACE } from "./py-text.js";
 
 /**
  * Python `re` patterns (on a `str`) as JavaScript regular expressions, for the rules the worker matches text with.
@@ -14,15 +12,22 @@ export { PY_B_END, PY_B_START, PY_D, PY_W, PY_W_CHARS } from "./py-regex-escapes
  *  - `\w` is a letter, a number or `_` of any script, `\W` the rest, and `\b`/`\B` are boundaries of that `\w`;
  *  - `^`, `$`, `\A`, `\Z` and `.` are Python's: `$` also matches before a final "\n" (with `m`, before any "\n" only, not
  *    "\r"), and `.` is anything but "\n" (with `s`, anything);
- *  - `(?P<name>...)` and `(?P=name)` are Python's named groups; a leading `(?ims)` is the flag; `(?#...)` is a comment;
- *  - `\-`, `\ `, `\#` (what `re.escape` writes) are the characters themselves, as are `\x..`, `\u....`, `\U........`,
- *    octal escapes and `\a`; a `{` or `}` that is no quantifier and a `]` outside a class are literal; `{,n}` is `{0,n}`;
- *  - with the `i` flag, `i`, `I`, `ı` and `İ` all match one another, as Python folds them (JavaScript does not).
- * The `u` flag is always on. What has no JavaScript form is refused when the pattern is built, with an InvariantError:
- * an escape Python refuses, `\N{...}`, a negated class escape inside a class (`[\S]`), inline flags anywhere but at the
- * start or scoped to a group (`(?s:...)`), a backreference under `i` (JavaScript folds it without `ı`/`İ`), and any
- * other syntax JavaScript cannot read.
+ *  - `(?P<name>...)` and `(?P=name)` are Python's named groups; a leading `(?i)`, `(?m)` or `(?s)` is the flag;
+ *  - with the `i` flag, `i` and `I` also match `ı` and `İ` (Python folds them together, JavaScript does not).
+ * The `u` flag is always on. A negated class escape inside a class (`[\S]`, `[\D]`, `[\W]`) and inline flags other than
+ * a leading `i`, `m`, `s` have no JavaScript form and are refused when the pattern is built.
  */
+
+/** Python's `\w` (letters, numbers and `_` of any script) as a character class. */
+export const PY_W = String.raw`[\p{L}\p{N}_]`;
+/** The inside of `PY_W`, to put in a class of one's own (`[${PY_W_CHARS}.-]`). */
+export const PY_W_CHARS = String.raw`\p{L}\p{N}_`;
+/** Python's `\d` (a decimal digit of any script), to put in a class. */
+export const PY_D = String.raw`\p{Nd}`;
+/** Python's `\b` before a word: not preceded by a word character. */
+export const PY_B_START = `(?<!${PY_W})`;
+/** Python's `\b` after a word: not followed by a word character. */
+export const PY_B_END = `(?!${PY_W})`;
 
 /** `ch.isalnum()` for one character: a letter or a number of any script. */
 export function pyIsAlnum(ch: string): boolean {
@@ -34,10 +39,41 @@ export function isAsciiAlpha(word: string): boolean {
   return /^[A-Za-z]+$/.test(word);
 }
 
+const DOTTED_I = "ıİ";
+const START = String.raw`(?<![\s\S])`;
+const END = String.raw`(?![\s\S])`;
+
+const OUTSIDE: Readonly<Record<string, string>> = {
+  s: `[${PY_SPACE}]`,
+  S: `[^${PY_SPACE}]`,
+  d: `[${PY_D}]`,
+  D: `[^${PY_D}]`,
+  w: PY_W,
+  W: `[^${PY_W_CHARS}]`,
+  b: `(?:(?<=${PY_W})${PY_B_END}|${PY_B_START}(?=${PY_W}))`,
+  B: `(?:(?<=${PY_W})(?=${PY_W})|${PY_B_START}${PY_B_END})`,
+  A: START,
+  Z: END,
+};
+
+const INSIDE: Readonly<Record<string, string>> = { s: PY_SPACE, d: PY_D, w: PY_W_CHARS };
+
 interface Flags {
   readonly ignoreCase: boolean;
   readonly multiline: boolean;
   readonly dotAll: boolean;
+}
+
+/** The escape that starts at `source[i]` (a backslash): its whole text, `\p{..}` and `\u{..}` included. */
+function escapeAt(source: string, i: number): string {
+  const next = source.charAt(i + 1);
+  if ((next === "p" || next === "P" || next === "u") && source.charAt(i + 2) === "{") {
+    const close = source.indexOf("}", i + 3);
+    if (close !== -1) return source.slice(i, close + 1);
+  }
+  if (next === "x") return source.slice(i, i + 4);
+  if (next === "u") return source.slice(i, i + 6);
+  return source.slice(i, i + 2);
 }
 
 interface State {
@@ -46,22 +82,27 @@ interface State {
   classStart: number;
 }
 
-interface Step {
-  readonly text: string;
-  readonly length: number;
+function translateEscape(escape: string, state: State): string {
+  const letter = escape.length === 2 ? escape.charAt(1) : "";
+  if (!state.inClass) return OUTSIDE[letter] ?? escape;
+  const inner = INSIDE[letter];
+  if (inner !== undefined) return inner;
+  if (letter === "S" || letter === "D" || letter === "W") {
+    throw new InvariantError(`a negated class escape \\${letter} inside a character class has no JavaScript form`);
+  }
+  return escape;
 }
 
 /**
- * With `i`: a class that takes any of `i`, `I`, `ı`, `İ` takes all four (a negated one then refuses them all). They go
+ * With `i`: a class that takes `i` or `I` takes `ı` and `İ` as well (a negated one then refuses them too). They go
  * first in the class, so a class ending in a literal `-` keeps it literal.
  */
 function closeClass(state: State, ignoreCase: boolean): void {
   const body = state.out.slice(state.classStart);
   const negated = body.startsWith("[^");
-  const positive = new RegExp(negated ? `[${body.slice(2)}]` : `${body}]`, "iu");
-  if (ignoreCase && Array.from(I_VARIANTS).some((ch) => positive.test(ch))) {
+  if (ignoreCase && new RegExp(negated ? `[${body.slice(2)}]` : `${body}]`, "iu").test("i")) {
     const at = state.classStart + (negated ? 2 : 1);
-    state.out = state.out.slice(0, at) + I_VARIANTS + state.out.slice(at);
+    state.out = state.out.slice(0, at) + DOTTED_I + state.out.slice(at);
   }
   state.out += "]";
   state.inClass = false;
@@ -75,80 +116,54 @@ function anchorOrDot(ch: string, flags: Flags): string | undefined {
   return undefined;
 }
 
-const NAME = String.raw`[\p{L}_][\p{L}\p{N}_]*`;
-
 /**
- * A group opening or reference at `source[i]` (outside a class): Python's `(?P<name>` (JavaScript `(?<name>`) and
- * `(?P=name)` (`\k<name>`), JavaScript's own `(?<name>` and `\k<name>`, a comment `(?#...)` (dropped), and a flag group
- * anywhere but the start (refused). A lookbehind `(?<=`/`(?<!` is no name and is read as the pattern it is.
+ * A group's name or reference at `source[i]`, copied whole so that nothing in it is read as text to match: Python's
+ * `(?P<name>` (JavaScript `(?<name>`) and `(?P=name)` (`\k<name>`), and JavaScript's own `(?<name>` and `\k<name>`.
+ * A lookbehind `(?<=`/`(?<!` is no name and is read as the pattern it is.
  */
-function groupAt(source: string, i: number, flags: Flags): Step | undefined {
+function groupAt(source: string, i: number): { text: string; length: number } | undefined {
   const rest = source.slice(i);
-  if (rest.startsWith("(?#")) {
-    const close = rest.indexOf(")");
-    return { text: "", length: close === -1 ? rest.length : close + 1 };
-  }
-  if (/^\(\?[aiLmsux-]+[:)]/.test(rest))
-    throw new InvariantError("inline flags not at the start have no JavaScript form here");
-  const python = new RegExp(`^\\(\\?P<(${NAME})>`, "u").exec(rest);
+  const python = /^\(\?P<(\w+)>/.exec(rest);
   if (python) return { text: `(?<${python[1] ?? ""}>`, length: python[0].length };
-  const reference = new RegExp(`^(?:\\(\\?P=(${NAME})\\)|\\\\k<(${NAME})>)`, "u").exec(rest);
-  if (reference) {
-    if (flags.ignoreCase) throw new InvariantError("a backreference under IGNORECASE has no JavaScript form here");
-    return { text: `\\k<${reference[1] ?? reference[2] ?? ""}>`, length: reference[0].length };
-  }
-  const own = new RegExp(`^\\(\\?<(?![=!])${NAME}>`, "u").exec(rest);
+  const reference = /^\(\?P=(\w+)\)/.exec(rest);
+  if (reference) return { text: `\\k<${reference[1] ?? ""}>`, length: reference[0].length };
+  const own = /^(?:\(\?<(?![=!])|\\k<)\w+>/.exec(rest);
   return own ? { text: own[0], length: own[0].length } : undefined;
 }
 
-/** A `{` that begins a quantifier (`{,n}` written `{0,n}`), or the literal `{`. */
-function braceAt(source: string, i: number): Step {
-  const quantifier = /^\{(\d*)(,(\d*))?\}/.exec(source.slice(i));
-  if (quantifier && (quantifier[1] || quantifier[3])) {
-    const text = quantifier[2] === undefined ? quantifier[0] : `{${quantifier[1] || "0"},${quantifier[3] ?? ""}}`;
-    return { text, length: quantifier[0].length };
-  }
-  return { text: "\\{", length: 1 };
-}
-
-function outsideClass(source: string, i: number, flags: Flags): Step {
+function plainChar(source: string, i: number, state: State, flags: Flags): string {
   const ch = source.charAt(i);
-  if (ch === "(") return groupAt(source, i, flags) ?? { text: ch, length: 1 };
-  if (ch === "{") return braceAt(source, i);
-  if (ch === "}" || ch === "]") return { text: `\\${ch}`, length: 1 };
+  if (state.inClass) return ch;
   const special = anchorOrDot(ch, flags);
-  if (special !== undefined) return { text: special, length: 1 };
-  const point = String.fromCodePoint(source.codePointAt(i) ?? 0);
-  if (flags.ignoreCase && I_VARIANTS.includes(point))
-    return { text: literal(point, context(false, flags)), length: point.length };
-  return { text: point, length: point.length };
-}
-
-function context(inClass: boolean, flags: Flags): EscapeContext {
-  return { inClass, ignoreCase: flags.ignoreCase };
+  if (special !== undefined) return special;
+  if (flags.ignoreCase && (ch === "i" || ch === "I")) return `[iI${DOTTED_I}]`;
+  return ch;
 }
 
 function translate(source: string, flags: Flags): string {
   const state: State = { out: "", inClass: false, classStart: 0 };
-  for (let i = 0; i < source.length;) {
+  for (let i = 0; i < source.length; i += 1) {
     const ch = source.charAt(i);
-    let step: Step;
-    if (ch === "\\") step = translateEscape(source, i, context(state.inClass, flags));
-    else if (state.inClass && ch === "]") {
-      const opened = state.out.slice(state.classStart);
-      if (opened === "[" || opened === "[^")
-        step = { text: "\\]", length: 1 }; // a "]" first in a class is itself
-      else {
-        closeClass(state, flags.ignoreCase);
-        step = { text: "", length: 1 };
-      }
-    } else if (!state.inClass && ch === "[") {
+    const group = state.inClass ? undefined : groupAt(source, i);
+    if (group !== undefined) {
+      state.out += group.text;
+      i += group.length - 1;
+    } else if (ch === "\\") {
+      const escape = escapeAt(source, i);
+      state.out += translateEscape(escape, state);
+      i += escape.length - 1;
+    } else if (ch === "[" && !state.inClass) {
       state.inClass = true;
       state.classStart = state.out.length;
-      step = { text: "[", length: 1 };
-    } else step = state.inClass ? { text: ch, length: 1 } : outsideClass(source, i, flags);
-    state.out += step.text;
-    i += step.length;
+      state.out += ch;
+    } else if (ch === "]" && state.inClass) {
+      const opened = state.out.slice(state.classStart);
+      if (opened === "[" || opened === "[^")
+        state.out += "\\]"; // a "]" first in a class is the character itself
+      else closeClass(state, flags.ignoreCase);
+    } else {
+      state.out += plainChar(source, i, state, flags);
+    }
   }
   return state.out;
 }
@@ -165,28 +180,21 @@ function leadingFlags(source: string, flags: string): { source: string; flags: F
   };
 }
 
-/** The JavaScript flags beside a translated pattern: `i` stays; `m` and `s` are in the pattern itself now. */
+/** The JavaScript flags beside a translated pattern: `m` and `s` are in the pattern itself now. */
 function jsFlags(flags: string, read: Flags): string {
-  const kept = Array.from(new Set(Array.from(flags.replace(/[imsu]/g, "")))).join("");
+  const kept = Array.from(new Set(Array.from(flags.replace(/[ims]/g, "")))).join("");
   return `${kept}${read.ignoreCase ? "i" : ""}u`;
-}
-
-function compile(pattern: string, flags: string): RegExp {
-  try {
-    return new RegExp(pattern, flags);
-  } catch (error) {
-    throw new InvariantError(`a pattern JavaScript cannot read: ${error instanceof Error ? error.message : "?"}`);
-  }
 }
 
 /** `re.compile(source, flags)` used with `search`: `regex.exec(text)` finds the first match anywhere. */
 export function pyRegExp(source: string, flags = ""): RegExp {
   const read = leadingFlags(source, flags.replaceAll("u", ""));
-  return compile(translate(read.source, read.flags), jsFlags(flags, read.flags));
+  return new RegExp(translate(read.source, read.flags), jsFlags(flags.replaceAll("u", ""), read.flags));
 }
 
 /** `re.fullmatch(source, text, flags)` as a RegExp: `regex.test(text)` / `regex.exec(text)` match the whole text. */
 export function pyFullmatch(source: string, flags = ""): RegExp {
   const read = leadingFlags(source, flags.replaceAll("u", ""));
-  return compile(`${START}(?:${translate(read.source, read.flags)})${END}`, jsFlags(flags, read.flags));
+  const pattern = `${START}(?:${translate(read.source, read.flags)})${END}`;
+  return new RegExp(pattern, jsFlags(flags.replaceAll("u", ""), read.flags));
 }
