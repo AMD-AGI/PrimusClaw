@@ -11,6 +11,7 @@ import { buttons, execute, header, message, note, openUrl, text, TITLE_MAX } fro
 import type { CardElement } from "../../cards/json.js";
 import type { Renderers } from "../registry.js";
 import { noteCard } from "./note.js";
+import { stopCard } from "./stop.js";
 
 /** Files listed on the changes card, over all repositories; the rest is one "+N more" line. */
 export const CHANGES_MAX_FILES = 8;
@@ -90,4 +91,5 @@ export const TURN_RENDERERS = {
   delivery: deliveryCard,
   changes: changesCard,
   note: noteCard,
+  turnStop: stopCard,
 } satisfies Partial<Renderers>;

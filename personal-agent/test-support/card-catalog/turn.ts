@@ -6,6 +6,7 @@ import { turn } from "@primusclaw/personal-agent";
 
 import { changesCard, deliveryCard } from "../../packages/teams/src/views/turn/index.js";
 import { noteCard } from "../../packages/teams/src/views/turn/note.js";
+import { stopCard } from "../../packages/teams/src/views/turn/stop.js";
 import { BASE, entries, SID } from "./catalog.js";
 
 function changes(): turn.Changes {
@@ -55,4 +56,7 @@ export const TURN = entries(
   ],
   ["inactive_note", () => noteCard({ text: "This button is no longer active." })],
   ["show_here_note", () => noteCard({ text: "回答在下面的聊天里。你的下一条消息会接着这个会话。", buttons: [SHOW] })],
+  // (internal #458, not yet in the port's Python baseline)
+  ["turn_stop", () => stopCard({ token: "turn-1", lang: "zh" })],
+  ["turn_stop_en", () => stopCard({ token: "turn-1", lang: "en" })],
 );
