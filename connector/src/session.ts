@@ -64,9 +64,9 @@ export interface SessionTiming {
   /** A typed message's turn also ends once the terminal has said it is idle for this long (a turn stopped with Esc writes no end). */
   terminalIdleMs: number;
   /**
-   * A terminal whose screen is not Claude Code's idle input box, and whose Claude Code does not say it is working or waiting (a
-   * screen this connector cannot read: another program, a layout it does not know), is read again for this long, then the message
-   * is refused (`terminal_screen_unknown`) instead of waiting `terminalWaitMs` with the phone showing nothing.
+   * A terminal whose Claude Code says it is idle but whose screen is not its input box (a screen this connector cannot read:
+   * another program, a layout it does not know) is read again for this long, then the message is refused (`terminal_screen_unknown`)
+   * instead of waiting `terminalWaitMs`. A Claude Code that says it is working or waiting, or whose word cannot be read, keeps that wait.
    */
   terminalScreenWaitMs: number;
 }
@@ -469,7 +469,8 @@ export class Session {
             if (r.why === "gone") { told = why; break; }
           }
           // A busy or typed-in terminal is worth waiting for (the phone is told it is queued); one that cannot be read is not.
-          if (why === WAIT_WHY.screen || why === "terminal_state_unknown") {
+          // (Only the screen itself read as unreadable: a Claude Code whose status row cannot be read now keeps the long wait.)
+          if (why === WAIT_WHY.screen) {
             unreadableSince ??= Date.now();
             if (Date.now() - unreadableSince >= this.env.timing.terminalScreenWaitMs) { unreadable = true; told = why; break; }
           } else {

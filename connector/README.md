@@ -468,9 +468,9 @@ is typed in any of them (`default`/manual, `plan`, `acceptEdits`, `auto`, `dontA
 terminal would. The mode is read from the line Claude Code draws below its input box (`⏸ manual mode on`, `⏵⏵ bypass permissions on`...)
 when the session starts, and `session_started` names it (`terminal_mode`, null when that line names none) so the chat can say so;
 the audit log records it with each message typed. The terminal is never switched to another mode for it. A conversation with a name
-(`/rename`) has it in the rule above the box; that rule is still the box's edge. A screen that is neither the idle box nor a Claude
-Code that says it is working or waiting (another program, a layout the connector does not know) is read again for 30 seconds, then
-the message is refused (`terminal_screen_unknown`) instead of waiting the 10 minutes a busy terminal gets; while it waits the phone is
+(`/rename`) has it in the rule above the box; that rule is still the box's edge. A Claude Code that says it is idle while its screen
+is not its input box (another program, a layout the connector does not know) is read again for 30 seconds, then the message is
+refused (`terminal_screen_unknown`) instead of waiting the 10 minutes a busy terminal gets; while it waits the phone is
 told why (`terminal_input_queued`). Connectors 0.1.8 to 0.1.13 refused a mode the agent's approval did not allow
 (`terminal_mode_not_allowed`, `terminal_mode_unknown`); this one no longer sends those. A message that starts with `!`
 (Claude Code runs the rest as a shell command, with no question) or `/` (a slash command such as `/permissions` or `/add-dir`) is
