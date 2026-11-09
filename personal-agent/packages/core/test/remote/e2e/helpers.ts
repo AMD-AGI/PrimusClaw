@@ -47,3 +47,13 @@ export function turnsOf(w: RemoteWorld): Map<string, unknown> {
 
 /** A turn in the worker's books that nothing runs. */
 export const idleTurn = (): unknown => ({ task: null, stopRequested: false, waitsForTerminal: false });
+
+/** An agent that answers each prompt with `text`, `chunks` times, and ends its turn. */
+export function promptScript(chunks = 1, text = "Done."): Script {
+  const script = new Script();
+  script.onPrompt = async (srv, sid) => {
+    for (let i = 0; i < chunks; i += 1) await srv.say(sid, text);
+    await srv.end(sid);
+  };
+  return script;
+}

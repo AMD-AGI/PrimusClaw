@@ -24,7 +24,7 @@ import { createHash } from "node:crypto";
 import { DirectChat } from "../packages/core/src/direct-chat/direct-chat.js";
 import { Guardrails } from "../packages/core/src/guardrails/guardrails.js";
 import { ConnectorSetup, setupFrom } from "../packages/core/src/remote/connector/setup.js";
-import type { RemoteContext, RemoteErrors, RemoteGuard } from "../packages/core/src/remote/context.js";
+import type { RemoteContext, RemoteErrors, RemoteGuard, RemoteSettings } from "../packages/core/src/remote/context.js";
 import type { FollowTimings } from "../packages/core/src/remote/follow/timings.js";
 import { RemoteAgents } from "../packages/core/src/remote/remote-agents.js";
 import { RENDERERS } from "../packages/teams/src/views/index.js";
@@ -97,6 +97,8 @@ export interface Operation {
   readonly op: Recorded["op"];
   readonly id: string;
   readonly card: Json | undefined;
+  /** The message's own text ("" for none). */
+  readonly text: string;
 }
 
 export interface WorldOptions {
@@ -116,6 +118,8 @@ export class RemoteWorld {
   readonly claw: ClawRemoteAgentsPort;
   /** A message the channel refuses to post (Teams said no), when this says so. */
   refuse: ((message: OutMessage) => boolean) | null = null;
+  /** The worker's settings, which a test may change (remote agents turned off under a card). */
+  readonly settings: { -readonly [K in keyof RemoteSettings]: RemoteSettings[K] };
   private n = 0;
   private langs = new Map<string, "zh" | "en">();
 
@@ -126,17 +130,18 @@ export class RemoteWorld {
     const store = this.test.store;
     const claw = createClawClient({ baseUrl: server.url, clock: systemClock });
     this.claw = claw.remoteAgents;
+    this.settings = {
+      enabled: options.enabled ?? true,
+      follow: true,
+      windowDefault: options.windowDefault ?? "chat",
+      timings: TEST_TIMINGS,
+      watchTimings: TEST_TIMINGS,
+      botName: "Clawy",
+      streaming: false,
+      ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
+    };
     const ctx: RemoteContext = {
-      settings: {
-        enabled: options.enabled ?? true,
-        follow: true,
-        windowDefault: options.windowDefault ?? "chat",
-        timings: TEST_TIMINGS,
-        watchTimings: TEST_TIMINGS,
-        botName: "Clawy",
-        streaming: false,
-        ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
-      },
+      settings: this.settings,
       claw: claw.remoteAgents,
       clawBaseUrl: server.url,
       setup: new ConnectorSetup(setupFrom(null, server.url)),
@@ -322,10 +327,11 @@ export class RemoteWorld {
    */
   operations(): Operation[] {
     return this.surface.outbox.flatMap((r): Operation[] => {
-      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined }];
+      if (r.op === "delete") return [{ op: r.op, id: r.id, card: undefined, text: "" }];
       if (r.op !== "send" && r.op !== "post" && r.op !== "update") return [];
       const activity = activityOf(r.message, { style: DEFAULT_STYLE, renderers: RENDERERS, masker: undefined }) as Json;
-      return [{ op: r.op, id: r.op === "send" ? "" : r.id, card: cardsOf(activity)[0] }];
+      const text = typeof activity["text"] === "string" ? activity["text"] : "";
+      return [{ op: r.op, id: r.op === "send" ? "" : r.id, card: cardsOf(activity)[0], text }];
     });
   }
 
