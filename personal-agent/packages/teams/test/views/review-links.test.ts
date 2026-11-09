@@ -18,6 +18,15 @@ function texts(node: unknown): string[] {
   return [...own, ...Object.values(record).flatMap(texts)];
 }
 
+/** Every address a card opens. */
+function urls(node: unknown): string[] {
+  if (Array.isArray(node)) return node.flatMap(urls);
+  if (typeof node !== "object" || node === null) return [];
+  const record = node as Record<string, unknown>;
+  const own = typeof record.url === "string" ? [record.url] : [];
+  return [...own, ...Object.values(record).flatMap(urls)];
+}
+
 test("the link card puts the link on a line of its own", () => {
   const page = "https://claw.example.test/primus-claw/teams-link";
   const shown = texts(linkCard({ bot: "Clawy", who: "Alice", page, notice: "AI notice" }));
@@ -33,7 +42,7 @@ test("the github connect card glues no text to a link in both languages", () => 
     const uri = "https://github.com/login/device";
     const card = githubConnectCard({ code: "ABCD-1234", uri, minutes: 15, question: "我的 PR", lang, cardId: "c1" });
     const shown = texts(card);
-    assert.ok(JSON.stringify(card).includes(uri), lang); // (on the button that opens it: nothing is glued to it)
+    assert.deepEqual(urls(card), [uri], lang); // (on the button that opens it: nothing is glued to it)
     assert.ok(
       shown.every((t) => textAfterLinks(t).length === 0),
       shown.join("\n"),

@@ -12,5 +12,6 @@ export { connectionsText, UNKNOWN, type ConnectionsInput } from "./connect/conne
 export { GithubReview } from "./service/github-review.js";
 export { ReviewHandoffAction, type HandoffActionDeps } from "./service/handoff-action.js";
 export type { ReviewDeps, ReviewHost, StartReviewTurn, Guard, Audit, FollowWire, RestoreRef } from "./service/deps.js";
+export type { PostWorkCard } from "./service/notices.js";
 export { parseReviewHandoff, REVIEW_HANDOFF, type ReviewHandoff } from "./handoff.js";
 export type { ReviewTurn } from "./review-turn.js";

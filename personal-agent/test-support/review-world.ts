@@ -12,6 +12,8 @@ import {
   type InboundMessage,
   type InboundMention,
   type IntentReader,
+  type PostWorkCard,
+  type WorkItem,
   type RosterMember,
   type JsonObject,
   type ReviewStart,
@@ -182,6 +184,8 @@ export class ReviewClaw {
   views = new Map<string, Record<string, unknown> | Record<string, unknown>[]>();
   /** A whole request refused, or not answered. */
   refuseAll: Error | undefined;
+  /** What the reviewer's own item is, read with their key; undefined: Claw answers 404. */
+  workItem: ((key: string, itemId: string) => WorkItem) | undefined;
 
   private refused(request: Record<string, unknown>): Error | undefined {
     if (this.refuseAll !== undefined) return this.refuseAll;
@@ -236,7 +240,10 @@ export class ReviewClaw {
         },
       },
       workItems: {
-        get: fail,
+        get: (key: string, itemId: string) => {
+          this.calls.push(["workItem", key, itemId]);
+          return this.workItem === undefined ? fail() : Promise.resolve(this.workItem(key, itemId));
+        },
         requesterView: (token: string, itemId: string) => {
           this.calls.push(["view", token, itemId]);
           const seen = this.views.get(itemId);
@@ -299,6 +306,8 @@ function recordingHost(
 export interface WorldOptions {
   readonly rosters?: Readonly<Record<string, readonly RosterMember[]>>;
   readonly intent?: IntentReader;
+  /** The assistant's work card for an item (the assistant line's); default: none is posted. */
+  readonly postWorkCard?: PostWorkCard;
 }
 
 export function reviewWorld(owners: readonly string[] = ["AMD-AGI"], options: WorldOptions = {}) {
@@ -369,7 +378,7 @@ export function reviewWorld(owners: readonly string[] = ["AMD-AGI"], options: Wo
   identity.know("aad-a", "u-alice", "alice-gh");
   identity.know("aad-b", "u-bob", "bob-gh", true);
   store.members.rememberMember("29:b", "aad-b", "Bob");
-  const service = new GithubReview(deps, new SeededRandom(7), () => Promise.resolve());
+  const service = new GithubReview(deps, new SeededRandom(7), options.postWorkCard ?? (() => Promise.resolve()));
   return { service, deps, store, clock, identity, github, claw, surface, started, said, audits, bound, link };
 }
 
@@ -480,8 +489,8 @@ export const ALICE_DM = "personal:aad-a";
  * The review world where Alice's assistant understands her and hands reviews back (`test_review_handoff.world`): her 1:1 chat
  * is known, Bob's link recorded his Claw user id, and the message `act-1` this worker sent for her declared the handoff.
  */
-export function handoffWorld(items: ItemOptions = { seqFrom: 1 }) {
-  const world = reviewWorld();
+export function handoffWorld(items: ItemOptions = { seqFrom: 1 }, options: WorldOptions = {}) {
+  const world = reviewWorld(["AMD-AGI"], options);
   withItems(world, items);
   world.store.references.saveReference("aad-a", { conversation: { id: ALICE_DM } });
   world.store.links.setClawUserId("aad-b", "u-bob");
