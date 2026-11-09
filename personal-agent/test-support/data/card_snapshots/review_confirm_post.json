@@ -1,0 +1,161 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "confirmation": "conf-2",
+       "decision": "allow",
+       "primusclaw": "github_confirm"
+      },
+      "style": "positive",
+      "title": "确认发布",
+      "type": "Action.Execute",
+      "verb": "primusclaw.github_confirm"
+     },
+     {
+      "data": {
+       "confirmation": "conf-2",
+       "decision": "deny",
+       "primusclaw": "github_confirm"
+      },
+      "title": "不发布",
+      "type": "Action.Execute",
+      "verb": "primusclaw.github_confirm"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Warning",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "⚠️ 发布 review 前需要你确认",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "Robin Lang 请求，我以你的身份发布",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "确认后：在 AMD-AGI/Primus-SaFE#482 上以你的 GitHub 账号 @huirui-amd 发布 REQUEST_CHANGES review。",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "facts": [
+       {
+        "title": "PR",
+        "value": "#482 docs: node join runbook"
+       },
+       {
+        "title": "作⁠者",
+        "value": "lisi"
+       },
+       {
+        "title": "结⁠论",
+        "value": "REQUEST_CHANGES，2 条行内评论"
+       },
+       {
+        "title": "内⁠容",
+        "value": "两处需要修改：1) 加入节点前没有校验 token 过期；2) runbook 的命令少了 --namespace。"
+       },
+       {
+        "title": "原⁠因",
+        "value": "别人请求，以你的身份发布"
+       }
+      ],
+      "type": "FactSet"
+     },
+     {
+      "id": "confirm-more-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "更多信息 ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "confirm-more"
+       ],
+       "title": "更多信息",
+       "type": "Action.ToggleVisibility"
+      },
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "confirm-more",
+      "isVisible": false,
+      "items": [
+       {
+        "facts": [
+         {
+          "title": "仓⁠库",
+          "value": "AMD-AGI/Primus-SaFE"
+         },
+         {
+          "title": "Head",
+          "value": "0a1b2c3d4e5f"
+         },
+         {
+          "title": "模⁠型",
+          "value": "默认模型"
+         },
+         {
+          "title": "账⁠号",
+          "value": "你的 GitHub 账号 @huirui-amd"
+         }
+        ],
+        "type": "FactSet"
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

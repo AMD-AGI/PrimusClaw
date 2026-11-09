@@ -1,0 +1,83 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "show",
+       "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77"
+      },
+      "style": "positive",
+      "title": "在这里显示",
+      "type": "Action.Execute",
+      "verb": "primusclaw.show"
+     },
+     {
+      "title": "在 Claw 中打开",
+      "type": "Action.OpenUrl",
+      "url": "https://claw.example.com/primus-claw/3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🗂️ 整理本周 SaFE 节点故障",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "当前会话 · 上次使用：今天 15:00",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "facts": [
+       {
+        "title": "仓⁠库",
+        "value": "AMD-AGI/Primus-SaFE@main"
+       }
+      ],
+      "type": "FactSet"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}
