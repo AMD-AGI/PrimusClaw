@@ -12,8 +12,14 @@ const PR = "AMD-AGI/Hyperloom#12";
 const BOB = { channelUserId: "29:b", userId: "", name: "Bob", shown: "Bob", offset: 0 };
 
 /** A message as the router hands it over: the bot's own mention gone, `{Bob}` an @mention of Bob. */
+/** The mentions placed where their words stand in `text` (code points), as the channel adapter places them. */
+function placed(text: string, mentions: readonly (typeof BOB)[]) {
+  return mentions.map((m) => ({ ...m, offset: Array.from(text.slice(0, Math.max(text.indexOf(m.shown), 0))).length }));
+}
+
 function read(text: string, mentions = [BOB]) {
-  const marked = markedText(text.replaceAll("{Bob}", "Bob"), mentions);
+  const shown = text.replaceAll("{Bob}", "Bob");
+  const marked = markedText(shown, text.includes("{Bob}") ? placed(shown, mentions) : []);
   return parseReviewAsk(marked.text, marked.mentions);
 }
 
@@ -91,10 +97,8 @@ test("a later line that names the same person in another way is that person", ()
     { channelUserId: "29:w", userId: "", name: "Lin, Mei", shown: "Lin, Mei", offset: 2 },
     { channelUserId: "29:w", userId: "", name: "Mei", shown: "@Mei", offset: 0 },
   ];
-  const marked = markedText(
-    `请 Lin, Mei review 合入 ${PR}\n请 Mei Lin review 合入 AMD-AGI/x#2\n请 @Mei review 合入 AMD-AGI/x#3\n请 review 合入 AMD-AGI/x#4`,
-    mentions,
-  );
+  const text = `请 Lin, Mei review 合入 ${PR}\n请 Mei Lin review 合入 AMD-AGI/x#2\n请 @Mei review 合入 AMD-AGI/x#3\n请 review 合入 AMD-AGI/x#4`;
+  const marked = markedText(text, placed(text, mentions));
   const parsed = parseReviewAsk(marked.text, marked.mentions);
   assert.ok(parsed);
   assert.deepEqual(otherReviewers(parsed), []);

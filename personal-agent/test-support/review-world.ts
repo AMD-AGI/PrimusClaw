@@ -6,17 +6,15 @@
  * SQLite store, the real identity-service client and GitHub device flow behind fake HTTP answers, a fake Claw that records
  * what it is asked, a recording channel, and a host that records the turns it is asked to start. Alice asks; Bob reviews.
  */
-import type {
-  ClawPort,
-  Conversation,
-  InboundMessage,
-  InboundMention,
-  JsonObject,
-  ReviewStart,
-  StartReviewTurn,
-  UserRef,
-} from "../packages/core/src/index.js";
 import {
+  type ClawPort,
+  type Conversation,
+  type InboundMessage,
+  type InboundMention,
+  type JsonObject,
+  type ReviewStart,
+  type StartReviewTurn,
+  type UserRef,
   ClawError,
   GithubReview,
   Guardrails,
@@ -222,6 +220,35 @@ export interface Started extends StartReviewTurn {
   readonly ended: () => void;
 }
 
+/** A host that records the turns it is asked to start and the onboarding it is asked for. */
+function recordingHost(
+  started: Started[],
+  said: { onboard: number; askLink: string[]; connect: string[] },
+): ReviewDeps["host"] {
+  return {
+    startTurn: (request) => {
+      let ended: () => void = () => undefined;
+      const done = new Promise<void>((resolve) => {
+        ended = resolve;
+      });
+      started.push({ ...request, ended });
+      return Promise.resolve({ ended: done });
+    },
+    onboard: () => {
+      said.onboard += 1;
+      return Promise.resolve();
+    },
+    askLink: (person, _c, lead) => {
+      said.askLink.push(`${person.id}:${lead}`);
+      return Promise.resolve();
+    },
+    connectIdentity: (person, _c, lead) => {
+      said.connect.push(`${person.id}:${lead}`);
+      return Promise.resolve();
+    },
+  };
+}
+
 /** The review service with everything it talks to faked, as `test_github_review.world` builds it. */
 export function reviewWorld(owners: readonly string[] = ["AMD-AGI"]) {
   const { store, clock } = openTestStore({ clock: new FakeClock(Date.UTC(2026, 10, 9)) });
@@ -234,9 +261,13 @@ export function reviewWorld(owners: readonly string[] = ["AMD-AGI"]) {
   const said = { onboard: 0, askLink: [] as string[], connect: [] as string[] };
   const audits: [string, Record<string, unknown>][] = [];
   const fetchIdentity = (input: string, init?: RequestInit) =>
-    Promise.resolve(identity.handle(input, JSON.parse(String(init?.body)) as Record<string, unknown>));
+    Promise.resolve(
+      identity.handle(input, JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>),
+    );
   const fetchGithub = (input: string, init?: RequestInit) =>
-    Promise.resolve(github.handle(input, Object.fromEntries(new URLSearchParams(String(init?.body)))));
+    Promise.resolve(
+      github.handle(input, Object.fromEntries(new URLSearchParams(typeof init?.body === "string" ? init.body : ""))),
+    );
   const deps: ReviewDeps = {
     store,
     claw: claw.port(),
@@ -264,28 +295,7 @@ export function reviewWorld(owners: readonly string[] = ["AMD-AGI"]) {
     mask: (text) => text.replaceAll(TOKEN, "[hidden]"),
     guard: new Guardrails(clock, () => undefined),
     audit: (event, fields) => audits.push([event, { ...fields }]),
-    host: {
-      startTurn: (request) => {
-        let ended: () => void = () => undefined;
-        const done = new Promise<void>((resolve) => {
-          ended = resolve;
-        });
-        started.push({ ...request, ended });
-        return Promise.resolve({ ended: done });
-      },
-      onboard: () => {
-        said.onboard += 1;
-        return Promise.resolve();
-      },
-      askLink: (person, _c, lead) => {
-        said.askLink.push(`${person.id}:${lead}`);
-        return Promise.resolve();
-      },
-      connectIdentity: (person, _c, lead) => {
-        said.connect.push(`${person.id}:${lead}`);
-        return Promise.resolve();
-      },
-    },
+    host: recordingHost(started, said),
     followWire: () => ({}),
     restoreRef: (stored) => {
       const id = (stored.conversation as { id?: string } | undefined)?.id;
