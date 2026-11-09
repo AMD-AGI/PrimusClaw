@@ -9,6 +9,7 @@
  */
 import type { JsonObject } from "../json.js";
 import { z } from "zod";
+import type { RemoteHidden } from "../protocol.js";
 import { anyText as text, flag, lenient, objectOf, rowsOf } from "./lenient.js";
 
 /** One agent a connector reports (`RemoteAgentDescriptor`, read leniently). */
@@ -73,15 +74,14 @@ export const remoteEventRowsSchema = rowsOf(remoteEventRowSchema);
 
 /**
  * The answer of hiding conversations of a machine from the owner's lists, or showing them again
- * (`POST /v1/remote-agents/connectors/:cid/hidden`): the refs that changed, and the ones refused (`live`: a process has
- * it open; `unknown_conversation`: the machine does not report it now). Claw does not name this shape in
- * `@claw/protocol` (AMD-AGI/PrimusClaw#576).
+ * (`POST /v1/remote-agents/connectors/:cid/hidden`): `@claw/protocol`'s `RemoteHidden`, the refs that changed and the
+ * ones refused (`live`: a process has it open; `unknown_conversation`: the machine does not report it now). Read
+ * strictly: an answer of another shape is one this client does not understand.
  */
-export const remoteHiddenSchema = z.looseObject({
-  changed: lenient(z.array(z.string())),
-  refused: lenient(rowsOf(z.looseObject({ ref: z.string(), reason: z.string() }))),
+export const remoteHiddenSchema: z.ZodType<RemoteHidden> = z.object({
+  changed: z.array(z.string()),
+  refused: z.array(z.object({ ref: z.string(), reason: z.enum(["live", "unknown_conversation"]) })),
 });
-export type RemoteHidden = z.output<typeof remoteHiddenSchema>;
 
 /** How to connect a machine (`GET /setup`): the connector's package and the exact commands, passed on as Claw wrote them. */
 export type RemoteSetup = JsonObject;
