@@ -35,9 +35,10 @@ import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
 import { notifyPaired } from "../remote-agents/pairing.js";
 import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
-import { db, inTransaction } from "../infra/db.js";
+import { db, dedicatedClient, inTransaction } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { Waker } from "../remote-agents/waker.js";
+import { startWakeRelay } from "../remote-agents/wake-relay.js";
 import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
@@ -64,6 +65,12 @@ export interface RemoteAgentOptions {
   maxStreamsPerUser?: number;
   /** Shared with the process, so a test can see a stream leave. */
   waker?: Waker;
+  /**
+   * Wake the streams of every replica, not only this one's, on a write (`remote-agents/wake-relay.ts`): one `pg_notify` per
+   * wake and one listening connection per replica. On in production (`index.ts`); off, a write through another replica is seen
+   * at a stream's next idle poll.
+   */
+  crossReplicaWake?: boolean;
   /** How often this replica sweeps presence (`remote-agents/presence.ts`); zero or less runs no sweep. */
   presenceSweepMs?: number;
   /** How long a connector stays offline before its owner is told. */
@@ -102,10 +109,11 @@ async function sayUndelivered(
 
 /**
  * How long an idle stream waits before it reads the database anyway. A write made
- * through this process wakes its streams at once, so this only bounds how late a
- * write made through another replica is seen. Short enough for that, and long
- * enough that a stream with nothing to say costs a query every few seconds, not
- * every second: a ping every 25 s still keeps the connection itself alive.
+ * through this process wakes its streams at once, and one made through another
+ * replica does too while the wake relay is up (`crossReplicaWake`), so this only
+ * bounds how late a write is seen when a wake-up was lost. Long enough that a
+ * stream with nothing to say costs a query every few seconds, not every second:
+ * a ping every 25 s still keeps the connection itself alive.
  */
 const IDLE_POLL_MS = 5_000;
 
@@ -234,6 +242,11 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
+  if (opts.crossReplicaWake) {
+    const relay = startWakeRelay(waker, { client: dedicatedClient, query: (text, params) => db.query(text, params) });
+    app.addHook("onClose", async () => relay.stop());
+    await relay.ready;
+  }
   // Commands the assistant issues for the user (`devenv_send`) wake this replica's command streams as a route's do.
   store.setCommandWaker((connectorId) => waker.wake(`c:${connectorId}`));
   store.setSessionWaker((sessionId) => waker.wake(`s:${sessionId}`));
