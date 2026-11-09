@@ -175,7 +175,8 @@ export class ReviewClaw {
   reviewModes = new Map<string, string>();
   modeError: number | undefined;
   models: string[] | ClawError = ["claude-sonnet-5.5", "claude-opus-5.5", "gpt-6-luna"];
-  modelChoice: JsonObject | null = null;
+  /** The assistant's settings (its model choice); a ClawError: they cannot be read now. */
+  modelChoice: JsonObject | ClawError | null = null;
   /** What `startReviews` answers: 404 (a Claw without items) unless a test sets the items. */
   starts: ((token: string, request: Record<string, unknown>) => ReviewStart[]) | undefined;
   confirmations: JsonObject[] = [];
@@ -220,7 +221,12 @@ export class ReviewClaw {
           this.calls.push(["models", key]);
           return this.models instanceof ClawError ? Promise.reject(this.models) : Promise.resolve([...this.models]);
         },
-        assistantSettings: () => Promise.resolve(this.modelChoice),
+        assistantSettings: () => {
+          this.calls.push(["assistantSettings"]);
+          return this.modelChoice instanceof ClawError
+            ? Promise.reject(this.modelChoice)
+            : Promise.resolve(this.modelChoice);
+        },
       },
       assistant: {
         startReviews: (token: string, request: Record<string, unknown>) => {
@@ -459,7 +465,9 @@ export interface ItemOptions {
   readonly queueReason?: string;
   /** The first item's board number. */
   readonly seqFrom?: number;
-  readonly model?: Partial<Pick<ReviewStart, "mergeNeedsConfirmation" | "mergeByRequester" | "model" | "ignored">>;
+  readonly model?: Partial<
+    Pick<ReviewStart, "mergeNeedsConfirmation" | "mergeByRequester" | "model" | "ignored" | "fellBackFrom">
+  >;
 }
 
 /** Claw's items for every pull request of a request: item-1, item-2, ... with board numbers from 7 (`items_world`). */
