@@ -1031,8 +1031,13 @@ describe("attach end to end", () => {
     fs.utimesSync(file, old, old);
     const sid = await h.attach(REF);
     const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
-    h.prompt(sid, "background 100");
+    // Each task finishes when the test says so, after its turn's end has reached Claw. The connector takes the transcript's
+    // size when a turn ends: a notification written before that (a timer that beat a slow connector) is part of the turn,
+    // and there is no growth between turns left to see.
+    const finished = (n: number) => path.join(h.attachDir, `task-${n}-finished`);
+    h.prompt(sid, `background ${finished(1)}`);
     assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(1), "");
     await h.claw.until("the agent to answer the finished task by itself", () => fs.readFileSync(file, "utf8").includes("task-notification"));
     assert.ok(Date.now() - fs.statSync(file).mtimeMs < 600_000, "the transcript was written a moment ago");
     h.prompt(sid, "say two");
@@ -1043,8 +1048,9 @@ describe("attach end to end", () => {
     assert.ok(h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
     assert.ok(!h.audit().some((a) => a.kind === "transcript_changed"));
     // And again, once more on its own: the agent's program is known from each of its turns.
-    h.prompt(sid, "background 50");
+    h.prompt(sid, `background ${finished(2)}`);
     assert.equal((await h.turnEnd(sid, 3)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(2), "");
     await h.claw.until("the second notification", () => fs.readFileSync(file, "utf8").split('"kind":"task-notification"').length === 3);
     h.prompt(sid, "say four");
     assert.equal((await h.turnEnd(sid, 4)).data.stopReason, "end_turn");
@@ -1060,8 +1066,10 @@ describe("attach end to end", () => {
     const old = (Date.now() - 3_600_000) / 1000;
     fs.utimesSync(file, old, old);
     const sid = await h.attach(REF);
-    h.prompt(sid, "background 50");
+    const finished = path.join(h.attachDir, "task-finished");
+    h.prompt(sid, `background ${finished}`);
     assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished, "");
     await h.claw.until("the agent's own turn", () => fs.readFileSync(file, "utf8").includes("task-notification"));
     // A terminal opened the conversation, the person typed a prompt, it was answered, and the terminal closed.
     fs.appendFileSync(file, jl(...typedTurn));
@@ -1071,7 +1079,7 @@ describe("attach end to end", () => {
     const changed = h.audit().find((a) => a.kind === "transcript_changed");
     assert.equal(changed?.why, "entries written by another program");
     assert.ok(!h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
-    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), ["background 50"], "not sent to the agent that has not read the terminal's turn");
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), [`background ${finished}`], "not sent to the agent that has not read the terminal's turn");
     // Once it has settled, a fresh agent that reads the transcript takes it.
     fs.utimesSync(file, old, old);
     h.prompt(sid, "say three");
