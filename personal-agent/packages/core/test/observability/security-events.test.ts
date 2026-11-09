@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 import { randomInt } from "node:crypto";
 import { describe, it } from "node:test";
 import {
-  CATEGORIES,
-  FIELDS,
+  SECURITY_FIELD_CATEGORIES,
+  SECURITY_FIELDS,
   InvariantError,
   SECURITY_EVENTS,
   SECURITY_LOGGER,
@@ -151,7 +151,7 @@ describe("security event values", () => {
       Object.keys(record)
         .filter((k) => k !== "event")
         .sort(),
-      Object.keys(FIELDS).sort(),
+      Object.keys(SECURITY_FIELDS).sort(),
     );
   });
 
@@ -254,7 +254,9 @@ describe("security event fields", () => {
     for (const fields of FORBIDDEN_FIELDS) {
       const { lines, log, everything } = capture();
       const record = log.event("link_attempt", { aad_object_id: AAD, outcome: "wrong", ...fields });
-      const names = Object.keys(fields).map((name) => (Object.hasOwn(FIELDS, name) ? name : "<unknown_field>"));
+      const names = Object.keys(fields).map((name) =>
+        Object.hasOwn(SECURITY_FIELDS, name) ? name : "<unknown_field>",
+      );
       assert.deepEqual(record.dropped, [...new Set(names)].sort(), JSON.stringify(fields));
       for (const name of Object.keys(fields)) assert.equal(record[name], undefined);
       const logged = everything();
@@ -272,8 +274,8 @@ describe("security event fields", () => {
   it("refuses every generated link code in every string field", () => {
     const numbers = new Set(["pr_number", "count", "limit", "window_seconds", "retry_after_seconds", "status"]);
     const own = new Set(["client_ip", "service_url_host", "aad_object_id", "correlation_id"]);
-    const stringFields = Object.keys(FIELDS).filter(
-      (name) => !Object.hasOwn(CATEGORIES, name) && !numbers.has(name) && !own.has(name),
+    const stringFields = Object.keys(SECURITY_FIELDS).filter(
+      (name) => !Object.hasOwn(SECURITY_FIELD_CATEGORIES, name) && !numbers.has(name) && !own.has(name),
     );
     const { log, everything } = capture();
     let code = "";

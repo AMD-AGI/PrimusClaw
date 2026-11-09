@@ -1,6 +1,7 @@
 # W2: the Claw port and client, settings, metrics, secret source (env), token exchange, redaction, security events,
-# public errors, limits, guardrails, typed answers, understanding. python-baseline is the internal main the port follows.
-python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+# public errors, limits, guardrails, typed answers, understanding. The ported modules and their tests are unchanged between
+# 26d66d75 (where the port started) and this baseline.
+python-baseline: f09c85233bb016544a733bc08ec6489dfdec5a56
 
 # W2 main: the Claw HTTP client (claw.py), settings (config.py), the env secret source (secret_source.py, env part)
 teams/tests/test_claw_request_paths.py::test_every_request_method_with_an_id_is_covered -> packages/runtime/test/claw/request-paths.test.ts::Claw request paths > every request method with an id is covered

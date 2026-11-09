@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { typedAnswerText } from "../locales/typed-answer.js";
-import { pyInt } from "../text/py-regex.js";
+import { decimalInt } from "../text/py-text.js";
 import { ALL, ALLOW, CLAUSE_END, DENY, FILLER, PULL, QUESTION, WEAK, WORD, has } from "./patterns.js";
 import { withoutModes } from "./mode.js";
 
@@ -50,12 +50,12 @@ function written(text: string): Written[] {
     const g = m.groups ?? {};
     const start = m.index;
     const end = start + m[0].length;
-    if (g["lnum"]) return { start, end, repo: `${g["lo"] ?? ""}/${g["ln"] ?? ""}`, number: pyInt(g["lnum"]) };
+    if (g["lnum"]) return { start, end, repo: `${g["lo"] ?? ""}/${g["ln"] ?? ""}`, number: decimalInt(g["lnum"]) };
     if (g["rnum"]) {
       const repo = g["owner"] ? `${g["owner"]}/${g["name"] ?? ""}` : (g["name"] ?? "");
-      return { start, end, repo, number: pyInt(g["rnum"]) };
+      return { start, end, repo, number: decimalInt(g["rnum"]) };
     }
-    return { start, end, repo: "", number: pyInt(g["num"] ?? g["bare"] ?? "0") };
+    return { start, end, repo: "", number: decimalInt(g["num"] ?? g["bare"] ?? "0") };
   });
 }
 

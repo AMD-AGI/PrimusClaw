@@ -45,7 +45,6 @@ export * from "./claw/work-item.js";
 export * from "./locales/claw.js";
 export * from "./public-error/index.js";
 export * from "./security/redact.js";
-export * from "./text/py-text.js";
 export * from "./observability/ip-address.js";
 export * from "./observability/security-fields.js";
 export * from "./observability/security-log.js";
