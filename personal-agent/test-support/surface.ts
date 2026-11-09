@@ -19,6 +19,7 @@ import {
   type StreamRefused,
   type Surface,
   type SurfaceCaps,
+  type UpdateOptions,
 } from "@primusclaw/personal-agent";
 
 /** One thing a conversation was asked to do, in order. */
@@ -47,6 +48,8 @@ export interface FakeSurfaceOptions {
   readonly caps?: Partial<SurfaceCaps>;
   /** Rosters `members` returns, by conversation id; any other conversation cannot be listed (undefined). */
   readonly rosters?: Readonly<Record<string, readonly RosterMember[]>>;
+  /** Awaited by every `update` before it is recorded: a test holds edits "in flight" with it (default: none). */
+  readonly beforeUpdate?: () => Promise<void>;
   /** The people `openPersonal` can open a 1:1 with, by directory id ("u1" opens "personal:u1"); others give undefined. */
   readonly reachable?: readonly string[];
   /** Files `fetchFile` returns, by name; any other file is refused as "unreachable". */
@@ -64,6 +67,8 @@ export class FakeSurface implements Surface {
   private readonly files: NonNullable<FakeSurfaceOptions["files"]>;
   private readonly rosters: NonNullable<FakeSurfaceOptions["rosters"]>;
   private readonly reachable: ReadonlySet<string>;
+  /** @internal */
+  readonly beforeUpdate: () => Promise<void>;
   private nextId = 1;
 
   constructor(options: FakeSurfaceOptions = {}) {
@@ -71,6 +76,7 @@ export class FakeSurface implements Surface {
     this.files = options.files ?? {};
     this.rosters = options.rosters ?? {};
     this.reachable = new Set(options.reachable ?? []);
+    this.beforeUpdate = options.beforeUpdate ?? (() => Promise.resolve());
   }
 
   openPersonal(
@@ -157,10 +163,18 @@ class FakeConversation implements Conversation {
     return Promise.resolve();
   }
 
-  update(id: MessageId, message: OutMessage): Promise<void> {
+  /**
+   * Refused (rejects) when the channel cannot edit. With a signal: aborted before the edit is sent (before the call, or
+   * while `beforeUpdate` holds it), the edit is not recorded and the promise rejects with the signal's reason.
+   */
+  async update(id: MessageId, message: OutMessage, options: UpdateOptions = {}): Promise<void> {
+    const { signal } = options;
+    if (!this.surface.caps.edit) throw new Error("FakeConversation.update: this channel cannot edit");
+    signal?.throwIfAborted();
     this.edited.add(id);
+    await this.surface.beforeUpdate();
+    signal?.throwIfAborted();
     this.surface.record({ op: "update", conversation: this.ref.id, id, message });
-    return Promise.resolve();
   }
 
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>> {
