@@ -30,7 +30,9 @@ export class Inbox<T> {
       if (timeoutMs !== null && timeoutMs <= 0) return TIMED_OUT;
       const pause = new AbortController();
       const arrived = new Promise<boolean>((resolve) => {
-        this.wake = () => resolve(true);
+        this.wake = () => {
+          resolve(true);
+        };
       });
       const waits: Promise<boolean>[] = [arrived];
       if (timeoutMs !== null)

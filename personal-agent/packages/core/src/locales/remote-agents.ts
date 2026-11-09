@@ -88,6 +88,10 @@ export const remoteAgentText = defineCatalog({
     notAccepted: (p: { code: string }) => `PrimusClaw did not accept that (${p.code}).`,
     notAcceptedRef: (p: { ref: string }) => `PrimusClaw did not accept that (ref ${p.ref}).`,
     couldNotTake: (p: { status: number }) => `PrimusClaw could not take that (error ${String(p.status)}).`,
+    /** A session that ended while the chat was idle, when its end cannot be described (said in English, as the worker did). */
+    endedWhileIdle: (p: { reason: string }) =>
+      (p.reason ? `The session ended: ${p.reason}.` : "The session ended.") +
+      " Your messages go to PrimusClaw again. Start a new session with `/agent new AGENT PATH`.",
   },
   zh: {
     notEnabled: "这个 PrimusClaw 还没有打开远程 agent。",
@@ -157,6 +161,9 @@ export const remoteAgentText = defineCatalog({
     notAccepted: (p) => `PrimusClaw 没有接受这个请求（${p.code}）。`,
     notAcceptedRef: (p) => `PrimusClaw 没有接受这个请求（ref ${p.ref}）。`,
     couldNotTake: (p) => `PrimusClaw 处理不了这个请求（错误 ${String(p.status)}）。`,
+    endedWhileIdle: (p) =>
+      (p.reason ? `会话已结束：${p.reason}。` : "会话已结束。") +
+      "你的消息会重新发给 PrimusClaw。用 `/agent new AGENT PATH` 开新会话。",
   },
 });
 
