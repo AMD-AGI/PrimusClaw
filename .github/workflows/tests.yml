@@ -283,7 +283,8 @@ jobs:
         run: |
           set -euo pipefail
           tarball="nats-server-${NATS_SERVER_VERSION}-linux-amd64.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+          # --retry: GitHub's release downloads answer 504 for minutes during GitHub incidents (2026-11-09); curl --retry retries 5xx/timeouts.
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/$tarball" \
             "https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}/$tarball"
           echo "${NATS_SERVER_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
