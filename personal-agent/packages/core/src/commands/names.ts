@@ -51,3 +51,6 @@ export function isGroupCommand(name: string): boolean {
 export function isCommand(name: string): name is Command {
   return within(COMMANDS, name);
 }
+
+/** Commands the worker reads in a 1:1 chat that are not in the lists above (they are its features'). */
+export const WORDS_OF_A_CHAT = ["github", "board"] as const;

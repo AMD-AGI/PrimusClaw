@@ -48,3 +48,30 @@ export const linkText = defineCatalog({
     badCode: "That code is not valid or has expired. Get a new one on the console page.",
   },
 });
+
+/** The name the linked key has in SaFE (the console creates it under this name). */
+export const LINK_KEY_NAME = "PrimusClaw Teams";
+
+/** `/unlink`. */
+export const unlinkText = defineCatalog({
+  en: {
+    bindingOnly:
+      "This chat acts as you through a SaFE identity binding, which only you can remove: " +
+      "delete it in SaFE under identity bindings. Until then I keep working for you.",
+    deleted: "The API key was deleted.",
+    notDeleted: `I could not delete the API key named "${LINK_KEY_NAME}"; please delete it in SaFE under API keys.`,
+    stillBound:
+      " This chat is still connected through a SaFE identity binding, which only you can remove: " +
+      "delete it in SaFE under identity bindings.",
+    unlinked: (p: { tail: string }) => `Unlinked. ${p.tail}`,
+  },
+  zh: {
+    bindingOnly:
+      "This chat acts as you through a SaFE identity binding, which only you can remove: " +
+      "delete it in SaFE under identity bindings. Until then I keep working for you.",
+    deleted: "API key 已删除。",
+    notDeleted: `我没能删除 API key "${LINK_KEY_NAME}"; 请在 SaFE 的 API keys 里删除。`,
+    stillBound: "这个聊天仍通过 SaFE 身份绑定连着，只有你能删除它：在 SaFE 的身份绑定里删除。",
+    unlinked: (p) => `已断开。${p.tail}`,
+  },
+});
