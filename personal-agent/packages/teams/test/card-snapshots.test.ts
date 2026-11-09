@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { pyJsonDumps, remoteView } from "@primusclaw/personal-agent";
+import { pyJsonDumps } from "@primusclaw/personal-agent";
 import { Ajv } from "ajv";
 
 import { CJK } from "../src/cards/cjk.js";
@@ -40,14 +40,9 @@ const validate = new Ajv({ strict: false, allErrors: false }).compile({
 /** The cards whose buttons are someone else's whole set of choices, each of which must stay one tap away. */
 const FOUR_BUTTONS = new Set(["remote_permission", "remote_status", "remote_window", "remote_window_en"]);
 const HALF_NEXT_TO_CJK = new RegExp(`${CJK}[,:;?!]|[,;?!]${CJK}`);
-/** Besides the kit's own: the thumbs, a remote agent's kind icons, and the robot. */
+/** Besides the kit's own: the thumbs and the robot; a card's feature adds its own icons (`CatalogEntry.emoji`). */
 const EXTRA_EMOJI = ["\u{1f44d}", "\u{1f44e}", "\u{1f916}"];
-let allowedEmoji = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI, ...remoteView.KIND_ICONS]);
-
-/** Lines that port cards with their own emoji (a remote agent's kind icons) add them here. */
-export function allowEmoji(...emoji: string[]): void {
-  allowedEmoji = new Set([...allowedEmoji, ...emoji]);
-}
+const KIT_EMOJI = new Set<string>([...Object.values(ICONS), ...EXTRA_EMOJI]);
 
 /** A JSON value as the text it shows (Python's `str(node.get(key, ""))`: an absent value is ""). */
 function s(value: unknown): string {
@@ -83,6 +78,18 @@ function* words(card: JsonObject): Generator<readonly ["text" | "fact" | "button
       for (const fact of node["facts"] as JsonObject[]) yield ["fact", s(fact["title"]) + s(fact["value"])];
     } else if (type.startsWith("Action.") && "title" in node) yield ["button", s(node["title"])];
   }
+}
+
+/** The text of a card's header title (the first TextBlock of its first element, medium and bolder), if it has one. */
+function headerTitle(card: JsonObject): string | undefined {
+  const body = card["body"] as JsonObject[];
+  const top = body[0] ?? {};
+  const columns = (top["columns"] ?? []) as JsonObject[];
+  const head = (top["items"] ?? columns[columns.length - 1]?.["items"] ?? []) as JsonObject[];
+  const title = head[0];
+  if (!title || title["type"] !== "TextBlock" || title["size"] !== "Medium" || title["weight"] !== "Bolder")
+    return undefined;
+  return s(title["text"]);
 }
 
 test("the words of a card skip nodes without a type (a button's data) and read texts, facts and buttons", () => {
@@ -163,6 +170,7 @@ for (const entry of CATALOG) {
 
   test(`card uses emoji as the kit says: ${entry.id}`, () => {
     const card = content(entry.build());
+    const allowedEmoji = new Set([...KIT_EMOJI, ...(entry.emoji ?? [])]);
     const found: string[] = [];
     for (const [where, line] of words(card)) {
       const emoji = emojiIn(line);
@@ -175,14 +183,10 @@ for (const entry of CATALOG) {
       }
     }
     assert.ok(found.length <= emojiBudget(card), found.join(" "));
-    const body = card["body"] as JsonObject[];
-    const top = body[0] ?? {};
-    const columns = (top["columns"] ?? []) as JsonObject[];
-    const head = (top["items"] ?? columns[columns.length - 1]?.["items"] ?? []) as JsonObject[];
-    const title = head[0];
-    if (title && title["type"] === "TextBlock" && title["size"] === "Medium" && title["weight"] === "Bolder") {
-      const lead = emojiIn(s(title["text"]))[0];
-      assert.ok(lead !== undefined && s(title["text"]).startsWith(lead), s(title["text"]));
+    const title = headerTitle(card);
+    if (title !== undefined) {
+      const lead = emojiIn(title)[0];
+      assert.ok(lead !== undefined && title.startsWith(lead), title);
     }
   });
 }

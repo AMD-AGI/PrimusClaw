@@ -7,7 +7,7 @@ import { ConnectorSetup, setupFrom } from "../../packages/core/src/remote/connec
 import type { Agent, Connector, Session } from "../../packages/core/src/remote/model.js";
 import { agentsCard, permissionCard, sessionsCard, statusCard } from "../../packages/teams/src/views/remote/index.js";
 import { disconnectCard } from "../../packages/teams/src/views/remote/small-cards.js";
-import { type CatalogEntry, NOW, TZ, entries } from "./catalog.js";
+import { type CatalogEntry, NOW, TZ, entriesWithEmoji } from "./catalog.js";
 
 /** What the worker's tests configure: the address it reaches Claw at. */
 export const SETUP = new ConnectorSetup(setupFrom(null, "https://claw.example.com/claw-api"));
@@ -70,7 +70,8 @@ const sessions = (
     remoteView.sessionsView({ connectors, sessions: list, attached, now: NOW, lang: "zh", setup: SETUP, waiting }),
   );
 
-export const REMOTE: readonly CatalogEntry[] = entries(
+export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
+  remoteView.KIND_ICONS,
   [
     "remote_permission",
     () =>

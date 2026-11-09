@@ -27,3 +27,4 @@ export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * from "./public-error/public-errors.js";
 export * as remoteView from "./remote-view/index.js";
+export * from "./inbound-text/index.js";
