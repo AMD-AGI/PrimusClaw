@@ -80,7 +80,7 @@ test("written in: whole words in any order, run together, or a Chinese name insi
   assert.equal(writtenIn("Mei Lin", "请 Lin, Mei review 合入"), true);
   assert.equal(writtenIn("linmei", "请 linmei 帮我"), true);
   assert.equal(writtenIn("Bob", "请 Bobby 帮我"), false);
-  assert.equal(writtenIn("林梅", "请林梅帮我"), true);
+  assert.equal(writtenIn("周瑞", "请周瑞帮我"), true);
   assert.equal(writtenIn("", "anything"), false);
 });
 
