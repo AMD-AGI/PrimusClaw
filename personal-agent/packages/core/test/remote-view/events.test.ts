@@ -239,9 +239,10 @@ test("what a connector says about unattended is read from its events", () => {
     assert.deepEqual([step.mode, step.unattended, step.modeFlags], [mode, unattended, flags], label);
     const modes = data["modes"];
     if (Array.isArray(modes)) {
-      const ids = modes.flatMap((m) =>
-        m && typeof m === "object" && !Array.isArray(m) && typeof m["id"] === "string" ? [m["id"]] : [],
-      );
+      const ids = (modes as unknown[]).flatMap((m: unknown) => {
+        const id = m && typeof m === "object" && !Array.isArray(m) ? (m as Record<string, unknown>)["id"] : undefined;
+        return typeof id === "string" ? [id] : [];
+      });
       assert.deepEqual(step.modes, ids, label);
     }
   }

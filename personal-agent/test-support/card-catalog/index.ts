@@ -12,7 +12,13 @@ import { PROACTIVE_CARDS } from "./proactive.js";
 import { REMOTE } from "./remote.js";
 import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [...APPROVAL_CARDS, ...ASSISTANT_CARDS, ...PROACTIVE_CARDS, ...REMOTE, ...TURN];
+export const CATALOG: readonly CatalogEntry[] = [
+  ...APPROVAL_CARDS,
+  ...ASSISTANT_CARDS,
+  ...PROACTIVE_CARDS,
+  ...REMOTE,
+  ...TURN,
+];
 
 const BY_LINE = {
   W4: ["binding", "link", "onboarding", "repo", "session"],
