@@ -1,0 +1,84 @@
+# W6: the remote-agent domain (Python teams_agent/remote.py, remote_follow.py, connector_setup.py, connector_reasons.py; the test
+# fakes remote_fake.py and remote_world.py). Includes #454 (a terminal that does not ask; terminal_screen_unknown in words) and
+# #461 (/agents lists terminal sessions first), which are in the baseline. Work in progress: tests are added as they are ported.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+
+tests/test_connector_reasons.py::test_the_closed_set_is_all_known -> packages/core/test/remote/connector-reasons.test.ts::the closed set is all known
+tests/test_connector_reasons.py::test_every_code_is_said_in_words_not_as_the_code -> packages/core/test/remote/connector-reasons.test.ts::every code is said in words not as the code
+tests/test_connector_reasons.py::test_an_old_or_unknown_connector_is_told_to_upgrade_and_how_to_get_by -> packages/core/test/remote/connector-reasons.test.ts::an old or unknown connector is told to upgrade and how to get by
+tests/test_connector_reasons.py::test_a_fixed_connector_is_not_told_to_upgrade -> packages/core/test/remote/connector-reasons.test.ts::a fixed connector is not told to upgrade
+tests/test_connector_reasons.py::test_an_unknown_code_gets_a_generic_sentence_that_names_it_and_words_stay_as_they_are -> packages/core/test/remote/connector-reasons.test.ts::an unknown code gets a generic sentence that names it and words stay as they are
+tests/test_connector_reasons.py::test_ended_puts_the_lead_first_in_the_language -> packages/core/test/remote/connector-reasons.test.ts::ended puts the lead first in the language
+tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
+tests/test_remote_agents.py::test_with_the_flag_off_the_commands_say_so_and_nothing_is_called -> packages/core/test/remote/e2e/agents.test.ts::with the flag off the commands say so and nothing is called
+tests/test_remote_agents.py::test_a_claw_without_remote_agents_is_told_apart_from_a_missing_session -> packages/core/test/remote/e2e/agents.test.ts::a claw without remote agents is told apart from a missing session
+tests/test_remote_agents.py::test_agents_lists_my_machines_and_nobody_elses -> packages/core/test/remote/e2e/agents.test.ts::agents lists my machines and nobody elses
+tests/test_remote_agents.py::test_agents_with_no_machine_says_how_to_connect_one -> packages/core/test/remote/e2e/agents.test.ts::agents with no machine says how to connect one
+tests/test_remote_agents.py::test_a_new_session_on_a_connector_too_old_says_how_to_upgrade_it -> packages/core/test/remote/e2e/agents.test.ts::a new session on a connector too old says how to upgrade it
+tests/test_remote_agents.py::test_agents_with_no_machine_gives_the_one_line_that_pairs_one -> packages/core/test/remote/e2e/agents.test.ts::agents with no machine gives the one line that pairs one
+tests/test_remote_agents.py::test_pairing_a_claw_cannot_give_falls_back_to_signing_in_on_the_machine -> packages/core/test/remote/e2e/agents.test.ts::pairing a claw cannot give falls back to signing in on the machine
+tests/test_remote_agents.py::test_a_pairing_answer_of_an_unexpected_shape_never_reaches_a_shell -> packages/core/test/remote/e2e/agents.test.ts::a pairing answer of an unexpected shape never reaches a shell
+tests/test_remote_agents.py::test_a_revoked_machine_is_not_listed -> packages/core/test/remote/e2e/agents.test.ts::a revoked machine is not listed
+tests/test_remote_agents.py::test_an_unknown_subcommand_gets_the_usage_and_calls_nothing -> packages/core/test/remote/e2e/agents.test.ts::an unknown subcommand gets the usage and calls nothing
+tests/test_remote_agents.py::test_new_starts_a_session_attaches_the_chat_and_says_when_the_agent_is_ready -> packages/core/test/remote/e2e/agents.test.ts::new starts a session attaches the chat and says when the agent is ready
+tests/test_remote_agents.py::test_new_that_cannot_start_says_why_and_creates_nothing -> packages/core/test/remote/e2e/agents.test.ts::new that cannot start says why and creates nothing
+tests/test_remote_agents.py::test_an_agent_id_on_two_online_machines_must_be_named_with_its_machine -> packages/core/test/remote/e2e/agents.test.ts::an agent id on two online machines must be named with its machine
+tests/test_remote_agents.py::test_one_online_machine_wins_over_an_offline_one_with_the_same_agent -> packages/core/test/remote/e2e/agents.test.ts::one online machine wins over an offline one with the same agent
+tests/test_remote_agents.py::test_the_session_limit_and_the_machine_going_offline_between_the_list_and_the_create_are_told -> packages/core/test/remote/e2e/agents.test.ts::the session limit and the machine going offline between the list and the create are told
+tests/test_remote_agents.py::test_a_machine_that_goes_offline_between_the_list_and_the_create_is_told_so -> packages/core/test/remote/e2e/agents.test.ts::a machine that goes offline between the list and the create is told so
+tests/test_remote_agents.py::test_a_machine_reconnecting_as_the_session_is_asked_for_gets_it_once_it_is_back -> packages/core/test/remote/e2e/agents.test.ts::a machine reconnecting as the session is asked for gets it once it is back
+tests/test_remote_agents.py::test_a_session_refused_as_offline_says_reconnecting_only_for_a_machine_heard_from_moments_ago -> packages/core/test/remote/e2e/agents.test.ts::a session refused as offline says reconnecting only for a machine heard from moments ago
+tests/test_remote_agents.py::test_an_offline_machine_is_told_as_reconnecting_only_when_it_was_heard_from_moments_ago -> packages/core/test/remote/machines.test.ts::an offline machine is told as reconnecting only when it was heard from moments ago
+tests/test_remote_agents.py::test_a_message_claw_ended_for_its_machine_ends_the_turn_and_says_how -> packages/core/test/remote/e2e/agents.test.ts::a message claw ended for its machine ends the turn and says how
+tests/test_remote_agents.py::test_a_session_closed_under_a_running_turn_is_not_said_as_done -> packages/core/test/remote/e2e/agents.test.ts::a session closed under a running turn is not said as done
+tests/test_remote_agents.py::test_a_session_that_cannot_open_says_why_and_the_chat_goes_back_to_claw -> packages/core/test/remote/e2e/agents.test.ts::a session that cannot open says why and the chat goes back to claw
+tests/test_remote_agents.py::test_a_turn_shows_the_work_as_it_happens_then_the_answer_and_nothing_stays_open -> packages/core/test/remote/e2e/agents.test.ts::a turn shows the work as it happens then the answer and nothing stays open
+tests/test_remote_agents.py::test_a_message_while_the_agent_is_working_is_not_sent_on -> packages/core/test/remote/e2e/agents.test.ts::a message while the agent is working is not sent on
+tests/test_remote_agents.py::test_a_prompt_to_an_offline_machine_says_so_and_starts_no_turn -> packages/core/test/remote/e2e/agents.test.ts::a prompt to an offline machine says so and starts no turn
+tests/test_remote_agents.py::test_a_prompt_to_a_session_that_has_ended_says_so -> packages/core/test/remote/e2e/agents.test.ts::a prompt to a session that has ended says so
+tests/test_remote_agents.py::test_one_message_makes_one_idempotency_key_that_claw_accepts -> packages/core/test/remote/refusals.test.ts::one message makes one idempotency key that claw accepts
+tests/test_remote_agents.py::test_a_message_sent_twice_with_one_key_queues_one_prompt -> packages/core/test/remote/e2e/agents.test.ts::a message sent twice with one key queues one prompt
+tests/test_remote_agents.py::test_a_dropped_stream_is_picked_up_where_it_left_off_with_nothing_lost_or_repeated -> packages/core/test/remote/e2e/agents.test.ts::a dropped stream is picked up where it left off with nothing lost or repeated
+tests/test_remote_agents.py::test_events_the_agent_replayed_are_not_shown_as_new -> packages/core/test/remote/e2e/agents.test.ts::events the agent replayed are not shown as new
+tests/test_remote_agents.py::test_how_a_turn_ended_is_told_when_it_was_not_a_plain_end -> packages/core/test/remote/e2e/agents.test.ts::how a turn ended is told when it was not a plain end
+tests/test_remote_agents.py::test_the_agent_failing_a_turn_with_an_error_ends_it_with_the_reason -> packages/core/test/remote/e2e/agents.test.ts::the agent failing a turn with an error ends it with the reason
+tests/test_remote_agents.py::test_a_session_closed_while_it_works_ends_the_turn_and_the_attachment -> packages/core/test/remote/e2e/agents.test.ts::a session closed while it works ends the turn and the attachment
+tests/test_remote_agents.py::test_a_credential_the_agent_prints_is_masked_in_progress_and_in_the_answer -> packages/core/test/remote/e2e/agents.test.ts::a credential the agent prints is masked in progress and in the answer
+tests/test_remote_agents.py::test_stop_cancels_the_agents_turn_and_the_turn_ends_as_stopped -> packages/core/test/remote/e2e/agents-sessions.test.ts::stop cancels the agents turn and the turn ends as stopped
+tests/test_remote_agents.py::test_stop_when_nothing_runs_sends_nothing -> packages/core/test/remote/e2e/agents-sessions.test.ts::stop when nothing runs sends nothing
+tests/test_remote_agents.py::test_stop_for_a_machine_that_went_offline_queues_the_cancel_and_stops_watching -> packages/core/test/remote/e2e/agents-sessions.test.ts::stop for a machine that went offline queues the cancel and stops watching
+tests/test_remote_agents.py::test_a_turn_this_worker_lost_track_of_that_is_still_going_is_shown_to_its_end_before_a_new_one_starts -> packages/core/test/remote/e2e/agents-sessions.test.ts::a turn this worker lost track of that is still going is shown to its end before a new one starts
+tests/test_remote_agents.py::test_a_turn_that_ended_while_nobody_watched_still_delivers_its_answer -> packages/core/test/remote/e2e/agents-sessions.test.ts::a turn that ended while nobody watched still delivers its answer
+tests/test_remote_agents.py::test_a_turn_is_closed_in_the_store_even_when_its_answer_could_not_be_sent -> packages/core/test/remote/e2e/agents-sessions.test.ts::a turn is closed in the store even when its answer could not be sent
+tests/test_remote_agents.py::test_a_second_stop_stops_waiting_for_an_agent_that_does_not_end_its_turn -> packages/core/test/remote/e2e/agents-sessions.test.ts::a second stop stops waiting for an agent that does not end its turn
+tests/test_remote_agents.py::test_sessions_are_listed_numbered_and_only_mine -> packages/core/test/remote/e2e/agents-sessions.test.ts::sessions are listed numbered and only mine
+tests/test_remote_agents.py::test_attach_goes_back_to_a_session_without_replaying_it_and_resumes_the_agent -> packages/core/test/remote/e2e/agents-sessions.test.ts::attach goes back to a session without replaying it and resumes the agent
+tests/test_remote_agents.py::test_attach_by_id_prefix_and_the_refusals -> packages/core/test/remote/e2e/agents-sessions.test.ts::attach by id prefix and the refusals
+tests/test_remote_agents.py::test_an_id_whose_first_characters_are_all_digits_is_still_an_id_and_a_short_number_is_still_a_number -> packages/core/test/remote/e2e/agents-sessions.test.ts::an id whose first characters are all digits is still an id and a short number is still a number
+tests/test_remote_agents.py::test_attach_to_a_session_on_an_offline_machine_works_but_sends_no_resume -> packages/core/test/remote/e2e/agents-sessions.test.ts::attach to a session on an offline machine works but sends no resume
+tests/test_remote_agents.py::test_attach_while_the_agent_is_at_work_says_so_and_relights_its_open_permission_card -> packages/core/test/remote/e2e/agents-sessions.test.ts::attach while the agent is at work says so and relights its open permission card
+tests/test_remote_agents.py::test_detach_new_and_attach_wait_for_a_running_turn -> packages/core/test/remote/e2e/agents-sessions.test.ts::detach new and attach wait for a running turn
+tests/test_remote_agents.py::test_mode_shows_what_the_agent_offers_and_changes_it_with_the_agents_own_ids -> packages/core/test/remote/e2e/agents-sessions.test.ts::mode shows what the agent offers and changes it with the agents own ids
+tests/test_remote_agents.py::test_a_mode_the_agent_does_not_offer_is_refused_before_anything_is_sent -> packages/core/test/remote/e2e/agents-sessions.test.ts::a mode the agent does not offer is refused before anything is sent
+tests/test_remote_agents.py::test_mode_needs_an_attached_session_and_an_agent_that_has_not_confirmed_is_said_so -> packages/core/test/remote/e2e/agents-sessions.test.ts::mode needs an attached session and an agent that has not confirmed is said so
+tests/test_remote_agents.py::test_close_ends_the_attached_session_and_the_chat_goes_back_to_claw -> packages/core/test/remote/e2e/agents-sessions.test.ts::close ends the attached session and the chat goes back to claw
+tests/test_remote_agents.py::test_close_by_number_closes_that_one_and_keeps_the_attachment -> packages/core/test/remote/e2e/agents-sessions.test.ts::close by number closes that one and keeps the attachment
+tests/test_remote_agents.py::test_off_asks_first_and_disconnects_only_on_yes -> packages/core/test/remote/e2e/agents-machines.test.ts::off asks first and disconnects only on yes
+tests/test_remote_agents.py::test_off_speaks_the_chat_language -> packages/core/test/remote/e2e/agents-machines.test.ts::off speaks the chat language
+tests/test_remote_agents.py::test_off_a_paired_machine_points_to_a_new_pairing_command_not_login -> packages/core/test/remote/e2e/agents-machines.test.ts::off a paired machine points to a new pairing command not login
+tests/test_remote_agents.py::test_the_agents_card_connects_a_new_machine_with_one_tap -> packages/core/test/remote/e2e/agents-machines.test.ts::the agents card connects a new machine with one tap
+tests/test_remote_agents.py::test_off_names_the_machine_when_there_are_several_and_cannot_touch_anyone_elses -> packages/core/test/remote/e2e/agents-machines.test.ts::off names the machine when there are several and cannot touch anyone elses
+tests/test_remote_agents.py::test_everything_a_user_does_uses_that_users_key_only -> packages/core/test/remote/e2e/agents-machines.test.ts::everything a user does uses that users key only
+tests/test_remote_agents.py::test_the_answer_of_a_remote_turn_is_a_new_message_and_never_only_an_edit_of_the_progress_message -> packages/core/test/remote/e2e/agents-machines.test.ts::the answer of a remote turn is a new message and never only an edit of the progress message
+tests/test_remote_agents.py::test_a_long_remote_turn_ends_in_one_new_message_not_an_answer_and_a_notice -> packages/core/test/remote/e2e/agents-machines.test.ts::a long remote turn ends in one new message not an answer and a notice
+tests/test_remote_agents.py::test_what_a_refusal_from_claw_means_for_a_person -> packages/core/test/remote/refusals.test.ts::what a refusal from claw means for a person
+tests/test_remote_agents.py::test_claw_error_code_reads_the_error_word_and_nothing_else -> packages/core/test/remote/refusals.test.ts::claw error code reads the error word and nothing else
+tests/test_remote_agents.py::test_resolve_agent_prefers_the_one_online_machine_and_asks_when_it_cannot_choose -> packages/core/test/remote/machines.test.ts::resolve agent prefers the one online machine and asks when it cannot choose
+tests/test_remote_agents.py::test_a_refusal_cut_short_still_names_its_error -> packages/core/test/remote/refusals.test.ts::a refusal cut short still names its error
+tests/test_remote_agents.py::test_a_stopped_review_never_repeats_an_error_that_is_not_a_plain_word -> packages/core/test/remote/refusals.test.ts::a stopped review never repeats an error that is not a plain word
+tests/test_remote_agents.py::test_every_refusal_is_said_in_the_chat_language -> packages/core/test/remote/refusals.test.ts::every refusal is said in the chat language
+tests/test_remote_agents.py::test_every_table_sentence_and_fixed_reply_has_its_chinese -> packages/core/test/remote/refusals.test.ts::every table sentence and fixed reply has its chinese
+tests/test_remote_agents.py::test_resolve_agent_says_why_not_in_the_chat_language -> packages/core/test/remote/machines.test.ts::resolve agent says why not in the chat language
+tests/test_session_window.py::test_the_repost_rule -> packages/core/test/remote/window.test.ts::the repost rule
+tests/test_session_window.py::test_full_output_parts_are_bounded_and_masked -> packages/core/test/remote/window.test.ts::full output parts are bounded and masked
+tests/test_deployment_defaults.py::test_the_connector_commands_come_from_the_configured_claw_address -> MERGED packages/core/test/remote/connector-setup.test.ts::the connector commands come from the configured claw address
