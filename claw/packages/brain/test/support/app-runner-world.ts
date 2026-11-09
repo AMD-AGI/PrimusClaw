@@ -65,6 +65,8 @@ export class World {
   rec: AppRunRecord;
   /** workload id -> phase */
   workloads = new Map<string, "running" | "terminal" | "absent">();
+  /** What SaFE says about a terminal workload: its stable reason, and whether a disruption took it. */
+  endings = new Map<string, { reason?: string; disrupted?: boolean }>();
   /** shared storage */
   files = new Map<string, string>();
   /** `${workload}:${pid}` of live application processes */
@@ -145,9 +147,13 @@ export class World {
     if (exit !== undefined) this.files.set(`${STATE_DIR}/exit.json`, typeof exit === "string" ? exit : JSON.stringify(exit));
   }
 
-  /** SaFE says the workload is gone: its processes with it. */
-  killWorkload(wl: string, phase: "terminal" | "absent"): void {
+  /**
+   * SaFE says the workload is gone: its processes with it. `ending` is what SaFE says
+   * about a terminal one; none is a terminal workload with no reason named.
+   */
+  killWorkload(wl: string, phase: "terminal" | "absent", ending: { reason?: string; disrupted?: boolean } = {}): void {
     this.workloads.set(wl, phase);
+    this.endings.set(wl, ending);
     for (const key of [...this.procs]) if (key.startsWith(`${wl}:`)) this.procs.delete(key);
   }
 
@@ -205,9 +211,13 @@ export class World {
     instance: (_run, id) => this.inst(id),
     status: async (inst) => {
       const phase = this.workloads.get(inst.id) ?? "absent";
-      return phase === "running"
-        ? { running: true, healthy: true, state: "running" }
-        : { running: false, healthy: false, state: phase };
+      if (phase === "running") return { running: true, healthy: true, state: "running" };
+      const ending = phase === "terminal" ? this.endings.get(inst.id) ?? {} : {};
+      return {
+        running: false, healthy: false, state: phase,
+        ...(ending.reason ? { reason: ending.reason } : {}),
+        ...(ending.disrupted ? { disrupted: true } : {}),
+      };
     },
     exec: async (inst, command, _timeout, opts) => this.exec(inst.id, command, opts),
     stop: async (inst) => { this.stopped.push(inst.id); this.stoppedAt.push(this.clock); this.killWorkload(inst.id, "terminal"); },
