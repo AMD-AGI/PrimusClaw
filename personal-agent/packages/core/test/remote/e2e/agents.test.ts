@@ -1,30 +1,23 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-// Remote agents from the chat: the commands, where a message goes, the live view and the answer, stop, attach and detach. Every
-// test runs the remote agents and the real Claw client against the fake remote-agents server over real HTTP and SSE; the agent on
-// the machine is whatever a test says it is: the events a connector would post.
+// Remote agents from the chat: the commands, where a message goes, the live view and the answer. Every test runs the remote
+// agents and the real Claw client against the fake remote-agents server over real HTTP and SSE.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import { ClawError } from "../../../src/claw/errors.js";
-import { remoteAgentText } from "../../../src/locales/remote-agents.js";
-import { failureText } from "../../../src/remote/refusals.js";
+import { failureText, idempotencyKey } from "../../../src/remote/refusals.js";
 import { RECONNECT_RETRY_SECONDS } from "../../../src/remote/sessions.js";
-import type { FakeCommand, FakeRemote } from "../../../../../test-support/remote-fake.js";
-import { ALICE, type RemoteWorld, Script, USER_A, remoteWorld } from "../../../../../test-support/remote-world.js";
+import { type FakeCommand, type FakeRemote } from "../../../../../test-support/remote-fake.js";
+import { ALICE, Script, remoteWorld } from "../../../../../test-support/remote-world.js";
+import { AAD, BOB, TWO_AGENTS, attached, en, oneTurn, seen } from "./helpers.js";
 
-const BOB = "u-bob";
-const TWO_AGENTS: readonly (readonly [string, string, string])[] = [
-  ["codex", "codex", "Codex"],
-  ["claude", "claude", "Claude Code"],
-];
-const en = remoteAgentText.in("en");
 const OFFLINE = en.offline;
 const OUTDATED = en.outdated;
 const NOT_ENABLED = en.notEnabled;
 const STILL_WORKING = en.stillWorking;
-const AAD = USER_A.id;
 
 const errors = {
   looksInternal: () => false,
@@ -32,23 +25,6 @@ const errors = {
 };
 const said = (status: number, body: string): string =>
   failureText(new ClawError(status, body), errors, Date.now() / 1000);
-
-/** A world whose user has started a session on dev-pod and has been told it is ready. */
-async function attached(w: RemoteWorld, script = new Script(), cwd = "/home/me/repo", agent = "codex", online = true) {
-  const cid = w.server.addConnector(ALICE, "dev-pod", TWO_AGENTS, { online });
-  w.server.onCommand = script.hook;
-  await w.say(`/agent new ${agent} ${cwd}`);
-  const state = w.test.store.remoteState.attachedRemote(AAD);
-  assert.ok(state, w.said().join("\n"));
-  return { cid, sid: state.sessionId ?? "" };
-}
-
-async function oneTurn(srv: FakeRemote, sid: string, _cmd: FakeCommand, text = "Done."): Promise<void> {
-  await srv.say(sid, text);
-  await srv.end(sid);
-}
-
-const seen = (secondsAgo: number): string => new Date(Date.now() - secondsAgo * 1000).toISOString();
 
 // --- off by default, and off on Claw ------------------------------------------------------------------------------------
 
@@ -489,4 +465,111 @@ test("a prompt to a session that has ended says so", () =>
     w.server.session(sid).status = "closed";
     await w.say("hello?");
     assert.ok(w.last().includes("That session has ended") && w.progressTexts().length === 0, w.last());
+  }));
+
+test("a message sent twice with one key queues one prompt", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attached(w);
+    const keys = { sha1Hex: (t: string) => createHash("sha1").update(t).digest("hex"), hexId: () => "x" };
+    const key = idempotencyKey(keys, "aad-a", "act-dup");
+    await w.claw.command("ak-alice", sid, { type: "prompt", text: "once" }, key);
+    const out = await w.claw.command("ak-alice", sid, { type: "prompt", text: "once" }, key);
+    assert.equal(out["duplicate"], true);
+    assert.equal(w.server.commandsOf("prompt").length, 1);
+  }));
+
+test("a dropped stream is picked up where it left off with nothing lost or repeated", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      for (let n = 0; n < 6; n += 1) await srv.say(sid, `part${String(n)} `);
+      await srv.end(sid);
+    };
+    const { sid } = await attached(w, script);
+    w.server.dropStreamAfter = 3;
+    w.server.streamOpens.length = 0;
+    await w.say("go");
+    assert.equal(w.answer(), "part0 part1 part2 part3 part4 part5");
+    const [first, second] = w.server.streamOpens;
+    const rows = w.server.events.get(sid) ?? [];
+    const ids = rows.map((e) => e.id);
+    const promptStart = ids.indexOf(rows.find((e) => e.type === "agent_message_chunk")?.id ?? -1) - 1;
+    assert.ok(first && second);
+    assert.ok(
+      second.after === ids[promptStart + 3] && second.after > first.after,
+      JSON.stringify([first, second, ids]),
+    );
+  }));
+
+test("events the agent replayed are not shown as new", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      await srv.emit(sid, "agent_message_chunk", { replay: true, text: "OLD MESSAGE" });
+      await srv.emit(sid, "turn_end", { replay: true, stopReason: "end_turn" });
+      await srv.say(sid, "new message");
+      await srv.end(sid);
+    };
+    await attached(w, script);
+    await w.say("go");
+    assert.equal(w.answer(), "new message");
+    assert.ok(!w.said().some((t) => t.includes("OLD")));
+  }));
+
+test("how a turn ended is told when it was not a plain end", async () => {
+  for (const [reason, note] of [
+    ["max_tokens", "reached its output limit"],
+    ["refusal", "declined to continue"],
+    ["max_turn_requests", "limit of steps"],
+    ["weird", "The turn ended (error): an internal error (ref "],
+  ] as const) {
+    await remoteWorld(async (w) => {
+      const script = new Script();
+      script.onPrompt = async (srv, sid) => {
+        await srv.say(sid, "partial answer");
+        await srv.end(sid, reason);
+      };
+      await attached(w, script);
+      await w.say("go");
+      assert.ok(w.answer().includes("partial answer") && w.answer().includes(note), `${reason}: ${w.answer()}`);
+    });
+  }
+});
+
+test("the agent failing a turn with an error ends it with the reason", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      await srv.emit(sid, "turn_end", { stopReason: "error", error: "model gateway returned 502" });
+    };
+    await attached(w, script);
+    await w.say("go");
+    assert.ok(w.answer().includes("The turn ended (error): model gateway returned 502"), w.answer());
+    assert.equal(w.test.store.remoteState.attachedRemote(AAD)?.turnOpen, false);
+  }));
+
+test("a session closed while it works ends the turn and the attachment", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      await srv.say(sid, "starting");
+      await srv.emit(sid, "session_closed", { reason: "the connector was revoked" });
+    };
+    await attached(w, script);
+    await w.say("go");
+    assert.ok(w.answer().includes("The session ended: the connector was revoked."), w.answer());
+    assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
+  }));
+
+test("a credential the agent prints is masked in progress and in the answer", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    const secret = "sk-EXAMPLE-abcdef0123456789abcdef0123456789";
+    script.onPrompt = async (srv, sid) => {
+      await srv.say(sid, `your key is ${secret}`);
+      await srv.end(sid);
+    };
+    await attached(w, script);
+    await w.say("show it");
+    assert.ok(!w.said().join(" ").includes(secret));
   }));

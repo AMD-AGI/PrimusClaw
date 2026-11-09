@@ -18,6 +18,7 @@ import {
   silentLogger,
 } from "@primusclaw/personal-agent";
 import { createClawClient, systemClock } from "@primusclaw/personal-agent-runtime";
+import type { ClawRemoteAgentsPort } from "../packages/core/src/ports/claw/remote-agents.js";
 import { createHash } from "node:crypto";
 
 import { DirectChat } from "../packages/core/src/direct-chat/direct-chat.js";
@@ -92,6 +93,7 @@ export function* wordsOf(blocks: unknown): Generator<string> {
 
 export interface WorldOptions {
   readonly enabled?: boolean;
+  readonly watchSeconds?: { readonly start: number; readonly mode: number };
   readonly windowDefault?: "card" | "chat";
   readonly direct?: boolean;
 }
@@ -101,6 +103,10 @@ export class RemoteWorld {
   readonly virtual = new VirtualClock();
   readonly test = openTestStore();
   readonly remote: RemoteAgents;
+  /** Claw's remote-agents port as the agent calls it. */
+  readonly claw: ClawRemoteAgentsPort;
+  /** A message the channel refuses to post (Teams said no), when this says so. */
+  refuse: ((message: OutMessage) => boolean) | null = null;
   private n = 0;
   private langs = new Map<string, "zh" | "en">();
 
@@ -110,6 +116,7 @@ export class RemoteWorld {
   ) {
     const store = this.test.store;
     const claw = createClawClient({ baseUrl: server.url, clock: systemClock });
+    this.claw = claw.remoteAgents;
     const ctx: RemoteContext = {
       settings: {
         enabled: options.enabled ?? true,
@@ -119,6 +126,7 @@ export class RemoteWorld {
         watchTimings: TEST_TIMINGS,
         botName: "Clawy",
         streaming: false,
+        ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
       },
       claw: claw.remoteAgents,
       clawBaseUrl: server.url,
@@ -128,7 +136,7 @@ export class RemoteWorld {
       permissions: store.remotePermissions,
       prefs: store.prefs,
       references: store.references,
-      conversationFor: (reference) => this.surface.conversation(refOf(reference)),
+      conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
       credentialFor: (person) => Promise.resolve(KEY_OF[person] ?? null),
       reach: { reachable: () => true, muted: () => null, holdRemote: () => undefined },
       guard: guardOf(new Guardrails(systemClock, () => undefined)),
@@ -163,7 +171,28 @@ export class RemoteWorld {
       wire: { conversation: { id: `conv-${user.id}` } },
     };
     this.test.store.references.saveReference(user.id, { conversation: { id: ref.id, conversationType: "personal" } });
-    return this.surface.conversation(ref);
+    return this.wrap(this.surface.conversation(ref));
+  }
+
+  /** The conversation as the channel posts to it, refusing what a test says Teams refuses. */
+  private wrap(to: Conversation): Conversation {
+    const refused = (message: OutMessage): Promise<never> | null =>
+      this.refuse?.(message) === true ? Promise.reject(new Error("Teams said no")) : null;
+    return {
+      ref: to.ref,
+      edited: to.edited,
+      typing: () => to.typing(),
+      send: (message) => refused(message) ?? to.send(message),
+      post: (message) => refused(message) ?? to.post(message),
+      update: (id, message, options) => refused(message) ?? to.update(id, message, options),
+      delete: (id) => to.delete(id),
+      outgoing: (message) => to.outgoing(message),
+      deliver: (envelope) => to.deliver(envelope),
+      openStream: (replyTo, status) => to.openStream(replyTo, status),
+      markSettled: (id) => {
+        to.markSettled(id);
+      },
+    };
   }
 
   /** One message from the user, routed as the router routes it for remote agents, then until the worker is quiet. */

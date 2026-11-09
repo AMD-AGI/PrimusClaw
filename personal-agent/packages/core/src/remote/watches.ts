@@ -57,6 +57,11 @@ export class Watches {
     private readonly ended: EndedWords,
   ) {}
 
+  /** How long a watch of a new session (`start`) or of a mode switch (`mode`) reads. */
+  private seconds(which: "start" | "mode"): number {
+    return this.ctx.settings.watchSeconds?.[which] ?? (which === "start" ? WATCH_SECONDS : MODE_WATCH_SECONDS);
+  }
+
   /** Run a watch for the chat; once it is over (not cancelled) the follower reads on. */
   spawn(chatKey: string, work: (signal: AbortSignal) => Promise<void>): void {
     const task = new Task(work, this.ctx.logger, "a short watch");
@@ -107,7 +112,14 @@ export class Watches {
   async start(w: StartWatch, signal: AbortSignal): Promise<void> {
     try {
       const credential = (): Promise<string> => credentialOf(w.key, w.provider);
-      const step = await this.watch(w.chatKey, w.sessionId, credential, (s) => s.started, WATCH_SECONDS, signal);
+      const step = await this.watch(
+        w.chatKey,
+        w.sessionId,
+        credential,
+        (s) => s.started,
+        this.ctx.settings.watchSeconds?.start ?? WATCH_SECONDS,
+        signal,
+      );
       const state = this.state.attached(w.chatKey);
       if (state?.sessionId !== w.sessionId) return;
       if (step?.terminal !== null && step?.terminal !== undefined)
@@ -212,7 +224,14 @@ export class Watches {
       return remoteAgentText.in(this.state.lang(w.chatKey)).switchFailed;
     }
     const credential = (): Promise<string> => credentialOf(w.key, w.provider);
-    const step = await this.watch(w.chatKey, w.sessionId, credential, modeAnswer, MODE_WATCH_SECONDS, signal);
+    const step = await this.watch(
+      w.chatKey,
+      w.sessionId,
+      credential,
+      modeAnswer,
+      this.ctx.settings.watchSeconds?.mode ?? MODE_WATCH_SECONDS,
+      signal,
+    );
     if (!step?.rejected) return null;
     const connectorId = this.state.attached(w.chatKey)?.connectorId ?? "";
     const why = await this.ended.said(
@@ -236,7 +255,14 @@ export class Watches {
   ): Promise<void> {
     try {
       const credential = (): Promise<string> => credentialOf(w.key, w.provider);
-      const step = await this.watch(chatKey, sessionId, credential, modeAnswer, MODE_WATCH_SECONDS, signal);
+      const step = await this.watch(
+        chatKey,
+        sessionId,
+        credential,
+        modeAnswer,
+        this.ctx.settings.watchSeconds?.mode ?? MODE_WATCH_SECONDS,
+        signal,
+      );
       const lang = this.state.lang(chatKey);
       const words = remoteAgentText.in(lang);
       const shown = neutral(mode, MODE_ID_MAX);

@@ -62,6 +62,8 @@ export interface RemoteSettings {
   readonly watchTimings: FollowTimings;
   /** The assistant's display name. */
   readonly botName: string;
+  /** How long `/agent new` waits for the agent's first word, and `/agent mode` for its answer (defaults: 30 s and 10 s). */
+  readonly watchSeconds?: { readonly start: number; readonly mode: number };
   /** A turn is shown in a live stream answering the person's message (the reply style streams here and the channel can). */
   readonly streaming: boolean;
 }
