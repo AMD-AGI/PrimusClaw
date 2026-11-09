@@ -174,7 +174,7 @@ export class ReviewClaw {
   readonly calls: [string, ...unknown[]][] = [];
   reviewModes = new Map<string, string>();
   modeError: number | undefined;
-  models: string[] | ClawError = ["claude-sonnet-5.5", "claude-opus-5.5", "gpt-6-luna"];
+  models: string[] | Error = ["claude-sonnet-5.5", "claude-opus-5.5", "gpt-6-luna"];
   /** The assistant's settings (its model choice); a ClawError: they cannot be read now. */
   modelChoice: JsonObject | ClawError | null = null;
   /** What `startReviews` answers: 404 (a Claw without items) unless a test sets the items. */
@@ -223,7 +223,7 @@ export class ReviewClaw {
         },
         models: (key: string) => {
           this.calls.push(["models", key]);
-          return this.models instanceof ClawError ? Promise.reject(this.models) : Promise.resolve([...this.models]);
+          return this.models instanceof Error ? Promise.reject(this.models) : Promise.resolve([...this.models]);
         },
         assistantSettings: () => {
           this.calls.push(["assistantSettings"]);

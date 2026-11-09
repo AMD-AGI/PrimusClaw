@@ -369,6 +369,13 @@ teams/tests/test_typed_answer.py::test_every_request_to_review_and_merge_that_ha
 teams/tests/test_typed_answer.py::test_a_confirmation_that_names_no_review_still_confirms_the_merge -> packages/core/test/review/typed-answers.test.ts::a confirmation that names no review still confirms the merge: 确认
 teams/tests/test_typed_answer.py::test_a_bare_confirmation_with_no_model_reading_still_confirms -> packages/core/test/review/typed-answers.test.ts::a bare confirmation with no model reading still confirms: 确认 #12
 teams/tests/test_typed_answer.py::test_whether_it_can_merge_is_a_question_never_a_choice_of_the_merge -> packages/core/test/review/typed-answers.test.ts::whether it can merge is a question never a choice of the merge: 确认 #12 能不能合
+teams/tests/test_github_review_many.py::test_a_named_model_is_the_model_of_every_session_of_the_request -> packages/core/test/review/many-models.test.ts::a named model is the model of every session of the request (named several)
+teams/tests/test_github_review_many.py::test_a_model_the_askers_key_cannot_use_starts_nothing_and_never_falls_back_to_the_default -> packages/core/test/review/many-models.test.ts::a model the askers key cannot use starts nothing and never falls back to the default (not on the list)
+teams/tests/test_github_review_many.py::test_the_result_says_which_model_the_review_ran_on -> packages/core/test/review/many-models.test.ts::the result says which model the review ran on (session model)
+teams/tests/test_github_review_many.py::test_the_confirmation_card_says_which_model_the_review_ran_on -> packages/core/test/review/many-models.test.ts::the confirmation card says which model the review ran on
+teams/tests/test_github_review_many.py::test_a_model_name_from_outside_reaches_the_group_as_a_model_id_and_nothing_else -> packages/core/test/review/many-models.test.ts::a model name from outside reaches the group as a model id and nothing else
+teams/tests/test_github_review_many.py::test_ten_lines_that_each_ask_the_same_person_are_one_request_for_ten_pull_requests -> packages/core/test/review/many-models.test.ts::ten lines that each ask the same person are one request for ten pull requests (a mention per line)
+teams/tests/test_github_review_many.py::test_lines_that_ask_different_people_start_nothing_and_say_why -> packages/core/test/review/many-models.test.ts::lines that ask different people start nothing and say why
 
 # LATER: tests of another line's code, to be ported by that line (the checker skips comment lines; one per Python test).
 # LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out
