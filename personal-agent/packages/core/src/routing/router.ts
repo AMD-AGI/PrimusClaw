@@ -5,6 +5,7 @@ import { naturalCommand } from "../capabilities/natural.js";
 import { menuCommand, parseCommand } from "../commands/parse.js";
 import { errorName } from "../errors.js";
 import { routingText } from "../locales/routing.js";
+import { noRequestScope } from "../ports/request-scope.js";
 import type { InboundEvent, InboundMessage, InboundVote, UserRef } from "../ports/surface.js";
 import type { ReviewSlots } from "./admission.js";
 import { Chat } from "./chat.js";
@@ -63,7 +64,14 @@ export class Router {
   async handle(event: InboundEvent): Promise<void> {
     const { store } = this.ctx.deps;
     if (event.id && store.idempotency.seen(event.id)) return;
-    if (event.sender.id) await this.route(event);
+    // (what this event starts runs in its context: its locale, its id for audit records, its sender and chat for logs)
+    const context = {
+      clientLocale: event.locale,
+      activityId: event.id,
+      userId: event.sender.id,
+      conversationId: event.conversation.id,
+    };
+    if (event.sender.id) await (this.ctx.deps.requestScope ?? noRequestScope).run(context, () => this.route(event));
     if (event.id) store.idempotency.markProcessed(event.id);
   }
 
