@@ -1,0 +1,645 @@
+{
+  "about": "The Python worker's safe.revoke_own_key on these platform answers (httpx.MockTransport): what it returned and the requests it made, in order (safe.py with the path-segment fix: an id is used only as one path segment, a positive integer or [A-Za-z0-9._~-]{1,200} but not . or ..).",
+  "cases": [
+    {
+      "label": "deleted: 204",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1001\"}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1001"]
+      ]
+    },
+    {
+      "label": "deleted: 200",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1002\"}"
+      },
+      "delete": {
+        "status": 200,
+        "body": "{\"ok\": true}"
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1002"]
+      ]
+    },
+    {
+      "label": "deleted: 202",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1003\"}"
+      },
+      "delete": {
+        "status": 202,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1003"]
+      ]
+    },
+    {
+      "label": "the id inside data",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": {\"id\": \"k-1004\"}}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1004"]
+      ]
+    },
+    {
+      "label": "the top id wins over data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1005\", \"data\": {\"id\": \"k-other\"}}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1005"]
+      ]
+    },
+    {
+      "label": "an empty top id falls back to data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"\", \"data\": {\"id\": \"k-1006\"}}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1006"]
+      ]
+    },
+    {
+      "label": "an id of 0 falls back to data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": 0, \"data\": {\"id\": \"k-1007\"}}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1007"]
+      ]
+    },
+    {
+      "label": "a numeric id",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": 4242}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/4242"]
+      ]
+    },
+    {
+      "label": "an id with dots, tilde, dash, underscore",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"a.b~c-d_e\"}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/a.b~c-d_e"]
+      ]
+    },
+    {
+      "label": "the delete refused: 401",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1008\"}"
+      },
+      "delete": {
+        "status": 401,
+        "body": ""
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1008"]
+      ]
+    },
+    {
+      "label": "the delete refused: 403",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1009\"}"
+      },
+      "delete": {
+        "status": 403,
+        "body": ""
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1009"]
+      ]
+    },
+    {
+      "label": "the delete not found: 404",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1010\"}"
+      },
+      "delete": {
+        "status": 404,
+        "body": ""
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1010"]
+      ]
+    },
+    {
+      "label": "the delete failed: 500",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1011\"}"
+      },
+      "delete": {
+        "status": 500,
+        "body": "oops"
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1011"]
+      ]
+    },
+    {
+      "label": "the delete redirected: 302",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1012\"}"
+      },
+      "delete": {
+        "status": 302,
+        "body": ""
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1012"]
+      ]
+    },
+    {
+      "label": "the delete timed out",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1013\"}"
+      },
+      "delete": {
+        "fail": "ReadTimeout"
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1013"]
+      ]
+    },
+    {
+      "label": "the delete's connection broke",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k-1014\"}"
+      },
+      "delete": {
+        "fail": "ConnectError"
+      },
+      "revoked": false,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/k-1014"]
+      ]
+    },
+    {
+      "label": "current unauthorized: 401",
+      "current": {
+        "status": 401,
+        "body": "{\"id\": \"k-1015\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current forbidden: 403",
+      "current": {
+        "status": 403,
+        "body": "{\"id\": \"k-1016\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current not found: 404",
+      "current": {
+        "status": 404,
+        "body": "{\"id\": \"k-1017\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current failed: 500",
+      "current": {
+        "status": 500,
+        "body": "{\"id\": \"k-1018\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current redirected: 302",
+      "current": {
+        "status": 302,
+        "body": "{\"id\": \"k-1019\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current 201 is not 200",
+      "current": {
+        "status": 201,
+        "body": "{\"id\": \"k-1020\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current timed out",
+      "current": {
+        "fail": "ReadTimeout"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current's connection broke",
+      "current": {
+        "fail": "ConnectError"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current not JSON",
+      "current": {
+        "status": 200,
+        "body": "<html>sign in</html>"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current empty",
+      "current": {
+        "status": 200,
+        "body": ""
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current a list",
+      "current": {
+        "status": 200,
+        "body": "[{\"id\": \"k-1021\"}]"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current a string",
+      "current": {
+        "status": 200,
+        "body": "\"k-1022\""
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current null",
+      "current": {
+        "status": 200,
+        "body": "null"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "current without an id",
+      "current": {
+        "status": 200,
+        "body": "{\"name\": \"mine\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of null and no data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": null}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "data that is a string",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": \"k-1023\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "data that is a list",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": [\"k-1024\"]}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "data that is an empty list",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": []}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "data without an id",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": {\"name\": \"x\"}}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "data with an empty id",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": {\"id\": \"\"}}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "SaFE's own numeric id",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": 123}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/123"]
+      ]
+    },
+    {
+      "label": "a numeric id inside data",
+      "current": {
+        "status": 200,
+        "body": "{\"data\": {\"id\": 77}}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/77"]
+      ]
+    },
+    {
+      "label": "an id of 0 and no data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": 0}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of false and no data",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": false}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "a numeric string id",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"123\"}"
+      },
+      "delete": {
+        "status": 204,
+        "body": ""
+      },
+      "revoked": true,
+      "requests": [
+        ["GET", "/api/v1/apikeys/current"],
+        ["DELETE", "/api/v1/apikeys/123"]
+      ]
+    },
+    {
+      "label": "a negative id",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": -5}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of true",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": true}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "a fractional id",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": 5.5}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of an object",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": {\"v\": 1}}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of 201 characters",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id with a slash",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"../users/self\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id with a space",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k 1\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of a dot segment",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"..\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of one dot",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \".\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id of a list",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": [\"k-1\"]}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id with a percent",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k%2F1\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    },
+    {
+      "label": "an id with non-ASCII letters",
+      "current": {
+        "status": 200,
+        "body": "{\"id\": \"k\\u00e9\"}"
+      },
+      "delete": null,
+      "revoked": false,
+      "requests": [["GET", "/api/v1/apikeys/current"]]
+    }
+  ]
+}
