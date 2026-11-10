@@ -1,0 +1,599 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Personal agent release
+
+# Releases the personal agent (personal-agent/README.md, "Releasing"): its three npm packages, @primusclaw/personal-agent,
+# -runtime and -teams, in lockstep at one version, and, once switched on, its worker image. A maintainer pushes the tag
+# personal-agent-vX.Y.Z on a commit of main whose three package.json files name X.Y.Z; this workflow builds, tests and
+# checks the packages and the image, then (each behind a GitHub environment's reviewers) attests the tarballs, puts them
+# on the GitHub Release of that tag and publishes them to npm, and pushes the image and attests it.
+#
+# What runs on which event:
+#   tag push personal-agent-v*            package, then publish-npm; publish-image too when the switch below is on
+#   workflow_dispatch, dry-run (default)  package only, on any ref: builds and checks everything, publishes nothing
+#   workflow_dispatch, dry-run off        as a tag push, and only on a personal-agent-v* tag (the re-run of a release
+#                                         whose run failed part-way); on any other ref the package job refuses
+#   pull_request changing this file       package only, as a dry run, so a change to the release is seen working
+# Nothing else starts it: a push to a branch does not.
+#
+# What stops an unreviewed publish. A tag push runs this file as it exists at the tag, and a tag can point at any
+# commit, so the checks in this file (tag shape, the commit being in main's history, the environments having reviewers)
+# catch honest mistakes. The boundary is outside it: the environment npm-publish, whose reviewers must approve
+# publish-npm and which npm's Trusted Publisher entry names (npm gives the publish credential to nothing else), the
+# environment image-publish, whose reviewers must approve publish-image, and a tag ruleset that lets only repository
+# admins create personal-agent-v* tags.
+#
+# Nothing that runs repository code or installs a dependency holds a credential:
+#   package        builds, tests and checks the tarballs and the image. contents: read, no OIDC, no secret.
+#   publish-npm    handles the finished tarballs and nothing else: no checkout, no install, no repository script.
+#   publish-image  handles the finished image archive and nothing else, likewise. Its registry and push target are
+#                  derived here, from repository configuration only, never from anything the package job produced.
+#
+# The image. Off until the repository variable PERSONAL_AGENT_IMAGE_PUBLISH is exactly "true": until then a release
+# publishes the npm packages and attaches the tarballs, and the image is built and smoke-tested but pushed nowhere. The
+# target is PERSONAL_AGENT_IMAGE_PREFIX (default docker.io/primussafe) followed by /personal-agent-teams:X.Y.Z. The
+# registry publish-image logs in to is the first component of that same target, computed in the same step, so the two
+# cannot point at different registries; personal-agent/scripts/release-workflow-check.sh runs that step against a set
+# of prefixes and fails if they ever differ. Docker Hub's credentials (DOCKER_USERNAME/PASSWORD, which the Build
+# workflow pushes claw with) are only ever given to docker.io; any other registry needs its own
+# PERSONAL_AGENT_REGISTRY_USERNAME/PASSWORD, and the job fails without them rather than fall back to another target.
+on:
+  push:
+    tags:
+      - "personal-agent-v*"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build and check only; publish nothing. Turning it off publishes, and only on a personal-agent-v* tag."
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - ".github/workflows/personal-agent-release.yml"
+      - "personal-agent/scripts/release-workflow-check.sh"
+
+# Least privilege for the default GITHUB_TOKEN; the publish jobs add what they need.
+permissions:
+  contents: read
+
+# A new pull request head cancels the previous head's dry run. A tag or a dispatch gets a group of its own here; the two
+# publish jobs share one group of their own (below), so releases never run side by side and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    name: Build and check the packages and the image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A tagged commit has to be compared with main's history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The shape this file must keep (which job may publish on which event, the switch, the login registry being the
+      # push registry), checked on the copy of the file this run is executing.
+      - name: The release workflow keeps its shape
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update && sudo apt-get install -y python3-yaml; }
+          bash personal-agent/scripts/release-workflow-check.sh
+
+      # The ref and the tag are attacker-shaped text, so they reach the shell through the environment, never through
+      # ${{ }} in a script.
+      - name: What this run releases
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ format('{0}', inputs.dry-run) }}
+          IMAGE_SWITCH: ${{ vars.PERSONAL_AGENT_IMAGE_PUBLISH }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [ "$EVENT" = push ] || { [ "$EVENT" = workflow_dispatch ] && [ "$DRY_RUN" = false ]; }; then publish=true; fi
+          if [[ "$REF" == refs/tags/personal-agent-v* ]]; then
+            if ! [[ "$REF_NAME" =~ ^personal-agent-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::the tag is not personal-agent-vMAJOR.MINOR.PATCH; refusing to release"
+              exit 1
+            fi
+            version="${REF_NAME#personal-agent-v}"
+          elif [ "$publish" = true ]; then
+            echo "::error::a publishing run needs a personal-agent-vX.Y.Z tag as its ref, not $REF; dispatch it on the tag, or leave dry-run on"
+            exit 1
+          else
+            version="$(jq -r .version personal-agent/packages/teams/package.json)"
+          fi
+          image=off
+          if [ "$IMAGE_SWITCH" = true ]; then image=on; fi
+          echo "publish=$publish image=$image version=$version"
+          {
+            echo "publish=$publish"
+            echo "image=$image"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      # A tag can be put on any commit, including one on a side branch that never went through review. This catches the
+      # honest mistake; the environments are the control.
+      - name: The tagged commit is in main's history
+        if: startsWith(github.ref, 'refs/tags/personal-agent-v')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::the tagged commit $GITHUB_SHA is not in main's history; refusing to release"
+            exit 1
+          fi
+
+      # Fails a publishing run before anything is built if an environment that gates it is missing, has no required
+      # reviewer, or lets administrators bypass its protection (naming a missing environment in a job creates it,
+      # unprotected, on first use). Self-review is allowed, as for the connector. A writer's copy of this file could drop
+      # the check, so it is not the boundary; it stops a maintainer who forgot the setup.
+      - name: The publishing environments require reviewers
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_MODE: ${{ steps.plan.outputs.image }}
+        run: |
+          set -euo pipefail
+          environments=(npm-publish)
+          if [ "$IMAGE_MODE" = on ]; then environments+=(image-publish); fi
+          for name in "${environments[@]}"; do
+            if ! environment="$(gh api "repos/$GITHUB_REPOSITORY/environments/$name")"; then
+              echo "::error::cannot read the $name environment; create it with required reviewers first (personal-agent/README.md, Releasing)"
+              exit 1
+            fi
+            if ! jq -e '
+              .can_admins_bypass == false
+              and ([.protection_rules[]? | select(((.reviewers // []) | length) > 0)] | length) > 0
+            ' <<<"$environment" >/dev/null; then
+              echo "::error::$name must have at least one required reviewer and administrator bypass off (personal-agent/README.md, Releasing)"
+              exit 1
+            fi
+          done
+
+      # No cache: a release job installs exactly what the lockfile names and nothing a previous run left behind.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+
+      # The suite's cross-language Fernet test needs Python with `cryptography`, as in the Tests workflow.
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        working-directory: personal-agent
+        # The lockfile is the whole dependency set; a package's install script never runs here.
+        run: |
+          set -euo pipefail
+          pip install -r test-support/python/requirements.txt
+          npm ci --ignore-scripts
+
+      # Every gate CI runs on a change (typecheck, lint, format, layers, the whole suite under coverage, the ledgers).
+      - name: Check and test
+        working-directory: personal-agent
+        run: npm run check
+
+      - name: Build
+        working-directory: personal-agent
+        run: npm run build
+
+      # The three tarballs uploaded below, attested and published are the ones checked here (scripts/check-pack.ts): the
+      # files each ships, one version for all three equal to the tag's, repository.url naming the repository npm's
+      # provenance will name, and the three installed into an empty directory, imported, run and type-checked.
+      - name: Pack and check the tarballs
+        working-directory: personal-agent
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          OUT: ${{ runner.temp }}/personal-agent-packages
+        run: |
+          set -euo pipefail
+          npm run check-pack -- --version "$VERSION" --repository https://github.com/AMD-AGI/PrimusClaw --out "$OUT"
+          for name in personal-agent personal-agent-runtime personal-agent-teams; do
+            [ -f "$OUT/primusclaw-$name-$VERSION.tgz" ] || { echo "::error::check-pack kept no primusclaw-$name-$VERSION.tgz"; exit 1; }
+          done
+          count=$(find "$OUT" -maxdepth 1 -name '*.tgz' | wc -l)
+          [ "$count" -eq 3 ] || { echo "::error::expected exactly three tarballs, found $count"; exit 1; }
+
+      # The release notes are the version's section of personal-agent/CHANGELOG.md; a version without one is not released.
+      - name: Release notes from the changelog
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          OUT: ${{ runner.temp }}/personal-agent-packages
+        run: |
+          set -euo pipefail
+          awk -v heading="## $VERSION" '
+            $0 == heading { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' personal-agent/CHANGELOG.md > "$OUT/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$OUT/release-notes.md"; then
+            echo "::error::personal-agent/CHANGELOG.md has no \"## $VERSION\" section, or it is empty"
+            exit 1
+          fi
+
+      - name: Install Buildah
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      - name: Build the image
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: buildah bud --layers -t "personal-agent-teams:$VERSION" -f personal-agent/Dockerfile .
+
+      # The image as it would run: as uid 65534, with the three packages at the release's version and, started through
+      # the release gate's test entry (loopback only, no queue, no real Teams or Claw), answering /healthz and naming its
+      # build on /metrics.
+      - name: Smoke-test the image
+        env:
+          IMAGE: localhost/personal-agent-teams:${{ steps.plan.outputs.version }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          USER_ID=$(podman run --rm "$IMAGE" id -u)
+          [[ "$USER_ID" == "65534" ]] || { echo "::error::the image runs as uid $USER_ID, expected 65534"; exit 1; }
+          GOT=$(podman run --rm -w /app "$IMAGE" node -p 'const v=(n)=>require("./node_modules/@primusclaw/"+n+"/package.json").version; [v("personal-agent"),v("personal-agent-runtime"),v("personal-agent-teams")].join(" ")')
+          echo "packages in image: $GOT"
+          [[ "$GOT" == "$VERSION $VERSION $VERSION" ]] || { echo "::error::packages in the image are '$GOT', expected $VERSION"; exit 1; }
+          podman run -d --name pa-smoke --network host \
+            -e TEAMS_ENCRYPTION_KEYS="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_')" \
+            -e TEAMS_DB_PATH=/data/state.db -e PUBLIC_BASE_URL=https://claw.example.com \
+            -e CLAW_API_URL=http://claw.invalid -e SAFE_API_URL=http://safe.invalid/api/v1 \
+            -e OUTBOUND_MODE=direct -e BOT_MSI_CLIENT_ID=smoke -e SECRETS_SOURCE=env \
+            -e TEAMS_GATE_ENTRY=1 -e GATE_RUN_ID=release-smoke -e TEAMS_GATE_CONNECTOR_URL=http://127.0.0.1:9 \
+            -e PORT=18080 -e METRICS_PORT=19090 \
+            "$IMAGE"
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [[ -z "$ok" ]]; then echo "::error::/healthz did not answer within 60 s"; podman logs pa-smoke; exit 1; fi
+          METRICS=$(curl -fsS http://127.0.0.1:19090/metrics)
+          grep -q "^personal_agent_build_info{version=\"$VERSION\"," <<<"$METRICS" \
+            || { echo "::error::/metrics does not name version $VERSION"; podman logs pa-smoke; exit 1; }
+          podman stop -t 10 pa-smoke >/dev/null
+
+      # The image leaves this job as an OCI archive: publish-image pushes these bytes and builds nothing.
+      - name: Export the image
+        id: image
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          OUT: ${{ runner.temp }}/personal-agent-image
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          buildah push "localhost/personal-agent-teams:$VERSION" "oci-archive:$OUT/personal-agent-teams.oci.tar:personal-agent-teams:$VERSION"
+          echo "sha256=$(sha256sum "$OUT/personal-agent-teams.oci.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # What a reviewer needs in front of them before approving the publish jobs. The comparison is made by this file
+      # and is no substitute for opening the run's workflow file.
+      - name: Summary for the reviewer of the publish
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          PUBLISH: ${{ steps.plan.outputs.publish }}
+          IMAGE_MODE: ${{ steps.plan.outputs.image }}
+          ARCHIVE_SHA256: ${{ steps.image.outputs.sha256 }}
+          OUT: ${{ runner.temp }}/personal-agent-packages
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null || true
+          if git diff --quiet refs/remotes/origin/main -- .github/workflows/personal-agent-release.yml 2>/dev/null; then
+            same="identical to the one on main"
+          else
+            same="DIFFERENT from the one on main: read the diff before approving"
+          fi
+          if [ "$PUBLISH" = true ]; then mode="release"; else mode="dry run: nothing is published or pushed"; fi
+          if [ "$IMAGE_MODE" = on ]; then image="pushed by publish-image after its environment's approval"; else image="built and smoke-tested, not pushed (PERSONAL_AGENT_IMAGE_PUBLISH is not \"true\")"; fi
+          {
+            echo "### personal-agent $VERSION ($mode)"
+            echo
+            echo "- commit \`$GITHUB_SHA\`"
+            echo "- release workflow at this commit: $same"
+            for f in "$OUT"/*.tgz; do
+              echo "- \`$(basename "$f")\`, sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`"
+            done
+            echo "- image archive sha256 \`$ARCHIVE_SHA256\`: $image"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the tarballs for publish-npm
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-agent-packages
+          path: ${{ runner.temp }}/personal-agent-packages/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Keep the image for publish-image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-agent-image
+          path: ${{ runner.temp }}/personal-agent-image/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-npm:
+    name: Attest, attach and publish the packages
+    needs: package
+    # Only this repository holds the Trusted Publisher entries, only a personal-agent-v* tag is released, and a
+    # workflow_dispatch publishes only with dry-run explicitly off.
+    if: >-
+      github.repository == 'AMD-AGI/PrimusClaw'
+      && startsWith(github.ref, 'refs/tags/personal-agent-v')
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) == 'false'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: personal-agent-release
+      cancel-in-progress: false
+    # The name npm's Trusted Publisher entries are told, and the gate: the job does not start until the environment's
+    # required reviewers approve.
+    environment: npm-publish
+    permissions:
+      contents: write # create the release and attach the tarballs
+      id-token: write # sign the attestation; exchange the OIDC identity for npm's publish credential
+      attestations: write # store the attestation
+    steps:
+      - name: Fetch the tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: personal-agent-packages
+          path: ${{ runner.temp }}/personal-agent-packages
+
+      # npm's own Node-bundled version is what publishes; this job has no checkout. An npm older than 11.5.1 does not
+      # fail on the missing capability, it looks for a token that does not exist.
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: The toolchain supports Trusted Publishing
+        run: |
+          set -euo pipefail
+          node -e '
+            const atLeast = (have, want) => {
+              const h = have.split(".").map(Number), w = want.split(".").map(Number);
+              for (let i = 0; i < 3; i++) if (h[i] !== w[i]) return h[i] > w[i];
+              return true;
+            };
+            const [nodeV, npmV] = [process.versions.node, process.argv[1]];
+            if (!atLeast(nodeV, "22.14.0") || !atLeast(npmV, "11.5.1")) {
+              console.error("::error::node " + nodeV + " and npm " + npmV + " are older than the 22.14.0 and 11.5.1 Trusted Publishing needs");
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+
+      # The version is the tag's, read here from the ref, not from anything the package job produced.
+      - name: Locate the tarballs
+        id: tarballs
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DIR: ${{ runner.temp }}/personal-agent-packages
+        run: |
+          set -euo pipefail
+          [[ "$REF_NAME" =~ ^personal-agent-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::the ref is not a personal-agent-vX.Y.Z tag"; exit 1; }
+          version="${REF_NAME#personal-agent-v}"
+          count=$(find "$DIR" -maxdepth 1 -name '*.tgz' | wc -l)
+          [ "$count" -eq 3 ] || { echo "::error::expected exactly three tarballs, found $count"; exit 1; }
+          {
+            echo "version=$version"
+            echo "core=$DIR/primusclaw-personal-agent-$version.tgz"
+            echo "runtime=$DIR/primusclaw-personal-agent-runtime-$version.tgz"
+            echo "teams=$DIR/primusclaw-personal-agent-teams-$version.tgz"
+          } >> "$GITHUB_OUTPUT"
+          for name in personal-agent personal-agent-runtime personal-agent-teams; do
+            [ -f "$DIR/primusclaw-$name-$version.tgz" ] || { echo "::error::primusclaw-$name-$version.tgz is missing"; exit 1; }
+          done
+
+      # `gh attestation verify <tarball> --repo AMD-AGI/PrimusClaw` checks each.
+      - name: Attest the tarballs' provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ steps.tarballs.outputs.core }}
+            ${{ steps.tarballs.outputs.runtime }}
+            ${{ steps.tarballs.outputs.teams }}
+
+      # Before the publish: this is repeatable (an existing release is kept, --clobber), the registry is not.
+      - name: Attach the tarballs to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.tarballs.outputs.version }}
+          DIR: ${{ runner.temp }}/personal-agent-packages
+          CORE: ${{ steps.tarballs.outputs.core }}
+          RUNTIME: ${{ steps.tarballs.outputs.runtime }}
+          TEAMS: ${{ steps.tarballs.outputs.teams }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "personal-agent $VERSION" --notes-file "$DIR/release-notes.md"
+          fi
+          gh release upload "$TAG" "$CORE" "$RUNTIME" "$TEAMS" --clobber --repo "$GITHUB_REPOSITORY"
+
+      # The OIDC credential is exchanged here, nowhere earlier, and the packages go out in dependency order under the
+      # default `latest` dist-tag; publishing a tarball runs no lifecycle script. A version already on the registry is
+      # skipped when it is byte-for-byte this tarball (the re-run of a release that failed part-way) and fails the run
+      # otherwise. Nothing may follow this step: a run that fails anywhere before it publishes nothing.
+      - name: Publish core, runtime, teams
+        env:
+          VERSION: ${{ steps.tarballs.outputs.version }}
+          CORE: ${{ steps.tarballs.outputs.core }}
+          RUNTIME: ${{ steps.tarballs.outputs.runtime }}
+          TEAMS: ${{ steps.tarballs.outputs.teams }}
+        run: |
+          set -euo pipefail
+          publish() {
+            local name="$1" tarball="$2" have want err
+            want="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)"
+            err="$(mktemp)"
+            if have="$(npm view "$name@$VERSION" dist.integrity 2>"$err")"; then
+              if [ -n "$have" ]; then
+                if [ "$have" = "$want" ]; then echo "$name@$VERSION is already published from this tarball"; return 0; fi
+                echo "::error::$name@$VERSION is already on the registry with different contents"
+                return 1
+              fi
+            elif ! grep -q E404 "$err"; then
+              cat "$err" >&2
+              echo "::error::cannot tell whether $name@$VERSION is published"
+              return 1
+            fi
+            npm publish "$tarball" --provenance --access public
+          }
+          publish @primusclaw/personal-agent "$CORE"
+          publish @primusclaw/personal-agent-runtime "$RUNTIME"
+          publish @primusclaw/personal-agent-teams "$TEAMS"
+
+  publish-image:
+    name: Push and attest the image
+    needs: [package, publish-npm]
+    # As publish-npm, and only while the repository variable PERSONAL_AGENT_IMAGE_PUBLISH says "true".
+    if: >-
+      github.repository == 'AMD-AGI/PrimusClaw'
+      && startsWith(github.ref, 'refs/tags/personal-agent-v')
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry-run) == 'false'))
+      && vars.PERSONAL_AGENT_IMAGE_PUBLISH == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: personal-agent-release
+      cancel-in-progress: false
+    environment: image-publish
+    permissions:
+      contents: write # add the image's digest to the release notes
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    steps:
+      # The `if` above compares without regard to case; the switch is exactly "true" or the job stops.
+      - name: The image switch is on
+        env:
+          SWITCH: ${{ vars.PERSONAL_AGENT_IMAGE_PUBLISH }}
+        run: |
+          set -euo pipefail
+          [ "$SWITCH" = true ] || { echo "::error::PERSONAL_AGENT_IMAGE_PUBLISH is \"$SWITCH\", not exactly \"true\""; exit 1; }
+
+      # One step derives both the registry and the push target from one prefix, so the registry logged in to below is
+      # by construction the one pushed to. personal-agent/scripts/release-workflow-check.sh runs this script.
+      - name: Resolve the image target
+        id: target
+        env:
+          IMAGE_PREFIX: ${{ vars.PERSONAL_AGENT_IMAGE_PREFIX || 'docker.io/primussafe' }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$REF_NAME" =~ ^personal-agent-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::the ref is not a personal-agent-vX.Y.Z tag"; exit 1; }
+          version="${REF_NAME#personal-agent-v}"
+          prefix="${IMAGE_PREFIX%/}"
+          # host[:port]/namespace[/more]: the host named explicitly (a dot or a port), lower case, no scheme, no tag.
+          if ! [[ "$prefix" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+$ ]]; then
+            echo "::error::PERSONAL_AGENT_IMAGE_PREFIX \"$IMAGE_PREFIX\" is not registry-host/namespace"
+            exit 1
+          fi
+          registry="${prefix%%/*}"
+          if [[ "$registry" != *.* && "$registry" != *:* ]]; then
+            echo "::error::PERSONAL_AGENT_IMAGE_PREFIX \"$IMAGE_PREFIX\" does not start with a registry host"
+            exit 1
+          fi
+          repository="$prefix/personal-agent-teams"
+          [ "${repository%%/*}" = "$registry" ] || { echo "::error::the push target $repository is not on $registry"; exit 1; }
+          echo "image: $repository:$version, registry: $registry"
+          {
+            echo "registry=$registry"
+            echo "repository=$repository"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: personal-agent-image
+          path: ${{ runner.temp }}/personal-agent-image
+
+      - name: Install skopeo
+        run: command -v skopeo >/dev/null || { sudo apt-get update && sudo apt-get install -y skopeo; }
+
+      # Docker Hub's credentials go to docker.io and nowhere else; a registry of another host needs its own pair.
+      # Missing credentials fail the job: it never pushes anywhere but the target resolved above.
+      - name: Log in to the target's registry
+        env:
+          REGISTRY: ${{ steps.target.outputs.registry }}
+          AUTHFILE: ${{ runner.temp }}/registry-auth.json
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          REGISTRY_USERNAME: ${{ secrets.PERSONAL_AGENT_REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.PERSONAL_AGENT_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          user="$REGISTRY_USERNAME" pass="$REGISTRY_PASSWORD"
+          if [ "$REGISTRY" = docker.io ] && [ -z "$user$pass" ]; then user="$DOCKERHUB_USERNAME" pass="$DOCKERHUB_PASSWORD"; fi
+          if [ -z "$user" ] || [ -z "$pass" ]; then
+            echo "::error::no credentials for $REGISTRY (personal-agent/README.md, Releasing); nothing is pushed"
+            exit 1
+          fi
+          printf '%s' "$pass" | skopeo login --authfile "$AUTHFILE" --username "$user" --password-stdin "$REGISTRY"
+
+      - name: Push the image
+        id: push
+        env:
+          REPOSITORY: ${{ steps.target.outputs.repository }}
+          VERSION: ${{ steps.target.outputs.version }}
+          AUTHFILE: ${{ runner.temp }}/registry-auth.json
+          ARCHIVE: ${{ runner.temp }}/personal-agent-image/personal-agent-teams.oci.tar
+          DIGESTFILE: ${{ runner.temp }}/image-digest
+        run: |
+          set -euo pipefail
+          skopeo copy --authfile "$AUTHFILE" --digestfile "$DIGESTFILE" \
+            "oci-archive:$ARCHIVE:personal-agent-teams:$VERSION" "docker://$REPOSITORY:$VERSION"
+          digest="$(cat "$DIGESTFILE")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::skopeo reported digest \"$digest\""; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Log out of the registry
+        if: always()
+        env:
+          AUTHFILE: ${{ runner.temp }}/registry-auth.json
+        run: rm -f "$AUTHFILE"
+
+      # `gh attestation verify oci://<repository>:<version> --repo AMD-AGI/PrimusClaw` checks it.
+      - name: Attest the image's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.target.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+
+      - name: Name the image on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ steps.target.outputs.repository }}
+          VERSION: ${{ steps.target.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes"
+          line="Image: \`$REPOSITORY:$VERSION@$DIGEST\`"
+          if ! grep -qF "$line" "$notes"; then
+            printf '\n%s\n' "$line" >> "$notes"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          fi

@@ -212,6 +212,68 @@ In short:
   (`ASSISTANT_ENABLED`), remote agents (`REMOTE_AGENTS_ENABLED`), the token exchange (`TEAMS_EXCHANGE_ENABLED`), review
   for a colleague (`TEAMS_GITHUB_REVIEW_ENABLED`) and more.
 
+## Releasing (maintainers)
+
+A release is the tag `personal-agent-vX.Y.Z` on a commit of `main` whose three `package.json` files name `X.Y.Z`.
+Pushing it starts
+[personal-agent-release.yml](../.github/workflows/personal-agent-release.yml). Its `package` job (no credential, no
+OIDC) runs `npm run check`, builds the packages, packs and checks them with `check-pack --version X.Y.Z`, takes the
+release notes from this version's section of [CHANGELOG.md](CHANGELOG.md), and builds and smoke-tests the image. Then,
+each behind a GitHub environment's required reviewers:
+
+- `publish-npm` (environment `npm-publish`) attests the three tarballs, creates the GitHub Release with those notes,
+  attaches the tarballs, and publishes them to npm with Trusted Publishing (OIDC, `--provenance`, no npm token), core,
+  then runtime, then teams. These are the tarballs `check-pack` checked: the job checks out and installs nothing. A
+  version already on npm is skipped when it is byte-for-byte the same tarball and fails the run otherwise, so a release
+  that failed part-way is finished by dispatching the workflow on its tag with `dry-run` off.
+- `publish-image` (environment `image-publish`) runs only while the repository variable
+  `PERSONAL_AGENT_IMAGE_PUBLISH` is exactly `true`. It pushes the image the `package` job built and smoke-tested to
+  `<PERSONAL_AGENT_IMAGE_PREFIX>/personal-agent-teams:X.Y.Z` (prefix default `docker.io/primussafe`), attests it and
+  adds `Image: <repository>:X.Y.Z@sha256:<digest>` to the release notes. The registry it logs in to is the prefix's
+  host, derived in the same step as the push target, so changing the prefix moves both. Docker Hub's credentials
+  (`DOCKER_USERNAME`/`DOCKER_PASSWORD`) are only given to `docker.io`; another registry needs
+  `PERSONAL_AGENT_REGISTRY_USERNAME`/`PERSONAL_AGENT_REGISTRY_PASSWORD`, and without credentials the job fails rather
+  than push anywhere else. While the switch is off, a release publishes the packages only.
+
+`workflow_dispatch` with `dry-run` on (the default) runs the `package` job on any ref and publishes nothing; a pull
+request that changes the workflow does the same. [`scripts/release-workflow-check.sh`](scripts/release-workflow-check.sh),
+the first step of every run, evaluates each job's condition for every kind of run (pull request, branch, tag, dry run,
+dispatch, fork, switch on and off), runs the step that resolves the image target against a set of prefixes and the
+login step with a stand-in `skopeo`, and then mutates the workflow once per rule to see each rule refuse.
+
+**What stops an unreviewed publish.** A tag push runs the workflow file as it is at the tag, so the checks inside it
+(tag shape, the commit being in `main`, the environments having reviewers) catch honest mistakes. The control is the
+two environments, whose required reviewers approve each publish, the Trusted Publisher entries on npmjs.com, which name
+`npm-publish`, and a tag ruleset that lets only repository admins create `personal-agent-v*` tags.
+
+**One-time setup** (a repository admin, and a member of the `primusclaw` npm organisation):
+
+1. Environment `npm-publish` exists for the connector; it needs no change. Create the environment `image-publish`
+   the same way: **Required reviewers** set, **Allow administrators to bypass** off, no branch restriction (a tag is
+   the ref).
+2. Add a tag ruleset matching `refs/tags/personal-agent-v*` that restricts creation to repository admins.
+3. Publish 0.1.0 of each package once by hand from a clean checkout of the merged `main`: `npm ci && npm run build &&
+npm run check-pack -- --out /tmp/pa`, then `npm publish /tmp/pa/<tarball> --access public` for core, runtime,
+   teams, logged in to npm with 2FA.
+4. On npmjs.com, for each of the three packages: Settings > Trusted publishing > GitHub Actions: Organization
+   `AMD-AGI`, Repository `PrimusClaw`, Workflow filename `personal-agent-release.yml`, Environment `npm-publish`. Then
+   Publishing access: require two-factor authentication and disallow tokens.
+5. When the image is to be published: `DOCKER_USERNAME`/`DOCKER_PASSWORD` must be able to push to the prefix's
+   namespace (or set `PERSONAL_AGENT_IMAGE_PREFIX` and, for a registry other than `docker.io`, the
+   `PERSONAL_AGENT_REGISTRY_*` pair), then set the repository variable `PERSONAL_AGENT_IMAGE_PUBLISH` to `true`.
+
+**Cutting a release.**
+
+1. Set the version in the three `package.json` files (and the exact version teams names core and runtime by), add its
+   section to [CHANGELOG.md](CHANGELOG.md), and merge that to `main`.
+2. Tag the merged commit and push the tag: `git tag personal-agent-vX.Y.Z <sha-on-main> && git push origin
+personal-agent-vX.Y.Z`.
+3. The `package` job's summary lists the commit, whether the workflow at that commit equals `main`'s, and each
+   tarball's sha256. A reviewer checks them and approves `publish-npm` (and `publish-image`).
+4. Check it: `npm view @primusclaw/personal-agent-teams version`; `gh attestation verify <tarball> --repo
+AMD-AGI/PrimusClaw` on each tarball attached to the release; with the image,
+   `gh attestation verify oci://<repository>:X.Y.Z --repo AMD-AGI/PrimusClaw`.
+
 ## Security
 
 Report vulnerabilities through the private process in the repository's [SECURITY.md](../SECURITY.md), never in a public
