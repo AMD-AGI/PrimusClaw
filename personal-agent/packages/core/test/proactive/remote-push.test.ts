@@ -1,0 +1,255 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The assistant's half of what a remote agent says on its own and of Claw's pushes of a session: when it may wake the person
+ * (`reachable`: quiet hours and /pause hold it, a person who wrote a moment ago lifts quiet hours but never a pause), what is held
+ * and how it is released, and which pushes of a session reach the chat. Following the session itself is the remote line's.
+ */
+import assert from "node:assert/strict";
+import { it } from "node:test";
+
+import { advanceSeconds } from "../../../../test-support/store.js";
+import { ALICE, at, shown, world } from "../../../../test-support/assistant/proactive-world.js";
+import type { JsonObject } from "../../src/json.js";
+import type { RemoteAskRequest } from "../../src/proactive/deps.js";
+
+const LABEL = "\u{1F7E0} Claude Code on dev-pod";
+const SECRET = "ghp_" + "a".repeat(36);
+
+/** Out of the reply window: the person last wrote three hours ago. */
+function longAgo(w: ReturnType<typeof world>): void {
+  advanceSeconds(w.clock, 3 * 3600);
+}
+
+function quietAllDay(w: ReturnType<typeof world>): void {
+  w.store.prefs.setTimezone(ALICE, "UTC");
+  w.store.prefs.setQuiet(ALICE, ["00:00", "23:59"]);
+}
+
+/** What the agent said on its own, as the chat shows it (headed with who said it). */
+function onItsOwn(w: ReturnType<typeof world>): string[] {
+  return shown(w.surface.outbox).filter((line) => line.includes(LABEL));
+}
+
+/** Claw's push of a development environment session: an `assistant.say` about the item, with `remote`. */
+function remoteSay(
+  sessionId: string,
+  kind: string,
+  eventId: string,
+  options: { text?: string; ask?: JsonObject; occurredAt?: string; seq?: number } = {},
+): JsonObject {
+  const seq = options.seq ?? 7;
+  return {
+    type: "assistant.say",
+    event_id: eventId,
+    ...(options.occurredAt ? { occurred_at: options.occurredAt } : {}),
+    text: options.text ?? `dev-pod 上的 claude 做完了 #${String(seq)}：跑 make test\n312 passed`,
+    fallback: true,
+    item: { item_id: "wi-1", seq, title: "dev-pod claude：跑 make test", board_state: "done" },
+    remote: {
+      kind,
+      session_id: sessionId,
+      machine: "dev-pod",
+      agent: "claude",
+      ...(options.ask ? { ask: options.ask } : {}),
+    },
+  };
+}
+
+function anAsk(actionId = "act-1", expiresAt = "2026-10-27T05:00:00Z"): JsonObject {
+  return {
+    action_id: actionId,
+    tool: "Bash",
+    title: "Run make test",
+    options: [{ optionId: "allow-once" }, { optionId: "allow-with-updates" }, { optionId: "reject" }],
+    expires_at: expiresAt,
+  };
+}
+
+function attach(w: ReturnType<typeof world>, sessionId: string): void {
+  w.store.remoteState.attachRemote(ALICE, {
+    sessionId,
+    connectorId: "c1",
+    agentId: "claude",
+    agentLabel: "\u{1F7E0} Claude Code",
+    host: "dev-pod",
+    cwd: "/home/me/a",
+  });
+}
+
+it("in quiet hours what the agent says on its own is held and delivered when they end", async () => {
+  const w = world();
+  longAgo(w);
+  quietAllDay(w);
+  assert.equal(w.proactive.muted(ALICE), "quiet");
+  assert.equal(w.proactive.reachable(ALICE), false);
+  w.proactive.holdRemote(ALICE, LABEL, "Night result: all green.", "r1");
+  assert.deepEqual(onItsOwn(w), []);
+  assert.deepEqual(w.store.held.usersWithHeld(), [ALICE]);
+  w.store.prefs.setQuiet(ALICE, null);
+  await w.release.releaseDue();
+  assert.deepEqual(onItsOwn(w), [`send ${LABEL}: Night result: all green.`]);
+  assert.deepEqual(w.store.held.usersWithHeld(), []);
+});
+
+it("a pause holds it too and resume releases it", async () => {
+  const w = world();
+  longAgo(w);
+  w.store.prefs.setPausedUntil(ALICE, w.store.now() + 7200);
+  assert.equal(w.proactive.reachable(ALICE), false);
+  w.proactive.holdRemote(ALICE, LABEL, "Paused-time result.", "r1");
+  assert.deepEqual(w.store.held.usersWithHeld(), [ALICE]);
+  w.store.prefs.setPausedUntil(ALICE, null);
+  await w.release.releaseDue();
+  assert.equal(onItsOwn(w).length, 1);
+});
+
+it("someone who wrote a moment ago is not held back by quiet hours", () => {
+  const w = world();
+  quietAllDay(w);
+  assert.equal(w.proactive.muted(ALICE), "quiet");
+  assert.equal(w.proactive.inReplyWindow(ALICE), true);
+  assert.equal(w.proactive.reachable(ALICE), true);
+});
+
+it("a pause typed a moment ago still holds what the agent says on its own until it is over", async () => {
+  const w = world();
+  w.store.prefs.setPausedUntil(ALICE, w.store.now() + 2 * 3600);
+  assert.equal(w.proactive.muted(ALICE), "paused");
+  assert.equal(w.proactive.inReplyWindow(ALICE), true); // (the /pause is the person's last message)
+  assert.equal(w.proactive.reachable(ALICE), false);
+  w.proactive.holdRemote(ALICE, LABEL, "Result right after the pause command.", "r1");
+  await w.release.releaseDue();
+  assert.deepEqual(onItsOwn(w), []);
+  advanceSeconds(w.clock, 2 * 3600 + 60);
+  await w.release.releaseDue();
+  assert.deepEqual(onItsOwn(w), [`send ${LABEL}: Result right after the pause command.`]);
+});
+
+it("a pause typed a moment ago gives no permission card", async () => {
+  const w = world();
+  w.store.prefs.setPausedUntil(ALICE, w.store.now() + 2 * 3600);
+  // What the agent asks on its own (the remote line's follower) is put to the person only when this says so: never in a pause.
+  assert.equal(w.proactive.muted(ALICE), "paused");
+  assert.equal(w.proactive.reachable(ALICE), false);
+  // Outside the reply window Claw's push of that request is held as well, card and all (as the Python worker's
+  // `Proactive.handle`: a say in the reply window is a reply, delivered).
+  advanceSeconds(w.clock, 3600);
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, remoteSay("rs-1", "needs_you", "say-ask", { ask: anAsk() })),
+    "held",
+  );
+  assert.deepEqual(shown(w.surface.outbox), []);
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-1", "act-1"), null);
+});
+
+it("what is held is sent as messages the newest five and a line for the rest and secrets are masked", async () => {
+  const w = world();
+  for (let n = 0; n < 7; n += 1) {
+    w.proactive.holdRemote(ALICE, LABEL, `held ${String(n)}${n === 6 ? ` token ${SECRET}` : ""}`, `r${String(n)}`);
+  }
+  assert.equal(w.proactive.muted(ALICE), undefined);
+  await w.release.release(ALICE);
+  const sent = shown(w.surface.outbox);
+  assert.ok(sent[0]?.includes("2 earlier messages from your remote agent"), sent.join("\n"));
+  assert.deepEqual(
+    sent.slice(1).map((line) => /held (\d)/.exec(line)?.[1]),
+    ["2", "3", "4", "5", "6"],
+  );
+  assert.ok(!sent.some((line) => line.includes(SECRET)));
+});
+
+it("what is held is masked in the store too", () => {
+  const w = world();
+  w.proactive.holdRemote(ALICE, LABEL, `key ${SECRET}`, "r1");
+  const [held, ...more] = w.store.held.takeHeld(ALICE);
+  assert.deepEqual(more, []);
+  assert.ok(held !== undefined);
+  const text = held["text"];
+  assert.ok(typeof text === "string" && !text.includes("ghp_"));
+  assert.equal(held["type"], "remote.said");
+  assert.equal(held["label"], LABEL);
+});
+
+it("a needs you push is one approval card with the agents options for its session and request", async () => {
+  const asked: RemoteAskRequest[] = [];
+  const w = world({
+    remote: {
+      options: (raw): readonly unknown[] => (Array.isArray(raw) ? (raw as unknown[]) : []),
+      askCard: (request) => {
+        asked.push(request);
+        return { body: { type: "text", text: `ask ${request.sessionId} ${String(request.ask["action_id"])}` } };
+      },
+      saidParts: (label, text) => [`${label}: ${text}`],
+    },
+  });
+  const text = "dev-pod 上的 claude 在等你批准：Run make test（#7 跑 make test）。发 /agent attach rs-1 切过去处理。";
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, remoteSay("rs-1", "needs_you", "say-ask", { text, ask: anAsk() })),
+    "delivered",
+  );
+  assert.deepEqual(shown(w.surface.outbox), ["send ask rs-1 act-1"]); // (one push: the card, not the words to type)
+  assert.deepEqual(
+    asked.map((r) => [r.sessionId, r.about, r.options]),
+    [["rs-1", "#7 dev-pod claude：跑 make test", anAsk()["options"]]],
+  );
+  // The card's button answers the agent through the request this push recorded for the person.
+  const saved = w.store.remotePermissions.getRemotePermission("rs-1", "act-1");
+  assert.equal(saved?.userId, ALICE);
+});
+
+it("the same request is one card whoever shows it first", async () => {
+  const w = world();
+  const push = (eventId: string, ask: JsonObject) =>
+    w.proactive.handle(ALICE, w.reference, remoteSay("rs-1", "needs_you", eventId, { text: "x", ask }));
+  assert.equal(await push("say-ask", anAsk()), "delivered");
+  assert.equal(await push("say-ask-2", anAsk()), "dropped"); // (Claw's retry, or the same request pushed twice)
+  // One that the attached chat's reader already showed is not shown again either.
+  w.store.remotePermissions.saveRemotePermission({
+    userId: ALICE,
+    sessionId: "rs-1",
+    actionId: "act-2",
+    tool: "Edit main.go",
+    options: [{ optionId: "allow-once" }],
+    expiresAt: w.store.now() + 600,
+  });
+  assert.equal(await push("say-ask-3", anAsk("act-2")), "dropped");
+  // One that ran out while it was held is not put to the person.
+  assert.equal(await push("say-ask-4", anAsk("act-3", "2000-01-01T00:00:00Z")), "dropped");
+  assert.deepEqual(shown(w.surface.outbox), ["send ask rs-1 act-1"]);
+});
+
+it("a finish is not pushed into the chat that shows that session", async () => {
+  const w = world();
+  w.proactive.showsAttached = true;
+  attach(w, "rs-shown");
+  advanceSeconds(w.clock, 60);
+  const now = new Date(w.store.now() * 1000).toISOString();
+  const push = (event: JsonObject) => w.proactive.handle(ALICE, w.reference, event);
+  // The chat is that session's own view: its finish and its failure are not said a second time.
+  assert.equal(await push(remoteSay("rs-shown", "done", "say-done", { occurredAt: now })), "dropped");
+  const failed = "dev-pod 上的 claude 出错了，#7 没有做完：跑 make test";
+  assert.equal(await push(remoteSay("rs-shown", "error", "say-err", { text: failed, occurredAt: now })), "dropped");
+  assert.deepEqual(shown(w.surface.outbox), []);
+  // Another session's finish is news here.
+  const other = remoteSay("rs-other", "done", "say-other", {
+    text: "dev-pod 上的 codex 做完了 #8：跑 lint\nclean",
+    occurredAt: now,
+    seq: 8,
+  });
+  assert.equal(await push(other), "delivered");
+  assert.ok(shown(w.surface.outbox).some((line) => line.includes("做完了 #8")));
+});
+
+it("a finish and an error are pushed to a chat that is not attached", async () => {
+  const w = world({ now: at(12) });
+  w.proactive.showsAttached = true;
+  const push = (event: JsonObject) => w.proactive.handle(ALICE, w.reference, event);
+  assert.equal(await push(remoteSay("rs-1", "done", "say-done")), "delivered");
+  const failed = "dev-pod 上的 claude 出错了，#7 没有做完：跑 make test";
+  assert.equal(await push(remoteSay("rs-1", "error", "say-err", { text: failed })), "delivered");
+  const said = shown(w.surface.outbox);
+  assert.ok(said.some((line) => line.includes("做完了 #7")));
+  assert.ok(said.some((line) => line.includes("出错了，#7")));
+});
