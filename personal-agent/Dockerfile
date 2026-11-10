@@ -10,14 +10,12 @@
 #
 #   docker build -f personal-agent/Dockerfile -t personal-agent-teams .
 #
-# BASE_REGISTRY prefixes the base image's reference, for a registry mirror (for example
-# `--build-arg BASE_REGISTRY=registry.example.com/dockerhub/`); empty pulls from Docker Hub.
-
-ARG BASE_REGISTRY=
-ARG NODE_IMAGE=node:26-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072
+# Both stages name the base image literally, pinned by digest, and it is the one claw/Dockerfile runs on (Node.js 26 on
+# Debian bookworm, slim): the base image scan (security.yml) reads the FROM lines and scans the final stage's image. To
+# pull it through a mirror, configure the builder's registry mirrors.
 
 # ========== Build and check the packages ==========
-FROM ${BASE_REGISTRY}${NODE_IMAGE} AS build
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS build
 WORKDIR /src/personal-agent
 
 # The dependencies first, so a source change reuses this layer.
@@ -49,7 +47,7 @@ RUN printf '{"name":"personal-agent-image","private":true,"type":"module"}\n' > 
  && npm install --omit=dev --ignore-scripts --no-audit --no-fund /packages/*.tgz
 
 # ========== Runtime ==========
-FROM ${BASE_REGISTRY}${NODE_IMAGE}
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app /app

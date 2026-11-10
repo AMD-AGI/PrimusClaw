@@ -176,8 +176,8 @@ docker build -f personal-agent/Dockerfile -t personal-agent-teams .
 docker run --env-file /path/outside/the/repo/worker.env -v personal-agent-data:/data personal-agent-teams
 ```
 
-The store defaults to `/data/state.db`; the volume must be writable by uid 65534. `--build-arg BASE_REGISTRY=<mirror>/`
-pulls the Node.js base image through a registry mirror. CI builds and smoke-tests the image on every change that
+The store defaults to `/data/state.db`; the volume must be writable by uid 65534. The base image is pinned by digest
+(the one `claw/Dockerfile` runs on). CI builds and smoke-tests the image on every change that
 touches it and never pushes it. `/metrics` names the running build as
 `personal_agent_build_info{version="<the teams package version>",node="<Node.js version>"} 1`.
 
