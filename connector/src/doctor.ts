@@ -376,7 +376,9 @@ export async function checkAll(input: CheckInput, d: DoctorDeps): Promise<Report
         if (r.foreign) continue;
         let v: unknown = null;
         try { v = JSON.parse(fs.readFileSync(path.join(configDir, "sessions", `${r.pid}.json`), "utf8")).version; } catch { /* gone meanwhile */ }
-        if (typeof v === "string" && !BUSY_SCREEN_VERIFIED_VERSIONS.includes(v) && !versions.has(v)) versions.set(v, r.pid);
+        // (a row that names no version is one not measured either)
+        const name = typeof v === "string" ? v : "(version not given)";
+        if (!BUSY_SCREEN_VERIFIED_VERSIONS.includes(name) && !versions.has(name)) versions.set(name, r.pid);
       }
       for (const [v, pid] of versions) {
         out.problems.push({ code: "claude_version_unverified", severity: "warn", agent: a.id,

@@ -836,14 +836,25 @@ export class AttachSupport {
       const lines = text.split("\n");
       lines.pop();
       if (size > len) lines.shift();   // (the first line read is cut)
-      for (let i = lines.length - 1; i >= 0; i--) {
+      // Read forward: which main-thread entry of a turn came last, and whether a message queued for the main thread (typed while
+      // a turn ran) is still waiting to be taken (an enqueue not yet answered by a dequeue or a removal: codex r1 on #632).
+      let last: "ended" | "under_way" | null = null;
+      let queued = 0;
+      for (const line of lines) {
         let doc: unknown;
-        try { doc = JSON.parse(lines[i]!); } catch { return null; }
+        try { doc = JSON.parse(line); } catch { return null; }
         if (!isObject(doc) || doc.isSidechain === true) continue;
-        if (doc.type === "system" && doc.subtype === "turn_duration") return true;
-        if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment" || doc.type === "queue-operation") return false;
+        if (doc.type === "queue-operation") {
+          if (doc.operation === "enqueue") queued += 1;
+          else if (doc.operation === "dequeue" || doc.operation === "remove") queued = Math.max(0, queued - 1);
+          else return null;   // (an operation not known: no answer)
+          continue;
+        }
+        if (doc.type === "system" && doc.subtype === "turn_duration") last = "ended";
+        else if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment") last = "under_way";
       }
-      return null;
+      if (queued > 0) return false;
+      return last === null ? null : last === "ended";
     } catch {
       return null;
     } finally {

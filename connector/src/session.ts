@@ -456,6 +456,9 @@ export class Session {
         const waitBy = Date.now() + this.env.timing.terminalWaitMs;
         let told = "";
         let ready = false;
+        // Let in through the `busy` gate (codex r1 on #632): every later check and the Enter keep that gate's checks, whatever the
+        // status says by then.
+        let viaBusy = false;
         // Typed in any permission mode (the terminal's owner chose it); the mode is recorded with what was typed.
         // Since when the screen has been one this connector cannot read (neither the idle box nor a Claude Code that says it works).
         let unreadableSince: number | null = null;
@@ -471,7 +474,7 @@ export class Session {
             // both say its main turn waits for input, twice: its transcript (the last main turn ended), and its screen (an empty
             // box, no `esc to interrupt`); and only for a Claude Code version measured to behave so. Anything else: it waits.
             const r = await this.busyButFree(term);
-            if (r === true) { ready = true; break; }
+            if (r === true) { ready = true; viaBusy = true; break; }
             why = r === "gone" ? WAIT_WHY.gone : WAIT_WHY.busy;
             if (r === "gone") { told = why; break; }
           } else if (!isIdleStatus(status)) {
@@ -542,15 +545,15 @@ export class Session {
         };
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
-        const before = this.holderStatus(term);
-        const again = before === "busy"
+        const gated = viaBusy || this.holderStatus(term) === "busy";
+        const again = gated
           ? ((await this.busyButFree(term)) === true ? await term.readiness(true) : { ready: false as const, why: "busy" as const })
           : await term.readiness();
         if (!again.ready || !this.mayType(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
-          await term.type(text, before === "busy" ? () => this.mainTurnStillEnded() : undefined);
+          await term.type(text, gated ? () => this.mainTurnStillEnded() : undefined);
         } catch (e) {
           this.terminalTurn = null;
           this.env.store.endTurn(this.id);
