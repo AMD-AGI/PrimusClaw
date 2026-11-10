@@ -6,6 +6,7 @@
  * autocommit (`isolation_level=None`), WAL, and a 5 s busy timeout (`sqlite3.connect`'s default).
  */
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { own } from "@primusclaw/personal-agent";
 
 export type SqlValue = SQLInputValue;
 export type Row = Readonly<Record<string, SqlValue>>;
@@ -85,22 +86,25 @@ function asNumber(value: SqlValue | undefined): number {
   return 0;
 }
 
+/** The row's own value of column `name` (undefined when the row has no such column). */
+const cell = (row: Row, name: string): SqlValue | undefined => own(row, name);
+
 /** Typed reads of a column; a value of another type is a corrupt row, not a case to handle. */
 export const col = {
-  str: (row: Row, name: string): string => asText(row[name]),
+  str: (row: Row, name: string): string => asText(cell(row, name)),
   strOrNull: (row: Row, name: string): string | null =>
-    row[name] === null || row[name] === undefined ? null : asText(row[name]),
-  num: (row: Row, name: string): number => asNumber(row[name]),
+    cell(row, name) === null || cell(row, name) === undefined ? null : asText(cell(row, name)),
+  num: (row: Row, name: string): number => asNumber(cell(row, name)),
   numOrNull: (row: Row, name: string): number | null =>
-    row[name] === null || row[name] === undefined ? null : asNumber(row[name]),
+    cell(row, name) === null || cell(row, name) === undefined ? null : asNumber(cell(row, name)),
   /** Python's truthiness of the value. */
   bool(row: Row, name: string): boolean {
-    const value = row[name];
+    const value = cell(row, name);
     if (value instanceof Uint8Array) return value.length > 0;
     return value !== null && value !== undefined && value !== 0 && value !== "" && value !== 0n;
   },
   bytes(row: Row, name: string): Uint8Array {
-    const value = row[name];
+    const value = cell(row, name);
     return value instanceof Uint8Array ? value : new TextEncoder().encode(asText(value));
   },
 };

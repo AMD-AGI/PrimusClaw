@@ -5,7 +5,7 @@
  * Status colour and headings: a line that starts with a status emoji gets that status's colour on its short label, and
  * a bold line becomes a larger bold heading whose colour follows its leading emoji.
  */
-import { cpLength } from "@primusclaw/personal-agent";
+import { cpLength, own } from "@primusclaw/personal-agent";
 import { MAX_LABEL_CHARS, STATUS_COLORS } from "./constants.js";
 import { escaping, S } from "./escape.js";
 import { inlineFrags, joinHtml, textFrag, type Frag } from "./inline.js";
@@ -18,7 +18,7 @@ const LABEL_END = new RegExp(
 
 function colorOf(plain: string): string | null {
   const m = MARKER.exec(plain);
-  return m?.[1] ? (STATUS_COLORS[m[1].charAt(0)] ?? null) : null;
+  return m?.[1] ? (own(STATUS_COLORS, m[1].charAt(0)) ?? null) : null;
 }
 
 function paint(color: string, inner: string): string {

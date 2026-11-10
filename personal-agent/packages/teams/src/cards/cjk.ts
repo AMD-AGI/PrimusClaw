@@ -5,7 +5,7 @@
  * Chinese typography for card text: half-width , : ; ? ! ( ) next to Chinese become full-width, and the blanks around them go
  * (Chinese puts none there). Inline code, markdown links and bare URLs keep theirs.
  */
-import { cpLength, cpSlice, pyRstrip, pyStr, pyStrip, squashSpaces } from "@primusclaw/personal-agent";
+import { cpLength, cpSlice, pyRstrip, pyStr, pyStrip, squashSpaces, own } from "@primusclaw/personal-agent";
 
 /** The CJK ranges the card kit treats as Chinese (CJK ideographs, compatibility ideographs, CJK punctuation, full-width forms). */
 export const CJK = "[\\u3400-\\u9fff\\uf900-\\ufaff\\u3000-\\u303f\\uff00-\\uffef]";
@@ -23,7 +23,7 @@ export function hasCjk(text: unknown): boolean {
 }
 
 function full(half: string): string {
-  return HALF_TO_FULL[half] ?? half;
+  return own(HALF_TO_FULL, half) ?? half;
 }
 
 /**

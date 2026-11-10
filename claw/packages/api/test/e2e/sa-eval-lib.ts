@@ -54,7 +54,9 @@
  * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
  * runner answers it as the person's channel does, see {@link HoldSpec}), `setup` (assistant mode: what the identity must have before each
  * attempt, made by the runner through the API and removed after it; `triggers`: [{name, schedule, timezone, prompt?, action?}], made with
- * `POST /v1/triggers`, see {@link CaseSetup}), `delivers` ([{name?, type?}]: files the last turn's
+ * `POST /v1/triggers`; `forget_memories`: [substring]: the identity's memory entries whose title or body holds one of them,
+ * case-insensitively, are deleted before each attempt, so a case that asks to remember something is not answered "I already have
+ * that", see {@link CaseSetup}), `delivers` ([{name?, type?}]: files the last turn's
  * items must hand the user, each matched by a name pattern and a media type prefix, from the files the assistant's messages
  * carry). A case with files runs on the assistant path only.
  *
@@ -155,9 +157,44 @@ export interface EvalCase {
  * brief); a name the identity already has a trigger under makes the attempt an error, never a second trigger the case did not mean.
  */
 export interface SetupTrigger { name: string; schedule: string; timezone: string; prompt?: string; action?: "run" | "brief" }
-export interface CaseSetup { triggers?: SetupTrigger[] }
+/**
+ * `forget_memories`: what the identity must NOT have when the attempt starts. Every memory entry (`GET /v1/users/me/memories`) whose
+ * title or body holds one of the substrings, case-insensitively, is deleted by id before the attempt (`DELETE /v1/users/me/memories/:id`);
+ * one that cannot be deleted makes the attempt an error, never a grade against an entry the case did not mean.
+ */
+export interface CaseSetup { triggers?: SetupTrigger[]; forget_memories?: string[] }
 /** The most triggers a case's setup makes (the server's own cap per user is higher; a case needs one or two). */
 export const SETUP_TRIGGERS_MAX = 5;
+/** The most substrings a case's `setup.forget_memories` names. */
+export const SETUP_FORGET_MAX = 10;
+
+/** A memory entry as the run reads it from `GET /v1/users/me/memories`: its id, and the text a case's substrings are looked for in. */
+export interface MemoryEntrySeen { id: number; title: string; body: string }
+
+/** The entries of a `GET /v1/users/me/memories` answer, or null when it is not a list of entries each with an id. */
+export function memoryRows(json: unknown): MemoryEntrySeen[] | null {
+  const data = (json as { data?: unknown } | null)?.data;
+  if (!Array.isArray(data)) return null;
+  const out: MemoryEntrySeen[] = [];
+  for (const e of data as Array<Record<string, unknown> | null>) {
+    const id = Number(e?.id);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    const text = (v: unknown): string => (typeof v === "string" ? v : "");
+    out.push({ id, title: text(e!.title), body: text(e!.body) || text(e!.content) });
+  }
+  return out;
+}
+
+/** The ids of the entries whose title or body holds one of `substrings`, case-insensitively (`setup.forget_memories`). */
+export function memoriesMatching(rows: readonly MemoryEntrySeen[], substrings: readonly string[]): number[] {
+  const wanted = substrings.map((x) => x.trim().toLowerCase()).filter(Boolean);
+  return rows.filter((r) => wanted.some((w) => `${r.title}\n${r.body}`.toLowerCase().includes(w))).map((r) => r.id);
+}
+
+/** The entries an attempt made: listed after it and not before it. An entry from before it is never one, whatever happened to it. */
+export function newMemoryIds(before: ReadonlySet<number>, after: readonly MemoryEntrySeen[]): number[] {
+  return after.filter((r) => !before.has(r.id)).map((r) => r.id);
+}
 
 /**
  * A request the case's item holds for its person (an entry of the item's `params.holds`, `assistant/holds.ts`): which tool, and how the
@@ -228,8 +265,12 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
 function setupProblems(setup: unknown): string[] {
   if (!setup || typeof setup !== "object" || Array.isArray(setup)) return ["setup is not an object"];
   const out: string[] = [];
-  const { triggers, ...rest } = setup as CaseSetup & Record<string, unknown>;
+  const { triggers, forget_memories: forget, ...rest } = setup as CaseSetup & Record<string, unknown>;
   if (Object.keys(rest).length) out.push(`setup ${Object.keys(rest).join(",")} unknown`);
+  if (forget !== undefined) {
+    if (!Array.isArray(forget) || !forget.length || forget.length > SETUP_FORGET_MAX) out.push(`setup forget_memories is a list of 1 to ${SETUP_FORGET_MAX}`);
+    else if (forget.some((x) => typeof x !== "string" || !x.trim())) out.push("setup forget_memories with an empty or non-text entry");
+  }
   if (triggers === undefined) return out;
   if (!Array.isArray(triggers) || !triggers.length || triggers.length > SETUP_TRIGGERS_MAX) return [...out, `setup triggers is a list of 1 to ${SETUP_TRIGGERS_MAX}`];
   const names = new Set<string>();
