@@ -70,6 +70,7 @@ updates:
     directories:
       - "/claw"
       - "/deploy/litellm"
+      - "/personal-agent"
       - "/sandbox/docker"
     schedule:
       interval: "monthly"
