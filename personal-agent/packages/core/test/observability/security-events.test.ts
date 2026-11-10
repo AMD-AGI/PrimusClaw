@@ -15,9 +15,11 @@ import {
   type LogFields,
   type Logger,
   type MetricsPort,
+  type RequestScope,
   type SecurityEventName,
   type SecurityEventRecord,
 } from "../../src/index.js";
+import { own } from "../../src/own.js";
 
 // Values that must never reach a log line. Each is handed to the helper in the field a careless caller might use.
 const LINK_CODE = "K7PQ2XMZ";
@@ -42,7 +44,7 @@ interface Line {
 }
 
 /** A logger that keeps every line with the fields bound to it, and metrics that keep every record. */
-function capture() {
+function capture(scope?: RequestScope) {
   const lines: Line[] = [];
   const counted: SecurityEventRecord[] = [];
   const make = (bound: LogFields): Logger => {
@@ -60,7 +62,7 @@ function capture() {
     };
   };
   const metrics: MetricsPort = { ...noMetrics, securityEvent: (record) => counted.push(record) };
-  const log = new SecurityLog(make({}), metrics);
+  const log = new SecurityLog(make({}), metrics, scope);
   const everything = (): string => lines.map((l) => `${l.level} ${l.message} ${JSON.stringify(l.fields)}`).join("\n");
   return { lines, counted, log, everything };
 }
@@ -258,7 +260,7 @@ describe("security event fields", () => {
         Object.hasOwn(SECURITY_FIELDS, name) ? name : "<unknown_field>",
       );
       assert.deepEqual(record.dropped, [...new Set(names)].sort(), JSON.stringify(fields));
-      for (const name of Object.keys(fields)) assert.equal(record[name], undefined);
+      for (const name of Object.keys(fields)) assert.equal(own(record, name), undefined);
       const logged = everything();
       for (const value of Object.values(fields)) {
         const text = value instanceof Error ? value.message : typeof value === "string" ? value : "";
@@ -307,7 +309,7 @@ describe("security event ids", () => {
       ...ids,
     });
     assert.equal(record.dropped, undefined);
-    for (const [name, value] of Object.entries(ids)) assert.equal(record[name], value);
+    for (const [name, value] of Object.entries(ids)) assert.equal(own(record, name), value);
   });
 
   it("keeps a real client address, normalised", () => {
@@ -341,5 +343,51 @@ describe("security event ids", () => {
     assert.deepEqual(record, { event: "link_attempt", dropped: ["<unknown_field>"] });
     const logged = everything();
     for (const text of [LINK_CODE, "Outcome", "k7pq2xmz"]) assert.ok(!logged.includes(text), text);
+  });
+});
+
+describe("the activity a security event belongs to (Python guardrails.audit)", () => {
+  // The lines Python's audit() logged for the same calls, with ACTIVITY_ID as named.
+  const PY = {
+    given:
+      '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","activity_id":"act-given-1","operation":"pr_merge"}',
+    neither: '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","operation":"pr_merge"}',
+    fromContext:
+      '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","operation":"pr_merge","activity_id":"act-context-7"}',
+    givenInsideContext:
+      '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","activity_id":"act-given-1","operation":"pr_merge"}',
+    nullInsideContext:
+      '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","operation":"pr_merge"}',
+    emptyContext:
+      '{"event":"rate_limited","aad_object_id":"9f1c2e3d-0000-4000-8000-000000000abc","operation":"pr_merge"}',
+  };
+  /** A scope handling `activityId` ("" is an activity without an id), or none when undefined. */
+  const handling = (activityId: string | undefined): RequestScope => ({
+    run: (_context, fn) => fn(),
+    current: () =>
+      activityId === undefined ? undefined : { clientLocale: "", activityId, userId: AAD, conversationId: "c-1" },
+  });
+  const logged = (scope: RequestScope | undefined, extra: Record<string, unknown> = {}): string => {
+    const { lines, counted, log } = capture(scope);
+    const returned = log.event("rate_limited", { aad_object_id: AAD, ...extra, operation: "pr_merge" });
+    assert.deepEqual(counted, [returned]);
+    assert.equal(lines.length, 1);
+    return lines[0]?.message ?? "";
+  };
+
+  it("keeps the activity id the caller gives", () => {
+    assert.equal(logged(undefined, { activity_id: "act-given-1" }), PY.given);
+    assert.equal(logged(handling("act-context-7"), { activity_id: "act-given-1" }), PY.givenInsideContext);
+  });
+
+  it("takes the activity being handled when the caller gives none, after the caller's fields", () => {
+    assert.equal(logged(handling("act-context-7")), PY.fromContext);
+  });
+
+  it("has none outside an activity, for an activity without an id, or when the caller says null", () => {
+    assert.equal(logged(undefined), PY.neither);
+    assert.equal(logged(handling(undefined)), PY.neither);
+    assert.equal(logged(handling("")), PY.emptyContext);
+    assert.equal(logged(handling("act-context-7"), { activity_id: null }), PY.nullInsideContext);
   });
 });

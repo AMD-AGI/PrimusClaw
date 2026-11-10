@@ -6,7 +6,7 @@
  * and bare URLs) and emphasis (bold, italic, strike, underline). Text and code reach the HTML only escaped, a URL only
  * through `safeUrl`.
  */
-import { cpLength } from "@primusclaw/personal-agent";
+import { cpLength, own } from "@primusclaw/personal-agent";
 import { MAX_NEST } from "./constants.js";
 import { cpBefore, escapeAttr, escaping, isAlnum, PY_SPACE, strip } from "./escape.js";
 import { canOpen, codeSpans, findCloser, parseLink, trimUrl, type CodeSpans } from "./scan.js";
@@ -184,7 +184,7 @@ class InlineReader {
         this.dead.set(key, i + size);
         continue;
       }
-      const [tag, kind] = EMPHASIS[key] ?? ["i", "other"];
+      const [tag, kind] = own(EMPHASIS, key) ?? ["i", "other"];
       const inner = text.slice(i + size, at);
       this.push({ html: `<${tag}>${this.sub(inner)}</${tag}>`, plain: inner, kind }, at + size);
       return;

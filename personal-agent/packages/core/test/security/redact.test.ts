@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MASK, NOTE, redactLogLine, redactText } from "../../src/index.js";
+import { own } from "../../src/own.js";
 
 const HEX = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 // Built from pieces at run time so that no literal in this file looks like a real credential to a secret scanner.
@@ -31,7 +32,7 @@ const CASES: Readonly<Record<string, string>> = {
   ].join("."),
 };
 
-const secret = (name: string): string => CASES[name] ?? assert.fail(name);
+const secret = (name: string): string => own(CASES, name) ?? assert.fail(name);
 
 describe("redactText", () => {
   it("masks each credential shape", () => {

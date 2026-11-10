@@ -1,0 +1,206 @@
+# W4: routing and commands (agent.py's routing, commands.py, capabilities.py, transparency.py, integrations.py, branding.py).
+# Work in progress: the router and the command handlers follow; this ledger grows with them.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+
+teams/tests/test_commands_render.py::test_parse_command -> packages/core/test/commands.test.ts::parse_command
+
+teams/tests/test_capabilities.py::test_the_registry_is_well_formed -> packages/core/test/help.test.ts::test_the_registry_is_well_formed
+teams/tests/test_capabilities.py::test_ways_of_saying_the_same -> packages/core/test/capabilities-natural.test.ts::test_ways_of_saying_the_same
+teams/tests/test_capabilities.py::test_anything_else_is_a_request_for_claw -> packages/core/test/capabilities-natural.test.ts::test_anything_else_is_a_request_for_claw
+teams/tests/test_capabilities.py::test_a_group_reads_only_what_a_group_may_do -> packages/core/test/capabilities-natural.test.ts::test_a_group_reads_only_what_a_group_may_do
+teams/tests/test_capabilities.py::test_a_sentence_for_what_this_chat_does_not_have_stays_words_for_claw -> packages/core/test/capabilities-natural.test.ts::test_a_sentence_for_what_this_chat_does_not_have_stays_words_for_claw
+teams/tests/test_capabilities.py::test_every_command_a_sentence_means_is_one_the_worker_handles -> packages/core/test/capabilities-natural.test.ts::test_every_command_a_sentence_means_is_one_the_worker_handles
+teams/tests/test_capabilities.py::test_short_generic_words_are_no_longer_triggers -> packages/core/test/capabilities-natural.test.ts::test_short_generic_words_are_no_longer_triggers
+teams/tests/test_capabilities.py::test_help_lists_no_commands_and_every_category_in_order -> packages/core/test/help.test.ts::test_help_lists_no_commands_and_every_category_in_order
+teams/tests/test_capabilities.py::test_each_line_is_short_enough_for_a_phone -> packages/core/test/help.test.ts::test_each_line_is_short_enough_for_a_phone
+teams/tests/test_capabilities.py::test_settings_show_their_current_value_and_a_group_never_does -> packages/core/test/help.test.ts::test_settings_show_their_current_value_and_a_group_never_does
+teams/tests/test_capabilities.py::test_menu_buttons_are_mentioned_once_at_the_end -> packages/core/test/help.test.ts::test_menu_buttons_are_mentioned_once_at_the_end
+teams/tests/test_capabilities.py::test_parts_that_are_off_are_not_offered -> packages/core/test/help.test.ts::test_parts_that_are_off_are_not_offered
+teams/tests/test_capabilities.py::test_with_the_assistant_help_says_it_looks_up_github_and_the_web_itself -> packages/core/test/help.test.ts::test_with_the_assistant_help_says_it_looks_up_github_and_the_web_itself
+teams/tests/test_capabilities.py::test_review_entries_say_what_the_worker_does -> packages/core/test/help.test.ts::test_review_entries_say_what_the_worker_does
+teams/tests/test_capabilities.py::test_whether_a_merge_waits_for_a_tap_is_said_without_a_fixed_list -> packages/core/test/help.test.ts::test_whether_a_merge_waits_for_a_tap_is_said_without_a_fixed_list
+
+teams/tests/test_transparency.py::test_every_help_says_answers_are_ai_generated_and_carries_the_data_statement -> packages/core/test/transparency.test.ts::test_every_help_says_answers_are_ai_generated_and_carries_the_data_statement
+teams/tests/test_transparency.py::test_where_remote_agents_are_on_a_1to1_help_says_an_attached_chat_goes_to_the_agent -> packages/core/test/transparency.test.ts::test_where_remote_agents_are_on_a_1to1_help_says_an_attached_chat_goes_to_the_agent
+teams/tests/test_transparency.py::test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_to_stop -> packages/core/test/transparency.test.ts::test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_to_stop
+teams/tests/test_transparency.py::test_the_stop_word_help_teaches_is_the_stop_command -> packages/core/test/transparency.test.ts::test_the_stop_word_help_teaches_is_the_stop_command
+
+# the router (WIP: the remaining tests of these modules follow)
+teams/tests/test_agent.py::test_unlinked_user_is_told_to_get_a_code_on_the_page_and_no_code_is_issued -> packages/core/test/routing/agent.test.ts::test_unlinked_user_is_told_to_get_a_code_on_the_page_and_no_code_is_issued
+teams/tests/test_agent.py::test_link_command_binds_the_pending_key_to_the_sender -> packages/core/test/routing/agent.test.ts::test_link_command_binds_the_pending_key_to_the_sender
+teams/tests/test_agent.py::test_link_with_wrong_or_missing_code_is_one_generic_refusal -> packages/core/test/routing/agent.test.ts::test_link_with_wrong_or_missing_code_is_one_generic_refusal
+teams/tests/test_agent.py::test_link_attempts_are_rate_limited_per_user -> packages/core/test/routing/agent.test.ts::test_link_attempts_are_rate_limited_per_user
+teams/tests/test_agent.py::test_message_from_a_never_uses_the_key_of_b -> packages/core/test/routing/agent.test.ts::test_message_from_a_never_uses_the_key_of_b
+teams/tests/test_agent.py::test_unlinked_b_cannot_ride_on_the_link_of_a -> packages/core/test/routing/agent.test.ts::test_unlinked_b_cannot_ride_on_the_link_of_a
+teams/tests/test_agent.py::test_second_message_reuses_the_session_and_new_starts_a_fresh_one -> packages/core/test/routing/agent.test.ts::test_second_message_reuses_the_session_and_new_starts_a_fresh_one
+teams/tests/test_agent.py::test_same_activity_delivered_twice_is_handled_once -> packages/core/test/routing/agent.test.ts::test_same_activity_delivered_twice_is_handled_once
+teams/tests/test_agent.py::test_help_and_group_chat -> packages/core/test/routing/agent.test.ts::test_help_and_group_chat
+teams/tests/test_agent.py::test_stop_interrupts_only_when_a_task_runs -> packages/core/test/routing/agent.test.ts::test_stop_interrupts_only_when_a_task_runs
+teams/tests/test_agent.py::test_unlink_removes_the_link -> packages/core/test/routing/agent.test.ts::test_unlink_removes_the_link
+teams/tests/test_agent.py::test_link_success_names_the_safe_user_and_offers_unlink -> packages/core/test/routing/agent.test.ts::test_link_success_names_the_safe_user_and_offers_unlink
+teams/tests/test_agent.py::test_link_success_still_confirms_when_safe_cannot_say_who -> packages/core/test/routing/agent.test.ts::test_link_success_still_confirms_when_safe_cannot_say_who
+teams/tests/test_agent.py::test_whoami_and_help_show_the_users_own_account -> packages/core/test/routing/agent.test.ts::test_whoami_and_help_show_the_users_own_account
+teams/tests/test_agent.py::test_whoami_for_an_unlinked_user_asks_to_connect -> packages/core/test/routing/agent.test.ts::test_whoami_for_an_unlinked_user_asks_to_connect
+teams/tests/test_agent.py::test_memory_command_reports_each_users_own_state_and_links_the_page -> packages/core/test/routing/agent.test.ts::test_memory_command_reports_each_users_own_state_and_links_the_page
+teams/tests/test_agent.py::test_memory_command_survives_a_claw_error_and_an_unlinked_user -> packages/core/test/routing/agent.test.ts::test_memory_command_survives_a_claw_error_and_an_unlinked_user
+teams/tests/test_agent.py::test_stop_during_a_running_turn -> packages/core/test/routing/agent.test.ts::test_stop_during_a_running_turn (the router's part: the interrupt, and the turn told it was stopped)
+teams/tests/test_agent.py::test_a_stop_claw_refused_leaves_a_failed_turn_said_as_an_error -> packages/core/test/routing/agent.test.ts::test_a_stop_claw_refused_leaves_a_failed_turn_said_as_an_error (the refusal is said)
+teams/tests/test_group_chat.py::test_group_message_without_a_mention_is_ignored -> packages/core/test/routing/group-chat.test.ts::test_group_message_without_a_mention_is_ignored
+teams/tests/test_group_chat.py::test_group_message_from_b_never_uses_the_key_of_a -> packages/core/test/routing/group-chat.test.ts::test_group_message_from_b_never_uses_the_key_of_a
+teams/tests/test_group_chat.py::test_a_one_to_one_session_keeps_memory -> packages/core/test/routing/group-chat.test.ts::test_a_one_to_one_session_keeps_memory
+teams/tests/test_group_chat.py::test_a_group_session_made_before_it_could_be_shared_is_replaced -> packages/core/test/routing/group-chat.test.ts::test_a_group_session_made_before_it_could_be_shared_is_replaced
+teams/tests/test_group_chat.py::test_unlinked_sender_gets_a_chat_reply_and_no_credential_is_used -> packages/core/test/routing/group-chat.test.ts::test_unlinked_sender_gets_a_chat_reply_and_no_credential_is_used
+teams/tests/test_group_chat.py::test_group_traffic_saves_no_proactive_reference -> packages/core/test/routing/group-chat.test.ts::test_group_traffic_saves_no_proactive_reference
+teams/tests/test_group_chat.py::test_group_turn_creates_one_session_per_sender_and_reuses_it -> packages/core/test/routing/group-chat.test.ts::test_group_turn_creates_one_session_per_sender_and_reuses_it
+teams/tests/test_group_chat.py::test_group_commands_are_limited -> packages/core/test/routing/group-chat.test.ts::test_group_commands_are_limited
+teams/tests/test_group_chat.py::test_help_works_unlinked_and_mentions_the_review_flow_and_approval -> packages/core/test/routing/group-chat.test.ts::test_help_works_unlinked_and_mentions_the_review_flow_and_approval
+teams/tests/test_group_chat.py::test_new_and_stop_only_touch_the_senders_own_group_session -> packages/core/test/routing/group-chat.test.ts::test_new_and_stop_only_touch_the_senders_own_group_session
+teams/tests/test_group_chat.py::test_whoami_in_a_group_does_not_print_the_email -> packages/core/test/routing/group-chat.test.ts::test_whoami_in_a_group_does_not_print_the_email
+teams/tests/test_group_onboarding.py::test_an_unlinked_mention_gets_a_card_for_them_and_a_one_to_one_message -> packages/core/test/routing/onboarding.test.ts::test_an_unlinked_mention_gets_a_card_for_them_and_a_one_to_one_message
+teams/tests/test_group_onboarding.py::test_the_card_goes_out_in_the_group_even_when_the_conversation_cannot_be_created -> packages/core/test/routing/onboarding.test.ts::test_the_card_goes_out_in_the_group_even_when_the_conversation_cannot_be_created
+teams/tests/test_group_onboarding.py::test_a_command_is_not_kept_to_run_after_the_link -> packages/core/test/routing/onboarding.test.ts::test_a_command_is_not_kept_to_run_after_the_link
+teams/tests/test_group_onboarding.py::test_only_the_person_the_card_is_for_can_press_it -> packages/core/test/routing/onboarding.test.ts::test_only_the_person_the_card_is_for_can_press_it
+teams/tests/test_group_onboarding.py::test_pressing_the_button_is_the_persons_own_request_and_is_not_held_to_the_daily_message -> packages/core/test/routing/onboarding.test.ts::test_pressing_the_button_is_the_persons_own_request_and_is_not_held_to_the_daily_message
+teams/tests/test_group_onboarding.py::test_a_press_after_a_day_is_not_active -> packages/core/test/routing/onboarding.test.ts::test_a_press_after_a_day_is_not_active
+teams/tests/test_group_onboarding.py::test_a_second_mention_in_the_same_chat_within_a_day_posts_nothing -> packages/core/test/routing/onboarding.test.ts::test_a_second_mention_in_the_same_chat_within_a_day_posts_nothing
+teams/tests/test_group_onboarding.py::test_after_a_day_the_card_and_the_message_come_again -> packages/core/test/routing/onboarding.test.ts::test_after_a_day_the_card_and_the_message_come_again
+teams/tests/test_group_onboarding.py::test_a_second_chat_gets_its_own_card_but_not_a_second_message -> packages/core/test/routing/onboarding.test.ts::test_a_second_chat_gets_its_own_card_but_not_a_second_message
+teams/tests/test_group_onboarding.py::test_another_person_in_the_same_chat_gets_their_own -> packages/core/test/routing/onboarding.test.ts::test_another_person_in_the_same_chat_gets_their_own
+teams/tests/test_group_onboarding.py::test_the_request_runs_in_the_group_when_they_connect_within_15_minutes -> packages/core/test/routing/onboarding.test.ts::test_the_request_runs_in_the_group_when_they_connect_within_15_minutes
+teams/tests/test_group_onboarding.py::test_a_request_older_than_15_minutes_is_not_run_and_the_link_is_just_confirmed -> packages/core/test/routing/onboarding.test.ts::test_a_request_older_than_15_minutes_is_not_run_and_the_link_is_just_confirmed
+teams/tests/test_group_onboarding.py::test_a_failed_link_does_not_run_the_request -> packages/core/test/routing/onboarding.test.ts::test_a_failed_link_does_not_run_the_request
+teams/tests/test_group_onboarding.py::test_pressing_the_button_after_connecting_elsewhere_runs_the_request -> packages/core/test/routing/onboarding.test.ts::test_pressing_the_button_after_connecting_elsewhere_runs_the_request
+teams/tests/test_group_onboarding.py::test_a_linked_member_is_unchanged -> packages/core/test/routing/onboarding.test.ts::test_a_linked_member_is_unchanged
+teams/tests/test_group_onboarding.py::test_a_private_message_in_a_group_is_not_answered_in_the_group_and_the_sender_is_pointed_to_the_1_1_chat -> packages/core/test/routing/onboarding.test.ts::test_a_private_message_in_a_group_is_not_answered_in_the_group_and_the_sender_is_pointed_to_the_1_1_chat
+teams/tests/test_group_onboarding.py::test_a_private_message_in_a_group_whose_1_1_chat_cannot_open_posts_nothing -> packages/core/test/routing/onboarding.test.ts::test_a_private_message_in_a_group_whose_1_1_chat_cannot_open_posts_nothing
+teams/tests/test_group_onboarding.py::test_the_person_it_is_for_gets_the_steps_by_pressing_it -> MERGED packages/core/test/routing/onboarding.test.ts::test_pressing_the_button_is_the_persons_own_request_and_is_not_held_to_the_daily_message
+teams/tests/test_queued_messages.py::test_stop_with_no_turn_of_mine_interrupts_a_session_that_is_busy_on_claw -> packages/core/test/routing/settings.test.ts::/stop with no turn of mine interrupts a session that is busy on Claw, and says so
+teams/tests/test_queued_messages.py::test_stop_with_no_turn_and_an_idle_session_says_nothing_is_running -> MERGED packages/core/test/routing/settings.test.ts::/stop with no turn of mine interrupts a session that is busy on Claw, and says so
+teams/tests/test_queued_messages.py::test_stop_in_a_chat_with_no_session_never_asks_claw -> MERGED packages/core/test/routing/agent.test.ts::test_stop_interrupts_only_when_a_task_runs
+teams/tests/test_repo_sessions.py::test_a_bare_repo_lists_the_last_five_newest_first_one_card_each_with_a_button -> MERGED packages/core/test/routing/settings.test.ts::/repo binds the next session, lists the recent ones with a button each, and a tap does the same
+teams/tests/test_repo_sessions.py::test_a_tap_does_what_the_command_does_and_replaces_the_card -> MERGED packages/core/test/routing/settings.test.ts::/repo binds the next session, lists the recent ones with a button each, and a tap does the same
+teams/tests/test_repo_sessions.py::test_a_bad_argument_changes_nothing_and_says_how_to_write_it -> MERGED packages/core/test/routing/settings.test.ts::/repo binds the next session, lists the recent ones with a button each, and a tap does the same
+teams/tests/test_repo_sessions.py::test_repo_is_refused_while_a_task_runs_and_changes_nothing -> packages/core/test/routing/settings.test.ts::/repo and its tap are refused while a task runs; /new too
+teams/tests/test_repo_sessions.py::test_a_tap_while_a_task_runs_puts_the_card_back_with_its_button -> MERGED packages/core/test/routing/settings.test.ts::/repo and its tap are refused while a task runs; /new too
+teams/tests/test_repo_sessions.py::test_a_session_claw_refuses_or_does_not_know_is_forgotten -> packages/core/test/routing/settings.test.ts::/sessions lists the caller's own sessions checked with their key, and forgets the ones Claw refuses
+teams/tests/test_repo_sessions.py::test_when_claw_cannot_be_asked_nothing_is_shown_and_nothing_is_forgotten -> MERGED packages/core/test/routing/settings.test.ts::/sessions lists the caller's own sessions checked with their key, and forgets the ones Claw refuses
+teams/tests/test_repo_sessions.py::test_repo_then_a_task_creates_the_session_with_the_repository_and_the_next_message_does_not -> MERGED packages/core/test/routing/settings.test.ts::/repo binds the next session, lists the recent ones with a button each, and a tap does the same
+teams/tests/test_capabilities.py::test_a_plain_sentence_sets_quiet_hours_end_to_end -> MERGED packages/core/test/routing/settings.test.ts::/quiet shows, turns off, refuses a bad window and sets one; held notices go once nothing mutes
+teams/tests/test_capabilities.py::test_each_example_reaches_its_capability -> packages/core/test/routing/capabilities-route.test.ts::test_each_example_reaches_its_capability task-zh-dm
+teams/tests/test_capabilities.py::test_which_account_in_a_group_is_answered_there -> packages/core/test/routing/capabilities-route.test.ts::test_which_account_in_a_group_is_answered_there
+teams/tests/test_capabilities.py::test_without_the_assistant_my_tasks_goes_to_claw_as_the_words -> packages/core/test/routing/capabilities-route.test.ts::test_without_the_assistant_my_tasks_goes_to_claw_as_the_words
+teams/tests/test_capabilities.py::test_without_the_brief_a_brief_sentence_is_words_for_claw -> packages/core/test/routing/capabilities-route.test.ts::test_without_the_brief_a_brief_sentence_is_words_for_claw
+teams/tests/test_capabilities.py::test_a_remote_agent_sentence_is_a_command_only_while_it_applies -> packages/core/test/routing/capabilities-route.test.ts::test_a_remote_agent_sentence_is_a_command_only_while_it_applies 回来吧 / remote agents off
+teams/tests/test_message_while_running.py::test_a_second_message_is_queued_in_claw_and_answered_after_the_first -> packages/core/test/routing/while-running.test.ts::test_a_second_message_is_queued_in_claw_and_answered_after_the_first
+teams/tests/test_message_while_running.py::test_one_message_at_most_waits -> packages/core/test/routing/while-running.test.ts::test_one_message_at_most_waits
+teams/tests/test_message_while_running.py::test_a_message_sent_before_the_first_reached_claw_goes_to_the_same_session -> packages/core/test/routing/while-running.test.ts::test_a_message_sent_before_the_first_reached_claw_goes_to_the_same_session
+teams/tests/test_message_while_running.py::test_stop_says_the_waiting_message_runs_next -> packages/core/test/routing/while-running.test.ts::test_stop_says_the_waiting_message_runs_next
+teams/tests/test_message_while_running.py::test_a_message_is_not_queued_behind_a_review_for_a_colleague -> packages/core/test/routing/while-running.test.ts::test_a_message_is_not_queued_behind_a_review_for_a_colleague
+teams/tests/test_message_while_running.py::test_a_message_behind_a_turn_that_is_itself_queued_waits_until_that_turn_runs -> MERGED packages/core/test/routing/while-running.test.ts::a message whose turn in front never starts running in time is refused
+teams/tests/test_click_outcome_is_a_message.py::test_the_card_is_replaced_and_the_line_is_said_once -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_card_that_is_more_than_a_note_says_its_fallback_line -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_card_with_no_line_says_nothing_new -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_announce_false_says_nothing_new_while_the_edit_works -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_failed_edit_still_says_the_line_once -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_click_that_came_as_a_message_says_the_line_once -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_line_that_cannot_be_sent_does_not_undo_the_replaced_card -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_line_that_cannot_be_sent_when_the_edit_failed_too_is_not_hidden -> MERGED packages/core/test/routing/chat.test.ts::a settled click replaces the card and says the outcome; a failed edit still says it
+teams/tests/test_click_outcome_is_a_message.py::test_a_button_no_handler_knows_is_also_said_in_a_new_message -> MERGED packages/core/test/routing/settings.test.ts::a button of an unconnected chat, and one nobody handles, are settled with a note
+teams/tests/test_click_outcome_is_a_message.py::test_not_connected_is_said_in_a_new_message_too -> MERGED packages/core/test/routing/settings.test.ts::a button of an unconnected chat, and one nobody handles, are settled with a note
+teams/tests/test_click_outcome_is_a_message.py::test_a_handler_that_crashes_is_also_said_in_a_new_message -> packages/core/test/routing/features.test.ts::test_a_handler_that_crashes_is_also_said_in_a_new_message
+teams/tests/test_commands_while_attached.py::test_help_without_a_slash_is_the_help_and_not_the_agents_message -> packages/core/test/routing/attached-commands.test.ts::test_help_without_a_slash_is_the_help_and_not_the_agents_message
+teams/tests/test_commands_while_attached.py::test_help_says_which_agent_the_chat_is_attached_to_and_how_to_leave -> packages/core/test/routing/attached-commands.test.ts::test_help_says_which_agent_the_chat_is_attached_to_and_how_to_leave
+teams/tests/test_commands_while_attached.py::test_help_of_a_chat_that_is_not_attached_has_no_note_about_an_agent -> packages/core/test/routing/attached-commands.test.ts::test_help_of_a_chat_that_is_not_attached_has_no_note_about_an_agent
+teams/tests/test_commands_while_attached.py::test_every_menu_word_without_a_slash_is_answered_by_clawy_and_never_reaches_the_agent -> packages/core/test/routing/attached-commands.test.ts::test_every_menu_word_without_a_slash_is_answered_by_clawy_and_never_reaches_the_agent
+teams/tests/test_commands_while_attached.py::test_unlink_without_a_slash_only_asks_and_deletes_nothing -> packages/core/test/routing/attached-commands.test.ts::test_unlink_without_a_slash_only_asks_and_deletes_nothing
+teams/tests/test_commands_while_attached.py::test_a_word_after_link_goes_on_to_the_agent_and_to_claw_and_is_not_a_failed_link_attempt -> packages/core/test/routing/attached-commands.test.ts::test_a_word_after_link_goes_on_to_the_agent_and_to_claw_and_is_not_a_failed_link_attempt
+teams/tests/test_commands_while_attached.py::test_a_sentence_that_starts_with_a_menu_word_still_goes_to_the_agent -> packages/core/test/routing/attached-commands.test.ts::test_a_sentence_that_starts_with_a_menu_word_still_goes_to_the_agent
+teams/tests/test_commands_while_attached.py::test_the_slash_forms_of_clawys_commands_are_still_clawys_while_attached -> packages/core/test/routing/attached-commands.test.ts::test_the_slash_forms_of_clawys_commands_are_still_clawys_while_attached
+teams/tests/test_commands_while_attached.py::test_sessions_and_detach_in_a_chat_that_is_not_attached_are_answered_and_not_sent_to_claw -> packages/core/test/routing/attached-commands.test.ts::test_sessions_and_detach_in_a_chat_that_is_not_attached_are_answered_and_not_sent_to_claw
+teams/tests/test_commands_while_attached.py::test_a_group_chat_reads_help_and_new_without_a_slash_too -> packages/core/test/routing/attached-commands.test.ts::test_a_group_chat_reads_help_and_new_without_a_slash_too
+teams/tests/test_commands_while_attached.py::test_in_a_group_chat_the_personal_menu_words_are_not_commands -> packages/core/test/routing/attached-commands.test.ts::test_in_a_group_chat_the_personal_menu_words_are_not_commands
+teams/tests/test_commands_while_attached.py::test_in_a_group_chat_the_slash_forms_of_the_personal_commands_are_refused -> packages/core/test/routing/attached-commands.test.ts::test_in_a_group_chat_the_slash_forms_of_the_personal_commands_are_refused
+teams/tests/test_rule_tool.py::test_a_session_made_with_another_plugin_is_kept_and_records_the_new_plugin -> packages/core/test/routing/misc.test.ts::test_a_session_made_with_another_plugin_is_kept_and_records_the_new_plugin
+teams/tests/test_plugin.py::test_a_session_made_without_the_plugin_is_replaced_on_the_next_message -> packages/core/test/routing/misc.test.ts::a session made without the plugin is replaced, and the person is told why
+teams/tests/test_log_hygiene.py::test_an_ordinary_message_and_its_answer_are_not_logged -> packages/core/test/routing/misc.test.ts::test_an_ordinary_message_and_its_answer_are_not_logged (the router's lines)
+teams/tests/test_log_hygiene.py::test_a_message_that_holds_credentials_is_not_logged -> packages/core/test/routing/misc.test.ts::test_a_message_that_holds_credentials_is_not_logged (the router's lines)
+teams/tests/test_attached_provenance.py::test_someone_the_assistant_does_not_understand_also_tells_it_which_session -> packages/core/test/routing/misc.test.ts::test_someone_the_assistant_does_not_understand_also_tells_it_which_session (#455)
+teams/tests/test_attached_provenance.py::test_by_the_plain_route_a_chat_attached_to_nothing_says_so_and_a_worker_without_remote_agents_says_nothing -> packages/core/test/routing/misc.test.ts::test_by_the_plain_route_a_chat_attached_to_nothing_says_so_and_a_worker_without_remote_agents_says_nothing (#455)
+teams/tests/test_changes_card.py::test_create_pr_asks_the_agent_in_this_chats_session_and_replaces_the_card -> packages/core/test/routing/create-pr.test.ts::test_create_pr_asks_the_agent_in_this_chats_session_and_replaces_the_card
+teams/tests/test_changes_card.py::test_a_card_for_another_session_starts_nothing -> packages/core/test/routing/create-pr.test.ts::test_a_card_for_another_session_starts_nothing "sess-someone-else"
+teams/tests/test_changes_card.py::test_create_pr_while_a_task_runs_puts_the_card_back_with_its_button -> packages/core/test/routing/create-pr.test.ts::test_create_pr_while_a_task_runs_puts_the_card_back_with_its_button
+teams/tests/test_changes_card.py::test_a_session_made_before_the_plugin_setting_changed_is_not_continued_by_a_button -> packages/core/test/routing/create-pr.test.ts::test_a_session_made_before_the_plugin_setting_changed_is_not_continued_by_a_button
+teams/tests/test_changes_card.py::test_create_pr_from_a_chat_that_is_not_connected_is_refused_like_any_button -> packages/core/test/routing/create-pr.test.ts::test_create_pr_from_a_chat_that_is_not_connected_is_refused_like_any_button
+teams/tests/test_changes_card.py::test_a_group_chat_gets_no_changes_card -> packages/core/test/routing/create-pr.test.ts::test_a_group_chat_gets_no_changes_card (the group's turn shows no changes)
+teams/tests/test_remote_store.py::test_agent_commands_parse_to_a_subcommand_and_its_rest -> packages/core/test/routing/small-ports.test.ts::test_agent_commands_parse_to_a_subcommand_and_its_rest
+teams/tests/test_remote_store.py::test_the_commands_are_known_help_names_them_and_the_group_list_is_unchanged -> packages/core/test/routing/small-ports.test.ts::test_the_commands_are_known_help_names_them_and_the_group_list_is_unchanged
+teams/tests/test_remote_live_view.py::test_the_plain_sentences_of_switching -> packages/core/test/routing/small-ports.test.ts::test_the_plain_sentences_of_switching
+teams/tests/test_link_code_hardening.py::test_the_lockout_answer_names_the_configured_window -> packages/core/test/routing/small-ports.test.ts::test_the_lockout_answer_names_the_configured_window
+teams/tests/test_link_code_hardening.py::test_link_from_teams_logs_the_activity_and_answers_the_global_limit -> packages/core/test/routing/small-ports.test.ts::test_link_from_teams_logs_the_activity_and_answers_the_global_limit (the chat's part)
+teams/tests/test_turn_deadline.py::test_a_message_after_the_deadline_starts_a_turn_again -> packages/core/test/routing/small-ports.test.ts::test_a_message_after_the_deadline_starts_a_turn_again
+teams/tests/test_transparency.py::test_help_through_the_worker_in_a_1to1_chat_and_in_a_group -> packages/core/test/routing/transparency-router.test.ts::test_help_through_the_worker_in_a_1to1_chat_and_in_a_group
+teams/tests/test_transparency.py::test_the_link_steps_an_unconnected_chat_gets_say_answers_are_ai_generated -> packages/core/test/routing/transparency-router.test.ts::test_the_link_steps_an_unconnected_chat_gets_say_answers_are_ai_generated
+teams/tests/test_transparency.py::test_the_identity_binding_card_says_answers_are_ai_generated -> packages/core/test/routing/transparency-router.test.ts::test_the_identity_binding_card_says_answers_are_ai_generated
+teams/tests/test_transparency.py::test_the_connect_card_used_when_the_identity_service_does_not_answer_says_it_too -> packages/core/test/routing/transparency-router.test.ts::test_the_connect_card_used_when_the_identity_service_does_not_answer_says_it_too
+teams/tests/test_transparency.py::test_the_proactive_message_after_a_group_mention_says_it_too -> packages/core/test/routing/transparency-router.test.ts::test_the_proactive_message_after_a_group_mention_says_it_too
+teams/tests/test_transparency.py::test_both_connect_cards_render_the_notice -> packages/teams/test/views/commands.test.ts::test_both_connect_cards_render_the_notice
+teams/tests/test_transparency.py::test_the_app_description_says_the_same -> INTERNAL
+teams/tests/test_transparency.py::test_the_readme_quotes_the_statement_word_for_word -> INTERNAL
+teams/tests/test_transparency.py::test_a_delivered_report_is_gone_30_days_after_it_was_filed_without_another_report -> DROPPED: the store's retention of feedback reports is W1's (FeedbackRepository), tested there
+teams/tests/test_capabilities.py::test_every_capability_of_the_code_is_in_the_registry_and_nothing_else_is -> packages/core/test/capabilities-guard.test.ts::test_every_capability_of_the_code_is_in_the_registry_and_nothing_else_is (the router's commands, verbs and routes)
+teams/tests/test_capabilities.py::test_the_derived_sets_are_not_empty -> packages/core/test/capabilities-guard.test.ts::test_the_derived_sets_are_not_empty
+teams/tests/test_capabilities.py::test_every_route_is_in_the_code -> packages/core/test/capabilities-guard.test.ts::test_every_route_is_in_the_code
+teams/tests/test_capabilities.py::test_removing_an_entry_turns_the_guard_red -> packages/core/test/capabilities-guard.test.ts::test_removing_an_entry_turns_the_guard_red
+# after the baseline: internal #463 (the /memory wording), Port-later item assigned to W4
+teams/tests/test_log_hygiene.py::test_link_codes_and_the_keys_they_carry_are_not_logged -> packages/core/test/routing/misc.test.ts::test_link_codes_and_the_keys_they_carry_are_not_logged (the router's lines and security events)
+teams/tests/test_every_button_replaces_card.py::test_the_net_leaves_alone_what_it_must -> packages/core/test/routing/features.test.ts::test_the_net_leaves_alone_what_it_must
+teams/tests/test_every_button_replaces_card.py::test_a_button_no_handler_knows_still_gets_its_card_replaced -> MERGED packages/core/test/routing/settings.test.ts::a button of an unconnected chat, and one nobody handles, are settled with a note
+teams/tests/test_every_button_replaces_card.py::test_a_handler_that_crashes_still_replaces_the_card_and_the_crash_is_not_hidden -> MERGED packages/core/test/routing/features.test.ts::test_a_handler_that_crashes_is_also_said_in_a_new_message
+teams/tests/test_group_binds_agent_session.py::test_switch_in_a_group_binds_it_with_a_status_card_and_the_next_mention_goes_to_the_session -> packages/core/test/routing/group-binding.test.ts::test_switch_in_a_group_binds_it_with_a_status_card_and_the_next_mention_goes_to_the_session
+teams/tests/test_group_binds_agent_session.py::test_another_members_mention_never_reaches_the_binding -> packages/core/test/routing/group-binding.test.ts::test_another_members_mention_never_reaches_the_binding
+teams/tests/test_group_binds_agent_session.py::test_back_to_the_assistant_in_the_group_unbinds_it -> packages/core/test/routing/group-binding.test.ts::test_back_to_the_assistant_in_the_group_unbinds_it
+teams/tests/test_group_binds_agent_session.py::test_stop_it_in_a_bound_group_cancels_the_sessions_turn -> packages/core/test/routing/group-binding.test.ts::test_stop_it_in_a_bound_group_cancels_the_sessions_turn
+teams/tests/test_group_binds_agent_session.py::test_the_other_agent_commands_stay_a_1on1_chats_in_a_group -> packages/core/test/routing/group-binding.test.ts::test_the_other_agent_commands_stay_a_1on1_chats_in_a_group
+teams/tests/test_queued_messages.py::test_stop_when_the_session_cannot_be_read -> packages/core/test/routing/small-ports.test.ts::test_stop_when_the_session_cannot_be_read 500
+teams/tests/test_clawy_model.py::test_a_new_chat_is_created_with_the_model_and_never_patched -> packages/core/test/routing/small-ports.test.ts::test_a_new_chat_is_created_with_the_model_and_never_patched (the router's part: the model and what the session has)
+teams/tests/test_clawy_model.py::test_new_starts_a_session_that_is_created_with_the_model -> MERGED packages/core/test/routing/small-ports.test.ts::test_a_new_chat_is_created_with_the_model_and_never_patched (the router's part: the model and what the session has)
+
+# The router in front of the real remote agents (W6's tests that need the router): written, they come with a follow-up PR once W6's remote world is on main
+# teams/tests/test_remote_agents.py::test_a_message_that_quotes_goes_to_the_attached_agent_with_the_quote -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_a_plain_message_goes_to_claw_until_the_chat_is_attached_and_to_the_agent_after -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_detach_sends_messages_to_claw_again_and_leaves_the_session_where_it_is -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_new_while_attached_says_how_to_get_back_to_claw -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_a_group_chat_gets_no_agent_commands_and_calls_nothing -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_a_group_message_never_goes_to_the_remote_agent_the_1on1_chat_is_attached_to -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_a_remote_button_clicked_in_a_group_is_not_active_there -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_agents.py::test_unlinking_stops_everything_that_reads_with_the_key -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_menu.py::test_a_user_who_is_not_connected_or_in_a_group_gets_no_remote_buttons -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_follow.py::test_link_with_a_code_and_no_slash_links_the_chat -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent -> LATER: needs W6 test-support (follow-up PR)
+# teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do -> LATER: needs W6 test-support (follow-up PR)
+
+
+# Show here (agent.py `_show`): the click is the router's
+teams/tests/test_every_button_replaces_card.py::test_show_here_posts_the_answer_before_it_replaces_the_card -> packages/core/test/routing/show-here-click.test.ts::test_show_here_posts_the_answer_before_it_replaces_the_card
+teams/tests/test_rich_answer.py::test_show_here_sends_the_answer_as_xml -> packages/core/test/routing/show-here-click.test.ts::test_show_here_sends_the_answer_as_xml
+# Waiting for the real implementation of another line (ported once it is on this branch):
+#   test_every_button_replaces_card.py::test_a_click_ends_with_the_card_replaced (every kind) and ::test_a_card_pressed_again_after_a_failure_still_works: W5/W6/W6b/W7/W8 click handlers; W4's own kinds (repo, create_pr, bind, onboard) are covered in settings/create-pr/features/onboarding tests
+#   test_group_binds_agent_session.py::test_a_permission_of_a_bound_group_is_put_to_the_binder_in_their_1on1_chat, ::test_only_the_binders_status_card_buttons_act_in_the_group: W6 (RemoteChat, ClickHandler.inGroup)
+#   test_group_like_1on1.py (progress, answer parts, thumbs, approval and report cards in a group): W4b, W5, W8 views through the turn engine
+#   test_clawy_model.py (patching a session's model, the wire format): W4b engine and W2 client
+#   test_queued_messages.py (TurnState adoption, the wire format, the queued notice): W4b engine and W2 client; ::test_stop_while_the_queued_message_waits_interrupts_without_asking_claw_if_busy: W4b engine
+#   test_agents_card_refresh.py: W6b
+# internal #458 (open, head 7c1679d4): the Stop card of a phone's turn, routing half (the card itself is W4b's)
+teams/tests/test_stop_button.py::test_a_turn_from_a_phone_gets_the_card_and_its_press_interrupts_that_turn -> packages/core/test/routing/stop-card.test.ts::test_a_turn_from_a_phone_gets_the_card_and_its_press_interrupts_that_turn iOS
+teams/tests/test_stop_button.py::test_a_turn_from_a_desktop_or_the_web_gets_no_card -> packages/core/test/routing/stop-card.test.ts::test_a_turn_from_a_desktop_or_the_web_gets_no_card Windows
+teams/tests/test_stop_button.py::test_a_press_after_the_turn_ended_stops_nothing_and_says_so -> packages/core/test/routing/stop-card.test.ts::test_a_press_after_the_turn_ended_stops_nothing_and_says_so
+teams/tests/test_stop_button.py::test_the_card_of_an_earlier_turn_never_stops_the_next_one -> packages/core/test/routing/stop-card.test.ts::test_the_card_of_an_earlier_turn_never_stops_the_next_one
+teams/tests/test_stop_button.py::test_a_phones_message_to_an_attached_agent_gets_the_card_and_its_press_cancels_that_turn -> packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_an_attached_agent_gets_the_card_and_its_press_cancels_that_turn
+teams/tests/test_stop_button.py::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before -> packages/core/test/routing/stop-card.test.ts::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before
+teams/tests/test_stop_button.py::test_an_attached_agents_turn_from_the_desktop_gets_no_card -> packages/core/test/routing/stop-card.test.ts::test_an_attached_agents_turn_from_the_desktop_gets_no_card
+teams/tests/test_stop_button.py::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it -> packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it
+teams/tests/test_stop_button.py::test_a_press_after_the_agents_turn_ended_on_its_own_cancels_nothing -> MERGED packages/core/test/routing/stop-card.test.ts::test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before
+teams/tests/test_stop_button.py::test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited -> packages/core/test/routing/stop-card.test.ts::test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited
+teams/tests/test_stop_button.py::test_the_assistants_card_stays_while_its_turn_runs_past_a_first_say_and_goes_when_claw_says_it_ended -> packages/core/test/routing/stop-card.test.ts::a phone's message to the assistant: the card goes once Claw says the turn ended
+teams/tests/test_stop_button.py::test_the_turn_is_checked_by_the_stop_itself_so_a_turn_that_ends_meanwhile_is_never_the_one_stopped -> MERGED packages/core/test/routing/stop-card.test.ts::test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it
+# test_stop_button.py's StopButtons tests (the delay, the token's life, the card's words) are W4b's

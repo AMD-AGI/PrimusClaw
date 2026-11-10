@@ -9,6 +9,10 @@
  * assistant, in their language: which pull request, that its branch has conflicts, and that the author resolves them before the review can
  * merge it. Once per item and head commit (the notice's key): a push that still conflicts is told again, a second block on the same head is not.
  *
+ * The same holds for a merge GitHub refused because the pull request changes a CI workflow file and the reviewer's GitHub authorization
+ * has no `workflow` scope (`gh_pr_merge` refused `github_workflow_scope_missing`; 2026-11-09, daily gaps N17): no one can get past it
+ * through Claw, binding again does not add the scope, and the pull request has to be merged by hand on GitHub. R is told so, the same way.
+ *
  * What R is told is within what R may know of the item (`requester-view.ts`, which lists it): the pull request R named and one fact GitHub
  * shows on it to anyone who can read it, read through the reviewer's session as the view's `findings` and `merged` are; nothing of the
  * session itself (no summary, question or session id).
@@ -22,6 +26,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js
 import { db, type Querier } from "../infra/db.js";
 import { personWritesChinese, recordSystemNotice } from "./outbound.js";
 import { requestedByOfItem } from "./requester-view.js";
+import { WORKFLOW_SCOPE_REFUSAL } from "../github-review/service.js";
 
 const logger = pino({ name: "assistant-review-conflict" });
 
@@ -31,6 +36,24 @@ export function conflictText(pr: string, url: string, zh: boolean): string {
     ? `你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突。需要作者先解决冲突（合并或变基目标分支后推送），评审才能继续合入。${url}`
     : `${pr}, which you asked to be reviewed and merged, cannot be merged: GitHub says its branch has conflicts with the base branch. The author `
       + `has to resolve them (merge or rebase onto the base branch, then push) before the review can merge it. ${url}`;
+}
+
+/** What R is told, by language, when GitHub refused the merge for the missing `workflow` scope. */
+export function workflowScopeText(pr: string, url: string, zh: boolean): string {
+  return zh
+    ? `你请人评审并合入的 ${pr} 没能合入：这个 PR 改了 CI workflow 文件（.github/workflows/ 下），助理代为合入需要 GitHub 的 workflow 权限，目前没有这个权限。请在 GitHub 上手动合入。${url}`
+    : `${pr}, which you asked to be reviewed and merged, was not merged: it changes CI workflow files (.github/workflows/), and the assistant needs `
+      + `GitHub's workflow permission to merge it on someone's behalf, which it does not have. Please merge it by hand on GitHub. ${url}`;
+}
+
+/** Which refused merge R is told of, from the merge's audit row: a conflict (DIRTY), the missing `workflow` scope, or none. */
+function noticeOf(merge: { result: string; detail: string; merge_state: string | null }): "conflict" | "workflow_scope" | { skip: string; extra: Record<string, unknown> } {
+  if (merge.result === "refused" && merge.detail === WORKFLOW_SCOPE_REFUSAL) return "workflow_scope";
+  if (merge.result !== "refused" || merge.detail !== "merge_state_not_clean") {
+    return { skip: "merge_not_refused_on_state", extra: { result: merge.result, detail: merge.detail } };
+  }
+  if (merge.merge_state !== "DIRTY") return { skip: "merge_state_not_dirty", extra: { mergeState: merge.merge_state ?? null } };
+  return "conflict";
 }
 
 /** The ports a test stands in for: what reaches R. */
@@ -88,21 +111,21 @@ export async function tellRequesterOfConflict(itemId: string): Promise<boolean> 
       [item.worker_session_id],
     )).rows[0] as { repo: string; pr: number | null; head_sha: string; result: string; detail: string; merge_state: string | null } | undefined;
     if (!merge) return skipped("no_merge");
-    if (merge.result !== "refused" || merge.detail !== "merge_state_not_clean") {
-      return skipped("merge_not_refused_on_state", { result: merge.result, detail: merge.detail });
-    }
-    if (merge.merge_state !== "DIRTY") return skipped("merge_state_not_dirty", { mergeState: merge.merge_state ?? null });
+    const kind = noticeOf(merge);
+    if (typeof kind !== "string") return skipped(kind.skip, kind.extra);
     if (!merge.repo || !merge.pr) return skipped("merge_without_pr");
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [requester])).rows[0]?.session_id as string | undefined;
     if (!sessionId) return skipped("requester_has_no_assistant", { requester });
     const pr = `${merge.repo}#${merge.pr}`;
     const zh = await personWritesChinese(q, requester);
+    const url = `https://github.com/${merge.repo}/pull/${merge.pr}`;
     const told = await reviewConflictPorts.recordSystemNotice({
-      userId: requester, sessionId, text: conflictText(pr, `https://github.com/${merge.repo}/pull/${merge.pr}`, zh),
-      key: `review_conflict:${item.item_id}:${merge.head_sha || "-"}`,
+      userId: requester, sessionId, text: kind === "conflict" ? conflictText(pr, url, zh) : workflowScopeText(pr, url, zh),
+      // The conflict's key is the one it always had, so a conflict told before this is not told again.
+      key: `${kind === "conflict" ? "review_conflict" : "review_workflow_scope"}:${item.item_id}:${merge.head_sha || "-"}`,
     });
-    if (told === null) return skipped("already_told", { requester, pr, head: merge.head_sha || "-" });
-    logger.info({ itemId, requester, pr }, "assistant.review_conflict_told");
+    if (told === null) return skipped("already_told", { requester, pr, head: merge.head_sha || "-", kind });
+    logger.info({ itemId, requester, pr, kind }, "assistant.review_conflict_told");
     return true;
   } catch (err) {
     logger.warn({ err, itemId }, "assistant.review_conflict_not_told");

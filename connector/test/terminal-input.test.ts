@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, enterGuard, inputBox, findPane, terminalMode, turnRunning, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -83,6 +83,13 @@ describe("the terminal's permission mode, and whether the agent's policy lets th
     assert.deepEqual([...MODES_THAT_DO_NOT_ASK].sort(), ["acceptEdits", "auto", "bypassPermissions", "dontAsk"]);
     for (const m of MODES_THAT_DO_NOT_ASK) assert.ok(MODES.includes(m), m);
   });
+  test("a turn running under the box is read from its footer (esc to interrupt); an idle footer, or no box, is none", () => {
+    assert.equal(turnRunning(screenIn("  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt")), true);
+    assert.equal(turnRunning(screenIn("  ⏵⏵ bypass permissions on · 2 shells")), false);
+    assert.equal(turnRunning(screenIn("  ⏸ manual mode on · ? for shortcuts")), false);
+    assert.equal(turnRunning(screenIn("  ⏸ manual mode on", "❯ press esc to interrupt it")), false, "words in the box are not the footer");
+    assert.equal(turnRunning(" Do you want to proceed?\n ❯ 1. Yes\n  esc to interrupt"), false);
+  });
   test("a message that would run a shell command (!) or a slash command (/) there is not a prompt", () => {
     for (const t of ["!rm -rf ~", "  !ls", "/permissions", " /add-dir /", "/clear\nmore"]) assert.equal(actsAsCommand(t), true, t);
     for (const t of ["hello", "what does ! do", "a/b", "# heading"]) assert.equal(actsAsCommand(t), false, t);
@@ -149,7 +156,7 @@ function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Recor
   const pid = Number(tmux("display-message", "-p", "-t", "%0", "#{pane_pid}").trim());
   // The registry row Claude Code keeps for its process, named by its pid, which the stand-in updates.
   const named = path.join(claudeDir, "sessions", `${pid}.json`);
-  fs.writeFileSync(named, JSON.stringify({ pid, sessionId: REF, status: "idle", kind: "interactive", cwd: work, procStart: processStart(pid), pidDomain: localPidDomain() }));
+  fs.writeFileSync(named, JSON.stringify({ pid, sessionId: REF, status: extraEnv.FAKE_IDLE_STATUS ?? "idle", kind: "interactive", cwd: work, procStart: processStart(pid), pidDomain: localPidDomain() }));
   fs.symlinkSync(named, row);
   return { socket, pid, row: named, transcript, tmux, setMode: (m) => fs.writeFileSync(modeFile, m) };
 }
@@ -431,6 +438,70 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
     assert.equal(end.data.error, undefined);
     assert.ok(typed(t.transcript).includes("from the phone"));
+  });
+
+  test("a terminal whose Claude Code says `shell` (idle at its prompt, background shells running) is typed into at once", async () => {
+    // (Claude Code 2.1.32x: `shell` is `idle` with background shells; read as busy, the message waited until it was refused)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "toolbox", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "shell" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "shell", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    await h.online();
+    const hb = await h.claw.until("a heartbeat that offers typing", () => [...h.claw.heartbeats].reverse().find((b) =>
+      b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal"));
+    assert.equal(hb.agents[0].capabilities.resumable.find((r: any) => r.ref === REF).activity, "idle", "listed as idle at its prompt");
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "from the phone");
+    const end1 = await h.claw.until("the first turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
+    assert.deepEqual([end1.data.stopReason, end1.data.error], ["end_turn", undefined]);
+    // and again after a turn of its own, which leaves the row at `shell`
+    const two = h.prompt(sid, "and again");
+    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 10_000);
+    assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone", "and again"]);
+    assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.reason === "terminal_state_unknown"), "never held as a state it cannot read");
+  });
+
+  test("Enter is never sent onto a question: typed text with a permission question under its box is not submitted and nothing is approved", async () => {
+    // (the hard rule: a phone's message never becomes a key of a confirmation; the screen is read for that right before Enter)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const approved = path.join(tmpdir("cc-dialog-"), "approved");
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: approved });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "1 yes please go ahead");
+    const end = await h.claw.until("the refusal", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.equal(end.data.error, "terminal_input_failed");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(fs.existsSync(approved), false, "no Enter reached the question");
+    assert.deepEqual(typed(t.transcript), [], "nothing was submitted");
+    assert.match(String(h.audit().find((a) => a.kind === "terminal_input_refused")?.detail), /a question or a menu is on the screen/);
+  });
+
+  test("Enter's guard reads the one screen: the box there, exactly the text, no question; a long text the box wraps is still exact", () => {
+    const box = (held: string[], below = "  ⏸ manual mode on") => `  ready\n${RULE}\n❯ ${held[0]}\n${held.slice(1).map((l) => `  ${l}`).join("\n")}${held.length > 1 ? "\n" : ""}${RULE}\n${below}`;
+    assert.equal(enterGuard(box(["hello from the phone"]), "hello from the phone"), null);
+    assert.equal(enterGuard(box(["这是一段很长的手机消息，用来", "测试输入框如何显示。"]), "这是一段很长的手机消息，用来测试输入框如何显示。"), null, "wrapped");
+    assert.equal(enterGuard(box(["line one", "line two"]), "line one\nline two"), null);
+    assert.equal(enterGuard(box(["[Pasted text #1 +40 lines]"]), "a\nb\nc"), null, "a long paste");
+    assert.equal(enterGuard(box(["hello from the phone and more"]), "hello from the phone"), "the box does not hold exactly what was typed");
+    assert.equal(enterGuard(box(["hello"], "  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"), "hello"), "a question or a menu is on the screen");
+    assert.equal(enterGuard(" Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend", "hello"), "no input box on the screen");
+    // A turn running under the box (a question can only come from one): no Enter, so none can land on a question that appears next.
+    assert.equal(enterGuard(box(["hello"], "  ⏵⏵ bypass permissions on · esc to interrupt"), "hello"), "a turn is running there");
+    // The agent's own words above the box that look like a question do not hold Enter back.
+    assert.equal(enterGuard(`● Do you want to proceed? Esc to cancel\n${box(["hello"])}`, "hello"), null);
   });
 
   test("a screen that cannot be read is refused by name after terminalScreenWaitMs, not held for terminalWaitMs", async () => {

@@ -28,7 +28,8 @@ const SPACE_NOT_NEWLINE = `[${PY_SPACE.replace("\\n", "")}]`;
 const NEXT = `(?!\\p{Nd})(?![.:：/-]\\p{Nd})(?!${SPACE_NOT_NEWLINE}*${UNIT})(?!(?!和|及|与|以及)[A-Za-z\\u3400-\\u9fff])`;
 const BARE_PULLS_SOURCE =
   "(?:(?<![A-Za-z0-9_./#-])(?<repo>(?:[A-Za-z0-9][A-Za-z0-9-]{0,38}/)?[A-Za-z][A-Za-z0-9._-]{0,99})\\s*(?:的\\s*)?)?" +
-  "(?<kw>(?:PRs?|pull\\s*requests?)\\s*[:：]?\\s*)?" +
+  // (Python's `\s*[:：]?\s*`, written so that one run of white space has one reading: same strings, no backtracking)
+  "(?<kw>(?:PRs?|pull\\s*requests?)\\s*(?:[:：]\\s*)?)?" +
   `(?<nums>#?\\s?\\p{Nd}{1,7}(?:${SEP}#?\\s?\\p{Nd}{1,7}${NEXT})*)(?!\\p{Nd})`;
 // A number written on its own (not inside a word, a version, a link or owner/repo#N), and not a count or a time.
 const LONE_NUMBER_SOURCE = `(?<![A-Za-z0-9_./#:：-])#?\\s?(\\p{Nd}{1,7})${NEXT}`;

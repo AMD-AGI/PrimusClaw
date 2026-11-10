@@ -22,15 +22,18 @@ export function storeStructure(path: string): StoreStructure {
       .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
       .all()
       .map(plain);
-    const tables: Record<string, { columns: unknown[]; indexes: unknown[] }> = {};
-    for (const row of master) {
-      if (row["type"] !== "table") continue;
-      const name = String(row["name"]);
-      tables[name] = {
-        columns: db.prepare(`PRAGMA table_info(${name})`).all().map(plain),
-        indexes: db.prepare(`PRAGMA index_list(${name})`).all().map(plain),
-      };
-    }
+    const tables = Object.fromEntries(
+      master
+        .filter((row) => row["type"] === "table")
+        .map((row) => {
+          const name = String(row["name"]);
+          const shape = {
+            columns: db.prepare(`PRAGMA table_info(${name})`).all().map(plain),
+            indexes: db.prepare(`PRAGMA index_list(${name})`).all().map(plain),
+          };
+          return [name, shape] as const;
+        }),
+    );
     return { master, tables };
   } finally {
     db.close();

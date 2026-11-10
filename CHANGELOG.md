@@ -170,6 +170,12 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A sandbox grant's 8-GPU template is admitted on an MI355X node. Each card was sized at 256Gi memory, so the g8 template asked
+  for 2Ti and SaFE refused it ("Resource request exceeds maximum available: memory"): the vk-mi355x flavor has 2Ti, of which SaFE
+  admits 95% (about 1.90TiB). Each card is now 224Gi, so g8 asks for 1792Gi, and eight g1 sandboxes (or four g2, two g4) now fit
+  one node together, which at 2Ti they did not. CPU (24 per card), shared memory (125Gi) and pod storage (187.5Gi) are unchanged and already fit.
+  Templates registered before the release keep their size until their grant is issued again. Deploy the sandbox control plane
+  (`agent-sandbox-controlplane`, which serves sandbox grants); Claw is unchanged.
 - The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
   with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
   which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation
@@ -1235,6 +1241,10 @@ record it.
   client offers to take one over, and a takeover or new attach there is refused (`twin_check_failed`, naming the process and the
   file); a session this connector already holds goes on. The scan is shared and time-limited, and `doctor` warns
   (`claude_registry_row_unreadable`) with the fix: send anything in that terminal (#572).
+- `@primusclaw/connector` 0.1.16: a terminal at its prompt with background shells running (Claude Code's `shell` status) is
+  typed into like an idle one, instead of a message waiting 10 minutes and being refused. Enter is sent only on a screen that
+  shows the input box holding exactly the typed text, no question or menu, and no running turn, so a phone's message never
+  answers a permission question; otherwise the text stays in the box and the message is refused (#626).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
