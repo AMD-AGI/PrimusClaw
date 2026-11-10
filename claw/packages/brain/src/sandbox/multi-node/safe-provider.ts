@@ -601,7 +601,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
       });
-    } else if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+    } else if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
       const pd = {
         ...common,
         model: spec.model,
@@ -619,7 +619,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         sshAuthorizedKey: keypair?.authorizedKey,
         sshPortBase: inferaSshPortBase(displayName),
       };
-      body = spec.backend === "atom" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
+      body = spec.backend === "atomesh" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {
       body = buildRayJobWorkloadBody(common);
     }
@@ -803,7 +803,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       };
     }
 
-    if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+    if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
       const sshPort = inferaSshPortBase(displayName);
       const groups = discoverRolePods(detail, "disaggregated", sshPort);
       return {

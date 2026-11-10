@@ -14,21 +14,21 @@
 // Flag names, units and defaults mirror Hyperloom
 // `inference_optimizer/cli/parser.py`:
 //   --nodes                total GPU nodes (head + workers), default 1
-//   --mn-backend           rayjob | infera | atom | sglangrouter; no default, required for multi-node
+//   --mn-backend           rayjob | infera | atomesh | sglangrouter (atom = atomesh); no default, required for multi-node
 //   --mn-image             cluster image; falls back to the sandbox image
 //   --gpus-per-node        default 8
 //   --cpus-per-node        default 96
 //   --mem-per-node         GiB, default 1024
-//   --model                model path/id (infera frontend, or atom/sglangrouter --model-path)
+//   --model                model path/id (infera frontend, or atomesh/sglangrouter --model-path)
 //   --framework            sglang | vllm, default sglang. Atom router --backend and
 //                          Infera backendFramework take this value.
 //   --server-args          engine flags, appended as given
 //   --pd-prefill-extra-args / --pd-decode-extra-args   per-role engine flags
 //   --pd-ib-device         IB device list for the disaggregation plane
-//   --pd-transfer-backend  nixl | mori | mooncake. Default mori, except atom and
+//   --pd-transfer-backend  nixl | mori | mooncake. Default mori, except atomesh and
 //                          sglangrouter, which default to mooncake.
 //   --pd-mode              aggregated | disaggregated. Default aggregated, except
-//                          atom and sglangrouter, which can only be disaggregated.
+//                          atomesh and sglangrouter, which can only be disaggregated.
 //   --pd-prefill-nodes / --pd-decode-nodes    PD group node counts
 //   --pd-prefill-tp    / --pd-decode-tp       PD group tensor-parallel sizes
 //   --extra-env K=V    repeatable; the only way to reach the GPU pods' env
@@ -36,9 +36,9 @@
 // Imports are limited to types and pure protocol helpers, so tests can load
 // this without pulling in the k8s client.
 import {
-  TOPOLOGY_BACKENDS,
   backendRequiresDisaggregatedPd,
   backendRequiresModel,
+  normalizeTopologyBackend,
   validateTopology,
   type EnvironmentTopology,
   type TopologyBackend,
@@ -57,7 +57,7 @@ const DEFAULT_CPUS_PER_NODE = 96;
 const DEFAULT_MEM_PER_NODE_GIB = 1024;
 const DEFAULT_FRAMEWORK = "sglang";
 const DEFAULT_KV_TRANSFER_BACKEND = "mori";
-/** Used when atom or sglangrouter omits --pd-transfer-backend. */
+/** Used when atomesh or sglangrouter omits --pd-transfer-backend. */
 const PD_CLUSTER_KV_TRANSFER_BACKEND = "mooncake";
 
 /** Enum values mirrored from the SaFE Infera webhook. */
@@ -91,7 +91,7 @@ export interface MultiNodePromptSpec {
   image: string;
   /** `--extra-env K=V` entries (repeatable), injected into the cluster containers. */
   extraEnv: Record<string, string>;
-  /** `--model`; required by infera, atom, and sglangrouter, unused by rayjob. */
+  /** `--model`; required by infera, atomesh, and sglangrouter, unused by rayjob. */
   model: string;
   /** `--framework`. Atom router `--backend` and Infera `backendFramework`. */
   framework: string;
@@ -261,10 +261,7 @@ function defaultKvTransferBackend(backend: MultiNodeBackendFlag): string {
 
 /** `--mn-backend`, or null when the flag is absent or outside the enum. */
 function readBackendFlag(prompt: string): MultiNodeBackendFlag | null {
-  const raw = (readFlag(prompt, "mn-backend") ?? "").toLowerCase();
-  return (TOPOLOGY_BACKENDS as readonly string[]).includes(raw)
-    ? (raw as MultiNodeBackendFlag)
-    : null;
+  return normalizeTopologyBackend((readFlag(prompt, "mn-backend") ?? "").toLowerCase()) ?? null;
 }
 
 /**
@@ -455,9 +452,8 @@ export function specFromTopology(topology: EnvironmentTopology): MultiNodePrompt
 function declaredFailureCode(raw: unknown): string | null {
   if (!raw || typeof raw !== "object") return null;
   const body = raw as Record<string, unknown>;
-  const backend = typeof body.backend === "string" ? body.backend : "";
-  if (!(TOPOLOGY_BACKENDS as readonly string[]).includes(backend)) return null;
-  const known = backend as TopologyBackend;
+  const known = normalizeTopologyBackend(body.backend);
+  if (!known) return null;
   if (backendRequiresModel(known) && !String(body.model ?? "").trim()) {
     return known === "infera" ? "infera_model_missing" : "mn_model_missing";
   }

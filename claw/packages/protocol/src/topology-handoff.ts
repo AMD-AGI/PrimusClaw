@@ -16,7 +16,7 @@
  * never carries them and a restore never overwrites them.
  *
  * Only the block of the active backend is present: `ray` for `rayjob`, `infera`
- * for `infera`, and an optional `cluster` for `atom` and `sglangrouter`, which
+ * for `infera`, and an optional `cluster` for `atomesh` and `sglangrouter`, which
  * carries the SSH control plane of their prefill and decode pods. Optional
  * fields are omitted when Claw has no value for them rather than written as
  * empty strings.
@@ -24,7 +24,7 @@
 
 export const TOPOLOGY_HANDOFF_SCHEMA = "topology-handoff/v1" as const;
 
-export type TopologyHandoffBackend = "rayjob" | "infera" | "atom" | "sglangrouter";
+export type TopologyHandoffBackend = "rayjob" | "infera" | "atomesh" | "sglangrouter";
 
 export interface TopologyHandoffRay {
   head_ip?: string;
@@ -41,7 +41,7 @@ export interface TopologyHandoffInfera {
   worker_ips: string[];
 }
 
-/** SSH control plane of an `atom` or `sglangrouter` cluster. */
+/** SSH control plane of an `atomesh` or `sglangrouter` cluster. */
 export interface TopologyHandoffCluster {
   /** File holding the SSH private key (mode 0600). Never the key itself. */
   ssh_key_file?: string;
@@ -85,7 +85,7 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
       then: { required: ["infera"], not: { anyOf: [{ required: ["ray"] }, { required: ["cluster"] }] } },
     },
     {
-      if: { properties: { backend: { const: "atom" } } },
+      if: { properties: { backend: { const: "atomesh" } } },
       then: { not: { anyOf: [{ required: ["ray"] }, { required: ["infera"] }] } },
     },
     {
@@ -95,7 +95,7 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
   ],
   properties: {
     schema: { const: TOPOLOGY_HANDOFF_SCHEMA },
-    backend: { enum: ["rayjob", "infera", "atom", "sglangrouter"] },
+    backend: { enum: ["rayjob", "infera", "atomesh", "sglangrouter"] },
     nodes: { type: "integer", minimum: 1 },
     gpus_per_node: { type: "integer", minimum: 1 },
     service_url: { type: "string", minLength: 1 },
@@ -179,7 +179,7 @@ export function validateTopologyHandoff(value: unknown): string[] {
         break;
       case "backend":
         if (!S.properties.backend.enum.includes(v as never)) {
-          problems.push("backend: must be rayjob, infera, atom, or sglangrouter");
+          problems.push("backend: must be rayjob, infera, atomesh, or sglangrouter");
         }
         break;
       case "nodes":
@@ -219,7 +219,7 @@ export function validateTopologyHandoff(value: unknown): string[] {
       if (Object.hasOwn(value, block)) problems.push(`${block}: not allowed when backend is ${value.backend}`);
     }
   }
-  if (isObj(value) && (value.backend === "atom" || value.backend === "sglangrouter")) {
+  if (isObj(value) && (value.backend === "atomesh" || value.backend === "sglangrouter")) {
     for (const block of ["ray", "infera"] as const) {
       if (Object.hasOwn(value, block)) problems.push(`${block}: not allowed when backend is ${value.backend}`);
     }

@@ -94,8 +94,8 @@ test("infera with empty role lists: file keeps empty arrays, legacy vars stay un
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.9");
 });
 
-test("atom and sglangrouter hand off the router service and no control-plane block", () => {
-  for (const backend of ["atom", "sglangrouter"] as const) {
+test("atomesh and sglangrouter hand off the router service and no control-plane block", () => {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
     const ctx: MultiNodeContext = {
       backend,
       provider: "safe",
@@ -118,8 +118,8 @@ test("atom and sglangrouter hand off the router service and no control-plane blo
   }
 });
 
-test("atom and sglangrouter with an SSH control plane hand off a cluster block and the legacy SSH env", () => {
-  for (const backend of ["atom", "sglangrouter"] as const) {
+test("atomesh and sglangrouter with an SSH control plane hand off a cluster block and the legacy SSH env", () => {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
     const ctx: MultiNodeContext = {
       backend,
       provider: "safe",

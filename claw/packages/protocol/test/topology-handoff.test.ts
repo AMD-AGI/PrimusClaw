@@ -54,12 +54,12 @@ test("full documents validate, one per backend", () => {
   assert.deepEqual(validateTopologyHandoff({ ...base, backend: "infera", infera }), []);
   assert.deepEqual(validateTopologyHandoff({ ...base, backend: "rayjob", ray }), []);
   assert.deepEqual(validateTopologyHandoff({ ...base, backend: "sglangrouter", cluster }), []);
-  assert.deepEqual(validateTopologyHandoff({ ...base, backend: "atom", cluster }), []);
+  assert.deepEqual(validateTopologyHandoff({ ...base, backend: "atomesh", cluster }), []);
 });
 
-test("atom and sglangrouter validate with no control-plane block", () => {
+test("atomesh and sglangrouter validate with no control-plane block", () => {
   const { ray, infera, cluster: _cluster, ...base } = FULL;
-  for (const backend of ["atom", "sglangrouter"] as const) {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
     assert.deepEqual(validateTopologyHandoff({ ...base, backend }), [], backend);
     assert.ok(validateTopologyHandoff({ ...base, backend, ray }).some((p) => p.startsWith("ray")), `${backend} with ray`);
     assert.ok(validateTopologyHandoff({ ...base, backend, infera }).some((p) => p.startsWith("infera")), `${backend} with infera`);
@@ -85,7 +85,7 @@ test("the JSON schema states the same backend/block rule", () => {
     [["infera", "cluster"], ["ray", "cluster"]],
   );
   const open = S.allOf.filter((r) => !("required" in r.then));
-  assert.deepEqual(open.map((r) => r.if.properties.backend.const), ["atom", "sglangrouter"]);
+  assert.deepEqual(open.map((r) => r.if.properties.backend.const), ["atomesh", "sglangrouter"]);
 });
 
 test("every schema-required field is enforced by the validator", () => {

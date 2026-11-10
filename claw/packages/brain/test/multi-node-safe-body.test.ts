@@ -333,7 +333,7 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   assert.equal(body.images.length, 3);
   assert.equal(body.service.port, 8000);
   assert.equal(body.service.targetPort, 8000);
-  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atom");
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atomesh");
   assert.equal(body.env.NCCL_IB_GID_INDEX, "1");
   assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
   assert.equal(body.inferaOptions, undefined);

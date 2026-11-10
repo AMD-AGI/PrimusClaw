@@ -160,7 +160,7 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * The backends drive the cluster through different control planes: rayjob talks
  * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
  * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
- * private key, and atom and sglangrouter serve on the router Service and, when
+ * private key, and atomesh and sglangrouter serve on the router Service and, when
  * a key was derived, also hand over SSH to their prefill and decode pods.
  * Only the variables the active backend reads are set, since Hyperloom infers
  * the mode from which ones are present.
@@ -201,9 +201,9 @@ export function applyMultiNodeExternalEnv(
     return;
   }
 
-  // atom and sglangrouter: the optimizer SSHes into prefill and decode to
+  // atomesh and sglangrouter: the optimizer SSHes into prefill and decode to
   // relaunch the engine in place; every pod shares one sshd port.
-  if (ctx.backend === "atom" || ctx.backend === "sglangrouter") {
+  if (ctx.backend === "atomesh" || ctx.backend === "sglangrouter") {
     if (!hasSshKeyFile(ctx)) return;
     env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath!;
     if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);

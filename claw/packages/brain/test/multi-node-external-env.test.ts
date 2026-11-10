@@ -99,10 +99,10 @@ test("sglangrouter env carries the prefill and decode engine URLs with or withou
   }
 });
 
-test("atom env points at the router and does not hand over an SSH control plane", () => {
+test("atomesh env points at the router and does not hand over an SSH control plane", () => {
   const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
   const ctx: MultiNodeContext = {
-    backend: "atom",
+    backend: "atomesh",
     provider: "safe",
     name: "msg1-atom",
     namespace: "test-workspace",
@@ -113,7 +113,7 @@ test("atom env points at the router and does not hand over an SSH control plane"
   applyMultiNodeExternalEnv(env, ctx);
 
   assert.equal(env.SAFE_API_URL, undefined);
-  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "atom");
+  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "atomesh");
   assert.equal(env.INFERENCE_OPTIMIZER_NODES, "2");
   assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, ctx.serviceUrl);
   assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, undefined);

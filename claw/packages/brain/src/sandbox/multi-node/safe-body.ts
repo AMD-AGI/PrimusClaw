@@ -707,7 +707,7 @@ interface PdClusterBodyOptions {
   /** SaFE GroupVersionKind.kind. */
   kind: "Atom" | "SGLangRouter";
   /** Correlation label and env value. */
-  backend: "atom" | "sglangrouter";
+  backend: "atomesh" | "sglangrouter";
   /** Router command, base64-encoded by the builder. */
   routerEntrypoint: string;
 }
@@ -828,7 +828,7 @@ function buildPdClusterWorkloadBody(
 export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
   return buildPdClusterWorkloadBody(p, {
     kind: "Atom",
-    backend: "atom",
+    backend: "atomesh",
     routerEntrypoint: atomRouterEntrypoint(p.framework),
   });
 }

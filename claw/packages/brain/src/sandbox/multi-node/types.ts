@@ -36,11 +36,11 @@ export interface MultiNodeContext {
   headHost?: string;
   /** rayjob: Ray Dashboard auth token, when the dashboard is authenticated. */
   dashboardToken?: string;
-  /** infera, atom, sglangrouter: PEM private key authorised on the GPU pods. */
+  /** infera, atomesh, sglangrouter: PEM private key authorised on the GPU pods. */
   sshPrivateKey?: string;
-  /** infera, atom, sglangrouter: path the private key is materialised at inside the sandbox. */
+  /** infera, atomesh, sglangrouter: path the private key is materialised at inside the sandbox. */
   sshKeyPath?: string;
-  /** infera: SSH base port, decode pods role-offset; atom/sglangrouter: the one port of every pod. */
+  /** infera: SSH base port, decode pods role-offset; atomesh/sglangrouter: the one port of every pod. */
   sshPortBase?: number;
   /** PD: prefill pod IPs, rank order. */
   prefillIps?: string[];
@@ -48,9 +48,9 @@ export interface MultiNodeContext {
   decodeIps?: string[];
   /** infera aggregated: worker pod IPs, rank order (leader first). */
   workerIps?: string[];
-  /** atom/sglangrouter: prefill engine Service URL. */
+  /** atomesh/sglangrouter: prefill engine Service URL. */
   prefillUrl?: string;
-  /** atom/sglangrouter: decode engine Service URL. */
+  /** atomesh/sglangrouter: decode engine Service URL. */
   decodeUrl?: string;
 }
 
