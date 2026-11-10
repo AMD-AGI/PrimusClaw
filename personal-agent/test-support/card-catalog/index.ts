@@ -26,7 +26,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   ...FEEDBACK_CARDS,
 ];
 
-const BY_LINE = {} as const;
+const BY_LINE: Readonly<Record<string, readonly string[]>> = {}; // (every line has registered its cards)
 
 /** Snapshot ids whose builders are not ported yet. Each line removes its own as it registers them. */
 export const PENDING: ReadonlySet<string> = new Set<string>(Object.values(BY_LINE).flat());
