@@ -164,7 +164,7 @@ jobs:
 
       # No cache: a release job installs exactly what the lockfile names and nothing a previous run left behind.
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: claw/.nvmrc
 
@@ -313,7 +313,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the tarballs for publish-npm
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: personal-agent-packages
           path: ${{ runner.temp }}/personal-agent-packages/
@@ -321,7 +321,7 @@ jobs:
           retention-days: 7
 
       - name: Keep the image for publish-image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: personal-agent-image
           path: ${{ runner.temp }}/personal-agent-image/
@@ -360,7 +360,7 @@ jobs:
       # npm's own Node-bundled version is what publishes; this job has no checkout. An npm older than 11.5.1 does not
       # fail on the missing capability, it looks for a token that does not exist.
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
