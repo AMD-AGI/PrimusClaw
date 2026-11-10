@@ -1135,11 +1135,13 @@ describe("crash safety", () => {
       // At once, as the next run reads them: whether the turn is recorded, and whether its prompt counts as handled.
       onDisk = { recorded: recorded(), counted: JSON.parse(fs.readFileSync(identityFile(h.dirs), "utf8")).cursor >= seq };
     } finally {
-      // The held write renamed the FIFO into place (the run has returned, so it has): what it wrote becomes the file, as a disk
-      // would have kept it, so that the next run does not open a FIFO.
+      // The held write renamed the FIFO into place (the run has returned, so it has), and it was the run's last write to the file:
+      // what it wrote becomes the file, as a disk would have kept it, so that the next run does not open a FIFO. (Put in place
+      // by a rename, which replaces the FIFO without opening it.)
       const wrote = await (read ?? fs.promises.readFile(fifo));
       const recs = path.join(h.dirs.state, "sessions.json");
-      if (fs.lstatSync(recs).isFIFO()) { fs.rmSync(recs); fs.writeFileSync(recs, wrote as Buffer, { mode: 0o600 }); }
+      fs.writeFileSync(`${recs}.restored`, wrote as Buffer, { mode: 0o600 });
+      fs.renameSync(`${recs}.restored`, recs);
     }
     // Both or neither: a recorded turn whose prompt is not counted is ended by the next run AND sent to it again.
     assert.equal(onDisk.counted, onDisk.recorded, `turn recorded: ${onDisk.recorded}, prompt counted: ${onDisk.counted}`);
