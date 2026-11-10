@@ -88,7 +88,7 @@ test("what the connector wrote is inert and an unknown code shows its detail", (
     2,
     "a command is one code span: its own backtick cannot end it",
   );
-  assert.ok(line.startsWith("⛔ see (here)(https://evil.test) ‹b›now‹/b›"));
+  assert.ok(line.startsWith("⛔ see (here)(https:\u200b//evil.test) ‹b›now‹/b›"));
 });
 
 test("more than four problems points at doctor", () => {
