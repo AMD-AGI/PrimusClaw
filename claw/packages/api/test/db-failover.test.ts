@@ -35,6 +35,8 @@
  *       database answers
  *   F10 a caller that checks a connection out of the advisory-lock pool itself gets one made since the failover, and
  *       one whose server says it is not in recovery
+ *   F17 a connection being asked whether its server is in recovery when a failover is noticed elsewhere is not handed
+ *       out: it is from before the failover, whatever its server answers
  *   F11 the say cap's notice whose COMMIT took effect and whose answer the failover lost: the web client is told, once,
  *       and the Router hears the user was told
  *   F12 the same while the database cannot be asked: the notice is announced once the database answers, and the next
@@ -370,6 +372,41 @@ describe("database failover", { skip }, () => {
     try {
       assert.equal(asked, 3, "asked until a connection reached the primary");
       assert.ok(!old.includes(await pidOf(client)), "a connection from before the failover was handed out");
+    } finally {
+      client.release();
+    }
+  });
+
+  test("F17 a connection asked about recovery as a failover is noticed elsewhere is not handed out", async () => {
+    const { db: dbModule } = w.h.app;
+    // The pool holds nothing, so the checkout opens a connection and asks it; another connection meets the failover
+    // while that question is out, and the server still answers that it is not in recovery.
+    const idle: pg.PoolClient[] = [];
+    while (pool().idleCount > 0) idle.push(await pool().connect());
+    for (const held of idle) held.release(true);
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    let asked = 0;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === "SELECT pg_is_in_recovery() AS r" && asked === 0) {
+        asked += 1;
+        return (real.apply(this, args) as Promise<unknown>).then((answer) => {
+          dbModule.noteFailover(Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" }));
+          return answer;
+        });
+      }
+      return real.apply(this, args);
+    };
+    let client: pg.PoolClient;
+    try {
+      client = await pool().connect();
+    } finally {
+      proto.query = real;
+    }
+    try {
+      assert.equal(asked, 1);
+      assert.equal(dbModule.failoverSince(client), undefined, "a connection from before the failover was handed out");
     } finally {
       client.release();
     }
