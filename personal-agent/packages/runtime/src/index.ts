@@ -26,3 +26,7 @@ export * from "./http/server.js";
 export * from "./http/link.js";
 export * from "./http/claw-events.js";
 export * from "./github/index.js";
+export * from "./github/feedback-config.js";
+export * from "./github/feedback-issues.js";
+export * from "./github/feedback-worker.js";
+export * from "./logging/chat-log.js";

@@ -1,0 +1,541 @@
+{
+  "about": "Shared with the Python worker's compound-key cases (52). Values are given by shape and filled in by the test: A upper, a lower, 9 digit, other characters as they are.",
+  "cases": [
+    {
+      "text": "DefaultEndpointsProtocol=https;AccountName=examplestore;AccountKey={0};EndpointSuffix=core.windows.net",
+      "output": "DefaultEndpointsProtocol=https;AccountName=examplestore;AccountKey=[hidden];EndpointSuffix=core.windows.net",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["Aa/9A9aAAaaaa/aaaAaAaaAaAaAAAAAaa/9AaaAAaa9Aaaaa9a9aaaAaaAaaA9+9aaaAAAaAAaaAAAa9/AAAaA=="]
+    },
+    {
+      "text": "Endpoint=sb://example-ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey={0}",
+      "output": "Endpoint=sb://example-ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAa9AAAAAAA9AAAaAaAaAa99AaaA9999aAAA99aAa9a="]
+    },
+    {
+      "text": "Endpoint=sb://example-eh.servicebus.windows.net/;SharedAccessKeyName=send;SharedAccessKey={0};EntityPath=events",
+      "output": "Endpoint=sb://example-eh.servicebus.windows.net/;SharedAccessKeyName=send;SharedAccessKey=[hidden];EntityPath=events",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["A9a9A++aaaAAAa9aA99a9Aaa99AaAAaA99AaAaaaAAA="]
+    },
+    {
+      "text": "AccountEndpoint=https://example.documents.azure.com:443/;AccountKey={0};",
+      "output": "AccountEndpoint=https://example.documents.azure.com:443/;AccountKey=[hidden];",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["A9A9AAaAAaaaa9AaAaAAaaaA9+aAa9AAAaa9AAAA9aAAAaAAAaA9AaaAa9AaaaaAaAa+AAAAAA9aaaaA/9aA/a=="]
+    },
+    {
+      "text": "AccountKey={0}",
+      "output": "AccountKey=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9A+aAaA9AAA9aAaaa9aAAaAAAAAaA99aaAAaAA/AA"]
+    },
+    {
+      "text": "{\"AccountKey\": \"{0}\"}",
+      "output": "{\"AccountKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9A+aAaA9AAA9aAaaa9aAAaAAAAAaA99aaAAaAA/AA"]
+    },
+    {
+      "text": "export AccountKey='{0}'",
+      "output": "export AccountKey='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9A+aAaA9AAA9aAaaa9aAAaAAAAAaA99aaAAaAA/AA"]
+    },
+    {
+      "text": "accountkey: {0}",
+      "output": "accountkey: [hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9A99AAaaaaAA9aaaAaAA9aaaAaAAa9AaAaAA9a9AaaaA9A99aAAAaa9AAaa9aAaAAAAaaaAAaAAAaAaa9AA9A"]
+    },
+    {
+      "text": "{\"accountkey\": \"{0}\"}",
+      "output": "{\"accountkey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9A99AAaaaaAA9aaaAaAA9aaaAaAAa9AaAaAA9a9AaaaA9A99aAAAaa9AAaa9aAaAAAAaaaAAaAAAaAaa9AA9A"]
+    },
+    {
+      "text": "export accountkey: '{0}'",
+      "output": "export accountkey: '[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9A99AAaaaaAA9aaaAaAA9aaaAaAAa9AaAaAA9a9AaaaA9A99aAAAaa9AAaa9aAaAAAAaaaAAaAAAaAaa9AA9A"]
+    },
+    {
+      "text": "SharedAccessKey={0}",
+      "output": "SharedAccessKey=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9AA99A9Aaaa9Aa9AaaAAaaAAa+9AaAA9AaAaA/9aAAA9A+aaaaAAA9a9aA99a"]
+    },
+    {
+      "text": "{\"SharedAccessKey\": \"{0}\"}",
+      "output": "{\"SharedAccessKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9AA99A9Aaaa9Aa9AaaAAaaAAa+9AaAA9AaAaA/9aAAA9A+aaaaAAA9a9aA99a"]
+    },
+    {
+      "text": "export SharedAccessKey='{0}'",
+      "output": "export SharedAccessKey='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["9aA9AA99A9Aaaa9Aa9AaaAAaaAAa+9AaAA9AaAaA/9aAAA9A+aaaaAAA9a9aA99a"]
+    },
+    {
+      "text": "my_key={0}",
+      "output": "my_key=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["Aaa9AAaAa+aAAaAaaaaAaAaAa/A99Aaaa9AAAAAAaaAa"]
+    },
+    {
+      "text": "{\"my_key\": \"{0}\"}",
+      "output": "{\"my_key\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["Aaa9AAaAa+aAAaAaaaaAaAaAa/A99Aaaa9AAAAAAaaAa"]
+    },
+    {
+      "text": "export my_key='{0}'",
+      "output": "export my_key='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["Aaa9AAaAa+aAAaAaaaaAaAaAa/A99Aaaa9AAAAAAaaAa"]
+    },
+    {
+      "text": "ACCOUNT_KEY={0}",
+      "output": "ACCOUNT_KEY=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["a+a9AAa9Aa9A9AAaaaAaa9Aa9aaAAAaaaA9aaAAaaAaAaaaa9AaaaAA99AaAAaaAaaaAAAAA/9aaaaaaAAaA9a9A"]
+    },
+    {
+      "text": "{\"ACCOUNT_KEY\": \"{0}\"}",
+      "output": "{\"ACCOUNT_KEY\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["a+a9AAa9Aa9A9AAaaaAaa9Aa9aaAAAaaaA9aaAAaaAaAaaaa9AaaaAA99AaAAaaAaaaAAAAA/9aaaaaaAAaA9a9A"]
+    },
+    {
+      "text": "export ACCOUNT_KEY='{0}'",
+      "output": "export ACCOUNT_KEY='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["a+a9AAa9Aa9A9AAaaaAaa9Aa9aaAAAaaaA9aaAAaaAaAaaaa9AaaaAA99AaAAaaAaaaAAAAA/9aaaaaaAAaA9a9A"]
+    },
+    {
+      "text": "STORAGE_KEY={0}",
+      "output": "STORAGE_KEY=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aA+9AaAA9aaAaa9aaaAAA9AAaaAaAaAAA9aAaAaAAA99"]
+    },
+    {
+      "text": "{\"STORAGE_KEY\": \"{0}\"}",
+      "output": "{\"STORAGE_KEY\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aA+9AaAA9aaAaa9aaaAAA9AAaaAaAaAAA9aAaAaAAA99"]
+    },
+    {
+      "text": "export STORAGE_KEY='{0}'",
+      "output": "export STORAGE_KEY='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aA+9AaAA9aaAaa9aaaAAA9AAaaAaAaAAA9aAaAaAAA99"]
+    },
+    {
+      "text": "storageAccountKey = {0}",
+      "output": "storageAccountKey = [hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAa9AAa9Aaa9A9Aa99AaAa9aAAa9a9AAa9AaA99/Aa9A"]
+    },
+    {
+      "text": "{\"storageAccountKey\": \"{0}\"}",
+      "output": "{\"storageAccountKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAa9AAa9Aaa9A9Aa99AaAa9aAAa9a9AAa9AaA99/Aa9A"]
+    },
+    {
+      "text": "export storageAccountKey = '{0}'",
+      "output": "export storageAccountKey = '[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAa9AAa9Aaa9A9Aa99AaAa9aAAa9a9AAa9AaA99/Aa9A"]
+    },
+    {
+      "text": "primaryKey: {0}",
+      "output": "primaryKey: [hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9Aa9AAA9aAAaA9aaaa9AAAaAAAaAaAaa9AaAAa99AAAaaAaaAAAA9Aaa9AAAA9aaa+9aaa999aAAaaa999AAA"]
+    },
+    {
+      "text": "{\"primaryKey\": \"{0}\"}",
+      "output": "{\"primaryKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9Aa9AAA9aAAaA9aaaa9AAAaAAAaAaAaa9AaAAa99AAAaaAaaAAAA9Aaa9AAAA9aaa+9aaa999aAAaaa999AAA"]
+    },
+    {
+      "text": "export primaryKey: '{0}'",
+      "output": "export primaryKey: '[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9Aa9AAA9aAAaA9aaaa9AAAaAAAaAaAaa9AaAAa99AAAaaAaaAAAA9Aaa9AAAA9aaa+9aaa999aAAaaa999AAA"]
+    },
+    {
+      "text": "subscriptionKey={0}",
+      "output": "subscriptionKey=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAA9AaA+aAAaaaaAA999A9aaaAAAaAaAAAAA9Aaa9a9AaaAAAa9a9aaaAaa9a9AA"]
+    },
+    {
+      "text": "{\"subscriptionKey\": \"{0}\"}",
+      "output": "{\"subscriptionKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAA9AaA+aAAaaaaAA999A9aaaAAAaAaAAAAA9Aaa9a9AaaAAAa9a9aaaAaa9a9AA"]
+    },
+    {
+      "text": "export subscriptionKey='{0}'",
+      "output": "export subscriptionKey='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAA9AaA+aAAaaaaAA999A9aaaAAAaAaAAAAA9Aaa9a9AaaAAAa9a9aaaAaa9a9AA"]
+    },
+    {
+      "text": "masterKey is {0}",
+      "output": "masterKey is [hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9AAaAA9AAAAaAAAaaAaAAa9aAa9aAAAA9AaAA"]
+    },
+    {
+      "text": "{\"masterKey\": \"{0}\"}",
+      "output": "{\"masterKey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9AAaAA9AAAAaAAAaaAaAAa9aAa9aAAAA9AaAA"]
+    },
+    {
+      "text": "export masterKey is '{0}'",
+      "output": "export masterKey is '[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AAA9AAaAA9AAAAaAAAaaAaAAa9aAa9aAAAA9AaAA"]
+    },
+    {
+      "text": "private_key={0}",
+      "output": "private_key=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aaA9AAaaA99a9/AA9aaaAaA9aaaAa+aa9AAAaaAaaaaaaAAAaaaAAAA9AaAAaaA99aA9aaAa9AaaaA9Aa9AAAa9a"]
+    },
+    {
+      "text": "{\"private_key\": \"{0}\"}",
+      "output": "{\"private_key\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aaA9AAaaA99a9/AA9aaaAaA9aaaAa+aa9AAAaaAaaaaaaAAAaaaAAAA9AaAAaaA99aA9aaAa9AaaaA9Aa9AAAa9a"]
+    },
+    {
+      "text": "export private_key='{0}'",
+      "output": "export private_key='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aaA9AAaaA99a9/AA9aaaAaA9aaaAa+aa9AAAaaAaaaaaaAAAaaaAAAA9AaAAaaA99aA9aaAa9AaaaA9Aa9AAAa9a"]
+    },
+    {
+      "text": "ACCOUNTKEY={0}",
+      "output": "ACCOUNTKEY=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["99A9AaAaaa9AAa9AAA9aAaAaAAAaAaAaaaAaaAA9AAAA"]
+    },
+    {
+      "text": "{\"ACCOUNTKEY\": \"{0}\"}",
+      "output": "{\"ACCOUNTKEY\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["99A9AaAaaa9AAa9AAA9aAaAaAAAaAaAaaaAaaAA9AAAA"]
+    },
+    {
+      "text": "export ACCOUNTKEY='{0}'",
+      "output": "export ACCOUNTKEY='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["99A9AaAaaa9AAa9AAA9aAaAaAAAaAaAaaaAaaAA9AAAA"]
+    },
+    {
+      "text": "sharedaccesskey={0}",
+      "output": "sharedaccesskey=[hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9A9/a9aAAAAAAaa9aaaAaAAAaaaaaa9aa99a9AAAaaAaAaAAAaAaAAAAA9+A9"]
+    },
+    {
+      "text": "{\"sharedaccesskey\": \"{0}\"}",
+      "output": "{\"sharedaccesskey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9A9/a9aAAAAAAaa9aaaAaAAAaaaaaa9aa99a9AAAaaAaAaAAAaAaAAAAA9+A9"]
+    },
+    {
+      "text": "export sharedaccesskey='{0}'",
+      "output": "export sharedaccesskey='[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["AaA9A9/a9aAAAAAAaa9aaaAaAAAaaaaaa9aa99a9AAAaaAaAaAAAaAaAAAAA9+A9"]
+    },
+    {
+      "text": "storageaccountkey: {0}",
+      "output": "storageaccountkey: [hidden]",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAa9AaAAaAa9a9/aaaA99A9AAaAa9aA9aaAAAaa9"]
+    },
+    {
+      "text": "{\"storageaccountkey\": \"{0}\"}",
+      "output": "{\"storageaccountkey\": \"[hidden]\"}",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAa9AaAAaAa9a9/aaaA99A9AAaAa9aA9aaAAAaa9"]
+    },
+    {
+      "text": "export storageaccountkey: '{0}'",
+      "output": "export storageaccountkey: '[hidden]'",
+      "masked": true,
+      "maskedBefore": false,
+      "credential": true,
+      "shapes": ["aAa9AaAAaAa9a9/aaaA99A9AAaAa9aA9aaAAAaa9"]
+    },
+    {
+      "text": "monkey business",
+      "output": "monkey business",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "keyboard shortcuts",
+      "output": "keyboard shortcuts",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "the keyboard: Logitech K380",
+      "output": "the keyboard: Logitech K380",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "monkey = banana",
+      "output": "monkey = banana",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "monkeypatch={0}",
+      "output": "monkeypatch={0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "hotkeys={0}",
+      "output": "hotkeys={0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "keychains: {0}",
+      "output": "keychains: [hidden]",
+      "masked": true,
+      "maskedBefore": true,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "SharedAccessKeyName=RootManageSharedAccessKey",
+      "output": "SharedAccessKeyName=RootManageSharedAccessKey",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "turkey: roast at 180C for 3h",
+      "output": "turkey: roast at 180C for 3h",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "my_key=short1",
+      "output": "my_key=short1",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "AccountKey=",
+      "output": "AccountKey=",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "AccountKey=too-short-1",
+      "output": "AccountKey=too-short-1",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": []
+    },
+    {
+      "text": "javakeystore={0}",
+      "output": "javakeystore={0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "keystore={0}",
+      "output": "keystore=[hidden]",
+      "masked": true,
+      "maskedBefore": true,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "keyboard={0}",
+      "output": "keyboard=[hidden]",
+      "masked": true,
+      "maskedBefore": true,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "monkey={0}",
+      "output": "monkey={0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["Aa9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    },
+    {
+      "text": "monkey: {0}",
+      "output": "monkey: {0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "turkey = {0}",
+      "output": "turkey = {0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "donkey is {0}",
+      "output": "donkey is {0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "whiskey={0}",
+      "output": "whiskey={0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    },
+    {
+      "text": "hockey: {0}",
+      "output": "hockey: {0}",
+      "masked": false,
+      "maskedBefore": false,
+      "credential": false,
+      "shapes": ["9aA9AAAA9aAaaAaaAa9AA+AAaAAaaAA9aAAAaAa9Aaaa"]
+    }
+  ]
+}

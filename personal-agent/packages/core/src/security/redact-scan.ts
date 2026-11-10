@@ -7,8 +7,10 @@
  * the matches Python's `re.sub` makes:
  *
  *   JWT     \beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}
- *   secret  (?i)(?:token|secret|api[_-]?key|password|passwd|\bkey)[\w-]*["']?\s*(?::|=|\bis\b)\s*["']?
- *           (?=B64*\d)(?=B64*[A-Za-z])(B64{32,})          B64 = [A-Za-z0-9+/=_-]
+ *   secret  (?i)(?:token|secret|api[_-]?key|password|passwd|\bkey|JOINED(?=SEP))[\w-]*SEP\s*["']?
+ *           (?=B64*\d)(?=B64*[A-Za-z])(B64{32,})          B64 = [A-Za-z0-9+/=_-]   SEP = ["']?\s*(?::|=|\bis\b)
+ *           JOINED = (?-i:(?<=[a-z0-9])Key)|(?<=_)key|(?<![A-Za-z0-9])(?:account|storage(?:account)?|sharedaccess
+ *                    |primary|secondary|master|private|subscription|sas|signing|encryption)key
  *
  * Texts are read by code point, as Python reads a str.
  */
@@ -156,7 +158,49 @@ function secretFrom(cps: readonly string[], table: ValueTable, e: number): reado
   return null;
 }
 
-const NAME = pyRegExp(String.raw`(?i)(?:token|secret|api[_-]?key|password|passwd|\bkey)`, "g");
+const SEP = String.raw`["']?\s*(?::|=|\b[iIıİ][sSſ]\b)`; // the separator after a name, its "is" as re.I reads it
+const KEY_WORDS =
+  "account|storage(?:account)?|sharedaccess|primary|secondary|master|private|subscription|sas|signing|encryption";
+// A "key" joined to the word before it (AccountKey, SharedAccessKey, my_key, primaryKey) is a name only where the
+// separator follows it, and only after an underscore or one of the key words, or as a camel-case "Key"; monkey, turkey
+// and hotkeys are no names. Such a name ends its run of `[\w-]` characters, so the skip after a failed name below still
+// holds. The camel-case branch is case-sensitive (Python's `(?-i:...)`), so it is a pattern of its own.
+const NAMES = [
+  pyRegExp(
+    String.raw`(?i)(?:token|secret|api[_-]?key|password|passwd|\bkey|(?<=_)key(?=${SEP})|(?<![A-Za-z0-9])(?:${KEY_WORDS})key(?=${SEP}))`,
+    "g",
+  ),
+  pyRegExp(String.raw`(?<=[a-z0-9])Key(?=${SEP})`, "g"),
+];
+
+interface Found {
+  readonly index: number;
+  readonly length: number;
+}
+
+/**
+ * A reader of the leftmost name at or after a UTF-16 index that only moves forward: each pattern's next match is kept
+ * and searched for again only once the scan has passed it, so each pattern reads the text once (searching every
+ * pattern again from every place would read to the end of the text once per name).
+ */
+function names(text: string): (from: number) => Found | null {
+  // per pattern: its leftmost match at or after the last search's start; null once there is none
+  const next: Array<Found | null | undefined> = NAMES.map(() => undefined);
+  return (from) => {
+    let first: Found | null = null;
+    NAMES.forEach((pattern, i) => {
+      let found = next[i];
+      if (found === undefined || (found !== null && found.index < from)) {
+        pattern.lastIndex = from;
+        const match = pattern.exec(text);
+        found = match ? { index: match.index, length: match[0].length } : null;
+        next[i] = found;
+      }
+      if (found && (first === null || found.index < first.index)) first = found;
+    });
+    return first;
+  };
+}
 
 /**
  * The secret rule: only the value is masked (the name, the separator and a quote stay). A name that fails fails for
@@ -178,13 +222,13 @@ export function maskSecretValues(text: string): { text: string; masked: boolean 
   const cpAt = (unit: number): number => cpOfUnit[unit] ?? cps.length;
   let table: ValueTable | null = null;
   const spans: Array<readonly [number, number]> = [];
+  const nameFrom = names(text);
   let from = 0;
   for (;;) {
-    NAME.lastIndex = unitAt[from] ?? text.length;
-    const name = NAME.exec(text);
+    const name = nameFrom(unitAt[from] ?? text.length);
     if (name === null) break;
     const s = cpAt(name.index);
-    const e = cpAt(name.index + name[0].length);
+    const e = cpAt(name.index + name.length);
     table ??= valueTable(cps);
     const found = secretFrom(cps, table, e);
     if (found) {

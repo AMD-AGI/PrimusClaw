@@ -13,7 +13,11 @@
  * names no mode; `nobox` draws a screen with no input box at all (another program, a layout the connector does not know). Read
  * again every 50 ms, so the test can switch it as shift+tab would. FAKE_TITLE: a conversation name Claude Code writes into the rule
  * above the box (`/rename`). FAKE_IDLE_STATUS: what the row says between turns (`idle`; `shell` is what Claude Code 2.1.32x says
- * when background shells run).
+ * when background shells run). FAKE_TORN_ROW=1: the row is never written (Claude Code gives up on a row it cannot read). FAKE_TASKS_DIR:
+ * a conversation's task folder the process keeps open, as Claude Code does once that conversation ran a background task.
+ * FAKE_FOOTER_ESC=1: the footer says `esc to interrupt` even between turns (a screen that says a main turn runs).
+ * FAKE_TURN_ON_TYPE=1: an adversary: once anything is typed, a main turn of its own starts in the transcript (a user entry with no
+ * end), while the screen stays as it was.
  * FAKE_DIALOG_FILE: an adversary. Once anything is typed, a permission question is drawn under the box (the typed text still shows
  * in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is submitted.
  */
@@ -24,6 +28,7 @@ const rowFile = process.env.FAKE_ROW;
 const sessionId = process.env.FAKE_SESSION;
 const workMs = Number(process.env.FAKE_WORK_MS || "300");
 const idleStatus = process.env.FAKE_IDLE_STATUS || "idle";
+if (process.env.FAKE_TASKS_DIR) fs.openSync(process.env.FAKE_TASKS_DIR, "r");   // (held open for as long as it runs)
 let buffer = "";
 let pasting = false;
 let working = false;
@@ -34,15 +39,20 @@ const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "acc
 const readMode = () => { try { return fs.readFileSync(modeFile, "utf8").trim(); } catch { return "default"; } };
 let mode = readMode();
 let dialog = false;
+let turnStarted = false;
 const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
   ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
   : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
 
 const status = (s) => {
+  if (process.env.FAKE_TORN_ROW === "1") return;
   try {
     const row = JSON.parse(fs.readFileSync(rowFile, "utf8"));
     row.status = s;
-    fs.writeFileSync(rowFile, JSON.stringify(row));
+    // (written whole and moved into place, as a reader must never see half a row)
+    const real = fs.realpathSync(rowFile);
+    fs.writeFileSync(`${real}.tmp`, JSON.stringify(row));
+    fs.renameSync(`${real}.tmp`, real);
   } catch { /* the test has not written it yet */ }
 };
 const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, isSidechain: false, ...doc })}\n`);
@@ -54,7 +64,7 @@ function draw() {
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
   const question = dialog ? "\r\n Bash command\r\n   touch approved.txt\r\n Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n Esc to cancel · Tab to amend\r\n" : "";
-  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working ? " · esc to interrupt" : ""}\r\n${question}`);
+  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working || process.env.FAKE_FOOTER_ESC === "1" ? " · esc to interrupt" : ""}\r\n${question}`);
 }
 
 function submit() {
@@ -95,6 +105,10 @@ process.stdin.on("data", (chunk) => {
     if (ch === "\x1b" || ch < " ") continue;
     buffer += ch;
     if (process.env.FAKE_DIALOG_FILE) dialog = true;
+    if (process.env.FAKE_TURN_ON_TYPE === "1" && !turnStarted) {
+      turnStarted = true;
+      line({ type: "user", message: { role: "user", content: "a notification of a background task" }, origin: { kind: "task-notification" } });
+    }
   }
   draw();
 });

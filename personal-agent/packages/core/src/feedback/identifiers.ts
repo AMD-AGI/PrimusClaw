@@ -15,6 +15,11 @@ export const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\n?$/;
 /** A plain email address (nothing else may be written into the markdown). */
 export const EMAIL = /^[A-Za-z0-9._%+'-]{1,64}@[A-Za-z0-9.-]{1,253}\n?$/;
 
+/** An image tag as a report shows it: the tag, or "unknown" when it is not one (Python's `_env_tag` after its strip). */
+export function tagOf(value: string): string {
+  return TAG.test(value) ? value : "unknown";
+}
+
 /** A value that may be echoed: a short identifier-shaped string, or an integer; undefined for anything else. */
 export function tokenOf(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isInteger(value)) return String(value);

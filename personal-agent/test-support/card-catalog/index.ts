@@ -9,6 +9,7 @@ import { APPROVAL_CARDS } from "./approval.js";
 import { ASSISTANT_CARDS } from "./assistant.js";
 import type { CatalogEntry } from "./catalog.js";
 import { COMMAND_CARDS } from "./commands.js";
+import { FEEDBACK_CARDS } from "./feedback.js";
 import { PROACTIVE_CARDS } from "./proactive.js";
 import { REVIEW_CARDS } from "./review.js";
 import { TURN } from "./turn.js";
@@ -20,6 +21,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   ...PROACTIVE_CARDS,
   ...TURN,
   ...REVIEW_CARDS,
+  ...FEEDBACK_CARDS,
 ];
 
 const BY_LINE = {
@@ -35,7 +37,6 @@ const BY_LINE = {
     "remote_window",
     "remote_window_en",
   ],
-  W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
 } as const;
 
 /** Snapshot ids whose builders are not ported yet. Each line removes its own as it registers them. */
