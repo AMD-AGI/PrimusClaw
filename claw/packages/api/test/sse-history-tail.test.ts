@@ -284,3 +284,59 @@ test("a reconnect after a user message gets the events stored after it", async (
   await store1("claw-11", 11);
   assert.deepEqual((await stream("", { "last-event-id": USER_MSG })).ids, ["claw-10", "claw-11"]);
 });
+
+// What the Teams worker sends to follow only the turn it is about to start (`after` later than every id Claw gives).
+const LIVE_ONLY = "claw-99999999999999";
+
+test("after=LIVE_ONLY sends no history: the first frame is the marker, with nothing sent and nothing said to be left out", async () => {
+  const total = SSE_HISTORY_TAIL + 1000;
+  await seed(total);
+  await store1(USER_MSG, 1000);
+  const res = await app.inject({ method: "GET", url: `/v1/chat/sessions/${SID}/messages?after=${LIVE_ONLY}` });
+  assert.equal(res.statusCode, 200);
+  assert.match(String(res.headers["content-type"]), /^text\/event-stream/);
+  const frames = res.body.split("\n\n").filter((f) => f.trim() !== "");
+  assert.equal(frames[0], `event: historyComplete\ndata: {"type":"historyComplete","count":0,"has_more":false}`);
+  assert.equal(frames.length, 1, `nothing but the marker: ${frames.length} frames`);
+  assert.ok(Math.max(0, ...rowsRead) <= 1, `no history page was read: ${rowsRead}`);
+});
+
+test("Last-Event-ID=LIVE_ONLY is read the same way", async () => {
+  await seed(30);
+  const s = await stream("", { "last-event-id": LIVE_ONLY });
+  assert.deepEqual(s.ids, []);
+  assert.deepEqual(s.marker, { type: "historyComplete", count: 0, has_more: false });
+});
+
+test("an after later than every id of the session starts at the tail too, however it is written", async () => {
+  await seed(12);
+  await store1(USER_MSG, 1000);
+  for (const after of ["claw-1999999999999", "claw-123456789012345678901234567890"]) {
+    const s = await stream(`?after=${after}`);
+    assert.deepEqual(s.ids, [], after);
+    assert.deepEqual(s.marker, { type: "historyComplete", count: 0, has_more: false }, after);
+  }
+});
+
+test("after=LIVE_ONLY still sends what is stored while the stream opens: it starts at the tail, not after it", async () => {
+  await seed(20);
+  let writes = 1;
+  afterPage = async () => {
+    if (writes-- <= 0) return;
+    await seed(23, 0, 21);
+  };
+  const s = await stream(`?after=${LIVE_ONLY}`);
+  assert.deepEqual(s.ids, ["claw-21", "claw-22", "claw-23"]);
+  assert.equal(s.marker?.count, 3);
+});
+
+test("an ordinary after is unchanged next to LIVE_ONLY: the events after it, and an unknown id is still the tail", async () => {
+  await seed(12);
+  assert.deepEqual((await stream("?after=claw-9")).ids, ["claw-10", "claw-11", "claw-12"]);
+  await store1(USER_MSG, 1000);
+  await store1("claw-13", 13);
+  assert.deepEqual((await stream(`?after=${USER_MSG}`)).ids, ["claw-13"]);
+  const unknown = await stream("?after=not-an-event");
+  assert.equal(unknown.ids.length, 14);
+  assert.equal(unknown.marker?.has_more, false);
+});
