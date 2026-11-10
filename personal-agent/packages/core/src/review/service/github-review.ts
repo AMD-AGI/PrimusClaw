@@ -8,14 +8,17 @@
  * interceptors, the `/github` command, the card buttons, the turn hooks and the help values.
  */
 
+import { errorName } from "../../errors.js";
 import type { Lang } from "../../locales/lang.js";
 import { reviewRequestText as rt } from "../../locales/review-request.js";
 import type { JsonObject } from "../../json.js";
+import type { GithubState } from "../../ports/github.js";
 import type { Random } from "../../ports/random.js";
 import type { ClickRoute, MessageRoute, RouteHandlers } from "../../ports/routing.js";
 import type { Conversation, InboundMessage, UserRef } from "../../ports/surface.js";
 import type { ReviewTurnOptions, ReviewTurnOutcome } from "../../turn/runner.js";
-import { GithubConnect } from "../connect/github-connect.js";
+import { UNKNOWN } from "../connect/connections.js";
+import { GithubConnect, type ConnectRequest } from "../connect/github-connect.js";
 import type { ReviewHandoff } from "../handoff.js";
 import { pullKey } from "../../review-text/pull-ref.js";
 import { otherReviewers, reviewAsk } from "../request-parse.js";
@@ -255,6 +258,29 @@ export class GithubReview {
       pull_request: `${r.repo}#${String(r.pr)}`,
       waits: r.kind === "review" ? `${r.event} review to post` : "merge",
     }));
+  }
+
+  /** Beside a question about the person's own GitHub: the connect card, before the question goes on (`GithubConnect.offer`). */
+  async offerConnect(request: ConnectRequest): Promise<void> {
+    await this.connect.offer(request);
+  }
+
+  /**
+   * The person's GitHub binding at the identity service, as /whoami shows it (Python `Agent._github_connections`): their
+   * state, null when they have none, UNKNOWN when the identity service could not say just now (never "not connected").
+   */
+  async connectionState(userId: string): Promise<GithubState | null | typeof UNKNOWN> {
+    let status: Awaited<ReturnType<ReviewDeps["credentials"]["status"]>>;
+    try {
+      status = await this.deps.credentials.status(userId);
+    } catch (err) {
+      this.deps.logger.info("the GitHub binding could not be read for /whoami", { error: errorName(err) });
+      return UNKNOWN;
+    }
+    if (status.ok) return status.value;
+    if (status.error.kind === "not_bound") return null;
+    this.deps.logger.info("the GitHub binding could not be read for /whoami", { error: status.error.kind });
+    return UNKNOWN;
   }
 
   /** Help's values of the person's GitHub ("github", "delegation", "confirm_mode"); those it cannot read are left out. */

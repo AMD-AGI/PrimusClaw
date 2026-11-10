@@ -8,6 +8,7 @@
 
 import { isUpper } from "../../review-text/text/unicode.js";
 import { pyRegExp } from "../../text/py-regex.js";
+import { pyRstrip } from "../../text/py-text.js";
 
 // A word for something on GitHub, bounded by anything that is not an ASCII letter ("的pr" has no word boundary in Unicode).
 const NOUN = pyRegExp(
@@ -68,7 +69,7 @@ export function repositoriesNamed(text: string): [string, string][] {
   }
   const seen = new Map<string, [string, string]>();
   for (const [owner, raw] of found) {
-    const name = raw.replace(/\.+$/u, "");
+    const name = pyRstrip(raw, ".");
     // ("CI/CD", "I/O": words, not a repository)
     if (isUpper(owner) && isUpper(name)) continue;
     if (name && name !== "." && name !== "..") {
