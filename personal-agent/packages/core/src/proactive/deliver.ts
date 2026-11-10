@@ -19,6 +19,7 @@ import { proactiveLines } from "../locales/proactive-lines.js";
 import type { Conversation, OutMessage, View } from "../ports/surface.js";
 import { ITEM_SOURCE, ASSISTANT_SAID_TYPES } from "../subscriptions/event-types.js";
 import { clip } from "../text/plain.js";
+import { clientLocaleOf, noRequestScope } from "../ports/request-scope.js";
 import { pyRstrip, pyStrip } from "../text/py-text.js";
 import { replyParts } from "../turn/answer-parts.js";
 import type { ProactiveDeps } from "./deps.js";
@@ -111,8 +112,7 @@ export class Deliveries {
     }
     let words = workEventText(parseWorkItem(event["item"]) ?? null, event["text"]);
     if (!words && assistantDeliveries(event).length === 0) return false;
-    // TODO(request-context): the client locale of the message being handled (Python CLIENT_LOCALE); "" until RequestScope lands.
-    const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, "", words);
+    const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, this.clientLocale(), words);
     const reader = { remoteState: (u: string) => this.attached(u) };
     const { head, replies } = this.deps.directChat.clawyExtras(reader, userId, lang);
     if (words && head) words = `${head}\n\n${words}`;
@@ -128,6 +128,11 @@ export class Deliveries {
     }
     await this.closeReceiptWith(userId, conversation, event, { words, head, replies });
     return true;
+  }
+
+  /** The client locale of the message being handled ("" for a push or a sweep: Python CLIENT_LOCALE's default). */
+  private clientLocale(): string {
+    return clientLocaleOf(this.deps.requestScope ?? noRequestScope);
   }
 
   /** The chat is an agent's window now: direct chat is on for the person and the chat is attached to a session. */
@@ -295,8 +300,7 @@ export class Deliveries {
       about: item ? `#${String(item.seq)} ${item.title}` : "",
       expiresAt,
       zone: zoneOf(prefs),
-      // TODO(request-context): the client locale of the message being handled (Python CLIENT_LOCALE); "" until RequestScope lands.
-      lang: answerLang(prefs.lang, "", event["text"]),
+      lang: answerLang(prefs.lang, this.clientLocale(), event["text"]),
     });
     try {
       await conversation.send(card);

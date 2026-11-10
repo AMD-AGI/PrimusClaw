@@ -7,10 +7,11 @@ import { it } from "node:test";
 import {
   ApprovalCards,
   TURN_DEADLINE_SECONDS,
-  turnApprovalsFor,
+  turnApprovals,
   type ApprovalRecordStore,
 } from "../../src/approvals/records.js";
 import type { Conversation, Envelope, OutMessage } from "../../src/ports/surface.js";
+import type { TurnApprovals } from "../../src/turn/runner.js";
 
 function world(fail = false) {
   return build(fail);
@@ -81,10 +82,10 @@ it("an approval a turn shows runs out when brain stops waiting or at the turn de
 
 it("a turns approvals are recorded for its person with brains wait or the turn deadline", () => {
   const { store, log } = world();
-  const turn = turnApprovalsFor(store, "aad-b");
-  assert.equal(turn.record("s2", "tu2", "bash", 90, { a: 1 }), true);
-  assert.equal(turn.record("s2", "tu2", "bash", 90, { a: 1 }), false);
-  assert.equal(turn.record("s3", "tu3", "ask_user_question", undefined, {}), true);
+  const turn = turnApprovals(store);
+  assert.equal(turn.record("aad-b", "s2", "tu2", "bash", 90, { a: 1 }), true);
+  assert.equal(turn.record("aad-b", "s2", "tu2", "bash", 90, { a: 1 }), false);
+  assert.equal(turn.record("aad-b", "s3", "tu3", "ask_user_question", undefined, {}), true);
   turn.sent("s2", "tu2");
   turn.unsent("s3", "tu3");
   assert.deepEqual(log, [
@@ -93,4 +94,12 @@ it("a turns approvals are recorded for its person with brains wait or the turn d
     "sent s2/tu2",
     "forget s3/tu3",
   ]);
+});
+
+it("one record of the approvals serves every person's turn, each saved as that person's (W4's TurnApprovals)", () => {
+  const { store, log } = world();
+  const approvals: TurnApprovals = turnApprovals(store); // (the turn engine's port, as the worker passes it in)
+  assert.equal(approvals.record("aad-a", "s1", "tu1", "bash", 60, {}), true);
+  assert.equal(approvals.record("aad-b", "s2", "tu2", "bash", 60, {}), true);
+  assert.deepEqual(log, ["save s1/tu1 aad-a bash 1060", "save s2/tu2 aad-b bash 1060"]);
 });

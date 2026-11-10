@@ -15,6 +15,7 @@ export * from "./own.js";
 export * from "./guardrails/index.js";
 export * from "./limits/index.js";
 export * from "./review-text/index.js";
+export { INTENT_PROMPT, MODE_PROMPT } from "./locales/review-github.js";
 export * from "./typed-answer/index.js";
 export * from "./understanding/index.js";
 export * from "./locales/index.js";
@@ -35,6 +36,8 @@ export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * as turn from "./turn/index.js";
+// (the assembly runs the changes card's read itself)
+export { fetchChanges } from "./turn/changes.js";
 export * from "./note/note.js";
 export * from "./branding.js";
 export * from "./claw/message-text.js";
@@ -62,6 +65,7 @@ export * from "./direct-chat/index.js";
 export * from "./proactive/index.js";
 export * from "./proactive/views.js";
 export * from "./subscriptions/index.js";
+export * from "./review/index.js";
 export * as remoteDomain from "./remote/index.js";
 export * as remoteView from "./remote-view/index.js";
 // The remote agents, as the worker's assembly builds them (W6; the view it gives them is remoteView.createRemoteViews).

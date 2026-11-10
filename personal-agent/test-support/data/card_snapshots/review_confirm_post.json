@@ -70,7 +70,7 @@
       "type": "ColumnSet"
      },
      {
-      "text": "确认后：在 AMD-AGI/Primus-SaFE#482 上以你的 GitHub 账号 @huirui-amd 发布 REQUEST_CHANGES review。",
+      "text": "确认后：在 AMD-AGI/Primus-SaFE#482 上以你的 GitHub 账号 @linmei-amd 发布 REQUEST_CHANGES review。",
       "type": "TextBlock",
       "wrap": true
      },
@@ -141,7 +141,7 @@
          },
          {
           "title": "账⁠号",
-          "value": "你的 GitHub 账号 @huirui-amd"
+          "value": "你的 GitHub 账号 @linmei-amd"
          }
         ],
         "type": "FactSet"

@@ -8,32 +8,16 @@ import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 
 /**
- * A press on the Stop card of a turn from Teams mobile (the Python `Agent._turn_stop_click`, `_drop_tapped`). The turn it
- * was sent for is stopped as /stop stops it, only while that very turn still runs; otherwise nothing is stopped and the
- * person is told. The pressed card is deleted, never edited (a phone does not redraw an edit), and the outcome is said as a
- * new message; where it cannot be deleted it is closed to a line.
+ * A press on a Stop card sent before the worker stopped sending them (the Python `Agent._turn_stop_click`, `_drop_tapped`,
+ * after internal #481: a turn from a phone is stopped by saying 停止 or /stop, and no card is offered any more). Such a card
+ * names no turn this worker runs, so the press stops nothing and says so; the pressed card is deleted, never edited (a phone
+ * does not redraw an edit), and where it cannot be deleted it is closed to a line.
  */
 export class StopPress {
   constructor(private readonly ctx: RouterContext) {}
 
-  async press(action: InboundAction, chat: Chat, key: string): Promise<void> {
-    const token = typeof action.data["turn"] === "string" ? action.data["turn"] : "";
-    const offer = this.ctx.deps.stopCards.get(token, chat.sender.id);
-    if (offer !== undefined && offer.cardId === action.cardMessageId) offer.cardId = undefined; // (gone with the press)
-    let stopped = false;
-    if (offer !== undefined && !offer.used) {
-      // the stop of the card's kind, for that turn only: it checks the turn with no wait before it stops anything, so a turn
-      // that ended meanwhile (and the next one, which may already run) is never stopped; it says its own outcome
-      const stop = this.ctx.stoppers.get(offer);
-      stopped = stop === undefined ? false : await stop(chat, key);
-      offer.used = stopped;
-    }
+  async press(action: InboundAction, chat: Chat): Promise<void> {
     const said = routingText.in(chat.lang());
-    if (stopped) {
-      this.ctx.deps.logger.info("the Stop card of a turn was pressed", { kind: offer?.kind });
-      await this.dropTapped(action, chat, said.stopPressed);
-      return;
-    }
     await this.dropTapped(action, chat, said.stopTurnOver);
     await chat.say(said.stopTurnOver);
   }

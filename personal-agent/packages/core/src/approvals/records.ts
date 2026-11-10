@@ -52,9 +52,13 @@ export class ApprovalCards {
 /** A turn's deadline: an approval a turn shows is answerable this long when Brain did not say how long it waits (turn.py). */
 export const TURN_DEADLINE_SECONDS = 30 * 60;
 
-/** The turn engine's view of the records (W4b `TurnApprovals`, satisfied structurally), bound to the person the turn is for. */
+/**
+ * The turn engine's view of the records (W4's `TurnApprovals`, satisfied structurally): `record` is told whose approval it is,
+ * the person the turn is for (Python `store.save_approval(sender.aad_id, ...)`).
+ */
 export interface TurnApprovalRecords {
   record(
+    userId: string,
     sessionId: string,
     toolUseId: string,
     tool: string,
@@ -65,10 +69,10 @@ export interface TurnApprovalRecords {
   unsent(sessionId: string, toolUseId: string): void;
 }
 
-/** The records of the approvals one person's turn shows (the Python `on_approval`, `on_approval_sent`, `on_approval_unsent`). */
-export function turnApprovalsFor(store: ApprovalRecordStore, userId: string): TurnApprovalRecords {
+/** The records of the approvals a turn shows (the Python `on_approval`, `on_approval_sent`, `on_approval_unsent`). */
+export function turnApprovals(store: ApprovalRecordStore): TurnApprovalRecords {
   return {
-    record: (sessionId, toolUseId, tool, expiresIn, envelope) =>
+    record: (userId, sessionId, toolUseId, tool, expiresIn, envelope) =>
       store.approvals.saveApproval({
         userId,
         sessionId,

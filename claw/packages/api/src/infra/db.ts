@@ -435,6 +435,11 @@ function checkoutsCurrent(p: pg.Pool): void {
         client.release(err as Error);
         throw err;
       }
+      // A failover noticed while the question was out makes this a connection from before it, whatever it answered.
+      if (isStale(client)) {
+        client.release(new Error("connected before a failover"));
+        continue;
+      }
       if (!inRecovery) {
         onPrimary.add(client);
         return client;

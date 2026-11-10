@@ -170,6 +170,17 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- The assistant can tell where a public pull request stands for a person with no GitHub here when the deployment has a read-only
+  GitHub App. `pr_state` read such a pull request with no credential, which GitHub allows 60 times an hour for the deployment's whole
+  address; once that was used up every read failed (403), so a request to review pull requests merged days before was not answered as
+  merged, and "#99999" was "could not be read" rather than "does not exist". With `CLAW_GITHUB_PUBLIC_READ_APP_ID`,
+  `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` and `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` set, those reads use an installation token of
+  that App asked for with `metadata: read` alone, and with `CLAW_GITHUB_PUBLIC_READ_REPOSITORIES` for those of the installation's
+  repositories alone, whatever more the App itself may do. A token GitHub grants with any other permission, or that reaches a repository
+  it does not say is public, is revoked, logged (`github.public_read_token_refused`) and not used. A token is kept until shortly before
+  it expires, and only a pull request or repository GitHub says is public is answered. Each `pr_state` call logs how it read
+  (`assistant.pr_state_read`, `via` app, anonymous, own or binding). A person with GitHub here is still read for as themselves;
+  without the App, reads stay anonymous, with the public page as their fallback.
 - A sandbox grant's 8-GPU template is admitted on an MI355X node. Each card was sized at 256Gi memory, so the g8 template asked
   for 2Ti and SaFE refused it ("Resource request exceeds maximum available: memory"): the vk-mi355x flavor has 2Ti, of which SaFE
   admits 95% (about 1.90TiB). Each card is now 224Gi, so g8 asks for 1792Gi, and eight g1 sandboxes (or four g2, two g4) now fit

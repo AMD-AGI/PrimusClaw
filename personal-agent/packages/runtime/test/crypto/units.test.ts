@@ -52,16 +52,38 @@ test("a token round-trips, is refused by another key, and respects a ttl", () =>
   assert.throws(() => fernet.decrypt(urlsafeB64Encode(Uint8Array.from([0x80, 1, 2]))), InvalidToken);
 });
 
-test("a token with a valid MAC but a broken body is refused, not thrown as another error", () => {
-  const key = Fernet.generateKey();
-  const fernet = new Fernet(key);
+// Fixed keys: whether a zero ciphertext block decrypts to legal PKCS7 padding depends on the key (about 1 key in 256
+// gives a last byte of 0x01), so a random key made the "bad padding" case fail now and then. Both outcomes were checked
+// against Python's `cryptography` (Fernet.decrypt on the same tokens): BAD_PADDING_KEY raises InvalidToken,
+// LEGAL_PADDING_KEY returns the 15 bytes below.
+const BAD_PADDING_KEY = "wd7WBluziLYHHCBYFrVOppZ8xlavX5nlBBJvMM8KMME=";
+const LEGAL_PADDING_KEY = "ppTaaNSsXkV_J_IwymeR1avudmSGh7OUPY9hpwfVYFE=";
+const HEADER = Buffer.concat([Buffer.from([0x80]), Buffer.alloc(8), Buffer.alloc(16)]);
+
+/** A token for `body` under `key`, signed as Fernet signs (so its MAC is valid whatever the body). */
+function signed(key: string, body: Buffer): string {
   const signing = Buffer.from(urlsafeB64Decode(key)).subarray(0, 16);
-  const sign = (body: Buffer): string =>
-    urlsafeB64Encode(Buffer.concat([body, Buffer.from(nodeCrypto.hmacSha256Hex(signing, body), "hex")]));
-  const header = Buffer.concat([Buffer.from([0x80]), Buffer.alloc(8), Buffer.alloc(16)]);
-  assert.throws(() => fernet.decrypt(sign(Buffer.concat([header, Buffer.alloc(5)]))), InvalidToken); // not a block
-  assert.throws(() => fernet.decrypt(sign(Buffer.concat([header, Buffer.alloc(16)]))), InvalidToken); // bad padding
-  assert.throws(() => fernet.decrypt(sign(Buffer.from([0x80, 0, 0, 0, 0, 0, 0, 0, 0]))), InvalidToken); // too short
+  return urlsafeB64Encode(Buffer.concat([body, Buffer.from(nodeCrypto.hmacSha256Hex(signing, body), "hex")]));
+}
+
+test("a token with a valid MAC but a broken body is refused, not thrown as another error", () => {
+  const fernet = new Fernet(BAD_PADDING_KEY);
+  assert.throws(() => fernet.decrypt(signed(BAD_PADDING_KEY, Buffer.concat([HEADER, Buffer.alloc(5)]))), InvalidToken); // not a block
+  assert.throws(() => fernet.decrypt(signed(BAD_PADDING_KEY, Buffer.concat([HEADER, Buffer.alloc(16)]))), InvalidToken); // bad padding
+  assert.throws(
+    () => fernet.decrypt(signed(BAD_PADDING_KEY, Buffer.from([0x80, 0, 0, 0, 0, 0, 0, 0, 0]))),
+    InvalidToken,
+  ); // too short
+});
+
+test("a signed body whose padding happens to be legal decrypts, as in Python; tampering with it is refused by the MAC", () => {
+  // The case that made the test above flaky: with this key the zero block decrypts to a last byte of 0x01.
+  const fernet = new Fernet(LEGAL_PADDING_KEY);
+  const token = signed(LEGAL_PADDING_KEY, Buffer.concat([HEADER, Buffer.alloc(16)]));
+  assert.equal(Buffer.from(fernet.decrypt(token)).toString("hex"), "fca4f61138c98ef82efa0cc51a106a");
+  const tampered = Buffer.from(urlsafeB64Decode(token));
+  tampered[30] = (tampered[30] ?? 0) ^ 0x01; // a ciphertext byte, the MAC left as it was
+  assert.throws(() => fernet.decrypt(urlsafeB64Encode(tampered)), InvalidToken);
 });
 
 test("MultiFernet encrypts with the first key, reads with any, and rotates keeping the timestamp", () => {

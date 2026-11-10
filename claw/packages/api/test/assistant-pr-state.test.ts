@@ -18,6 +18,10 @@
  *      page instead: merged (when, merge commit), closed, open, draft, and a number that redirects to an issue is not_found; a page
  *      that is not found, of another layout, of another number or with a time of another shape stays unknown; a reader with GitHub
  *      never reads pages, and neither does an API answer that is not the limit
+ *   P8 a person with no GitHub here, in a deployment with a read-only App, is read for with the App's token: a pull request of a
+ *      repository GitHub says is public comes back, one whose repository is private (or not said to be public) is unknown, a missing
+ *      number is not_found only in a public repository; a token that cannot be made reads anonymously, a 401 drops the token; a person
+ *      with GitHub here is read for as themselves, never with the App
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -154,6 +158,63 @@ describe("merged pull requests of a review request", () => {
     assert.deepEqual(await pullStates("u-alice", "sess-1", missing.slice(0, 1), { ...anon.deps, settings: anon.settings({ binding: false }) }),
       [{ pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" }]);
   });
+
+  test("P8 with the deployment's read-only App a public pull request is read with its token, and nothing private is answered", async () => {
+    const APP = "ghs_app0123456789abcdefghijklmnopqrstuvw";
+    const log: string[] = [];
+    const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+    const pub = { private: false };
+    const fetchImpl = (async (input: URL | string, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init.headers).get("authorization");
+      log.push(`${auth === `Bearer ${APP}` ? "APP" : auth === null ? "ANON" : "OTHER"} ${url.pathname}`);
+      switch (url.pathname) {
+        case "/repos/AMD-AGI/PrimusClaw/pulls/306": return json({ number: 306, state: "closed", merged: true, merged_at: "2026-11-06T09:50:16Z", merge_commit_sha: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6", base: { repo: pub } });
+        case "/repos/AMD-AGI/PrimusClaw/pulls/578": return json({ number: 578, state: "open", draft: false, base: { repo: pub } });
+        case "/repos/AMD-AGI/PrimusClaw/pulls/99999": return json({ message: "Not Found" }, 404);
+        case "/repos/AMD-AGI/PrimusClaw": return json({ full_name: "AMD-AGI/PrimusClaw", private: false });
+        // A repository the App's installation can see but that is private: its metadata reads, nothing of it is answered.
+        case "/repos/Org/Internal/pulls/292": return json({ number: 292, state: "closed", merged: true, merged_at: "2026-11-06T09:50:16Z", base: { repo: { private: true } } });
+        case "/repos/Org/Internal/pulls/9999": return json({ message: "Not Found" }, 404);
+        case "/repos/Org/Internal": return json({ full_name: "Org/Internal", private: true });
+        case "/repos/Org/Unsaid/pulls/1": return json({ number: 1, state: "open", base: { repo: {} } });
+        case "/repos/Org/Expired/pulls/1": return json({ message: "Bad credentials" }, 401);
+        default: return json({ message: "boom" }, 502);
+      }
+    }) as typeof fetch;
+    let made = 0;
+    const dropped: string[] = [];
+    const app = { token: async () => { made++; return APP; }, drop: (t: string) => { dropped.push(t); } };
+    const settings = (over: Row = {}) => () => ({ enabled: true, binding: false, secret: "s".repeat(40), mcpUrl: "http://api.test/mcp", apiUrl: API, ...over }) as never;
+    const db = { query: async (text: string) => { if (/FROM claw_user_env_vars/.test(text)) return { rows: [] }; throw new Error(`unexpected query: ${text}`); } };
+    const deps = { db: db as never, fetchImpl, settings: settings(), publicRead: app };
+    const ref = (repo: string, number: number) => ({ owner: repo.split("/")[0]!, repo: repo.split("/")[1]!, number });
+    const states = await pullStates("u-alice", "sess-1", [ref("AMD-AGI/PrimusClaw", 306), ref("AMD-AGI/PrimusClaw", 578), ref("AMD-AGI/PrimusClaw", 99999),
+      ref("Org/Internal", 292), ref("Org/Internal", 9999), ref("Org/Unsaid", 1)], deps);
+    assert.deepEqual(states, [
+      { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+      { pr: "AMD-AGI/PrimusClaw#578", state: "open", draft: false },
+      { pr: "AMD-AGI/PrimusClaw#99999", state: "not_found" },
+      { pr: "Org/Internal#292", state: "unknown", reason: "read_failed" },
+      { pr: "Org/Internal#9999", state: "unknown", reason: "read_failed" },
+      { pr: "Org/Unsaid#1", state: "unknown", reason: "read_failed" },
+    ]);
+    assert.ok(log.every((l) => l.startsWith("APP ")), `every read with the App's token: ${log.join(", ")}`);
+    assert.equal(made, 1, "one token for the whole check");
+    // GitHub no longer takes the token: it is dropped, so the next check makes another.
+    assert.equal((await pullStates("u-alice", "sess-1", [ref("Org/Expired", 1)], deps))[0]!.state, "unknown");
+    assert.deepEqual(dropped, [APP]);
+    // No token can be made: read as anyone, as before the App.
+    log.length = 0;
+    const broken = { token: async () => { throw Object.assign(new Error("GitHub answered 500"), { status: 500 }); }, drop: () => undefined };
+    assert.equal((await pullStates("u-alice", "sess-1", [ref("AMD-AGI/PrimusClaw", 578)], { ...deps, publicRead: broken }))[0]!.state, "open");
+    assert.deepEqual(log, ["ANON /repos/AMD-AGI/PrimusClaw/pulls/578"]);
+    // A person with GitHub here is read for as themselves: the App is never asked.
+    made = 0;
+    const bound = world();
+    await pullStates("u-alice", "sess-1", prs.slice(0, 1), { ...bound.deps, publicRead: app });
+    assert.equal(made, 0);
+  });
 });
 
 describe("a person with no GitHub here, when GitHub's anonymous API limit is spent", () => {
@@ -245,6 +306,33 @@ describe("a person with no GitHub here, when GitHub's anonymous API limit is spe
     assert.equal(githubWebUrl("http://api.github.com"), null);
     assert.equal(githubWebUrl("https://github.api.test"), null);
     assert.equal(githubWebUrl("not a url"), null);
+  });
+
+  test("P8 with the App, a read GitHub refuses as over a limit still falls back to the public page; a private one reads no page", async () => {
+    const APP = "ghs_app0123456789abcdefghijklmnopqrstuvw";
+    const log: string[] = [];
+    const fetchImpl = (async (input: URL | string, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const auth = new Headers(init.headers).get("authorization");
+      log.push(`${url.origin === WEB ? "PAGE" : auth === `Bearer ${APP}` ? "APP" : "OTHER"} ${url.pathname}`);
+      if (url.origin === WEB) {
+        assert.equal(auth, null, "a page is read with no credential");
+        return (pages[url.pathname] ?? (() => new Response("Not Found", { status: 404 })))();
+      }
+      const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+      if (url.pathname === "/repos/AMD-AGI/PrimusClaw/pulls/306") return json({ message: "API rate limit exceeded" }, 403);
+      if (url.pathname === "/repos/Org/Internal/pulls/1") return json({ number: 1, state: "open", base: { repo: { private: true } } });
+      return json({ message: "boom" }, 502);
+    }) as typeof fetch;
+    const app = { token: async () => APP, drop: () => undefined };
+    const w = world({ anonymous: true });
+    const deps = { ...w.deps, fetchImpl, webUrl: WEB, settings: w.settings({ binding: false }), publicRead: app };
+    const states = await pullStates("u-alice", "sess-1", [ref(306), { owner: "Org", repo: "Internal", number: 1 }], deps);
+    assert.deepEqual(states, [
+      { pr: "AMD-AGI/PrimusClaw#306", state: "merged", merged_at: "2026-11-06T09:50:16Z", merge_commit: "428a33dc26ef33c1a53fea29ebd8e87d67915ed6" },
+      { pr: "Org/Internal#1", state: "unknown", reason: "read_failed" },
+    ]);
+    assert.deepEqual(log.sort(), ["APP /repos/AMD-AGI/PrimusClaw/pulls/306", "APP /repos/Org/Internal/pulls/1", "PAGE /AMD-AGI/PrimusClaw/pull/306"]);
   });
 });
 
