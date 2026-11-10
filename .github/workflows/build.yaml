@@ -227,6 +227,8 @@ jobs:
           IMAGE: localhost/${{ matrix.name }}:${{ needs.detect-changes.outputs.image_version }}
         run: |
           set -euo pipefail
+          # The runner image ships podman (it shares Buildah's image store); install it only where it is missing.
+          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
           VERSION=$(node -p 'require("./personal-agent/packages/teams/package.json").version')
           USER_ID=$(podman run --rm "$IMAGE" id -u)
           echo "user in image: $USER_ID"
