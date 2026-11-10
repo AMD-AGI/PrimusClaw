@@ -182,6 +182,14 @@ export class Router {
     return this.ctx.hasTurn(userId);
   }
 
+  /**
+   * A work item was stopped from its card (the assistant's Stop): the review turn this router follows for it ends as
+   * stopped, not as a task that failed, as when a group's "停 N" stops it (Python `Agent._item_stopped`).
+   */
+  itemStopped(itemId: string): void {
+    this.ctx.itemStopped(itemId);
+  }
+
   /** A chat as the router answers in it, for work that runs on its own (no client locale). */
   chat(sender: UserRef, conversation: Chat["conversation"], scope = ""): Chat {
     return new Chat(this.ctx.deps.store, sender, conversation, scope, "");

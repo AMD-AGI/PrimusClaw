@@ -97,7 +97,7 @@ export class AccountCommands {
     const first =
       owner === undefined
         ? said.whoamiUnknown
-        : said.whoamiFirst({ name: owner.name.trim(), email: owner.email.trim() });
+        : said.whoamiFirst({ name: pyStrip(owner.name), email: pyStrip(owner.email) });
     const lines = this.ctx.deps.connectionsText({
       owner,
       githubState: github.state,
