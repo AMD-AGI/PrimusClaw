@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { markedText } from "../../src/inbound-text/marked-text.js";
 import { shortName } from "../../src/review-text/pull-ref.js";
 import { asksReviewOnly, saysReviewAndMerge } from "../../src/review-text/asks.js";
-import { otherReviewers, parseReviewAsk } from "../../src/review/request-parse.js";
+import { otherReviewers, NAMED_ASK_MAX, parseReviewAsk } from "../../src/review/request-parse.js";
 
 const PR = "AMD-AGI/Hyperloom#12";
 const BOB = { channelUserId: "29:b", userId: "", name: "Bob", shown: "Bob", offset: 0 };
@@ -164,3 +164,19 @@ for (const [name, text, models, who] of [
     assert.equal(parsed.who, who);
   });
 }
+
+test("a long message is read in linear time, and who it names only up to the limit", () => {
+  // (each 请 after the first request was scanned to the end of the text: ~0.4 s for 30000 characters)
+  const head = "请 Bob 帮我 review 合入 AMD-AGI/x#1\n";
+  for (const tail of ["请".repeat(30_000), "请 ".repeat(15_000), "请 review ".repeat(3_333)]) {
+    const started = performance.now();
+    parseReviewAsk(head + tail, []);
+    assert.ok(performance.now() - started < 100, `took ${String(performance.now() - started)} ms`);
+  }
+  // (up to NAMED_ASK_MAX code points the reviewer is read as before; past it, never)
+  const filler = (n: number) => " ".repeat(n - Array.from(head).length);
+  assert.equal(parseReviewAsk(head + filler(NAMED_ASK_MAX), [])?.who, "Bob");
+  assert.equal(parseReviewAsk(head + filler(NAMED_ASK_MAX + 1), [])?.who, "");
+  // (with no review word, or no 合入 or merge, there is nothing to name)
+  assert.equal(parseReviewAsk("请 Bob 帮我看看 AMD-AGI/x#1", []), undefined);
+});

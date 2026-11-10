@@ -109,6 +109,19 @@ function nameBefore(text: string, start: number, end: RegExp): Asked | undefined
   };
 }
 
+/** A message longer than this (code points) is never read for "请 XX ... review 合入": who it names is not looked for. */
+export const NAMED_ASK_MAX = 1000;
+const REVIEW_WORD = pyRegExp("review", "i");
+const MERGE_WORD = pyRegExp("合入|merge", "i");
+
+/**
+ * Whether "请 XX ... review 合入" may be looked for at all: a short message with a review word and 合入 or merge in it (two
+ * linear searches first, as the Python worker checks before its patterns; each later 请 is otherwise scanned to the end).
+ */
+function mayName(text: string): boolean {
+  return Array.from(text).length <= NAMED_ASK_MAX && REVIEW_WORD.test(text) && MERGE_WORD.test(text);
+}
+
 /** "请 XX [帮我] review 合入 <rest>" at the start of the text (spaces before 请 allowed). */
 function namedAskAt(text: string): Asked | undefined {
   let i = 0;
@@ -175,7 +188,7 @@ function reviewOnlyAsk(text: string, mentions: readonly Mention[]): ReviewAsk | 
  * "review 合入" and points at a pull request; a review only when it says 请 XX 帮我 review <PR> with no word of merging.
  */
 export function parseReviewAsk(text: string, mentions: readonly Mention[]): ReviewAsk | undefined {
-  const named = namedAskAt(text);
+  const named = mayName(text) ? namedAskAt(text) : undefined;
   const pulls = pullsIn(named === undefined ? text : named.rest);
   // ("请 XX review 并合入 <PR>" without 帮我 is one only with a pull request, so "请问 review 合入的流程是什么？" stays chat;
   // such a match leaves no pull request for the second reading either)
