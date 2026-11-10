@@ -122,6 +122,24 @@ npm test        # the test suite alone
 
 Tests use `node:test` with `tsx`: `node --import tsx --test packages/core/test/<file>.test.ts` runs one file.
 
+### Building the packages
+
+The three packages are published to npm in lockstep (one version for all three, naming each other by it exactly).
+Inside the workspace nothing is built: `tsconfig.json`'s `paths` point each package name at its `src/`, so typecheck,
+lint, the layers and the tests all read the sources. What npm gets is built from them:
+
+```bash
+npm run build        # scripts/build.ts: packages/*/dist (esbuild bundles, tsc declarations, the licence)
+npm run check-pack   # scripts/check-pack.ts: pack, inspect, install in an empty directory, import, type-check
+```
+
+Each package is one ES module bundle, its dependencies (and the other two packages) left to npm. Core's bundle and
+declarations carry the Claw wire contract from `claw/packages/protocol`, which is not published on its own. A file a
+module reads at run time (the store's `schema.sql`) ships next to the bundle. `check-pack` fails on a file in a tarball
+that should not be there (sources, tests, fixtures) or one missing from it, on a manifest that cannot be published, and
+on packages that do not install, import, run the worker program or compile against their declarations in a clean
+directory. CI runs both on every change (`.github/workflows/personal-agent-packaging.yml`).
+
 ### The ported-tests ledgers
 
 The worker is a port of an earlier Python implementation, and its behaviour is the specification. Each file in

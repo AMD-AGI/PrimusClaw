@@ -1,0 +1,53 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Personal agent packaging
+
+# Checks, before a release is ever cut, what a release of the personal agent's three npm packages
+# (@primusclaw/personal-agent, -runtime, -teams) would publish. The workspace itself typechecks and tests the
+# packages' sources (tsconfig.json's `paths`), never what is built from them, so this is where the built packages
+# are checked: `npm run build`, then personal-agent/scripts/check-pack.ts packs the three real tarballs, checks
+# their files and manifests, installs them into an empty directory outside the workspace, imports each package,
+# runs the worker program, and compiles a TypeScript consumer against their declarations.
+#
+# No path filter, like connector-packaging.yml: core compiles the Claw wire contract in from
+# claw/packages/protocol, so a change there can break the packages as surely as one under personal-agent/.
+on:
+  # PRs run via `pull_request`; `push` is scoped to `main` so a same-repo PR does not trigger twice.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per pull request: a new head cancels the previous head's run. Every other event gets a group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  packages:
+    name: npm packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: personal-agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: personal-agent/package-lock.json
+
+      # No install script runs: the job only builds and inspects.
+      - run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the packages
+        run: npm run check-pack

@@ -1,12 +1,32 @@
 {
   "name": "@primusclaw/personal-agent",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "The personal agent's channel-neutral core: domain logic, ports and plugin interfaces.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AMD-AGI/PrimusClaw.git",
+    "directory": "personal-agent/packages/core"
+  },
+  "homepage": "https://github.com/AMD-AGI/PrimusClaw/tree/main/personal-agent#readme",
+  "bugs": {
+    "url": "https://github.com/AMD-AGI/PrimusClaw/issues"
+  },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "zod": "^4.6.5"

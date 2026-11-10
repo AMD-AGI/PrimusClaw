@@ -13,7 +13,12 @@
     "verbatimModuleSyntax": true,
     "declaration": false,
     "declarationMap": false,
-    "sourceMap": false
+    "sourceMap": false,
+    "paths": {
+      "@primusclaw/personal-agent": ["./packages/core/src/index.ts"],
+      "@primusclaw/personal-agent-runtime": ["./packages/runtime/src/index.ts"],
+      "@primusclaw/personal-agent-teams": ["./packages/teams/src/index.ts"]
+    }
   },
   "include": ["packages/*/src", "packages/*/test", "test-support", "test", "scripts/*.ts"]
 }

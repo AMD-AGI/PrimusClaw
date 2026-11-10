@@ -51,7 +51,9 @@ function strings(value: unknown): string[] {
 /**
  * Why a package's runtime could load code the floor does not see, if it could: an entry point of its package.json
  * (`exports`, `main`, `module`, `browser`, `bin`) outside its src, or a source file of the package outside src/ and
- * test/ (which src could import by a relative path).
+ * test/ (which src could import by a relative path). The one exception is dist/, the build of src (`npm run build`):
+ * what a published package's entries name. The workspace itself never loads it (tsconfig.json's `paths` name each
+ * package's src), so the floor measured on src is the floor of what is built from it.
  */
 export function codeOutsideSrc(packagesDir: string, pkg: string): string[] {
   const dir = path.join(packagesDir, pkg);
@@ -60,11 +62,12 @@ export function codeOutsideSrc(packagesDir: string, pkg: string): string[] {
     strings(Object.hasOwn(manifest, field) ? manifest[field] : undefined),
   );
   const src = path.join(dir, "src") + path.sep;
+  const dist = path.join(dir, "dist") + path.sep;
   const badEntries = entries
-    .filter((target) => !path.resolve(dir, target).startsWith(src))
+    .filter((target) => !path.resolve(dir, target).startsWith(src) && !path.resolve(dir, target).startsWith(dist))
     .map((target) => `packages/${pkg}/package.json points at ${target}, outside src (the floor would not see it)`);
   const stray = readdirSync(dir, { withFileTypes: true })
-    .filter((e) => !["src", "test", "node_modules"].includes(e.name))
+    .filter((e) => !["src", "test", "node_modules", "dist"].includes(e.name))
     .flatMap((e) => (e.isDirectory() ? sourceFiles(path.join(dir, e.name)) : [path.join(dir, e.name)]))
     .filter((file) => (SOURCE_EXTENSIONS as readonly string[]).includes(path.extname(file)))
     .map((file) => `${path.relative(path.dirname(packagesDir), file)} is source outside src/ and test/`);
