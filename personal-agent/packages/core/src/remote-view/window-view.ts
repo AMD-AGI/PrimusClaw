@@ -13,7 +13,7 @@ import { remoteWindowCardText } from "../locales/remote-window-card.js";
 import { chatBoxLine, masked, sentLabel, tailLines } from "../remote/window/output.js";
 import { INPUT_ID, INPUT_MAX, takesInput } from "../remote/window/view.js";
 import { type DecisionButton, type RemoteButton, remoteButton } from "../remote/actions.js";
-import { lit } from "../remote/inert.js";
+import { breakLinks, lit } from "../remote/inert.js";
 import { remoteText } from "../locales/remote.js";
 import { cpLength, cpSlice, pyLstrip, pyRstrip } from "../text/py-text.js";
 import type { StatusPhase } from "../remote/lines.js";
@@ -31,6 +31,8 @@ export const APPROVALS_SHOWN = 3;
 /** One line of output (a minified file is not one card). */
 export const LINE_MAX = 400;
 
+/** Bidi overrides and isolates: dropped by the rich text before it reads anything, so dropped before addresses are looked for. */
+const BIDI = /[\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu;
 const MARKUP = /([\\*_`~#[\]|])/g;
 const LIST_ITEM = /^\s*\d+[.)]\s/;
 
@@ -38,11 +40,13 @@ function isLineControl(code: number): boolean {
   return (code <= 0x1f && code !== 0x09 && code !== 0x0a) || code === 0x7f;
 }
 
-/** One line of the agent's output as a TextBlock shows it: control characters gone, no link or tag can be built from it, the
- * markdown a TextBlock reads escaped, never read as a list item, clipped. */
+/** One line of the agent's output as a TextBlock shows it: control characters gone, no link or tag can be built from it (an
+ * address in it broken where it stands, as in a short line: the output is shown as the agent wrote it, not made words as an
+ * answer is, so a code span made for a host would only show its backticks), the markdown a TextBlock reads escaped, never read
+ * as a list item, clipped. */
 export function outputLine(raw: string): string {
   let line = Array.from(raw, (ch) => (isLineControl(ch.charCodeAt(0)) ? " " : ch)).join("");
-  line = pyRstrip(line.replaceAll("\t", "    "));
+  line = breakLinks(pyRstrip(line.replaceAll("\t", "    ").replace(BIDI, "")));
   line = line.replaceAll("](", "]\u{200b}(").replaceAll("<", "\u{2039}").replaceAll(">", "\u{203a}");
   line = line.replace(MARKUP, "\\$1");
   if (pyLstrip(line).startsWith("-") || pyLstrip(line).startsWith("+") || LIST_ITEM.test(line))

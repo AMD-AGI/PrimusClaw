@@ -228,3 +228,26 @@ test("a blank line of the output holds a no-break space as the python worker's d
     ["first", " ", " ", "last"],
   );
 });
+
+test("no address in the output can be followed once the card shows it, each broken where it stands", () => {
+  // (the seven ways an address reached the card whole, and a plain sentence that must stay as it is: the output is shown as the
+  // agent wrote it, so each address is broken in place as a short line breaks it, never put in a code span the card would only
+  // show the backticks of)
+  const rows: readonly (readonly [string, string])[] = [
+    ["L1 请看 example.com/path 这一页。", "L1 请看 example\u200b.com/path 这一页。"],
+    ["docs.example.museum/x", "docs.example\u200b.museum/x"],
+    ["a@b.example", "a@\u200bb.example"],
+    ["L4 write `a@b.example now", "L4 write \\`a@\u200bb.example now"],
+    ["| docs.example.museum/p\\| | x |", "\\| docs.example\u200b.museum/p\\\\\\| \\| x \\|"],
+    ["main.py:42", "main\u200b.py:42"],
+    ["a@b.com.1", "a@\u200bb.com.1"],
+    ["L7 今天下午三点开会，请准时参加。", "L7 今天下午三点开会，请准时参加。"],
+  ];
+  const c = card("zh", windowOf({ text: rows.map(([line]) => line).join("\n") }), [], "idle");
+  const tail = (c["body"] as Json[]).find((b) => b["id"] === "window_tail") ?? {};
+  const shown = (tail["items"] as Json[]).map((i) => i["text"]);
+  assert.deepEqual(
+    shown,
+    rows.map(([, line]) => line),
+  );
+});
