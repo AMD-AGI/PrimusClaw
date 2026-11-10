@@ -63,3 +63,30 @@ test("a long history is read page by page from where the last page ended", async
   assert.equal(tail.cursor, String(TAIL_PAGE + 3));
   assert.ok(tail.active);
 });
+
+// A connector replays the session's history on every reconnect: a page can be all replayed rows. The read must go on past them
+// (review of #636: it asked for the same page for ever), while the tail's cursor stays the session's own last event.
+test("a page of replayed rows alone is read past and the tail ends", async () => {
+  const chunk = (id: number, replay: boolean): EventRow => ({
+    id: String(id),
+    type: "agent_message_chunk",
+    data: {
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } },
+      ...(replay ? { replay: true } : {}),
+    },
+  });
+  const rows: EventRow[] = [
+    chunk(1, false),
+    ...Array.from({ length: TAIL_PAGE }, (_, i) => chunk(i + 2, true)),
+    chunk(TAIL_PAGE + 2, true),
+  ];
+  const asked: (string | null)[] = [];
+  const read = (after: string | null, limit: number) => {
+    asked.push(after);
+    if (asked.length > 5) throw new Error(`asked ${String(asked.length)} times: ${JSON.stringify(asked.slice(0, 5))}`);
+    return Promise.resolve(rows.filter((r) => Number(r.id) > Number(after ?? 0)).slice(0, limit));
+  };
+  const tail = await readTail(read, decodeStep);
+  assert.deepEqual(asked, [null, String(TAIL_PAGE)]); // (two pages: the first ends at a replayed row, the next starts after it)
+  assert.equal(tail.cursor, "1"); // the session's own last event, as Python's tail says
+});

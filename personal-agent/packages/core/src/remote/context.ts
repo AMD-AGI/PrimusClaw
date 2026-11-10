@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** What the remote-agent domain is given: its settings and the ports it works through. */
+import { personOf } from "./chat-key.js";
 import type { RemoteViews } from "./ports.js";
 import type { DirectChat } from "../direct-chat/direct-chat.js";
 import type { ClawRemoteAgentsPort } from "../ports/claw/remote-agents.js";
@@ -106,4 +107,17 @@ export interface RemoteContext {
   langOf(person: string): Lang;
   /** TEAMS_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */
   readonly directChat: DirectChat;
+}
+
+/**
+ * The per-person limits as a chat key reads them (Python's `_PersonGuard`): a group binding's chat key
+ * (`person#conversation`) counts against its binder's own allowance, so binding another group is no new allowance.
+ */
+export function perPerson(guard: RemoteGuard): RemoteGuard {
+  return {
+    take: (chatKey, operation, ticket, ids) => guard.take(personOf(chatKey), operation, ticket, ids),
+    giveBack: (chatKey, operation, ticket) => {
+      guard.giveBack(personOf(chatKey), operation, ticket);
+    },
+  };
 }

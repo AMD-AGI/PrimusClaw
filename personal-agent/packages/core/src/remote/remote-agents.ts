@@ -20,6 +20,7 @@ import { remoteText } from "../locales/remote.js";
 import type { Attachment, RemoteAgentCommand, RemoteChat, RemotePrompt } from "../routing/features.js";
 import { StatusBoard } from "./board.js";
 import { groupChatKey, personOf } from "./chat-key.js";
+import { perPerson } from "./context.js";
 import { ChatRegistry, type RemoteTurn } from "./chats.js";
 import { StartClicks } from "./clicks-start.js";
 import { MachineClicks } from "./clicks-machine.js";
@@ -62,7 +63,12 @@ export class RemoteAgents implements RemoteChat {
   private readonly prompts: Prompts;
   private readonly runner: TurnRunner;
 
-  constructor(private readonly ctx: RemoteContext) {
+  private readonly ctx: RemoteContext;
+
+  constructor(context: RemoteContext) {
+    // (a group binding counts against its binder's own allowance: the limits are per person, not per chat)
+    const ctx: RemoteContext = { ...context, guard: perPerson(context.guard) };
+    this.ctx = ctx;
     this.state = new ChatState(ctx, this.chats);
     this.board = new StatusBoard(ctx, this.state);
     this.permissions = new Permissions(ctx, this.state, this.board);
