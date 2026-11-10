@@ -3,7 +3,7 @@
 
 /**
  * The assistant's receipt (teams_agent/stream.py, the receipt half): a message to the assistant returns at once and the assistant
- * answers later, by notification; the receipt is a live stream opened when the message is handed over ("Got it, working on it…"
+ * answers later, by notification; the receipt is a live stream opened when the message is handed over ("Working on it…"
  * under it), and the assistant's first reply to that chat closes it, so the reply appears where the status was. A reply that does
  * not come before RECEIPT_CLOSE_SECONDS closes it with "running in the background", and the reply comes as a message of its own.
  *

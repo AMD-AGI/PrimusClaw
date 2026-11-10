@@ -89,18 +89,31 @@ export function typedLine(text: string, lang: Lang): string {
   return remoteText.in(lang).typedInTerminal({ quoted });
 }
 
-type QueuedKey = "terminalWorking" | "terminalWaiting" | "terminalTyping" | "terminalScrolled";
-const QUEUED_KEYS: Readonly<Record<string, QueuedKey>> = {
-  terminal_working: "terminalWorking",
-  terminal_waiting: "terminalWaiting",
-  terminal_typing: "terminalTyping",
-  terminal_scrolled: "terminalScrolled",
-};
+/**
+ * Teams' floating status (an informative update) is cut on a phone after a few characters. Microsoft documents only an upper
+ * bound (1000 characters) and no display width; the one measurement is a phone on 2026-11-10, which showed four Chinese
+ * characters after the icon. So a line saying why a message still waits for its terminal is at most WAIT_LINE_MAX_ZH code points
+ * in Chinese and WAIT_LINE_MAX_EN in English, the "⏳ " included.
+ */
+export const WAIT_LINE_MAX_ZH = 6;
+export const WAIT_LINE_MAX_EN = 16;
 
-/** What a message for a conversation open in a terminal waits for (`terminal_input_queued`). */
+type QueuedKey = "terminalWorking" | "terminalWaiting" | "terminalDialog" | "terminalTyping" | "terminalScrolled";
+/** Reason of `terminal_input_queued` -> what the message waits for. A newer connector adds terminal_dialog (a confirmation or a
+ * menu on the terminal's screen) and terminal_screen (a screen it cannot read: the fallback, like any reason not listed). */
+const QUEUED_KEYS: ReadonlyMap<string, QueuedKey> = new Map([
+  ["terminal_working", "terminalWorking"],
+  ["terminal_waiting", "terminalWaiting"],
+  ["terminal_dialog", "terminalDialog"],
+  ["terminal_typing", "terminalTyping"],
+  ["terminal_scrolled", "terminalScrolled"],
+]);
+
+/** What a message for a conversation open in a terminal waits for (`terminal_input_queued`), in the chat's language: one short
+ * line within WAIT_LINE_MAX_ZH / WAIT_LINE_MAX_EN, so that a phone shows all of it. */
 export function queuedLine(reason: string, lang: Lang): string {
   const words = remoteQueuedText.in(lang);
-  const key = Object.hasOwn(QUEUED_KEYS, reason) ? QUEUED_KEYS[reason] : undefined;
+  const key = QUEUED_KEYS.get(reason);
   return `⏳ ${key ? words[key] : words.other}`;
 }
 

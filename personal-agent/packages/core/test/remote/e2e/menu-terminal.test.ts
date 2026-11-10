@@ -220,10 +220,10 @@ test("a conversation open in a terminal its connector types into takes messages 
       .runner;
     const request = { chatKey: AAD, to: w.conversationOf(), state };
     await runner.apply(request, step, display);
-    assert.deepEqual(seen, ["⏳ The terminal is running a turn; your message is queued and goes in when it finishes."]);
+    assert.deepEqual(seen, ["⏳ Queued"]);
     w.setLang(AAD, "zh");
     await runner.apply(request, step, display);
-    assert.equal(seen.at(-1), "⏳ 终端里正在跑一轮，你的消息排队中，跑完就发给它。");
+    assert.equal(seen.at(-1), "⏳ 已排队");
   }));
 
 test("what is typed at the shared terminal shows on the phone before its reply and leaving ends nothing there", () =>

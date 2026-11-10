@@ -50,6 +50,20 @@ export function boundedBody(paragraphs: readonly string[], budget: number): stri
   return body;
 }
 
+/** Whether a step is something of the turn itself (its words, a step, a question, its start or end, what was typed at the
+ * terminal): once one shows, the message no longer waits for the terminal. */
+function showsTheTurn(step: RemoteStep): boolean {
+  return (
+    step.chunk !== null ||
+    step.tool !== null ||
+    (step.permission !== null && Object.keys(step.permission).length > 0) ||
+    step.finished ||
+    step.started ||
+    Boolean(step.plan) ||
+    step.typed !== null
+  );
+}
+
 export class RemoteLiveView {
   /** The first line of every render: who is working. */
   readonly header: string;
@@ -58,6 +72,9 @@ export class RemoteLiveView {
   private readonly active = new Map<string, string>();
   /** The next text starts a new block (a tool ran since the last one). */
   private split = true;
+  /** Why the message waits, while it waits for a terminal on the machine (`terminal_input_queued`, said in the chat's language by
+   * the runner): the floating status says it, not only "Thinking…", until anything of the turn shows. */
+  private waiting = "";
 
   constructor(
     label: string,
@@ -69,6 +86,9 @@ export class RemoteLiveView {
   /** Fold one step in; true when what `render` returns changed. */
   apply(step: RemoteStep): boolean {
     const before = this.render();
+    const waited = this.waiting;
+    if (step.queued !== null) this.waiting = step.note ?? "";
+    else if (showsTheTurn(step)) this.waiting = "";
     if (step.chunk) this.addText(step.chunk.kind, step.chunk.text);
     else if (step.tool) this.trackTool(step.tool.id, step.tool.title, step.tool.status);
     else if (step.plan) this.setPlan(step.plan);
@@ -77,13 +97,14 @@ export class RemoteLiveView {
       this.split = true;
     }
     this.blocks.splice(0, Math.max(0, this.blocks.length - LIVE_KEEP_BLOCKS));
-    return this.render() !== before;
+    return this.render() !== before || this.waiting !== waited;
   }
 
-  /** The few short lines of Teams' floating status while the agent works: where its plan stands, a step that failed last, and
-   * the step running now. Its words are streamed into the answer's bubble, not into the status. */
+  /** The few short lines of Teams' floating status while the agent works: why the message still waits for the terminal, where
+   * its plan stands, a step that failed last, and the step running now. Its words are streamed into the answer's bubble, not
+   * into the status. */
   statusLines(): string[] {
-    const lines: string[] = [];
+    const lines: string[] = this.waiting ? [this.waiting] : [];
     const plan = this.blocks.find((b) => b.kind === "plan")?.text ?? "";
     if (plan) lines.push(plan);
     const last = this.blocks.at(-1);

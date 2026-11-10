@@ -29,7 +29,7 @@ async function opened(lang: "zh" | "en" = "zh") {
 
 it("the receipt opens with got it and only once per conversation", async () => {
   const { receipts, status } = await opened();
-  assert.equal(status, "收到，正在处理…");
+  assert.equal(status, "收到，处理中");
   assert.equal(await receipts.openIn("c1", "en", () => Promise.resolve(new FakeReceiptStream())), undefined);
   assert.equal(await receipts.openIn("c2", "en", () => Promise.resolve(undefined)), undefined);
   const off = new Receipts(new FakeClock(), silentLogger, () => false);
