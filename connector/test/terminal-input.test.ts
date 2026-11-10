@@ -467,6 +467,36 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.reason === "terminal_state_unknown"), "never held as a state it cannot read");
   });
 
+  test("a terminal Claude Code calls busy while only background agents run (its main turn idle) is typed into; one whose main turn runs waits", async () => {
+    // (Claude Code 2.1.321: status = isLoading || delegatedActive ? "busy" : "idle"; a coordinator's terminal says busy for hours,
+    // and a phone's message waited "while the terminal runs a turn" until it was refused. Its screen tells the two apart.)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 1_500, { FAKE_IDLE_STATUS: "busy" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "from the phone");
+    const end1 = await h.claw.until("the first turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    assert.deepEqual([end1.data.stopReason, end1.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone"]);
+    // Its main turn runs (a prompt typed at the terminal: `esc to interrupt` under the box): the next message waits for it.
+    t.tmux("send-keys", "-t", "%0", "-l", "typed at the terminal");
+    t.tmux("send-keys", "-t", "%0", "Enter");
+    await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
+    const two = h.prompt(sid, "while it works");
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === two));
+    assert.equal(queued.data.reason, "terminal_working");
+    assert.ok(!typed(t.transcript).includes("while it works"), "not typed while the main turn runs");
+    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
+    assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal", "while it works"]);
+  });
+
   test("Enter is never sent onto a question: typed text with a permission question under its box is not submitted and nothing is approved", async () => {
     // (the hard rule: a phone's message never becomes a key of a confirmation; the screen is read for that right before Enter)
     const work = tmpdir("cc-work-");

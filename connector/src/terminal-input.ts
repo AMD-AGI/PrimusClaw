@@ -290,7 +290,7 @@ export function enterGuard(screen: string, text: string): string | null {
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
 export const ENTER_SETTLE_MS = 250;
 
-export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" };
+export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" | "busy" };
 
 /** What was typed is in the box but was not submitted: the screen did not pass {@link enterGuard}. */
 export class TerminalNotSubmitted extends Error {
@@ -311,9 +311,11 @@ export class TerminalInput {
 
   /**
    * Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty;
-   * when it can, with the permission mode its footer shows on that same screen (null when it does not show one).
+   * when it can, with the permission mode its footer shows on that same screen (null when it does not show one). `screenOnly`:
+   * Claude Code's own word does not settle whether its main turn runs (it says `busy` while background agents run, with the main
+   * turn idle), so the footer must not say one does either (`esc to interrupt`).
    */
-  async readiness(): Promise<Readiness> {
+  async readiness(screenOnly = false): Promise<Readiness> {
     let info: string;
     try {
       info = await this.tmux.run(["display-message", "-p", "-t", this.ref.pane, "#{pane_in_mode} #{pane_dead} #{pane_pid}"]);
@@ -325,6 +327,7 @@ export class TerminalInput {
     if (mode !== "0") return { ready: false, why: "copy_mode" };
     const screen = await this.screen();
     const box = inputBox(screen);
+    if (box === "empty" && screenOnly && turnRunning(screen)) return { ready: false, why: "busy" };
     return box === "empty" ? { ready: true, mode: terminalMode(screen) } : { ready: false, why: box === "typed" ? "typing" : "screen" };
   }
 

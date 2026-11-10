@@ -84,6 +84,9 @@ export const READ_ONLY_REASON = "read_only_live_session";
 /** Why a mode change or a decision for a conversation that is typed into in its terminal is refused: the terminal owns those. */
 export const TERMINAL_OWNS_REASON = "terminal_session";
 /** What a terminal that typed messages wait for is doing, as the queue notice says it. */
+/** How far apart the two screen reads are that let a message into a terminal Claude Code calls `busy` (background agents only). */
+const BUSY_SCREEN_SETTLE_MS = 500;
+
 const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "busy" | "waiting" | "other", string> = {
   typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", busy: "terminal_working", waiting: "terminal_waiting", other: "terminal_switched",
 };
@@ -460,8 +463,16 @@ export class Session {
           const status = this.holderStatus(term);
           let why: string;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
-          if (!isIdleStatus(status)) {
-            why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
+          if (status === "busy") {
+            // `busy` is also what Claude Code says while only background agents run and its main turn is idle (status is
+            // isLoading || delegatedActive, 2.1.321): a coordinator's terminal can say it for hours. Its screen tells the two apart:
+            // an empty box with no `esc to interrupt` under it, on two reads apart, is a prompt waiting for input.
+            const r = await term.readiness(true);
+            if (r.ready && await this.stillFree(term)) { ready = true; break; }
+            why = r.ready || r.why === "busy" || r.why === "screen" ? WAIT_WHY.busy : WAIT_WHY[r.why];
+            if (!r.ready && r.why === "gone") { told = why; break; }
+          } else if (!isIdleStatus(status)) {
+            why = status === "waiting" ? WAIT_WHY.waiting : "terminal_state_unknown";
           } else {
             const r = await term.readiness();
             if (r.ready) { ready = true; break; }
@@ -498,7 +509,7 @@ export class Session {
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
-        if (!isIdleStatus(this.holderStatus(term))) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
+        if (!this.mayType(this.holderStatus(term))) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
           this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
@@ -528,8 +539,9 @@ export class Session {
         };
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
-        const again = await term.readiness();
-        if (!again.ready || !isIdleStatus(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        const before = this.holderStatus(term);
+        const again = await term.readiness(before === "busy");
+        if (!again.ready || !this.mayType(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
@@ -553,6 +565,19 @@ export class Session {
     } finally {
       this.terminalPumping = false;
     }
+  }
+
+  /** Whether what Claude Code says lets a message be typed, its screen permitting (`busy`: only on a screen with no main turn running). */
+  private mayType(status: string | null): boolean {
+    return isIdleStatus(status) || status === "busy";
+  }
+
+  /** For a terminal that says `busy`: its screen shows no main turn running a second time, BUSY_SCREEN_SETTLE_MS later. */
+  private async stillFree(term: TerminalInput): Promise<boolean> {
+    await sleep(BUSY_SCREEN_SETTLE_MS);
+    if (this.holderStatus(term) !== "busy" && !isIdleStatus(this.holderStatus(term))) return false;
+    const r = await term.readiness(true);
+    return r.ready;
   }
 
   /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */

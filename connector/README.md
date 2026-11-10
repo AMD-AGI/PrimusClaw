@@ -457,7 +457,8 @@ watch. Nothing else writes to the conversation, so its history never forks, and 
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
 accepted: it waits (one notice, `terminal_input_queued`, with `reason` `terminal_working`, `terminal_waiting`, `terminal_typing`,
 `terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle (`idle`, or `shell`: idle with background shells
-running) **and** its input box is empty on the screen, so that
+running; or `busy` while its screen shows no main turn running, which is what Claude Code says while only background agents run)
+**and** its input box is empty on the screen, so that
 half-typed text at the terminal is never sent along and a question or a menu on the screen is never answered by an Enter; after
 10 minutes it is refused (`terminal_busy`). It is then typed with `tmux send-keys -l` (literal: nothing in it is read as a key
 name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and submitted with Enter
