@@ -8,6 +8,7 @@
 
 import { isUpper } from "../../review-text/text/unicode.js";
 import { pyRegExp } from "../../text/py-regex.js";
+import { asksForReview } from "./review-ask.js";
 import { pyRstrip } from "../../text/py-text.js";
 
 // A word for something on GitHub, bounded by anything that is not an ASCII letter ("的pr" has no word boundary in Unicode).
@@ -23,15 +24,6 @@ const STATE = pyRegExp(
     String.raw`(?<![A-Za-z])(?:open|opened|merged|closed|failing|failed|red|how\s+many|latest|last|status|waiting|assigned)(?![A-Za-z])`,
   "i",
 );
-// A review asked for: reviews go their own way, and no card is offered beside one.
-// (owner/repo#N only from the start of its run of name characters: the same earliest start as Python's `_REVIEW`, without
-// trying the run again from each of its characters, which made a long line of "review-review-..." cubic)
-const REVIEW_NEAR = pyRegExp(
-  String.raw`(?:合入|merge|https?://|(?<![A-Za-z0-9-])[A-Za-z0-9-]+/[A-Za-z0-9._-]+#\d)`,
-  "i",
-);
-const REVIEW_WORD = pyRegExp(String.raw`(?<![A-Za-z])review(?![A-Za-z])`, "gi");
-const REVIEW_OTHER = pyRegExp(String.raw`代审|帮.{0,6}审`);
 
 export const MAX_QUESTION_CHARS = 2000;
 export const MAX_REPOS_LOOKED_AT = 3;
@@ -41,18 +33,6 @@ const REPO_NAME = pyRegExp(
   String.raw`(?<![\w./-])([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})(?![\w/])`,
   "g",
 );
-
-/** "review" followed within 40 characters of its line by a merge word, a link or owner/repo#N; or 代审, 帮…审. */
-function asksForReview(text: string): boolean {
-  if (REVIEW_OTHER.test(text)) return true;
-  for (const m of text.matchAll(REVIEW_WORD)) {
-    const after = text.slice(m.index + m[0].length).split("\n", 1)[0] ?? "";
-    // (`[^\n]{0,40}?` then one of them: it must start within 40 characters)
-    const found = REVIEW_NEAR.exec(after);
-    if (found !== null && Array.from(after.slice(0, found.index)).length <= 40) return true;
-  }
-  return false;
-}
 
 /** Whether a message asks about the state of the person's own GitHub (a GitHub word, the person, a word of state). */
 export function asksAboutOwnGithub(text: string): boolean {
