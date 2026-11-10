@@ -18,6 +18,7 @@
  * (`remote-view`), and posting it is the remote agents' (`remote/window/board.ts`).
  */
 import { cpLength, cpSlice } from "../../text/py-text.js";
+import { inertAnswer } from "../links/answer.js";
 
 export const WINDOW_MODES = ["card", "chat"] as const;
 export type WindowMode = (typeof WINDOW_MODES)[number];
@@ -90,7 +91,8 @@ export class WindowView {
    * the card showed when it was posted was another output, and only how much of this one there is counts (`shouldRepost`).
    */
   setText(text: string): void {
-    const kept = cpSlice(text, -FULL_KEEP_CHARS);
+    // (an agent's words, whichever way they came: its links and addresses are words)
+    const kept = cpSlice(inertAnswer(text), -FULL_KEEP_CHARS);
     const before = cpSlice(this.text, 0, Math.min(cpLength(this.text), 200));
     if (!kept.startsWith(before) || cpLength(kept) < cpLength(this.text)) this.postedLen = 0;
     this.text = kept;

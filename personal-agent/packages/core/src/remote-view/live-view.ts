@@ -14,6 +14,7 @@ import type { Lang } from "../locales/lang.js";
 import { ACTIVE_STEPS_MAX, BLOCK_KEEP_CHARS, THOUGHT_MAX, TOOL_TITLE_MAX } from "../remote/limits.js";
 import { cpLength, cpSlice, pyLstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { remoteText } from "../locales/remote.js";
+import { inertAnswer } from "../remote/links/answer.js";
 
 /** The live view of a turn shows at most this much below its header. */
 export const LIVE_MAX_CHARS = 2500;
@@ -112,7 +113,8 @@ export class RemoteLiveView {
       lines.push(remoteText.in(this.lang).stepFailed({ title: neutral(last.text, TOOL_TITLE_MAX) }));
     const running = this.runningLine();
     if (running) lines.push(running);
-    return lines;
+    // (the floating status is the agent's words too: its plan's line, a step's title)
+    return lines.map(inertAnswer);
   }
 
   /** The header and the newest part of the turn that fits. */
@@ -163,9 +165,9 @@ export class RemoteLiveView {
   private paragraph(block: Block): string {
     switch (block.kind) {
       case "message": // (the raw error of a failed model call is cut off here as in the answer)
-        return pyStrip(splitErrorTail(redactText(block.text)).kept);
+        return pyStrip(inertAnswer(splitErrorTail(redactText(block.text)).kept));
       case "thought": {
-        const flat = squashSpaces(redactText(block.text).replace(STYLE_CHARS, " "));
+        const flat = inertAnswer(squashSpaces(redactText(block.text).replace(STYLE_CHARS, " ")));
         const clipped = cpLength(flat) <= THOUGHT_MAX ? flat : "…" + pyLstrip(cpSlice(flat, -(THOUGHT_MAX - 1)));
         return pyStrip(clipped) ? `_\u{1f4ad} ${pyStrip(clipped)}_` : "";
       }
@@ -180,6 +182,7 @@ export class RemoteLiveView {
     const out = this.blocks.map((b) => this.paragraph(b)).filter((p) => p);
     const running = this.runningLine();
     if (running) out.push(running);
-    return out;
+    // (the plan's line, a note, a step's title: whatever of the agent's reaches the progress message, its addresses are words)
+    return out.map(inertAnswer);
   }
 }
