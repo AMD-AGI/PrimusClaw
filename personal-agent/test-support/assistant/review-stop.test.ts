@@ -166,7 +166,8 @@ it("the askers stop answered with her view alone is said and not said again", as
   assert.ok(card !== undefined);
   await press(w, stopClick(card));
   assert.deepEqual(stops(w), [["stop_item", ALICE_KEY, "item-1"]]);
-  assert.ok(saidToAlice(w).includes("已停止") && saidToAlice(w).includes(LINK), saidToAlice(w));
+  // (said from her view alone: the item Claw names is the pull request, as the Python worker's item_label puts it)
+  assert.match(saidToAlice(w), /已停止 #\d+ https:\/\/github\.com\/AMD-AGI\/Hyperloom\/pull\/12。/);
   // (the stop was said on the card; its view is not said again in the group)
   assert.ok(!saidIn(w.surface, CONV).includes("代审）："), saidIn(w.surface, CONV));
 });
