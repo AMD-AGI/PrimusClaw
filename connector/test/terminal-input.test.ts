@@ -699,6 +699,31 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual(typed(t.transcript), [], "nothing submitted after the cancel");
   });
 
+  test("a phone cancel after the text went into the box but before its Enter: no further key, nothing submitted, the turn ends cancelled once (Wei Lei on #648, r2)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const escs = path.join(tmpdir("cc-esc-"), "escs");
+    const t = terminal(work, h.attachDir, 300, { FAKE_ESC_FILE: escs });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "cancel me before the enter");
+    // (the moment the text shows in the box: the Enter waits two screen reads, 250 ms apart, after it)
+    await until("the text in the box", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("cancel me before the enter"), 10_000);
+    h.claw.issue("cancel", sid);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 10_000);
+    assert.equal(end.data.stopReason, "cancelled");
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.deepEqual(typed(t.transcript), [], "not submitted after the cancel");
+    assert.equal(fs.existsSync(escs), false, "no Esc");
+    assert.equal(h.turnEnds(sid).filter((e) => e.data.cmd_seq === seq).length, 1, "ended once");
+    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("cancel me before the enter"), "the text stays in the box");
+  });
+
   test("a phone cancel of a message Claude Code queued behind the person's running turn: no Esc (it would stop the person's turn); a turn it started at an idle prompt: Esc as before (Wei Lei on #648)", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({

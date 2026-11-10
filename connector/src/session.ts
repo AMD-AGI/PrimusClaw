@@ -438,6 +438,8 @@ export class Session {
       // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
       // queued before it could be the one that came out first, and its turn is the person's)
       if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
+      // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
+      if (turn.pasted && !turn.seen && turn.queued && said.replace(/\s+/g, " ").includes(turn.text.replace(/\s+/g, " ").trim())) { turn.seen = true; return; }
       if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";

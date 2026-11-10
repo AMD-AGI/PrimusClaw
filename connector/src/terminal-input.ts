@@ -480,6 +480,8 @@ export class TerminalInput {
     if (!text) throw new Error("nothing to type");
     let told = false;
     let declined = 0;
+    // (a message cancelled or withdrawn meanwhile gets no further key: what is in the box stays there)
+    const stillWanted = () => { if (opts.stillWanted && !opts.stillWanted()) throw new TerminalNotSubmitted("no longer wanted"); };
     // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
     const waitOutDialog = async () => {
       if (!told) { told = true; opts.onDialog?.(); }
@@ -496,6 +498,7 @@ export class TerminalInput {
       if (waited) await waitOutDialog();
       // (after a question, or to type again, the box is read anew: someone's text there is never pasted onto)
       if ((waited || typings > 1) && inputBox(await this.screen()) !== "empty") throw new TerminalNotSubmitted("the box is no longer empty");
+      stillWanted();
       await this.put(text, typings === 1 ? opts.onPaste : undefined);
       const by = Date.now() + this.echoWaitMs;
       let dialog = false;
@@ -519,6 +522,7 @@ export class TerminalInput {
           why = enterGuard(screen, text);
         }
         if (!why) {
+          stillWanted();
           // End and Enter in one write (SUBMIT_BYTES): the box takes them as "to the end, submit"; a question that came up after the read
           // above takes End as its last option, "No", and Enter chooses that. Never a "Yes".
           await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...SUBMIT_BYTES]);

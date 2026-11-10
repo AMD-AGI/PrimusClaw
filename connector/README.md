@@ -484,8 +484,8 @@ after the `dequeue`), when the turn is stopped there (`cancelled`), or once Clau
 that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
 `terminal_input_unconfirmed`, and one Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
 `terminal_input_withdrawn`. A
-`cancel` presses Esc in the terminal only for a turn the phone's message started itself (typed at an idle prompt, or taken from
-Claude Code's queue once a turn ended), which stops it there. While the message is still being put in, waiting on a question, or
+`cancel` presses Esc in the terminal only for a turn the phone's message started itself (submitted straight at a prompt, not
+through Claude Code's queue), which stops it there. While the message is still being put in, waiting on a question, or
 held in Claude Code's queue or taken into a turn the person started, no key is sent: the phone stops following it (the question
 stays the person's to answer; a message Claude Code already queued is still Claude Code's to run, and text already in the box stays
 there). A mode change is refused (`terminal_session`): the terminal keeps
