@@ -13,7 +13,8 @@
  * names no mode; `nobox` draws a screen with no input box at all (another program, a layout the connector does not know). Read
  * again every 50 ms, so the test can switch it as shift+tab would. FAKE_TITLE: a conversation name Claude Code writes into the rule
  * above the box (`/rename`). FAKE_IDLE_STATUS: what the row says between turns (`idle`; `shell` is what Claude Code 2.1.32x says
- * when background shells run).
+ * when background shells run). FAKE_TORN_ROW=1: the row is never written (Claude Code gives up on a row it cannot read). FAKE_TASKS_DIR:
+ * a conversation's task folder the process keeps open, as Claude Code does once that conversation ran a background task.
  * FAKE_DIALOG_FILE: an adversary. Once anything is typed, a permission question is drawn under the box (the typed text still shows
  * in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is submitted.
  */
@@ -24,6 +25,7 @@ const rowFile = process.env.FAKE_ROW;
 const sessionId = process.env.FAKE_SESSION;
 const workMs = Number(process.env.FAKE_WORK_MS || "300");
 const idleStatus = process.env.FAKE_IDLE_STATUS || "idle";
+if (process.env.FAKE_TASKS_DIR) fs.openSync(process.env.FAKE_TASKS_DIR, "r");   // (held open for as long as it runs)
 let buffer = "";
 let pasting = false;
 let working = false;
@@ -39,6 +41,7 @@ const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
   : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
 
 const status = (s) => {
+  if (process.env.FAKE_TORN_ROW === "1") return;
   try {
     const row = JSON.parse(fs.readFileSync(rowFile, "utf8"));
     row.status = s;

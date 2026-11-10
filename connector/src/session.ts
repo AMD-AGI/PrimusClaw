@@ -460,10 +460,12 @@ export class Session {
           const status = this.holderStatus(term);
           let why: string;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
-          if (!isIdleStatus(status)) {
+          // `unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation: its
+          // screen alone says whether it is free (an empty box, and no turn running under it).
+          if (!isIdleStatus(status) && status !== "unread") {
             why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
           } else {
-            const r = await term.readiness();
+            const r = await term.readiness(status === "unread");
             if (r.ready) { ready = true; break; }
             why = WAIT_WHY[r.why];
             if (r.why === "gone") { told = why; break; }
@@ -498,7 +500,7 @@ export class Session {
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
-        if (!isIdleStatus(this.holderStatus(term))) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
+        if (!this.freeStatus(term)) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
           this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
@@ -528,8 +530,14 @@ export class Session {
         };
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
-        const again = await term.readiness();
-        if (!again.ready || !isIdleStatus(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        // One whose row cannot be read is proven again here, after every wait above: a `/clear` or `/resume` there meanwhile leaves
+        // the old task folder open while the new conversation's empty box shows, so a proof that is not fresh is no proof (codex r1).
+        if (this.holderStatus(term) === "unread" && !(await this.env.attach.get(this.agent.id)?.refreshBlind())) {
+          giveUp("terminal_busy");
+          continue;
+        }
+        const again = await term.readiness(this.holderStatus(term) === "unread");
+        if (!again.ready || !this.freeStatus(term)) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
@@ -555,6 +563,12 @@ export class Session {
     }
   }
 
+  /** Whether what Claude Code says of the terminal's process lets a message be typed now (`unread`: its screen says, see above). */
+  private freeStatus(term: TerminalInput): boolean {
+    const status = this.holderStatus(term);
+    return isIdleStatus(status) || status === "unread";
+  }
+
   /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */
   private holderStatus(term: TerminalInput): string | null {
     return this.env.attach.get(this.agent.id)?.holderStatus(term.ref.pid, this.acpId ?? "", term.ref.procStart) ?? null;
@@ -571,6 +585,7 @@ export class Session {
     }
     const status = support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart);
     if (status === "other") { this.endTerminalTurn("end_turn"); return; }
+    // (`unread`: nothing says it is idle; the transcript's own end of the turn, `turn_done`, ends it)
     if (isIdleStatus(status)) {
       turn.idleSince ??= now;
       if (now - turn.idleSince >= this.env.timing.terminalIdleMs) this.endTerminalTurn("end_turn");

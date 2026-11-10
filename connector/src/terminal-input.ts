@@ -171,6 +171,14 @@ function boxOf(screen: string): { raw: string[]; plain: string[]; at: number; en
   return { raw, plain, at, end };
 }
 
+/** The conversation name in the rule above Claude Code's input box (`──────── clean ─`), or null when the rule names none. */
+export function boxName(screen: string): string | null {
+  const { plain, at, end } = boxOf(screen);
+  if (at < 1 || end < 0) return null;
+  const m = /^─{8,} +(\S(?:.*\S)?) +─+$/.exec(plain[at - 1]!.trim());
+  return m ? m[1]! : null;
+}
+
 /**
  * Claude Code's permission modes, as its footer names each one (`<indicator> on`, below the input box) and the id the agent and
  * its transcript use for it: Claude Code's own table (`indicator` and `external`), the same in 2.1.285 and 2.1.319. Every mode is
@@ -290,7 +298,7 @@ export function enterGuard(screen: string, text: string): string | null {
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
 export const ENTER_SETTLE_MS = 250;
 
-export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" };
+export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" | "busy" };
 
 /** What was typed is in the box but was not submitted: the screen did not pass {@link enterGuard}. */
 export class TerminalNotSubmitted extends Error {
@@ -311,9 +319,10 @@ export class TerminalInput {
 
   /**
    * Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty;
-   * when it can, with the permission mode its footer shows on that same screen (null when it does not show one).
+   * when it can, with the permission mode its footer shows on that same screen (null when it does not show one). `screenOnly`:
+   * nothing else says whether a turn runs there (its registry row cannot be read), so the footer must not say one does either.
    */
-  async readiness(): Promise<Readiness> {
+  async readiness(screenOnly = false): Promise<Readiness> {
     let info: string;
     try {
       info = await this.tmux.run(["display-message", "-p", "-t", this.ref.pane, "#{pane_in_mode} #{pane_dead} #{pane_pid}"]);
@@ -325,6 +334,7 @@ export class TerminalInput {
     if (mode !== "0") return { ready: false, why: "copy_mode" };
     const screen = await this.screen();
     const box = inputBox(screen);
+    if (box === "empty" && screenOnly && turnRunning(screen)) return { ready: false, why: "busy" };
     return box === "empty" ? { ready: true, mode: terminalMode(screen) } : { ready: false, why: box === "typed" ? "typing" : "screen" };
   }
 
