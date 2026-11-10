@@ -143,7 +143,7 @@ test("the kind picks a label and an icon", () => {
 
 test("untrusted text is one masked clipped line", () => {
   assert.equal(neutral("a\n\tb\x00c   d"), "a b c d");
-  assert.equal(neutral("[x](http://e)"), "(x)(http://e)");
+  assert.equal(neutral("[x](http://e)"), "(x)(http:\u200b//e)");
   assert.ok(neutral("x".repeat(300), 50).endsWith("…") && neutral("x".repeat(300), 50).length === 50);
   assert.ok(!neutral("tok ghp_" + "b".repeat(36)).includes("ghp_" + "b".repeat(36)));
   assert.equal(neutral(null), "");
@@ -199,7 +199,7 @@ const RESUMABLE: [string, unknown, unknown[]][] = [
   [
     "a title is one inert line",
     [{ ref: "r", cwd: "/a", title: "[x](http://e)\n<b>" }],
-    [{ ref: "r", title: "(x)(http://e) ‹b›", cwd: "/a", updatedAt: null, state: "unknown" }],
+    [{ ref: "r", title: "(x)(http:\u200b//e) ‹b›", cwd: "/a", updatedAt: null, state: "unknown" }],
   ],
 ];
 
@@ -218,7 +218,7 @@ test("what a terminal is doing is read only for one it has open", () => {
     ],
     [
       { state: "live", activity: "waiting", waiting_for: "[x](http://e)\n" + "y".repeat(100) },
-      { activity: "waiting", waitingFor: "(x)(http://e) " + "y".repeat(45) + "…" },
+      { activity: "waiting", waitingFor: "(x)(http:\u200b//e) " + "y".repeat(44) + "…" },
     ],
     [{ state: "live", activity: "working", waiting_for: "ignored" }, { activity: "working" }],
     [{ state: "idle", activity: "waiting", waiting_for: "x" }, {}],
