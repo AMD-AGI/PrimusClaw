@@ -131,7 +131,11 @@ export async function readTail(read: ReadEvents, decode: (event: SseEvent) => Re
     for (const row of page) fold.add(row.id, decode(rowEvent(row)));
     if (page.length < TAIL_PAGE) return fold.result();
     // The next page starts after the last row read, replayed or not: the tail's cursor stays the session's own last event, but a
-    // page of replayed rows alone must not be asked for again (it would be, for ever).
-    after = page.at(-1)?.id || after;
+    // page of replayed rows alone must not be asked for again (it would be, for ever). A full page that names no row past `after`
+    // cannot be read past, so the tail ends there rather than asking for the same page again.
+    let next = "";
+    for (const row of page) if (row.id) next = row.id;
+    if (!next || next === after) return fold.result();
+    after = next;
   }
 }

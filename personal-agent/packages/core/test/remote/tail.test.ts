@@ -90,3 +90,17 @@ test("a page of replayed rows alone is read past and the tail ends", async () =>
   assert.deepEqual(asked, [null, String(TAIL_PAGE)]); // (two pages: the first ends at a replayed row, the next starts after it)
   assert.equal(tail.cursor, "1"); // the session's own last event, as Python's tail says
 });
+
+test("a full page that names no row past the cursor ends the tail rather than being asked for again", async () => {
+  const row = (id: string): EventRow => ({ id, type: "agent_message_chunk", data: { replay: true } });
+  const rows: EventRow[] = Array.from({ length: TAIL_PAGE }, () => row(""));
+  let asks = 0;
+  const read = () => {
+    asks += 1;
+    if (asks > 5) throw new Error(`asked ${String(asks)} times`);
+    return Promise.resolve(rows);
+  };
+  const tail = await readTail(read, decodeStep);
+  assert.equal(asks, 1);
+  assert.equal(tail.cursor, "");
+});
