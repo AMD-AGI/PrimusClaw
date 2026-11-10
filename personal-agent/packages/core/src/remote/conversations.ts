@@ -7,7 +7,7 @@
  */
 import { neutral } from "./inert.js";
 import { RESUMABLE_READ_MAX, RESUME_REF_MAX, ROOT_MAX, SUBFOLDER_MAX, WAITING_FOR_MAX } from "./limits.js";
-import { cpLength, hasControl, pyStrip } from "../text/py-text.js";
+import { cpLength, hasControl, pyRstrip, pyStrip } from "../text/py-text.js";
 import type { Agent } from "./model.js";
 import { type Reported, list, objOrNull } from "./reported.js";
 
@@ -108,7 +108,7 @@ export function cleanSubfolder(text: unknown): string | null {
 export function joinPath(root: string, sub: string): string {
   if (!sub) return root;
   const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
-  return root.replace(/[/\\]+$/, "") + sep + sub.replaceAll("/", sep);
+  return pyRstrip(root, "/\\") + sep + sub.replaceAll("/", sep);
 }
 
 /** The conversations of an agent its owner hid (`hidden: true`, in a listing with them included), read as `resumableOf` reads them. */

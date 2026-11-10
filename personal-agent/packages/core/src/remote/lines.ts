@@ -60,7 +60,7 @@ export function sessionTitle(text: string): string {
 
 /** The last part of a folder (`…/repo`), which tells two sessions apart better than the whole path does (inert, for a card). */
 export function placeOf(cwd: unknown, lit: (text: unknown, limit: number) => string): string {
-  const path = (cwd ? pyStr(cwd) : "").replace(/[/\\]+$/, "");
+  const path = pyRstrip(cwd ? pyStr(cwd) : "", "/\\");
   const tail = path ? (path.split(/[\\/]/).at(-1) ?? "") : "";
   return lit(tail || path, 40);
 }

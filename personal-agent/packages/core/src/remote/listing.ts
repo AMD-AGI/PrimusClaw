@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** The machines, agents and sessions of a user as lists: `/agents` and `/agent sessions` as text, and the facts a card shows. */
+import { pyRstrip } from "../text/py-text.js";
 import type { Lang } from "../locales/lang.js";
 import { remoteText } from "../locales/remote.js";
 import { kindLabel } from "./agents.js";
@@ -144,5 +145,5 @@ export const SESSION_PAGE_PATH = "/primus-claw/agent-sessions";
 export function sessionPageUrl(base: string, sessionId = ""): string {
   if (!base) return "";
   const sid = /^[0-9a-fA-F-]{8,64}$/.test(sessionId) ? sessionId : "";
-  return `${base.replace(/\/+$/, "")}${SESSION_PAGE_PATH}` + (sid ? `/${sid}` : "");
+  return `${pyRstrip(base, "/")}${SESSION_PAGE_PATH}` + (sid ? `/${sid}` : "");
 }
