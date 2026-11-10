@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SecretsUnavailable, type SecretName } from "@primusclaw/personal-agent";
+import { SecretsUnavailable, type SecretName, own } from "@primusclaw/personal-agent";
 import { ATTEMPTS, KeyVaultSecretSource, keyVaultSourceFromEnv, vaultErrorCode } from "../../src/azure/keyvault.js";
 import {
   KEYVAULT_API_VERSION,
@@ -76,7 +76,7 @@ class FakeAzure {
     const name = url.pathname.replace(/^\/secrets\//, "");
     this.reads.push(name);
     this.authHeaders.add(new Headers(init?.headers).get("authorization") ?? "");
-    const stored = VAULT_VALUES[name];
+    const stored = own(VAULT_VALUES, name);
     const normal =
       stored === undefined
         ? reply(404, { error: { code: "SecretNotFound", message: `A secret with (name/id) ${name} was not found` } })

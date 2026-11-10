@@ -22,6 +22,7 @@ import {
   SHAREPOINT,
   Tokens,
 } from "./fakes.js";
+import { own } from "@primusclaw/personal-agent";
 
 const X = bytes("x");
 
@@ -74,7 +75,7 @@ test("a file that fails or is too large is named and the others still go", async
     "/gone": { status: 404 },
     "/ok": { status: 200, body: bytes("fine") },
   };
-  const { files } = fetcher((url) => answers[url.pathname] ?? { status: 500 }, new Tokens(), { maxFileBytes: 10 });
+  const { files } = fetcher((url) => own(answers, url.pathname) ?? { status: 500 }, new Tokens(), { maxFileBytes: 10 });
   const { fetched, failed } = await files.fetchAll([
     sent("big.log", "https://x.test/big"),
     sent("gone.txt", "https://x.test/gone"),

@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ConfigError, decimalBigInt, pyStrip } from "@primusclaw/personal-agent";
+import { ConfigError, decimalBigInt, own, pyStrip } from "@primusclaw/personal-agent";
 
 /** The process environment, or a test's. */
 export type Env = Readonly<Record<string, string | undefined>>;
@@ -15,7 +15,7 @@ export class EnvReader {
 
   /** The raw value ("" unset). */
   raw(name: string, fallback = ""): string {
-    return this.env[name] ?? fallback;
+    return own(this.env, name) ?? fallback;
   }
 
   /** The value without surrounding white space ("" unset). */

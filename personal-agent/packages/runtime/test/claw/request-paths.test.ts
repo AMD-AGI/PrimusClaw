@@ -161,7 +161,8 @@ function methodsOf(claw: ClawPort): string[] {
     if (typeof port !== "object" || port === null) continue;
     const proto = Object.getPrototypeOf(port) as object;
     for (const name of Object.getOwnPropertyNames(proto)) {
-      const member: unknown = (port as Record<string, unknown>)[name];
+      // (Reflect.get on purpose: the methods are on the prototype)
+      const member: unknown = Reflect.get(port, name);
       if (name !== "constructor" && typeof member === "function") out.push(`${resource}.${name}`);
     }
   }

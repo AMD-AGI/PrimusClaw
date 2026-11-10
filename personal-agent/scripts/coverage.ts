@@ -56,7 +56,9 @@ function strings(value: unknown): string[] {
 export function codeOutsideSrc(packagesDir: string, pkg: string): string[] {
   const dir = path.join(packagesDir, pkg);
   const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as Record<string, unknown>;
-  const entries = ["exports", "main", "module", "browser", "bin"].flatMap((field) => strings(manifest[field]));
+  const entries = ["exports", "main", "module", "browser", "bin"].flatMap((field) =>
+    strings(Object.hasOwn(manifest, field) ? manifest[field] : undefined),
+  );
   const src = path.join(dir, "src") + path.sep;
   const badEntries = entries
     .filter((target) => !path.resolve(dir, target).startsWith(src))
@@ -90,7 +92,7 @@ export function packagesToCheck(
     ...entries
       .filter((e) => e.isSymbolicLink())
       .map((e) => `packages/${e.name} is a symbolic link (not allowed: a package is a directory of its own)`),
-    ...found.filter((p) => floors[p] === undefined).map((p) => `packages/${p} has no coverage floor in FLOORS`),
+    ...found.filter((p) => !Object.hasOwn(floors, p)).map((p) => `packages/${p} has no coverage floor in FLOORS`),
     ...Object.keys(floors)
       .filter((p) => !found.includes(p))
       .map((p) => `FLOORS names ${p}, which is not a package`),
@@ -98,7 +100,7 @@ export function packagesToCheck(
     ...found.flatMap((p) => codeOutsideSrc(packagesDir, p)),
   ];
   const packages = found.flatMap((p): [string, number][] => {
-    const floor = floors[p];
+    const floor = Object.hasOwn(floors, p) ? floors[p] : undefined;
     return floor === undefined ? [] : [[p, floor]];
   });
   return { packages, errors };

@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { STATUS_COLORS, toTeamsHtml } from "../../src/richtext/index.js";
+import { own } from "@primusclaw/personal-agent";
 
 const BR = "<br>";
 const LEAD = '<b><span style="font-size:16px">';
@@ -20,7 +21,7 @@ function paint(color: string, inner: string): string {
 }
 
 function color(emoji: string): string {
-  const value = STATUS_COLORS[emoji];
+  const value = own(STATUS_COLORS, emoji);
   assert.ok(value !== undefined, emoji);
   return value;
 }

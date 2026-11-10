@@ -7,7 +7,7 @@
  * Azure identity (WORKER_IDENTITY_*), the install hint and the reply style (TEAMS_*). A value that is not one the worker
  * knows stops it at start: a typo must never quietly pick a path. Core's settings (Claw, store, limits) are read by core.
  */
-import { pyRstrip, pyStrip } from "@primusclaw/personal-agent";
+import { pyRstrip, pyStrip, own } from "@primusclaw/personal-agent";
 
 import { workerIdentityFromEnv, type WorkerIdentity } from "../azure/workload-identity.js";
 import type { OutboundMode } from "../caps.js";
@@ -54,7 +54,7 @@ export interface TeamsSettings {
 }
 
 function get(env: Env, name: string, fallback = ""): string {
-  return pyStrip(env[name] ?? fallback);
+  return pyStrip(own(env, name) ?? fallback);
 }
 
 function required(env: Env, name: string): string {

@@ -9,6 +9,7 @@ import { createTypeScriptImportResolver } from "eslint-import-resolver-typescrip
 import { importX } from "eslint-plugin-import-x";
 import tseslint from "typescript-eslint";
 import asyncContext from "./eslint-rules/async-context.js";
+import noPrototypeKeys from "./eslint-rules/no-prototype-keys.js";
 
 /** Rules that are gates: no inline disable of these is accepted, with or without a reason. */
 const GATES = [
@@ -19,11 +20,15 @@ const GATES = [
   "@typescript-eslint/no-explicit-any",
   "@typescript-eslint/no-floating-promises",
   "@typescript-eslint/no-misused-promises",
+  "own-keys/no-prototype-keys",
   "layers/async-context-in-runtime-context",
 ];
 
 export default tseslint.config(
-  { ignores: ["**/node_modules/**", "**/dist/**", "coverage/**", ".c8-tmp/**"] },
+  {
+    // test/fixtures holds code written to break a rule; test/no-prototype-keys.test.ts lints it on purpose.
+    ignores: ["**/node_modules/**", "**/dist/**", "coverage/**", ".c8-tmp/**", "test/fixtures/**"],
+  },
   {
     linterOptions: { reportUnusedDisableDirectives: "error", reportUnusedInlineConfigs: "error" },
   },
@@ -63,6 +68,13 @@ export default tseslint.config(
       "import-x/no-default-export": "off",
       "import-x/no-named-as-default-member": "off",
     },
+  },
+  {
+    // A plain-object lookup by an arbitrary string key reaches Object.prototype ("constructor", "__proto__"), which a
+    // Python dict never does (eslint-rules/no-prototype-keys.js says what is allowed instead).
+    files: ["**/*.ts"],
+    plugins: { "own-keys": { rules: { "no-prototype-keys": noPrototypeKeys } } },
+    rules: { "own-keys/no-prototype-keys": "error" },
   },
   {
     // Asynchronous context only in packages/runtime/src/context/ (eslint-rules/async-context.js).

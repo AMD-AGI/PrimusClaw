@@ -15,6 +15,7 @@ import { TAG } from "../../src/richtext/check.js";
 import { END, S } from "../../src/richtext/escape.js";
 import { toTeamsHtml } from "../../src/richtext/index.js";
 import { BULLET, FENCE, headingText, NUMBERED, QUOTE, TABLE_SEP } from "../../src/richtext/lines.js";
+import { own } from "@primusclaw/personal-agent";
 
 type Groups = readonly (string | undefined)[];
 type Span = readonly [number, number, Groups];
@@ -86,8 +87,8 @@ function growth(fn: (text: string) => unknown, make: (n: number) => string, n = 
 
 for (const name of Object.keys(HOSTILE).sort()) {
   test(`each line pattern is linear on the run that made it quadratic: ${name}`, () => {
-    const fn = NEW[name];
-    const make = HOSTILE[name];
+    const fn = own(NEW, name);
+    const make = own(HOSTILE, name);
     assert.ok(fn && make);
     const ratio = growth(fn, make);
     assert.ok(ratio < 24, `${name} ${String(ratio)}`);
@@ -112,8 +113,8 @@ function oldHeading(line: string): string | null {
 }
 
 function same(name: string, line: string): boolean {
-  const old = OLD[name];
-  const fresh = NEW[name];
+  const old = own(OLD, name);
+  const fresh = own(NEW, name);
   assert.ok(old && fresh);
   if (name === "heading") return oldHeading(line) === fresh(line);
   if (name === "tag") {
@@ -145,7 +146,7 @@ function* product(alphabet: string, length: number): Generator<string> {
 
 for (const name of Object.keys(ALPHABET).sort()) {
   test(`the rewritten pattern reads every short line as before: ${name}`, () => {
-    const alphabet = ALPHABET[name] ?? "";
+    const alphabet = own(ALPHABET, name) ?? "";
     for (let length = 0; length < (alphabet.length <= 5 ? 7 : 6); length++) {
       for (const line of product(alphabet, length)) assert.ok(same(name, line), `${name} ${JSON.stringify(line)}`);
     }

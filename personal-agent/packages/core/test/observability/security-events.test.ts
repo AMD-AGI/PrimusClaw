@@ -18,6 +18,7 @@ import {
   type SecurityEventName,
   type SecurityEventRecord,
 } from "../../src/index.js";
+import { own } from "../../src/own.js";
 
 // Values that must never reach a log line. Each is handed to the helper in the field a careless caller might use.
 const LINK_CODE = "K7PQ2XMZ";
@@ -258,7 +259,7 @@ describe("security event fields", () => {
         Object.hasOwn(SECURITY_FIELDS, name) ? name : "<unknown_field>",
       );
       assert.deepEqual(record.dropped, [...new Set(names)].sort(), JSON.stringify(fields));
-      for (const name of Object.keys(fields)) assert.equal(record[name], undefined);
+      for (const name of Object.keys(fields)) assert.equal(own(record, name), undefined);
       const logged = everything();
       for (const value of Object.values(fields)) {
         const text = value instanceof Error ? value.message : typeof value === "string" ? value : "";
@@ -307,7 +308,7 @@ describe("security event ids", () => {
       ...ids,
     });
     assert.equal(record.dropped, undefined);
-    for (const [name, value] of Object.entries(ids)) assert.equal(record[name], value);
+    for (const [name, value] of Object.entries(ids)) assert.equal(own(record, name), value);
   });
 
   it("keeps a real client address, normalised", () => {

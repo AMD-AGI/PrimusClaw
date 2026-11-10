@@ -74,10 +74,7 @@ export function recordingFetch(handler: (url: URL) => Answer): {
 } {
   const seen: Seen[] = [];
   const fetch = (url: string, init: RequestInit): Promise<Response> => {
-    const headers: Record<string, string> = {};
-    new Headers(init.headers).forEach((value, name) => {
-      headers[name] = value;
-    });
+    const headers = Object.fromEntries(new Headers(init.headers).entries());
     seen.push({ url, headers });
     const answer = handler(new URL(url));
     const body = answer.body ?? new Uint8Array();

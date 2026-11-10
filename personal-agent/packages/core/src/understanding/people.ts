@@ -10,6 +10,7 @@ import { isAsciiAlpha } from "../text/py-regex.js";
 import { cpLength, pyCasefold } from "../text/py-text.js";
 import { similarity } from "./sequence-matcher.js";
 import { CONTEXT_ITEMS_MAX, CONTEXT_TEXT_MAX, clip } from "./limits.js";
+import { own } from "../own.js";
 
 /** One person the message names, as the channel context carries them. */
 export interface NamedPerson {
@@ -58,7 +59,7 @@ class People {
 }
 
 const field = (record: unknown, name: string): unknown =>
-  record !== null && typeof record === "object" ? (record as Record<string, unknown>)[name] : undefined;
+  record !== null && typeof record === "object" ? own(record as Record<string, unknown>, name) : undefined;
 
 /**
  * Who the message names: the people it @mentions, then the people this worker knows whose name it writes (in any
