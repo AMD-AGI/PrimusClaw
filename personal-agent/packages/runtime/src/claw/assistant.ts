@@ -9,6 +9,7 @@ import {
   isApiKey,
   parseStartedReviews,
   pyStr,
+  pyStrOf,
   pyStrip,
   pyTruthy,
   cpHead,
@@ -41,7 +42,7 @@ export class HttpAssistant implements ClawAssistantPort {
     );
     const sessionId = data["session_id"];
     if (sessionId === undefined || sessionId === null) throw new ClawAnswerInvalid("the assistant without its session");
-    return { sessionId: pyStr(sessionId), created: pyTruthy(data["created"]) };
+    return { sessionId: pyStrOf(sessionId), created: pyTruthy(data["created"]) };
   }
 
   async send(

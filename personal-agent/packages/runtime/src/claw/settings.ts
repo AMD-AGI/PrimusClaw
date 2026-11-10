@@ -7,6 +7,7 @@ import {
   cpHead,
   notAClawId,
   pyStr,
+  pyStrOf,
   pyTruthy,
   type ClawCredential,
   type ClawMergeConfirmationsPort,
@@ -35,7 +36,7 @@ export class HttpSettings implements ClawSettingsPort {
     const items = rowsOf(await this.http.json({ method: "GET", path: "/v1/users/me/memories", key }), "memories");
     const texts = items
       .filter((m) => m["category"] !== "user_profile")
-      .map((m) => ("content" in m ? pyStr(m["content"]) : ""));
+      .map((m) => ("content" in m ? pyStrOf(m["content"]) : ""));
     return {
       enabled: pyTruthy(settings["enabled"]),
       available: "available" in settings ? pyTruthy(settings["available"]) : true,

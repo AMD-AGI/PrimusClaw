@@ -4,6 +4,7 @@
 import {
   err,
   ok,
+  own,
   type Conversation,
   type ConversationRef,
   type DeleteUnsupported,
@@ -97,7 +98,7 @@ export class FakeSurface implements Surface {
   }
 
   members(conversation: ConversationRef): Promise<readonly RosterMember[] | undefined> {
-    return Promise.resolve(this.rosters[conversation.id]);
+    return Promise.resolve(own(this.rosters, conversation.id));
   }
 
   conversation(ref: ConversationRef): Conversation {
@@ -105,7 +106,7 @@ export class FakeSurface implements Surface {
   }
 
   fetchFile(file: InboundFile): Promise<Result<FetchedFile, FileRefused>> {
-    const found = this.files[file.name];
+    const found = own(this.files, file.name);
     return Promise.resolve(
       found === undefined ? err({ kind: "file_refused", reason: "unreachable" }) : ok({ name: file.name, ...found }),
     );

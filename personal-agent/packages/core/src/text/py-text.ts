@@ -9,7 +9,7 @@
  *  - there is no `str.isprintable`.
  */
 
-import { PY_SPACE, isPySpace } from "./py-chars.js";
+import { PY_SPACE, isPySpace, pointAt } from "./py-chars.js";
 
 export * from "./py-chars.js";
 export * from "./py-json.js";
@@ -83,7 +83,7 @@ const CHEROKEE_CAPITALS: readonly [number, number] = [0x13a0, 0x13f5];
 
 /** One code point's `casefold()`: Python's full case folding, which differs from upper-then-lower in four places. */
 function foldPoint(ch: string): string {
-  const c = ch.codePointAt(0) ?? 0;
+  const c = pointAt(ch);
   if (c === 0x131) return ch; // dotless i folds to itself, not to "i"
   if (c === 0x1e9e) return "ss"; // capital sharp s folds like "ß"
   if (c >= CHEROKEE_CAPITALS[0] && c <= CHEROKEE_CAPITALS[1]) return ch; // Cherokee folds to its capitals
@@ -114,7 +114,7 @@ const DECIMAL_DIGIT = /^\p{Nd}$/u;
 
 /** The value of one decimal digit of any script: Unicode keeps every script's 0-9 in a run of ten. */
 function digitValue(ch: string): number {
-  let start = ch.codePointAt(0) ?? 0;
+  let start = pointAt(ch);
   const at = start;
   while (start > 0 && DECIMAL_DIGIT.test(String.fromCodePoint(start - 1))) start -= 1;
   return (at - start) % 10;
