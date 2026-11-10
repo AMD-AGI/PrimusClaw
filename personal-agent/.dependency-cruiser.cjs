@@ -20,9 +20,20 @@ module.exports = {
     {
       name: "no-circular",
       severity: "error",
-      comment: "A cycle couples modules that should have one direction between them.",
+      comment:
+        "A cycle couples modules that should have one direction between them: any cycle, across directories and " +
+        "packages, type-only imports included (tsPreCompilationDeps).",
       from: {},
       to: { circular: true },
+    },
+    {
+      name: "domain-not-to-view",
+      severity: "error",
+      comment:
+        "A view depends on its domain, never the other way: src/<area>/ must not import src/<area>-view/ of the same " +
+        "package (core/src/remote -> core/src/remote-view is refused; remote-view -> remote is the allowed direction).",
+      from: { path: "^packages/([^/]+)/src/([^/]+)/" },
+      to: { path: "^packages/$1/src/$2-view/" },
     },
     {
       name: "core-is-channel-neutral",
