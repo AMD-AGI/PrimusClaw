@@ -117,7 +117,14 @@
  *
  * A case's `setup` (`triggers`) is made before each of its attempts with the key (`POST /v1/triggers`), after its session is open, and
  * deleted after the attempt (seen gone: a GET answers 404); one the run could not delete fails the run. A trigger the identity already has
- * under a setup trigger's name makes the attempt an error.
+ * under a setup trigger's name makes the attempt an error. A case's `setup.forget_memories` deletes, by id, the identity's memory entries
+ * that hold one of its substrings before each attempt; one that is still listed after makes the attempt an error.
+ *
+ * Memory entries: the ids of the identity's entries (`GET /v1/users/me/memories`) are read before each attempt (after its
+ * forget_memories), and every entry listed after it that was not before, the attempt's own, is deleted by id
+ * (`DELETE /v1/users/me/memories/:id`) and seen gone from the list; an entry from before the attempt is never deleted by this.
+ * One the run could not delete, or a list it could not read after an attempt, fails the cleanup (cleanup_failed); a list it could
+ * not read before an attempt makes the attempt an error, with nothing sent.
  *
  * EVAL_STATIC reports, without sending anything, every case that can never pass on its arm (a tools_must no tool of the arm
  * matches: the router's from `assistant/read-tools.ts`, the worker's every plugin server, given as EVAL_STATIC_SERVERS or the
@@ -155,6 +162,7 @@ import {
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
+  memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
@@ -1353,6 +1361,59 @@ async function removeSetup(ids: readonly string[]): Promise<void> {
   }
 }
 
+// --- Memory entries -----------------------------------------------------------------------------------------------------
+
+/** Memory entries attempts made that the run has not seen gone: deleted after their attempt, and again at the end. */
+const RUN_MEMORIES = new Set<number>();
+
+/** The identity's memory entries now, or null when they could not be read. */
+async function memoriesNow(): Promise<MemoryEntrySeen[] | null> {
+  const r = await api("GET", "/v1/users/me/memories").catch(() => null);
+  return r?.status === 200 ? memoryRows(r.json) : null;
+}
+
+/** Delete memory entries by id: the ones still listed after (all of them when the list could not be read). */
+async function deleteMemories(ids: readonly number[]): Promise<number[]> {
+  for (const id of ids) await api("DELETE", `/v1/users/me/memories/${id}`).catch(() => null);
+  const now = await memoriesNow();
+  if (!now) return [...ids];
+  const listed = new Set(now.map((r) => r.id));
+  return ids.filter((id) => listed.has(id));
+}
+
+/**
+ * The ids of the identity's memory entries as an attempt starts, after the case's `setup.forget_memories` deleted those it names. Throws
+ * an `infra:` error when the entries cannot be read (what the attempt saves could not be told from what was there) or one the case names
+ * is not deleted (the case would be graded against an entry it did not mean).
+ */
+async function memoriesBefore(c: EvalCase): Promise<Set<number>> {
+  const unread = "infra: setup: GET /v1/users/me/memories could not be read: what the attempt saves could not be told apart";
+  let rows = await memoriesNow();
+  if (!rows) throw new Error(unread);
+  const forget = memoriesMatching(rows, c.setup?.forget_memories ?? []);
+  if (forget.length) {
+    live();   // a stop deletes nothing more
+    const left = await deleteMemories(forget);
+    if (left.length) throw new Error(`infra: setup: memory entries named by forget_memories not deleted: ${left.join(",")}`);
+    log(`setup of ${c.id}: deleted ${forget.length} memory entry(ies) it names`);
+    rows = await memoriesNow();
+    if (!rows) throw new Error(unread);
+  }
+  return new Set(rows.map((r) => r.id));
+}
+
+/** Delete the memory entries an attempt made (listed now, not in `before`); what could not be is left in RUN_MEMORIES or CLEANUP_ISSUES. */
+async function removeAttemptMemories(before: ReadonlySet<number>, caseId: string): Promise<void> {
+  const after = await memoriesNow();
+  if (!after) { CLEANUP_ISSUES.push(`the memory entries could not be listed after an attempt of ${caseId}: what it saved may be left`); return; }
+  const made = newMemoryIds(before, after);
+  if (!made.length) return;
+  for (const id of made) RUN_MEMORIES.add(id);
+  const left = new Set(await deleteMemories(made));
+  for (const id of made) if (!left.has(id)) RUN_MEMORIES.delete(id);
+  log(`memory entries ${caseId} made: ${made.length}, deleted ${made.length - left.size}`);
+}
+
 // --- The run ------------------------------------------------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -1468,6 +1529,7 @@ async function main(): Promise<void> {
           const earlier = new Set(RUN_MESSAGES);   // an earlier attempt's refusal that arrives late is not this one's
           let waiting: WaitingCard[] | null = null;
           let setup: string[] = [];
+          let memBefore: Set<number> | null = null;
           attemptsInSession++;
           preflightFailed = true;
           try {
@@ -1477,6 +1539,7 @@ async function main(): Promise<void> {
               const left = cardsLeftError(filled, waiting, CASE_CARDS.get(c.id) ?? new Set());
               if (left) throw new Error(left);
             }
+            memBefore = await memoriesBefore(filled);
             setup = await makeSetup(filled);
             preflightFailed = false;
             a = MODE === "assistant" ? await runAssistant(filled, turns, session!) : await runBaseline(filled, turns);
@@ -1484,6 +1547,7 @@ async function main(): Promise<void> {
             a = { pass: false, checks: [], tools: [], final: null, finalChars: 0, firstReplyMs: null, finalMs: null, items: [], error: scrub(err instanceof Error ? err.message : String(err)) };
           } finally {
             if (setup.length) await removeSetup(setup);
+            if (memBefore) await removeAttemptMemories(memBefore, c.id);
           }
           // The cards this attempt made: those waiting now that did not before it. A card it made that could not be read stays unseen,
           // and the next attempt is graded as without it (the same as before this runner closed cards at all).
@@ -1553,6 +1617,8 @@ async function main(): Promise<void> {
   }
   if (SETUP_TRIGGERS.size) await removeSetup([...SETUP_TRIGGERS]);
   if (SETUP_TRIGGERS.size) cleanupFailed.push(`setup triggers the run made not deleted: ${[...SETUP_TRIGGERS].join(",")}`);
+  const memoriesLeft = RUN_MEMORIES.size ? await deleteMemories([...RUN_MEMORIES]) : [];
+  if (memoriesLeft.length) cleanupFailed.push(`memory entries the run made not deleted: ${memoriesLeft.join(",")}`);
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));
   cleanupFailed = cleanupFailed.map(scrub);
