@@ -25,7 +25,7 @@ function cpuMs(run: () => void): number {
 test("tags, entities, links and mention markers are blanked in one pass", () => {
   // (as a regular expression, `<[^>]*>` read to the end of the text from each "<" with no ">" after it)
   const ms = cpuMs(() => {
-    for (const unit of ["<", "http://x<", "<a>http://", "&#"]) blank(unit.repeat(40_000));
+    for (const unit of ["<", "http://x<", "<a>http://", "&#", "<b>&amp;⟦1⟧ "]) blank(unit.repeat(40_000)); // (the last: many spans)
   });
   assert.ok(ms < 250, `${String(ms)} ms of CPU`);
   assert.equal(
