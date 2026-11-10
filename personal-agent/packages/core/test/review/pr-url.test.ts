@@ -33,6 +33,12 @@ test("claw's address is shown only when it is exactly a pull request's, as the p
   }
 });
 
+test("a line end after the address is no part of it: the match is of the whole string", () => {
+  // (Python's fullmatch refuses each; a JavaScript `$` without the m flag matches only at the very end)
+  for (const end of ["\n", "\r", "\r\n", "\u2028", "\u2029"])
+    assert.equal(shownPrUrl(`https://github.com/a/b/pull/1${end}`, PULL), shared.named, JSON.stringify(end));
+});
+
 test("an address with a second link in it never reaches the asker's line", () => {
   const review = reviewTurn({
     pull: PULL,
