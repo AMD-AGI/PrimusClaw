@@ -587,7 +587,6 @@ teams/tests/test_assistant_live_status.py::test_a_message_cancelled_while_its_st
 # teams/tests/test_assistant_files.py::test_a_file_name_said_back_draws_no_link_or_formatting -> LATER: W3 inbound (failed_line/unreadable_line/shown_name and to_teams_html)
 # teams/tests/test_assistant_files.py::test_a_delivered_image_carried_inline_passes_the_endpoint -> LATER: endpoint (link_api body cap) owner
 # teams/tests/test_assistant_live_status.py::test_the_steps_the_assistant_takes_have_plain_labels -> LATER: step labels (step_labels.lookup_label/label_for are not ported to TS; AssistantChat takes stepLabel injected)
-# teams/tests/test_conversation_language.py::test_english_sentences_that_are_commands_set_the_language_help_reports -> LATER: router W4 (English sentences routed as commands, and /help's "(now: English, auto)")
 # teams/tests/test_deliveries.py::test_a_delivery_is_read_only_from_a_successful_deliver_file_that_says_what_it_delivered -> LATER: W4b (a turn's deliver_file; ported in ported-tests/w4b.txt, core/test/turn/deliveries.test.ts)
 # teams/tests/test_deliveries.py::test_an_image_is_shown_only_as_exactly_the_small_image_the_delivery_says -> LATER: W4b (ported in ported-tests/w4b.txt)
 # teams/tests/test_deliveries.py::test_names_and_captions_are_one_clipped_line -> LATER: W4b (ported in ported-tests/w4b.txt)
