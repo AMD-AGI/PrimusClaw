@@ -66,3 +66,4 @@ export * from "./direct-chat/index.js";
 export * from "./proactive/index.js";
 export * from "./proactive/views.js";
 export * from "./subscriptions/index.js";
+export * from "./review/index.js";
