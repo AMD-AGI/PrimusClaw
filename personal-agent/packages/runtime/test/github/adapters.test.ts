@@ -189,3 +189,13 @@ test("the runtime entry point exports the github adapters the assembly injects",
   ] as const)
     assert.equal(typeof runtime[name], "function", name);
 });
+
+test("the json object in what the model wrote is found in one pass", () => {
+  // (the Python worker's `\{.*\}` read to the end of the text from each "{" with no "}" after it)
+  const cpu = process.cpuUsage();
+  assert.deepEqual(readingOf("{".repeat(80_000)), { intent: null });
+  assert.deepEqual(readingOf(`x${"{".repeat(40_000)}}`), { intent: null });
+  const used = process.cpuUsage(cpu);
+  assert.ok((used.user + used.system) / 1000 < 250, `${String((used.user + used.system) / 1000)} ms of CPU`);
+  assert.deepEqual(readingOf('sure: {"intent": "review", "n": {"a": 1}} done'), { intent: "review", n: { a: 1 } });
+});
