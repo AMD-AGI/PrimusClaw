@@ -269,3 +269,47 @@ test("claws own answer keeps its links", () => {
   const text = "See [the release](https://github.com/AMD-AGI/PrimusClaw/releases/tag/v1).";
   assert.ok((turn.answerParts(text, "")[0] ?? "").includes("[the release](https://github.com/"));
 });
+
+test("a code span made here pairs with no backtick of the text's own as sent", () => {
+  // (the client pairs a backtick run with the next one of its length, across lines when that closes one: a stray backtick, an
+  // escaped one, a code span over lines, or a span made inside another must not leave an address outside code)
+  const pieces = [
+    "`",
+    "``",
+    "```",
+    "\\`",
+    " ",
+    "\n",
+    "\n\n",
+    "\r",
+    "a",
+    "x@y.example",
+    "https://h.example/p",
+    "www.w.example",
+    "[l](https://k.example)",
+    "<a href=https://t.example>t</a>",
+    "`x@y.example`",
+    "(",
+    ")",
+    "*",
+    "_",
+    "|",
+    "- ",
+    "> ",
+    "~~~",
+    "    ",
+  ];
+  const mail = /[\w.+-]@[\w-]+(?:\.[\w-]+)*\.[a-z]+(?!\w)/iu;
+  const random = seeded(5);
+  for (let n = 0; n < 4000; n += 1) {
+    const count = 1 + Math.floor(random() * 12);
+    let text = "";
+    for (let i = 0; i < count; i += 1) text += pieces[Math.floor(random() * pieces.length)] ?? "";
+    const html = sent(remoteDomain.inertAnswer(text));
+    const outside = html.replace(/<code>[\s\S]*?<\/code>|<pre>[\s\S]*?<\/pre>/gu, "");
+    assert.doesNotMatch(outside, mail, `${JSON.stringify(text)}: ${html}`);
+    assert.ok(!outside.includes("://") && !outside.includes("www."), `${JSON.stringify(text)}: ${html}`);
+    // (an agent's own `<a href=...>` in a code span is text there: what may not be is a tag of the message's)
+    assert.ok(!/<a[\s>]|<img[\s>]|href="/iu.test(html), `${JSON.stringify(text)}: ${html}`);
+  }
+});

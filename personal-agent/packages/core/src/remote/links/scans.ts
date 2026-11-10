@@ -8,14 +8,18 @@
  */
 import { isPySpace, pyLstrip, pyRstrip, pySplit, pyStrip } from "../../text/py-text.js";
 
+/** Where a code span this scan made opens or closes (a backtick in the end, see `answer.ts`): the scans after it read it as the
+ * backtick it will be, and an agent's own backtick left in the prose is told apart from it. */
+export const CODE = "\x02";
+
 const LINK_TEXT_MAX = 1000; // the words of a markdown link, at most
 const LINK_DEST_MAX = 2000; // its address, and an HTML tag, at most
 const ANCHOR_MAX = 2000; // the words of an HTML anchor, at most
 const SCHEME_MAX = 32; // the letters of a scheme, at most
 const TRAILING = ".,;:!?'\"）。，；：！？";
-const URL_END = new Set([" ", "\t", "\r", "\n", "<", ">", '"', "`", "\x00"]);
+const URL_END = new Set([" ", "\t", "\r", "\n", "<", ">", '"', "`", CODE, "\x00"]);
 const SCHEME_CHARS = /^[A-Za-z0-9+.-]$/u;
-const BEFORE_URL = new Set(["@", "/", "`", "\x00"]); // a character an address does not start right after
+const BEFORE_URL = new Set(["@", "/", "`", CODE, "\x00"]); // a character an address does not start right after
 
 /** What a link becomes, given its words and its address. */
 export type Mark = (label: string, address: string) => string;
@@ -44,27 +48,55 @@ function charAt(text: string, i: number): string {
   return point === undefined ? "" : String.fromCodePoint(point);
 }
 
-/** How many characters (code points, as Python counts) `text[from:to]` holds, counted no further than `limit` + 1. */
-function charsBetween(text: string, from: number, to: number, limit: number): number {
-  if (to - from <= limit) return to - from - countLow(text, from, to);
-  let n = 0;
-  for (let i = from; i < to && n <= limit; n += 1) i += charAt(text, i).length || 1;
-  return n;
-}
+/** The characters (code points, as Python counts) of one text between two of its offsets, in constant time. */
+class Chars {
+  private readonly before: Int32Array | undefined;
 
-function countLow(text: string, from: number, to: number): number {
-  let n = 0;
-  for (let i = from + 1; i < to; i += 1) {
-    const unit = text.charCodeAt(i);
-    if (unit >= 0xdc00 && unit <= 0xdfff && charAt(text, i - 1).length === 2) n += 1;
+  constructor(text: string) {
+    let pairs = false;
+    for (let i = 0; i < text.length && !pairs; i += 1) pairs = charAt(text, i).length === 2;
+    if (!pairs) return;
+    this.before = new Int32Array(text.length + 1);
+    let n = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      this.before[i] = n;
+      const unit = text.charCodeAt(i);
+      if (!(unit >= 0xdc00 && unit <= 0xdfff && charAt(text, i - 1).length === 2)) n += 1;
+    }
+    this.before[text.length] = n;
   }
-  return n;
+
+  /** How many characters `text[from:to]` holds. */
+  between(from: number, to: number): number {
+    return this.before ? (this.before[to] ?? 0) - (this.before[from] ?? 0) : to - from;
+  }
 }
 
-/** Python `s.find(sub, start, end)` with `end` = `base` + `limit` characters: `sub` wholly inside `s[start:end]`. */
-function findWithin(s: string, sub: string, start: number, base: number, limit: number): number {
-  const at = s.indexOf(sub, start);
-  return at >= 0 && charsBetween(s, base, at + sub.length, limit) <= limit ? at : -1;
+/** `text.indexOf(sub, from)` for a `from` that never goes back: each stretch of the text is searched once, so a scan that asks
+ * for every `<` of a long text with no `>` stays linear. */
+class Finder {
+  private last = -1;
+  private found = -1;
+  private readonly text: string;
+  private readonly sub: string;
+
+  constructor(text: string, sub: string) {
+    this.text = text;
+    this.sub = sub;
+  }
+
+  at(from: number): number {
+    if (this.last < 0 || from < this.last || (this.found >= 0 && this.found < from)) {
+      this.found = this.text.indexOf(this.sub, from);
+    }
+    this.last = from;
+    return this.found;
+  }
+}
+
+/** Python `s.find(sub, start, end)` with `end` = `base` + `limit` characters, given where `sub` is next at or after `start`. */
+function within(at: number, sub: string, chars: Chars, base: number, limit: number): number {
+  return at >= 0 && chars.between(base, at + sub.length) <= limit ? at : -1;
 }
 
 /** `[label]: url` at the start of a line: its brackets escaped (no `[words][label]` can use it) and the address made words. */
@@ -74,7 +106,7 @@ export function referenceDefinitions(text: string, mark: Mark): string {
     .map((line) => {
       const body = line.replace(/^ +/u, "");
       if (line.length - body.length > 3 || !body.startsWith("[")) return line;
-      const close = findWithin(body, "]:", 1, 0, LINK_TEXT_MAX);
+      const close = within(body.indexOf("]:", 1), "]:", new Chars(body), 0, LINK_TEXT_MAX);
       const label = close < 0 ? "" : body.slice(1, close);
       if (close < 0 || label.includes("]") || label.includes("[")) return line;
       const rest = pySplit(body.slice(close + 2));
@@ -117,18 +149,14 @@ function destinationOf(raw: string): string {
 /** Where the link whose `[` is at `start` closes its words and its address, [-1, -1] when it is none (unclosed, or longer than
  * LINK_TEXT_MAX and LINK_DEST_MAX characters). */
 function linkAt(
-  text: string,
+  chars: Chars,
   start: number,
   brackets: Map<number, number>,
   parens: Map<number, number>,
 ): [number, number] {
   const close = brackets.get(start) ?? -1;
   const paren = close >= 0 ? (parens.get(close + 1) ?? -1) : -1;
-  if (
-    paren < 0 ||
-    charsBetween(text, start, close, LINK_TEXT_MAX) > LINK_TEXT_MAX ||
-    charsBetween(text, close, paren, LINK_DEST_MAX) > LINK_DEST_MAX
-  ) {
+  if (paren < 0 || chars.between(start, close) > LINK_TEXT_MAX || chars.between(close, paren) > LINK_DEST_MAX) {
     return [-1, -1];
   }
   return [close, paren];
@@ -139,12 +167,13 @@ function linkAt(
 export function links(text: string, mark: Mark, depth = 0): string {
   const brackets = pairs(text, "[", "]");
   const parens = pairs(text, "(", ")");
+  const chars = new Chars(text);
   const out: string[] = [];
   let i = 0;
   for (;;) {
     const start = text.indexOf("[", i);
     if (start < 0) break;
-    const [close, paren] = linkAt(text, start, brackets, parens);
+    const [close, paren] = linkAt(chars, start, brackets, parens);
     if (paren < 0) {
       out.push(text.slice(i, start + 1));
       i = start + 1;
@@ -191,6 +220,15 @@ function schemeBefore(text: string, colon: number): number {
   return start < colon ? start : -1;
 }
 
+/** One text the tag scan reads: lowered for its words, counted, and where its next `>` and `</a` are. */
+interface TagScan {
+  readonly text: string;
+  readonly low: string;
+  readonly chars: Chars;
+  readonly closes: Finder;
+  readonly anchorEnds: Finder;
+}
+
 interface Tag {
   readonly tag: string;
   readonly start: number;
@@ -198,10 +236,11 @@ interface Tag {
 }
 
 /** One tag as it is shown, and where the scan goes on. */
-function tagShown(text: string, low: string, at: Tag, mark: Mark): [string, number] {
+function tagShown(scan: TagScan, at: Tag, mark: Mark): [string, number] {
+  const { text, low } = scan;
   const { tag, start, close } = at;
   if (low.charAt(start + 1) === "a" && isPySpace(charAt(low, start + 2))) {
-    const end = findWithin(low, "</a", close, close, ANCHOR_MAX);
+    const end = within(scan.anchorEnds.at(close), "</a", scan.chars, close, ANCHOR_MAX);
     const words = end >= 0 ? text.slice(close + 1, end) : "";
     const shown = mark(pyStrip(words), attr(tag, "href"));
     if (end < 0) return [shown, close + 1];
@@ -222,18 +261,25 @@ function tagShown(text: string, low: string, at: Tag, mark: Mark): [string, numb
 export function tags(text: string, mark: Mark): string {
   const out: string[] = [];
   const low = asciiLower(text);
+  const scan: TagScan = {
+    text,
+    low,
+    chars: new Chars(text),
+    closes: new Finder(text, ">"),
+    anchorEnds: new Finder(low, "</a"),
+  };
   let i = 0;
   for (;;) {
     const start = text.indexOf("<", i);
     if (start < 0) break;
-    const close = findWithin(text, ">", start + 1, start, LINK_DEST_MAX);
+    const close = within(scan.closes.at(start + 1), ">", scan.chars, start, LINK_DEST_MAX);
     if (close < 0) {
       out.push(text.slice(i, start + 1));
       i = start + 1;
       continue;
     }
     out.push(text.slice(i, start));
-    const [shown, next] = tagShown(text, low, { tag: text.slice(start, close + 1), start, close }, mark);
+    const [shown, next] = tagShown(scan, { tag: text.slice(start, close + 1), start, close }, mark);
     out.push(shown);
     i = next;
   }
@@ -257,7 +303,7 @@ function nextWww(text: string, low: string, at: number): number {
   while (www >= 0) {
     // (after a `/` too: `x/www.host` is a path to the rich text, but a client's own markdown may still take it for an address)
     const before = charBefore(text, www);
-    if (www === 0 || !(isAlnum(before) || "@`\x00.".includes(before))) return www;
+    if (www === 0 || !(isAlnum(before) || "@`\x00\x02.".includes(before))) return www;
     www = low.indexOf("www.", www + 4);
   }
   return -1;
@@ -286,7 +332,7 @@ export function trim(address: string): string {
 
 /** `text` in a code span, which no client makes a link of (a backtick in it made a look-alike). */
 function code(text: string): string {
-  return text ? `\`${text.replaceAll("`", "\u{2cb}")}\`` : "";
+  return text ? `${CODE}${text.replaceAll("`", "\u{2cb}")}${CODE}` : "";
 }
 
 /** Every bare address as its host (in a code span whole when it names none), without the punctuation that ends its sentence or
@@ -334,8 +380,16 @@ function isMail(found: string): boolean {
   return local !== "" && domain.includes(".") && /^\p{L}+$/u.test(tld);
 }
 
-/** Every mail address `name@host.tld` (a client makes a mail link of one) in a code span. */
+/** Every mail address `name@host.tld` (a client makes a mail link of one) in a code span; not looked for inside a code span an
+ * earlier scan made (one there is code already, and a span opened inside it would cross it). */
 export function emails(text: string): string {
+  return text
+    .split(CODE)
+    .map((part, n) => (n % 2 ? part : mailsIn(part)))
+    .join(CODE);
+}
+
+function mailsIn(text: string): string {
   const out: string[] = [];
   let i = 0;
   for (;;) {

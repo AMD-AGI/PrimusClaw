@@ -94,6 +94,12 @@ test("hostile text is made words in linear time", () => {
     "https://evil.example/" + ")".repeat(600000),
     "https://evil.example/" + ").".repeat(300000),
     "` `".repeat(20000),
+    // (a search with no end for every `<`, `</a` or `>`, or a length counted afresh for every bracket, was quadratic)
+    "<".repeat(400000),
+    "<a x>".repeat(80000),
+    "<a\u3000".repeat(80000),
+    "\u{1d400}[".repeat(100000) + "]".repeat(100000),
+    "\u{1d400}<".repeat(200000),
   ];
   for (const text of hostile) {
     const started = performance.now();

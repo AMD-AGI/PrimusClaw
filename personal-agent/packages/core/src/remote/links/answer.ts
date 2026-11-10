@@ -10,9 +10,10 @@
  * links: they are the assistant's, with citations a person follows on purpose.
  */
 import { hostOf } from "./hosts.js";
-import { type Mark, bare, emails, links, referenceDefinitions, tags } from "./scans.js";
+import { CODE, type Mark, bare, emails, links, referenceDefinitions, tags } from "./scans.js";
 
 const ZWSP = "\u{200b}";
+const LOOK_ALIKE = "\u{2cb}"; // (a backtick the rich text cannot pair: what a code span of a host shows for one too)
 /** What the chat's rich text drops before it reads anything: controls and bidi overrides (the rich text's own set). */
 // eslint-disable-next-line no-control-regex -- the control characters are exactly what the rich text drops
 export const DROPPED_BY_RICH_TEXT = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu;
@@ -120,11 +121,12 @@ function firstAfter(positions: readonly number[], at: number): number | undefine
   return positions[lo];
 }
 
-/** Where the code spans of `text` are: a run of backticks to the next run of the same length (each run looked at once, its
- * closer found by bisection). */
-function codeSpans(text: string): [number, number][] {
-  const runs = new Map<number, number[]>();
-  const order: [number, number][] = [];
+/** What a backslash escapes in the chat's rich text (so a backtick after one opens no code span there). */
+const ESCAPABLE = "\\`*_{}[]()#+-.!|~<>";
+
+/** The backtick runs of `text`, [start, end] each. */
+function backtickRuns(text: string): [number, number][] {
+  const runs: [number, number][] = [];
   let i = 0;
   while (i < text.length) {
     if (text.charAt(i) !== "`") {
@@ -133,35 +135,86 @@ function codeSpans(text: string): [number, number][] {
     }
     let j = i;
     while (j < text.length && text.charAt(j) === "`") j += 1;
-    const list = runs.get(j - i) ?? [];
-    list.push(i);
-    runs.set(j - i, list);
-    order.push([i, j - i]);
+    runs.push([i, j]);
     i = j;
   }
+  return runs;
+}
+
+/** Where a code span may open, and where it ends, as the rich text pairs them: each run, in order, closed by the next run of the
+ * same length (found by bisection), a run inside a pair opening nothing. */
+function openers(text: string): Map<number, number> {
+  const runs = backtickRuns(text);
+  const byLength = new Map<number, number[]>();
+  runs.forEach(([start, end], index) => {
+    const same = byLength.get(end - start) ?? [];
+    same.push(index);
+    byLength.set(end - start, same);
+  });
+  const opens = new Map<number, number>();
+  let index = 0;
+  while (index < runs.length) {
+    const [start, end] = runs[index] ?? [0, 0];
+    const closing = firstAfter(byLength.get(end - start) ?? [], index);
+    const closer = closing === undefined ? undefined : runs[closing];
+    if (closing === undefined || closer === undefined) {
+      index += 1;
+      continue;
+    }
+    opens.set(start, closer[1]);
+    index = closing + 1;
+  }
+  return opens;
+}
+
+/** Where the code spans of `text` are, as the rich text reads them: left to right, an escaped character skipped (an escaped
+ * backtick opens nothing), a run that opens a span read to its end; and only a span within one line (one that crosses a line
+ * is code to the rich text only if it joins those lines, which it does not always do). */
+function codeSpans(text: string): [number, number][] {
+  const opens = openers(text);
   const spans: [number, number][] = [];
-  let after = 0;
-  for (const [start, size] of order) {
-    if (start < after) continue;
-    const next = firstAfter(runs.get(size) ?? [], start);
-    if (next !== undefined) {
-      spans.push([start, next + size]);
-      after = next + size;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text.charAt(i);
+    const end = ch === "`" ? opens.get(i) : undefined;
+    if (ch === "\\" && i + 1 < text.length && ESCAPABLE.includes(text.charAt(i + 1))) {
+      i += 2;
+    } else if (end !== undefined && !/[\r\n]/u.test(text.slice(i, end))) {
+      spans.push([i, end]);
+      i = end;
+    } else if (ch === "`") {
+      while (text.charAt(i) === "`") i += 1;
+    } else {
+      i += 1;
     }
   }
   return spans;
 }
 
-/** Prose: a code span kept (unlinkable), the rest made words. */
+/** Prose: a code span kept (unlinkable), the rest made words. The client pairs a backtick run with the next one of its length,
+ * across lines when that closes one, so a backtick of the text's own left in the prose (it opens no span here) could pair with
+ * a span's and leave an address outside code: it is shown as a look-alike. A backslash before a span made here escapes
+ * nothing, and a span made here touching one of the text's is kept apart from it. */
 function inline(text: string): string {
-  const out: string[] = [];
+  const parts: [string, boolean][] = [];
   let end = 0;
   for (const [start, stop] of codeSpans(text)) {
-    out.push(words(text.slice(end, start)), unlinkable(text.slice(start, stop)));
+    parts.push([words(text.slice(end, start)), false], [unlinkable(text.slice(start, stop)), true]);
     end = stop;
   }
-  out.push(words(text.slice(end)));
-  return out.join("");
+  parts.push([words(text.slice(end)), false]);
+  return parts
+    .map(([part, isCode]) => (isCode ? part : spansMade(part)))
+    .filter(Boolean)
+    .reduce(
+      (joined, part) => (joined.endsWith("`") && part.startsWith("`") ? `${joined}${ZWSP}${part}` : joined + part),
+      "",
+    );
+}
+
+/** Prose with its own backticks as look-alikes and the code spans made here (CODE ... CODE) as backticks. */
+function spansMade(prose: string): string {
+  return prose.replaceAll("`", LOOK_ALIKE).replaceAll(`\\${CODE}`, `\\${ZWSP}${CODE}`).replaceAll(CODE, "`");
 }
 
 /** Prose with no code in it: every link its words, every address its host in a code span. */
@@ -178,8 +231,9 @@ function words(text: string): string {
   const shown = emails(bare(tags(links(referenceDefinitions(text, mark), mark), mark), mark));
   // (a host is `\x00n\x00`: the input holds no NUL, so every odd part is a host's number; and what is left that a client could
   // still take for an address, `a@https://...` say, is made unlinkable too)
-  return shown
+  const spans = shown
     .split("\x00")
-    .map((part, n) => (n % 2 ? `\`${hosts[Number(part)] ?? ""}\`` : unlinkable(part)))
+    .map((part, n) => (n % 2 ? `${CODE}${hosts[Number(part)] ?? ""}${CODE}` : unlinkable(part)))
     .join("");
+  return spans;
 }
