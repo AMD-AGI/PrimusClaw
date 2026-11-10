@@ -685,6 +685,21 @@ describe("reading a transcript another process writes", () => {
     fs.appendFileSync(file, say("after"));
     assert.deepEqual(texts(tail.poll()), ["after"]);
   });
+
+  test("a step written after a large line (Claude Code's prompt_snapshot attachment) comes on the first look, not a look per 256 KB later (#505 acceptance)", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    fs.writeFileSync(file, "");
+    const tail = new TranscriptTail(() => file);
+    tail.fromEnd();
+    const line = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: "s", isSidechain: false, ...o })}\n`;
+    for (const size of [900_000, 1_500_000]) {   // (one Claude Code reads whole, one past the line limit it skips)
+      fs.appendFileSync(file, line({ type: "user", message: { role: "user", content: "run it" } })
+        + line({ type: "attachment", attachment: { type: "prompt_snapshot", text: "x".repeat(size) } })
+        + line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${size}`, name: "Bash", input: { command: "sleep 3" } }] } }));
+      const got = tail.poll();
+      assert.deepEqual(got.filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), [`toolu_${size}`], `after ${size} bytes`);
+    }
+  });
 });
 
 // ---- the connector, end to end ---------------------------------------------------------------------------

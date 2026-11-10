@@ -1527,8 +1527,14 @@ function cleanTitleTo(raw: string, max: number): string {
 
 /** How much of the end of a transcript is read for what came just before a watcher arrived. */
 const TAIL_BACKLOG_BYTES = 64 * 1024;
-/** What one look reads at most; a burst larger than this is read over the next looks. */
+/** What one read takes at most; one look reads on, read after read, up to TAIL_LOOK_BYTES. */
 const TAIL_READ_BYTES = 256 * 1024;
+/**
+ * What one look reads at most: everything new up to this, so that a large line Claude Code writes before a step (a `prompt_snapshot`
+ * attachment is 0.2 MB and more) does not hold the step back a look per 256 KB (a tool_call came after its tool had ended, #505
+ * acceptance). A burst larger than this is read over the next looks.
+ */
+const TAIL_LOOK_BYTES = 32 * 1024 * 1024;
 /** A line longer than this (one huge tool result) is skipped rather than held. */
 const TAIL_MAX_LINE = 1024 * 1024;
 /** How many of the backlog's updates are passed on. */
@@ -1596,10 +1602,16 @@ export class TranscriptTail {
       if (this.offset === null) this.offset = 0;   // it did not exist when the watch began: all of it is new
       if (size < this.offset) { this.offset = size; this.partial = ""; this.decoder = new StringDecoder("utf8"); return []; }
       if (size === this.offset) return [];
-      const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, size - this.offset));
-      const n = fs.readSync(fd, buf, 0, buf.length, this.offset);
-      this.offset += n;
-      return this.take(this.decoder.write(buf.subarray(0, n)));
+      const out: TranscriptUpdate[] = [];
+      const until = Math.min(size, this.offset + TAIL_LOOK_BYTES);
+      const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, until - this.offset));
+      while (this.offset < until) {
+        const n = fs.readSync(fd, buf, 0, Math.min(buf.length, until - this.offset), this.offset);
+        if (n <= 0) break;
+        this.offset += n;
+        out.push(...this.take(this.decoder.write(buf.subarray(0, n))));
+      }
+      return out;
     } catch {
       return [];
     } finally {

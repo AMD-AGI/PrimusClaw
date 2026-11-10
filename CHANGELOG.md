@@ -170,6 +170,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A step of a conversation open in a terminal reaches the phone while it runs again when Claude Code wrote a large line before it.
+  The connector read the transcript 256 KB per look (one look a second), so a `prompt_snapshot` attachment (0.2 MB and more) held
+  the next step back a second per 256 KB: a 5-second tool's step came after the tool had ended and the phone never showed it. One
+  look now reads everything new (up to 32 MB).
 - A message from the phone to a conversation open in a tmux terminal is typed at once, whatever Claude Code is doing there: one
   submitted while a turn runs is queued by Claude Code itself and taken in at that turn's next step or once it ends, as one typed at
   the terminal is. The connector no longer decides whether the terminal is busy (its registry status, whether the transcript's last
