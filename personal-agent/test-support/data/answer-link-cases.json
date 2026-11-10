@@ -1,0 +1,381 @@
+{
+ "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same.",
+ "cases": [
+  {
+   "about": "plain link",
+   "input": "See [the docs](https://docs.example.com/a?b=1) for details.",
+   "lang": "en",
+   "expected": [
+    "See the docs (`docs.example.com`) for details."
+   ]
+  },
+  {
+   "about": "plain link",
+   "input": "See [the docs](https://docs.example.com/a?b=1) for details.",
+   "lang": "zh",
+   "expected": [
+    "See the docs (`docs.example.com`) for details."
+   ]
+  },
+  {
+   "about": "image",
+   "input": "![diagram](https://img.example/p.png)",
+   "lang": "en",
+   "expected": [
+    "🖼 diagram (`img.example`)"
+   ]
+  },
+  {
+   "about": "image",
+   "input": "![diagram](https://img.example/p.png)",
+   "lang": "zh",
+   "expected": [
+    "🖼 diagram (`img.example`)"
+   ]
+  },
+  {
+   "about": "image without alt",
+   "input": "Here: ![](https://img.example/q.png)",
+   "lang": "en",
+   "expected": [
+    "Here: 🖼 (`img.example`)"
+   ]
+  },
+  {
+   "about": "image without alt",
+   "input": "Here: ![](https://img.example/q.png)",
+   "lang": "zh",
+   "expected": [
+    "Here: 🖼 (`img.example`)"
+   ]
+  },
+  {
+   "about": "bare URL",
+   "input": "Logs are at https://logs.example/run/42.",
+   "lang": "en",
+   "expected": [
+    "Logs are at `logs.example`."
+   ]
+  },
+  {
+   "about": "bare URL",
+   "input": "Logs are at https://logs.example/run/42.",
+   "lang": "zh",
+   "expected": [
+    "Logs are at `logs.example`."
+   ]
+  },
+  {
+   "about": "bare www",
+   "input": "Try www.example.org/page, then retry.",
+   "lang": "en",
+   "expected": [
+    "Try `www​.example.org`, then retry."
+   ]
+  },
+  {
+   "about": "bare www",
+   "input": "Try www.example.org/page, then retry.",
+   "lang": "zh",
+   "expected": [
+    "Try `www​.example.org`, then retry."
+   ]
+  },
+  {
+   "about": "credentials in the URL",
+   "input": "Pull from [here](https://user:pass@git.example:8443/r.git?token=abc123).",
+   "lang": "en",
+   "expected": [
+    "Pull from here (`git.example`)."
+   ]
+  },
+  {
+   "about": "credentials in the URL",
+   "input": "Pull from [here](https://user:pass@git.example:8443/r.git?token=abc123).",
+   "lang": "zh",
+   "expected": [
+    "Pull from here (`git.example`)."
+   ]
+  },
+  {
+   "about": "Chinese words",
+   "input": "请看[部署文档](https://wiki.example.cn/deploy)。",
+   "lang": "en",
+   "expected": [
+    "请看部署文档（`wiki.example.cn`）。"
+   ]
+  },
+  {
+   "about": "Chinese words",
+   "input": "请看[部署文档](https://wiki.example.cn/deploy)。",
+   "lang": "zh",
+   "expected": [
+    "请看部署文档（`wiki.example.cn`）。"
+   ]
+  },
+  {
+   "about": "parentheses in the words and the address",
+   "input": "[the (old) guide](https://x.example/p_(1)) is outdated",
+   "lang": "en",
+   "expected": [
+    "the (old) guide (`x.example`) is outdated"
+   ]
+  },
+  {
+   "about": "parentheses in the words and the address",
+   "input": "[the (old) guide](https://x.example/p_(1)) is outdated",
+   "lang": "zh",
+   "expected": [
+    "the (old) guide (`x.example`) is outdated"
+   ]
+  },
+  {
+   "about": "no scheme",
+   "input": "Open [the page](example.com/path) or [this](/relative/path).",
+   "lang": "en",
+   "expected": [
+    "Open the page (`example.com`) or this."
+   ]
+  },
+  {
+   "about": "no scheme",
+   "input": "Open [the page](example.com/path) or [this](/relative/path).",
+   "lang": "zh",
+   "expected": [
+    "Open the page (`example.com`) or this."
+   ]
+  },
+  {
+   "about": "javascript address",
+   "input": "[click](javascript:alert(1))",
+   "lang": "en",
+   "expected": [
+    "click"
+   ]
+  },
+  {
+   "about": "javascript address",
+   "input": "[click](javascript:alert(1))",
+   "lang": "zh",
+   "expected": [
+    "click"
+   ]
+  },
+  {
+   "about": "autolink and HTML",
+   "input": "<https://auto.example/z> and <a href=\"https://h.example/x\">this</a> and <img src='https://i.example/x.png' alt='pic'>",
+   "lang": "en",
+   "expected": [
+    "`auto.example` and this (`h.example`) and 🖼 pic (`i.example`)"
+   ]
+  },
+  {
+   "about": "autolink and HTML",
+   "input": "<https://auto.example/z> and <a href=\"https://h.example/x\">this</a> and <img src='https://i.example/x.png' alt='pic'>",
+   "lang": "zh",
+   "expected": [
+    "`auto.example` and this (`h.example`) and 🖼 pic (`i.example`)"
+   ]
+  },
+  {
+   "about": "reference link",
+   "input": "[1]: https://ref.example/x\nSee [the spec][1].",
+   "lang": "en",
+   "expected": [
+    "\\[1\\]: `ref.example`\nSee [the spec][1]."
+   ]
+  },
+  {
+   "about": "reference link",
+   "input": "[1]: https://ref.example/x\nSee [the spec][1].",
+   "lang": "zh",
+   "expected": [
+    "\\[1\\]: `ref.example`\nSee [the spec][1]."
+   ]
+  },
+  {
+   "about": "nested image in a link",
+   "input": "[![badge](https://badge.example/b.svg)](https://ci.example/run)",
+   "lang": "en",
+   "expected": [
+    "🖼 badge (`badge.example`) (`ci.example`)"
+   ]
+  },
+  {
+   "about": "nested image in a link",
+   "input": "[![badge](https://badge.example/b.svg)](https://ci.example/run)",
+   "lang": "zh",
+   "expected": [
+    "🖼 badge (`badge.example`) (`ci.example`)"
+   ]
+  },
+  {
+   "about": "link text that is an address",
+   "input": "[https://shown.example](https://elsewhere.example)",
+   "lang": "en",
+   "expected": [
+    "`shown.example` (`elsewhere.example`)"
+   ]
+  },
+  {
+   "about": "link text that is an address",
+   "input": "[https://shown.example](https://elsewhere.example)",
+   "lang": "zh",
+   "expected": [
+    "`shown.example` (`elsewhere.example`)"
+   ]
+  },
+  {
+   "about": "mail address link",
+   "input": "Write to [me](mailto:dev@mail.example).",
+   "lang": "en",
+   "expected": [
+    "Write to me (`mail.example`)."
+   ]
+  },
+  {
+   "about": "mail address link",
+   "input": "Write to [me](mailto:dev@mail.example).",
+   "lang": "zh",
+   "expected": [
+    "Write to me (`mail.example`)."
+   ]
+  },
+  {
+   "about": "code is kept",
+   "input": "Run `curl https://in.code/x` and\n\n```\n[a](https://fenced.example)\nhttps://fenced.example/b\n```\n\nthen https://after.example",
+   "lang": "en",
+   "expected": [
+    "Run `curl https:​//in.code/x` and\n\n```\n[a]​(https:​//fenced.example)\nhttps:​//fenced.example/b\n```\n\nthen `after.example`"
+   ]
+  },
+  {
+   "about": "code is kept",
+   "input": "Run `curl https://in.code/x` and\n\n```\n[a](https://fenced.example)\nhttps://fenced.example/b\n```\n\nthen https://after.example",
+   "lang": "zh",
+   "expected": [
+    "Run `curl https:​//in.code/x` and\n\n```\n[a]​(https:​//fenced.example)\nhttps:​//fenced.example/b\n```\n\nthen `after.example`"
+   ]
+  },
+  {
+   "about": "no links",
+   "input": "All 128 tests pass.",
+   "lang": "en",
+   "expected": [
+    "All 128 tests pass."
+   ]
+  },
+  {
+   "about": "no links",
+   "input": "All 128 tests pass.",
+   "lang": "zh",
+   "expected": [
+    "All 128 tests pass."
+   ]
+  },
+  {
+   "about": "a fence that is no fence for every client",
+   "input": "```lang`bad\nhttps://evil.example/x\n```",
+   "lang": "en",
+   "expected": [
+    "```lang`bad\n`evil.example`\n```"
+   ]
+  },
+  {
+   "about": "a fence that is no fence for every client",
+   "input": "```lang`bad\nhttps://evil.example/x\n```",
+   "lang": "zh",
+   "expected": [
+    "```lang`bad\n`evil.example`\n```"
+   ]
+  },
+  {
+   "about": "a code span across a blank line",
+   "input": "`intro\n\nhttps://evil.example/x`",
+   "lang": "en",
+   "expected": [
+    "`intro\n\nhttps:​//evil.example/x`"
+   ]
+  },
+  {
+   "about": "a code span across a blank line",
+   "input": "`intro\n\nhttps://evil.example/x`",
+   "lang": "zh",
+   "expected": [
+    "`intro\n\nhttps:​//evil.example/x`"
+   ]
+  },
+  {
+   "about": "other schemes",
+   "input": "Get ftp://files.example/a or file:///etc/passwd",
+   "lang": "en",
+   "expected": [
+    "Get `files.example` or `file:​///etc/passwd`"
+   ]
+  },
+  {
+   "about": "other schemes",
+   "input": "Get ftp://files.example/a or file:///etc/passwd",
+   "lang": "zh",
+   "expected": [
+    "Get `files.example` or `file:​///etc/passwd`"
+   ]
+  },
+  {
+   "about": "NUL in the text",
+   "input": "a \u00000\u0000 b https://n.example",
+   "lang": "en",
+   "expected": [
+    "a 0 b `n.example`"
+   ]
+  },
+  {
+   "about": "NUL in the text",
+   "input": "a \u00000\u0000 b https://n.example",
+   "lang": "zh",
+   "expected": [
+    "a 0 b `n.example`"
+   ]
+  },
+  {
+   "about": "mail address",
+   "input": "Write to dev@mail.example or mailto:ops@mail.example.",
+   "lang": "en",
+   "expected": [
+    "Write to `dev@mail.example` or `mail.example`."
+   ]
+  },
+  {
+   "about": "mail address",
+   "input": "Write to dev@mail.example or mailto:ops@mail.example.",
+   "lang": "zh",
+   "expected": [
+    "Write to `dev@mail.example` or `mail.example`."
+   ]
+  },
+  {
+   "about": "escaped address",
+   "input": "see www.example\\.com today",
+   "lang": "en",
+   "expected": [
+    "see `www​.example.com` today"
+   ]
+  },
+  {
+   "about": "escaped address",
+   "input": "see www.example\\.com today",
+   "lang": "zh",
+   "expected": [
+    "see `www​.example.com` today"
+   ]
+  },
+  {
+   "about": "an address after a slash",
+   "input": "x/www.evil.example and /var/www.example.com/logs, x/https://www.evil.example/p",
+   "lang": "en",
+   "expected": [
+    "x/`www​.evil.example` and /var/`www​.example.com/logs`, x/https:​//`www​.evil.example/p`"
+   ]
+  }
+ ]
+}

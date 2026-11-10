@@ -6,6 +6,7 @@ import type { Lang } from "../locales/lang.js";
 import { ANSWER_CHARS_MAX, ANSWER_MESSAGES_MAX } from "./limits.js";
 import { cpLength, cpSlice, pyLstrip, pyRstrip, pyStrip } from "../text/py-text.js";
 import { remoteText } from "../locales/remote.js";
+import { inertAnswer } from "./links/answer.js";
 
 /** `text` cut into pieces of at most `limit` characters, at a paragraph break (else a line break) past half the limit. */
 export function splitAtParagraphs(text: string, limit: number): string[] {
@@ -32,7 +33,8 @@ export function splitAtParagraphs(text: string, limit: number): string[] {
 /** The messages that carry a remote agent's final text: split at paragraph boundaries, at most ANSWER_MESSAGES_MAX, and what is
  * beyond that cut with a line saying so (the rest is in the session on the machine). Credentials are masked. */
 export function answerParts(text: string, lang: Lang = "en"): string[] {
-  const body = redactText(pyStrip(text)) || remoteText.in(lang).noTextOutput;
+  // (the agent's links become words: what it writes is not ours to make clickable)
+  const body = inertAnswer(redactText(pyStrip(text))) || remoteText.in(lang).noTextOutput;
   const chunks = splitAtParagraphs(body, ANSWER_CHARS_MAX);
   if (chunks.length <= ANSWER_MESSAGES_MAX) return chunks;
   const kept = chunks.slice(0, ANSWER_MESSAGES_MAX - 1);

@@ -1,0 +1,77 @@
+{
+ "about": "remote_view.neutral(text, limit) after the fix: one short line of text an agent or a connector supplied (a connector's name, a health check's unknown detail, an agent's plan, a tool's title): control characters gone, credentials masked, `[`/`]` as `(`/`)`, `<`/`>` as look-alikes, a zero-width space after the colon of every `://` (the chat's rich text links a bare address by itself), clipped to `limit`. Generated from the Python worker; the TypeScript port must give the same.",
+ "cases": [
+  {
+   "about": "connector name",
+   "input": "dev-pod https://evil.example/x",
+   "limit": 200,
+   "expected": "dev-pod https:​//evil.example/x"
+  },
+  {
+   "about": "health detail",
+   "input": "see https://evil.example/fix for details",
+   "limit": 200,
+   "expected": "see https:​//evil.example/fix for details"
+  },
+  {
+   "about": "plan text",
+   "input": "Open https://evil.example and log in",
+   "limit": 200,
+   "expected": "Open https:​//evil.example and log in"
+  },
+  {
+   "about": "tool title",
+   "input": "Fetch https://evil.example/data.json",
+   "limit": 200,
+   "expected": "Fetch https:​//evil.example/data.json"
+  },
+  {
+   "about": "after an underscore",
+   "input": "_https://evil.example/x",
+   "limit": 200,
+   "expected": "_https:​//evil.example/x"
+  },
+  {
+   "about": "after @ and /",
+   "input": "a@https://evil.example x/https://b.example",
+   "limit": 200,
+   "expected": "a@https:​//evil.example x/https:​//b.example"
+  },
+  {
+   "about": "markdown link",
+   "input": "[docs](https://evil.example)",
+   "limit": 200,
+   "expected": "(docs)(https:​//evil.example)"
+  },
+  {
+   "about": "no address",
+   "input": "Run the tests",
+   "limit": 200,
+   "expected": "Run the tests"
+  },
+  {
+   "about": "credential",
+   "input": "token sk-EXAMPLE-abcdef0123456789abcdef0123456789 at https://h.example",
+   "limit": 200,
+   "expected": "token (hidden) at https:​//h.example"
+  },
+  {
+   "about": "bidi override inside the separator",
+   "input": "see https:‮//evil.example/x",
+   "limit": 200,
+   "expected": "see https:​//evil.example/x"
+  },
+  {
+   "about": "bare www",
+   "input": "connector www.evil.example/x",
+   "limit": 200,
+   "expected": "connector www​.evil.example/x"
+  },
+  {
+   "about": "escaped www",
+   "input": "connector www\\.evil.example",
+   "limit": 200,
+   "expected": "connector www​\\.evil.example"
+  }
+ ]
+}

@@ -32,6 +32,7 @@ import { StatusMessage } from "../../turn/progress/status-message.js";
 import type { TurnSurface } from "../../turn/ports.js";
 import type { FinishWith, TurnDisplay } from "./display.js";
 import type { Signer } from "./signer.js";
+import { inertAnswer } from "../links/answer.js";
 
 /** What the bubble shows of a remote turn, and how its stream ends. */
 export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
@@ -78,7 +79,8 @@ export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
       .map((s) => pyStrip(s))
       .filter(Boolean)
       .join("\n\n");
-    const shown = pyRstrip(this.cutError(redactText(text).text));
+    // (its links become words; a link still being written changes what was streamed, and the answer then comes whole)
+    const shown = pyRstrip(inertAnswer(this.cutError(redactText(text).text)));
     return this.signer !== null && shown ? this.signer.first(shown) : shown;
   }
 
