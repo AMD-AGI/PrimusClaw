@@ -14,6 +14,7 @@ import { type Mark, bare, emails, links, referenceDefinitions, tags } from "./sc
 
 const ZWSP = "\u{200b}";
 /** What the chat's rich text drops before it reads anything: controls and bidi overrides (the rich text's own set). */
+// eslint-disable-next-line no-control-regex -- the control characters are exactly what the rich text drops
 export const DROPPED_BY_RICH_TEXT = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u{202a}-\u{202e}\u{2066}-\u{2069}]/gu;
 /** A fence line as the rich text reads one. */
 const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)/su;

@@ -131,3 +131,28 @@ test("what the agent says into the window card is words whichever way it came", 
   view.setText("look at https://evil.example/x and [docs](https://docs.example/y)");
   assert.equal(view.text, "look at `evil.example` and docs (`docs.example`)");
 });
+
+test("a character, a bracket and a space are read as Python reads them", () => {
+  // (from Python 3.14's urlsplit and str methods: a bracketed host is an IPv6 or IPvFuture address or nothing, a character beyond
+  // the BMP is one character, and Python's whitespace is not JavaScript's)
+  const table: readonly (readonly [string, string])[] = [
+    ["https:// [x]/a", "`https:​//` [x]/a"],
+    ["see https://[v1.host]/x", "see `v1.host`"],
+    ["see https://u[1]@host.example/x", "see `https:​//u[1]@host.example/x`"],
+    ["see https://[::1]:8080/x", "see `https:​//[::1]:8080/x`"],
+    ["a\u{1d400}www.evil.example", "a\u{1d400}www​.evil.example"],
+    ["a\u{1d400}x@y.example", "`a\u{1d400}x@y.example`"],
+    ["<a　href=https://e.example>go</a>", "go (`e.example`)"],
+    ["<a﻿href=https://e.example>go</a>", "<a﻿href=`e.example`>go</a>"],
+    ["<img\x1csrc=https://e.example/p.png alt=x>", "<imgsrc=`e.example` alt=x>"],
+    ["say \u{1d400}https://e.example/x", "say \u{1d400}https:​//e.example/x"],
+  ];
+  for (const [text, shown] of table) assert.equal(inertAnswer(text), shown, JSON.stringify(text));
+});
+
+test("a character that lowers to two does not move where an address is read", () => {
+  // (only ASCII letters are lowered to find `www.`, `mailto:` or a tag, so the index found is the index in the text)
+  assert.equal(inertAnswer("İİİİİwww."), "İİİİİwww​.");
+  assert.equal(inertAnswer("see İİİ www.evil.example"), "see İİİ `www​.evil.example`");
+  assert.equal(inertAnswer("İ<A HREF=https://e.example>go</a>"), "İgo (`e.example`)");
+});
