@@ -7,7 +7,9 @@
  * release gate's test entry, its routes on the loopback instead), and the features' timers. Nothing runs until `run`.
  */
 import {
+  InboundStats,
   neutralPlugins,
+  type MetricsPort,
   NOTE,
   redactText,
   SecurityLog,
@@ -129,11 +131,36 @@ function surfaceOf(teams: AssemblyBase["teams"], outbound: Outbound, gate: GateE
   return { acks, surface };
 }
 
+/**
+ * The metrics, with the inbound path also counted for its `inbound_stats` line (Python `InboundStats(metrics=...)`: one line
+ * a minute of what was handled, how long it waited and took, what failed and what a limit refused).
+ */
+export function withInboundStats(prometheus: PrometheusMetrics, stats: InboundStats): MetricsPort {
+  return {
+    eventDelivered: (eventType, handleSeconds, since) => {
+      prometheus.eventDelivered(eventType, handleSeconds, since);
+    },
+    securityEvent: (record) => {
+      prometheus.securityEvent(record);
+    },
+    processed: (lagMs, handleMs, ok) => {
+      stats.processed(lagMs, handleMs, ok);
+    },
+    limited: (reason) => {
+      stats.limited(reason);
+    },
+    filesDropped: (path, count) => {
+      prometheus.filesDropped(path, count);
+    },
+  };
+}
+
 async function assemblyBase(env: WorkerEnv, gate: GateEntry | undefined, deps: Basics) {
   const secrets = await loadSecrets(env, deps);
   const settings = readSettings(env, secrets);
   const teams = teamsSettingsFromEnv(env, { queues: gate === undefined });
-  const metrics = new PrometheusMetrics(deps.clock);
+  const prometheus = new PrometheusMetrics(deps.clock);
+  const metrics = withInboundStats(prometheus, new InboundStats(deps.clock, deps.logger, prometheus));
   const securityLog = new SecurityLog(deps.logger, metrics, deps.requestScope);
   const store = openWorkerStore(settings, {
     securityEvent: (event, fields) => securityLog.event(event, fields),
@@ -151,7 +178,7 @@ async function assemblyBase(env: WorkerEnv, gate: GateEntry | undefined, deps: B
     clientLabel: settings.claw.clientLabel,
     fetch: (url, init) => deps.fetch(url, init),
   });
-  return { secrets, settings, teams, metrics, securityLog, store, claw };
+  return { secrets, settings, teams, metrics, prometheus, securityLog, store, claw };
 }
 
 type Parts = Awaited<ReturnType<typeof assemblyBase>>;
@@ -252,7 +279,7 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
         });
   return runner({
     app: buildServer({ routes: routesOf(base, features, handle, gate), maxBodyBytes: MAX_BODY_BYTES }),
-    metricsApp: buildServer({ routes: metricsRoutes(() => parts.metrics.render()), maxBodyBytes: 1024 }),
+    metricsApp: buildServer({ routes: metricsRoutes(() => parts.prometheus.render()), maxBodyBytes: 1024 }),
     host: gate === undefined ? "0.0.0.0" : LOOPBACK,
     port: parts.settings.listenPort,
     metricsPort: parts.settings.metricsPort,

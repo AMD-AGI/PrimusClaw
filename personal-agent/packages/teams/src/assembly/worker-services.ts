@@ -75,7 +75,7 @@ export function workerServices(parts: ServicesParts): BoundServices {
       void running.finally(() => tasks.delete(running));
     },
     audit(fields) {
-      securityLog.event("on_behalf_message", { operation: "on_behalf", ...fields });
+      securityLog.event("on_behalf_message", { ...fields, operation: "on_behalf" }); // (the operation is always this one)
     },
     logger,
   };
@@ -85,7 +85,8 @@ export function workerServices(parts: ServicesParts): BoundServices {
       late.router = built;
     },
     idle: async () => {
-      await Promise.all([...tasks]);
+      // (a task may spawn another: wait until none is left)
+      while (tasks.size > 0) await Promise.all([...tasks]);
     },
   };
 }
