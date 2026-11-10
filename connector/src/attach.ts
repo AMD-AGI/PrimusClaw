@@ -258,6 +258,10 @@ export interface AttachDeps {
   /** The session ids this connector itself holds open. */
   attachedRefs: () => ReadonlySet<string>;
   now?: () => number;
+  /** How long a check or a poll waits for the unreadable-row scan (default BLIND_CHECK_MS; tests). */
+  blindCheckMs?: number;
+  /** What a process's own pane shows as its conversation's name (default: read with the agent's tmux; tests). */
+  screenName?: (pid: number) => Promise<string | null>;
 }
 
 const NO_HOOKS: AdapterHooks = {
@@ -415,10 +419,14 @@ export class AttachSupport {
   /** The conversation each proven blind holder has open, from the last scan (pid -> ref): what {@link holderStatus} reads. */
   private blindHeld = new Map<number, string>();
 
+  private get blindCheckMs(): number {
+    return this.d.blindCheckMs ?? BLIND_CHECK_MS;
+  }
+
   private scanBlind(): Promise<BlindHolder[]> {
     const tmux = this.agent.attach?.tmux ?? "tmux";
     this.blindScan ??= blindHolders(this.configDir, "/proc", typeof process.getuid === "function" ? process.getuid() : null,
-      (pid) => paneBoxName(pid, tmux)).then((list) => {
+      this.d.screenName ?? ((pid) => paneBoxName(pid, tmux))).then((list) => {
       this.blindHeld = new Map(list.filter((b) => b.sessionId !== null).map((b) => [b.pid, b.sessionId!]));
       return list;
     }).finally(() => { this.blindScan = null; });
@@ -433,11 +441,11 @@ export class AttachSupport {
     // (a scan already under way may have started before the caller's wait ended: a new one is started after it, and a scan that
     // is stuck on a stalled disk is no answer either; codex r2)
     const prior = this.blindScan;
-    if (prior && !(await within(prior.then(() => true, () => true), BLIND_CHECK_MS, false))) {
+    if (prior && !(await within(prior.then(() => true, () => true), this.blindCheckMs, false))) {
       this.blindHeld = new Map();
       return false;
     }
-    const fresh = await within(this.scanBlind().then(() => true, () => false), BLIND_CHECK_MS, false);
+    const fresh = await within(this.scanBlind().then(() => true, () => false), this.blindCheckMs, false);
     if (!fresh) this.blindHeld = new Map();   // (nothing proven, until a scan answers again)
     return fresh;
   }
@@ -460,6 +468,13 @@ export class AttachSupport {
     const attached = this.d.attachedRefs();
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
+      // A process proven by this very scan to have it open holds it, whatever the live list (made from another scan) says
+      // (Wei Lei, #612: two scans that disagree must not make it free).
+      for (const b of blind ?? []) {
+        if (b.sessionId === l.ref && !holders.some((e) => e.pid === b.pid && !e.foreign)) {
+          holders.push({ pid: b.pid, sessionId: b.sessionId, status: null, waitingFor: null, cwd: b.cwd, foreign: false, via: "blind" });
+        }
+      }
       let state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
       // A Claude Code process here whose registry row cannot be read may be the one that has it open: not "idle" (which a
       // client offers to take over, starting a second writer), but "unknown".
@@ -515,7 +530,7 @@ export class AttachSupport {
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
     // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
     // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
-    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? []).map((b) => b.pid).sort().join(".");
+    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), this.blindCheckMs, null)) ?? []).map((b) => b.pid).sort().join(".");
     const summary = (rows === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
       const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
       return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
@@ -591,7 +606,7 @@ export class AttachSupport {
     if (inTerminal) return { ok: false, reason: "session_live", detail: describeTwin(inTerminal) };
     let live: LiveEntry[];
     try {
-      live = await this.liveEntries();
+      live = await this.liveEntries(o.ownPgid == null);   // (its own session: an unreadable row of another process does not stop it)
     } catch (e) {
       return { ok: false, reason: "twin_check_failed", detail: errMessage(e) };
     }
@@ -607,9 +622,12 @@ export class AttachSupport {
     if (o.ownPgid == null) {
       const cwd = this.listed.find((l) => l.ref === want)?.cwd ?? null;
       const own = new Set(this.d.registry.list().map((r) => r.pgid));
-      const scanned = await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null);
+      const scanned = await within(this.scanBlind().catch(() => null), this.blindCheckMs, null);
       if (scanned === null) return { ok: false, reason: "twin_check_failed", detail: "the Claude Code session registry did not answer in time" };
-      // (one proven to hold a conversation holds only that one, and is among the live entries above when it is this one)
+      // One proven to hold this very conversation is its holder (decided on this scan, not on the one the live list came from);
+      // one that cannot be proven may hold any conversation of its folder.
+      const proven = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && b.sessionId === want);
+      if (proven) return { ok: false, reason: "session_live", detail: describeTwin({ pid: proven.pid, sessionId: want, status: null, foreign: false, via: "blind" }) };
       const blind = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && b.sessionId === null && (cwd === null || mayHold(b, cwd)));
       if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
     }
@@ -714,7 +732,7 @@ export class AttachSupport {
       }
     } catch { /* the rows below may still prove it */ }
     // A process whose row cannot be read, proven to hold it by what it has open (`provenBlindHold`), with its own folder.
-    for (const b of (await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? []) {
+    for (const b of (await within(this.scanBlind().catch(() => [] as BlindHolder[]), this.blindCheckMs, null)) ?? []) {
       if (b.sessionId === want && !out.has(b.pid)) out.set(b.pid, b.cwd);
     }
     if (this.localDomain === null) return out;
@@ -735,8 +753,12 @@ export class AttachSupport {
     return out;
   }
 
-  /** Every live process that holds a session open. Throws {@link TwinCheckError} when neither source can be read. */
-  async liveEntries(): Promise<LiveEntry[]> {
+  /**
+   * Every live process that holds a session open. Throws {@link TwinCheckError} when neither source can be read, or when the
+   * processes whose registry row cannot be read could not be looked at in time (`blind`; `blind: false`, for a session this
+   * connector already holds with its own adapter, which another process's unreadable row does not stop: they are left out).
+   */
+  async liveEntries(blind = true): Promise<LiveEntry[]> {
     const env = { ...this.d.env, ...this.agent.env, CLAUDE_CONFIG_DIR: this.configDir };
     let viaCli: LiveEntry[] | null = null;
     let cliError = "";
@@ -767,8 +789,11 @@ export class AttachSupport {
     }
     // A process whose row cannot be read, proven to hold a conversation by what it has open, holds it as a row would say.
     const own = new Set(this.d.registry.list().map((r) => r.pgid));
-    const blind = (await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? [];
-    for (const b of blind) {
+    // A scan that does not answer in time (or fails) leaves unknown who holds what: no answer at all, never one without them
+    // (Wei Lei, #612: "[]" here let a conversation such a process holds look free).
+    const scanned = await within(this.scanBlind().catch(() => null), this.blindCheckMs, null);
+    if (scanned === null && blind) throw new TwinCheckError("the processes whose Claude Code registry row cannot be read could not be looked at in time");
+    for (const b of scanned ?? []) {
       if (b.sessionId === null || (b.pgid !== null && own.has(b.pgid)) || out.some((e) => e.pid === b.pid && !e.foreign)) continue;
       out.push({ pid: b.pid, sessionId: b.sessionId, status: null, waitingFor: null, cwd: b.cwd, foreign: false, via: "blind" });
     }

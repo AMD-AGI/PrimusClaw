@@ -46,7 +46,7 @@ function configDir(): string {
 const registryRow = (dir: string, pid: number, extra: Record<string, unknown>) =>
   fs.writeFileSync(path.join(dir, "sessions", `${pid}.json`), JSON.stringify({ pid, sessionId: REF, status: "idle", kind: "interactive", ...extra }));
 
-function support(dir: string, o: { cli?: string; cliEnv?: Record<string, string>; recentWriteMs?: number; attached?: string[] } = {}): AttachSupport {
+function support(dir: string, o: { cli?: string; cliEnv?: Record<string, string>; recentWriteMs?: number; attached?: string[]; blindCheckMs?: number; screenName?: (pid: number) => Promise<string | null> } = {}): AttachSupport {
   const cfg = parseConfig(`
 [[agents]]
 id = "a"
@@ -60,6 +60,7 @@ ${Object.entries(o.cliEnv ?? {}).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).
   return new AttachSupport(cfg.agents[0]!, {
     registry: new ChildRegistry(path.join(tmpdir(), "children.json")), audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test",
     env: process.env, catalogMs: 60_000, cliTimeoutMs: 1500, recentWriteMs: o.recentWriteMs ?? 10_000, attachedRefs: () => new Set(o.attached ?? []),
+    ...(o.blindCheckMs !== undefined ? { blindCheckMs: o.blindCheckMs } : {}), ...(o.screenName ? { screenName: o.screenName } : {}),
   });
 }
 
@@ -387,6 +388,40 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     assert.deepEqual((await blindHolders(dir)).map((b) => b.sessionId), [null, null]);
     await stop(second);
     await stop(other);
+    await stop(blind);
+  });
+
+  test("a scan of such processes that answers late never makes the conversation one holds look free (Wei Lei, #612)", { skip: process.platform !== "linux" }, async () => {
+    // A process proven (by its task folder and its screen) to hold REF, whose scan takes longer than a check waits for it.
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-late-"));
+    const project = work.replace(/[^A-Za-z0-9]/g, "-");
+    const uid = process.getuid!();
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const blind = spawn(process.execPath, ["-e", "require('fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000)", tasks], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(blind);
+    await new Promise((r) => setTimeout(r, 300));
+    emptyRow(dir, blind.pid!);
+    const transcripts = path.join(dir, "projects", project);
+    fs.mkdirSync(transcripts, { recursive: true });
+    fs.writeFileSync(path.join(transcripts, `${REF}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "late", sessionId: REF })}\n`);
+    const slowScreen = async () => { await new Promise((r) => setTimeout(r, 150)); return "late"; };
+    // The live list's wait gives up at 100 ms; the check's own wait on the same scan gets its answer (REF proven) at 150 ms.
+    const s = support(dir, { blindCheckMs: 100, screenName: slowScreen });
+    const v = await s.check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok, false, "a takeover or attach of REF is refused");
+    // And the listing: a live list made without the late scan, then the scan proving REF: never "idle".
+    const listing = support(dir, { blindCheckMs: 100, screenName: slowScreen });
+    const any = listing as unknown as { listed: unknown[]; waitedOnce: boolean; listedAt: number };
+    any.listed = [{ ref: REF, title: "late", cwd: work, updatedAt: Date.now() }];
+    any.waitedOnce = true;
+    any.listedAt = Date.now();
+    const [r] = await listing.resumable(1_000);
+    assert.notEqual(r!.state, "idle", "REF is not offered to take over");
+    // Its own session (an adapter of this connector) is not stopped by such a scan being late.
+    const own = await support(dir, { blindCheckMs: 100, screenName: slowScreen }).check(REF2, { ownPgid: 424242, transcript: false });
+    assert.equal(own.ok, true, "its own session goes on");
     await stop(blind);
   });
 
