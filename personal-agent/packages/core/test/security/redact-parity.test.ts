@@ -31,6 +31,7 @@ describe("redaction parity with the Python worker", () => {
   for (const [name, masked] of [
     ["redact-parity.json", 1000],
     ["redact-parity-2.json", 400],
+    ["redact-parity-3.json", 500],
   ] as const) {
     it(`masks exactly what the Python worker masks, byte for byte: ${name}`, () => {
       const rows = corpus(name);
@@ -38,7 +39,7 @@ describe("redaction parity with the Python worker", () => {
         const got = redactText(decode(row.t));
         return got.text !== decode(row.o) || got.masked !== row.m;
       });
-      assert.equal(rows.length, 6000);
+      assert.ok(rows.length >= 6000);
       assert.ok(rows.filter((r) => r.m).length > masked, "the corpus masks something");
       assert.deepEqual(
         differences.slice(0, 5).map((r) => [decode(r.t), decode(r.o)]),
@@ -62,4 +63,22 @@ describe("Python's re.I, as Unicode", () => {
   it("a credential-named URL parameter with a dotless i", () => {
     assert.equal(redactLogLine("GET /x?sıg=abc&a=1"), "GET /x?sıg=[hidden]&a=1");
   });
+});
+
+describe("a hostile text is masked in linear time", () => {
+  // Each took seconds as a regular expression (and in Python's re): a long run of what one rule's start looks like.
+  const hostile: Record<string, string> = {
+    "many JWT starts in one run": "eyJ0--J-".repeat(12_500) + "\x00",
+    "many names before one value": "ke" + "password".repeat(6_250) + "y=" + "a_".repeat(25_000) + "\x00",
+    "many 'is' after one name": "token" + "-is".repeat(20_000) + "!",
+  };
+  for (const [what, text] of Object.entries(hostile)) {
+    it(`within a bound: ${what}`, () => {
+      const started = performance.now();
+      redactText(text);
+      redactLogLine(text);
+      const ms = performance.now() - started;
+      assert.ok(ms < 400, `${what}: ${ms.toFixed(0)} ms`);
+    });
+  }
 });
