@@ -6,12 +6,12 @@
  * `PENDING` (snapshots whose builders are not ported yet, with the line that ports them).
  */
 import type { CatalogEntry } from "./catalog.js";
+import { COMMAND_CARDS } from "./commands.js";
+import { TURN } from "./turn.js";
 
-export const CATALOG: readonly CatalogEntry[] = [];
+export const CATALOG: readonly CatalogEntry[] = [...COMMAND_CARDS, ...TURN];
 
 const BY_LINE = {
-  W4: ["binding", "link", "onboarding", "repo"],
-  W4b: ["changes", "error_note", "inactive_note", "session", "show_here_note"],
   W5: [
     "answered",
     "approval_decided",
@@ -24,7 +24,6 @@ const BY_LINE = {
     "assistant_confirm",
     "board",
     "board_asked",
-    "delivery",
     "digest",
     "question",
     "question_item",

@@ -1,0 +1,2367 @@
+{
+  "servers": {
+    "jobhub": "JobHub",
+    "fleetpilot": "FleetPilot"
+  },
+  "query": ["jobhub"],
+  "labels": [
+    {
+      "tool": "read",
+      "lang": "en",
+      "skill": null,
+      "one": "Reading a file",
+      "many": "Reading files",
+      "text3": "Reading files (3)",
+      "failed": "⚠️ Reading a file failed, continuing"
+    },
+    {
+      "tool": "read",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "read",
+      "lang": "zh",
+      "skill": null,
+      "one": "读取文件",
+      "many": null,
+      "text3": "读取文件 (3)",
+      "failed": "⚠️ 读取文件失败，已继续"
+    },
+    {
+      "tool": "read",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "Read",
+      "lang": "en",
+      "skill": null,
+      "one": "Reading a file",
+      "many": "Reading files",
+      "text3": "Reading files (3)",
+      "failed": "⚠️ Reading a file failed, continuing"
+    },
+    {
+      "tool": "Read",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "Read",
+      "lang": "zh",
+      "skill": null,
+      "one": "读取文件",
+      "many": null,
+      "text3": "读取文件 (3)",
+      "failed": "⚠️ 读取文件失败，已继续"
+    },
+    {
+      "tool": "Read",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "bash",
+      "lang": "en",
+      "skill": null,
+      "one": "Running a command",
+      "many": "Running commands",
+      "text3": "Running commands (3)",
+      "failed": "⚠️ Running a command failed, continuing"
+    },
+    {
+      "tool": "bash",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "bash",
+      "lang": "zh",
+      "skill": null,
+      "one": "执行命令",
+      "many": null,
+      "text3": "执行命令 (3)",
+      "failed": "⚠️ 执行命令失败，已继续"
+    },
+    {
+      "tool": "bash",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "edit",
+      "lang": "en",
+      "skill": null,
+      "one": "Editing a file",
+      "many": "Editing files",
+      "text3": "Editing files (3)",
+      "failed": "⚠️ Editing a file failed, continuing"
+    },
+    {
+      "tool": "edit",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "edit",
+      "lang": "zh",
+      "skill": null,
+      "one": "修改文件",
+      "many": null,
+      "text3": "修改文件 (3)",
+      "failed": "⚠️ 修改文件失败，已继续"
+    },
+    {
+      "tool": "edit",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "write",
+      "lang": "en",
+      "skill": null,
+      "one": "Editing a file",
+      "many": "Editing files",
+      "text3": "Editing files (3)",
+      "failed": "⚠️ Editing a file failed, continuing"
+    },
+    {
+      "tool": "write",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "write",
+      "lang": "zh",
+      "skill": null,
+      "one": "修改文件",
+      "many": null,
+      "text3": "修改文件 (3)",
+      "failed": "⚠️ 修改文件失败，已继续"
+    },
+    {
+      "tool": "write",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "grep",
+      "lang": "en",
+      "skill": null,
+      "one": "Searching files",
+      "many": null,
+      "text3": "Searching files (3)",
+      "failed": "⚠️ Searching files failed, continuing"
+    },
+    {
+      "tool": "grep",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "grep",
+      "lang": "zh",
+      "skill": null,
+      "one": "搜索文件",
+      "many": null,
+      "text3": "搜索文件 (3)",
+      "failed": "⚠️ 搜索文件失败，已继续"
+    },
+    {
+      "tool": "grep",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "glob",
+      "lang": "en",
+      "skill": null,
+      "one": "Searching files",
+      "many": null,
+      "text3": "Searching files (3)",
+      "failed": "⚠️ Searching files failed, continuing"
+    },
+    {
+      "tool": "glob",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "glob",
+      "lang": "zh",
+      "skill": null,
+      "one": "搜索文件",
+      "many": null,
+      "text3": "搜索文件 (3)",
+      "failed": "⚠️ 搜索文件失败，已继续"
+    },
+    {
+      "tool": "glob",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "task",
+      "lang": "en",
+      "skill": null,
+      "one": "Running a sub-task",
+      "many": "Running sub-tasks",
+      "text3": "Running sub-tasks (3)",
+      "failed": "⚠️ Running a sub-task failed, continuing"
+    },
+    {
+      "tool": "task",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "task",
+      "lang": "zh",
+      "skill": null,
+      "one": "执行子任务",
+      "many": null,
+      "text3": "执行子任务 (3)",
+      "failed": "⚠️ 执行子任务失败，已继续"
+    },
+    {
+      "tool": "task",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "ls",
+      "lang": "en",
+      "skill": null,
+      "one": "Searching files",
+      "many": null,
+      "text3": "Searching files (3)",
+      "failed": "⚠️ Searching files failed, continuing"
+    },
+    {
+      "tool": "ls",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "ls",
+      "lang": "zh",
+      "skill": null,
+      "one": "搜索文件",
+      "many": null,
+      "text3": "搜索文件 (3)",
+      "failed": "⚠️ 搜索文件失败，已继续"
+    },
+    {
+      "tool": "ls",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "find",
+      "lang": "en",
+      "skill": null,
+      "one": "Searching files",
+      "many": null,
+      "text3": "Searching files (3)",
+      "failed": "⚠️ Searching files failed, continuing"
+    },
+    {
+      "tool": "find",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "find",
+      "lang": "zh",
+      "skill": null,
+      "one": "搜索文件",
+      "many": null,
+      "text3": "搜索文件 (3)",
+      "failed": "⚠️ 搜索文件失败，已继续"
+    },
+    {
+      "tool": "find",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "en",
+      "skill": null,
+      "one": "Looking something up online",
+      "many": null,
+      "text3": "Looking something up online (3)",
+      "failed": "⚠️ Looking something up online failed, continuing"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "zh",
+      "skill": null,
+      "one": "在线查询",
+      "many": null,
+      "text3": "在线查询 (3)",
+      "failed": "⚠️ 在线查询失败，已继续"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "websearch",
+      "lang": "en",
+      "skill": null,
+      "one": "Looking something up online",
+      "many": null,
+      "text3": "Looking something up online (3)",
+      "failed": "⚠️ Looking something up online failed, continuing"
+    },
+    {
+      "tool": "websearch",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "websearch",
+      "lang": "zh",
+      "skill": null,
+      "one": "在线查询",
+      "many": null,
+      "text3": "在线查询 (3)",
+      "failed": "⚠️ 在线查询失败，已继续"
+    },
+    {
+      "tool": "websearch",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "en",
+      "skill": null,
+      "one": "Editing a file",
+      "many": "Editing files",
+      "text3": "Editing files (3)",
+      "failed": "⚠️ Editing a file failed, continuing"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "zh",
+      "skill": null,
+      "one": "修改文件",
+      "many": null,
+      "text3": "修改文件 (3)",
+      "failed": "⚠️ 修改文件失败，已继续"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "en",
+      "skill": null,
+      "one": "Editing a file",
+      "many": "Editing files",
+      "text3": "Editing files (3)",
+      "failed": "⚠️ Editing a file failed, continuing"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "zh",
+      "skill": null,
+      "one": "修改文件",
+      "many": null,
+      "text3": "修改文件 (3)",
+      "failed": "⚠️ 修改文件失败，已继续"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "sh",
+      "lang": "en",
+      "skill": null,
+      "one": "Running a command",
+      "many": "Running commands",
+      "text3": "Running commands (3)",
+      "failed": "⚠️ Running a command failed, continuing"
+    },
+    {
+      "tool": "sh",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "sh",
+      "lang": "zh",
+      "skill": null,
+      "one": "执行命令",
+      "many": null,
+      "text3": "执行命令 (3)",
+      "failed": "⚠️ 执行命令失败，已继续"
+    },
+    {
+      "tool": "sh",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "shell",
+      "lang": "en",
+      "skill": null,
+      "one": "Running a command",
+      "many": "Running commands",
+      "text3": "Running commands (3)",
+      "failed": "⚠️ Running a command failed, continuing"
+    },
+    {
+      "tool": "shell",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "shell",
+      "lang": "zh",
+      "skill": null,
+      "one": "执行命令",
+      "many": null,
+      "text3": "执行命令 (3)",
+      "failed": "⚠️ 执行命令失败，已继续"
+    },
+    {
+      "tool": "shell",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "en",
+      "skill": null,
+      "one": "Reading a board topic",
+      "many": "Reading board topics",
+      "text3": "Reading board topics (3)",
+      "failed": "⚠️ Reading a board topic failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "zh",
+      "skill": null,
+      "one": "读取看板话题",
+      "many": null,
+      "text3": "读取看板话题 (3)",
+      "failed": "⚠️ 读取看板话题失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "en",
+      "skill": null,
+      "one": "Listing board issues",
+      "many": null,
+      "text3": "Listing board issues (3)",
+      "failed": "⚠️ Listing board issues failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "zh",
+      "skill": null,
+      "one": "查看看板列表",
+      "many": null,
+      "text3": "查看看板列表 (3)",
+      "failed": "⚠️ 查看看板列表失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "en",
+      "skill": null,
+      "one": "Listing board org repos",
+      "many": null,
+      "text3": "Listing board org repos (3)",
+      "failed": "⚠️ Listing board org repos failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "zh",
+      "skill": null,
+      "one": "查看看板列表",
+      "many": null,
+      "text3": "查看看板列表 (3)",
+      "failed": "⚠️ 查看看板列表失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "en",
+      "skill": null,
+      "one": "Listing board items",
+      "many": null,
+      "text3": "Listing board items (3)",
+      "failed": "⚠️ Listing board items failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "zh",
+      "skill": null,
+      "one": "查看看板列表",
+      "many": null,
+      "text3": "查看看板列表 (3)",
+      "failed": "⚠️ 查看看板列表失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying JobHub",
+      "many": null,
+      "text3": "Querying JobHub (3)",
+      "failed": "⚠️ Querying JobHub failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 JobHub",
+      "many": null,
+      "text3": "查询 JobHub (3)",
+      "failed": "⚠️ 查询 JobHub失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying JobHub",
+      "many": null,
+      "text3": "Querying JobHub (3)",
+      "failed": "⚠️ Querying JobHub failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 JobHub",
+      "many": null,
+      "text3": "查询 JobHub (3)",
+      "failed": "⚠️ 查询 JobHub失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: jobhub create plan",
+      "many": null,
+      "text3": "Working: jobhub create plan (3)",
+      "failed": "⚠️ Working: jobhub create plan failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：jobhub create plan",
+      "many": null,
+      "text3": "处理中：jobhub create plan (3)",
+      "failed": "⚠️ 处理中：jobhub create plan失败，已继续"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: fleetpilot get status",
+      "many": null,
+      "text3": "Working: fleetpilot get status (3)",
+      "failed": "⚠️ Working: fleetpilot get status failed, continuing"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：fleetpilot get status",
+      "many": null,
+      "text3": "处理中：fleetpilot get status (3)",
+      "failed": "⚠️ 处理中：fleetpilot get status失败，已继续"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying SaFE",
+      "many": null,
+      "text3": "Querying SaFE (3)",
+      "failed": "⚠️ Querying SaFE failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 SaFE",
+      "many": null,
+      "text3": "查询 SaFE (3)",
+      "failed": "⚠️ 查询 SaFE失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying SaFE",
+      "many": null,
+      "text3": "Querying SaFE (3)",
+      "failed": "⚠️ Querying SaFE failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 SaFE",
+      "many": null,
+      "text3": "查询 SaFE (3)",
+      "failed": "⚠️ 查询 SaFE失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying SaFE",
+      "many": null,
+      "text3": "Querying SaFE (3)",
+      "failed": "⚠️ Querying SaFE failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 SaFE",
+      "many": null,
+      "text3": "查询 SaFE (3)",
+      "failed": "⚠️ 查询 SaFE失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "en",
+      "skill": null,
+      "one": "Querying SaFE",
+      "many": null,
+      "text3": "Querying SaFE (3)",
+      "failed": "⚠️ Querying SaFE failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "zh",
+      "skill": null,
+      "one": "查询 SaFE",
+      "many": null,
+      "text3": "查询 SaFE (3)",
+      "failed": "⚠️ 查询 SaFE失败，已继续"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: assistant work create",
+      "many": null,
+      "text3": "Working: assistant work create (3)",
+      "failed": "⚠️ Working: assistant work create failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：assistant work create",
+      "many": null,
+      "text3": "处理中：assistant work create (3)",
+      "failed": "⚠️ 处理中：assistant work create失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: assistant review start",
+      "many": null,
+      "text3": "Working: assistant review start (3)",
+      "failed": "⚠️ Working: assistant review start failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：assistant review start",
+      "many": null,
+      "text3": "处理中：assistant review start (3)",
+      "failed": "⚠️ 处理中：assistant review start失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: assistant say",
+      "many": null,
+      "text3": "Working: assistant say (3)",
+      "failed": "⚠️ Working: assistant say failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：assistant say",
+      "many": null,
+      "text3": "处理中：assistant say (3)",
+      "failed": "⚠️ 处理中：assistant say失败，已继续"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: github list prs",
+      "many": null,
+      "text3": "Working: github list prs (3)",
+      "failed": "⚠️ Working: github list prs failed, continuing"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：github list prs",
+      "many": null,
+      "text3": "处理中：github list prs (3)",
+      "failed": "⚠️ 处理中：github list prs失败，已继续"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: agent board issue write",
+      "many": null,
+      "text3": "Working: agent board issue write (3)",
+      "failed": "⚠️ Working: agent board issue write failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：agent board issue write",
+      "many": null,
+      "text3": "处理中：agent board issue write (3)",
+      "failed": "⚠️ 处理中：agent board issue write失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: todo write",
+      "many": null,
+      "text3": "Working: todo write (3)",
+      "failed": "⚠️ Working: todo write failed, continuing"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：todo write",
+      "many": null,
+      "text3": "处理中：todo write (3)",
+      "failed": "⚠️ 处理中：todo write失败，已继续"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: a step",
+      "many": null,
+      "text3": "Working: a step (3)",
+      "failed": "⚠️ Working: a step failed, continuing"
+    },
+    {
+      "tool": "",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：a step",
+      "many": null,
+      "text3": "处理中：a step (3)",
+      "failed": "⚠️ 处理中：a step失败，已继续"
+    },
+    {
+      "tool": "",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: a step",
+      "many": null,
+      "text3": "Working: a step (3)",
+      "failed": "⚠️ Working: a step failed, continuing"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：a step",
+      "many": null,
+      "text3": "处理中：a step (3)",
+      "failed": "⚠️ 处理中：a step失败，已继续"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: x",
+      "many": null,
+      "text3": "Working: x (3)",
+      "failed": "⚠️ Working: x failed, continuing"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：x",
+      "many": null,
+      "text3": "处理中：x (3)",
+      "failed": "⚠️ 处理中：x失败，已继续"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: a b c",
+      "many": null,
+      "text3": "Working: a b c (3)",
+      "failed": "⚠️ Working: a b c failed, continuing"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：a b c",
+      "many": null,
+      "text3": "处理中：a b c (3)",
+      "failed": "⚠️ 处理中：a b c失败，已继续"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: foo bar",
+      "many": null,
+      "text3": "Working: foo bar (3)",
+      "failed": "⚠️ Working: foo bar failed, continuing"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：foo bar",
+      "many": null,
+      "text3": "处理中：foo bar (3)",
+      "failed": "⚠️ 处理中：foo bar失败，已继续"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: mcp mcp",
+      "many": null,
+      "text3": "Working: mcp mcp (3)",
+      "failed": "⚠️ Working: mcp mcp failed, continuing"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：mcp mcp",
+      "many": null,
+      "text3": "处理中：mcp mcp (3)",
+      "failed": "⚠️ 处理中：mcp mcp失败，已继续"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: s",
+      "many": null,
+      "text3": "Working: s (3)",
+      "failed": "⚠️ Working: s failed, continuing"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：s",
+      "many": null,
+      "text3": "处理中：s (3)",
+      "failed": "⚠️ 处理中：s失败，已继续"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: hook:pre tool use",
+      "many": null,
+      "text3": "Working: hook:pre tool use (3)",
+      "failed": "⚠️ Working: hook:pre tool use failed, continuing"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：hook:pre tool use",
+      "many": null,
+      "text3": "处理中：hook:pre tool use (3)",
+      "failed": "⚠️ 处理中：hook:pre tool use失败，已继续"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: weird server do it",
+      "many": null,
+      "text3": "Working: weird server do it (3)",
+      "failed": "⚠️ Working: weird server do it failed, continuing"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：weird server do it",
+      "many": null,
+      "text3": "处理中：weird server do it (3)",
+      "failed": "⚠️ 处理中：weird server do it失败，已继续"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "many": null,
+      "text3": "Working: ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv (3)",
+      "failed": "⚠️ Working: ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv failed, continuing"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "many": null,
+      "text3": "处理中：ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv (3)",
+      "failed": "⚠️ 处理中：ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv失败，已继续"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: padded tool",
+      "many": null,
+      "text3": "Working: padded tool (3)",
+      "failed": "⚠️ Working: padded tool failed, continuing"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：padded tool",
+      "many": null,
+      "text3": "处理中：padded tool (3)",
+      "failed": "⚠️ 处理中：padded tool失败，已继续"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: safe",
+      "many": null,
+      "text3": "Working: safe (3)",
+      "failed": "⚠️ Working: safe failed, continuing"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：safe",
+      "many": null,
+      "text3": "处理中：safe (3)",
+      "failed": "⚠️ 处理中：safe失败，已继续"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: agent board",
+      "many": null,
+      "text3": "Working: agent board (3)",
+      "failed": "⚠️ Working: agent board failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：agent board",
+      "many": null,
+      "text3": "处理中：agent board (3)",
+      "failed": "⚠️ 处理中：agent board失败，已继续"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: 中文 读取",
+      "many": null,
+      "text3": "Working: 中文 读取 (3)",
+      "failed": "⚠️ Working: 中文 读取 failed, continuing"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：中文 读取",
+      "many": null,
+      "text3": "处理中：中文 读取 (3)",
+      "failed": "⚠️ 处理中：中文 读取失败，已继续"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: camel case get httpthing",
+      "many": null,
+      "text3": "Working: camel case get httpthing (3)",
+      "failed": "⚠️ Working: camel case get httpthing failed, continuing"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：camel case get httpthing",
+      "many": null,
+      "text3": "处理中：camel case get httpthing (3)",
+      "failed": "⚠️ 处理中：camel case get httpthing失败，已继续"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "en",
+      "skill": null,
+      "one": "Working: x ab",
+      "many": null,
+      "text3": "Working: x ab (3)",
+      "failed": "⚠️ Working: x ab failed, continuing"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "en",
+      "skill": "jobhub",
+      "one": "Using the jobhub skill",
+      "many": null,
+      "text3": "Using the jobhub skill (3)",
+      "failed": "⚠️ Using the jobhub skill failed, continuing"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "zh",
+      "skill": null,
+      "one": "处理中：x ab",
+      "many": null,
+      "text3": "处理中：x ab (3)",
+      "failed": "⚠️ 处理中：x ab失败，已继续"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "zh",
+      "skill": "jobhub",
+      "one": "使用 jobhub 技能",
+      "many": null,
+      "text3": "使用 jobhub 技能 (3)",
+      "failed": "⚠️ 使用 jobhub 技能失败，已继续"
+    }
+  ],
+  "lookups": [
+    {
+      "tool": "read",
+      "lang": "en",
+      "label": "Reading a file"
+    },
+    {
+      "tool": "read",
+      "lang": "zh",
+      "label": "读取文件"
+    },
+    {
+      "tool": "Read",
+      "lang": "en",
+      "label": "Reading a file"
+    },
+    {
+      "tool": "Read",
+      "lang": "zh",
+      "label": "读取文件"
+    },
+    {
+      "tool": "bash",
+      "lang": "en",
+      "label": "Running a command"
+    },
+    {
+      "tool": "bash",
+      "lang": "zh",
+      "label": "执行命令"
+    },
+    {
+      "tool": "edit",
+      "lang": "en",
+      "label": "Editing a file"
+    },
+    {
+      "tool": "edit",
+      "lang": "zh",
+      "label": "修改文件"
+    },
+    {
+      "tool": "write",
+      "lang": "en",
+      "label": "Editing a file"
+    },
+    {
+      "tool": "write",
+      "lang": "zh",
+      "label": "修改文件"
+    },
+    {
+      "tool": "grep",
+      "lang": "en",
+      "label": "Searching files"
+    },
+    {
+      "tool": "grep",
+      "lang": "zh",
+      "label": "搜索文件"
+    },
+    {
+      "tool": "glob",
+      "lang": "en",
+      "label": "Searching files"
+    },
+    {
+      "tool": "glob",
+      "lang": "zh",
+      "label": "搜索文件"
+    },
+    {
+      "tool": "task",
+      "lang": "en",
+      "label": "Running a sub-task"
+    },
+    {
+      "tool": "task",
+      "lang": "zh",
+      "label": "执行子任务"
+    },
+    {
+      "tool": "ls",
+      "lang": "en",
+      "label": "Searching files"
+    },
+    {
+      "tool": "ls",
+      "lang": "zh",
+      "label": "搜索文件"
+    },
+    {
+      "tool": "find",
+      "lang": "en",
+      "label": "Searching files"
+    },
+    {
+      "tool": "find",
+      "lang": "zh",
+      "label": "搜索文件"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "en",
+      "label": "Looking something up online"
+    },
+    {
+      "tool": "WebFetch",
+      "lang": "zh",
+      "label": "在线查询"
+    },
+    {
+      "tool": "websearch",
+      "lang": "en",
+      "label": "Looking something up online"
+    },
+    {
+      "tool": "websearch",
+      "lang": "zh",
+      "label": "在线查询"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "en",
+      "label": "Editing a file"
+    },
+    {
+      "tool": "NotebookEdit",
+      "lang": "zh",
+      "label": "修改文件"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "en",
+      "label": "Editing a file"
+    },
+    {
+      "tool": "multiedit",
+      "lang": "zh",
+      "label": "修改文件"
+    },
+    {
+      "tool": "sh",
+      "lang": "en",
+      "label": "Running a command"
+    },
+    {
+      "tool": "sh",
+      "lang": "zh",
+      "label": "执行命令"
+    },
+    {
+      "tool": "shell",
+      "lang": "en",
+      "label": "Running a command"
+    },
+    {
+      "tool": "shell",
+      "lang": "zh",
+      "label": "执行命令"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "en",
+      "label": "Reading a board topic"
+    },
+    {
+      "tool": "mcp__agent-board__issue_read",
+      "lang": "zh",
+      "label": "读取看板话题"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "en",
+      "label": "Listing board issues"
+    },
+    {
+      "tool": "mcp__agent-board__list_issues",
+      "lang": "zh",
+      "label": "查看看板列表"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "en",
+      "label": "Listing board org repos"
+    },
+    {
+      "tool": "mcp__agent-board__list_org_repos",
+      "lang": "zh",
+      "label": "查看看板列表"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "en",
+      "label": "Listing board items"
+    },
+    {
+      "tool": "mcp__agent-board__list_",
+      "lang": "zh",
+      "label": "查看看板列表"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "en",
+      "label": "Querying JobHub"
+    },
+    {
+      "tool": "mcp__jobhub__get_plan",
+      "lang": "zh",
+      "label": "查询 JobHub"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "en",
+      "label": "Querying JobHub"
+    },
+    {
+      "tool": "mcp__jobhub__list_runs",
+      "lang": "zh",
+      "label": "查询 JobHub"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "en",
+      "label": "Querying JobHub"
+    },
+    {
+      "tool": "mcp__jobhub__create_plan",
+      "lang": "zh",
+      "label": "查询 JobHub"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "en",
+      "label": "Querying FleetPilot"
+    },
+    {
+      "tool": "mcp__fleetpilot__get_status",
+      "lang": "zh",
+      "label": "查询 FleetPilot"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "en",
+      "label": "Checking SaFE workloads"
+    },
+    {
+      "tool": "mcp__safe__workload_list",
+      "lang": "zh",
+      "label": "查询 SaFE 工作负载"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "en",
+      "label": "Checking SaFE nodes"
+    },
+    {
+      "tool": "mcp__safe__node_get",
+      "lang": "zh",
+      "label": "查询 SaFE 节点"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "en",
+      "label": "Checking SaFE nodes"
+    },
+    {
+      "tool": "mcp__safe__node_cordon",
+      "lang": "zh",
+      "label": "查询 SaFE 节点"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "en",
+      "label": "Querying SaFE"
+    },
+    {
+      "tool": "mcp__safe__apikey_current",
+      "lang": "zh",
+      "label": "查询 SaFE"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "en",
+      "label": "Starting a task"
+    },
+    {
+      "tool": "mcp__assistant__work_create",
+      "lang": "zh",
+      "label": "创建任务"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "en",
+      "label": "Starting a review"
+    },
+    {
+      "tool": "mcp__assistant__review_start",
+      "lang": "zh",
+      "label": "发起代码评审"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "en",
+      "label": "Working: assistant say"
+    },
+    {
+      "tool": "mcp__assistant__say",
+      "lang": "zh",
+      "label": "处理中：assistant say"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "en",
+      "label": "Working: github list prs"
+    },
+    {
+      "tool": "mcp__github__list_prs",
+      "lang": "zh",
+      "label": "处理中：github list prs"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "en",
+      "label": "Working: agent board issue write"
+    },
+    {
+      "tool": "mcp__agent-board__issue_write",
+      "lang": "zh",
+      "label": "处理中：agent board issue write"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "en",
+      "label": "Working: todo write"
+    },
+    {
+      "tool": "TodoWrite",
+      "lang": "zh",
+      "label": "处理中：todo write"
+    },
+    {
+      "tool": "",
+      "lang": "en",
+      "label": "Working: a step"
+    },
+    {
+      "tool": "",
+      "lang": "zh",
+      "label": "处理中：a step"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "en",
+      "label": "Working: a step"
+    },
+    {
+      "tool": "mcp__",
+      "lang": "zh",
+      "label": "处理中：a step"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "en",
+      "label": "Working: x"
+    },
+    {
+      "tool": "mcp__x",
+      "lang": "zh",
+      "label": "处理中：x"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "en",
+      "label": "Working: a b c"
+    },
+    {
+      "tool": "mcp__a__b__c",
+      "lang": "zh",
+      "label": "处理中：a b c"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "en",
+      "label": "Working: foo bar"
+    },
+    {
+      "tool": "MCP__Foo__Bar",
+      "lang": "zh",
+      "label": "处理中：foo bar"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "en",
+      "label": "Working: mcp mcp"
+    },
+    {
+      "tool": "mcp__mcp__mcp__",
+      "lang": "zh",
+      "label": "处理中：mcp mcp"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "en",
+      "label": "Working: s"
+    },
+    {
+      "tool": "mcp__s__",
+      "lang": "zh",
+      "label": "处理中：s"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "en",
+      "label": "Working: hook:pre tool use"
+    },
+    {
+      "tool": "hook:PreToolUse",
+      "lang": "zh",
+      "label": "处理中：hook:pre tool use"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "en",
+      "label": "Working: weird server do it"
+    },
+    {
+      "tool": "mcp__weird server__do it!",
+      "lang": "zh",
+      "label": "处理中：weird server do it"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "en",
+      "label": "Working: ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+    },
+    {
+      "tool": "mcp__ok__vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+      "lang": "zh",
+      "label": "处理中：ok vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "en",
+      "label": "Working: padded tool"
+    },
+    {
+      "tool": " mcp__padded__tool ",
+      "lang": "zh",
+      "label": "处理中：padded tool"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "en",
+      "label": "Working: safe"
+    },
+    {
+      "tool": "mcp__safe",
+      "lang": "zh",
+      "label": "处理中：safe"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "en",
+      "label": "Working: agent board"
+    },
+    {
+      "tool": "mcp__agent-board",
+      "lang": "zh",
+      "label": "处理中：agent board"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "en",
+      "label": "Working: 中文 读取"
+    },
+    {
+      "tool": "mcp__中文__读取",
+      "lang": "zh",
+      "label": "处理中：中文 读取"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "en",
+      "label": "Working: camel case get httpthing"
+    },
+    {
+      "tool": "mcp__CamelCase__getHTTPThing",
+      "lang": "zh",
+      "label": "处理中：camel case get httpthing"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "en",
+      "label": "Working: x ab"
+    },
+    {
+      "tool": "mcp__x__a😀b",
+      "lang": "zh",
+      "label": "处理中：x ab"
+    }
+  ],
+  "skills": [
+    {
+      "command": "python3 /workspace/.skills/jobhub/scripts/api.py GET \"/plans/20\"",
+      "skill": "jobhub"
+    },
+    {
+      "command": "cat /workspace/.skills/primus-platform/SKILL.md",
+      "skill": "primus-platform"
+    },
+    {
+      "command": "python3 ~/.skills/agent-board/scripts/x.py",
+      "skill": "agent-board"
+    },
+    {
+      "command": "ls -la /workspace && git status",
+      "skill": null
+    },
+    {
+      "command": "ls /workspace/.skills/",
+      "skill": null
+    },
+    {
+      "command": "cat /workspace/.skills/../../etc/passwd",
+      "skill": null
+    },
+    {
+      "command": "cat /workspace/.skills/$(whoami)/x",
+      "skill": null
+    },
+    {
+      "command": "cat /workspace/.skills/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x",
+      "skill": null
+    }
+  ],
+  "shells": [
+    {
+      "tool": " Bash ",
+      "shell": true
+    },
+    {
+      "tool": "sh",
+      "shell": true
+    },
+    {
+      "tool": "zsh",
+      "shell": false
+    },
+    {
+      "tool": "SHELL",
+      "shell": true
+    },
+    {
+      "tool": "",
+      "shell": false
+    }
+  ]
+}
