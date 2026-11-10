@@ -24,6 +24,10 @@ export class FakeAssistantClaw {
   readonly calls: string[] = [];
   readonly running = new Set<string>();
   readonly uploads: { sessionId: string; folder: string; names: string[] }[] = [];
+  /** The sessions `turn` was asked about, in order. */
+  readonly turnsAsked: string[] = [];
+  /** Runs when `turn` is asked, before it answers (what a test does meanwhile). */
+  onTurn: (() => Promise<void>) | undefined;
   /** The error the next call of a kind throws (kept until cleared). */
   readonly fail = new Map<Call, Error>();
   /** Files Claw refuses by name. */
@@ -69,9 +73,11 @@ export class FakeAssistantClaw {
   };
 
   readonly sessions: Pick<ClawSessionsPort, "turn" | "interrupt" | "stream" | "uploadFiles"> = {
-    turn: (_key, sessionId) => {
+    turn: async (_key, sessionId) => {
+      this.turnsAsked.push(sessionId);
       this.check("turn");
-      return Promise.resolve({ running: this.running.has(sessionId), messageId: this.turnMessage || null });
+      await this.onTurn?.();
+      return { running: this.running.has(sessionId), messageId: this.turnMessage || null };
     },
     interrupt: (_key, sessionId) => {
       this.check("interrupt");

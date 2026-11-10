@@ -13,6 +13,9 @@ import { flushMicrotasks } from "../../../../test-support/clock.js";
 import { finals, liveWorld, sent, streamed } from "../../../../test-support/assistant/live-world.js";
 import { modelOf, viewsOf } from "../../../../test-support/assistant/view-of.js";
 import { LIVE_ONLY, SAY_TOOL } from "../../src/assistant/follow.js";
+import type { AssistantChat as AssistantChatPort } from "../../src/routing/features.js";
+import { ALICE as ROUTER_ALICE } from "../../../../test-support/routing/fixtures.js";
+import { message, world as routerWorld } from "../../../../test-support/routing/world.js";
 import type { JsonObject } from "../../src/json.js";
 import type { OutMessage } from "../../src/ports/surface.js";
 
@@ -244,4 +247,195 @@ it("a streamed reply about a result is said once and its card follows with the b
   const model = modelOf(cards[0], "workCard");
   assert.equal(model.item.canAccept, true);
   assert.ok(!model.text.includes(words), "the words are not said again in the card");
+});
+
+// --- a reply closes only the receipt of the message it answers (internal #496) -------------------------------------------------
+
+const RESULT_796 = "**❌ #796 删除 SaFE workload（global-cpu）未执行**：你在审批卡片上拒绝了删除。";
+const STARTED_797 = "已开始：#797 写问候语存成 hello.md。有结果或需要你时我会告诉你。";
+const ALICE = "aad-a";
+const SID = "asst-ak-alice"; // (the fake's assistant session of Alice's key)
+
+/**
+ * A 1:1 message to the assistant while another turn of its session (a task's report woke it) is running, the turn
+ * `claw-pending-3934`. An event of `otherKind` arrives while the message's receipt is open, then the message's own reply, said
+ * by `ownTurn`. With `queued`, Claw queued the message behind the running turn (no message id). `when` the other event arrives:
+ * "after" the message was handed over, "before_send" (the receipt is open and the message not yet handed over) or "in_flight"
+ * (Claw has the message and has not answered the send yet). Returns the outbox and whether the receipt was still open after the
+ * other event (Python `other_turn_meanwhile`).
+ */
+async function otherTurnMeanwhile(o: {
+  queued: boolean;
+  otherKind: string;
+  otherText: string;
+  otherExtra: JsonObject;
+  ownTurn: string;
+  when?: "after" | "before_send" | "in_flight";
+  /** The message comes through the worker's router (its 1:1 chat, as Teams sends it), not straight to the assistant. */
+  viaRouter?: boolean;
+}) {
+  const when = o.when ?? "after";
+  const l = await liveWorld();
+  l.w.claw.running.add(SID);
+  l.w.claw.turnMessage = "claw-pending-3934";
+  l.w.claw.queue = o.queued;
+  const conversation = `c-${ALICE}`;
+  const seen: boolean[] = [];
+  const pushOther = async (): Promise<void> => {
+    assert.ok(l.w.receipts.openOf(conversation) !== undefined, "the message has a receipt of its own");
+    const other = { type: o.otherKind, event_id: "e-other", text: o.otherText, ...o.otherExtra };
+    assert.equal(await l.push(other), "delivered");
+    seen.push(l.w.receipts.openOf(conversation) !== undefined);
+  };
+  const send = l.w.claw.assistant.send;
+  (l.w.claw.assistant as { send: typeof send }).send = async (...args) => {
+    const out = await send(...args);
+    if (when === "in_flight") await pushOther();
+    return out;
+  };
+  // (the turn in front is read once the receipt is open and before the message is handed over)
+  l.w.claw.onTurn = () => (when === "before_send" ? pushOther() : Promise.resolve());
+  const asked = "写一句问候语存成 hello.md，先问我中文还是英文";
+  try {
+    if (o.viaRouter === true) {
+      const r = routerWorld({
+        testStore: { store: l.w.store, clock: l.w.clock } as never,
+        surface: l.w.surface,
+        // (the assistant as the assembly hands it to the router: its methods, bound)
+        assistant: {
+          on: (userId) => l.w.chat.on(userId),
+          understands: (userId) => l.w.chat.understands(userId),
+          reachable: (userId) => l.w.chat.reachable(userId),
+          route: (request) => l.w.chat.route(request),
+        } satisfies Partial<AssistantChatPort>,
+      });
+      const inbound = message(asked, { user: { ...ROUTER_ALICE, id: ALICE }, conversation, id: "act-1" });
+      // (Teams' reference of the chat names the activity being answered: the receipt stands under it)
+      const wire = { ...inbound.conversation.wire, activityId: "act-1" };
+      await r.router.handle({ ...inbound, conversation: { ...inbound.conversation, wire } });
+      await r.router.settled();
+      assert.deepEqual(l.w.heard(), [asked]);
+    } else {
+      assert.equal(await l.w.say(asked), true);
+    }
+  } finally {
+    l.w.claw.running.delete(SID);
+  }
+  if (when === "after") await pushOther();
+  await flushMicrotasks();
+  const openAfterOther = seen.length === 1 && seen[0] === true && l.w.receipts.openOf(conversation) !== undefined;
+  const own = { type: "assistant.say", event_id: "e-own", text: STARTED_797, turn_message_id: o.ownTurn };
+  assert.equal(await l.push(own), "delivered");
+  await flushMicrotasks();
+  return { outbox: l.w.surface.outbox, openAfterOther, calls: [...l.w.claw.calls] };
+}
+
+const textOf = (m: OutMessage) =>
+  m.body.type === "text" ? m.body.text : m.body.type === "rich" ? m.body.markdown : JSON.stringify(m.body);
+
+function assertClosedByItsOwnReply(r: Awaited<ReturnType<typeof otherTurnMeanwhile>>, otherMark: string): void {
+  assert.ok(r.openAfterOther, "the other turn's words leave the receipt open");
+  const closedWith = finals(r.outbox).map(textOf);
+  assert.ok(closedWith.length === 1 && closedWith[0]?.includes("#797"), JSON.stringify(closedWith));
+  const messages = sent(r.outbox).map(textOf);
+  assert.ok(
+    messages.some((t) => t.includes(otherMark)),
+    JSON.stringify(messages),
+  );
+  assert.ok(!messages.some((t) => t.includes("#797")), JSON.stringify(messages));
+}
+
+it("another turns reply while a queued message waits is a message of its own", async () => {
+  // The release gate's failure (2026-11-10 05:11Z): the message asking for #797 was queued behind the turn reporting #796
+  // (claw-pending-3934), whose "❌ #796 … 未执行" closed the receipt under the #797 message.
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "claw-pending-3935",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+  // (what goes to Claw, in order: the assistant's session, the turn in front of the message, the message)
+  assert.deepEqual(
+    r.calls.filter((c) => c !== "upload"),
+    ["session", "turn", "send"],
+  );
+});
+
+it("another turns reply while a queued message waits is a message of its own, through the router", async () => {
+  // (the same, end to end: Alice's message as Teams sends it, read by the router, which hands it to the assistant)
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "claw-pending-3935",
+    viaRouter: true,
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("another turns reply does not close the receipt of a message claw took at once", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: false,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "msg-1", // (the message's id, as Claw gave it at once)
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+for (const queued of [true, false]) {
+  for (const when of ["before_send", "in_flight"] as const) {
+    it(`another turns reply while the message is being handed over is a message of its own (${when}, ${queued ? "queued" : "taken"})`, async () => {
+      const r = await otherTurnMeanwhile({
+        queued,
+        otherKind: "assistant.say",
+        otherText: RESULT_796,
+        otherExtra: { turn_message_id: "claw-pending-3934" },
+        ownTurn: queued ? "claw-pending-3935" : "msg-1",
+        when,
+      });
+      assertClosedByItsOwnReply(r, "#796");
+    });
+  }
+}
+
+it("a reply naming no turn before the message is handed over is a message of its own", async () => {
+  // (Claw's notice of a lost turn is an assistant.say with no turn_message_id)
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: {},
+    ownTurn: "claw-pending-3935",
+    when: "before_send",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("a tasks own notice never closes the receipt of a message", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "work_item.needs_you",
+    otherText: "#796 needs your attention.",
+    otherExtra: { fallback: true },
+    ownTurn: "claw-pending-3935",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("a reply that names no turn still closes the receipt", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: STARTED_797,
+    otherExtra: {},
+    ownTurn: "claw-pending-3935",
+  });
+  assert.equal(r.openAfterOther, false);
+  const closedWith = finals(r.outbox).map(textOf);
+  assert.ok(closedWith.length === 1 && closedWith[0]?.includes("#797"), JSON.stringify(closedWith));
 });

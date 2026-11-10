@@ -28,6 +28,7 @@ import { clawFailure, refusal } from "./failures.js";
 import type { Receipt } from "./receipt.js";
 import type { Receipts } from "./receipts.js";
 import { streamOpener } from "./tracked-stream.js";
+import { TurnInFront } from "./turn-in-front.js";
 
 /** A Claw that answers "no assistant here" is not asked again for this long. */
 export const OFF_SECONDS = 60;
@@ -169,7 +170,7 @@ export class AssistantChat {
       return false;
     }
     const handing = { ...request };
-    const sent = await this.handTo(handing, async (sessionId) => {
+    const sent = await this.handTo(handing, async (sessionId, handingOver) => {
       const folderId =
         typeof request.context["channel_message_id"] === "string" ? request.context["channel_message_id"] : "";
       const context = request.files.length
@@ -178,6 +179,7 @@ export class AssistantChat {
             files: await this.handOverFiles(handing, sessionId, folderId || this.o.random.hexId(), request.files),
           }
         : request.context;
+      handingOver();
       return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
         ...(request.modelKey ? { modelKey: request.modelKey } : {}),
         context,
@@ -264,12 +266,13 @@ export class AssistantChat {
     const handing = { ...request, lang: this.langOf(request.userId, request.prompt) };
     const sent = await this.handTo(
       handing,
-      async () => {
+      async (_sessionId, handingOver) => {
         const files = request.files.length
           ? { files: await this.handOverFiles(handing, sessionId, this.o.random.hexId(), request.files) }
           : {};
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
         const context = { ...files, ...attached };
+        handingOver();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),
           ...(this.o.pluginId === undefined ? {} : { plugin: this.o.pluginId }),
@@ -289,19 +292,31 @@ export class AssistantChat {
 
   /**
    * Acknowledge the message (receipt or typing), follow its turn into the receipt, and send it with `send` (given the assistant's
-   * session id). `ok` when the assistant has it; otherwise Claw's refusal (undefined when it did not answer).
+   * session id, and `handingOver`, which `send` calls just before the message goes to Claw). The turn in front of the message is
+   * read first (at most FRONT_TURN_SECONDS), so that only the message's own turn closes its receipt, and only then is its turn
+   * followed: the follower's first read never races the read of the turn in front. `ok` when the assistant has it; otherwise
+   * Claw's refusal (undefined when it did not answer).
    */
   private async handTo(
     handing: Handing,
-    send: (sessionId: string) => Promise<string | null>,
+    send: (sessionId: string, handingOver: () => void) => Promise<string | null>,
     knownSession?: string,
   ): Promise<{ ok: true } | { ok: false; error: { status: number } | undefined }> {
     let follower: TurnFollower | undefined;
     let messageId: string | undefined;
+    let front: TurnInFront | undefined;
     try {
       const sessionId = knownSession ?? (await this.o.claw.assistant.session(handing.credential)).sessionId;
-      follower = this.follow(handing, sessionId, await this.acknowledge(handing));
-      const sent = await send(sessionId);
+      const receipt = await this.acknowledge(handing);
+      front = new TurnInFront(
+        { sessions: this.o.claw.sessions, clock: this.o.clock, logger: this.o.logger },
+        handing.credential,
+        sessionId,
+      );
+      const behind = await front.before(receipt);
+      follower = this.follow(handing, sessionId, receipt);
+      const sent = await send(sessionId, () => receipt?.handingOver(behind));
+      receipt?.takenAs(sent);
       messageId = sent ?? undefined;
       this.tellSent(handing.onSent, sessionId, sent);
       return { ok: true };
@@ -314,6 +329,7 @@ export class AssistantChat {
       );
       return { ok: false, error: refused ? { status: refused.status } : undefined };
     } finally {
+      front?.abandon();
       follower?.answers(messageId);
     }
   }
@@ -368,6 +384,7 @@ export class AssistantChat {
         streamOpener(conversation, replyTo, this.o.clock),
       );
       if (receipt !== undefined) {
+        receipt.awaitHandOver(); // (until the message is handed to Claw: `handingOver`)
         receipt.head = this.o.directChat.clawyExtras(this.attachedReader(), handing.userId, handing.lang).head;
         return receipt;
       }
