@@ -11,8 +11,6 @@ import type { InboundFile, InboundMessage } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { CommandTable } from "./command-table.js";
 import type { RouterContext } from "./context.js";
-import type { OnSent } from "./features.js";
-import { StopOffers } from "./stop-offers.js";
 import type { TurnStarter } from "./turn-start.js";
 
 const ELSEWHERE = "Files are not passed on from this chat while it talks to an agent; only your words were sent.";
@@ -23,15 +21,11 @@ const ELSEWHERE = "Files are not passed on from this chat while it talks to an a
  * to the remote agent the chat is attached to, to the person's assistant, or to Claw as a turn.
  */
 export class PersonalText {
-  private readonly stops: StopOffers;
-
   constructor(
     private readonly ctx: RouterContext,
     private readonly commands: CommandTable,
     private readonly starter: TurnStarter,
-  ) {
-    this.stops = new StopOffers(ctx);
-  }
+  ) {}
 
   /**
    * What the person wrote, with a word of the commands menu read as its command and a sentence help teaches read as the
@@ -122,9 +116,7 @@ export class PersonalText {
     if (control && assistant.understands(userId)) {
       await this.understand(message, chat, key); // (the switch is put to the person as a button)
     } else if (prompt && toAgent && !control) {
-      const before = this.ctx.deps.remote.currentTurn?.(userId);
       await this.remotePrompt(message, chat, key, prompt);
-      this.stops.remote(message, chat, before);
     } else if (prompt || files.length > 0) {
       await this.toAssistantOrTurn(message, chat, key, { text, quote, sent, prompt, files });
     }
@@ -163,7 +155,6 @@ export class PersonalText {
       conversation: chat.conversation,
       files: said.files,
       ...(await this.attached(userId, key)),
-      ...onSentOf(this.stops.assistant(message, chat, key)),
     });
     if (routed) return;
     this.ctx.admission.dropLastHandoff(userId); // (not the assistant's after all: a turn here, counted as one)
@@ -290,7 +281,6 @@ export class PersonalText {
       lang: chat.lang(),
       conversation: chat.conversation,
       files,
-      ...onSentOf(this.stops.assistant(message, chat, key)),
     });
     if (!sent && held) this.ctx.admission.dropLastHandoff(userId);
   }
@@ -319,9 +309,4 @@ export async function filesNotReviewed(
       ? "随这条消息发来的文件没有交给 review：review 只读拉取请求本身。"
       : "The files sent with this message were not passed on: a review reads the pull request itself.",
   );
-}
-
-/** `{ onSent }` when there is one (the request leaves the field out otherwise). */
-function onSentOf(onSent: OnSent | undefined): { onSent?: OnSent } {
-  return onSent === undefined ? {} : { onSent };
 }

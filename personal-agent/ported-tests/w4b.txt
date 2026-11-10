@@ -280,7 +280,6 @@ teams/tests/test_reply_style.py::test_a_status_message_without_a_stream_is_the_s
 
 # A Python change after the baseline (ported ahead): stop_button.py and render.stop_card. Its agent, assistant and
 # remote tests (a press interrupts the turn, the card per kind of turn) are the router's, W5's and W6's.
-teams/tests/test_stop_button.py::test_a_turn_that_ends_before_the_delay_gets_no_card_and_one_that_runs_on_gets_it_and_loses_it_at_its_end -> packages/core/test/turn/stop-buttons.test.ts::test_a_turn_that_ends_before_the_delay_gets_no_card_and_one_that_runs_on_gets_it_and_loses_it_at_its_end
-teams/tests/test_stop_button.py::test_a_token_is_forgotten_after_its_time -> packages/core/test/turn/stop-buttons.test.ts::test_a_token_is_forgotten_after_its_time
+# (#481 deleted test_stop_button.py's delay and token tests; StopButtons keeps them as tests of its own)
 teams/tests/test_stop_button.py::test_the_card_says_what_it_does_in_the_persons_language_and_carries_only_the_token -> packages/teams/test/turn-views.test.ts::test_the_card_says_what_it_does_in_the_persons_language_and_carries_only_the_token
 # reassigned: teams/tests/test_reply_style.py::test_the_informative_text_is_cut_to_teams_limits_keeping_the_newest -> W3

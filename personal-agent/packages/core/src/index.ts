@@ -35,6 +35,8 @@ export * from "./claw/remote.js";
 export * from "./config/settings.js";
 export * from "./observability/security-events.js";
 export * as turn from "./turn/index.js";
+// (the assembly runs the changes card's read itself)
+export { fetchChanges } from "./turn/changes.js";
 export * from "./note/note.js";
 export * from "./branding.js";
 export * from "./claw/message-text.js";
