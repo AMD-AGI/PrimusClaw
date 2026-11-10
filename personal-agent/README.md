@@ -181,8 +181,9 @@ The store defaults to `/data/state.db`; the volume must be writable by uid 65534
 touches it and never pushes it. `/metrics` names the running build as
 `personal_agent_build_info{version="<the teams package version>",node="<Node.js version>"} 1`.
 
-A deployment's own entry builds the worker with `buildWorker(env, plugins, options)` (or `main(env, plugins)`); its
-MCP servers and `/whoami` lines go in through `options.registerIntegrations(registry)`, on top of the plugins' own.
+A deployment's own entry builds the worker with `buildWorker(env, plugins, options)`; its MCP servers and `/whoami`
+lines go in through `options.registerIntegrations(registry)`, on top of the plugins' own (`main(env, plugins)` takes no
+options).
 
 The worker reads its whole configuration from the environment once, at start. A setting it cannot use (a required one
 missing, a malformed number, an unknown word in a strict switch) stops it before it takes a message, with one line on

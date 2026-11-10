@@ -133,7 +133,8 @@ jobs:
         if [[ "${{ steps.detect-changes.outputs.claw_changed }}" == "true" ]]; then
           MATRIX+='{"name":"claw","context_path":"claw","dockerfile_path":"claw/Dockerfile"},'
         fi
-        # "push":"no": the image is built and smoke-tested here, never pushed (a release publishes it).
+        # "push":"no": the image is built and smoke-tested here and never pushed, on any event. No workflow pushes it
+        # yet: publishing it is for the personal agent's own release workflow, still to be written.
         if [[ "${{ steps.detect-changes.outputs.personal_agent_changed }}" == "true" ]]; then
           MATRIX+='{"name":"personal-agent-teams","context_path":".","dockerfile_path":"personal-agent/Dockerfile","push":"no"},'
         fi
@@ -256,8 +257,7 @@ jobs:
       - name: Push with Buildah
         if: github.event_name != 'pull_request' && matrix.push != 'no'
         env:
-          # The registry and namespace images are pushed to, a repository variable so a move needs no workflow edit.
-          DOCKERIO_REPOSITORY: ${{ vars.IMAGE_REPOSITORY_PREFIX || 'docker.io/primussafe' }}
+          DOCKERIO_REPOSITORY: docker.io/primussafe
           IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
           DATE_TIME: ${{ needs.detect-changes.outputs.date_time }}
         run: |

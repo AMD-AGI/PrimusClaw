@@ -26,7 +26,8 @@ export interface WorkerOptions {
   readonly fetch?: typeof fetch;
   /**
    * A deployment's own services (its MCP servers, its /whoami lines), registered as the worker is built, on top of
-   * whatever the plugins' `integrations` already hold. The public worker registers none.
+   * whatever the plugins' `integrations` already hold. Registering a server again renames it, but cannot clear the
+   * `query` flag the plugins gave it (the registry only adds). The public worker registers none.
    */
   readonly registerIntegrations?: (registry: IntegrationRegistry) => void;
 }
