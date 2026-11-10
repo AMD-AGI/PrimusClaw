@@ -343,6 +343,11 @@ export function trim(address: string): string {
   return url.slice(0, end);
 }
 
+/** `text` with markdown's backslash escapes resolved (`example\\.com` is `example.com`), as the client shows it. */
+function unescaped(text: string): string {
+  return text.replace(/\\([!-/:-@[-`{-~])/gu, "$1");
+}
+
 /** `text` in a code span, which no client makes a link of (a backtick in it made a look-alike). */
 function code(text: string): string {
   return text ? `${CODE}${text.replaceAll("`", "\u{2cb}")}${CODE}` : "";
@@ -378,8 +383,10 @@ export function bare(text: string, mark: Mark): string {
       i = start + 1;
       continue;
     }
-    // (in a path: kept as it is, in a code span)
-    out.push(start && text.charAt(start - 1) === "/" ? code(url) : mark("", url.replaceAll("\\", "")) || code(url));
+    // (in a path: kept as it is, in a code span; a bare domain whole, as the client shows it, in a code span)
+    if (run >= 0) out.push(code(unescaped(url)));
+    else
+      out.push(start && text.charAt(start - 1) === "/" ? code(url) : mark("", url.replaceAll("\\", "")) || code(url));
     i = start + url.length;
   }
   out.push(text.slice(i));
@@ -476,17 +483,17 @@ export function breakDomainsAndMails(text: string): string {
 /** A bare domain left in prose next to a code span or a host made here: the scans read `docs.evil.mdmailto:` as one word, but
  * once `mailto:` is code the client sees `docs.evil.md` on its own. Each stretch of prose between spans is read again for bare
  * domains, its ends as a start and an end. */
-export function leftoverDomains(text: string, mark: Mark): string {
+export function leftoverDomains(text: string): string {
   return (
     text
       // eslint-disable-next-line no-control-regex -- a host's token and a code span's marks are these control characters
       .split(/(\x00\d+\x00|\x02[^\x02]*\x02)/u)
-      .map((part, n) => (n % 2 ? part : domainsIn(part, mark)))
+      .map((part, n) => (n % 2 ? part : domainsIn(part)))
       .join("")
   );
 }
 
-function domainsIn(text: string, mark: Mark): string {
+function domainsIn(text: string): string {
   const out: string[] = [];
   let i = 0;
   for (const [start, run] of domains(text)) {
@@ -495,7 +502,7 @@ function domainsIn(text: string, mark: Mark): string {
     if (":/?#".includes(text.charAt(run) || " "))
       while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
     const url = trim(text.slice(start, stop));
-    out.push(text.slice(i, start), mark("", url.replaceAll("\\", "")) || code(url));
+    out.push(text.slice(i, start), code(unescaped(url)));
     i = start + url.length;
   }
   out.push(text.slice(i));

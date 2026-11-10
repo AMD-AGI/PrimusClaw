@@ -1,5 +1,5 @@
 {
- "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same. A backtick of the agent's own left in prose (one that opens no code span the rich text reads within a line) is shown as `ˋ`, so a code span made here pairs with nothing else; a mail address inside an address already made code is not made code again. Table rows (a line with a | over a separator line, and the rows after it that hold one) are read cell by cell, as the chat's rich text reads them. A bare domain (labels ending in a known top-level domain: the common generic ones and every two-letter country code, not right after an ASCII letter or digit, `.`, `-`, `@` or `/`) is an address too, except a two-label name with a country code and nothing after it (`README.md`, `self.id`).",
+ "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same. A backtick of the agent's own left in prose (one that opens no code span the rich text reads within a line) is shown as `ˋ`, so a code span made here pairs with nothing else; a mail address inside an address already made code is not made code again. Table rows (a line with a | over a separator line, and the rows after it that hold one) are read cell by cell, as the chat's rich text reads them. A bare domain is an address too: a run of labels (a dot or a hyphen possibly escaped) not right after an ASCII letter or digit, `.`, `-`, `@` or `/`, whose last label is any of two letters or more when it has three labels or more or a port, path, query or fragment after it, and a common generic top-level domain when it is `name.tld` alone (`README.md`, `self.id` stay words); it is shown whole, as the client shows it, in a code span (`main.py:42`).",
  "cases": [
   {
    "about": "plain link",
@@ -538,19 +538,19 @@
    ]
   },
   {
-   "about": "a bare domain is its host in a code span",
+   "about": "a bare domain is shown whole in a code span",
    "input": "Visit example.com/path, or sub.example.co.uk.",
    "lang": "en",
    "expected": [
-    "Visit `example.com`, or `sub.example.co.uk`."
+    "Visit `example.com/path`, or `sub.example.co.uk`."
    ]
   },
   {
-   "about": "a bare domain is its host in a code span",
+   "about": "a bare domain is shown whole in a code span",
    "input": "Visit example.com/path, or sub.example.co.uk.",
    "lang": "zh",
    "expected": [
-    "Visit `example.com`, or `sub.example.co.uk`."
+    "Visit `example.com/path`, or `sub.example.co.uk`."
    ]
   },
   {
@@ -558,7 +558,7 @@
    "input": "see example\\.com and api.github.io/x",
    "lang": "en",
    "expected": [
-    "see `example.com` and `api.github.io`"
+    "see `example.com` and `api.github.io/x`"
    ]
   },
   {
@@ -566,7 +566,7 @@
    "input": "see example\\.com and api.github.io/x",
    "lang": "zh",
    "expected": [
-    "see `example.com` and `api.github.io`"
+    "see `example.com` and `api.github.io/x`"
    ]
   },
   {
@@ -574,7 +574,7 @@
    "input": "README.md, setup.py, self.id and arr.at stay; docs.evil.md and evil.md/login do not",
    "lang": "en",
    "expected": [
-    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md` do not"
+    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md/login` do not"
    ]
   },
   {
@@ -582,7 +582,7 @@
    "input": "README.md, setup.py, self.id and arr.at stay; docs.evil.md and evil.md/login do not",
    "lang": "zh",
    "expected": [
-    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md` do not"
+    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md/login` do not"
    ]
   },
   {
@@ -631,6 +631,86 @@
    "lang": "zh",
    "expected": [
     "h|x\n---|---\nˋˋˋinfo|x|\n`victim@example.com`|row|"
+   ]
+  },
+  {
+   "about": "a bare address is shown whole in a code span, its port, path or line number kept",
+   "input": "fix it in main.py:42, or see example.com/path?x=1.",
+   "lang": "en",
+   "expected": [
+    "fix it in `main.py:42`, or see `example.com/path?x=1`."
+   ]
+  },
+  {
+   "about": "a bare address is shown whole in a code span, its port, path or line number kept",
+   "input": "fix it in main.py:42, or see example.com/path?x=1.",
+   "lang": "zh",
+   "expected": [
+    "fix it in `main.py:42`, or see `example.com/path?x=1`."
+   ]
+  },
+  {
+   "about": "three labels or a tail: any last label of two letters or more is a top-level domain",
+   "input": "docs.example.museum/path, a.b.example.zz and site.example.qq:8080 and os.path.join(x)",
+   "lang": "en",
+   "expected": [
+    "`docs.example.museum/path`, `a.b.example.zz` and `site.example.qq:8080` and `os.path.join`(x)"
+   ]
+  },
+  {
+   "about": "three labels or a tail: any last label of two letters or more is a top-level domain",
+   "input": "docs.example.museum/path, a.b.example.zz and site.example.qq:8080 and os.path.join(x)",
+   "lang": "zh",
+   "expected": [
+    "`docs.example.museum/path`, `a.b.example.zz` and `site.example.qq:8080` and `os.path.join`(x)"
+   ]
+  },
+  {
+   "about": "three labels or a tail, but no top-level domain",
+   "input": "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this",
+   "lang": "en",
+   "expected": [
+    "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this"
+   ]
+  },
+  {
+   "about": "three labels or a tail, but no top-level domain",
+   "input": "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this",
+   "lang": "zh",
+   "expected": [
+    "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this"
+   ]
+  },
+  {
+   "about": "an escaped hyphen in a label is a hyphen",
+   "input": "foo\\-bar.com/path and docs.foo\\-bar.example.org",
+   "lang": "en",
+   "expected": [
+    "`foo-bar.com/path` and `docs.foo-bar.example.org`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen in a label is a hyphen",
+   "input": "foo\\-bar.com/path and docs.foo\\-bar.example.org",
+   "lang": "zh",
+   "expected": [
+    "`foo-bar.com/path` and `docs.foo-bar.example.org`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen and dot together",
+   "input": "see a\\-b\\.example.net:8080/x",
+   "lang": "en",
+   "expected": [
+    "see `a-b.example.net:8080/x`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen and dot together",
+   "input": "see a\\-b\\.example.net:8080/x",
+   "lang": "zh",
+   "expected": [
+    "see `a-b.example.net:8080/x`"
    ]
   }
  ]

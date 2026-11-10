@@ -153,7 +153,7 @@ test("a character, a bracket and a space are read as Python reads them", () => {
     ["see https://[v1.host]/x", "see `v1.host`"],
     ["see https://u[1]@host.example/x", "see `https:​//u[1]@host.example/x`"],
     ["see https://[::1]:8080/x", "see `https:​//[::1]:8080/x`"],
-    ["a\u{1d400}www.evil.example", "a\u{1d400}www​.evil.example"],
+    ["a\u{1d400}www.evil.example", "a\u{1d400}`www\u200b.evil.example`"],
     ["a\u{1d400}x@y.example", "`a\u{1d400}x@y.example`"],
     ["<a　href=https://e.example>go</a>", "go (`e.example`)"],
     ["<a﻿href=https://e.example>go</a>", "<a﻿href=`e.example`>go</a>"],
@@ -173,24 +173,30 @@ test("a character that lowers to two does not move where an address is read", ()
 test("a bare domain is an address, and a file name or code is not", () => {
   const domains: readonly (readonly [string, string])[] = [
     ["example.com", "`example.com`"],
-    ["example.com/path", "`example.com`"],
+    ["example.com/path", "`example.com/path`"],
     ["Visit example.com.", "Visit `example.com`."],
     ["sub.example.co.uk", "`sub.example.co.uk`"],
     ["example\\.com", "`example.com`"],
-    ["api.github.io/x", "`api.github.io`"],
+    ["api.github.io/x", "`api.github.io/x`"],
     ["foo.app", "`foo.app`"],
-    ["evil.dev:8080/x", "`evil.dev`"],
-    ["EXAMPLE.COM", "`example.com`"],
+    ["evil.dev:8080/x", "`evil.dev:8080/x`"],
+    ["EXAMPLE.COM", "`EXAMPLE.COM`"],
     ["a-b.org", "`a-b.org`"],
-    ["example.org?q=1", "`example.org`"],
-    ["example.net#top", "`example.net`"],
+    ["example.org?q=1", "`example.org?q=1`"],
+    ["example.net#top", "`example.net#top`"],
     ["(example.com)", "(`example.com`)"],
     ["example.ai", "`example.ai`"],
-    ["evil.md/login", "`evil.md`"],
+    ["evil.md/login", "`evil.md/login`"],
     ["docs.evil.md", "`docs.evil.md`"],
     ["x.co", "`x.co`"],
     ["_x.co_", "_`x.co`_"],
-    ["user.example.de/x", "`user.example.de`"],
+    ["fix it in main.py:42", "fix it in `main.py:42`"],
+    ["docs.example.museum/path", "`docs.example.museum/path`"],
+    ["a.b.example.zz", "`a.b.example.zz`"],
+    ["site.example.qq:8080", "`site.example.qq:8080`"],
+    ["foo\\-bar.com/path", "`foo-bar.com/path`"],
+    ["docs.foo\\-bar.example.org", "`docs.foo-bar.example.org`"],
+    ["user.example.de/x", "`user.example.de/x`"],
     ["\u8bbf\u95eeexample.com\u770b\u770b", "\u8bbf\u95ee`example.com`\u770b\u770b"],
   ];
   for (const [text, shown] of domains) assert.equal(inertAnswer(text), shown, text);
@@ -218,6 +224,9 @@ test("a bare domain is an address, and a file name or code is not", () => {
     "a/b.com",
     "my_module.py",
     "version 1.2.3",
+    "a.b.c",
+    "x.y.z9",
+    "1.2.3.4",
   ];
   for (const text of words) assert.equal(inertAnswer(text), text, text);
 });
@@ -231,6 +240,7 @@ test("a short line breaks a bare domain and a mail address, and leaves a file na
 
 test("a domain the client sees on its own next to a span made here is made words too", () => {
   // (`docs.evil.mdmailto:` is one word to the scans, but once `mailto:` is code `docs.evil.md` stands alone in the client)
-  assert.equal(inertAnswer("docs.evil.mdmailto:x"), "`docs.evil.md``mailto:x`");
-  assert.equal(inertAnswer("x.comailto:"), "`x.co``mailto`:");
+  assert.equal(inertAnswer("x.comailto:"), "`x.comailto`:");
+  assert.equal(inertAnswer("john.doe.jr@example.com"), "`john.doe.jr@example.com`");
+  assert.equal(inertAnswer("see.example.commailto:x"), "`see.example.commailto:x`");
 });

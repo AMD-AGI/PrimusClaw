@@ -320,7 +320,8 @@ test("a code span made here pairs with no backtick of the text's own as sent", (
     let text = "";
     for (let i = 0; i < count; i += 1) text += pieces[Math.floor(random() * pieces.length)] ?? "";
     const html = sent(remoteDomain.inertAnswer(text));
-    const outside = html.replace(/<code>[\s\S]*?<\/code>|<pre>[\s\S]*?<\/pre>/gu, "");
+    // (a code element is a node of its own: what stands on either side of it is not joined across it)
+    const outside = html.replace(/<code>[\s\S]*?<\/code>|<pre>[\s\S]*?<\/pre>/gu, " ");
     assert.doesNotMatch(outside, mail, `${JSON.stringify(text)}: ${html}`);
     assert.ok(!outside.includes("://") && !outside.includes("www."), `${JSON.stringify(text)}: ${html}`);
     assert.doesNotMatch(

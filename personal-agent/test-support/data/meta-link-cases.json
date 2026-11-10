@@ -96,6 +96,18 @@
    "input": "write to me@evil.example (not @user or a@b)",
    "limit": 200,
    "expected": "write to me@​evil.example (not @user or a@b)"
+  },
+  {
+   "about": "three labels or a tail in a line",
+   "input": "docs.example.museum/path main.py:42 v1.2.3",
+   "limit": 200,
+   "expected": "docs.example​.museum/path main​.py:42 v1.2.3"
+  },
+  {
+   "about": "an escaped hyphen in a line",
+   "input": "foo\\-bar.com/path",
+   "limit": 200,
+   "expected": "foo\\-bar​.com/path"
   }
  ]
 }

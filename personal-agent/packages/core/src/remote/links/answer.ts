@@ -293,7 +293,7 @@ function words(text: string): string {
     if (!label) return token;
     return CJK.test(label.slice(-1)) ? `${label}（${token}）` : `${label} (${token})`;
   };
-  const shown = leftoverDomains(emails(bare(tags(links(referenceDefinitions(text, mark), mark), mark), mark)), mark);
+  const shown = leftoverDomains(emails(bare(tags(links(referenceDefinitions(text, mark), mark), mark), mark)));
   // (a host is `\x00n\x00`: the input holds no NUL, so every odd part is a host's number; and what is left that a client could
   // still take for an address, `a@https://...` say, is made unlinkable too)
   const spans = shown
