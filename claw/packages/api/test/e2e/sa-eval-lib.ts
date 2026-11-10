@@ -1284,7 +1284,7 @@ const LATIN = /[A-Za-z]/g;
 /**
  * The assistant's own words in a reply, which its language is judged by: the text without what it quotes or names. Taken out are
  * fenced and inline code, links (a markdown link whole, a bare URL), quoted lines (`> …`), quoted passages ("…", “…”, 「…」, 『…』),
- * and identifiers: a word with a digit or a `-`, `_`, `/`, `.`, `:`, `#` or `@` inside, or with a capital after its first letter
+ * and identifiers: a word with a digit or a `_`, `/`, `.`, `:`, `#` or `@` inside, two hyphens, or a capital after its first letter
  * (`global-control-plane`, `AMD-AGI/PrimusClaw`, `max_running`, `llama3`, `AgentX`, `SaFE`). A Chinese answer that lists English
  * plan names, or an English one that quotes a Chinese item title, is still in the language it is written in.
  */
@@ -1302,7 +1302,8 @@ export function replyProse(text: string): string {
     .replace(/[A-Za-z0-9\-_/.:#@]+/g, (w) => (IDENTIFIER.test(w) ? " " : w));
 }
 const LANGUAGE_SAMPLE = 8_000;
-const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|[a-z][A-Z]|^[A-Z][a-z]*[A-Z]/;
+// One hyphen joins English words too ("well-known", "user-facing"): only two or more make a name of a plain word.
+const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][_/.:#@][A-Za-z0-9]|[A-Za-z0-9]-[A-Za-z0-9]+-[A-Za-z0-9]|[a-z][A-Z]|^[A-Z][a-z]*[A-Z]/;
 
 /**
  * The titles the turn read (an item's, a pull request's, a plan's: every `"title"` its tools answered, and the case's own items):
@@ -1332,21 +1333,22 @@ const TITLE_MIN_CHARS = 8;
 /** A message that is only a slash command with up to three plain arguments (`/brief off`, `/hlep`, `/pause 2h`), not a sentence. */
 const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:[ \t]+[A-Za-z0-9_\-.:/@#]+){0,3}\s*$/;
 
-/** Whether a text has a word of its own (`replyProse`): a Chinese character or a Latin letter outside code, links, quotes and names. */
-export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(replyProse(text));
+/** Whether a text has a word at all: a Chinese character or a Latin letter. */
+export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(text);
 
 /**
  * The language check of `style.reply_lang`: the share of Chinese characters among the letters of the reply's own words
  * (`replyProse`; digits, punctuation and markdown are no language). Chinese needs at least 0.2 of them, English under 0.05, as
- * before; the titles the turn read (`readTitles`) are names too. A reply with no word of its own ("2", "**0**", `10.1.0`) is in
- * no language, and the check does not apply to it.
+ * before; the titles the turn read (`readTitles`) are names too. A reply with no letter at all ("2", "**0**", "10.1.0") is in no
+ * language, and the check does not apply to it; one whose letters are all names, code or quotes counts as no Chinese.
  */
 export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly string[] = []): { applies: boolean; pass: boolean; detail: string } {
+  // Only a reply with no letter at all is in no language; one whose letters are all in names, code or quotes is judged (as 0).
+  if (!/[㐀-鿿A-Za-z]/.test(text)) return { applies: false, pass: true, detail: "no words of its own" };
   const prose = replyProse(titles.reduce((t, title) => t.split(title).join(" "), text));
   const cjk = prose.match(CJK)?.length ?? 0;
   const letters = cjk + (prose.match(LATIN)?.length ?? 0);
-  if (!letters) return { applies: false, pass: true, detail: "no words of its own" };
-  const ratio = cjk / letters;
+  const ratio = letters ? cjk / letters : 0;
   return { applies: true, pass: lang === "zh" ? ratio >= 0.2 : ratio < 0.05, detail: `cjk ${ratio.toFixed(2)}` };
 }
 

@@ -1165,8 +1165,11 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
   const wrapped = "已经改好了，下面是新的配置：\n\n```yaml\nreplicas: 4\nimage: docker.io/primussafe/claw:202611091908\nresources:\n  limits: {cpu: 8, memory: 32Gi}\n```\n"
     + "详见 [the rollout guide](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md)。\n> Deployment updated successfully, waiting for rollout to finish.";
   assert.deepEqual(failed(zh, observed({ final: wrapped })), []);
-  // An English reply to a Chinese message still fails, with or without Chinese inside its code, quotes and links.
-  for (const final of ["There are 7 plans in Dispatron: top-model-daily, hyperloom-main-daily-ci and five more.",
+  // An English reply to a Chinese message still fails, with or without Chinese inside its code, quotes and links, and when every
+  // word of it is hyphenated or a name.
+  for (const final of ["well-known, user-facing, high-level.", "This is a well-known, user-facing, high-level 问题.", "`ls -la` [docs](https://x.invalid)",
+    "top-model-daily, hyperloom-main-daily-ci",
+    "There are 7 plans in Dispatron: top-model-daily, hyperloom-main-daily-ci and five more.",
     "I renamed the item to “修复登录超时” and set `标题 = 修复登录超时`; see [修复登录超时](https://x.invalid/1). It is running now.",
     "Done. The workspace list is below.\n```\n工作区 global-cpu 正常\n```"]) {
     assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"], final.slice(0, 40));
