@@ -7,6 +7,7 @@ import {
   sandboxWorkspaceAllowed,
   sandboxWorkspaceNotAllowedText,
 } from "@claw/protocol";
+import { AGENT_SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
 
 /**
  * A sandbox this deployment has no way to stop, ever.
@@ -357,11 +358,25 @@ export class DagHandleScanTimeoutError extends Error {
  * (a session pinned before the list was set, a namespace only a template
  * rendered). Called by each provider before it asks the platform for anything.
  */
-export function assertSandboxWorkspaceAllowed(workspace: string, env: Record<string, string | undefined> = process.env): void {
-  const allowed = allowedSandboxWorkspaces(env);
+export function assertSandboxWorkspaceAllowed(
+  workspace: string,
+  env: Record<string, string | undefined> = process.env,
+  deploymentDefaults: readonly string[] = brainDefaultSandboxWorkspaces(),
+): void {
+  const listed = allowedSandboxWorkspaces(env);
+  // The workspaces this Brain itself falls back to are on the list whatever
+  // the environment spells: SANDBOX_NAMESPACE and AGENT_SANDBOX_NAMESPACE
+  // default to "default" when unset, and a request that names nothing lands
+  // there; refusing it would refuse every unpinned sandbox.
+  const allowed = listed === null ? null : new Set([...listed, ...deploymentDefaults.map((d) => d.trim()).filter((d) => d !== "")]);
   if (sandboxWorkspaceAllowed(workspace, allowed)) return;
   throw new SandboxProvisionTerminalError(
     SANDBOX_WORKSPACE_NOT_ALLOWED,
     sandboxWorkspaceNotAllowedText(workspace.trim(), allowed!),
   );
+}
+
+/** Where this Brain puts a sandbox that names no workspace, in the deploy mode it runs in. */
+function brainDefaultSandboxWorkspaces(): string[] {
+  return isKubernetesMode() ? [AGENT_SANDBOX_NAMESPACE] : [SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE];
 }

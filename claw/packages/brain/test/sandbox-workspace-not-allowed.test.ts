@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 
 const { SafeWorkloadProvider } = await import("../src/sandbox/safe-workload-provider.js");
 const { AgentSandboxProvider } = await import("../src/sandbox/agent-sandbox-provider.js");
-const { SandboxProvisionTerminalError, SANDBOX_UNAVAILABLE_REASONS, SANDBOX_WORKSPACE_NOT_ALLOWED } =
+const { SandboxProvisionTerminalError, SANDBOX_UNAVAILABLE_REASONS, SANDBOX_WORKSPACE_NOT_ALLOWED, assertSandboxWorkspaceAllowed } =
   await import("../src/sandbox/errors.js");
 
 const KEYS = ["SANDBOX_ALLOWED_NAMESPACES", "SANDBOX_NAMESPACE", "SANDBOX_CPU_NAMESPACE", "AGENT_SANDBOX_NAMESPACE"];
@@ -63,7 +63,7 @@ for (const [name, make] of providers) {
     assert.ok(err instanceof SandboxProvisionTerminalError, String(err));
     assert.equal(err.reason, SANDBOX_WORKSPACE_NOT_ALLOWED);
     assert.match(err.message, /The ws-open workspace is not one of them/);
-    assert.match(err.message, /\(ws-isolated\)/);
+    assert.match(err.message, /\(default, ws-isolated\)/, "the list names the listed workspace and the default a request naming none goes to");
     assert.deepEqual(calls, [], "the platform was asked for a sandbox in a refused workspace");
   });
 
@@ -86,6 +86,29 @@ test("the deployment's own default workspace is always allowed, so a request nam
   const err = await new SafeWorkloadProvider().create(params("ws-cpu") as never).then(() => null, (e: unknown) => e);
   assert.ok(!(err instanceof SandboxProvisionTerminalError && err.reason === SANDBOX_WORKSPACE_NOT_ALLOWED), String(err));
   assert.ok(calls.length > 0);
+});
+
+test("with SANDBOX_NAMESPACE / AGENT_SANDBOX_NAMESPACE unset, the \"default\" a request naming nothing lands in is allowed", async () => {
+  // config.ts read neither at import (this file sets neither), so both are "default".
+  for (const [name, make] of providers) {
+    for (const ns of ["", "default"]) {
+      setList("ws-isolated");
+      recordFetch();
+      const err = await make().create(params(ns) as never).then(() => null, (e: unknown) => e);
+      assert.ok(!(err instanceof SandboxProvisionTerminalError && err.reason === SANDBOX_WORKSPACE_NOT_ALLOWED), `${name} ${JSON.stringify(ns)}: ${String(err)}`);
+      assert.ok(calls.length > 0, `${name} ${JSON.stringify(ns)} never reached the platform`);
+    }
+  }
+});
+
+test("the defaults are the deploy mode's: kubernetes mode's AGENT_SANDBOX_NAMESPACE, safe mode's SANDBOX_NAMESPACE and CPU workspace", () => {
+  const env = { SANDBOX_ALLOWED_NAMESPACES: "ws-isolated" };
+  assert.doesNotThrow(() => assertSandboxWorkspaceAllowed("agent-ns", env, ["agent-ns"]));
+  assert.doesNotThrow(() => assertSandboxWorkspaceAllowed("gpu-ws", env, ["gpu-ws", "cpu-ws"]));
+  assert.doesNotThrow(() => assertSandboxWorkspaceAllowed("cpu-ws", env, ["gpu-ws", "cpu-ws"]));
+  assert.throws(() => assertSandboxWorkspaceAllowed("other", env, ["gpu-ws", "cpu-ws"]), SandboxProvisionTerminalError);
+  // No list: nothing is refused, whatever the defaults.
+  assert.doesNotThrow(() => assertSandboxWorkspaceAllowed("other", {}, []));
 });
 
 test("a refused workspace is not offered to the model again: a second try names the same workspace", () => {

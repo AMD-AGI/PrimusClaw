@@ -13,6 +13,8 @@
  *      node sandbox names a workspace off the list: 400 on /tasks and /v1/batches
  *   W4 the dispatcher refuses a rendered spec Brain would place off the list
  *   W5 a managed-agents session pinned to a workspace off the list is not created
+ *   W6 the MCP one-shot pipeline refuses before it creates its session
+ *   W7 (sandbox-allowed-namespaces-a2a.test.ts) an A2A send naming a workspace off the list: invalid params
  *
  * The application run (and its grant) is covered in app-run-create.test.ts.
  * Every refusal has a positive control: a route that refused everything, or
@@ -292,6 +294,49 @@ describe("W5 managed-agents sessions", () => {
       const listed = await create("ws-isolated");
       assert.notEqual(listed.res.statusCode, 400, listed.res.body);
       assert.equal(listed.inserted, true, "the listed pin never reached the insert");
+    });
+  });
+});
+
+describe("W6 the MCP one-shot pipeline", () => {
+  const OWNER: UserInfo = { userId: "u-1", userName: "u-1", roles: ["default"], platformKey: "pk", virtualKey: "vk-u-1" };
+
+  /** `tools/call claw_run_pipeline` against /mcp, with POST /v1/sessions stubbed to record the call and return no id. */
+  async function runPipeline(workspace: string): Promise<{ result: any; sessionCreates: number }> {
+    let sessionCreates = 0;
+    const app = Fastify();
+    app.addHook("preHandler", async (req) => { (req as unknown as { user: UserInfo }).user = OWNER; });
+    app.post("/v1/sessions", async () => { sessionCreates++; return { ok: true, data: {} }; });
+    const { registerMcpRoutes } = await import("../src/routes/mcp.js");
+    await registerMcpRoutes(app);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    try {
+      const { port } = app.server.address() as { port: number };
+      const r = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { name: "claw_run_pipeline", arguments: { prompt: "go", workspace_id: workspace, timeout: 1 } },
+        }),
+      });
+      const text = await r.text();
+      const data = /^data: (.*)$/m.exec(text)?.[1] ?? text;
+      return { result: JSON.parse(data).result, sessionCreates };
+    } finally {
+      await app.close();
+    }
+  }
+
+  test("a workspace off the list is refused before the session is created; a listed one goes on to create it", async () => {
+    await withEnv(LISTED, async () => {
+      const refused = await runPipeline("ws-open");
+      assert.equal(refused.result?.isError, true, JSON.stringify(refused.result));
+      assert.match(JSON.stringify(refused.result), /ws-open workspace is not one of them/);
+      assert.equal(refused.sessionCreates, 0, "the session was created before the refusal");
+
+      const listed = await runPipeline("ws-isolated");
+      assert.equal(listed.sessionCreates, 1, JSON.stringify(listed.result));
     });
   });
 });
