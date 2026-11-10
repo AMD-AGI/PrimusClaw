@@ -85,6 +85,7 @@ NATS or database connection.
 | Path | Language | What it is |
 |------|----------|------------|
 | [`claw/`](claw) | TypeScript | The agent harness: `api` / `brain` / `hands` npm workspaces, Helm chart, design docs. |
+| [`personal-agent/`](personal-agent) | TypeScript | The personal agent: a chat assistant that works through Claw, with Microsoft Teams as its entry point. Channel-neutral core, Node runtime adapters, Teams adapter. |
 | [`sandbox/`](sandbox) | Go | SaFE sandbox control plane — a fork of [`sigs.k8s.io/agent-sandbox`](sandbox/UPSTREAM.md) that provisions the per-session pods Brain drives. |
 | [`deploy/`](deploy) | — | Whole-stack installer that chains the per-component deploy scripts, plus deployment packaging for the upstream LiteLLM gateway. Each component also keeps its own `deploy/`. |
 | [`docs/`](docs) | — | Sphinx site for the **Python** packages only. TypeScript and Go docs live next to their code. |
@@ -282,6 +283,7 @@ the published documents and also names the ones cited from source comments that
 are not part of this release, so a grep for a filename gives an answer.
 
 Per-tree documentation: [`claw/`](claw/README.md) ·
+[`personal-agent/`](personal-agent/README.md) ·
 [`sandbox/`](sandbox/README.md) · [`deploy/`](deploy/README.md). The Sphinx site under [`docs/`](docs) covers
 the Python packages only.
 
