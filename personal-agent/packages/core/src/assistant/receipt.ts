@@ -187,6 +187,17 @@ export class Receipt {
     }
   }
 
+  /**
+   * The worker stops: the receipt is dropped, not closed (Python's shutdown cancels its tasks; the channel ends the stream
+   * itself). Its close timer is cancelled and what follows the turn stops (`closed()` resolves), so nothing keeps the process up.
+   */
+  drop(): void {
+    this.closer.abort();
+    this.done = true;
+    this.want = undefined;
+    for (const resolve of this.closedWaiters.splice(0)) resolve();
+  }
+
   /** Close the receipt by itself at RECEIPT_CLOSE_SECONDS unless a reply closed it first. */
   arm(clock: Clock, stillMine: () => boolean, onClose: () => void): void {
     const wait = Math.max(RECEIPT_CLOSE_SECONDS - this.stream.ageSeconds(), 0) * 1000;

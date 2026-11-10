@@ -290,6 +290,9 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
     logger: deps.logger,
     close: () =>
       closeAll(deps.logger, [
+        () => {
+          features.stop();
+        },
         () => bound.idle(),
         () => outbound.close(),
         () => inbound?.close(),
