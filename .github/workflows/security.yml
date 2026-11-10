@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [claw]
+        project: [claw, personal-agent]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -71,6 +71,27 @@ jobs:
         run: |
           npm audit --audit-level=moderate || true
           npm audit --audit-level=high
+
+  # Third-party licences: every package a project installs for production must carry a licence compatible with the
+  # repository's MIT licence (personal-agent/scripts/license-check.ts: copyleft, unknown or missing fails). It reads
+  # package-lock.json only, so it needs no install and takes seconds.
+  npm-licenses:
+    name: npm licences (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [claw, personal-agent]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+
+      - name: Licences of the production dependencies
+        run: node personal-agent/scripts/license-check.ts "${{ matrix.project }}/package-lock.json" --list
 
   govulncheck:
     name: govulncheck (Sandbox)
