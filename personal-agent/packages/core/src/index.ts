@@ -67,3 +67,15 @@ export * from "./proactive/index.js";
 export * from "./proactive/views.js";
 export * from "./subscriptions/index.js";
 export * from "./review/index.js";
+export * as remoteDomain from "./remote/index.js";
+export * as remoteView from "./remote-view/index.js";
+// The remote agents, as the worker's assembly builds them (W6; the view it gives them is remoteView.createRemoteViews).
+export { RemoteAgents } from "./remote/remote-agents.js";
+export type { RemoteContext, RemoteErrors, RemoteGuard, RemoteSettings } from "./remote/context.js";
+export { ConnectorSetup, setupFrom } from "./remote/connector/setup.js";
+export { CredentialUnavailable as FollowCredentialUnavailable } from "./remote/follow/follower.js";
+export type { FollowReach } from "./remote/follow/speaker.js";
+export {
+  DEFAULT_TIMINGS as REMOTE_FOLLOW_TIMINGS,
+  WATCH_TIMINGS as REMOTE_WATCH_TIMINGS,
+} from "./remote/follow/timings.js";

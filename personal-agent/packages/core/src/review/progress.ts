@@ -7,7 +7,7 @@
  * reviewer hears when the reviews asked of them end. `viewStage` is the key that changes exactly when there is news.
  */
 
-import type { AskerView } from "../claw/model.js";
+import type { AskerView, PullRef } from "../claw/model.js";
 import { pullUrl, shortName } from "../review-text/pull-ref.js";
 import { oneLine } from "../review-text/names.js";
 import { askerName, type ReviewTurn, reviewerName, viewFinished, viewWaitsForReviewer } from "./review-turn.js";
@@ -53,8 +53,19 @@ export function viewWords(view: AskerView): string {
   return (status ?? `已结束（${oneLine(view.status, 30)}）`) + merged;
 }
 
+/**
+ * The address Claw gave for a pull request, shown only when it is exactly one (as the Python worker checks it: the whole string): a
+ * value with a second link, a space or a control character in it, or another host, is never put in a message.
+ */
+const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}\/pull\/[1-9][0-9]{0,6}$/;
+
+/** Claw's `pr_url` when it is a pull request's address, else the address of the pull request the request named. */
+export function shownPrUrl(prUrl: string, pull: PullRef): string {
+  return PR_URL.test(prUrl) ? prUrl : pullUrl(pull);
+}
+
 function viewLink(review: ReviewTurn, view: AskerView): string {
-  return view.prUrl.startsWith("https://github.com/") ? view.prUrl : pullUrl(review.pull);
+  return shownPrUrl(view.prUrl, review.pull);
 }
 
 /** What the asker of a review someone else ran hears of it, once. */

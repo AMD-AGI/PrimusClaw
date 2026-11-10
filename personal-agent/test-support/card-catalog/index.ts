@@ -11,6 +11,7 @@ import type { CatalogEntry } from "./catalog.js";
 import { COMMAND_CARDS } from "./commands.js";
 import { FEEDBACK_CARDS } from "./feedback.js";
 import { PROACTIVE_CARDS } from "./proactive.js";
+import { REMOTE } from "./remote.js";
 import { REVIEW_CARDS } from "./review.js";
 import { TURN } from "./turn.js";
 
@@ -19,25 +20,13 @@ export const CATALOG: readonly CatalogEntry[] = [
   ...ASSISTANT_CARDS,
   ...COMMAND_CARDS,
   ...PROACTIVE_CARDS,
+  ...REMOTE,
   ...TURN,
   ...REVIEW_CARDS,
   ...FEEDBACK_CARDS,
 ];
 
-const BY_LINE = {
-  W6b: [
-    "remote_agents",
-    "remote_disconnect",
-    "remote_permission",
-    "remote_sessions",
-    "remote_sessions_shared",
-    "remote_sessions_waiting",
-    "remote_sessions_watch",
-    "remote_status",
-    "remote_window",
-    "remote_window_en",
-  ],
-} as const;
+const BY_LINE: Readonly<Record<string, readonly string[]>> = {}; // (every line has registered its cards)
 
 /** Snapshot ids whose builders are not ported yet. Each line removes its own as it registers them. */
 export const PENDING: ReadonlySet<string> = new Set<string>(Object.values(BY_LINE).flat());
