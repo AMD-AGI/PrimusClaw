@@ -83,6 +83,39 @@ function fakeCli(mode: string, live: unknown[]): { cli: string; env: Record<stri
   return { cli, env: { FAKE_CLAUDE_MODE: mode, FAKE_CLAUDE_LIVE: liveFile } };
 }
 
+describe("whether a conversation's main turn has ended (a terminal Claude Code calls busy)", () => {
+  test("read from the transcript: turn_duration last, nothing queued; a file rewritten in place is read whole again (codex r3 on #632)", async () => {
+    const dir = configDir();
+    const projects = path.join(dir, "projects", "-w");
+    fs.mkdirSync(projects, { recursive: true });
+    const file = path.join(projects, `${REF}.jsonl`);
+    const l = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: REF, ...o })}\n`;
+    fs.writeFileSync(file, l({ type: "user" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
+    const s = support(dir);
+    assert.equal(await s.mainTurnEnded(REF), true);
+    fs.appendFileSync(file, l({ type: "user" }));
+    assert.equal(await s.mainTurnEnded(REF), false, "a new turn");
+    fs.appendFileSync(file, l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
+    assert.equal(await s.mainTurnEnded(REF), true);
+    // The same file (same inode) rewritten, longer than what was read, with a message still queued before its last turn's end.
+    // (every write from here goes through the one descriptor: the file is never reopened by its name)
+    const fd = fs.openSync(file, "r+");
+    let at = 0;
+    const put = (text: string) => { at += fs.writeSync(fd, text, at); };
+    try {
+      fs.ftruncateSync(fd, 0);
+      put(l({ type: "user", pad: "x".repeat(400) }) + l({ type: "queue-operation", operation: "enqueue" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
+      assert.equal(await s.mainTurnEnded(REF), false, "the queued message is seen");
+      put(l({ type: "queue-operation", operation: "remove" }));
+      assert.equal(await s.mainTurnEnded(REF), true, "taken");
+      put("{ not json\n");
+      assert.equal(await s.mainTurnEnded(REF), null, "a line that does not parse: no answer");
+    } finally {
+      fs.closeSync(fd);
+    }
+  });
+});
+
 describe("reading who holds a session open", () => {
   test("claude agents --json: the rows that name a process and a session, and nothing else", () => {
     const rows: Array<[string, unknown, number]> = [

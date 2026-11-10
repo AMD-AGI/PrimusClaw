@@ -4,8 +4,9 @@
 /**
  * `redactText` against the Python worker's `redact_text` on 6,000 credential-shaped texts (random, seeded, with
  * Unicode around and inside them: the Kelvin sign and long s that fold to k and s, CJK and full-width neighbours,
- * non-breaking spaces). The texts and Python's answers are stored base64-encoded so that no credential-shaped string
- * sits in the repository as such.
+ * non-breaking spaces), and further corpora of the same kind. redact-parity-4.json is built around compound key names
+ * (AccountKey=, my_key:, monkey=). The answers are those of Python's rule with the compound key names. The texts and Python's
+ * answers are stored base64-encoded so that no credential-shaped string sits in the repository as such.
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -32,6 +33,7 @@ describe("redaction parity with the Python worker", () => {
     ["redact-parity.json", 1000],
     ["redact-parity-2.json", 400],
     ["redact-parity-3.json", 500],
+    ["redact-parity-4.json", 500],
   ] as const) {
     it(`masks exactly what the Python worker masks, byte for byte: ${name}`, () => {
       const rows = corpus(name);

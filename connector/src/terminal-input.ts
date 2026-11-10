@@ -320,7 +320,8 @@ export class TerminalInput {
   /**
    * Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty;
    * when it can, with the permission mode its footer shows on that same screen (null when it does not show one). `screenOnly`:
-   * nothing else says whether a turn runs there (its registry row cannot be read), so the footer must not say one does either.
+   * Claude Code's own word does not settle whether a turn runs there (it says `busy` while only background agents run, with the main
+   * turn idle; or its registry row cannot be read), so the footer must not say one does either (`esc to interrupt`).
    */
   async readiness(screenOnly = false): Promise<Readiness> {
     let info: string;
@@ -347,7 +348,7 @@ export class TerminalInput {
    * key names); several go through a named buffer pasted with `-p` (bracketed paste) and deleted (`-d`). Enter is pressed
    * only once the box shows something: a paste the program did not take is not followed by an Enter into whatever is there.
    */
-  async type(text: string): Promise<void> {
+  async type(text: string, beforeEnter?: () => Promise<string | null>): Promise<void> {
     if (!text) throw new Error("nothing to type");
     if (!text.includes("\n")) {
       await this.tmux.run(["send-keys", "-t", this.ref.pane, "-l", "--", text]);
@@ -375,6 +376,9 @@ export class TerminalInput {
       const why = enterGuard(await this.screen(), text);
       if (why) throw new TerminalNotSubmitted(why);
     }
+    // (what else must still hold right before the Enter: for a terminal Claude Code calls busy, that its main turn has not started)
+    const other = beforeEnter ? await beforeEnter() : null;
+    if (other) throw new TerminalNotSubmitted(other);
     await this.tmux.run(["send-keys", "-t", this.ref.pane, "Enter"]);
   }
 
