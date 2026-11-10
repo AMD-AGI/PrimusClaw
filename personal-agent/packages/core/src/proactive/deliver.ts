@@ -111,6 +111,7 @@ export class Deliveries {
     }
     let words = workEventText(parseWorkItem(event["item"]) ?? null, event["text"]);
     if (!words && assistantDeliveries(event).length === 0) return false;
+    // TODO(request-context): the client locale of the message being handled (Python CLIENT_LOCALE); "" until RequestScope lands.
     const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, "", words);
     const reader = { remoteState: (u: string) => this.attached(u) };
     const { head, replies } = this.deps.directChat.clawyExtras(reader, userId, lang);
@@ -294,6 +295,7 @@ export class Deliveries {
       about: item ? `#${String(item.seq)} ${item.title}` : "",
       expiresAt,
       zone: zoneOf(prefs),
+      // TODO(request-context): the client locale of the message being handled (Python CLIENT_LOCALE); "" until RequestScope lands.
       lang: answerLang(prefs.lang, "", event["text"]),
     });
     try {
