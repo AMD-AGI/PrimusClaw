@@ -101,6 +101,12 @@ function actionOf(button: Button): InboundAction {
   return read.value;
 }
 
+/** A button's `op`, as text. */
+function opOf(data: Readonly<Record<string, unknown>>): string {
+  const op = data["op"];
+  return typeof op === "string" ? op : "";
+}
+
 /** The three handlers of these cards, each recording which of its features a press reached and settling it, as they do. */
 function handlers(reached: string[]): ClickHandler[] {
   const hit = async (click: ClickRoute, what: string): Promise<void> => {
@@ -127,8 +133,8 @@ function handlers(reached: string[]): ClickHandler[] {
     ),
     new WorkCardClicks(work, watch, { enabled: false } as unknown as TokenExchange, () => true, silentLogger),
     new AssistantActionClicks({
-      actionClick: (click) => hit(click as ClickRoute, `action ${String(click.action.data["op"])}`),
-      confirmClick: (click) => hit(click as ClickRoute, `confirm ${String(click.action.data["op"])}`),
+      actionClick: (click) => hit(click as ClickRoute, `action ${opOf(click.action.data)}`),
+      confirmClick: (click) => hit(click as ClickRoute, `confirm ${opOf(click.action.data)}`),
     }),
   ];
 }
