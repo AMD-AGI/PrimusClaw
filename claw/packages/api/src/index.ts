@@ -56,7 +56,8 @@ import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
 import { registerGithubMcpRoutes } from "./github-mcp/mcp.js";
-import { githubMcpConfigErrors, readGithubMcpSettings } from "./github-mcp/settings.js";
+import { githubMcpStartupErrors } from "./github-mcp/public-read.js";
+import { readGithubMcpSettings } from "./github-mcp/settings.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
 import { identityTokenSettings } from "./auth/identity-token.js";
@@ -190,7 +191,8 @@ function assertGithubReviewConfig(): void {
 
 /** Refuse to serve the GitHub tools without the secret that signs their token. */
 function assertGithubMcpConfig(): void {
-  const errors = githubMcpConfigErrors(readGithubMcpSettings(), identityClient() !== null, readGithubReviewSettings().enabled);
+  // The read-only App is used only by the GitHub tools' reads (`pr_state`): checked when they are on.
+  const errors = githubMcpStartupErrors(readGithubMcpSettings(), identityClient() !== null, readGithubReviewSettings().enabled);
   if (errors.length === 0) return;
   logger.error({ errors }, "startup.github_mcp_refused");
   throw new Error(`CLAW_GITHUB_MCP_ENABLED is true but the GitHub tools cannot be offered: ${errors.join("; ")}`);

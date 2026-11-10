@@ -22,10 +22,15 @@
  * so merged pull requests were offered for review again and "#99999" was "could not be read" rather than "does not exist" (parity
  * G3, H2). Such a read that GitHub refuses as over its limit (403 or 429) reads the pull request's public page on github.com instead
  * (`pageState`), which anyone can open and which the REST limit does not count.
+ *
+ * A deployment with a read-only GitHub App of its own (`github-mcp/public-read.ts`) reads them with an installation token of that App
+ * instead, at the App's own allowance: the token is narrowed to `metadata: read` when it is made, and what it reads is answered only
+ * when GitHub says the repository is public. The public page stays the fallback when a read is still refused as over a limit.
  */
 import pino from "pino";
 import { db as defaultDb } from "../infra/db.js";
 import { resolveGithubToken, type ResolveBinding } from "../github-mcp/mcp.js";
+import { publicReadTokens } from "../github-mcp/public-read.js";
 import { readGithubMcpSettings, type GithubMcpSettings } from "../github-mcp/settings.js";
 import { GithubClient, repoPath, type PrRef } from "../github-review/github.js";
 import { auditFinish, auditStart, GITHUB_MCP_AUDIT_TOOL_PREFIX, type Queryable } from "../github-review/store.js";
@@ -70,9 +75,14 @@ export interface PrStateDeps {
   settings?: () => GithubMcpSettings;
   resolveBinding?: ResolveBinding;
   fetchImpl?: typeof fetch;
+  /** The deployment's read-only App for a person with no GitHub here (`publicReadTokens` by default); null reads anonymously. */
+  publicRead?: { token(): Promise<string>; drop(token: string): void } | null;
   /** Where the pull requests' public pages are (`https://github.com`); by default derived from the API's address. */
   webUrl?: string | null;
 }
+
+/** Whether GitHub says, of a repository or a pull request's base repository, that it is public: `private` is false, nothing else. */
+const isPublic = (repo: unknown): boolean => Boolean(repo && typeof repo === "object" && (repo as { private?: unknown }).private === false);
 
 const nameOf = (p: PrRef): string => `${p.owner}/${p.repo}#${p.number}`;
 /** A GitHub timestamp (`2026-11-06T09:50:16Z`), or null: nothing else is passed on as a time. */
@@ -181,6 +191,11 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   let read: (path: string) => Promise<Record<string, any>>;
   let gh: GithubClient | null = null;
   let audit: { id: number } | null = null;
+  // Read with the deployment's App: only what GitHub says is public is answered, whatever else its installation could reach.
+  let appToken: string | null = null;
+  // How the reads below are made, logged once per call (never the token): the deployment's App, anonymously, or the person's own.
+  let via: "app" | "anonymous" | "own" | "binding" = "anonymous";
+  const publicRead = deps.publicRead !== undefined ? deps.publicRead : publicReadTokens(s.apiUrl);
   // Set when the person has no GitHub here: a REST read refused as over the anonymous limit falls back to the public page.
   let pageFallback: ((p: PrRef) => Promise<PullState>) | null = null;
   try {
@@ -189,9 +204,21 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
       read = anonymousReader(s.apiUrl, deps.fetchImpl ?? fetch);
       const webUrl = deps.webUrl === undefined ? githubWebUrl(s.apiUrl) : deps.webUrl;
       if (webUrl) pageFallback = (p) => pageState(webUrl, p, deps.fetchImpl ?? fetch);
+      if (publicRead) {
+        try {
+          const token = await publicRead.token();
+          const client = new GithubClient({ token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
+          read = async (path) => (await client.get<Record<string, any>>(path)).json;
+          appToken = token;
+          via = "app";
+        } catch (err) {   // (no token now: read as anyone, as without the App)
+          logger.warn({ sessionId, errorClass: (err as Error)?.constructor?.name, status: (err as { status?: number })?.status }, "assistant.pr_state_public_read_unavailable");
+        }
+      }
     } else {
       const client = new GithubClient({ token: cred.token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
       gh = client;
+      via = cred.source === "binding" ? "binding" : "own";
       read = async (path) => (await client.get<Record<string, any>>(path)).json;
       if (cred.source === "binding") {
         audit = {
@@ -216,7 +243,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
     const key = `${p.owner}/${p.repo}`.toLowerCase();
     let seen = repoSeen.get(key);
     if (!seen) {
-      seen = read(repoPath(p)).then((r) => Boolean(r && typeof r === "object"), () => false);
+      seen = read(repoPath(p)).then((r) => (appToken ? isPublic(r) : Boolean(r && typeof r === "object")), () => false);
       repoSeen.set(key, seen);
     }
     return seen;
@@ -224,9 +251,12 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   for (let i = 0; i < prs.length; i += READ_PARALLEL) {
     states.push(...await Promise.all(prs.slice(i, i + READ_PARALLEL).map(async (p): Promise<PullState> => {
       try {
-        return stateOf(p, await read(repoPath(p, `/pulls/${p.number}`)));
+        const pr = await read(repoPath(p, `/pulls/${p.number}`));
+        if (appToken && !isPublic(pr?.base?.repo)) throw Object.assign(new Error("not a public repository"), { status: 0 });
+        return stateOf(p, pr);
       } catch (err) {
         const status = (err as { status?: number })?.status;
+        if (status === 401 && appToken && publicRead) publicRead.drop(appToken);
         if (status === 404 && await repoReadable(p)) return { pr: nameOf(p), state: "not_found" };
         if (pageFallback && (status === 403 || status === 429)) {
           const fromPage = await pageFallback(p).catch((): PullState => ({ pr: nameOf(p), state: "unknown", reason: "read_failed" }));
@@ -239,6 +269,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
       }
     })));
   }
+  logger.info({ sessionId, via, prs: prs.length, failed }, "assistant.pr_state_read");
   if (audit && gh) {
     try {
       await auditFinish(q, audit.id, {

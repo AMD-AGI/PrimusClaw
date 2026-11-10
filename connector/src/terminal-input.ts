@@ -171,6 +171,14 @@ function boxOf(screen: string): { raw: string[]; plain: string[]; at: number; en
   return { raw, plain, at, end };
 }
 
+/** The conversation name in the rule above Claude Code's input box (`──────── clean ─`), or null when the rule names none. */
+export function boxName(screen: string): string | null {
+  const { plain, at, end } = boxOf(screen);
+  if (at < 1 || end < 0) return null;
+  const m = /^─{8,} +(\S(?:.*\S)?) +─+$/.exec(plain[at - 1]!.trim());
+  return m ? m[1]! : null;
+}
+
 /**
  * Claude Code's permission modes, as its footer names each one (`<indicator> on`, below the input box) and the id the agent and
  * its transcript use for it: Claude Code's own table (`indicator` and `external`), the same in 2.1.285 and 2.1.319. Every mode is
@@ -312,8 +320,8 @@ export class TerminalInput {
   /**
    * Whether the pane can be typed into now: the same process in it, alive, not scrolled back (copy mode), and its input box empty;
    * when it can, with the permission mode its footer shows on that same screen (null when it does not show one). `screenOnly`:
-   * Claude Code's own word does not settle whether its main turn runs (it says `busy` while background agents run, with the main
-   * turn idle), so the footer must not say one does either (`esc to interrupt`).
+   * Claude Code's own word does not settle whether a turn runs there (it says `busy` while only background agents run, with the main
+   * turn idle; or its registry row cannot be read), so the footer must not say one does either (`esc to interrupt`).
    */
   async readiness(screenOnly = false): Promise<Readiness> {
     let info: string;

@@ -78,6 +78,10 @@ A failed read is the tool's own error (`isError`), and Brain marks its result ev
 | `CLAW_GITHUB_MCP_URL` | `<INTERNAL_BACKEND_URL>/v1/internal/github/mcp` | Where Brain reaches the tools |
 | `CLAW_GITHUB_API_URL` | `https://api.github.com` | Shared with GitHub review |
 | `CLAW_GITHUB_MCP_BINDING_ENABLED` | `false` | An owner with no `GH_TOKEN` is served with their GitHub binding; the API does not start with it on unless `IDENTITY_CLIENT_ENABLED` and `CLAW_GITHUB_REVIEW_ENABLED` are on too |
+| `CLAW_GITHUB_PUBLIC_READ_APP_ID` | none | A read-only GitHub App of the deployment's own, used for reads of public repositories made for a person with no GitHub here (the assistant's `pr_state`), instead of reading with no credential (60 reads an hour for the deployment's whole address). Set all three or none; the API does not start with only some of them |
+| `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` | none | The App's installation. Each token is narrowed when it is made, whatever the App itself may do: asked for with `metadata: read` alone, and one that comes back with any other permission, or reaching a repository GitHub does not say is public, is revoked, logged (`github.public_read_token_refused`) and not used. Only what GitHub says is public is answered. Best: give the App `metadata: read` alone and install it where it reaches only public repositories |
+| `CLAW_GITHUB_PUBLIC_READ_REPOSITORIES` | none | Optional, comma-separated names (no owner) of the installation's public repositories that each token is limited to (GitHub's `repositories` on the token request); a token still reads every public repository, as any GitHub token does. Recommended when the installation could reach more, or could later be given more |
+| `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` | none | The App's private key (PEM), read whenever a token is made (about once an hour) |
 
 The tools call GitHub's REST and GraphQL API themselves rather than GitHub's own remote MCP server, so they need
 nothing reachable but `CLAW_GITHUB_API_URL`.
