@@ -635,6 +635,86 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual(typed(t.transcript), ["1"], "submitted once, after the question");
   });
 
+  test("a question that shows in the moment between the last screen read and the Enter is not approved by it: End then Enter choose No, and the message goes in after (Wei Lei on #648)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const dir = tmpdir("cc-dialog-");
+    const approved = path.join(dir, "approved");
+    const escs = path.join(dir, "escs");
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: approved, FAKE_DIALOG_AT_ENTER: "1", FAKE_ESC_FILE: escs });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.equal(fs.existsSync(approved), false, "the Enter did not approve the question");
+    assert.equal(fs.existsSync(`${approved}.denied`), true, "it chose No (the person's tool call is denied, never approved)");
+    assert.equal(fs.existsSync(escs), false, "no Esc");
+    assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone"], "submitted once, after the question went");
+  });
+
+  test("a phone cancel while the message waits on a question: no Esc reaches the terminal (it would deny the person's question), the turn ends cancelled (Wei Lei on #648)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const dir = tmpdir("cc-dialog-");
+    const approved = path.join(dir, "approved");
+    const escs = path.join(dir, "escs");
+    const dismiss = path.join(dir, "dismiss");
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: approved, FAKE_DIALOG_DISMISS: dismiss, FAKE_ESC_FILE: escs });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    h.claw.issue("cancel", sid);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.equal(end.data.stopReason, "cancelled");
+    await new Promise((r) => setTimeout(r, 1_000));
+    assert.equal(fs.existsSync(escs), false, "no Esc");
+    assert.equal(fs.existsSync(`${approved}.denied`), false, "the person's question was left to them");
+    assert.equal(fs.existsSync(approved), false);
+    assert.equal(h.turnEnds(sid).filter((e) => e.data.cmd_seq === seq).length, 1, "ended once");
+    fs.writeFileSync(dismiss, "");
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.deepEqual(typed(t.transcript), [], "nothing submitted after the cancel");
+  });
+
+  test("a phone cancel of a message Claude Code queued behind the person's running turn: no Esc (it would stop the person's turn); its own turn: Esc as before (Wei Lei on #648)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const escs = path.join(tmpdir("cc-esc-"), "escs");
+    const t = terminal(work, h.attachDir, 3_000, { FAKE_BUSY_MS: "4000", FAKE_ESC_FILE: escs });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "queued one");
+    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("queued one"), 3_000);
+    h.claw.issue("cancel", sid);
+    const end1 = await h.claw.until("the queued one's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
+    assert.equal(end1.data.stopReason, "cancelled");
+    assert.equal(fs.existsSync(escs), false, "no Esc into the person's turn");
+    // Its own turn (taken from the queue once the person's ended, 3 s of work): a cancel then stops it with Esc, as before.
+    const two = h.prompt(sid, "second");
+    await until("its own turn running", () => typed(t.transcript).includes("second") && t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);
+    h.claw.issue("cancel", sid);
+    const end2 = await h.claw.until("the second's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
+    assert.equal(end2.data.stopReason, "cancelled");
+    await until("the Esc", () => fs.existsSync(escs), 5_000);
+  });
+
   test("a question shows after the text is typed, and the person at the terminal types into the box meanwhile: their text is left, the message refused", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({

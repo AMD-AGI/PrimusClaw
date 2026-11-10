@@ -472,7 +472,9 @@ question it would approve a tool call), or the pane is scrolled back. It is past
 `paste-buffer -p -d`), one line or several: nothing in it is read as a key name, and a question that shows at that moment does not
 take it as its choice (a typed `1` would approve a permission question), and it is
 submitted with Enter once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
-text and no question or menu. A question that shows after the text went in holds the Enter: no key at all is sent while it shows,
+text and no question or menu, with End and Enter sent together (one write): in the box they submit it; on a question that came
+up in the moment after that read, End picks its last option ("No") and Enter chooses that, so a phone's message never approves
+anything (if a question took them, the Enter is tried again once it is gone). A question that shows after the text went in holds the Enter: no key at all is sent while it shows,
 the phone is told (`terminal_dialog`), and once it is answered at the terminal the Enter goes if the box holds the text again, or
 the text is typed again if the question emptied the box. A box that then holds anything else (the person at the terminal typed into
 it) is left as it is and the message is refused (`terminal_input_failed`): a phone's message never answers a permission question. Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
@@ -482,7 +484,11 @@ after the `dequeue`), when the turn is stopped there (`cancelled`), or once Clau
 that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
 `terminal_input_unconfirmed`, and one Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
 `terminal_input_withdrawn`. A
-`cancel` presses Esc in the terminal, which stops the turn there. A mode change is refused (`terminal_session`): the terminal keeps
+`cancel` presses Esc in the terminal only for a turn the phone's message started itself (typed at an idle prompt, or taken from
+Claude Code's queue once a turn ended), which stops it there. While the message is still being put in, waiting on a question, or
+held in Claude Code's queue or taken into a turn the person started, no key is sent: the phone stops following it (the question
+stays the person's to answer; a message Claude Code already queued is still Claude Code's to run, and text already in the box stays
+there). A mode change is refused (`terminal_session`): the terminal keeps
 its own mode.
 
 **The terminal's own permission mode applies to what is typed.** The terminal's owner chose that mode, and a message from the phone

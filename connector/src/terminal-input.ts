@@ -366,6 +366,15 @@ export interface TypeOptions {
   submitted?: () => boolean;
 }
 
+/**
+ * The keys that submit what is in the box, sent in one `send-keys` (one write to the terminal, read by Claude Code as one input):
+ * in the box End moves to the end of the text and Enter submits it; on a question or a menu that came up in the moment after the
+ * screen was read, End moves to the last option (a permission question's "No") and Enter chooses that, so an Enter from the phone
+ * never approves anything (measured on Claude Code 2.1.285, 2026-11-10: End on a permission question selects "4. No"; End then Enter
+ * denies it; End then Enter in the box submits).
+ */
+export const SUBMIT_KEYS: readonly string[] = ["End", "Enter"];
+
 /** How often a screen with a question on it is read again, waiting for it to go. */
 const DIALOG_POLL_MS = 200;
 /** How many times a message whose text a question took out of the box is typed again, once the question is gone. */
@@ -452,6 +461,7 @@ export class TerminalInput {
   async type(text: string, opts: TypeOptions = {}): Promise<void> {
     if (!text) throw new Error("nothing to type");
     let told = false;
+    let declined = 0;
     // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
     const waitOutDialog = async () => {
       if (!told) { told = true; opts.onDialog?.(); }
@@ -491,7 +501,18 @@ export class TerminalInput {
           why = enterGuard(screen, text);
         }
         if (!why) {
-          await this.tmux.run(["send-keys", "-t", this.ref.pane, "Enter"]);
+          // End and Enter in one write (SUBMIT_KEYS): the box takes them as "to the end, submit"; a question that came up after the read
+          // above takes End as its last option, "No", and Enter chooses that. Never a "Yes".
+          await this.tmux.run(["send-keys", "-t", this.ref.pane, ...SUBMIT_KEYS]);
+          // Submitted, or did a question take the keys? A box that still holds exactly the text, or a question on the screen, means the
+          // keys did not submit it: that is waited out and tried again.
+          await sleep(this.settleMs);
+          const after = await this.screen();
+          if (dialogOnScreen(after)) { if (++declined > MAX_TYPINGS) throw new TerminalNotSubmitted("a question took the Enter, again and again"); dialog = true; continue; }
+          if (enterGuard(after, text) === null && !opts.submitted?.()) {
+            if (++declined > MAX_TYPINGS) throw new TerminalNotSubmitted("the Enter did not submit it");
+            continue;
+          }
           return;
         }
         if (dialogOnScreen(screen)) { dialog = true; continue; }

@@ -179,6 +179,9 @@ record it.
   holds the Enter, with no key sent while it shows, and the phone is told (`terminal_input_queued` `terminal_dialog`); once it is
   answered at the terminal the Enter goes (the text is typed again if the question emptied the box). A queued message's echo is its
   `queue-operation` enqueue, and its turn ends with the turn that took it in (`queued_command`, or its own after the `dequeue`).
+  The message goes in as one bracketed paste and is submitted with End and Enter in one write, so a question that comes up at that
+  moment gets "No", never "Yes" (a typed `1` or a bare Enter would approve it). A phone `cancel` presses Esc only in a turn the
+  message started itself, never into a question or a turn of the person's.
   Doctor's `claude_version_unverified` is gone with the version list.
 - The assistant can tell where a public pull request stands for a person with no GitHub here when the deployment has a read-only
   GitHub App. `pr_state` read such a pull request with no credential, which GitHub allows 60 times an hour for the deployment's whole
