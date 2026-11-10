@@ -185,3 +185,6 @@ teams/tests/test_reviewer_reach.py::test_an_event_that_did_not_reach_the_chat_is
 teams/tests/test_typed_answer.py::test_the_install_link_is_read_from_the_environment_and_must_be_https -> packages/teams/test/config/env.test.ts::the install link is read from the environment and must be https
 teams/tests/test_github_review.py::test_a_github_token_in_a_message_to_a_group_is_masked -> MERGED packages/core/test/security/redact.test.ts::redactText > masks each credential shape
 teams/tests/test_github_review.py::test_the_roster_reader_of_the_direct_connector_asks_teams_for_the_members -> MERGED packages/teams/test/connector/direct-extras.test.ts::list members reads the roster with one retry on a rejected token
+teams/tests/test_feedback_discoverable.py::test_the_feedback_invoke_is_read_tolerantly_and_nothing_else_is_taken_for_it -> packages/teams/test/activity/to-event.test.ts::the feedback invoke is read tolerantly and nothing else is taken for it
+teams/tests/test_feedback_discoverable.py::test_only_message_submit_action_invokes_are_thumbs -> packages/teams/test/activity/to-event.test.ts::only message/submitAction invokes are thumbs
+teams/tests/test_mobile_thumbs.py::test_the_card_and_the_message_thumbs_are_told_apart_by_what_they_carry -> packages/teams/test/activity/to-event.test.ts::the card and the message thumbs are told apart by what they carry
