@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "../../..",
+    "paths": { "@primusclaw/personal-agent": ["../core/dist/types/index.d.ts"] }
+  },
+  "include": ["src"]
+}

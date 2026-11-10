@@ -1,18 +1,38 @@
 {
   "name": "@primusclaw/personal-agent-teams",
   "version": "0.1.0",
-  "private": true,
   "description": "The personal agent on Microsoft Teams: activities, Adaptive Cards, streams, Bot Connector, inbound queue, process assembly.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AMD-AGI/PrimusClaw.git",
+    "directory": "personal-agent/packages/teams"
+  },
+  "homepage": "https://github.com/AMD-AGI/PrimusClaw/tree/main/personal-agent#readme",
+  "bugs": {
+    "url": "https://github.com/AMD-AGI/PrimusClaw/issues"
+  },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "@azure/core-auth": "^1.11.0",
     "@azure/service-bus": "^7.10.0",
-    "@primusclaw/personal-agent": "0.0.0",
-    "@primusclaw/personal-agent-runtime": "0.0.0",
+    "@primusclaw/personal-agent": "0.1.0",
+    "@primusclaw/personal-agent-runtime": "0.1.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
