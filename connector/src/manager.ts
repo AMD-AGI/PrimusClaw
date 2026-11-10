@@ -39,6 +39,8 @@ export class SessionManager {
   /** Takeovers that have passed the "already attached" check and have not yet registered their session (`agent:ref`). */
   private readonly attaching = new Set<string>();
   private readonly chains = new Map<string, Promise<void>>();
+  /** The sessions {@link killAll} stopped: {@link idle} also waits for the prompts they were still counting. */
+  private stopped: Session[] = [];
 
   constructor(private readonly env: SessionEnv) {}
 
@@ -88,9 +90,13 @@ export class SessionManager {
     return next;
   }
 
-  /** Resolves once every command taken so far has been carried out (a stopping run waits for them). */
-  idle(): Promise<void> {
-    return Promise.all([...this.chains.values()]).then(() => undefined);
+  /**
+   * Resolves once every command taken so far has been carried out, and every prompt that reached an agent is counted as
+   * handled or dropped (a stopping run waits for them before connector.json's last write).
+   */
+  async idle(): Promise<void> {
+    await Promise.all([...this.chains.values()]);
+    await Promise.all([...this.sessions.values(), ...this.stopped].map((s) => s.recorded()));
   }
 
   private async dispatch(cmd: Command, handled: () => void, mayRun?: MayRun): Promise<void> {
@@ -345,6 +351,7 @@ export class SessionManager {
       s.stopTail();
     }
     await this.env.registry.killAll();
+    this.stopped = [...this.sessions.values()];
     this.sessions.clear();
   }
 }

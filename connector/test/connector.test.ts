@@ -15,7 +15,7 @@ import { getEventListeners } from "node:events";
 import { processStart } from "../src/children.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
-import { identityFile, identityKeepFile } from "../src/paths.js";
+import { disconnectsFile, identityFile, identityKeepFile } from "../src/paths.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const hs: Harness[] = [];
@@ -925,7 +925,14 @@ describe("crash safety", () => {
     const flag = path.join(h.work, "never");
     const seq = h.prompt(sid, `wait ${flag}`);
     await h.claw.until("the turn to be running", () => h.adapterLog().some((l) => l.prompt === `wait ${flag}`));
-    await h.claw.until("the turn recorded", () => fs.existsSync(path.join(h.dirs.state, "sessions.json.turns")));
+    // Recorded, and counted as handled (connector.json's cursor past it): the next run ends this turn and is not sent the prompt
+    // again. (Stopped before it counts, the record is dropped and the prompt sent again instead: the test below.)
+    await h.claw.until("the turn recorded and its prompt counted", () => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"))[sid]?.cmd_seq === seq
+          && JSON.parse(fs.readFileSync(identityFile(h.dirs), "utf8")).cursor >= seq;
+      } catch { return false; }
+    });
     await h.stop();
     h.connect();
     h.start();
@@ -1100,6 +1107,51 @@ describe("crash safety", () => {
     await h.claw.until("the prompt sent again", () => h.adapterLog().filter((l) => l.prompt === `wait ${flag}`).length === 2);
     await sleep(300);
     assert.equal(h.claw.eventsOf(sid, "turn_end").filter((e) => e.data.error === "connector_restarted").length, 0, "the dropped record is not recovered too");
+  });
+  test("a prompt that counts as handled only while the connector stops is on disk with its turn record when the run returns: the next run ends the turn or runs the prompt, once", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    // sessions.json's next write (the prompt's `used_at`) is held: the turn's record lands, and the prompt can count as handled
+    // only once that write lands too, which is after the connector began to stop.
+    const fifo = path.join(h.dirs.state, "sessions.json.tmp");
+    fs.rmSync(fifo, { force: true });
+    assert.equal(spawnSync("mkfifo", ["-m", "600", fifo]).status, 0);
+    const turnsFile = path.join(h.dirs.state, "sessions.json.turns");
+    const recorded = () => JSON.parse(fs.readFileSync(turnsFile, "utf8"))[sid]?.cmd_seq === seq;
+    const flag = path.join(h.work, "never6");
+    let read: Promise<unknown> | null = null;
+    let seq = 0;
+    let onDisk: { recorded: boolean; counted: boolean } | null = null;
+    try {
+      seq = h.prompt(sid, `wait ${flag}`);
+      await h.claw.until("the turn recorded", () => { try { return recorded(); } catch { return false; } });
+      const stopped = h.stop();
+      // The run's last writes are under way (its disconnect is the line written just before them): the disk answers now.
+      await h.claw.until("the stopping run's last writes", () => {
+        try { return fs.readFileSync(disconnectsFile(h.dirs), "utf8").includes('"reason":"stopped"'); } catch { return false; }
+      });
+      read = fs.promises.readFile(fifo);
+      await stopped;
+      // At once, as the next run reads them: whether the turn is recorded, and whether its prompt counts as handled.
+      onDisk = { recorded: recorded(), counted: JSON.parse(fs.readFileSync(identityFile(h.dirs), "utf8")).cursor >= seq };
+    } finally {
+      // The held write renamed the FIFO into place (the run has returned, so it has): what it wrote becomes the file, as a disk
+      // would have kept it, so that the next run does not open a FIFO.
+      const wrote = await (read ?? fs.promises.readFile(fifo));
+      const recs = path.join(h.dirs.state, "sessions.json");
+      if (fs.lstatSync(recs).isFIFO()) { fs.rmSync(recs); fs.writeFileSync(recs, wrote as Buffer, { mode: 0o600 }); }
+    }
+    // Both or neither: a recorded turn whose prompt is not counted is ended by the next run AND sent to it again.
+    assert.equal(onDisk.counted, onDisk.recorded, `turn recorded: ${onDisk.recorded}, prompt counted: ${onDisk.counted}`);
+    h.connect();
+    h.start();
+    fs.writeFileSync(flag, ""); // a prompt sent again ends at once
+    const end = await h.claw.until("the prompt's turn_end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq));
+    h.prompt(sid, "say after-restart");
+    await h.claw.until("the next prompt answered", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq + 1));
+    const runs = h.adapterLog().filter((l) => l.prompt === `wait ${flag}`).length;
+    assert.deepEqual([h.turnEnds(sid).filter((e) => e.data.cmd_seq === seq).length, runs], [1, end.data.error === "connector_restarted" ? 1 : 2],
+      "ended by the next run and not run again, or run again and ended by its own turn_end");
   });
   test("a prompt queued behind the running turn when the connector restarts is delivered again, not lost", async () => {
     const h = await make();

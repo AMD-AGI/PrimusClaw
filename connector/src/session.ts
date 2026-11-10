@@ -165,6 +165,13 @@ export class Session {
    * again). See {@link SessionManager.recover}.
    */
   private stopping = false;
+  /**
+   * Prompts that reached the agent and are not yet counted as handled or dropped ({@link handledOnceRecorded}, and the
+   * terminal's equivalent). A stopping connector waits for them ({@link recorded}) before it writes connector.json for the
+   * last time: counted after that write, a prompt whose turn is recorded would be both ended by the next run and sent to
+   * it again.
+   */
+  private readonly recording = new Set<Promise<unknown>>();
   private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
@@ -511,8 +518,7 @@ export class Session {
         const startedAt = new Date().toISOString();
         this.env.store.beginTurn({ session_id: this.id, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, started_at: startedAt });
         this.env.store.patch(this.id, { used_at: startedAt });
-        const recorded = await this.env.store.flushed(2_000);
-        next.started();
+        const recorded = await this.tracked(this.env.store.flushed(2_000).then((ok) => { next.started(); return ok; }));
         const turn = this.terminalTurn;
         // Everything asked again after that wait, right before the keys go: a cancel or a close meanwhile, a record that did not
         // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
@@ -1083,6 +1089,18 @@ export class Session {
     if (!keep) for (const item of q) item.started();
   }
 
+  /** Resolves once every prompt that reached the agent is counted as handled or dropped (see {@link recording}). */
+  async recorded(): Promise<void> {
+    while (this.recording.size) await Promise.allSettled([...this.recording]);
+  }
+
+  /** `p`, tracked in {@link recording} until it settles. */
+  private tracked<T>(p: Promise<T>): Promise<T> {
+    this.recording.add(p);
+    void p.finally(() => this.recording.delete(p)).catch(() => undefined);
+    return p;
+  }
+
   /** The connector is about to stop its adapters and will come back: see {@link stopping}. */
   shutdown(): void {
     this.stopping = true;
@@ -1148,7 +1166,7 @@ export class Session {
       // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
       this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
       this.env.store.patch(this.id, { used_at: now, unused: false });
-      void this.handledOnceRecorded(started, now);
+      void this.tracked(this.handledOnceRecorded(started, now));
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
       this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
