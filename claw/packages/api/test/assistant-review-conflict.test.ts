@@ -13,6 +13,8 @@
  *   C3  the shape production has (2026-11-08, N5): a review handed over on someone's behalf whose session posts its review and then has
  *       its merge refused on DIRTY sends no worker report; the item becomes blocked through `syncReviewItem` (a 'policy' event), and the
  *       one who asked is told from there, once per head commit; a sync that finds the same state again tells nothing new
+ *   C4  a merge GitHub refused for the missing `workflow` scope (`github_workflow_scope_missing`, 2026-11-09, N17) is told to the one who
+ *       asked the same way: the pull request changes CI workflow files and has to be merged by hand on GitHub; once per head commit
  * The check runs after the report is answered, not waited for (`checkConflictLater`): the tests wait for it (`conflictChecksSettled`).
  * The audit rows are written as the review service writes them; that it records GitHub's merge state on a refused merge is
  * github-review-service.test.ts M8c.
@@ -188,5 +190,51 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     await ri.syncReviewItem(item.itemId);
     await conflict.conflictChecksSettled();
     assert.equal((await toldAlice()).length, 2);
+  });
+
+  test("C4 a merge GitHub refused because the pull request changes a CI workflow file and the reviewer's token has no `workflow` scope is told to the one who asked: merge it by hand on GitHub, not bind again", async () => {
+    // The shape of 2026-11-09 12:05Z (daily gaps N17): a handed-over review posts its review, its merge is refused, its sync blocks the item.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    const run = await w.openRun(item.workerSid);
+    await merged(item, "refused", "github_workflow_scope_missing", null);
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 没能合入：这个 PR 改了 CI workflow 文件`), told[0].text);
+    assert.match(told[0].text, /需要 GitHub 的 workflow 权限，目前没有这个权限。请在 GitHub 上手动合入。/);
+    assert.doesNotMatch(told[0].text, /绑定/, "binding GitHub again does not add the scope, so it is not suggested");
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // The same head again: not told twice.
+    await merged(item, "refused", "github_workflow_scope_missing", null);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // A new head refused the same way, to one who writes English: told again, in English.
+    await w.q("UPDATE claw_assistant_messages SET content = 'Please ask bob to review and merge it' WHERE user_id = 'alice'");
+    await merged(item, "refused", "github_workflow_scope_missing", null, "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    assert.match(told[1].text, new RegExp(`^AMD-AGI/demo#${item.pr}, which you asked to be reviewed and merged, was not merged: it changes CI workflow files`));
+    assert.match(told[1].text, /Please merge it by hand on GitHub\./);
+    assert.doesNotMatch(told[1].text, /bind/i);
+    // Any other refusal from GitHub (a plain 403, github_error) is still not told.
+    const other = await reviewFor("alice");
+    await merged(other, "refused", "github_error", null);
+    await blocked(other);
+    assert.equal((await toldAlice()).length, 2);
+    // Nor to bob through this path, and not for his own review.
+    const own = await reviewFor(null);
+    await merged(own, "refused", "github_workflow_scope_missing", null);
+    await blocked(own);
+    assert.equal((await toldAlice()).length, 2);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
   });
 });

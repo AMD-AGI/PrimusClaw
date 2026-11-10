@@ -64,6 +64,10 @@
  *      decides, a case a check failed is judged once; it is told the values the run read as the truth; its reasons are kept without
  *      EVAL_KEEP_TEXT; EVAL_RECORD_DIR (no EVAL_KEEP_TEXT needed) is made 0700 and its file 0600 with the whole answers and every
  *      judge answer, and a directory open to others, or under one others may change, refuses the run before anything is sent
+ *   R22 memory entries: the entries an attempt made (listed after it, not before) are deleted after it, by id, and the entries the
+ *      identity had before are kept; one that could not be deleted fails the cleanup (cleanup_failed); a case's
+ *      setup.forget_memories deletes the identity's entries it names before the attempt's first message, and one it could not
+ *      delete makes the attempt the run's error with nothing sent
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -107,6 +111,10 @@ class FakeClaw {
   /** A new assistant session (`asst-2`, ...) is made when the last one was deleted, as the API does. */
   freshAssistant = false;
   private assistantAsked = 0;
+  /** The identity's memory entries, by id. */
+  readonly memories = new Map<number, { id: number; title: string; body: string }>();
+  /** Memory entries whose DELETE answers 500 and leaves them. */
+  readonly failMemoryDelete = new Set<number>();
   /** The authorization each message to a session came with. */
   readonly messageAuth: string[] = [];
   /** Who `GET /v1/me` says the caller is, by its authorization. */
@@ -190,6 +198,12 @@ class FakeClaw {
     // An oracle read that takes a while (a fact's `/v1/...#pick`).
     if (method === "GET" && path === "/v1/slow-oracle") { setTimeout(() => send(200, { data: { n: 3 } }), 2_000); return; }
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
+    if (method === "GET" && path === "/v1/users/me/memories") return send(200, { ok: true, data: [...this.memories.values()].map((e) => ({ ...e, content: e.body })) });
+    if ((m = /^\/v1\/users\/me\/memories\/([^/]+)$/.exec(path)) && method === "DELETE") {
+      const id = Number(m[1]);
+      if (this.failMemoryDelete.has(id)) return send(500, { ok: false });
+      return this.memories.delete(id) ? send(200, { ok: true }) : send(404, { ok: false, error: "not found" });
+    }
     if (method === "GET" && path === "/v1/work-items") {
       this.boardReads++;
       const scripted = this.boardScript.shift();
@@ -1347,6 +1361,76 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.equal(run2.code, 2, run2.out);
       assert.match(run2.out, /the token of EVAL_SEND_TOKEN_CMD is not the key's identity/);
       assert.equal(other.sent.length, 0);
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+  it("R22 the memory entries an attempt made are deleted after it; the identity's own are kept", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.memories.set(1352, { id: 1352, title: "Main repo", body: "The user's main repo is AMD-AGI/PrimusClaw" });
+    claw.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+    // The turn saves an entry, as memory_save does.
+    claw.router = (_content, id) => { claw.memories.set(2000, { id: 2000, title: "Reviews", body: "reviews with opus" }); claw.turn(id, { say: "Saved." }); };
+    const r = runner(base, [answerCase("t-mem-001", "remember that I review with opus")]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE /v1/users")), ["DELETE /v1/users/me/memories/2000"], "only the entry the attempt made");
+      assert.deepEqual([...claw.memories.keys()].sort((a, b) => a - b), [5, 1352], "the entries from before the attempt are kept");
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      assert.deepEqual(report.cleanup_failed, []);
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // An entry the run could not delete is the cleanup's failure, never silent.
+    const stuck = new FakeClaw();
+    const base2 = await stuck.start();
+    stuck.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+    stuck.failMemoryDelete.add(2001);
+    stuck.router = (_content, id) => { stuck.memories.set(2001, { id: 2001, title: "Repo", body: "AMD-AGI/PrimusClaw" }); stuck.turn(id, { say: "Saved." }); };
+    const r2 = runner(base2, [answerCase("t-mem-002", "remember my repo")]);
+    const run2 = await r2.done;
+    await stuck.stop();
+    try {
+      assert.equal(run2.code, 1, run2.out);
+      assert.ok(stuck.memories.has(5) && stuck.memories.has(2001));
+      const report = JSON.parse(readFileSync(join(r2.dir, "out", "assistant.json"), "utf8"));
+      assert.ok(report.cleanup_failed.some((x: string) => /memory entries the run made not deleted: 2001/.test(x)), JSON.stringify(report.cleanup_failed));
+      assert.ok(!report.cleanup_failed.some((x: string) => /\b5\b/.test(x)));
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R22 setup.forget_memories deletes the entries it names before the attempt; one it cannot is the run's error", { timeout: 120_000 }, async () => {
+    const memCase = { ...answerCase("cat-memory-wr-002", "remember that my main repo is AMD-AGI/PrimusClaw"), setup: { forget_memories: ["amd-agi/primusclaw"] } };
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.memories.set(1352, { id: 1352, title: "Main repo", body: "The user's main repo is AMD-AGI/PrimusClaw" });
+    claw.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+    claw.router = (_content, id) => { claw.memories.set(2002, { id: 2002, title: "Main repo", body: "AMD-AGI/PrimusClaw" }); claw.turn(id, { say: "Saved." }); };
+    const r = runner(base, [memCase]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.doesNotMatch(run.out, /case not loaded/);
+      const forgot = claw.calls.indexOf("DELETE /v1/users/me/memories/1352");
+      const sent = claw.calls.findIndex((c) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c));
+      assert.ok(forgot >= 0 && sent > forgot, "the named entry is deleted before the message is sent");
+      assert.deepEqual(claw.calls.filter((c) => c.startsWith("DELETE /v1/users")), ["DELETE /v1/users/me/memories/1352", "DELETE /v1/users/me/memories/2002"]);
+      assert.deepEqual([...claw.memories.keys()], [5], "an entry the case does not name is kept");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    const stuck = new FakeClaw();
+    const base2 = await stuck.start();
+    stuck.memories.set(1352, { id: 1352, title: "Main repo", body: "AMD-AGI/PrimusClaw" });
+    stuck.failMemoryDelete.add(1352);
+    stuck.router = (_content, id) => stuck.turn(id, { say: "Saved." });
+    const r2 = runner(base2, [memCase]);
+    const run2 = await r2.done;
+    await stuck.stop();
+    try {
+      assert.equal(run2.code, 1, run2.out);
+      assert.match(run2.out, /ERROR cat-memory-wr-002#1 .*infra: setup: memory entries named by forget_memories not deleted: 1352/);
+      assert.equal(stuck.sent.length, 0, "nothing sent");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
   });
 });

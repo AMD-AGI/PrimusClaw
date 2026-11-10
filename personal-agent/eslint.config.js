@@ -8,6 +8,7 @@ import comments from "@eslint-community/eslint-plugin-eslint-comments/configs";
 import { createTypeScriptImportResolver } from "eslint-import-resolver-typescript";
 import { importX } from "eslint-plugin-import-x";
 import tseslint from "typescript-eslint";
+import asyncContext from "./eslint-rules/async-context.js";
 import noPrototypeKeys from "./eslint-rules/no-prototype-keys.js";
 
 /** Rules that are gates: no inline disable of these is accepted, with or without a reason. */
@@ -20,6 +21,7 @@ const GATES = [
   "@typescript-eslint/no-floating-promises",
   "@typescript-eslint/no-misused-promises",
   "own-keys/no-prototype-keys",
+  "layers/async-context-in-runtime-context",
 ];
 
 export default tseslint.config(
@@ -73,6 +75,12 @@ export default tseslint.config(
     files: ["**/*.ts"],
     plugins: { "own-keys": { rules: { "no-prototype-keys": noPrototypeKeys } } },
     rules: { "own-keys/no-prototype-keys": "error" },
+  },
+  {
+    // Asynchronous context only in packages/runtime/src/context/ (eslint-rules/async-context.js).
+    files: ["**/*.ts"],
+    plugins: { layers: { rules: { "async-context-in-runtime-context": asyncContext } } },
+    rules: { "layers/async-context-in-runtime-context": "error" },
   },
   {
     // Config files, the local lint rules and scripts are plain JavaScript run by Node.

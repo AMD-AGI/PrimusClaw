@@ -622,6 +622,20 @@ describe("Q a base branch with a merge queue", () => {
     assert.equal(e.gh.enqueues.length, 1);
   });
 
+  test("Q10c a queue GitHub refuses because the pull request changes a CI workflow file and the token has no `workflow` scope is github_workflow_scope_missing, as a direct merge is: never queued, never merged", async () => {
+    byRule();
+    approvedHere();
+    e.gh.enqueueRefusal = "refusing to allow an OAuth App to create or update workflow `.github/workflows/tests.yml` without `workflow` scope";
+    const o = await merge();
+    assert.equal(o.isError, true, o.text);
+    assert.equal(reason(o), "github_workflow_scope_missing", o.text);
+    assert.match(String(o.body.message), /merged by hand on GitHub/);
+    assert.match(String(o.body.github_message), /without `workflow` scope/);
+    assert.equal(o.body.approved_by_this_call, false);
+    assert.notEqual(o.body.status, "queued");
+    assert.equal(e.gh.count(/\/merge$/), 0);
+  });
+
   test("Q10b an HTTP refusal of the queue request (a missing permission, a request GitHub will not process) is enqueue_refused with GitHub's message; a rate limit is not, and a 5xx is not", async () => {
     const answering = (status: number, message: string, headers: Record<string, string> = {}) => async (input: URL | string | Request, init: RequestInit = {}): Promise<Response> => {
       const real = e.gh.fetch;

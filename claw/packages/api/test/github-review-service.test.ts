@@ -654,6 +654,32 @@ describe("M the merge gates", () => {
     assert.deepEqual({ ...(await row()) }, { result: "ok", detail: "merged", merge_state: null });
   });
 
+  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; any other 403 is still github_error", async () => {
+    const workflow = "refusing to allow an OAuth App to create or update workflow `.github/workflows/tests.yml` without `workflow` scope";
+    const row = async () => (await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    approvedHere();
+    e.gh.mergeAnswers = [{ status: 403, message: workflow }];
+    const o = await merge();
+    assert.equal(o.isError, true, o.text);
+    assert.equal(reason(o), "github_workflow_scope_missing", o.text);
+    assert.match(String(o.body.message), /changes CI workflow files/);
+    assert.match(String(o.body.message), /merged by hand on GitHub/);
+    assert.match(String(o.body.message), /do not suggest binding GitHub again/);
+    assert.equal(o.body.github_status, 403);
+    assert.match(String(o.body.github_message), /without `workflow` scope/);
+    assert.equal(puts().length, 1, "not retried");
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_workflow_scope_missing" });
+    // A GitHub App says `workflows` permission: the same refusal.
+    e.gh.mergeAnswers = [{ status: 403, message: "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission" }];
+    assert.equal(reason(await merge()), "github_workflow_scope_missing");
+    // Another 403 is not this one.
+    e.gh.mergeAnswers = [{ status: 403, message: "Resource not accessible by integration" }];
+    const other = await merge();
+    assert.equal(reason(other), "github_error", other.text);
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_error" });
+  });
+
   test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
     const st = (mergeStateStatus: string, extra: Record<string, unknown> = {}) => ({ mergeStateStatus, ...extra });
     // [name, the states the reads after the approval answer, in order, then what every later read answers, expected reason or "merged", waits]

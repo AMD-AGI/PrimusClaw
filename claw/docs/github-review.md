@@ -399,7 +399,11 @@ A review asked of someone else meets the assistant in three places:
   and a `BLOCKED` right after this call's own approval, is looked at again for about seven seconds, one
   request a look, with CI read once more before a merge that had to wait, before the merge is refused as `merge_state_not_clean`), and the repository's own
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.
-  The method is the repository's first allowed one, squash first.
+  The method is the repository's first allowed one, squash first. A pull request that changes a CI workflow file
+  (`.github/workflows/*`) cannot be merged, nor put in a merge queue, with a token that lacks GitHub's `workflow`
+  scope; GitHub's 403 for it is refused as `github_workflow_scope_missing`, which says to merge it by hand on GitHub
+  (binding again does not add the scope), and a review someone asked of another person tells the one who asked
+  so, as it tells them of a conflict (`assistant/review-conflict.ts`).
 - **High risk.** Whether an `APPROVE` or a merge is held for the acting user's own confirmation is
   decided in `packages/api/src/github-review/risk.ts` (`assessRisk`). Under the acting user's default review
   mode, `high_risk_confirm` (under `fully_auto` see the item above), it is held when
