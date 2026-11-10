@@ -1606,7 +1606,9 @@ export class TranscriptTail {
       const until = Math.min(size, this.offset + TAIL_LOOK_BYTES);
       const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, until - this.offset));
       while (this.offset < until) {
-        const n = fs.readSync(fd, buf, 0, Math.min(buf.length, until - this.offset), this.offset);
+        let n: number;
+        // (a read that fails after others went through: what they gave is returned, and the next look reads on from there)
+        try { n = fs.readSync(fd, buf, 0, Math.min(buf.length, until - this.offset), this.offset); } catch { break; }
         if (n <= 0) break;
         this.offset += n;
         out.push(...this.take(this.decoder.write(buf.subarray(0, n))));
