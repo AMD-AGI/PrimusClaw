@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import { fixed1 } from "../text/py-text.js";
+import { pyStr } from "../text/py-json.js";
 import { tokenOf } from "./identifiers.js";
+import { isoSeconds } from "./iso-time.js";
 import { code, fence } from "./markdown.js";
 
 /**
@@ -70,35 +72,15 @@ export function objectOf(value: unknown): Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/**
- * ISO 8601 text without its fraction of a second, and that fraction: `Date.parse` cuts it to milliseconds, Python keeps
- * microseconds. Read by position, not by a pattern (no backtracking on a long input).
- */
-function splitFraction(value: string): { readonly base: string; readonly fraction: number } {
-  // the time follows the date's ten characters and Python's separator: "T", "t" or a space
-  const dot = "Tt ".includes(value.charAt(10)) ? value.indexOf(".", 11) : -1;
-  if (dot === -1) return { base: value, fraction: 0 };
-  let end = dot + 1;
-  while (end < value.length && value.charCodeAt(end) >= 48 && value.charCodeAt(end) <= 57) end += 1;
-  if (end === dot + 1) return { base: value, fraction: 0 };
-  return {
-    base: value.slice(0, dot) + value.slice(end),
-    fraction: Number(`0.${value.slice(dot + 1, Math.min(end, dot + 7))}`),
-  };
-}
-
-/** A timestamp as Claw writes it (epoch seconds or milliseconds, or ISO 8601 to the microsecond), in seconds. */
+/** A timestamp as Claw writes it (epoch seconds or milliseconds, or ISO 8601 as Python reads it), in seconds. */
 export function secondsOf(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value > 1e11 ? value / 1000 : value;
-  if (typeof value !== "string" || !value) return undefined;
-  const { base, fraction } = splitFraction(value);
-  const ms = Date.parse(base);
-  return Number.isNaN(ms) ? undefined : ms / 1000 + fraction;
+  return typeof value === "string" && value ? isoSeconds(value) : undefined;
 }
 
 function eventOf(row: HistoryRow): TurnEvent {
   const data = objectOf(row.data);
-  const type = row.event_type || (typeof data["type"] === "string" ? data["type"] : "");
+  const type = row.event_type || pyStr(data["type"]);
   return { id: row.event_id, type, data, at: secondsOf(row.created_at) };
 }
 

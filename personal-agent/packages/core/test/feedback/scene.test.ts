@@ -103,11 +103,16 @@ test("a turn is named by its message id, else its event id, else unknown", () =>
 test("tools are listed once each, at most fifteen, and errors at most five", () => {
   const tools = Array.from({ length: 20 }, (_, i) => row("toolUsed", { tool: `t${String(i)}` }, null));
   const errors = Array.from({ length: 8 }, (_, i) => row("error", { error_code: `c${String(i)}` }, null));
+  // the repeat comes before the cap, so a list that kept it would show t0 twice and stop at t13
+  const [first, ...others] = tools;
   const turn = summarizeTurn(
-    splitTurns([user("m", null), ...tools, row("toolUsed", { tool: "t0" }, null), ...errors])[0] ?? [],
+    splitTurns([user("m", null), ...(first ? [first, first] : []), ...others, ...errors])[0] ?? [],
     NOW,
   );
-  assert.equal(turn.tools.length, 15);
+  assert.deepEqual(
+    turn.tools,
+    Array.from({ length: 15 }, (_, i) => `t${String(i)}`),
+  );
   assert.deepEqual(turn.errors, ["error code=c0", "error code=c1", "error code=c2", "error code=c3", "error code=c4"]);
 });
 
@@ -125,7 +130,7 @@ test("timestamps are epoch seconds, epoch milliseconds or ISO 8601", () => {
     fixed1((secondsOf("2026-01-01t00:00:00.051000+00:00") ?? 0) - (secondsOf("2026-01-01 00:00:00.001100+00:00") ?? 0)),
     "0.0",
   );
-  assert.equal(secondsOf("2026-01-01T00:00:00.Z"), Date.parse("2026-01-01T00:00:00.Z") / 1000 || undefined);
+  assert.equal(secondsOf("2026-01-01T00:00:00.Z"), 1767225600); // python3: an empty fraction before the zone is taken
   assert.equal(secondsOf(`2026-01-01T00:00:00.${"0".repeat(50_000)}x`), undefined); // linear, and no date
   assert.equal(secondsOf("not a date"), undefined);
   assert.equal(secondsOf(""), undefined);
