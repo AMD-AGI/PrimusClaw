@@ -78,4 +78,9 @@ export interface TurnOutcome {
 
 export interface TurnRunner {
   run(run: TurnRun, hooks: TurnHooks): Promise<TurnOutcome>;
+  /**
+   * The answer of the session's last finished turn, read with `credential` (undefined: none finished yet). Claw refuses a
+   * session the credential does not own (a ClawError 401/403/404); one it cannot be reached for is a ClawUnreachable.
+   */
+  lastAnswer(credential: string, sessionId: string): Promise<string | undefined>;
 }

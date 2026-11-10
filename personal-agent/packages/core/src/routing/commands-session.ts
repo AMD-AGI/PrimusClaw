@@ -14,7 +14,7 @@ import type { RouterContext } from "./context.js";
 import { chatTurnKey, type ActiveTurn } from "./turn-registry.js";
 import type { TurnStarter } from "./turn-start.js";
 import { whenText, zoneOf } from "./time.js";
-import { repoButton } from "./views.js";
+import { createPrButton, repoButton } from "./views.js";
 
 /**
  * The chat's session (the Python `Agent._cmd_new`, `_cmd_stop`, `_cmd_sessions`, `_cmd_repo`, `_repo_click`, `_bind_repo`,
@@ -230,7 +230,7 @@ export class SessionCommands {
     } else if (this.ctx.hasTurn(chat.sender.id)) {
       const text = said.createPrBusy;
       const card = this.ctx.views.note(text, {
-        buttons: [{ title: "Create PR", verb: "create_pr", data: { session_id: sessionId } }],
+        buttons: [createPrButton(sessionId)],
       });
       await this.ctx.settle(action, chat, card, { fallback: text });
     } else {

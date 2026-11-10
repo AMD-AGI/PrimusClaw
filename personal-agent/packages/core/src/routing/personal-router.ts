@@ -14,10 +14,11 @@ import { learnLang, type Chat } from "./chat.js";
 import type { CommandSets } from "./command-table.js";
 import type { RouterContext } from "./context.js";
 import type { PersonalText } from "./personal-text.js";
+import { ShowHere } from "./show-here.js";
 import { StopPress } from "./stop-press.js";
 
 /** The router's own buttons in a 1:1 chat (its feature handlers' come from the assembly). */
-const OWN_VERBS = ["bind", "repo", "create_pr", "turn_stop"] as const;
+const OWN_VERBS = ["bind", "repo", "create_pr", "show", "turn_stop"] as const;
 
 /**
  * A 1:1 chat (the Python `Agent._dispatch` from the personal-chat check on): what needs no account first (`/link`, the
@@ -26,6 +27,7 @@ const OWN_VERBS = ["bind", "repo", "create_pr", "turn_stop"] as const;
  */
 export class PersonalRouter {
   private readonly stopPress: StopPress;
+  private readonly showHere: ShowHere;
 
   constructor(
     private readonly ctx: RouterContext,
@@ -33,6 +35,7 @@ export class PersonalRouter {
     private readonly text: PersonalText,
   ) {
     this.stopPress = new StopPress(ctx);
+    this.showHere = new ShowHere(ctx);
   }
 
   async route(event: InboundMessage | InboundAction, chat: Chat): Promise<void> {
@@ -138,6 +141,7 @@ export class PersonalRouter {
   private async ownClick(action: InboundAction, chat: Chat, key: string): Promise<void> {
     if (action.verb === "repo") await this.sets.sessions.repoClick(action, chat);
     else if (action.verb === "create_pr") await this.sets.sessions.createPr(action, chat, key);
+    else if (action.verb === "show") await this.showHere.click(action, chat, key);
     else if (action.verb === "turn_stop") await this.stopPress.press(action, chat, key);
   }
 }
