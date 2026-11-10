@@ -19,6 +19,7 @@ import {
   type Logger,
   type LogValue,
   type MetricsPort,
+  type RequestScope,
   type RouteHandlers,
   type UserRef,
 } from "@primusclaw/personal-agent";
@@ -164,6 +165,7 @@ export interface WorldOptions {
   /** The surface to post to (a remote-agent world's, so that one outbox holds everything). */
   readonly surface?: FakeSurface;
   readonly messageText?: Partial<MessageText>;
+  readonly requestScope?: RequestScope;
   /** The store (and its clock) to use: a remote-agent world's, so that both read one store as the worker does. */
   readonly testStore?: ReturnType<typeof openTestStore>;
   readonly handlers?: Partial<RouteHandlers>;
@@ -256,6 +258,7 @@ export function world(options: WorldOptions = {}) {
     note,
     handlers: { ...noRouteHandlers, ...options.handlers },
     integrations: integrationRegistry(),
+    ...(options.requestScope ? { requestScope: options.requestScope } : {}),
   };
   const router = new Router(deps);
   return { router, store, clock, surface, claw, turns, exchange, owners, events, limited, revoked, deps };
