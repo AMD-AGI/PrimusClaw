@@ -93,7 +93,7 @@ it("a post goes to the conversation, and the audit is one on_behalf_message even
   assert.ok(conversation !== undefined);
   await bound.services.post(conversation, "（协调者代发）hi");
   assert.equal(surface.outbox.at(-1)?.op, "post");
-  bound.services.audit({ outcome: "success", status: 202, count: 1 });
+  bound.services.audit({ outcome: "success", status: 202, count: 1, operation: "approval" });
   const record = JSON.parse(security.lines.at(-1)?.message ?? "{}") as Record<string, unknown>;
   assert.deepEqual(
     [record["event"], record["operation"], record["outcome"]],
@@ -139,4 +139,33 @@ it("buildWorker builds a deployment's plugins with the worker's services, and ru
     buildWorker({ ...env, TEAMS_DB_PATH: join(dir, "state2.db") }, () => ({}), options),
     /TEAMS_ON_BEHALF_USERS/,
   );
+});
+
+it("the worker waits for what a spawned task spawns in turn before it stops", async () => {
+  const { bound } = services();
+  bound.bind({ handle: () => Promise.resolve() } as unknown as Router);
+  const done: string[] = [];
+  const gate = (): { wait: Promise<void>; open: () => void } => {
+    let open!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { wait, open };
+  };
+  const parent = gate();
+  const child = gate();
+  bound.services.spawn(async () => {
+    await parent.wait; // (the follow-up is spawned only after the worker started waiting)
+    bound.services.spawn(async () => {
+      await child.wait;
+      done.push("child");
+    });
+    done.push("parent");
+  });
+  const idle = bound.idle().then(() => done.push("idle"));
+  parent.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  child.open();
+  await idle;
+  assert.deepEqual(done, ["parent", "child", "idle"]);
 });

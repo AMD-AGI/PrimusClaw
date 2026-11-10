@@ -109,6 +109,7 @@ function assembled(env: Record<string, string> = {}, security = new RecordingLog
     ),
     plugins,
     exchange: plugins.tokenExchange,
+    fetch: globalThis.fetch,
     env,
   };
   return { features: buildFeatures(base), store, surface };
@@ -309,24 +310,6 @@ describe("the platform services", () => {
     } finally {
       await safe.close();
     }
-  });
-
-  it("a configuration that turns the review service on stops the start: it is not run quietly without it", () => {
-    const githubReview = {
-      enabled: true,
-      owners: ["acme"],
-      intentModel: "",
-      credentialUrl: "https://claw.example.com/oauth/external-credentials",
-      clientId: "cli",
-    };
-    assert.throws(
-      () => assembled({}, new RecordingLogger(), { settings: { githubReview } }),
-      (error: unknown) => {
-        assert.ok(error instanceof StartupError);
-        assert.match(error.message, /TEAMS_GITHUB_REVIEW_ENABLED/);
-        return true;
-      },
-    );
   });
 
   it("a fallback model with no refusal policy stops the start: it would never be used", () => {
