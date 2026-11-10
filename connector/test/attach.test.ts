@@ -98,15 +98,21 @@ describe("whether a conversation's main turn has ended (a terminal Claude Code c
     fs.appendFileSync(file, l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
     assert.equal(await s.mainTurnEnded(REF), true);
     // The same file (same inode) rewritten, longer than what was read, with a message still queued before its last turn's end.
+    // (every write from here goes through the one descriptor: the file is never reopened by its name)
     const fd = fs.openSync(file, "r+");
-    fs.ftruncateSync(fd, 0);
-    fs.writeSync(fd, l({ type: "user", pad: "x".repeat(400) }) + l({ type: "queue-operation", operation: "enqueue" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }), 0);
-    fs.closeSync(fd);
-    assert.equal(await s.mainTurnEnded(REF), false, "the queued message is seen");
-    fs.appendFileSync(file, l({ type: "queue-operation", operation: "remove" }));
-    assert.equal(await s.mainTurnEnded(REF), true, "taken");
-    fs.appendFileSync(file, "{ not json\n");
-    assert.equal(await s.mainTurnEnded(REF), null, "a line that does not parse: no answer");
+    let at = 0;
+    const put = (text: string) => { at += fs.writeSync(fd, text, at); };
+    try {
+      fs.ftruncateSync(fd, 0);
+      put(l({ type: "user", pad: "x".repeat(400) }) + l({ type: "queue-operation", operation: "enqueue" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
+      assert.equal(await s.mainTurnEnded(REF), false, "the queued message is seen");
+      put(l({ type: "queue-operation", operation: "remove" }));
+      assert.equal(await s.mainTurnEnded(REF), true, "taken");
+      put("{ not json\n");
+      assert.equal(await s.mainTurnEnded(REF), null, "a line that does not parse: no answer");
+    } finally {
+      fs.closeSync(fd);
+    }
   });
 });
 
