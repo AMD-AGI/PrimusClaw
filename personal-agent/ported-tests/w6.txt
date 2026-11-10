@@ -319,3 +319,6 @@ tests/test_deployment_defaults.py::test_the_connector_commands_come_from_the_con
 # tests/test_session_window.py::test_the_card_in_both_languages, test_the_output_is_bounded_with_more_behind_a_toggle_and_made_inert,
 # test_the_agents_words_outside_the_output_are_inert_too, test_a_waiting_approval_and_a_busy_terminal_are_its_state,
 # test_stop_says_it_interrupts_the_terminal_where_messages_are_typed_into_one
+tests/test_connector_reasons.py::test_a_terminal_turn_error_of_connector_0_1_19_has_its_own_words -> packages/core/test/remote/connector-reasons.test.ts::a terminal turn error of connector 0.1.19 has its own words: terminal_busy
+tests/test_connector_reasons.py::test_terminal_busy_no_longer_blames_a_running_turn -> packages/core/test/remote/connector-reasons.test.ts::terminal busy no longer blames a running turn
+tests/test_connector_reasons.py::test_a_withdrawn_message_says_where_it_is_and_how_to_send_it -> packages/core/test/remote/connector-reasons.test.ts::a withdrawn message says where it is and how to send it
