@@ -82,6 +82,10 @@ const CONNECTOR_CODES = [
   "terminal_command_refused",
   "takeover_expired",
   "terminal_screen_unknown",
+  "read_only_live_session",
+  // connector 0.1.19 (session.ts): a queued message pulled back into the box; a holder never proven
+  "terminal_input_withdrawn",
+  "terminal_state_unknown",
   // roots.ts (a folder named by its base name; a root whose disk does not answer)
   "cwd_ambiguous",
   "root_unavailable",
@@ -220,4 +224,40 @@ test("a long run of full stops that does not end the reason is trimmed in linear
   assert.equal(bareReason(reason), reason); // (Python: the same text, nothing to strip at its end)
   assert.equal(bareReason(`${reason}...`), reason);
   assert.ok(performance.now() - started < 500, `${String(performance.now() - started)} ms`);
+});
+
+// The `turn_end` error codes a connector from 0.1.19 ends a message typed into a terminal with.
+const TERMINAL_TURN_ERRORS = [
+  "terminal_busy",
+  "terminal_input_withdrawn",
+  "terminal_input_failed",
+  "terminal_switched",
+  "terminal_gone",
+  "terminal_screen_unknown",
+  "terminal_state_unknown",
+  "read_only_live_session",
+];
+
+for (const code of TERMINAL_TURN_ERRORS) {
+  test(`a terminal turn error of connector 0.1.19 has its own words: ${code}`, () => {
+    assert.ok(knownReasons().includes(code), code);
+    const [zh, en] = explain(code);
+    assert.ok(!zh.includes("不认识") && !en.includes("do not know"), `${zh} | ${en}`);
+  });
+}
+
+test("terminal busy no longer blames a running turn", () => {
+  // (0.1.19 types a message in while a turn runs, Claude Code queues it: only typing or a scrolled-back screen holds it)
+  const [zh, en] = explain("terminal_busy");
+  assert.ok(!zh.includes("在跑") && !en.toLowerCase().includes("running"), `${zh} | ${en}`);
+  assert.ok(zh.includes("输入") && zh.includes("回滚") && en.includes("typing") && en.includes("scrolled back"));
+});
+
+test("a withdrawn message says where it is and how to send it", () => {
+  const [zh, en] = explain("terminal_input_withdrawn");
+  assert.ok(zh.includes("没有") && zh.includes("输入框") && zh.includes("回车") && zh.includes("重发"), zh);
+  assert.ok(
+    en.includes("not sent") && en.includes("input box") && en.includes("Enter") && en.includes("again from the phone"),
+    en,
+  );
 });

@@ -74,8 +74,16 @@ export const connectorReasonText = defineCatalog({
     takeover_not_permitted:
       "The terminal holding the conversation belongs to another user, so the connector may not end it; it was not taken over.",
     takeover_failed: "Ending the terminal's hold on the conversation failed, so it was not taken over.",
+    // (since connector 0.1.19 a running turn never holds a message back: Claude Code queues it; only someone's half-typed text in
+    // the box, or a screen scrolled back, held for 10 minutes ends it terminal_busy)
     terminal_busy:
-      "The terminal stayed busy (running, or someone typing) for 10 minutes, so the message was not typed in. Send it again later.",
+      "Someone was typing in the terminal (or had it scrolled back) for 10 minutes, so the message was not typed in. Send it again later.",
+    // (Claude Code took the message into its own queue, then someone at the terminal pulled that queue back into the box)
+    terminal_input_withdrawn:
+      "The message was in Claude Code's queue in the terminal, but someone there pulled the queue back into the input box (up-arrow to edit), so it was not sent as the phone's message; it is now in the terminal's input box. To send it, press Enter in the terminal, or send it again from the phone.",
+    // (a terminal whose Claude Code cannot be told to hold this conversation, for 10 minutes)
+    terminal_state_unknown:
+      "For 10 minutes the connector could not confirm that the terminal's Claude Code still has this conversation open, so the message was not typed in. Look at the terminal, make sure it is still on this conversation, and send again.",
     terminal_gone: "The terminal's tmux pane is gone, so the message was not typed in.",
     terminal_switched:
       "That terminal has moved to another conversation (a /resume or /clear there), so the message was not typed in.",
@@ -85,6 +93,9 @@ export const connectorReasonText = defineCatalog({
     terminal_input_unavailable:
       "After a restart the connector could not prove that terminal again, so the message was not typed in. Attach again.",
     empty_prompt: "The message was empty once its control characters were removed; nothing was typed.",
+    // (a prompt to a session that only watches a terminal's conversation; also a turn_end error)
+    read_only_live_session:
+      "That conversation is open in a terminal on that machine and can only be watched from here, so the message was not sent. Type it in the terminal, or take the conversation over first.",
     terminal_session: "That conversation is open in a terminal, which keeps its own mode.",
     terminal_mode_not_allowed:
       "The terminal's conversation is in a permission mode that does not ask (auto, for example), which this agent's approval setting does not allow from the phone, so the message was not typed in. Switch the terminal to a mode that asks (shift+tab in Claude Code: manual or plan) and send again, or set `approval = \"never\"` for this agent in agents.toml on that machine.",
@@ -165,13 +176,19 @@ export const connectorReasonText = defineCatalog({
       "这段对话开在另一台机器或容器里（共用同一个 Claude 配置目录），这里结束不了它，所以没有接管。在那边退出它再试。",
     takeover_not_permitted: "终端里的这段对话属于另一个系统用户，连接器无权结束它，所以没有接管。",
     takeover_failed: "结束终端里的这段对话失败了，所以没有接管。",
-    terminal_busy: "终端一直在忙（在跑或有人在输入），等了 10 分钟也没空出来，这条消息没有发进去。稍后再发。",
+    terminal_busy: "终端里有人在输入（或正在回滚查看），等了 10 分钟也没空出来，这条消息没有发进去。稍后再发。",
+    terminal_input_withdrawn:
+      "这条消息已经排进终端里 Claude Code 的队列，但后来终端里有人把队列拉回了输入框（按了上键编辑），所以它没有作为手机消息发出，现在在终端的输入框里。要发，请在终端里回车，或从手机重发。",
+    terminal_state_unknown:
+      "连接器 10 分钟内都没法确认那个终端里的 Claude Code 还开着这段对话，这条消息没有发进去。看一眼终端，确认它还在这段对话里，再发一次。",
     terminal_gone: "终端那边的 tmux 窗格已经没了，这条消息没有发进去。",
     terminal_switched: "那个终端已经换到另一段对话了（在终端里 /resume 或 /clear 过），这条消息没有发进去。",
     terminal_input_failed: "往终端里输入这条消息失败了，没有发进去。",
     terminal_input_unconfirmed: "消息已经输入终端，但终端的记录里没看到它，可能没发出去。去终端里看一眼。",
     terminal_input_unavailable: "连接器重启后没能再确认那个终端，这条消息没有发进去。重新 attach 一次。",
     empty_prompt: "这条消息去掉控制字符后是空的，没有发进终端。",
+    read_only_live_session:
+      "这段对话正开在那台机器的终端里，这边只能看、不能输入，这条消息没有发进去。在终端里输入，或先接管再发。",
     terminal_session: "这段对话开在终端里，模式由终端决定，这里改不了。",
     terminal_mode_not_allowed:
       '终端里这段对话的权限模式（例如 auto）不逐步询问，而这个 agent 的审批设置不允许从手机往这种模式里输入，这条消息没有发进去。在终端里按 shift+tab 切到会询问的模式（manual 或 plan）再发；或在那台机器的 agents.toml 里给这个 agent 设 `approval = "never"`。',
