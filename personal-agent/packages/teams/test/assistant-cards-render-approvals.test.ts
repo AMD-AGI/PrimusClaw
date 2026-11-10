@@ -28,7 +28,9 @@ import {
 
 import { ApprovalFlow, settledView, type Settled } from "../../../test-support/assistant/approval-flow.js";
 import { ALICE, world } from "../../../test-support/assistant/proactive-world.js";
-import { allLines, body, contentOf, str, valid, visible } from "../../../test-support/assistant/teams-cards.js";
+import { allLines, body, contentOf, str, visible } from "../../../test-support/assistant/teams-cards.js";
+
+import { valid } from "./assistant-cards-valid.js";
 import { RENDERERS, renderView } from "../src/views/index.js";
 import { answerButton } from "../src/views/approval/index.js";
 

@@ -33,9 +33,10 @@ import {
   str,
   texts,
   titles,
-  valid,
   walk,
 } from "../../../test-support/assistant/teams-cards.js";
+
+import { valid } from "./assistant-cards-valid.js";
 import { askerView } from "../../../test-support/card-catalog/assistant.js";
 
 const KEY = "ak-alice";

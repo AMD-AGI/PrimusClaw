@@ -3,33 +3,17 @@
 
 /**
  * The Teams side of the cards world (the Python tests' `valid`, `body_text`, `titles`, `column_text`, `badges_of`): every view
- * drawn by the Teams renderers, the note card a press is settled with, the Adaptive Card 1.5 schema, and the words of a card as
- * those tests read them.
+ * drawn by the Teams renderers, the note card a press is settled with, and the words of a card as those tests read them. (The
+ * Adaptive Card 1.5 schema check is the teams package's: `packages/teams/test/assistant-cards-valid.ts`, where its ajv resolves.)
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 
 import type { JsonObject, OutMessage } from "@primusclaw/personal-agent";
-import { Ajv } from "ajv";
 
 import { hasCjk } from "../../packages/teams/src/cards/cjk.js";
 import { noteCard } from "../../packages/teams/src/views/assistant/index.js";
 import { RENDERERS, renderView } from "../../packages/teams/src/views/index.js";
 import type { Out } from "./cards-world.js";
-
-const schema = JSON.parse(
-  readFileSync(new URL("../data/adaptive-card-1.5.schema.json", import.meta.url), "utf8"),
-) as JsonObject;
-const rules = Object.fromEntries(Object.entries(schema).filter(([key]) => key !== "$schema" && key !== "id"));
-const validate = new Ajv({ strict: false, allErrors: true }).compile({
-  ...rules,
-  $id: typeof schema["id"] === "string" ? schema["id"] : "",
-});
-
-/** The card's content validates against Adaptive Card 1.5. */
-export function valid(card: JsonObject): void {
-  assert.ok(validate(card), JSON.stringify(validate.errors));
-}
 
 /** The card content of a Teams message (undefined: it carries none). */
 export function contentOf(activity: JsonObject): JsonObject | undefined {

@@ -13,7 +13,9 @@ import { it } from "node:test";
 import { ClawUnreachable, type JsonObject } from "@primusclaw/personal-agent";
 
 import { CardsWorld } from "../../../test-support/assistant/cards-world.js";
-import { body, bodyText, opOf, render, str, titles, valid } from "../../../test-support/assistant/teams-cards.js";
+import { body, bodyText, opOf, render, str, titles } from "../../../test-support/assistant/teams-cards.js";
+
+import { valid } from "./assistant-cards-valid.js";
 
 const KEY = "ak-alice";
 
