@@ -1,0 +1,300 @@
+{
+  "empty": {
+    "rows": [],
+    "tail": {
+      "cursor": "",
+      "mode": null,
+      "modes": [],
+      "unattended": null,
+      "mode_flags": null,
+      "read_only": false,
+      "terminal": false,
+      "active": false,
+      "steps": [],
+      "pending": [],
+      "asked": []
+    }
+  },
+  "started_then_idle": {
+    "rows": [
+      {
+        "id": "1",
+        "type": "session_started",
+        "data": {
+          "acp_session_id": "acp-1",
+          "currentMode": "default",
+          "modes": [
+            {
+              "id": "default",
+              "name": "d",
+              "unattended": false
+            },
+            {
+              "id": "bypass",
+              "name": "b",
+              "unattended": true
+            }
+          ],
+          "unattended": false
+        }
+      },
+      {
+        "id": "2",
+        "type": "agent_message_chunk",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "hi"
+            }
+          }
+        }
+      },
+      {
+        "id": "3",
+        "type": "turn_end",
+        "data": {
+          "stopReason": "end_turn"
+        }
+      }
+    ],
+    "tail": {
+      "cursor": "3",
+      "mode": "default",
+      "modes": ["default", "bypass"],
+      "unattended": false,
+      "mode_flags": {
+        "default": false,
+        "bypass": true
+      },
+      "read_only": false,
+      "terminal": false,
+      "active": false,
+      "steps": [],
+      "pending": [],
+      "asked": []
+    }
+  },
+  "working_with_steps_and_ask": {
+    "rows": [
+      {
+        "id": "1",
+        "type": "session_started",
+        "data": {
+          "currentMode": "plan",
+          "modes": [
+            {
+              "id": "plan",
+              "name": "p"
+            }
+          ]
+        }
+      },
+      {
+        "id": "2",
+        "type": "agent_message_chunk",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "x"
+            }
+          }
+        }
+      },
+      {
+        "id": "3",
+        "type": "tool_call",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "Run",
+            "kind": "execute",
+            "status": "pending"
+          }
+        }
+      },
+      {
+        "id": "4",
+        "type": "tool_call_update",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t2",
+            "title": "Run",
+            "kind": "execute",
+            "status": "in_progress"
+          }
+        }
+      },
+      {
+        "id": "5",
+        "type": "tool_call_update",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "title": "Run",
+            "kind": "execute",
+            "status": "completed"
+          }
+        }
+      },
+      {
+        "id": "6",
+        "type": "permissionRequest",
+        "data": {
+          "actionId": "a1",
+          "tool": "Bash",
+          "options": [
+            {
+              "optionId": "allow",
+              "name": "Allow",
+              "kind": "allow_once"
+            }
+          ]
+        }
+      },
+      {
+        "id": "7",
+        "type": "permissionRequest",
+        "data": {
+          "actionId": "a2",
+          "tool": "Edit",
+          "options": [
+            {
+              "optionId": "allow",
+              "name": "Allow",
+              "kind": "allow_once"
+            }
+          ]
+        }
+      },
+      {
+        "id": "8",
+        "type": "permission_resolved",
+        "data": {
+          "actionId": "a1"
+        }
+      }
+    ],
+    "tail": {
+      "cursor": "8",
+      "mode": "plan",
+      "modes": ["plan"],
+      "unattended": null,
+      "mode_flags": null,
+      "read_only": false,
+      "terminal": false,
+      "active": true,
+      "steps": ["t2"],
+      "pending": [
+        {
+          "actionId": "a2",
+          "tool": "Edit",
+          "options": [
+            {
+              "optionId": "allow",
+              "name": "Allow",
+              "kind": "allow_once"
+            }
+          ]
+        }
+      ],
+      "asked": ["a2"]
+    }
+  },
+  "read_only_terminal": {
+    "rows": [
+      {
+        "id": "1",
+        "type": "session_started",
+        "data": {
+          "currentMode": "default",
+          "read_only": true,
+          "input": "terminal",
+          "terminal_mode": "auto"
+        }
+      },
+      {
+        "id": "2",
+        "type": "agent_message_chunk",
+        "data": {
+          "sessionId": "acp-1",
+          "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "watching"
+            }
+          }
+        }
+      }
+    ],
+    "tail": {
+      "cursor": "2",
+      "mode": "default",
+      "modes": [],
+      "unattended": null,
+      "mode_flags": null,
+      "read_only": true,
+      "terminal": true,
+      "active": true,
+      "steps": [],
+      "pending": [],
+      "asked": []
+    }
+  },
+  "mode_update": {
+    "rows": [
+      {
+        "id": "1",
+        "type": "session_started",
+        "data": {
+          "currentMode": "default",
+          "modes": [
+            {
+              "id": "default",
+              "name": "d"
+            }
+          ]
+        }
+      },
+      {
+        "id": "2",
+        "type": "mode_update",
+        "data": {
+          "currentModeId": "plan"
+        }
+      },
+      {
+        "id": "3",
+        "type": "turn_end",
+        "data": {
+          "stopReason": "end_turn"
+        }
+      }
+    ],
+    "tail": {
+      "cursor": "3",
+      "mode": "plan",
+      "modes": ["default"],
+      "unattended": null,
+      "mode_flags": null,
+      "read_only": false,
+      "terminal": false,
+      "active": false,
+      "steps": [],
+      "pending": [],
+      "asked": []
+    }
+  }
+}

@@ -217,3 +217,41 @@ export function clipLine(text: string, limit: number): string {
 export function cpHead(text: string, limit: number): string {
   return text.length <= limit ? text : cpSlice(text, 0, limit);
 }
+
+/** What `str.splitlines()` breaks a line at (`\r\n` is one break). */
+const LINE_BREAKS: ReadonlySet<string> = new Set([
+  "\n",
+  "\r",
+  "\v",
+  "\f",
+  "\x1c",
+  "\x1d",
+  "\x1e",
+  "\x85",
+  "\u2028",
+  "\u2029",
+]);
+
+/** `text.splitlines()`: the lines without their breaks; a trailing break makes no empty last line. */
+export function pySplitlines(text: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charAt(i);
+    if (!LINE_BREAKS.has(ch)) continue;
+    lines.push(text.slice(start, i));
+    if (ch === "\r" && text.charAt(i + 1) === "\n") i += 1;
+    start = i + 1;
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  return lines;
+}
+
+/** Whether `text` holds a control character: U+0000-U+001F or U+007F (Python's `[\x00-\x1f\x7f]`). */
+export function hasControl(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
