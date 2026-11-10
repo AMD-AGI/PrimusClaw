@@ -118,6 +118,14 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		if err != nil {
 			return caller{}, err
 		}
+	} else if platformRole != identity.RoleSystemAdmin {
+		user, err := s.grants.ReadOwnerUser(ctx, token.Subject)
+		if err != nil {
+			return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "user is temporarily unreadable")
+		}
+		if user != nil && user.Admin {
+			platformRole = identity.RoleSystemAdmin
+		}
 	}
 	admin := platformRole == identity.RoleSystemAdmin
 	var grantID string
@@ -216,10 +224,10 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	var workspace string
 	subjectKey := apiKey
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, who.groups, body.Metadata[workspaceMetadata])
+		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, who.groups, body.Metadata[workspaceMetadata], who.admin)
 	} else {
 		workspace, err = grantWorkspace(snap.Workspaces, tpl.Workspace)
-		if err == nil {
+		if err == nil && s.grants.ChecksGrantOwner() {
 			subjectKey, err = s.grants.CheckGrantOwner(ctx, grantID, workspace)
 		}
 	}

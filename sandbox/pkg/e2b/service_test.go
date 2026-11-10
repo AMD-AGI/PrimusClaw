@@ -132,6 +132,25 @@ func testPlaneInWorkspacesWith(t *testing.T, az *fakeAuthz) (*Service, *fakeRunn
 
 func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	return testPlaneConfigured(t, maxSec, perGPU, maxSandboxes, spec, workspaces, func(o *grant.Options) {
+		if az != nil {
+			o.Authz = az
+		}
+	})
+}
+
+// testPlaneSAROff builds the default grant plane with workspace SAR off and SaFE Users from users.
+func testPlaneSAROff(t *testing.T, users staticUsers, attest bool) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"top-models"}, func(o *grant.Options) {
+		o.Users = users
+		o.AttestWorkloads = attest
+	})
+}
+
+// testPlaneConfigured issues the default grant on a plane whose grant options configure adjusts.
+func testPlaneConfigured(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, configure func(*grant.Options)) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -146,12 +165,14 @@ func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 	if err != nil {
 		t.Fatal(err)
 	}
-	gs := grant.New(grant.Options{
+	opts := grant.Options{
 		Client: cl, Namespace: "agent-sandbox-system", DataKey: bytes32(),
-		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{}, Authz: az,
+		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{},
 		Workspaces: staticWorkspaces{"lab", "prod", "top-models"},
 		Now:        func() time.Time { return now },
-	})
+	}
+	configure(&opts)
+	gs := grant.New(opts)
 	req := grant.IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
 		Owner:       grant.OwnerRequest{UserID: "u-123", Workspaces: workspaces},
@@ -259,6 +280,13 @@ func defaultAuthz() *fakeAuthz {
 		workspaces: map[string][]string{"u-123": {"*"}, "u-1": {"lab"}, "u-2": {"lab", "prod"}},
 		admins:     map[string]bool{"u-8": true, "u-9": true},
 	}
+}
+
+// staticUsers serves SaFE Users by id. A missing id is a User that does not exist.
+type staticUsers map[string]grant.OwnerUser
+
+func (u staticUsers) ReadUser(_ context.Context, userID string) (grant.OwnerUser, error) {
+	return u[userID], nil
 }
 
 // staticWorkspaces lists a fixed set of workspaces.

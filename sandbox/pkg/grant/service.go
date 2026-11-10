@@ -61,6 +61,7 @@ type Service struct {
 	attest     AttestationChecker
 	identity   Introspector
 	authz      Authorizer
+	users      UserReader
 	workspaces WorkspaceLister
 	reclaimer  Reclaimer
 	exists     SandboxExists
@@ -69,6 +70,8 @@ type Service struct {
 	now        func() time.Time
 	owner      atomic.Pointer[ownerConfig]
 	writes     grantLocks
+	// attestWorkloads is true when every Workload carries an identity assertion.
+	attestWorkloads bool
 }
 
 // grantLocks serialises the read-modify-write of one grant inside this process,
@@ -113,11 +116,14 @@ type Options struct {
 	Attest     AttestationChecker
 	Identity   Introspector
 	Authz      Authorizer
+	Users      UserReader
 	Workspaces WorkspaceLister
 	Reclaimer  Reclaimer
 	Exists     SandboxExists
 	Record     Recorder
 	Now        func() time.Time
+	// AttestWorkloads is true when every Workload carries an identity assertion.
+	AttestWorkloads bool
 }
 
 // New returns a grant service. Client and Namespace are required.
@@ -131,19 +137,21 @@ func New(opt Options) *Service {
 		reader = opt.Client
 	}
 	return &Service{
-		client:     opt.Client,
-		reader:     reader,
-		namespace:  opt.Namespace,
-		dataKey:    opt.DataKey,
-		authn:      opt.Authn,
-		attest:     opt.Attest,
-		identity:   opt.Identity,
-		authz:      opt.Authz,
-		workspaces: opt.Workspaces,
-		reclaimer:  opt.Reclaimer,
-		exists:     opt.Exists,
-		record:     opt.Record,
-		now:        now,
+		client:          opt.Client,
+		reader:          reader,
+		namespace:       opt.Namespace,
+		dataKey:         opt.DataKey,
+		authn:           opt.Authn,
+		attest:          opt.Attest,
+		identity:        opt.Identity,
+		authz:           opt.Authz,
+		users:           opt.Users,
+		workspaces:      opt.Workspaces,
+		reclaimer:       opt.Reclaimer,
+		exists:          opt.Exists,
+		record:          opt.Record,
+		now:             now,
+		attestWorkloads: opt.AttestWorkloads,
 	}
 }
 

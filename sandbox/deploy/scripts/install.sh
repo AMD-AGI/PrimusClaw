@@ -529,8 +529,8 @@ fi
 if [[ -n "${RBAC_SUBJECT_PREFIX:-}" ]]; then
     HELM_ARGS+=( --set-string "controlplane.config.rbac.subjectPrefix=${RBAC_SUBJECT_PREFIX}" )
 fi
-[[ "${ENABLE_WORKSPACE_SAR}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.rbac.workspaceSAR=true" )
-[[ "${ENABLE_WORKLOAD_ASSERTION}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.identity.attestWorkloads=true" )
+[[ "${ENABLE_WORKSPACE_SAR:-false}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.rbac.workspaceSAR=true" )
+[[ "${ENABLE_WORKLOAD_ASSERTION:-false}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.identity.attestWorkloads=true" )
 if [[ -n "${IDENTITY_INTROSPECT_URL:-}" ]]; then
     HELM_ARGS+=(
         --set "router.config.enableAuth=true"

@@ -48,15 +48,21 @@ func ownerPlane(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy) (
 // ownerPlaneWith builds an identity-key plane on a fake cluster with the given permission reviews.
 func ownerPlaneWith(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy, az *fakeAuthz) (*Service, *fakeRunner, client.Client) {
 	t.Helper()
+	return ownerPlaneOptions(t, ids, policy, grant.Options{Authz: az})
+}
+
+// ownerPlaneOptions builds an identity-key plane on a fake cluster. opts supplies the
+// permission sources; the client, namespace and workspace list are filled in.
+func ownerPlaneOptions(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy, opts grant.Options) (*Service, *fakeRunner, client.Client) {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
-	gs := grant.New(grant.Options{
-		Client: cl, Namespace: "agent-sandbox-system",
-		Authz: az, Workspaces: staticWorkspaces{"any-ws", "lab", "prod"},
-	})
+	opts.Client, opts.Namespace = cl, "agent-sandbox-system"
+	opts.Workspaces = staticWorkspaces{"any-ws", "lab", "prod"}
+	gs := grant.New(opts)
 	if err := gs.SetOwnerPolicy(context.Background(), policy); err != nil {
 		t.Fatal(err)
 	}
@@ -149,15 +155,75 @@ func TestIdentityKeyWorkspaceSelection(t *testing.T) {
 	if _, _, err := plane.Create(ctx, "ak-admin", ws("any-ws")); err != nil {
 		t.Fatalf("admin create: %v", err)
 	}
-	adminResp, _, err := plane.Create(ctx, "ak-admin", CreateBody{TemplateID: "runner"})
-	if err != nil {
-		t.Fatalf("admin without a workspace: %v", err)
+	if _, _, err := plane.Create(ctx, "ak-admin", CreateBody{TemplateID: "runner"}); opReason(err) != "workspace_required" {
+		t.Fatalf("admin without a workspace err = %v", err)
 	}
-	if got := runner.created[len(runner.created)-1].Workspace; got != "" || adminResp.SandboxID == "" {
-		t.Fatalf("admin workspace = %q", got)
-	}
-	if got := runner.created[len(runner.created)-2].Workspace; got != "any-ws" {
+	if got := runner.created[len(runner.created)-1].Workspace; got != "any-ws" {
 		t.Fatalf("named admin workspace = %q", got)
+	}
+}
+
+func TestSAROffIdentityKeyUsesTheUserCR(t *testing.T) {
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{
+		"ak-alice":    {Subject: "u-1"},
+		"ak-bob":      {Subject: "u-2"},
+		"ak-cr-admin": {Subject: "u-7", Roles: []string{"default"}},
+		"ak-stranger": {Subject: "u-5"},
+	}}
+	users := staticUsers{
+		"u-1": {Found: true, Workspaces: []string{"lab"}},
+		"u-2": {Found: true, Workspaces: []string{"lab", "prod"}},
+		"u-7": {Found: true, Admin: true, Workspaces: []string{"lab"}},
+	}
+	policy := samplePolicy()
+	policy.Owners = map[string]grant.OwnerQuota{
+		"u-1": {MaxSandboxes: 4, MaxGPUs: 8, MaxSandboxSeconds: 3600},
+		"u-7": {MaxSandboxes: 4, MaxGPUs: 8, MaxSandboxSeconds: 3600},
+	}
+	plane, runner, _ := ownerPlaneOptions(t, ids, policy, grant.Options{Users: users})
+	ctx := context.Background()
+	ws := func(name string) CreateBody {
+		return CreateBody{TemplateID: "runner", Metadata: map[string]string{workspaceMetadata: name}}
+	}
+
+	if _, _, err := plane.Create(ctx, "ak-alice", CreateBody{TemplateID: "runner"}); err != nil {
+		t.Fatalf("only listed workspace: %v", err)
+	}
+	if got := runner.created[len(runner.created)-1].Workspace; got != "lab" {
+		t.Fatalf("picked workspace = %q", got)
+	}
+	if _, _, err := plane.Create(ctx, "ak-alice", ws("prod")); opReason(err) != "user_not_in_workspace" {
+		t.Fatalf("unlisted workspace err = %v", err)
+	}
+	if _, _, err := plane.Create(ctx, "ak-bob", CreateBody{TemplateID: "runner"}); opReason(err) != "workspace_required" {
+		t.Fatalf("multi-workspace without metadata err = %v", err)
+	}
+	if _, _, err := plane.Create(ctx, "ak-stranger", ws("lab")); opReason(err) != "user_not_in_workspace" {
+		t.Fatalf("missing User err = %v", err)
+	}
+	if _, _, err := plane.Create(ctx, "ak-cr-admin", CreateBody{TemplateID: "runner"}); opReason(err) != "workspace_required" {
+		t.Fatalf("User CR admin without a workspace err = %v", err)
+	}
+	if _, _, err := plane.Create(ctx, "ak-cr-admin", ws("prod")); err != nil {
+		t.Fatalf("User CR admin in an unlisted workspace: %v", err)
+	}
+}
+
+func TestSAROffGrantKeyCreateChecksOwnerOnlyForAssertion(t *testing.T) {
+	for _, attest := range []bool{false, true} {
+		users := staticUsers{"u-123": {Found: true, Workspaces: []string{"top-models"}}}
+		plane, runner, keys := testPlaneSAROff(t, users, attest)
+		delete(users, "u-123")
+		_, _, err := plane.Create(context.Background(), keys["dev"], CreateBody{TemplateID: "runner"})
+		if !attest && err != nil {
+			t.Fatalf("switches off: create rechecked the owner: %v", err)
+		}
+		if attest && opReason(err) != "user_not_in_workspace" {
+			t.Fatalf("assertion on: err = %v", err)
+		}
+		if want := map[bool]int{false: 1, true: 0}[attest]; len(runner.created) != want {
+			t.Fatalf("attest=%v runner calls = %d", attest, len(runner.created))
+		}
 	}
 }
 

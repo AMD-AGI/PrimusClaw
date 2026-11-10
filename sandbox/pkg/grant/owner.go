@@ -441,15 +441,13 @@ func (s *Service) deleteDroppedOwnerTemplates(ctx context.Context, wanted map[st
 }
 
 // OwnerWorkspace picks the workspace for an identity-key sandbox. A requested
-// workspace must pass the workspace review. A subject allowed to use every workspace
-// (the platform system-admin rule, which names no single workspace) may omit one.
-// Anyone else, with no request, is given the only workspace they may use; more than one requires a request.
-func (s *Service) OwnerWorkspace(ctx context.Context, userID string, groups []string, requested string) (string, error) {
+// workspace must pass the workspace check. A subject allowed to use every workspace
+// must request one. Anyone else, with no request, is given the only workspace they
+// may use; more than one requires a request. With workspace SAR off, admin is the
+// caller's platform admin flag and the SaFE User lists the workspaces.
+func (s *Service) OwnerWorkspace(ctx context.Context, userID string, groups []string, requested string, admin bool) (string, error) {
 	if !s.WorkspaceSAR() {
-		if requested == "" {
-			return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-		}
-		return requested, nil
+		return s.userWorkspace(ctx, userID, requested, admin)
 	}
 	if requested != "" {
 		if err := s.checkWorkspaces(ctx, userID, groups, []string{requested}); err != nil {
@@ -462,7 +460,7 @@ func (s *Service) OwnerWorkspace(ctx context.Context, userID string, groups []st
 		return "", err
 	}
 	if all {
-		return "", nil
+		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
 	}
 	if s.workspaces == nil {
 		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "workspace client is not configured")
@@ -489,4 +487,33 @@ func (s *Service) OwnerWorkspace(ctx context.Context, userID string, groups []st
 	default:
 		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
 	}
+}
+
+// userWorkspace picks the workspace from the SaFE User. An admin must request a
+// workspace and may use any. Others may use a listed workspace, and with no request
+// are given their only listed workspace.
+func (s *Service) userWorkspace(ctx context.Context, userID, requested string, admin bool) (string, error) {
+	if admin {
+		if requested == "" {
+			return "", opErr(http.StatusBadRequest, "workspace_required", "system-admin must set metadata agent-sandbox.io/workspace")
+		}
+		return requested, nil
+	}
+	u, err := s.readUser(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if requested != "" {
+		if err := u.allows([]string{requested}); err != nil {
+			return "", err
+		}
+		return requested, nil
+	}
+	if !u.Found {
+		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
+	}
+	if len(u.Workspaces) != 1 {
+		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
+	}
+	return u.Workspaces[0], nil
 }
