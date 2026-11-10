@@ -1,0 +1,383 @@
+{
+  "about": "The Python worker's safe.whoami, safe.safe_user and safe.user_id_of on these /users/self answers (generated with httpx.MockTransport).",
+  "cases": [
+    {
+      "label": "a full answer",
+      "status": 200,
+      "body": "{\"id\": \"u-1001\", \"name\": \"Ada Example\", \"email\": \"ada@example.com\", \"type\": \"SSO\"}",
+      "whoami": ["Ada Example", "ada@example.com"],
+      "safeUser": {
+        "name": "Ada Example",
+        "email": "ada@example.com",
+        "type": "sso"
+      },
+      "userId": "u-1001"
+    },
+    {
+      "label": "the user inside data",
+      "status": 200,
+      "body": "{\"data\": {\"id\": \"u-1002\", \"name\": \"Bo Example\", \"email\": \"bo@example.com\", \"type\": \"default\"}}",
+      "whoami": ["Bo Example", "bo@example.com"],
+      "safeUser": {
+        "name": "Bo Example",
+        "email": "bo@example.com",
+        "type": "default"
+      },
+      "userId": "u-1002"
+    },
+    {
+      "label": "data that is not an object is ignored",
+      "status": 200,
+      "body": "{\"data\": \"x\", \"id\": \"u-1003\", \"name\": \"Cy Example\"}",
+      "whoami": ["Cy Example", ""],
+      "safeUser": {
+        "name": "Cy Example",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1003"
+    },
+    {
+      "label": "data that is a list is ignored",
+      "status": 200,
+      "body": "{\"data\": [1], \"id\": \"u-1004\", \"name\": \"Di\"}",
+      "whoami": ["Di", ""],
+      "safeUser": {
+        "name": "Di",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1004"
+    },
+    {
+      "label": "data that is null is ignored",
+      "status": 200,
+      "body": "{\"data\": null, \"id\": \"u-1005\", \"name\": \"Ed\"}",
+      "whoami": ["Ed", ""],
+      "safeUser": {
+        "name": "Ed",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1005"
+    },
+    {
+      "label": "spaces around the fields",
+      "status": 200,
+      "body": "{\"id\": \"  u-1006\\t\", \"name\": \" Flo Example \", \"email\": \" flo@example.com\\n\", \"type\": \" SSO \"}",
+      "whoami": ["Flo Example", "flo@example.com"],
+      "safeUser": {
+        "name": "Flo Example",
+        "email": "flo@example.com",
+        "type": "sso"
+      },
+      "userId": "u-1006"
+    },
+    {
+      "label": "Python's white space around the fields",
+      "status": 200,
+      "body": "{\"id\": \"\\u3000u-1007\\u00a0\", \"name\": \"\\u2028Gus\\u001c\"}",
+      "whoami": ["Gus", ""],
+      "safeUser": {
+        "name": "Gus",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1007"
+    },
+    {
+      "label": "a numeric id",
+      "status": 200,
+      "body": "{\"id\": 4242, \"name\": \"Hal\"}",
+      "whoami": ["Hal", ""],
+      "safeUser": {
+        "name": "Hal",
+        "email": "",
+        "type": ""
+      },
+      "userId": "4242"
+    },
+    {
+      "label": "an id of 0 is none",
+      "status": 200,
+      "body": "{\"id\": 0, \"name\": \"Ivy\"}",
+      "whoami": ["Ivy", ""],
+      "safeUser": {
+        "name": "Ivy",
+        "email": "",
+        "type": ""
+      },
+      "userId": null
+    },
+    {
+      "label": "an id of false is none",
+      "status": 200,
+      "body": "{\"id\": false, \"name\": \"Jo\"}",
+      "whoami": ["Jo", ""],
+      "safeUser": {
+        "name": "Jo",
+        "email": "",
+        "type": ""
+      },
+      "userId": null
+    },
+    {
+      "label": "an id of true",
+      "status": 200,
+      "body": "{\"id\": true, \"name\": \"Kai\"}",
+      "whoami": ["Kai", ""],
+      "safeUser": {
+        "name": "Kai",
+        "email": "",
+        "type": ""
+      },
+      "userId": "True"
+    },
+    {
+      "label": "an id of null is none",
+      "status": 200,
+      "body": "{\"id\": null, \"name\": \"Lu\"}",
+      "whoami": ["Lu", ""],
+      "safeUser": {
+        "name": "Lu",
+        "email": "",
+        "type": ""
+      },
+      "userId": null
+    },
+    {
+      "label": "an id only",
+      "status": 200,
+      "body": "{\"id\": \"u-1008\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": "u-1008"
+    },
+    {
+      "label": "a name only",
+      "status": 200,
+      "body": "{\"name\": \"Mo\"}",
+      "whoami": ["Mo", ""],
+      "safeUser": {
+        "name": "Mo",
+        "email": "",
+        "type": ""
+      },
+      "userId": null
+    },
+    {
+      "label": "an empty name",
+      "status": 200,
+      "body": "{\"id\": \"u-1009\", \"name\": \"  \", \"email\": \"x@example.com\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": "u-1009"
+    },
+    {
+      "label": "a numeric name",
+      "status": 200,
+      "body": "{\"id\": \"u-1010\", \"name\": 7}",
+      "whoami": ["7", ""],
+      "safeUser": {
+        "name": "7",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1010"
+    },
+    {
+      "label": "an empty object",
+      "status": 200,
+      "body": "{}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a list",
+      "status": 200,
+      "body": "[]",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a list of users",
+      "status": 200,
+      "body": "[{\"id\": \"u-1011\", \"name\": \"Ned\"}]",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a string",
+      "status": 200,
+      "body": "\"u-1012\"",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "null",
+      "status": 200,
+      "body": "null",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a number",
+      "status": 200,
+      "body": "12",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "not JSON",
+      "status": 200,
+      "body": "<html>sign in</html>",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "an empty body",
+      "status": 200,
+      "body": "",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "unauthorized",
+      "status": 401,
+      "body": "{\"id\": \"u-1013\", \"name\": \"Ola\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "forbidden",
+      "status": 403,
+      "body": "{\"id\": \"u-1014\", \"name\": \"Pia\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "not found",
+      "status": 404,
+      "body": "{}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a server error",
+      "status": 500,
+      "body": "{\"id\": \"u-1015\", \"name\": \"Quin\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a redirect",
+      "status": 302,
+      "body": "{\"id\": \"u-1016\", \"name\": \"Ray\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "201 is not 200",
+      "status": 201,
+      "body": "{\"id\": \"u-1017\", \"name\": \"Sal\"}",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "204",
+      "status": 204,
+      "body": "",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "an upper-case type",
+      "status": 200,
+      "body": "{\"id\": \"u-1018\", \"name\": \"Tia\", \"type\": \"DeFault\"}",
+      "whoami": ["Tia", ""],
+      "safeUser": {
+        "name": "Tia",
+        "email": "",
+        "type": "default"
+      },
+      "userId": "u-1018"
+    },
+    {
+      "label": "an email of a number",
+      "status": 200,
+      "body": "{\"id\": \"u-1019\", \"name\": \"Uma\", \"email\": 5}",
+      "whoami": ["Uma", "5"],
+      "safeUser": {
+        "name": "Uma",
+        "email": "5",
+        "type": ""
+      },
+      "userId": "u-1019"
+    },
+    {
+      "label": "a name of a byte-order mark",
+      "status": 200,
+      "body": "{\"id\": \"u-1021\", \"name\": \"\\ufeff\"}",
+      "whoami": ["﻿", ""],
+      "safeUser": {
+        "name": "﻿",
+        "email": "",
+        "type": ""
+      },
+      "userId": "u-1021"
+    },
+    {
+      "label": "a byte-order mark around the fields",
+      "status": 200,
+      "body": "{\"id\": \"\\ufeffu-1022\", \"name\": \"\\ufeffVi\", \"email\": \"v@example.com\\ufeff\"}",
+      "whoami": ["﻿Vi", "v@example.com﻿"],
+      "safeUser": {
+        "name": "﻿Vi",
+        "email": "v@example.com﻿",
+        "type": ""
+      },
+      "userId": "﻿u-1022"
+    },
+    {
+      "label": "unicode name",
+      "status": 200,
+      "body": "{\"id\": \"u-1020\", \"name\": \"王小明\", \"email\": \"w@example.com\"}",
+      "whoami": ["王小明", "w@example.com"],
+      "safeUser": {
+        "name": "王小明",
+        "email": "w@example.com",
+        "type": ""
+      },
+      "userId": "u-1020"
+    },
+    {
+      "label": "a timeout",
+      "failure": "a timeout",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    },
+    {
+      "label": "a broken connection",
+      "failure": "a broken connection",
+      "whoami": null,
+      "safeUser": null,
+      "userId": null
+    }
+  ]
+}

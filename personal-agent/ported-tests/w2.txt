@@ -183,3 +183,5 @@ teams/tests/test_review_items.py::test_replay_the_request_claw_gets_is_exactly_t
 teams/tests/test_review_items.py::test_an_answer_that_cannot_be_followed_is_not_understood -> packages/runtime/test/claw/review-wire.test.ts::reading started reviews > an answer that cannot be followed is not understood: no session
 teams/tests/test_review_items.py::test_reviews_asked_of_someone_else_need_no_session_but_still_their_item_and_pull -> packages/runtime/test/claw/review-wire.test.ts::reading started reviews > reviews asked of someone else need no session but still their item and pull
 # (test_replay_... is MERGED: its reading of the message is the review delegation's; the request it makes is pinned here)
+# --- the platform's /users/self (safe.py), HttpIdentityLookup
+teams/tests/test_transport.py::test_whoami_reads_name_and_email_from_the_keys_own_users_self -> packages/runtime/test/claw/identity-lookup.test.ts::the key owner from the platform's /users/self (Python safe.py) > whoami reads name and email from the key's own users self
