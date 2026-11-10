@@ -1,0 +1,29 @@
+# Values of the ccs300 cluster: identity owns accounts, SaFE owns workspaces, this release consumes them.
+# Apply with: helm upgrade --install agent-sandbox sandbox/deploy/helm -n agent-sandbox-system -f values-ccs300.yaml
+controlplane:
+  image:
+    repository: harbor.ccs300.primus-safe.amd.com/primussafe/agent-sandbox-controlplane
+    tag: "5a266770"
+  config:
+    envdInjectorImage: harbor.ccs300.primus-safe.amd.com/proxy/primussafe/agent-sandbox-envd-injector:latest
+    identity:
+      introspectUrl: http://primus-identity.primus-identity.svc.cluster.local/oauth/introspect
+      tokenUrl: http://primus-identity.primus-identity.svc.cluster.local/oauth/token
+      attestWorkloads: true
+      assertionAudience: agent-sandbox-admission
+      assertionDetailType: agent-sandbox-workload
+      clientSecret: agent-sandbox-identity-client
+    rbac:
+      subjectPrefix: "primus:"
+      workspaceSAR: true
+  extraEnv:
+    - name: SANDBOX_CLUSTER_ID
+      value: ccs300
+
+router:
+  config:
+    enableAuth: true
+
+workloadmanager:
+  config:
+    enableAuth: true
