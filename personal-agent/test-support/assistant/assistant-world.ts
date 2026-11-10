@@ -8,6 +8,7 @@
  * not taken by the assistant (`started`: they would start a session's turn, as before).
  */
 import type { JsonObject } from "@primusclaw/personal-agent";
+import { own } from "@primusclaw/personal-agent";
 
 import { AssistantChat } from "../../packages/core/src/assistant/chat.js";
 import type { MessageFiles } from "../../packages/core/src/assistant/files.js";
@@ -73,7 +74,7 @@ export function stepLabel(tool: string): string {
     mcp__safe__workload_list: "查询 SaFE 工作负载",
     mcp__assistant__work_create: "创建任务",
   };
-  return labels[tool] ?? tool;
+  return own(labels, tool) ?? tool;
 }
 
 export class AssistantWorld {
@@ -199,7 +200,7 @@ export class AssistantWorld {
 
   /** `/link` with the person's key: their Claw user id is recorded when SaFE says it, and their subscription is made. */
   async link(aadId: string): Promise<void> {
-    const key = KEYS[aadId] ?? `ak-${aadId}`;
+    const key = own(KEYS, aadId) ?? `ak-${aadId}`;
     this.store.links.redeemPending(aadId, aadId, this.store.links.stashPending(key));
     const id = this.clawIds.get(key);
     if (id !== undefined) this.store.links.setClawUserId(aadId, id);

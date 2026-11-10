@@ -19,6 +19,7 @@ import {
   boardMeaning,
   itemLabel,
   markdownPlain,
+  own,
   cardLang,
   workCardText,
   type ActionCardModel,
@@ -167,7 +168,7 @@ function boardSection(
   const rows = column.slice(0, BOARD_LINES).map((item) => itemRow(item, model.now, lang));
   return [
     { ...section(icon(emoji, `${t.column({ state })} · ${String(column.length)}`), tone), id: `band-${emoji}` },
-    ...foldRest(`more-${state}`, rows, BOARD_SHOWN[state] ?? 0, column.length, t),
+    ...foldRest(`more-${state}`, rows, own(BOARD_SHOWN, state) ?? 0, column.length, t),
   ];
 }
 

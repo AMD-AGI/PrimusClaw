@@ -9,6 +9,7 @@
  * message. A test that reads the cards themselves gives `render` (the Teams renderers); core's tests read the views.
  */
 import type { JsonObject, OutMessage, View } from "@primusclaw/personal-agent";
+import { own } from "@primusclaw/personal-agent";
 
 import { FakeClock } from "../clock.js";
 import { advanceSeconds, openTestStore } from "../store.js";
@@ -149,7 +150,7 @@ export class CardsWorld {
 
   /** The person is linked with their key, their Claw user id recorded, and a place to post to saved. */
   link(userId: string): void {
-    const key = KEY_OF[userId] ?? `ak-${userId}`;
+    const key = own(KEY_OF, userId) ?? `ak-${userId}`;
     this.store.links.redeemPending(userId, userId, this.store.links.stashPending(key));
     this.store.links.setClawUserId(userId, `u-${key.slice(3)}`);
     this.store.references.saveReference(userId, {

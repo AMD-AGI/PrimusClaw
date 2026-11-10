@@ -7,11 +7,12 @@
  */
 import { devenvHideText } from "../locales/assistant-devenv-hide.js";
 import type { Lang } from "../locales/lang.js";
+import { own } from "../own.js";
 
 type Fields = Readonly<Record<string, unknown>>;
 
 function count(result: Fields, key: string): number {
-  const value = result[key];
+  const value = own(result, key);
   return typeof value === "number" && Number.isInteger(value) ? value : 0;
 }
 

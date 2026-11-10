@@ -10,6 +10,7 @@
  * status with its error word, or an error to throw (no answer at all).
  */
 import type { ClawWorkItemsPort, Decision, JsonObject, ReviewAskedOfOther, WorkItem } from "@primusclaw/personal-agent";
+import { own } from "@primusclaw/personal-agent";
 
 import { ClawError } from "../../packages/core/src/claw/errors.js";
 
@@ -83,7 +84,7 @@ function transition(kind: string, question: string | null): Transition {
     failed: needs,
     dropped: { ...quiet, board: "done", outcome: "dropped" },
   };
-  const found = table[kind];
+  const found = own(table, kind);
   if (found === undefined) throw new RangeError(`not a report kind: ${kind}`);
   return found;
 }
@@ -230,7 +231,7 @@ export class FakeBoardClaw implements Pick<
       event_id: `ev-${String(this.n)}`,
       type,
       occurred_at: "2026-10-30T04:53:20Z",
-      user_id: CLAW_USERS[owner] ?? "",
+      user_id: own(CLAW_USERS, owner) ?? "",
       text,
       ...(item ? { item } : {}),
       ...extra,
@@ -239,13 +240,13 @@ export class FakeBoardClaw implements Pick<
 
   /** The caller, named by the key it used; the call is recorded and a failure injected for it thrown. */
   private enter(call: BoardCall, method: string, path: string, key: string): string {
-    const owner = TOKENS[key] ?? key;
-    this.calls.push([method, path, CLAW_USERS[owner] ?? "?"]);
+    const owner = own(TOKENS, key) ?? key;
+    this.calls.push([method, path, own(CLAW_USERS, owner) ?? "?"]);
     const failure = this.fail.get(call);
     if (failure instanceof Error) throw failure;
     if (typeof failure === "number") throw refusedWith(failure, "injected");
     if (failure !== undefined) throw refusedWith(failure[0], failure[1]);
-    if (CLAW_USERS[owner] === undefined) throw refusedWith(401, "unauthorized");
+    if (own(CLAW_USERS, owner) === undefined) throw refusedWith(401, "unauthorized");
     return owner;
   }
 

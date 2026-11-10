@@ -7,6 +7,7 @@
  */
 import { z } from "zod";
 
+import { own } from "../own.js";
 import { clip } from "../text/plain.js";
 import { cpHead, pyStrip } from "../text/py-text.js";
 
@@ -105,13 +106,13 @@ export function answersOf(data: Readonly<Record<string, unknown>>): Answers {
   const skipped: string[] = [];
   cardQuestions(data["questions"]).forEach((q, i) => {
     const labels = new Map(q.options.map((o) => [o.id, o.label]));
-    const chosen = scalarText(data[`choice_${String(i)}`])
+    const chosen = scalarText(own(data, `choice_${String(i)}`))
       .split(",")
       .flatMap((c) => {
         const label = labels.get(c);
         return label === undefined ? [] : [label];
       });
-    const typed = cpHead(pyStrip(scalarText(data[`text_${String(i)}`])), ANSWER_MAX);
+    const typed = cpHead(pyStrip(scalarText(own(data, `text_${String(i)}`))), ANSWER_MAX);
     const answer = [chosen.join(", "), typed].filter(Boolean).join(". ");
     if (answer) answers.set(q.id, answer);
     else skipped.push(q.id);

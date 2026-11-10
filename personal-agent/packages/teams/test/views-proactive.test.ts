@@ -57,7 +57,7 @@ function cardOf(activity: JsonObject): JsonObject {
 function* blocks(items: readonly JsonObject[]): Generator<JsonObject> {
   for (const b of items) {
     yield b;
-    for (const key of ["items", "columns"]) yield* blocks((b[key] ?? []) as JsonObject[]);
+    for (const key of ["items", "columns"] as const) yield* blocks((b[key] ?? []) as JsonObject[]);
   }
 }
 

@@ -61,7 +61,7 @@ function* lines(node: unknown, hiddenToo: boolean): Generator<string> {
       yield `${name}${hasCjk(name) ? "：" : ": "}${String(fact["value"])}`;
     }
   }
-  for (const key of ["items", "columns"]) yield* lines(n[key] ?? [], hiddenToo);
+  for (const key of ["items", "columns"] as const) yield* lines(n[key] ?? [], hiddenToo);
 }
 
 const visible = (c: Node): string[] => [...lines(c["body"], false)];

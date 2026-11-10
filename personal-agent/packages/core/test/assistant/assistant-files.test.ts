@@ -5,6 +5,7 @@
  * Files in, results out, on the assistant path (tests/test_assistant_files.py): what a person sends with a message reaches their
  * assistant, and what the work hands back (a worker's delivered files, a long answer) reaches the person whole.
  */
+import { own } from "../../src/own.js";
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
@@ -31,7 +32,7 @@ function fetcher(fail: readonly string[] = []) {
   const files: MessageFiles = {
     fetch: (wanted) => {
       const fetched = wanted.flatMap((f) => {
-        const found = FILES[f.name];
+        const found = own(FILES, f.name);
         return fail.includes(f.name) || !found ? [] : [{ name: f.name, bytes: found[0], mediaType: found[1] }];
       });
       const failed = wanted

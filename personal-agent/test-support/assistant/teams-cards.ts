@@ -143,7 +143,7 @@ function* lines(node: unknown, hiddenToo: boolean): Generator<string> {
       yield `${name}${hasCjk(name) ? "：" : ": "}${str(fact["value"])}`;
     }
   }
-  for (const key of ["items", "columns"]) yield* lines(n[key] ?? [], hiddenToo);
+  for (const key of ["items", "columns"] as const) yield* lines(n[key] ?? [], hiddenToo);
 }
 
 /** The card's text in reading order (test_approval_card `visible`): facts as "name: value", hidden elements left out. */

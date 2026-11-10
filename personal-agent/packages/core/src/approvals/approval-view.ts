@@ -11,6 +11,7 @@
 
 import { pickLang } from "../language/detect.js";
 import type { Lang } from "../locales/lang.js";
+import { own } from "../own.js";
 import { redactText } from "../security/redact.js";
 import { clip, pyJson } from "../text/plain.js";
 import { cpHead, cpLength, cpSlice, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
@@ -160,7 +161,7 @@ function eventField(
   limit: number,
   secrets: readonly string[],
 ): string {
-  const value = event[name];
+  const value = own(event, name);
   if (typeof value !== "string") return "";
   return clip(redactText(squashSpaces(scrub(squashSpaces(value), secrets))).text, limit);
 }
