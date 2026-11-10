@@ -170,6 +170,10 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- `@primusclaw/connector` pins its three runtime dependencies to exact versions (`@agentclientprotocol/sdk` 2.5.0, `smol-toml`
+  1.9.1, `zod` 4.6.7). They were ranges (`^`), and a published package carries no lockfile, so every install took the newest
+  matching version, one CI had never tested (it tested the lockfile's): what is installed is now what CI tested, and an upgrade is
+  an explicit change of the pin.
 - A step of a conversation open in a terminal reaches the phone while it runs again when Claude Code wrote a large line before it.
   The connector read the transcript 256 KB per look (one look a second), so a `prompt_snapshot` attachment (0.2 MB and more) held
   the next step back a second per 256 KB: a 5-second tool's step came after the tool had ended and the phone never showed it. One
