@@ -10,7 +10,7 @@ import type { FeedbackThumbs } from "./thumbs.js";
 /**
  * What feedback, observation and the daily brief give the router, in the Python worker's order: in a 1:1 chat the
  * feedback answer is read before the account check; in a group `/observe` is read first, then the feedback answer; the
- * buttons of each card by their kind. (Teams' own thumbs come as a vote: `FeedbackThumbs.onVote`.)
+ * buttons of each card by their kind; the channel's own thumbs as a vote (`FeedbackThumbs.onVote`).
  */
 export function w8RouteHandlers(parts: {
   readonly flow: FeedbackFlow;
@@ -23,5 +23,6 @@ export function w8RouteHandlers(parts: {
     groupInterceptors: [parts.observer.interceptor, parts.flow.interceptor],
     commands: [parts.brief],
     clicks: [parts.flow.clicks, parts.thumbs.clicks, parts.observer.clicks],
+    votes: parts.thumbs.votes,
   };
 }

@@ -7,7 +7,7 @@ import { FEEDBACK_TEXT as T } from "../locales/feedback.js";
 import type { ClawAssistantPort } from "../ports/claw/assistant.js";
 import type { ClawSessionsPort } from "../ports/claw/sessions.js";
 import type { Logger } from "../ports/logger.js";
-import type { ClickHandler, ClickRoute, RouteBase } from "../ports/routing.js";
+import type { ClickHandler, ClickRoute, RouteBase, VoteHandler } from "../ports/routing.js";
 import type { SessionRepository } from "../ports/store/sessions.js";
 import { textMessage, type InboundVote, type OutMessage, type UserRef } from "../ports/surface.js";
 import { cpHead, pyStrip } from "../text/py-text.js";
@@ -88,6 +88,14 @@ export class FeedbackThumbs {
   async settled(): Promise<void> {
     while (this.background.size) await Promise.all([...this.background]);
   }
+
+  /** The channel's own thumbs, as the router hands them on (Python agent.py: an invoke `thumb_of` reads). */
+  readonly votes: VoteHandler = {
+    vote: (route) => {
+      this.onVote(route, route.vote);
+      return Promise.resolve();
+    },
+  };
 
   /** The channel's own thumbs: the person has written their comment in the channel's form. */
   onVote(route: RouteBase, vote: InboundVote): void {
