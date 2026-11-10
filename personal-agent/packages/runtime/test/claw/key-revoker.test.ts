@@ -103,3 +103,49 @@ describe("revoking a person's own key on the platform (Python safe.revoke_own_ke
     await assert.rejects(broken.revoke(KEY), RangeError);
   });
 });
+
+/** What revoking with `current` as the /apikeys/current answer returns and the requests it makes. */
+async function revokeWith(current: unknown): Promise<[boolean, string[]]> {
+  const sent: string[] = [];
+  const fetch: Fetch = (url, init) => {
+    sent.push(`${init.method ?? "GET"} ${new URL(url).pathname}`);
+    return Promise.resolve(
+      init.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json(current, { status: 200 }),
+    );
+  };
+  return [await new HttpKeyRevoker(BASE, fetch).revoke(KEY), sent];
+}
+
+// The Python worker's own tests of the path-segment fix, with their parameters.
+describe("the key id of a revoke (Python test_revoke_key_id.py)", () => {
+  it("the key's own id is deleted", async () => {
+    for (const [current, deleted] of [
+      [{ id: 123 }, "/api/v1/apikeys/123"],
+      [{ data: { id: 7 } }, "/api/v1/apikeys/7"],
+      [{ id: "ak-Abc_1.2~x" }, "/api/v1/apikeys/ak-Abc_1.2~x"],
+    ] as const) {
+      assert.deepEqual(await revokeWith(current), [true, ["GET /api/v1/apikeys/current", `DELETE ${deleted}`]]);
+    }
+  });
+
+  it("an id that is not one path segment deletes nothing", async () => {
+    for (const current of [
+      { id: "../users/self" },
+      { id: ".." },
+      { id: "." },
+      { id: "a/b" },
+      { id: "a b" },
+      { id: "a%2F.." },
+      { id: "a\nb" },
+      { id: ["x"] },
+      { id: { x: 1 } },
+      { id: true },
+      { id: -1 },
+      { id: 0 },
+      { id: "x".repeat(201) },
+      { data: { id: "../users/self" } },
+    ]) {
+      assert.deepEqual(await revokeWith(current), [false, ["GET /api/v1/apikeys/current"]], JSON.stringify(current));
+    }
+  });
+});

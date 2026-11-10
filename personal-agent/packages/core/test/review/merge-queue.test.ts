@@ -122,6 +122,13 @@ const REFUSALS = [
     "没有确认 AMD-AGI/Hyperloom#12 已进入合并队列",
     "是否排队、是否合入都不确定",
   ],
+  [
+    "github_workflow_scope_missing",
+    "GitHub refused to merge AMD-AGI/Hyperloom#12: it changes CI workflow files",
+    "Please merge it by hand on GitHub.",
+    "AMD-AGI/Hyperloom#12 改了 CI workflow 文件",
+    "请在 GitHub 上手动合入。",
+  ],
 ] as const;
 
 for (const [reason, cardA, cardB, groupA, groupB] of REFUSALS) {
@@ -170,6 +177,27 @@ test("a queue refusal after the approval says so and carries githubs reason with
   assert.ok(!group.includes("结果不确定"));
   // no markup, and Claw's trailer is not repeated
   assert.ok(!card.includes("`rm") && !card.includes("](") && !(card + group).includes("A review, an approval"));
+});
+
+test("a merge refused for the missing workflow scope after the approval is known not merged and never says bind again", async () => {
+  // (GitHub answers 403 to a merge of a pull request that changes `.github/workflows/*` with a token without the `workflow`
+  // scope, after the approval was written: known not merged, and binding again does not add the scope)
+  const world = await held();
+  const [card, group] = await allow(world, {
+    status: "refused",
+    reason: "github_workflow_scope_missing",
+    wrote: true,
+    message: "GitHub refused the merge: this pull request changes CI workflow files (.github/workflows/) ...",
+  });
+  assert.ok(card.includes("it was not merged. Please merge it by hand on GitHub"), card);
+  assert.ok(card.includes("the approval may already be on the pull request") && !card.includes("cannot say"), card);
+  assert.ok(
+    group.includes("需要 GitHub 的 workflow 权限") &&
+      group.includes("批准可能已经留在 PR 上") &&
+      !group.includes("结果不确定"),
+    group,
+  );
+  assert.ok(!card.includes("bind") && !group.includes("绑定"), `${card} / ${group}`);
 });
 
 test("a queue refusal without githubs words still says it was not queued", async () => {

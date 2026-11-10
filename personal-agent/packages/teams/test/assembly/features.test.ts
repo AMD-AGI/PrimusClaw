@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
 import {
+  integrationRegistry,
   neutralPlugins,
   noMetrics,
   SecurityLog,
@@ -353,5 +354,39 @@ describe("the platform services", () => {
       handle: () => Promise.resolve({ status: 202, body: {} }),
     };
     assembled({}, new RecordingLogger(), { settings, plugins: neutralPlugins({ routeExtensions: [route] }) });
+    // (the route answers POST: one on its path for another method does not serve it)
+    const get = { ...route, method: "GET" as const };
+    assert.throws(
+      () => assembled({}, new RecordingLogger(), { settings, plugins: neutralPlugins({ routeExtensions: [get] }) }),
+      /TEAMS_ON_BEHALF_USERS/,
+    );
+  });
+});
+
+describe("the deployment's integrations", () => {
+  it("a deployment's integrations reach /whoami: its line follows GitHub's", async () => {
+    const registry = integrationRegistry();
+    registry.addConnectionLine((_owner, lang) => (lang === "zh" ? "- 追踪：已连接" : "- Tracker: connected"));
+    const plugins = neutralPlugins({ integrations: registry });
+    const { features, store, surface } = assembled({}, new RecordingLogger(), { plugins });
+    store.links.redeemPending(ALICE.id, ALICE.name, store.links.stashPending("ak-alice"));
+    await features.router.handle(
+      inboundMessage({
+        id: "act-whoami",
+        sender: ALICE,
+        conversation: {
+          id: "dm-a",
+          kind: "personal",
+          tenantId: "t1",
+          wire: { conversation: { id: "dm-a", conversationType: "personal" }, user: { aadObjectId: ALICE.id } },
+        },
+        text: "/whoami",
+      }),
+    );
+    await features.router.settled();
+    assert.ok(
+      texts(surface).some((t) => t.includes("- Tracker: connected")),
+      JSON.stringify(texts(surface)),
+    );
   });
 });

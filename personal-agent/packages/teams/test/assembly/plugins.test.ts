@@ -34,6 +34,8 @@ before(async () => {
       path: "/api/v1/users/self",
       handle: () => ({ status: 200, json: { id: "u-alice", name: "alice" } }),
     },
+    { method: "GET", path: "/api/v1/apikeys/current", handle: () => ({ status: 200, json: { id: 42 } }) },
+    { method: "DELETE", path: "/api/v1/apikeys/42", handle: () => ({ status: 204, text: "" }) },
   ]);
   dir = mkdtempSync(join(tmpdir(), "w3b-plugins-"));
 });
@@ -60,6 +62,16 @@ it("with the neutral identity lookup, whose key it is is asked of SaFE's /users/
   const asked = safe.requests.at(-1);
   assert.equal(asked?.path, "/api/v1/users/self");
   assert.equal(asked.headers["authorization"], "Bearer ak-alice");
+});
+
+it("with the neutral key revoker, a key given up is deleted at SaFE with the key itself", async () => {
+  const plugins = platformPlugins(neutralPlugins(), deps());
+  assert.equal(await plugins.keyRevoker.revoke("ak-alice"), true);
+  const asked = safe.requests.slice(-2).map((r) => [r.method, r.path, r.headers["authorization"]]);
+  assert.deepEqual(asked, [
+    ["GET", "/api/v1/apikeys/current", "Bearer ak-alice"],
+    ["DELETE", "/api/v1/apikeys/42", "Bearer ak-alice"],
+  ]);
 });
 
 it("an identity lookup a deployment replaced is kept", () => {
