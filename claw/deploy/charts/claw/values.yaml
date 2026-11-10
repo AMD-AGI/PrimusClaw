@@ -971,9 +971,19 @@ networkPolicy:
   # first second or two after it starts under an engine that learns pod
   # addresses late (kube-router); the control plane is long-lived, and
   # fromCIDRs is the alternative where that matters. The node's own traffic
-  # (kubelet) is not a pod and is left to the engine.
+  # (kubelet probes) is not a pod: kube-router accepts it before any policy,
+  # Calico and Cilium allow host-to-local-pod traffic by default; elsewhere
+  # add the node's pod-network gateway to fromCIDRs.
+  #
+  # In kubernetes mode the Hands pods do not carry podLabels today (the
+  # agent-sandbox router puts a request's labels on the Sandbox object, not on
+  # its pod), so neither sandbox policy selects anything there yet.
   sandboxIngress:
     enabled: false
+    # Also admit this release's Brain and API pods, which reach Hands directly
+    # in kubernetes mode and in safe mode without secret.sandboxHandsViaRouter.
+    # "auto": exactly then; true / false: always / never.
+    admitClaw: auto
     fromPods:
       - namespace: agent-sandbox-system
         podLabels: {app: agent-sandbox-controlplane}

@@ -162,11 +162,25 @@ spec:
 {{- if not (or $si.fromPods $si.fromCIDRs) }}
 {{- fail "networkPolicy.sandboxIngress needs fromPods or fromCIDRs: an empty list would refuse the agent-sandbox control plane" }}
 {{- end }}
+{{- /* Brain and the API reach Hands directly (pod IP:9100 in kubernetes mode,
+     the sandbox's cluster DNS name in safe mode without the Router's port
+     proxy); only safe mode with sandboxHandsViaRouter goes through the
+     control plane alone. */}}
+{{- $k8sMode := eq (.Values.secret.clawDeployMode | default "") "kubernetes" }}
+{{- $viaRouter := and (not $k8sMode) (eq (toString .Values.secret.sandboxHandsViaRouter) "true") }}
+{{- $admitMode := "auto" }}
+{{- if not (kindIs "invalid" $si.admitClaw) }}{{ $admitMode = toString $si.admitClaw }}{{ end }}
+{{- if not (has $admitMode (list "auto" "true" "false")) }}
+{{- fail (printf "networkPolicy.sandboxIngress.admitClaw must be auto, true or false, not %q" $admitMode) }}
+{{- end }}
+{{- $admitClaw := or (eq $admitMode "true") (and (eq $admitMode "auto") (not $viaRouter)) }}
+{{- $release := .Release.Namespace }}
 {{- range $ns := $sb.namespaces }}
 ---
 # Ingress of Claw's sandboxes (Hands) in {{ $ns }}: only the listed clients
-# (the agent-sandbox control plane), on any port. Other pods of the cluster
-# cannot reach a sandbox's envd directly.
+# (the agent-sandbox control plane, and Brain and the API when they reach Hands
+# directly), on any port. Other pods of the cluster cannot reach a sandbox's
+# envd or Hands directly.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -188,6 +202,17 @@ spec:
           podSelector:
             matchLabels:
               {{- toYaml (required "networkPolicy.sandboxIngress.fromPods[].podLabels is required" .podLabels) | nindent 14 }}
+        {{- end }}
+        {{- if $admitClaw }}
+        {{- range $c := list "primus-claw-brain" "primus-claw-api" }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $release | quote }}
+          podSelector:
+            matchLabels:
+              app: primus-claw
+              component: {{ $c }}
+        {{- end }}
         {{- end }}
         {{- range $si.fromCIDRs }}
         - ipBlock:

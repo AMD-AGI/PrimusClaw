@@ -20,7 +20,10 @@
 #     and refuses to render without a namespace or with a CIDR without ports;
 #   - the public rule also excludes Azure's host endpoint 168.63.129.16;
 #   - sandboxIngress renders one ingress policy per sandbox namespace admitting
-#     only the listed clients, and refuses an empty client list.
+#     only the listed clients, plus the release's Brain and API pods exactly
+#     when they reach Hands directly (kubernetes mode, or safe mode without
+#     sandboxHandsViaRouter; admitClaw true/false overrides), and refuses an
+#     empty client list or an unknown admitClaw.
 #
 # The renders are parsed as YAML, not grepped.
 
@@ -203,7 +206,7 @@ elif case == "claw-sandbox":
     if [p for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress"]:
         fail("sandbox ingress rendered while sandboxIngress.enabled is false")
 
-elif case == "claw-sandbox-ingress":
+elif case.startswith("claw-sandbox-ingress"):
     got = sorted(p["metadata"]["namespace"] for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress")
     if got != ["ws-a", "ws-b"]:
         fail(f"sandbox ingress namespaces {got}")
@@ -220,8 +223,15 @@ elif case == "claw-sandbox-ingress":
         want_cp = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "agent-sandbox-system"}},
                    "podSelector": {"matchLabels": {"app": "agent-sandbox-controlplane"}}}
         selectors = [p for p in peers if "ipBlock" not in p]
-        if selectors != [want_cp]:
-            fail(f"selector peers {selectors}, want only the agent-sandbox control plane")
+        claw = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "claw-test"}},
+                 "podSelector": {"matchLabels": {"app": "primus-claw", "component": c}}}
+                for c in ("primus-claw-brain", "primus-claw-api")]
+        admits_claw = {"claw-sandbox-ingress-direct": True, "claw-sandbox-ingress-router": False,
+                       "claw-sandbox-ingress-k8s": True, "claw-sandbox-ingress-never": False,
+                       "claw-sandbox-ingress-always": True}[case]
+        want = [want_cp] + (claw if admits_claw else [])
+        if selectors != want:
+            fail(f"selector peers {selectors}, want {want}")
         if ip_blocks(peers) != ["192.0.2.10/32"]:
             fail(f"ipBlocks {ip_blocks(peers)}")
         if any(p.get("namespaceSelector") == {} or p.get("podSelector") == {} for p in peers):
@@ -295,8 +305,24 @@ networkPolicy:
     enabled: true
     fromCIDRs: [192.0.2.10/32]
 YAML
-render_claw "$tmp/claw-sandbox-ingress.yaml" -f "$tmp/si.yaml"
-check "$tmp/claw-sandbox-ingress.yaml" claw-sandbox-ingress
+# Safe mode (the default) without the Router's port proxy: Brain and the API
+# reach Hands by its cluster DNS name, so they are admitted.
+render_claw "$tmp/claw-sandbox-ingress-direct.yaml" -f "$tmp/si.yaml"
+check "$tmp/claw-sandbox-ingress-direct.yaml" claw-sandbox-ingress-direct
+# Safe mode through the Router: the control plane alone.
+render_claw "$tmp/claw-sandbox-ingress-router.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true
+check "$tmp/claw-sandbox-ingress-router.yaml" claw-sandbox-ingress-router
+# Kubernetes mode: Brain and the API use the pod IP, the Router flag does not apply.
+render_claw "$tmp/claw-sandbox-ingress-k8s.yaml" -f "$tmp/si.yaml" --set secret.clawDeployMode=kubernetes \
+  --set-string secret.sandboxHandsViaRouter=true
+check "$tmp/claw-sandbox-ingress-k8s.yaml" claw-sandbox-ingress-k8s
+render_claw "$tmp/claw-sandbox-ingress-never.yaml" -f "$tmp/si.yaml" --set networkPolicy.sandboxIngress.admitClaw=false
+check "$tmp/claw-sandbox-ingress-never.yaml" claw-sandbox-ingress-never
+render_claw "$tmp/claw-sandbox-ingress-always.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true \
+  --set networkPolicy.sandboxIngress.admitClaw=true
+check "$tmp/claw-sandbox-ingress-always.yaml" claw-sandbox-ingress-always
+must_fail claw-sandbox-ingress-bad-admit "admitClaw must be auto, true or false" -f "$tmp/si.yaml" \
+  --set networkPolicy.sandboxIngress.admitClaw=maybe
 
 must_fail claw-sandbox-ingress-no-namespace "sandboxIngress.enabled needs networkPolicy.sandboxEgress.namespaces" \
   --set networkPolicy.sandboxIngress.enabled=true
