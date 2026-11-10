@@ -36,7 +36,7 @@ async function click(world: ReviewWorld, mode: string): Promise<void> {
   const route = {
     action: {
       type: "action",
-      verb: "primusclaw.github_mode",
+      verb: "github_mode",
       data: { primusclaw: "github_mode", mode },
     } as unknown as InboundAction,
     sender: ALICE,

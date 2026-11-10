@@ -59,7 +59,7 @@ function click(world: ReviewWorld, decision: string, who = BOB): { route: ClickR
   });
   const action = {
     type: "action",
-    verb: "primusclaw.github_confirm",
+    verb: "github_confirm",
     data: { primusclaw: "github_confirm", confirmation: "conf-1", decision },
   } as unknown as InboundAction;
   const route = {

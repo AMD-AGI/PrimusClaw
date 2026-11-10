@@ -126,7 +126,7 @@ export async function press(
   });
   const action = {
     type: "action",
-    verb: "primusclaw.github_confirm",
+    verb: "github_confirm",
     data: { primusclaw: "github_confirm", confirmation: confirmationId, decision },
   } as unknown as InboundAction;
   const route = {
@@ -144,7 +144,7 @@ export async function press(
       return Promise.resolve(true);
     },
   } as unknown as ClickRoute;
-  const handler = world.service.routeHandlers().clicks.find((c) => c.verbs.includes("primusclaw.github_confirm"));
+  const handler = world.service.routeHandlers().clicks.find((c) => c.verbs.includes("github_confirm"));
   await handler?.beforeCredential?.(route);
   return settled;
 }

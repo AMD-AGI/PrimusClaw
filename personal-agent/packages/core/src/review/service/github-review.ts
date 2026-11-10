@@ -319,7 +319,8 @@ export class GithubReview {
       ],
       clicks: [
         {
-          verbs: ["primusclaw.github_mode", "primusclaw.github_confirm", "primusclaw.github_connect"],
+          // (the action's `verb` is its card data's `primusclaw` kind, as the adapter reads it; never the channel's verb)
+          verbs: ["github_mode", "github_confirm", "github_connect"],
           beforeCredential: async (click: ClickRoute) => {
             await this.click(click);
             return true;

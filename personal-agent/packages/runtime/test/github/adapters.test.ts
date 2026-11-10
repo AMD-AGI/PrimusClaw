@@ -155,3 +155,17 @@ test("the reader calls the gateway with the askers key and gives up on anything 
   assert.deepEqual(readingOf("no json"), { intent: null });
   assert.deepEqual(readingOf("[1]"), { intent: null });
 });
+
+test("the runtime entry point exports the github adapters the assembly injects", async () => {
+  const runtime = await import("../../src/index.js");
+  for (const name of [
+    "GithubApi",
+    "AppTokenSource",
+    "FallbackTokenSource",
+    "IdentityCredentialClient",
+    "GithubDeviceFlow",
+    "GatewayIntentReader",
+    "PublicPullReader",
+  ] as const)
+    assert.equal(typeof runtime[name], "function", name);
+});
