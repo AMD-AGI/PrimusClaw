@@ -463,20 +463,24 @@ When the terminal that has the conversation open is a **tmux pane**, the phone c
 is sent is typed into that terminal, as the person at it would type it, and the replies are read from the transcript as for a
 watch. Nothing else writes to the conversation, so its history never forks, and the terminal and the phone show the same
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
-accepted: it waits (one notice, `terminal_input_queued`, with `reason` `terminal_working`, `terminal_waiting`, `terminal_typing`,
-`terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle (`idle`, or `shell`: idle with background shells
-running; or `busy` while its screen shows no main turn running, which is what Claude Code says while only background agents run)
-**and** its input box is empty on the screen (for a process whose registry row cannot be read, proven as above, the screen alone: an
-empty box with no `esc to interrupt` under it), so that
-half-typed text at the terminal is never sent along and a question or a menu on the screen is never answered by an Enter; after
-10 minutes it is refused (`terminal_busy`). It is then typed with `tmux send-keys -l` (literal: nothing in it is read as a key
-name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and submitted with Enter
-once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that text, no question or
-menu, and no running turn (otherwise no further key is sent, the text stays in the box and the message is refused,
-`terminal_input_failed`: a phone's message never answers a permission question). Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
+accepted and typed at once, whatever Claude Code is doing there: one submitted while a turn runs is queued by Claude Code
+itself and taken in at that turn's next step or once it ends, as one typed by the person at the terminal is (no registry status, no
+transcript reading and no footer decides when it may be typed). It waits (one notice, `terminal_input_queued`, with `reason`
+`terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
+box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
+question it would approve a tool call), or the pane is scrolled back. It is typed with `tmux send-keys -l` (literal: nothing in it
+is read as a key name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and
+submitted with Enter once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
+text and no question or menu. A question that shows after the text went in holds the Enter: no key at all is sent while it shows,
+the phone is told (`terminal_dialog`), and once it is answered at the terminal the Enter goes if the box holds the text again, or
+the text is typed again if the question emptied the box. A box that then holds anything else (the person at the terminal typed into
+it) is left as it is and the message is refused (`terminal_input_failed`): a phone's message never answers a permission question. Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
 become spaces), so nothing in a message can act as a key or end the paste. Its turn ends (`turn_end`, naming the prompt) when the
-transcript records the end of the terminal's turn, when the turn is stopped there (`cancelled`), or once Claude Code has said it is
-idle for 5 seconds; a message that does not appear in the transcript within 20 seconds ends as `terminal_input_unconfirmed`. A
+transcript records the end of the turn that took it in (a queued message: the turn whose `queued_command` it is, or its own turn
+after the `dequeue`), when the turn is stopped there (`cancelled`), or once Claude Code has said it is idle for 5 seconds; a message
+that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
+`terminal_input_unconfirmed`, and one Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
+`terminal_input_withdrawn`. A
 `cancel` presses Esc in the terminal, which stops the turn there. A mode change is refused (`terminal_session`): the terminal keeps
 its own mode.
 
@@ -488,7 +492,7 @@ when the session starts, and `session_started` names it (`terminal_mode`, null w
 the audit log records it with each message typed. The terminal is never switched to another mode for it. A conversation with a name
 (`/rename`) has it in the rule above the box; that rule is still the box's edge. A Claude Code that says it is idle while its screen
 is not its input box (another program, a layout the connector does not know) is read again for 30 seconds, then the message is
-refused (`terminal_screen_unknown`) instead of waiting the 10 minutes a busy terminal gets; while it waits the phone is
+refused (`terminal_screen_unknown`); while it waits the phone is
 told why (`terminal_input_queued`). Connectors 0.1.8 to 0.1.13 refused a mode the agent's approval did not allow
 (`terminal_mode_not_allowed`, `terminal_mode_unknown`); this one no longer sends those. A message that starts with `!`
 (Claude Code runs the rest as a shell command, with no question) or `/` (a slash command such as `/permissions` or `/add-dir`) is

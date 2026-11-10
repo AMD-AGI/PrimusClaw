@@ -170,6 +170,16 @@ record it.
   from a character; a page cut short says how long it is and the offset to read on.
 
 ### Fixed
+- A message from the phone to a conversation open in a tmux terminal is typed at once, whatever Claude Code is doing there: one
+  submitted while a turn runs is queued by Claude Code itself and taken in at that turn's next step or once it ends, as one typed at
+  the terminal is. The connector no longer decides whether the terminal is busy (its registry status, whether the transcript's last
+  turn ended, `esc to interrupt` under the box, the Claude Code version): a coordinator's terminal that says `busy` for hours, with a
+  transcript too large to read (131 MB), held every message until it was refused. The one guard kept is Enter's: it goes only on a
+  screen that shows the input box holding exactly the message and no question or menu. A question that shows after the text went in
+  holds the Enter, with no key sent while it shows, and the phone is told (`terminal_input_queued` `terminal_dialog`); once it is
+  answered at the terminal the Enter goes (the text is typed again if the question emptied the box). A queued message's echo is its
+  `queue-operation` enqueue, and its turn ends with the turn that took it in (`queued_command`, or its own after the `dequeue`).
+  Doctor's `claude_version_unverified` is gone with the version list.
 - The assistant can tell where a public pull request stands for a person with no GitHub here when the deployment has a read-only
   GitHub App. `pr_state` read such a pull request with no credential, which GitHub allows 60 times an hour for the deployment's whole
   address; once that was used up every read failed (403), so a request to review pull requests merged days before was not answered as

@@ -15,11 +15,16 @@
  * above the box (`/rename`). FAKE_IDLE_STATUS: what the row says between turns (`idle`; `shell` is what Claude Code 2.1.32x says
  * when background shells run). FAKE_TORN_ROW=1: the row is never written (Claude Code gives up on a row it cannot read). FAKE_TASKS_DIR:
  * a conversation's task folder the process keeps open, as Claude Code does once that conversation ran a background task.
- * FAKE_FOOTER_ESC=1: the footer says `esc to interrupt` even between turns (a screen that says a main turn runs).
- * FAKE_TURN_ON_TYPE=1: an adversary: once anything is typed, a main turn of its own starts in the transcript (a user entry with no
- * end), while the screen stays as it was.
- * FAKE_DIALOG_FILE: an adversary. Once anything is typed, a permission question is drawn under the box (the typed text still shows
- * in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is submitted.
+ * A message submitted while a turn runs is queued, as Claude Code 2.1.285 queues it (measured 2026-11-10): `queue-operation`
+ * enqueue with its text at once; then, with FAKE_QUEUE=absorb, taken into the running turn (`remove` absorbed_mid_turn and a
+ * `queued_command` attachment, answered in that turn), or else after that turn's end (`dequeue`, then a turn of its own as a typed
+ * prompt).
+ * FAKE_BUSY_MS: a turn of its own runs from the start for this long (a prompt that is not the phone's; `esc to interrupt` below the
+ * box, the row `busy`).
+ * FAKE_DIALOG_FILE: an adversary. Once anything is typed (the first time only), a permission question is drawn under the box (the
+ * typed text still shows in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is
+ * submitted. Once the file FAKE_DIALOG_DISMISS exists, the question is answered at the terminal and goes; with FAKE_DIALOG_CLEARS=1
+ * that also empties the box.
  */
 import fs from "node:fs";
 
@@ -39,7 +44,8 @@ const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "acc
 const readMode = () => { try { return fs.readFileSync(modeFile, "utf8").trim(); } catch { return "default"; } };
 let mode = readMode();
 let dialog = false;
-let turnStarted = false;
+let dialogShown = false;
+const queue = [];
 const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
   ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
   : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
@@ -64,24 +70,43 @@ function draw() {
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
   const question = dialog ? "\r\n Bash command\r\n   touch approved.txt\r\n Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n Esc to cancel · Tab to amend\r\n" : "";
-  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working || process.env.FAKE_FOOTER_ESC === "1" ? " · esc to interrupt" : ""}\r\n${question}`);
+  const queued = queue.map((q) => `❯ ${q.split("\n")[0]}\r\n`).join("");
+  process.stdout.write(`\x1b[2J\x1b[H${queued}${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working ? " · esc to interrupt" : ""}\r\n${question}`);
+}
+
+/** A turn that answers `text` (null: one that is not the phone's), ending after workMs, and what was queued meanwhile. */
+function runTurn(text, ms) {
+  working = true;
+  status("busy");
+  draw();
+  setTimeout(() => {
+    if (text !== null) line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${text}` }], stop_reason: "end_turn" } });
+    if (process.env.FAKE_QUEUE === "absorb") {
+      for (const q of queue.splice(0)) {
+        line({ type: "queue-operation", operation: "remove", content: q, reason: "absorbed_mid_turn" });
+        line({ type: "attachment", attachment: { type: "queued_command", prompt: q, commandMode: "prompt" } });
+        line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${q}` }], stop_reason: "end_turn" } });
+      }
+    }
+    line({ type: "system", subtype: "turn_duration", durationMs: ms });
+    working = false;
+    status(idleStatus);
+    const next = queue.shift();
+    if (next !== undefined) {
+      line({ type: "queue-operation", operation: "dequeue" });
+      buffer = next;
+      return submit();
+    }
+    draw();
+  }, ms);
 }
 
 function submit() {
   const text = buffer;
   buffer = "";
   if (!text.trim()) return draw();
-  working = true;
-  status("busy");
   line({ type: "user", message: { role: "user", content: text }, promptSource: "typed", origin: { kind: "human" } });
-  draw();
-  setTimeout(() => {
-    line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${text}` }], stop_reason: "end_turn" } });
-    line({ type: "system", subtype: "turn_duration", durationMs: workMs });
-    working = false;
-    status(idleStatus);
-    draw();
-  }, workMs);
+  runTurn(text, workMs);
 }
 
 process.stdin.setRawMode?.(true);
@@ -99,18 +124,34 @@ process.stdin.on("data", (chunk) => {
     if (ch === "\r") {
       if (dialog) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
       if (!working) submit();
+      else if (buffer.trim()) {
+        // (Claude Code queues it: taken at the running turn's next step, or once it ends)
+        queue.push(buffer);
+        line({ type: "queue-operation", operation: "enqueue", content: buffer });
+        buffer = "";
+      }
       continue;
     }
     if (ch === "\x15") { buffer = ""; continue; }   // Ctrl-U
     if (ch === "\x1b" || ch < " ") continue;
     buffer += ch;
-    if (process.env.FAKE_DIALOG_FILE) dialog = true;
-    if (process.env.FAKE_TURN_ON_TYPE === "1" && !turnStarted) {
-      turnStarted = true;
-      line({ type: "user", message: { role: "user", content: "a notification of a background task" }, origin: { kind: "task-notification" } });
-    }
+    if (process.env.FAKE_DIALOG_FILE && !dialogShown) { dialog = true; dialogShown = true; }
   }
   draw();
 });
+if (Number(process.env.FAKE_BUSY_MS) > 0) {
+  line({ type: "user", message: { role: "user", content: "a long task of its own" }, origin: { kind: "human" } });
+  runTurn(null, Number(process.env.FAKE_BUSY_MS));
+}
 draw();
-setInterval(() => { const m = readMode(); if (m !== mode) { mode = m; draw(); } }, 50);
+setInterval(() => {
+  const m = readMode();
+  if (m !== mode) { mode = m; draw(); }
+  if (dialog && process.env.FAKE_DIALOG_DISMISS) {
+    if (fs.existsSync(process.env.FAKE_DIALOG_DISMISS)) {
+      dialog = false;
+      if (process.env.FAKE_DIALOG_CLEARS === "1") buffer = "";
+      draw();
+    }
+  }
+}, 50);
