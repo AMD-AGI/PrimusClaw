@@ -1584,9 +1584,15 @@ async function main(): Promise<void> {
               if (left) throw new Error(left);
             }
             // The entries before the attempt are listed once no earlier turn is running (one past its attempt, after a timeout, may
-            // still save): its entry would otherwise be taken for this attempt's own.
-            if (MODE === "assistant" && !(await idle(session!.id, turnWaitMs(true)))) {
-              throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
+            // still save): its entry would otherwise be taken for this attempt's own. A session still running is the run's error and,
+            // as when runAssistant finds it, no preflight failure: the attempt is run again once (EVAL_INFRA_RETRY), in a new session
+            // with EVAL_FRESH_SESSION_EVERY=attempt.
+            if (MODE === "assistant") {
+              preflightFailed = false;
+              if (!(await idle(session!.id, turnWaitMs(true)))) {
+                throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
+              }
+              preflightFailed = true;
             }
             memBefore = await memoriesBefore(filled);
             ATTEMPT_MEMORIES_BEFORE = memBefore;

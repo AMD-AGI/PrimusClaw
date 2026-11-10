@@ -75,6 +75,9 @@
  *      entry from before the run is kept
  *   R25 an attempt's memory entries are listed only once the assistant session is idle: an entry an earlier turn still running
  *      saves while the next attempt waits is not counted as that attempt's (expect_memory fails), and is deleted as the run's
+ *   R26 EVAL_FRESH_SESSION_EVERY=attempt with EVAL_INFRA_RETRY: an attempt whose assistant session is still running before it is the
+ *      run's error and is run again once, in a new session (the idle wait before an attempt's memory entries are listed is no
+ *      preflight failure)
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -1541,6 +1544,24 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(run.out, /pass t-idle-001#1/, run.out);
       assert.match(run.out, /FAIL t-idle-002#1 .*memory saved: opus/, "the earlier turn's entry is not the attempt's");
       assert.ok(!claw.memories.has(5000), "deleted as the run's");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R26 attempt mode: a session still running before an attempt is run again once, in a new session", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.freshAssistant = true;
+    // The second case's session (asst-2) has a turn going on (a person, or a turn past its attempt) for as long as it is there.
+    claw.onSessionGet = (sid) => { const s = claw.sessions.get(sid); if (sid === "asst-2" && s) s.status = "running"; };
+    claw.router = (_content, id, sid) => claw.turn(id, { say: `answered in ${sid}` });
+    const r = runner(base, [answerCase("t-retry-001"), answerCase("t-retry-002")], { EVAL_FRESH_SESSION_EVERY: "attempt", EVAL_INFRA_RETRY: "1", EVAL_TURN_WAIT_S: "3" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /ERROR t-retry-002#1 the assistant session was still running .*: running it again once/, run.out);
+      assert.match(run.out, /pass t-retry-002#1 .*\(second try\)/, run.out);
+      const posts = claw.calls.filter((c) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c));
+      assert.deepEqual(posts, ["POST /v1/sessions/asst-1/messages", "POST /v1/sessions/asst-3/messages"], "nothing sent into the running session");
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
