@@ -31,3 +31,22 @@ test("hands labels are exactly what ensureHands composed inline before the extra
   // Spec labels still win over the defaults, as the inline spread did.
   assert.equal(composeSandboxLabels({ sessionId: "s", component: "hands", extra: { team: "t" } }).team, "t");
 });
+
+test("a spec cannot override the session or component label the sandbox policies select on", () => {
+  const labels = composeSandboxLabels({
+    sessionId: "s1",
+    component: "hands",
+    own: { "primus-claw/sandbox-handle": "main" },
+    extra: {
+      "primus-claw/component": "not-hands",
+      "primus-claw/session-id": "someone-else",
+      "primus-claw/sandbox-handle": "ws",
+      custom: "x",
+    },
+  });
+  assert.equal(labels["primus-claw/component"], "hands");
+  assert.equal(labels["primus-claw/session-id"], "s1");
+  // Other spec labels still win over the caller's own ones, as before.
+  assert.equal(labels["primus-claw/sandbox-handle"], "ws");
+  assert.equal(labels.custom, "x");
+});

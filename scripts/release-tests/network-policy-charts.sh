@@ -17,7 +17,13 @@
 #     CIDRs, and an egress allow list whose public rule excludes link-local
 #     (cloud metadata) and the private ranges;
 #   - sandboxEgress renders one policy per namespace, selecting the Hands pods,
-#     and refuses to render without a namespace or with a CIDR without ports.
+#     and refuses to render without a namespace or with a CIDR without ports;
+#   - the public rule also excludes Azure's host endpoint 168.63.129.16;
+#   - sandboxIngress renders one ingress policy per sandbox namespace admitting
+#     only the listed clients, plus the release's Brain and API pods exactly
+#     when they reach Hands directly (kubernetes mode, or safe mode without
+#     sandboxHandsViaRouter; admitClaw true/false overrides), and refuses an
+#     empty client list or an unknown admitClaw.
 #
 # The renders are parsed as YAML, not grepped.
 
@@ -92,7 +98,8 @@ def check_public(egress, want_ports):
     if len(rules) != 1:
         fail(f"expected one public egress rule, got {len(rules)}")
     peer = rules[0]["to"][0]["ipBlock"]
-    for must in ("169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"):
+    for must in ("169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+                 "168.63.129.16/32"):
         if must not in peer.get("except", []):
             fail(f"public egress does not exclude {must}")
     if ports(rules[0]) != sorted(("TCP", p) for p in want_ports):
@@ -196,6 +203,41 @@ elif case == "claw-sandbox":
             fail(f"node subnet rule {node}")
     if [p for p in policies() if p["metadata"]["name"] == "default-deny"]:
         fail("release policies rendered while networkPolicy.enabled is false")
+    if [p for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress"]:
+        fail("sandbox ingress rendered while sandboxIngress.enabled is false")
+
+elif case.startswith("claw-sandbox-ingress"):
+    got = sorted(p["metadata"]["namespace"] for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress")
+    if got != ["ws-a", "ws-b"]:
+        fail(f"sandbox ingress namespaces {got}")
+    for ns in got:
+        spec = one("claw-sandbox-ingress", ns)["spec"]
+        if spec["podSelector"] != {"matchLabels": {"primus-claw/component": "hands"}}:
+            fail(f"selects {spec['podSelector']}, not the Hands pods")
+        if spec["policyTypes"] != ["Ingress"] or spec.get("egress"):
+            fail(f"policyTypes {spec['policyTypes']}")
+        rules = spec["ingress"]
+        if len(rules) != 1 or rules[0].get("ports"):
+            fail(f"expected one any-port ingress rule, got {rules}")
+        peers = rules[0]["from"]
+        want_cp = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "agent-sandbox-system"}},
+                   "podSelector": {"matchLabels": {"app": "agent-sandbox-controlplane"}}}
+        selectors = [p for p in peers if "ipBlock" not in p]
+        claw = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "claw-test"}},
+                 "podSelector": {"matchLabels": {"app": "primus-claw", "component": c}}}
+                for c in ("primus-claw-brain", "primus-claw-api")]
+        admits_claw = {"claw-sandbox-ingress-direct": True, "claw-sandbox-ingress-router": False,
+                       "claw-sandbox-ingress-k8s": True, "claw-sandbox-ingress-never": False,
+                       "claw-sandbox-ingress-always": True,
+                       "claw-sandbox-ingress-router-1": False, "claw-sandbox-ingress-router-yes": False,
+                       "claw-sandbox-ingress-router-no-url": True}[case]
+        want = [want_cp] + (claw if admits_claw else [])
+        if selectors != want:
+            fail(f"selector peers {selectors}, want {want}")
+        if ip_blocks(peers) != ["192.0.2.10/32"]:
+            fail(f"ipBlocks {ip_blocks(peers)}")
+        if any(p.get("namespaceSelector") == {} or p.get("podSelector") == {} for p in peers):
+            fail("an empty selector admits every pod")
 else:
     fail("unknown case")
 print(f"  ok [{case}]")
@@ -256,6 +298,55 @@ check "$tmp/claw-sandbox.yaml" claw-sandbox
 
 must_fail claw-sandbox-no-namespace "needs networkPolicy.sandboxEgress.namespaces" \
   --set networkPolicy.sandboxEgress.enabled=true
+
+cat >"$tmp/si.yaml" <<'YAML'
+networkPolicy:
+  sandboxEgress:
+    namespaces: [ws-a, ws-b]
+  sandboxIngress:
+    enabled: true
+    fromCIDRs: [192.0.2.10/32]
+YAML
+# Safe mode (the default) without the Router's port proxy: Brain and the API
+# reach Hands by its cluster DNS name, so they are admitted.
+render_claw "$tmp/claw-sandbox-ingress-direct.yaml" -f "$tmp/si.yaml"
+check "$tmp/claw-sandbox-ingress-direct.yaml" claw-sandbox-ingress-direct
+# Safe mode through the Router: the control plane alone.
+render_claw "$tmp/claw-sandbox-ingress-router.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true
+check "$tmp/claw-sandbox-ingress-router.yaml" claw-sandbox-ingress-router
+# Kubernetes mode: Brain and the API use the pod IP, the Router flag does not apply.
+render_claw "$tmp/claw-sandbox-ingress-k8s.yaml" -f "$tmp/si.yaml" --set secret.clawDeployMode=kubernetes \
+  --set-string secret.sandboxHandsViaRouter=true
+check "$tmp/claw-sandbox-ingress-k8s.yaml" claw-sandbox-ingress-k8s
+# Brain's envBool spellings, and the flag without a Router base (Brain then
+# uses the sandbox's cluster DNS name).
+render_claw "$tmp/claw-sandbox-ingress-router-1.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=1
+check "$tmp/claw-sandbox-ingress-router-1.yaml" claw-sandbox-ingress-router-1
+render_claw "$tmp/claw-sandbox-ingress-router-yes.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=YES
+check "$tmp/claw-sandbox-ingress-router-yes.yaml" claw-sandbox-ingress-router-yes
+render_claw "$tmp/claw-sandbox-ingress-router-no-url.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true \
+  --set-string secret.sandboxRouterUrl=""
+check "$tmp/claw-sandbox-ingress-router-no-url.yaml" claw-sandbox-ingress-router-no-url
+render_claw "$tmp/claw-sandbox-ingress-never.yaml" -f "$tmp/si.yaml" --set networkPolicy.sandboxIngress.admitClaw=false
+check "$tmp/claw-sandbox-ingress-never.yaml" claw-sandbox-ingress-never
+render_claw "$tmp/claw-sandbox-ingress-always.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true \
+  --set networkPolicy.sandboxIngress.admitClaw=true
+check "$tmp/claw-sandbox-ingress-always.yaml" claw-sandbox-ingress-always
+must_fail claw-sandbox-ingress-bad-admit "admitClaw must be auto, true or false" -f "$tmp/si.yaml" \
+  --set networkPolicy.sandboxIngress.admitClaw=maybe
+
+must_fail claw-sandbox-ingress-no-namespace "sandboxIngress.enabled needs networkPolicy.sandboxEgress.namespaces" \
+  --set networkPolicy.sandboxIngress.enabled=true
+cat >"$tmp/si-empty.yaml" <<'YAML'
+networkPolicy:
+  sandboxEgress:
+    namespaces: [ws-a]
+  sandboxIngress:
+    enabled: true
+    fromPods: []
+    fromCIDRs: []
+YAML
+must_fail claw-sandbox-ingress-no-clients "sandboxIngress needs fromPods or fromCIDRs" -f "$tmp/si-empty.yaml"
 cat >"$tmp/noports.yaml" <<'YAML'
 networkPolicy:
   enabled: true

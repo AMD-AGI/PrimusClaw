@@ -935,7 +935,10 @@ networkPolicy:
   # (LLM and Git over HTTPS/SSH, AMQP over TLS for Teams, ...).
   publicEgressPorts: [80, 443]
   # Excluded from "public": the private ranges, link-local (cloud metadata),
-  # carrier-grade NAT and loopback.
+  # carrier-grade NAT, loopback and Azure's host endpoint 168.63.129.16
+  # (WireServer: VM agent and extension configuration on port 80). The last is
+  # a public address that only the VM's host answers, so a pod on an Azure node
+  # would otherwise reach it as "public"; elsewhere it is an unused address.
   privateCIDRs:
     - 10.0.0.0/8
     - 172.16.0.0/12
@@ -943,8 +946,9 @@ networkPolicy:
     - 169.254.0.0/16
     - 100.64.0.0/10
     - 127.0.0.0/8
-  # Egress of the Hands pods, in each namespace they run in. Only Egress is
-  # restricted: ingress there is the workspace's business.
+    - 168.63.129.16/32
+  # Egress of the Hands pods, in each namespace they run in. Ingress is
+  # sandboxIngress below.
   sandboxEgress:
     enabled: false
     # Namespaces the sandboxes run in (secret.sandboxNamespace and every
@@ -960,3 +964,30 @@ networkPolicy:
     # Private destinations by CIDR and port, as networkPolicy.egressCIDRs.
     egressCIDRs: []
     publicEgressPorts: [80, 443, 22]
+  # Ingress of the Hands pods, in each of sandboxEgress.namespaces: only the
+  # clients listed here, on any port (the control plane proxies envd and the
+  # ports a sandbox serves). Without it every pod of the cluster can connect
+  # to a sandbox's envd directly. A client named by labels is refused for the
+  # first second or two after it starts under an engine that learns pod
+  # addresses late (kube-router); the control plane is long-lived, and
+  # fromCIDRs is the alternative where that matters. The node's own traffic
+  # (kubelet probes) is not a pod: kube-router accepts it before any policy,
+  # Calico and Cilium allow host-to-local-pod traffic by default; elsewhere
+  # add the node's pod-network gateway to fromCIDRs.
+  #
+  # In kubernetes mode the Hands pods do not carry podLabels today (the
+  # agent-sandbox router puts a request's labels on the Sandbox object, not on
+  # its pod), so neither sandbox policy selects anything there yet.
+  sandboxIngress:
+    enabled: false
+    # Also admit this release's Brain and API pods, which reach Hands directly
+    # in kubernetes mode and in safe mode unless secret.sandboxHandsViaRouter
+    # is on (true, 1 or yes) with a non-empty secret.sandboxRouterUrl.
+    # "auto": exactly then, read from secret.*; true / false: always / never.
+    # A deployment that overrides those settings through api/brain extraEnv
+    # (EXTRA_ENV_*) instead of secret.* should set this explicitly.
+    admitClaw: auto
+    fromPods:
+      - namespace: agent-sandbox-system
+        podLabels: {app: agent-sandbox-controlplane}
+    fromCIDRs: []
