@@ -67,6 +67,8 @@ export interface Features {
   readonly timers: readonly FeatureTimer[];
   /** Once the worker runs: chats attached to a remote agent are followed again (`Agent.resume_remote`). */
   start(): Promise<void>;
+  /** The worker stops: the assistant's open receipts are dropped, so their close timers do not keep the process up. */
+  stop(): void;
   /** The review service (TEAMS_GITHUB_REVIEW_ENABLED; undefined off), for the gate's review scenarios and the tests. */
   readonly review: GithubReview | undefined;
   /** What the release gate's test entry reads: the subscriptions, and the Claw sessions this worker made. */
@@ -386,6 +388,9 @@ export function buildFeatures(given: AssemblyBase): Features {
       remote.resume(); // (chats attached to a remote agent are followed again from where they were)
       review?.service.resume(); // (reviews someone asked of a colleague: their asker hears the outcome again)
       return Promise.resolve();
+    },
+    stop: () => {
+      assistant.receipts.stop();
     },
     gate: gateOf(parts, base, made),
     review: review?.service,

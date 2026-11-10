@@ -45,6 +45,12 @@ export class Receipts {
     return receipt;
   }
 
+  /** The worker stops: every open receipt is dropped (`Receipt.drop`), so no close timer or follower keeps the process up. */
+  stop(): void {
+    for (const receipt of this.open.values()) receipt.drop();
+    this.open.clear();
+  }
+
   /** The open receipt of this conversation, left where it is (what follows the turn shows its steps in it). */
   openOf(conversation: string): Receipt | undefined {
     const receipt = this.open.get(conversation);
