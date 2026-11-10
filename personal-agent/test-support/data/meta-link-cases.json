@@ -120,6 +120,12 @@
    "input": "john.doe@example.comx@y.example",
    "limit": 200,
    "expected": "john.doe@​example.comx@​y.example"
+  },
+  {
+   "about": "a mail address followed by a label that is no top-level domain in a line",
+   "input": "a@b.com.1 and x@y.example.2",
+   "limit": 200,
+   "expected": "a@​b.com.1 and x@​y.example.2"
   }
  ]
 }

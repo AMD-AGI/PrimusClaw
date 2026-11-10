@@ -760,6 +760,22 @@
    "expected": [
     "`example.com/path` and `example.com:8080`"
    ]
+  },
+  {
+   "about": "a mail address followed by a label that is no top-level domain: the address a client links is made code",
+   "input": "write a@b.com.1 now",
+   "lang": "en",
+   "expected": [
+    "write `a@b.com`.1 now"
+   ]
+  },
+  {
+   "about": "a mail address followed by a label that is no top-level domain: the address a client links is made code",
+   "input": "write a@b.com.1 now",
+   "lang": "zh",
+   "expected": [
+    "write `a@b.com`.1 now"
+   ]
   }
  ]
 }

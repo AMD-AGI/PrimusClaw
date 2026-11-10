@@ -412,6 +412,33 @@ function isMail(found: string): boolean {
   return local !== "" && domain.includes(".") && /^\p{L}+$/u.test(tld);
 }
 
+/** The mail address a client links at the start of `name@host...`, "" if none: the whole when it is one, else the host cut at the
+ * last of its dots that leaves a last label of letters (`a@b.com.1` is `a@b.com` to a client). One pass from the end, each
+ * character read once (`found` is someone else's text: `a@b` and a hundred thousand `.1`). */
+function mail(found: string): string {
+  if (isMail(found)) return found;
+  const sign = found.indexOf("@");
+  if (!found.slice(0, sign).replaceAll("\\", "")) return "";
+  let end = found.length;
+  for (let dot = lastDot(found, sign + 1, end); dot > sign; dot = lastDot(found, sign + 1, end)) {
+    // (without the dots, hyphens and backslashes that end the host here, as the whole is read)
+    let stop = dot;
+    while (stop > sign + 1 && ".-\\".includes(found.charAt(stop - 1))) stop -= 1;
+    const before = lastDot(found, sign + 1, stop);
+    if (before > sign && /^\p{L}+$/u.test(found.slice(before + 1, stop).replaceAll("\\", "")))
+      return found.slice(0, stop);
+    end = stop;
+  }
+  return "";
+}
+
+/** Python `s.rfind(".", start, end)`. */
+function lastDot(s: string, start: number, end: number): number {
+  if (end - 1 < start) return -1;
+  const at = s.lastIndexOf(".", end - 1);
+  return at >= start ? at : -1;
+}
+
 /** Every mail address `name@host.tld` (a client makes a mail link of one) in a code span; not looked for inside a code span an
  * earlier scan made (one there is code already, and a span opened inside it would cross it). */
 export function emails(text: string): string {
@@ -431,8 +458,8 @@ function mailsIn(text: string): string {
     while (start > i && isMailLocal(charBefore(text, start))) start -= charBefore(text, start).length;
     let stop = at + 1;
     while (stop < text.length && isMailDomain(charAt(text, stop))) stop += charAt(text, stop).length;
-    const found = pyRstrip(text.slice(start, stop), ".-\\");
-    if (isMail(found)) {
+    const found = mail(pyRstrip(text.slice(start, stop), ".-\\"));
+    if (found) {
       out.push(text.slice(i, start), code(found.replaceAll("\\", "")));
       i = start + found.length;
     } else {
@@ -455,7 +482,7 @@ function mailAts(text: string): number[] {
     while (start > after && isMailLocal(charBefore(text, start))) start -= charBefore(text, start).length;
     let stop = at + 1;
     while (stop < text.length && isMailDomain(charAt(text, stop))) stop += charAt(text, stop).length;
-    if (isMail(pyRstrip(text.slice(start, stop), ".-\\"))) found.push(at);
+    if (mail(pyRstrip(text.slice(start, stop), ".-\\"))) found.push(at);
     after = at + 1;
   }
   return found;

@@ -107,6 +107,7 @@ test("hostile text is made words in linear time", () => {
     "www.x.co/".repeat(50000),
     "a.co`x`".repeat(30000),
     "x.comailto:".repeat(30000),
+    "a@b" + ".1".repeat(100000),
   ];
   for (const text of hostile) {
     const started = performance.now();
@@ -235,6 +236,7 @@ test("a short line breaks a bare domain and a mail address, and leaves a file na
   assert.equal(neutral("Visit example.com/path"), "Visit example\u200b.com/path");
   assert.equal(neutral("docs.evil.md README.md"), "docs.evil\u200b.md README.md");
   assert.equal(neutral("me@evil.example"), "me@\u200bevil.example");
+  assert.equal(neutral("a@b.com.1"), "a@\u200bb.com.1");
   assert.equal(neutral("john.doe@example.comx@y.example"), "john.doe@\u200bexample.comx@\u200by.example");
   assert.equal(neutral("site.museum\\/path"), "site\u200b.museum\\/path");
   assert.equal(neutral("@user a@b x@1.2 self.id"), "@user a@b x@1.2 self.id");
