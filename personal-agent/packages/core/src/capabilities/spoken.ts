@@ -32,7 +32,7 @@ const CN_DIGITS: Readonly<Record<string, number>> = {
 export const NUM = String.raw`(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})`;
 export const PERIOD = String.raw`(?:早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|凌晨|半夜)`;
 /** A time of day: "22:00", "晚上 10 点", "8 点半", "九点十五分". No capturing groups: it is used inside other patterns. */
-export const TIME = String.raw`(?:${PERIOD})?\s*${NUM}\s*(?:[:：]\s*\d{2}|(?:点|點)\s*(?:半|${NUM}\s*分?)?)`;
+export const TIME = String.raw`(?:${PERIOD}\s*)?${NUM}\s*(?:[:：]\s*\d{2}|(?:点|點)(?:\s*(?:半|${NUM}(?:\s*分)?))?)`;
 
 const TIME_PARTS = pyFullmatch(
   String.raw`(?<p>${PERIOD})?\s*(?<h>${NUM})\s*(?:[:：]\s*(?<m>\d{2})|(?:点|點)\s*(?:(?<half>半)|(?<m2>${NUM})\s*分?)?)`,

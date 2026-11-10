@@ -6,6 +6,7 @@
  * state, no I/O. What each command does is in `routing/`.
  */
 import { decimalInt, isUpper, pyLower, pySplit, pyStrip, splitOnce, squashSpaces } from "../text/py-text.js";
+import { own } from "../own.js";
 import { CODE_ALPHABET, CODE_LENGTH } from "../ports/store/policy.js";
 import { pyFullmatch } from "../text/py-regex.js";
 import { isCommand, type Command } from "./names.js";
@@ -123,6 +124,6 @@ export function parseQuietWindow(text: string): readonly [string, string] | null
 /** '2h', '30m', '1d' to seconds, at most 30 days; null when malformed. */
 export function parseDurationSeconds(text: string): number | null {
   const [count = "", unit = ""] = groupsOf(DURATION, text) ?? [];
-  const seconds = decimalInt(count) * (UNIT_SECONDS[pyLower(unit)] ?? 0);
+  const seconds = decimalInt(count) * (own(UNIT_SECONDS, pyLower(unit)) ?? 0);
   return seconds > 0 && seconds <= MAX_PAUSE_SECONDS ? seconds : null;
 }

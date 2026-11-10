@@ -7,6 +7,7 @@
  * No list of commands.
  */
 import { BOT_NAME } from "../branding.js";
+import { own } from "../own.js";
 import { toLang, type Lang } from "../locales/lang.js";
 import { dataStatement } from "../locales/transparency.js";
 import { CAPABILITIES, CATEGORIES, type Capability, type Part } from "./registry.js";
@@ -100,7 +101,7 @@ function categoryBlocks(lang: Lang, chat: ChatShape, values: Readonly<Record<str
     if (items.length === 0) continue;
     const lines = [`**${lang === "zh" ? category.zh : category.en}**`];
     for (const c of items) {
-      const current = c.setting && !chat.group ? values[c.setting] : undefined;
+      const current = c.setting && !chat.group ? own(values, c.setting) : undefined;
       lines.push(capabilityLine(c, lang, current));
     }
     blocks.push(lines.join("\n"));

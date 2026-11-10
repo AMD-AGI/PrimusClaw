@@ -9,6 +9,7 @@
 
 import type { Lang } from "../locales/lang.js";
 import { ASSISTANT_STEPS, SAFE_OBJECTS, stepText } from "../locales/steps.js";
+import { own } from "../own.js";
 import { type Integrations, noIntegrations } from "../plugins/integrations.js";
 import { cpSlice, pyStrip, squashSpaces } from "../text/py-text.js";
 
@@ -157,11 +158,6 @@ function lookupOf(server: string, verb: string, zh: boolean, integrations: Integ
   if (objects) return t.safeQuery({ what: objects[zh ? 1 : 0] });
   const shown = own(SERVERS, server) ?? integrations.mcpServers.get(server);
   return shown ? t.query({ server: shown }) : undefined;
-}
-
-/** `table`'s own entry for `key` (a tool name is Claw's to choose: what every object inherits is no entry). */
-function own<V>(table: Readonly<Record<string, V>>, key: string): V | undefined {
-  return Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
 export function failedLine(label: Label, lang = "en"): string {

@@ -26,13 +26,13 @@ type Seen = [string, string | null];
 function spy(seen: Seen[]): () => void {
   const restore: (() => void)[] = [];
   const patch = <T extends object>(proto: T, name: keyof T & string, record: (args: unknown[]) => Seen): void => {
-    const original = proto[name];
-    (proto as Record<string, unknown>)[name] = (...args: unknown[]) => {
+    const original: unknown = Reflect.get(proto, name);
+    Reflect.set(proto, name, (...args: unknown[]) => {
       seen.push(record(args));
       return Promise.resolve(true);
-    };
+    });
     restore.push(() => {
-      (proto as Record<string, unknown>)[name] = original;
+      Reflect.set(proto, name, original);
     });
   };
   const second =

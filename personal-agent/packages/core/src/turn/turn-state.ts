@@ -6,6 +6,7 @@
  * what the runner should do, so the mapping is testable without any network.
  */
 
+import { own } from "../own.js";
 import { cpSlice, pyStrip, squashSpaces } from "../text/py-text.js";
 import { type Delivery, deliveryOf } from "./deliveries.js";
 import { type GithubOutcome, githubPrSummary, githubResult, githubWrite, reviewComments } from "./github-outcome.js";
@@ -43,7 +44,7 @@ export function messageIdOf(data: JsonObject): unknown {
 /** The shell command of a toolUsed event, wherever this Brain puts it (`argumentsDetail: {tool: {command}}`). */
 function commandOf(data: JsonObject, tool: string): string | undefined {
   for (const source of [data["argumentsDetail"], data["input"]]) {
-    const nested = isObject(source) ? source[tool] : undefined;
+    const nested = isObject(source) ? own(source, tool) : undefined;
     const args = isObject(nested) ? nested : source;
     if (isObject(args) && typeof args["command"] === "string") return args["command"];
   }

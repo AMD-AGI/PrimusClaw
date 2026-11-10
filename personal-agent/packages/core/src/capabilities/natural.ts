@@ -7,6 +7,7 @@
  * message and says exactly that; anything else is a request for Claw, as before.
  */
 import { pyLower, pyLstrip, pyRstrip, pySplit, pyStrip } from "../text/py-text.js";
+import { MAX_COMMAND_TEXT_CHARS, within } from "./command-text.js";
 import { pyFullmatch } from "../text/py-regex.js";
 import * as P from "./phrases.js";
 import { sessionControl, switchCommand } from "./sessions-words.js";
@@ -51,38 +52,38 @@ export function detachKey(key: string): string {
 const TO = String.raw`\s*(?:到|至|-|~|～|—)\s*`;
 const QUIET_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:每天)?\s*(?:从)?\s*(?<a>${TIME})${TO}(?<b>${TIME})\s*(?:之间)?\s*(?:都)?\s*(?:别|不要|勿|请勿|不用)\s*(?:打扰|吵|通知|找)\s*我?`,
+    String.raw`(?:每天\s*)?(?:从\s*)?(?<a>${TIME})${TO}(?<b>${TIME})\s*(?:之间\s*)?(?:都\s*)?(?:别|不要|勿|请勿|不用)\s*(?:打扰|吵|通知|找)\s*我?`,
   ),
   whole(
-    String.raw`(?:把)?\s*免打扰(?:时间|时段)?\s*(?:改成|设成|设为|设置为|改为|是)?\s*(?<a>${TIME})${TO}(?<b>${TIME})`,
+    String.raw`(?:把\s*)?免打扰(?:时间|时段)?\s*(?:(?:改成|设成|设为|设置为|改为|是)\s*)?(?<a>${TIME})${TO}(?<b>${TIME})`,
   ),
   whole(String.raw`quiet hours\s+(?<a>\d{1,2}:\d{2})\s*-\s*(?<b>\d{1,2}:\d{2})`, "i"),
 ];
 const PAUSE_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:先)?\s*(?:暂停(?:通知|消息)?|别给我发(?:通知|消息)?)\s*(?<n>${NUM}|半)\s*(?<u>分钟|分|个小时|小时|个钟头|钟头|天)`,
+    String.raw`(?:先\s*)?(?:暂停(?:通知|消息)?|别给我发(?:通知|消息)?)\s*(?<n>${NUM}|半)\s*(?<u>分钟|分|个小时|小时|个钟头|钟头|天)`,
   ),
   whole(
-    String.raw`(?<n>${NUM}|半)\s*(?<u>分钟|个小时|小时|个钟头|钟头|天)\s*(?:内|之内)?\s*(?:别|不要)\s*(?:打扰|给我发消息|通知)\s*我?`,
+    String.raw`(?<n>${NUM}|半)\s*(?<u>分钟|个小时|小时|个钟头|钟头|天)\s*(?:(?:内|之内)\s*)?(?:别|不要)\s*(?:打扰|给我发消息|通知)\s*我?`,
   ),
   whole(String.raw`pause notifications for (?<n>\d{1,4}) ?(?<u>minutes?|hours?|days?)`, "i"),
 ];
 const BRIEF_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:每个?)?\s*(?:工作日|每天|每日)?\s*(?<t>${TIME})\s*(?:给我)?\s*发\s*(?:一份)?\s*(?:简报|日报|每日简报)(?:给我)?`,
+    String.raw`(?:每个?\s*)?(?:(?:工作日|每天|每日)\s*)?(?<t>${TIME})\s*(?:给我\s*)?发\s*(?:一份\s*)?(?:简报|日报|每日简报)(?:给我)?`,
   ),
   whole(String.raw`send me a brief every (?:week)?day at (?<t>\d{1,2}:\d{2})`, "i"),
 ];
 const TIMEZONE_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:把)?\s*(?:我的)?\s*时区\s*(?:改成|设成|设为|设置为|改为|是)\s*(?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`,
+    String.raw`(?:把\s*)?(?:我的\s*)?时区\s*(?:改成|设成|设为|设置为|改为|是)\s*(?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`,
   ),
   whole(String.raw`set my time ?zone to (?<z>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){0,2})`, "i"),
 ];
 const LANG_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:以后|之后|今后|从现在起|从现在开始)?\s*(?:请|麻烦)?\s*(?:都|一律)?\s*(?:用|说)\s*(?<l>中文|汉语|英文|英语)` +
-      String.raw`\s*(?:回复|回答|回我|跟我说|和我说|跟我交流|和我交流|交流)?\s*(?:吧|好吗|好不好|可以吗)?`,
+    String.raw`(?:(?:以后|之后|今后|从现在起|从现在开始)\s*)?(?:(?:请|麻烦)\s*)?(?:(?:都|一律)\s*)?(?:用|说)\s*(?<l>中文|汉语|英文|英语)` +
+      String.raw`(?:\s*(?:回复|回答|回我|跟我说|和我说|跟我交流|和我交流|交流))?(?:\s*(?:吧|好吗|好不好|可以吗))?`,
   ),
   whole(
     String.raw`(?:please\s+)?(?:reply|answer|talk|speak|respond)(?:\s+to\s+me)?\s+in\s+(?<l>english|chinese)` +
@@ -103,12 +104,27 @@ const NAME_CHARS = String.raw`[\p{L}\p{N}_.-]`;
 const BRANCH_CHARS = String.raw`[\p{L}\p{N}_./-]`;
 const REPO_PATTERNS: readonly RegExp[] = [
   whole(
-    String.raw`(?:切到|换到|进到)\s*(?:仓库)?\s*(?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?:\s*仓库)?` +
+    String.raw`(?:切到|换到|进到)\s*(?:仓库\s*)?(?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?:\s*仓库)?` +
       String.raw`(?:\s+(?<b>${BRANCH_CHARS}+)\s*分支)?`,
   ),
   whole(String.raw`switch to repo (?<r>[A-Za-z0-9]${NAME_CHARS}*/${NAME_CHARS}+)(?: (?<b>${BRANCH_CHARS}+))?`, "i"),
 ];
 const FEEDBACK = whole(String.raw`(?:我要)?(?:反馈|报告问题|报个问题|feedback)\s*[:：]\s*(?<t>.+)`, "is");
+
+/**
+ * Every pattern a command said in plain words is read with, by family. No two `\s*` meet across an optional part in any
+ * of them (a run of spaces could then be split between them in every way before a match fails: polynomial time), which
+ * the ReDoS tests check by running each over adversarial input.
+ */
+export const NATURAL_PATTERNS: readonly (readonly [string, readonly RegExp[]])[] = [
+  ["quiet", QUIET_PATTERNS],
+  ["pause", PAUSE_PATTERNS],
+  ["brief", BRIEF_PATTERNS],
+  ["timezone", TIMEZONE_PATTERNS],
+  ["lang", LANG_PATTERNS],
+  ["repo", REPO_PATTERNS],
+  ["feedback", [FEEDBACK]],
+];
 
 /** Phrase lists that are read in a group chat too (what a group may do), in the order they are tried. */
 const GROUP_PHRASES: readonly (readonly [ReadonlySet<string>, string])[] = [
@@ -232,6 +248,7 @@ function natural(text: string, group: boolean): string {
   const key = phraseKey(text);
   const feedback = pyStrip(FEEDBACK.exec(flat)?.groups?.["t"] ?? "");
   if (feedback) return `/feedback ${feedback}`;
+  if (!within(flat, MAX_COMMAND_TEXT_CHARS)) return text; // (read after feedback: a long one is still /feedback)
   if (FEEDBACK_ALONE.has(key)) return "/feedback";
   const command = lookUp(key, GROUP_PHRASES);
   if (command !== null) return command;
