@@ -5,7 +5,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Setup, connectMarkdown, pairCommand, setupFrom, versionNote } from "../../src/remote/connector/setup.js";
+import {
+  Setup,
+  connectMarkdown,
+  pairCommand,
+  safeUrl,
+  setupFrom,
+  versionNote,
+} from "../../src/remote/connector/setup.js";
 
 const BASE = "https://claw.example.com/claw-api";
 
@@ -121,4 +128,22 @@ test("a version note names the upgrade command and only a version's own characte
     })?.startsWith("Its connector (0.1.3id) is out of date."),
   );
   assert.ok(versionNote({ version: "", versionStatus: "outdated" }, "zh")?.startsWith("连接器版本 ? 较旧"));
+});
+
+// The address's trailing slashes go as Python's strip().rstrip("/") takes them, and in linear time: a /\/+$/ replace retries the
+// run of slashes from every position when the text does not end in one (CodeQL js/polynomial-redos).
+test("an address loses its trailing slashes as python strips them and in linear time", () => {
+  const cases: readonly (readonly [string, string | null])[] = [
+    ["https://claw.example.com/", "https://claw.example.com"],
+    ["https://claw.example.com///", "https://claw.example.com"],
+    ["  https://a.b/x/ ", "https://a.b/x"],
+    ["https://a.b", "https://a.b"],
+    [" /// ", null], // (Python: "", which is no address)
+    ["https://a.b//////", "https://a.b"],
+  ];
+  for (const [given, want] of cases) assert.equal(safeUrl(given), want, given);
+  const slashes = "https://a.b" + "/".repeat(50_000) + "x";
+  const started = performance.now();
+  assert.equal(safeUrl(slashes), null);
+  assert.ok(performance.now() - started < 500, `${String(performance.now() - started)} ms`);
 });

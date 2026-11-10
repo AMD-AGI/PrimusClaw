@@ -13,6 +13,7 @@
 import type { ConnectSteps, ConnectorSetupWords } from "../setup.js";
 import type { Connector } from "../model.js";
 import { recordOf, textOf } from "../fields.js";
+import { pyRstrip, pyStrip } from "../../text/py-text.js";
 import { connectorSetupText } from "../../locales/connector-setup.js";
 import type { Lang } from "../../locales/lang.js";
 
@@ -31,7 +32,7 @@ const PAIR_CODE = /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-
 
 /** `value` as an address fit for a shell command, without a trailing slash; null when it is anything else. */
 export function safeUrl(value: unknown): string | null {
-  const text = textOf(value).trim().replace(/\/+$/u, "");
+  const text = pyRstrip(pyStrip(textOf(value)), "/"); // (Python's strip().rstrip("/"): linear, where a /\/+$/ replace is not)
   return SAFE_URL.test(text) ? text : null;
 }
 
