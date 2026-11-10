@@ -58,7 +58,10 @@
  * case-insensitively, are deleted before each attempt, so a case that asks to remember something is not answered "I already have
  * that", see {@link CaseSetup}), `delivers` ([{name?, type?}]: files the last turn's
  * items must hand the user, each matched by a name pattern and a media type prefix, from the files the assistant's messages
- * carry). A case with files runs on the assistant path only.
+ * carry), `expect_memory` / `expect_no_memory` ([substring]: graded on the memory entries the attempt made, read after its
+ * turns and before the runner deletes them: each `expect_memory` substring is held by one of them, title or body, case-insensitively,
+ * and no `expect_no_memory` substring by any; an entry from before the attempt never counts, see {@link memoryChecks}). A case with
+ * files runs on the assistant path only.
  *
  * Placeholders fill turns, claims, values, oracle queries and the rubric: `{NAME}` is an environment variable, `{{name}}`
  * (also `{{a.b}}`) a run variable from EVAL_VARS_FILE or EVAL_VAR_<NAME>. A case with a placeholder that has no value
@@ -149,6 +152,8 @@ export interface EvalCase {
   hold?: HoldSpec;
   setup?: CaseSetup;
   delivers?: Delivers[];
+  expect_memory?: string[];
+  expect_no_memory?: string[];
 }
 
 /**
@@ -259,7 +264,14 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
     if (h.wait_s !== undefined && !(Number.isInteger(h.wait_s) && h.wait_s >= 0 && h.wait_s <= 7200)) out.push(`hold wait_s ${h.wait_s}`);
   }
   if (c.setup !== undefined) out.push(...setupProblems(c.setup));
+  for (const k of ["expect_memory", "expect_no_memory"] as const) if (c[k] !== undefined) out.push(...substringListProblems(k, c[k]));
   return out;
+}
+
+/** A list of 1 to SETUP_FORGET_MAX non-empty substrings (`setup.forget_memories`, `expect_memory`, `expect_no_memory`). */
+function substringListProblems(what: string, v: unknown): string[] {
+  if (!Array.isArray(v) || !v.length || v.length > SETUP_FORGET_MAX) return [`${what} is a list of 1 to ${SETUP_FORGET_MAX}`];
+  return v.some((x) => typeof x !== "string" || !x.trim()) ? [`${what} with an empty or non-text entry`] : [];
 }
 
 function setupProblems(setup: unknown): string[] {
@@ -267,10 +279,7 @@ function setupProblems(setup: unknown): string[] {
   const out: string[] = [];
   const { triggers, forget_memories: forget, ...rest } = setup as CaseSetup & Record<string, unknown>;
   if (Object.keys(rest).length) out.push(`setup ${Object.keys(rest).join(",")} unknown`);
-  if (forget !== undefined) {
-    if (!Array.isArray(forget) || !forget.length || forget.length > SETUP_FORGET_MAX) out.push(`setup forget_memories is a list of 1 to ${SETUP_FORGET_MAX}`);
-    else if (forget.some((x) => typeof x !== "string" || !x.trim())) out.push("setup forget_memories with an empty or non-text entry");
-  }
+  if (forget !== undefined) out.push(...substringListProblems("setup forget_memories", forget));
   if (triggers === undefined) return out;
   if (!Array.isArray(triggers) || !triggers.length || triggers.length > SETUP_TRIGGERS_MAX) return [...out, `setup triggers is a list of 1 to ${SETUP_TRIGGERS_MAX}`];
   const names = new Set<string>();
@@ -1286,6 +1295,30 @@ export interface Observed {
    * told apart (the identity's user id was not read, so its "on it" line is not known); absent in baseline.
    */
   ownSays?: number | null;
+  /**
+   * The memory entries the attempt made (listed after its turns, not before it), read for a case with `expect_memory` or
+   * `expect_no_memory`; undefined when they were not read (a recording graded offline: the entries are the identity's data).
+   */
+  madeMemories?: MemoryEntrySeen[];
+}
+
+/**
+ * The checks of `expect_memory` (`memory saved: <s>`: one entry the attempt made holds it) and `expect_no_memory` (`no memory left: <s>`:
+ * none does), on `made`; unverified, never passed, when the entries were not read.
+ */
+export function memoryChecks(c: EvalCase, made: readonly MemoryEntrySeen[] | undefined): Check[] {
+  const out: Check[] = [];
+  const each = (subs: readonly string[] | undefined, label: string, want: boolean): void => {
+    for (const s of subs ?? []) {
+      const name = `${label}: ${s}`;
+      if (!made) { out.push({ name, pass: true, skipped: true, unverified: true, detail: "memory entries not read" }); continue; }
+      const hit = memoriesMatching(made, [s]).length > 0;
+      out.push({ name, pass: hit === want, detail: `${made.length} entr${made.length === 1 ? "y" : "ies"} made by the attempt` });
+    }
+  };
+  each(c.expect_memory, "memory saved", true);
+  each(c.expect_no_memory, "no memory left", false);
+  return out;
 }
 
 /** The longest an item may take to hold its request for the person, from Brain asking: what a person waits for the card. */
@@ -1316,6 +1349,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     out.push({ name: `no tool ${p}`, pass: hit.length === 0, detail: hit.join(",") });
   }
   out.push({ name: "answered", pass: o.final.trim().length > 0 });
+  out.push(...memoryChecks(c, o.madeMemories));
   if (c.said) {
     // Said by the turn itself or for it, not the system's line in its place; a baseline session has no says.
     if (o.mode === "baseline") skip("said");
@@ -1536,9 +1570,10 @@ export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: 
 }
 
 /** What a recording keeps of an observation: an api oracle's values are the identity's data, so they are left out (null:
- * an offline grading skips that fact). */
+ * an offline grading skips that fact), and so are the memory entries the attempt made (`madeMemories`). */
 export function forRecording(c: EvalCase, o: Observed): Observed {
-  return { ...o, factValues: o.factValues.map((v, k) => (oracleQuery(c.facts?.[k]?.oracle) ? null : v)) };
+  const { madeMemories: _entries, ...rest } = o;
+  return { ...rest, factValues: o.factValues.map((v, k) => (oracleQuery(c.facts?.[k]?.oracle) ? null : v)) };
 }
 
 export interface CaseResult {

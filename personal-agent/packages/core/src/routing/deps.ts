@@ -8,6 +8,7 @@ import type { TokenExchange } from "../plugins/token-exchange.js";
 import type { ClawPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
 import type { Random } from "../ports/random.js";
+import type { RequestScope } from "../ports/request-scope.js";
 import type { Logger, LogValue } from "../ports/logger.js";
 import type { MetricsPort } from "../ports/metrics.js";
 import type { RouteHandlers } from "../ports/routing.js";
@@ -113,6 +114,8 @@ export interface RouterDeps {
   readonly store: RouterStore;
   readonly claw: ClawPort;
   readonly clock: Clock;
+  /** Where the event being handled is kept for what it starts (none: `noRequestScope`). */
+  readonly requestScope?: RequestScope;
   readonly random: Random;
   readonly logger: Logger;
   readonly metrics: MetricsPort;

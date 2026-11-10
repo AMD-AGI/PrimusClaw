@@ -53,6 +53,9 @@
  *       says for a router that ended in plain text; the line is known by the id the server gives it
  *   S36 a case's setup.forget_memories: a list of 1 to 10 non-empty substrings; the entries it names are found by title or body,
  *       case-insensitively; the entries an attempt made are those listed after it that were not before it, and only those
+ *   S37 expect_memory / expect_no_memory: lists of 1 to 10 non-empty substrings; graded on the entries the attempt made: each
+ *       expect_memory substring held by one of them (title or body, case-insensitive), no expect_no_memory substring held by any;
+ *       entries not read (a recording graded offline) leave the check unverified, never passed
  *   S35 the signed-in token is sent only with the person's text message (its words, type and channel context, nothing else), a card's
  *       `deny` and the check of whose it is: an allow, an answer, a decision or a message with more in it, or any other route is refused; a turn's channel_context is sent beside its files, and a
  *       case may name only what a channel sends
@@ -1117,6 +1120,35 @@ test("S36 a case's setup.forget_memories, and the memory entries an attempt made
   assert.deepEqual(newMemoryIds(before, after), [1400]);
   assert.deepEqual(newMemoryIds(before, after.filter((r) => r.id !== 7)), [1400], "one the attempt deleted is not one it made");
   assert.deepEqual(newMemoryIds(new Set([1352, 7, 1400]), after), []);
+});
+
+test("S37 expect_memory and expect_no_memory: checks on the memory entries the attempt made", () => {
+  const base: EvalCase = { id: "cat-memory-wr-003", pipeline: "catalog", area: "memory", lang: "zh", turns: [{ user: "记住：我审 PR 默认用 opus" }, { user: "不对，改成 sonnet", after_ms: 6000 }] };
+  assert.deepEqual(parseCases(JSON.stringify({ ...base, expect_memory: ["sonnet"], expect_no_memory: ["opus"] })).bad, []);
+  const bad = (k: string, v: unknown): string => parseCases(JSON.stringify({ ...base, [k]: v })).bad.join("; ");
+  for (const k of ["expect_memory", "expect_no_memory"]) {
+    assert.match(bad(k, []), new RegExp(`${k} is a list of 1 to 10`));
+    assert.match(bad(k, "opus"), new RegExp(`${k} is a list of 1 to 10`));
+    assert.match(bad(k, Array.from({ length: 11 }, (_, n) => `s${n}`)), new RegExp(`${k} is a list of 1 to 10`));
+    assert.match(bad(k, ["opus", " "]), new RegExp(`${k} with an empty or non-text entry`));
+  }
+  const c: EvalCase = { ...base, expect_memory: ["SONNET", "审 PR"], expect_no_memory: ["opus"] };
+  const o = (madeMemories: Observed["madeMemories"]): Observed => ({ mode: "assistant", route: "answer", cards: "none", calls: [], shown: ["已改为 sonnet"], final: "已改为 sonnet", firstReplyMs: 100, finalMs: 200, replyMs: [100, 100], items: [], factValues: [], madeMemories });
+  const memChecks = (checks: ReturnType<typeof grade>) => checks.filter((x) => /^(memory saved|no memory left)/.test(x.name)).map((x) => [x.name, x.pass, !!x.unverified]);
+  assert.deepEqual(memChecks(grade(c, o([{ id: 9, title: "Review model", body: "审 PR 默认用 Sonnet" }]))), [
+    ["memory saved: SONNET", true, false], ["memory saved: 审 PR", true, false], ["no memory left: opus", true, false],
+  ]);
+  // A second entry that still says opus (the correction duplicated instead of updating), and no entry at all.
+  assert.deepEqual(memChecks(grade(c, o([{ id: 9, title: "t", body: "审 PR 默认用 sonnet" }, { id: 10, title: "t", body: "审 PR 默认用 opus" }]))).map((x) => x[1]), [true, true, false]);
+  assert.deepEqual(memChecks(grade(c, o([]))).map((x) => x[1]), [false, false, true]);
+  // Not read (offline, from a recording): unverified, so never a pass.
+  const offline = grade(c, o(undefined));
+  assert.deepEqual(memChecks(offline).map((x) => x[2]), [true, true, true]);
+  assert.equal(verdictOf(c, offline, null).pass, false);
+  // A case without them has no such checks.
+  assert.deepEqual(memChecks(grade(base, o([{ id: 9, title: "t", body: "opus" }]))), []);
+  // The recording leaves the identity's entries out.
+  assert.equal(forRecording(c, o([{ id: 9, title: "t", body: "sonnet" }])).madeMemories, undefined);
 });
 
 test("S35 the signed-in token only says what the person may: their message, a deny, whose it is", () => {
