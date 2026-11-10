@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ConfigError } from "@primusclaw/personal-agent";
-import { readSettings, type Env } from "../../src/index.js";
+import { EnvReader, readSettings, type Env } from "../../src/index.js";
 
 /** What every deployment sets (the test environment's, as the Python suite's `conftest` gives it). */
 const BASE: Env = {
@@ -154,4 +154,15 @@ describe("the per-person limits", () => {
       refused({ TEAMS_LINK_MAX_FAILURES_GLOBAL: value }, "TEAMS_LINK_MAX_FAILURES_GLOBAL");
     });
   }
+});
+
+describe("EnvReader and names Object.prototype has", () => {
+  it("reads only the environment's own variables, as os.environ.get does", () => {
+    const reader = new EnvReader({ TEAMS_X: "1" });
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      assert.equal(reader.raw(name), "", name);
+      assert.equal(reader.raw(name, "dflt"), "dflt", name);
+    }
+    assert.equal(reader.raw("TEAMS_X"), "1");
+  });
 });

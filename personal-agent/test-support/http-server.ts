@@ -114,10 +114,11 @@ async function read(req: IncomingMessage): Promise<ReceivedRequest> {
   const body = Buffer.concat(chunks).toString("utf8");
   const url = req.url ?? "/";
   const parsed = new URL(url, "http://fake");
-  const headers: Record<string, string> = {};
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
-  }
+  const headers = Object.fromEntries(
+    Object.entries(req.headers).flatMap(([name, value]): [string, string][] =>
+      value === undefined ? [] : [[name, Array.isArray(value) ? value.join(", ") : value]],
+    ),
+  );
   return {
     method: req.method ?? "GET",
     url,

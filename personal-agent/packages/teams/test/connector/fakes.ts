@@ -45,10 +45,7 @@ function pick(answers: readonly Answer[], n: number, call: Call): Response {
 }
 
 function headersOf(init: RequestInit | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  new Headers(init?.headers).forEach((value, name) => {
-    out[name] = value;
-  });
+  const out = Object.fromEntries(new Headers(init?.headers).entries());
   return out;
 }
 

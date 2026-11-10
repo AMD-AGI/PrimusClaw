@@ -24,6 +24,7 @@ import { inboundFiles } from "../../src/inbound/attachments.js";
 import { TeamsFileFetcher } from "../../src/inbound/fetcher.js";
 import { ServiceBusOutbox } from "../../src/servicebus/outbox.js";
 import { FakeBus } from "../servicebus/fakes.js";
+import { own } from "@primusclaw/personal-agent";
 
 const CLIENT_ID = "00000000-0000-0000-0000-0000000000a1";
 const KEY_PEM = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" });
@@ -43,7 +44,7 @@ const FEDERATED: Env = {
 const deps = (files: Record<string, string> = {}) => ({
   clock: new FakeClock(),
   readFile: (path: string): Buffer => {
-    const content = files[path];
+    const content = own(files, path);
     if (content === undefined) throw Object.assign(new Error("absent"), { code: "ENOENT" });
     return Buffer.from(content);
   },

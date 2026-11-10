@@ -4,7 +4,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { FILES_DROPPED_PATHS, SecurityLog, silentLogger, type SecurityEventName } from "@primusclaw/personal-agent";
+import {
+  FILES_DROPPED_PATHS,
+  own,
+  SecurityLog,
+  silentLogger,
+  type SecurityEventName,
+} from "@primusclaw/personal-agent";
 import { FakeClock } from "../../../../test-support/index.js";
 import { ALERTED, CONTENT_TYPE, HELP, PrometheusMetrics } from "../../src/index.js";
 
@@ -198,7 +204,7 @@ describe("files and inbound counted", () => {
       [...samples(text).keys()].map((k) => {
         const name = k.split("|")[0] ?? "";
         const base = name.replace(/_(bucket|sum|count)$/, "");
-        return base !== name && HELP[base]?.[0] === "histogram" ? base : name;
+        return base !== name && own(HELP, base)?.[0] === "histogram" ? base : name;
       }),
     );
     assert.deepEqual([...names].sort(), Object.keys(HELP).sort());
