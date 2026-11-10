@@ -5,10 +5,13 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
-import { DETAILS_ID, type JsonObject } from "@primusclaw/personal-agent";
+import { DETAILS_ID, approvalTurnCards, cardQuestions, type JsonObject } from "@primusclaw/personal-agent";
 
 import { hasCjk } from "../src/cards/cjk.js";
 import { approvalRenderers } from "../src/views/approval/index.js";
+import { RENDERERS, renderView } from "../src/views/index.js";
+import { APPROVAL_CARDS } from "../../../test-support/card-catalog/approval.js";
+import { SID } from "../../../test-support/card-catalog/catalog.js";
 
 const TOOL = "mcp__ops__patch_plans_plan_id_labels";
 const INPUT = { plan_id: 85, labels: { "clawy-test": "1" }, reason: "clawy MCP verification" };
@@ -221,3 +224,78 @@ it("an empty input has no details toggle", () => {
 it("the tool name never decides what is hidden", () => {
   assert.equal(visible(card({ tool: "", input: null, lang: "en" }))[1], "Action: an action");
 });
+
+it("the turn's approval and question cards are the ones the turn engine drew itself, as the Python catalog has them", () => {
+  // What the engine sent before the TurnCards port (its consume.ts built these views itself), and the catalog's snapshots.
+  const PERM_EVENT = {
+    summary: "删除 /workspace/PrimusClaw/build 下的旧产物",
+    tool_description: "Run a shell command",
+    intent: "清理构建产物，腾出磁盘空间",
+  };
+  const asked = (input: unknown, group: boolean, ownerName: string) => ({
+    tool: "bash",
+    input,
+    sessionId: SID,
+    toolUseId: "tu-1",
+    group,
+    ownerName,
+    event: PERM_EVENT,
+    lang: "zh" as const,
+  });
+  for (const [id, ask] of [
+    ["approval_turn", asked({ command: "rm -rf /workspace/PrimusClaw/build && make clean" }, false, "")],
+    ["approval_group", asked({ command: "make deploy" }, true, "Robin Lang")],
+  ] as const) {
+    const message = approvalTurnCards.approval(ask);
+    assert.deepEqual(message, { body: { type: "view", view: { name: "approval", model: ask }, fallbackText: "bash" } });
+    assert.ok(message.body.type === "view" && message.body.view.name === "approval");
+    assert.deepEqual(renderView(RENDERERS, message.body.view), catalogCard(id));
+  }
+  const questions = [
+    {
+      id: "q1",
+      question: "要把哪个分支作为基线？",
+      options: [
+        { id: "main", label: "main" },
+        { id: "rel", label: "release/1.4" },
+      ],
+      allow_multiple: false,
+    },
+  ];
+  const question = approvalTurnCards.question({
+    questions,
+    sessionId: SID,
+    toolUseId: "tu-9",
+    group: false,
+    ownerName: "",
+  });
+  const model = {
+    questions: cardQuestions(questions),
+    sessionId: SID,
+    toolUseId: "tu-9",
+    group: false,
+    ownerName: "",
+    note: "",
+  };
+  assert.deepEqual(question, {
+    body: { type: "view", view: { name: "question", model }, fallbackText: "ask_user_question" },
+  });
+  assert.ok(question.body.type === "view" && question.body.view.name === "question");
+  assert.deepEqual(renderView(RENDERERS, question.body.view), catalogCard("question"));
+  // Brain's questions are read here (Python card_questions): what is malformed is dropped, not shown.
+  const bad = approvalTurnCards.question({
+    questions: "x",
+    sessionId: SID,
+    toolUseId: "",
+    group: false,
+    ownerName: "",
+  });
+  assert.ok(bad.body.type === "view" && bad.body.view.name === "question");
+  assert.deepEqual((bad.body.view.model as { questions: unknown }).questions, cardQuestions("x"));
+});
+
+function catalogCard(id: string): JsonObject {
+  const entry = APPROVAL_CARDS.find((e) => e.id === id);
+  assert.ok(entry, id);
+  return entry.build();
+}

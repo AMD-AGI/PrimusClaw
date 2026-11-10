@@ -18,6 +18,6 @@ const validate = new Ajv({ strict: false, allErrors: true }).compile({
   $id: typeof schema["id"] === "string" ? schema["id"] : "",
 });
 
-export function valid(card: JsonObject): void {
+export function valid(card: unknown): void {
   assert.ok(validate(card), JSON.stringify(validate.errors));
 }

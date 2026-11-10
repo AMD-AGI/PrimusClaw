@@ -98,7 +98,9 @@ export function saidOf(settled: Settled | undefined): string {
 /** The model of the view a press settled with. */
 export function settledModel(settled: Settled | undefined): Readonly<Record<string, unknown>> {
   const card = settled?.card;
-  return typeof card === "object" && card.body.type === "view" ? (card.body.view.model as Record<string, unknown>) : {};
+  return typeof card === "object" && card.body.type === "view"
+    ? (card.body.view.model as unknown as Record<string, unknown>)
+    : {};
 }
 
 export type DecisionStore = Pick<StorePort, "approvals" | "sessions" | "prefs" | "reviewDelegation" | "now" | "links">;

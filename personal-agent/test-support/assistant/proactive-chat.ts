@@ -43,7 +43,13 @@ export function sentViews(outbox: readonly Recorded[]): SentView[] {
     if (r.op !== "send" && r.op !== "post") return [];
     const body = r.message.body;
     if (body.type !== "view") return [];
-    return [{ conversation: r.conversation, name: body.view.name, model: body.view.model as Record<string, unknown> }];
+    return [
+      {
+        conversation: r.conversation,
+        name: body.view.name,
+        model: body.view.model as unknown as Record<string, unknown>,
+      },
+    ];
   });
 }
 
