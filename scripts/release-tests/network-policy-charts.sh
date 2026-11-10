@@ -17,7 +17,10 @@
 #     CIDRs, and an egress allow list whose public rule excludes link-local
 #     (cloud metadata) and the private ranges;
 #   - sandboxEgress renders one policy per namespace, selecting the Hands pods,
-#     and refuses to render without a namespace or with a CIDR without ports.
+#     and refuses to render without a namespace or with a CIDR without ports;
+#   - the public rule also excludes Azure's host endpoint 168.63.129.16;
+#   - sandboxIngress renders one ingress policy per sandbox namespace admitting
+#     only the listed clients, and refuses an empty client list.
 #
 # The renders are parsed as YAML, not grepped.
 
@@ -92,7 +95,8 @@ def check_public(egress, want_ports):
     if len(rules) != 1:
         fail(f"expected one public egress rule, got {len(rules)}")
     peer = rules[0]["to"][0]["ipBlock"]
-    for must in ("169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"):
+    for must in ("169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+                 "168.63.129.16/32"):
         if must not in peer.get("except", []):
             fail(f"public egress does not exclude {must}")
     if ports(rules[0]) != sorted(("TCP", p) for p in want_ports):
@@ -196,6 +200,32 @@ elif case == "claw-sandbox":
             fail(f"node subnet rule {node}")
     if [p for p in policies() if p["metadata"]["name"] == "default-deny"]:
         fail("release policies rendered while networkPolicy.enabled is false")
+    if [p for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress"]:
+        fail("sandbox ingress rendered while sandboxIngress.enabled is false")
+
+elif case == "claw-sandbox-ingress":
+    got = sorted(p["metadata"]["namespace"] for p in policies() if p["metadata"]["name"] == "claw-sandbox-ingress")
+    if got != ["ws-a", "ws-b"]:
+        fail(f"sandbox ingress namespaces {got}")
+    for ns in got:
+        spec = one("claw-sandbox-ingress", ns)["spec"]
+        if spec["podSelector"] != {"matchLabels": {"primus-claw/component": "hands"}}:
+            fail(f"selects {spec['podSelector']}, not the Hands pods")
+        if spec["policyTypes"] != ["Ingress"] or spec.get("egress"):
+            fail(f"policyTypes {spec['policyTypes']}")
+        rules = spec["ingress"]
+        if len(rules) != 1 or rules[0].get("ports"):
+            fail(f"expected one any-port ingress rule, got {rules}")
+        peers = rules[0]["from"]
+        want_cp = {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "agent-sandbox-system"}},
+                   "podSelector": {"matchLabels": {"app": "agent-sandbox-controlplane"}}}
+        selectors = [p for p in peers if "ipBlock" not in p]
+        if selectors != [want_cp]:
+            fail(f"selector peers {selectors}, want only the agent-sandbox control plane")
+        if ip_blocks(peers) != ["192.0.2.10/32"]:
+            fail(f"ipBlocks {ip_blocks(peers)}")
+        if any(p.get("namespaceSelector") == {} or p.get("podSelector") == {} for p in peers):
+            fail("an empty selector admits every pod")
 else:
     fail("unknown case")
 print(f"  ok [{case}]")
@@ -256,6 +286,30 @@ check "$tmp/claw-sandbox.yaml" claw-sandbox
 
 must_fail claw-sandbox-no-namespace "needs networkPolicy.sandboxEgress.namespaces" \
   --set networkPolicy.sandboxEgress.enabled=true
+
+cat >"$tmp/si.yaml" <<'YAML'
+networkPolicy:
+  sandboxEgress:
+    namespaces: [ws-a, ws-b]
+  sandboxIngress:
+    enabled: true
+    fromCIDRs: [192.0.2.10/32]
+YAML
+render_claw "$tmp/claw-sandbox-ingress.yaml" -f "$tmp/si.yaml"
+check "$tmp/claw-sandbox-ingress.yaml" claw-sandbox-ingress
+
+must_fail claw-sandbox-ingress-no-namespace "sandboxIngress.enabled needs networkPolicy.sandboxEgress.namespaces" \
+  --set networkPolicy.sandboxIngress.enabled=true
+cat >"$tmp/si-empty.yaml" <<'YAML'
+networkPolicy:
+  sandboxEgress:
+    namespaces: [ws-a]
+  sandboxIngress:
+    enabled: true
+    fromPods: []
+    fromCIDRs: []
+YAML
+must_fail claw-sandbox-ingress-no-clients "sandboxIngress needs fromPods or fromCIDRs" -f "$tmp/si-empty.yaml"
 cat >"$tmp/noports.yaml" <<'YAML'
 networkPolicy:
   enabled: true

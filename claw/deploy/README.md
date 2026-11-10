@@ -156,13 +156,16 @@ kube-router, ...), `networkPolicy` in `charts/claw/values.yaml` renders:
 | `default-deny` | release | Nothing in or out of any pod unless allowed below. |
 | `allow-ingress-pod-network` | release | Ingress from `networkPolicy.ingressCIDRs` (typically the pod network). |
 | `allow-egress` | release | Own namespace; `egressNamespaces` (any port); `egressNamespacePorts`; DNS (kube-dns and `dnsIPs`); `egressCIDRs`; public addresses (outside `privateCIDRs`, so no cloud metadata) on `publicEgressPorts`. |
-| `claw-sandbox-egress` | each of `sandboxEgress.namespaces` | Egress of the Hands pods only: DNS, `sandboxEgress.egressPods` (the agent-sandbox control plane), `sandboxEgress.egressCIDRs`, public addresses on `sandboxEgress.publicEgressPorts`. The Kubernetes API, in-cluster databases and cloud metadata are not reachable. |
+| `claw-sandbox-egress` | each of `sandboxEgress.namespaces` | Egress of the Hands pods only: DNS, `sandboxEgress.egressPods` (the agent-sandbox control plane), `sandboxEgress.egressCIDRs`, public addresses on `sandboxEgress.publicEgressPorts`. The Kubernetes API, in-cluster databases, cloud metadata and Azure's host endpoint (168.63.129.16, in the default `privateCIDRs`) are not reachable. |
+| `claw-sandbox-ingress` | each of `sandboxEgress.namespaces` | With `sandboxIngress.enabled`: ingress of the Hands pods only from `sandboxIngress.fromPods` (default: the agent-sandbox control plane) and `sandboxIngress.fromCIDRs`, on any port. Without it any pod of the cluster can connect to a sandbox's envd. |
 
 Ingress is by CIDR on purpose: a gateway on the host network has no pod
 identity (it arrives from the node address, or from the node's overlay address
 on another node), and an engine that learns a new pod's address a second or two
 after it starts (kube-router) refuses a selector-matched client's first
-connection. `deploy.sh` reads the lists from the values file named by
+connection. The sandbox ingress policy is the exception: its client is the
+long-lived agent-sandbox control plane, refused only for that moment after it
+rolls; use `sandboxIngress.fromCIDRs` instead where that matters. `deploy.sh` reads the lists from the values file named by
 `NETWORK_POLICY_VALUES_FILE`; `upgrade.sh` does not touch NetworkPolicies.
 
 ```yaml
@@ -181,6 +184,8 @@ networkPolicy:
     egressPods:
       - {namespace: agent-sandbox-system, podLabels: {app: agent-sandbox-controlplane}, ports: [8080, 8081]}
     egressCIDRs: [{cidr: 192.0.2.0/24, ports: [80, 443]}]
+  sandboxIngress:
+    enabled: true
 ```
 
 ### PostgreSQL Connection
