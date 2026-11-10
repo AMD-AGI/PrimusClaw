@@ -18,7 +18,7 @@ import type { OutMessage } from "../../src/ports/surface.js";
 
 const ANSWER = "节点：12 个就绪，3 个忙。";
 const ASKED = "现在有多少节点在忙？";
-const RECEIVED = "收到，正在处理…";
+const RECEIVED = "收到，处理中";
 const BOTH = "查询 SaFE 节点 · 查询 SaFE 工作负载…";
 
 type Live = Awaited<ReturnType<typeof liveWorld>>;

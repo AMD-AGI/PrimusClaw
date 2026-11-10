@@ -187,11 +187,8 @@ test("what claw writes for an instruction its machine never got is read as that"
 });
 
 test("the lines of an attached chat in either language", () => {
-  assert.equal(
-    queuedLine("terminal_typing", "en"),
-    "⏳ Someone is typing in the terminal; your message is queued and goes in once the input box is empty.",
-  );
-  assert.ok(queuedLine("something", "zh").includes("排队中"));
+  assert.equal(queuedLine("terminal_typing", "en"), "⏳ Box in use");
+  assert.equal(queuedLine("something", "zh"), "⏳ 等终端");
   assert.ok(readOnlyRefused("en", true).endsWith("but it ends the terminal's session for it."));
   assert.ok(!readOnlyRefused("en").includes("Take over"));
   assert.equal(switchedLine("⬛ Codex", "dev-pod", "en"), "—— Now: dev-pod · ⬛ Codex ——");
@@ -220,11 +217,7 @@ test("what was typed at the terminal cannot make a link or a tag in the chat", (
 test("a word that names a property of every object is no key of our tables", () => {
   // (Python reads these tables with `dict.get`/`in`: `constructor`, `__proto__` and `toString` are no entries)
   for (const word of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
-    assert.equal(
-      queuedLine(word, "en"),
-      "⏳ The terminal cannot take input right now (a menu or a dialog is on its screen); your message is queued.",
-      word,
-    );
+    assert.equal(queuedLine(word, "en"), "⏳ Waiting", word);
     assert.equal(noAskLine(word, "en"), null, word);
     assert.equal(isStopReason(word), false, word);
     assert.equal(decode(frame(word, { text: "x" }), PLAIN_ERRORS).chunk, null, word);

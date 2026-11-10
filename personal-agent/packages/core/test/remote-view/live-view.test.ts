@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import type { SseEvent } from "../../src/claw/model.js";
 import { decode, remoteStep } from "../../src/remote/events.js";
+import { queuedLine } from "../../src/remote/lines.js";
 import { RemoteLiveView } from "../../src/remote-view/live-view.js";
 import { PLAIN_ERRORS, acp, frame } from "./frames.js";
 
@@ -196,4 +197,19 @@ test("the remote live view cuts off a raw error while the turn still runs", () =
     }),
   );
   assert.ok(!v.render().includes("10.1.2.3") && v.render().includes("Still going."), v.render());
+});
+
+test("the wait line goes once anything of the turn shows a plan too", () => {
+  for (const later of [
+    remoteStep({ plan: "1/3 run the tests" }),
+    remoteStep({ chunk: { kind: "message", text: "Running." } }),
+    remoteStep({ tool: { id: "t1", title: "make test", status: "in_progress" } }),
+  ]) {
+    const v = new RemoteLiveView("Claude Code", "zh");
+    const wait = queuedLine("terminal_working", "zh");
+    assert.ok(v.apply(remoteStep({ queued: "terminal_working", note: wait })));
+    assert.equal(v.statusLines()[0], wait);
+    v.apply(later);
+    assert.ok(!v.statusLines().includes(wait), JSON.stringify(later));
+  }
 });
