@@ -20,7 +20,6 @@ import { activeSessions, conversationLine, newestFirst, offlineSince } from "../
 import { MARKS } from "../remote/marks.js";
 import type { Agent, Connector, Session } from "../remote/model.js";
 import type { ConnectSteps } from "../remote/setup.js";
-import { windowText } from "./status-view.js";
 import { ago } from "../remote/time.js";
 
 export type AgentRow =
@@ -45,8 +44,7 @@ export type SessionsItem =
   | { readonly kind: "subtle"; readonly text: string }
   /** One agent (`row-agent-N`): its title and rows. */
   | { readonly kind: "agent"; readonly rowId: number; readonly title: string; readonly rows: readonly AgentRow[] }
-  | { readonly kind: "connect"; readonly steps: ConnectSteps }
-  | { readonly kind: "window"; readonly text: string };
+  | { readonly kind: "connect"; readonly steps: ConnectSteps };
 
 export interface SessionsView {
   readonly lang: Lang;
@@ -202,9 +200,7 @@ export function sessionsView(input: SessionsInput): SessionsView {
   if (need) items.push({ kind: "badge", text: words.nWaiting({ mark: MARKS.needsYou, n: need }) });
   const counters: Counters = { listing: [], conversations: 0, agents: 0 };
   for (const connector of input.connectors) items.push(...machineItems(connector, active, input, counters));
-  const window = windowText(input.page ?? "", lang, true);
   if (input.connectors.length === 0) items.push({ kind: "connect", steps: input.setup.connectSteps(lang) });
-  else if (window) items.push({ kind: "window", text: window });
   const actions = [remoteButton(words.refresh, "switch", null, { session_id: input.attached ?? "" })];
   if (input.attached) actions.unshift(remoteButton(words.backButton, "row", null, { session_id: input.attached }));
   return { lang, title: words.yourSessions, items, actions, listing: counters.listing };

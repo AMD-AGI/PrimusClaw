@@ -125,10 +125,6 @@ export const remoteText = defineCatalog({
     waitingForYouMark: (p: { mark: string }) => `${p.mark} **Waiting for you**`,
     waitingWhy: (p: { why: string }) => ` (${p.why})`,
     workingMark: (p: { mark: string }) => `${p.mark} Working · `,
-    openSessionsWindow: (p: { url: string }) =>
-      `↗ [Open sessions in their own window](${p.url}): one page per session, and this chat stays with the assistant`,
-    openWindow: (p: { url: string }) =>
-      `↗ [Open in its own window](${p.url}): talk to this session there, from a phone browser too`,
     phaseIdle: "idle; what you send goes to it",
     phaseWorking: "working",
     phaseStarting: "starting",
@@ -330,8 +326,6 @@ It installs the connector, pairs the machine with you and keeps it running. I wi
     waitingForYouMark: (p) => `${p.mark} **等你**`,
     waitingWhy: (p) => `（${p.why}）`,
     workingMark: (p) => `${p.mark} 正在做 · `,
-    openSessionsWindow: (p) => `↗ [在单独窗口打开会话](${p.url})：每个会话一个页面，这个聊天照常和助理说话`,
-    openWindow: (p) => `↗ [在单独窗口打开](${p.url})：在那里收发这个会话，手机浏览器也能用`,
     phaseIdle: "空闲，发消息就会交给它",
     phaseWorking: "正在处理",
     phaseStarting: "正在启动",

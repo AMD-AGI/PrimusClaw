@@ -59,8 +59,6 @@ function item(entry: remoteView.SessionsItem): CardElement[] {
       ];
     case "connect":
       return connectBlocks(entry.steps);
-    case "window":
-      return [block(entry.text, { size: "Small", spacing: "Small", separator: true })];
   }
 }
 

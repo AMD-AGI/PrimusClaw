@@ -17,7 +17,6 @@ import { lit } from "../remote/inert.js";
 import { remoteText } from "../locales/remote.js";
 import { cpLength, cpSlice, pyLstrip, pyRstrip } from "../text/py-text.js";
 import type { StatusPhase } from "../remote/lines.js";
-import { windowText } from "./status-view.js";
 import { whereLine } from "../remote/lines.js";
 import { clock, utcClock } from "../remote/time.js";
 
@@ -86,7 +85,6 @@ export interface WindowCardView {
   } | null;
   readonly boxNote: string | null;
   readonly chatBox: string;
-  readonly page: string | null;
   readonly updated: string;
   readonly actions: readonly RemoteButton[];
   /** Whether the card carries the text box (what a later refresh reads instead of the card's JSON). */
@@ -241,7 +239,6 @@ export function windowView(input: WindowInput): WindowCardView {
     ...approvalsOf(input),
     ...boxOf(input),
     chatBox: chatBoxLine("card", input.lang, input.bot),
-    page: windowText(input.page ?? "", input.lang),
     updated: words.updated({ stamp: utcClock(input.at) }),
     actions: actionsOf(input),
     takesInput: takesInput(input.phase),

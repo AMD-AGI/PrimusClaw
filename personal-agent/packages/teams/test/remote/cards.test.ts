@@ -256,19 +256,6 @@ test("the status card back at the assistant offers to go back and one that ended
   );
 });
 
-test("the status card links its session page only while the chat is in the session", () => {
-  const sid = "2f6c0b8e-8f6e-4c5e-9d0a-1b2c3d4e5f60";
-  const url = remoteDomain.sessionPageUrl("https://h.example", sid);
-  const of = (phase: remoteDomain.StatusPhase, page = url, lang: "en" | "zh" = "en") =>
-    JSON.stringify(
-      status({ label: "Claude Code", host: "devbox", cwd: "/r", mode: null, sessionId: sid, phase, at: 0, lang, page }),
-    );
-  assert.ok(of("idle", url, "zh").includes(`[在单独窗口打开](${url})`));
-  assert.ok(of("watching").includes(`[Open in its own window](${url})`)); // (a conversation open in a terminal is watched there too)
-  assert.ok(!of("detached").includes(url));
-  assert.ok(!of("idle", "").includes("agent-sessions"));
-});
-
 test("the page of a session and of the list are under the console", () => {
   const sid = "2f6c0b8e-8f6e-4c5e-9d0a-1b2c3d4e5f60";
   assert.equal(
