@@ -81,3 +81,25 @@ it("a stopped receipt is dropped, not closed: no final, its turn stops, and the 
     [],
   );
 });
+
+it("a status update on its way when the receipt is dropped is given up at once, not waited for", async () => {
+  const receipts = new Receipts(new FakeClock(), silentLogger);
+  const stream = new FakeReceiptStream();
+  stream.hangUpdates = true;
+  const receipt = await receipts.openIn("c1", "en", () => Promise.resolve(stream));
+  assert.ok(receipt);
+  receipt.showStep("Searching…");
+  await flushMicrotasks();
+  assert.deepEqual(
+    stream.ops.map((o) => o.op),
+    ["inform"],
+  );
+  receipts.stop();
+  // (real time: the update ends because it was given up, not because a clock moved)
+  const late = new Promise<"late">((resolve) => {
+    setTimeout(() => {
+      resolve("late");
+    }, 1000).unref();
+  });
+  assert.equal(await Promise.race([receipt.shownWords(), late]), "");
+});

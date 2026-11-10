@@ -74,8 +74,11 @@ export interface Outbox {
 
 /** An outbox that posts to the Bot Connector itself (direct mode): the only one that can stream, open a 1:1 chat, list members. */
 export interface DirectOutbox extends Outbox {
-  /** One request of a Teams stream, sent once, directly. Throws StreamRefusedError when it was not taken. */
-  publishStream(envelope: TeamsEnvelope): Promise<Delivered>;
+  /**
+   * One request of a Teams stream, sent once, directly. Throws StreamRefusedError when it was not taken; once
+   * `options.signal` aborts (the stream was dropped), it rejects with the signal's reason and leaves nothing waiting.
+   */
+  publishStream(envelope: TeamsEnvelope, options?: PublishOptions): Promise<Delivered>;
   /** The bot's 1:1 conversation id with `userId`; throws ConversationNotOpenedError. */
   openPersonal(serviceUrl: string, userId: string, tenantId: string, botId: string): Promise<string>;
   /** The members of a group chat; throws when Teams did not answer. */

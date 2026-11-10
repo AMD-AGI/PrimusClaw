@@ -282,17 +282,25 @@ export class ConnectorOutbox implements DirectOutbox {
    * relay cannot carry a stream, and a retry would break the stream's one-request-a-second limit). Throws
    * StreamRefusedError when Teams did not take it, or when the conversation is on the queue just now.
    */
-  async publishStream(envelope: TeamsEnvelope): Promise<Delivered> {
+  async publishStream(envelope: TeamsEnvelope, options: PublishOptions = {}): Promise<Delivered> {
     const { kind, key } = describe(envelope);
+    const { signal } = options;
     const started = this.clock.monotonicMs();
-    const answer = await this.lanes.hold(key, async () => {
-      if (this.queuedFor(key) > 0) throw new StreamRefusedError("the conversation is on the queue");
-      try {
-        return await this.once(buildRequestLazily(envelope, this.policy), this.limits.requestTimeoutMs, 1, "send");
-      } catch (error) {
-        throw this.streamRefused(error, kind, started);
-      }
-    });
+    const answer = await this.lanes.hold(
+      key,
+      async () => {
+        throwIfAborted(signal);
+        if (this.queuedFor(key) > 0) throw new StreamRefusedError("the conversation is on the queue");
+        try {
+          const request = buildRequestLazily(envelope, this.policy);
+          return await this.once(request, this.limits.requestTimeoutMs, 1, "send", signal);
+        } catch (error) {
+          throwIfAborted(signal); // (dropped: the caller's reason, not a refusal)
+          throw this.streamRefused(error, kind, started);
+        }
+      },
+      signal,
+    );
     this.logger.info("direct stream delivered", {
       kind,
       status: answer.status,
@@ -324,13 +332,14 @@ export class ConnectorOutbox implements DirectOutbox {
     timeoutMs: number,
     attempts: number,
     budget: "send" | "open",
+    cancel?: AbortSignal,
   ): Promise<Answer> {
     const budgetMs = budget === "send" ? this.limits.sendDeadlineMs : this.limits.openDeadlineMs;
-    const timer = startTimer(this.clock, budgetMs, "the overall deadline passed");
+    const timer = startTimer(this.clock, budgetMs, "the overall deadline passed", cancel);
     try {
       const built = request();
       const progress = { attempts: 0 };
-      const options = { maxAttempts: attempts, timeoutMs, budgetMs, deadline: timer.signal, progress };
+      const options = { maxAttempts: attempts, timeoutMs, budgetMs, deadline: timer.signal, cancel, progress };
       return await raceAbort(timer.signal, this.client.execute(built, options));
     } finally {
       timer.dispose();
