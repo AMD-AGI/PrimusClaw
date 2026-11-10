@@ -53,11 +53,19 @@ export class Receipts {
 
   /**
    * The open receipt of this conversation, taken (the first reply closes it). One kept for a handed-back review's answer is
-   * taken only by that answer (`reserved`).
+   * taken only by that answer (`reserved`). `reply`: what the assistant said, pushed by Claw, said by the turn `reply.turn`; one
+   * that is not the message's own reply leaves the receipt where it is (`Receipt.answeredBy`), as does one that is no turn's
+   * answer at all (`reply.foreign`: a task's own notice). The worker's own words in the receipt's place (the message was not
+   * taken) pass no `reply` and always take it.
    */
-  take(conversation: string, reserved?: Receipt): Receipt | undefined {
+  take(
+    conversation: string,
+    reserved?: Receipt,
+    reply?: { readonly turn?: string | undefined; readonly foreign?: boolean },
+  ): Receipt | undefined {
     const receipt = this.open.get(conversation);
     if (receipt === undefined || (receipt.reserved && receipt !== reserved)) return undefined;
+    if (reply !== undefined && (reply.foreign === true || !receipt.answeredBy(reply.turn))) return undefined;
     this.open.delete(conversation);
     return receipt.stream.open ? receipt : undefined;
   }

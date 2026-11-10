@@ -19,6 +19,8 @@ import type { Receipt } from "./receipt.js";
 /** An event id later than every id Claw gives: the stream sends no history, only what happens from now on. */
 export const LIVE_ONLY = "claw-99999999999999";
 export const FOLLOW_SECONDS = 180;
+/** How long a message waits for its turn's stream to open (`TurnFollower.waitOpen`); later, it is sent anyway. */
+export const FOLLOW_OPEN_SECONDS = 2.0;
 export const SAY_TOOL = "mcp__assistant__say";
 const TEXT_DELTA = "toolTextDelta";
 /** Claw takes back the say text it streamed for the turn: the say is not going to be said. */
@@ -26,7 +28,8 @@ const TEXT_VOID = "toolTextVoid";
 const STEP_ELLIPSIS = "…";
 
 /** Opens the session's live stream after `after`; closed when `signal` aborts. */
-export type OpenStream = (after: string, signal: AbortSignal) => AsyncIterable<SseEvent>;
+/** The session's stream from `after`; `onOpen` once Claw has answered its request, before any event. */
+export type OpenStream = (after: string, signal: AbortSignal, onOpen: () => void) => AsyncIterable<SseEvent>;
 /** The step a tool call is, in the person's language (step_labels.lookup_label). */
 export type StepLabel = (tool: string, lang: Lang) => string;
 
@@ -70,11 +73,38 @@ export class TurnFollower {
   private knownWaiters: (() => void)[] = [];
   /** Settles when following has ended (for tests and orderly shutdown). */
   done: Promise<void> = Promise.resolve();
+  private markOpen: () => void = () => undefined;
+  /** Claw has answered the stream's request (or it could not open at all): the turn's events reach it from now on. */
+  private readonly opened = new Promise<void>((resolve) => {
+    this.markOpen = resolve;
+  });
 
   constructor(private readonly options: FollowerOptions) {}
 
   start(): void {
     this.done = this.run();
+  }
+
+  /**
+   * Wait, at most `seconds`, until Claw has answered the stream's request, so that a message sent after it cannot have its turn's
+   * first event go by before the stream is there (the stream reads only what comes after it opens: LIVE_ONLY). False when it
+   * did not open in time (the receipt then shows what reaches it, as before). A stream that could not open at all ends the wait.
+   */
+  async waitOpen(seconds: number): Promise<boolean> {
+    const timer = new AbortController();
+    const late = this.options.clock.sleep(seconds * 1000, timer.signal).then(
+      () => true,
+      () => true,
+    );
+    try {
+      if (await Promise.race([this.opened.then(() => false), late])) {
+        this.options.logger.info("the assistant's turn stream did not open in time");
+        return false;
+      }
+      return true;
+    } finally {
+      timer.abort();
+    }
   }
 
   /** The id of the message the followed turn answers; undefined stops following. */
@@ -88,8 +118,11 @@ export class TurnFollower {
   private async run(): Promise<void> {
     const { clock, receipt, logger } = this.options;
     const timer = new AbortController();
+    const following = this.follow().finally(() => {
+      this.markOpen(); // (a stream that could not open frees whoever waits for it)
+    });
     const outcome = await Promise.race([
-      this.follow().then(
+      following.then(
         () => undefined,
         (error: unknown) => error,
       ),
@@ -109,7 +142,10 @@ export class TurnFollower {
   }
 
   private async follow(): Promise<void> {
-    for await (const event of this.options.open(LIVE_ONLY, this.stop.signal)) {
+    const onOpen = (): void => {
+      this.markOpen();
+    };
+    for await (const event of this.options.open(LIVE_ONLY, this.stop.signal, onOpen)) {
       if (this.stop.signal.aborted) return;
       if (!this.known) {
         this.early.push(event);

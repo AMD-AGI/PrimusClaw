@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ClawUnreachable, type SseEvent } from "@primusclaw/personal-agent";
+import { ClawError, ClawUnreachable, type SseEvent } from "@primusclaw/personal-agent";
 import { createClawClient } from "../../src/index.js";
 import { sseEvents } from "../../src/claw/sse-stream.js";
 import { ClawHttp } from "../../src/claw/http.js";
@@ -116,5 +116,34 @@ describe("a Claw event stream that ends badly", () => {
     assert.deepEqual(early.sent, []);
     const bodiless = new Wire(() => new Response(null, { status: 204 }));
     assert.deepEqual(await all(bodiless.client().sessions.stream("ak-a", "s1")), []);
+  });
+});
+
+describe("a Claw event stream that is open", () => {
+  it("says it is open once Claw answered, before its first event, and not when Claw refused it", async () => {
+    const seen: string[] = [];
+    const ok = new Wire(() => {
+      seen.push("answered");
+      return new Response('data: {"type":"a"}\n\n');
+    });
+    for await (const event of createClawClient({
+      baseUrl: "https://claw.test",
+      clock: new FakeClock(),
+      fetch: ok.fetch,
+    }).sessions.stream("ak-a", "s-1", "claw-1", undefined, () => seen.push("open")))
+      seen.push(event.name);
+    assert.deepEqual(seen, ["answered", "open", "a"]);
+    const opened: string[] = [];
+    const refused = new Wire(() => new Response("no", { status: 404 }));
+    const err = await (async () => {
+      for await (const event of createClawClient({
+        baseUrl: "https://claw.test",
+        clock: new FakeClock(),
+        fetch: refused.fetch,
+      }).sessions.stream("ak-a", "s-1", undefined, undefined, () => opened.push("open")))
+        opened.push(event.name);
+    })().catch((e: unknown) => e);
+    assert.ok(err instanceof ClawError);
+    assert.deepEqual(opened, []);
   });
 });

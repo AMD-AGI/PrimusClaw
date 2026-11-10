@@ -34,7 +34,8 @@ it("two tasks and three interjections are all taken and the chat is never locked
   assert.deepEqual(w.heard(), said);
   assert.ok(!w.texts().some((t) => t.includes("still working")));
   assert.deepEqual(w.started, []);
-  assert.ok(!w.claw.calls.includes("turn"), "no session was asked about or made for any of them");
+  // (no session was made for any of them: only the assistant's own is read, for the turn in front of each message)
+  assert.deepEqual(new Set(w.claw.turnsAsked), new Set([w.claw.sessionOf("ak-alice")]));
 });
 
 it("a message the assistant queues is taken all the same", async () => {
