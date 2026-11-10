@@ -136,8 +136,8 @@ python-baseline: <the commit of the Python implementation the port follows>
 ```
 
 `npm run ported-tests` fails when a named TS test did not run and pass (a skipped, todo or missing test fails too), when
-a line is malformed, or when a Python test is listed twice. So a test can be renamed or deleted only together with its
-ledger line, and the count of Python tests with a destination cannot quietly shrink.
+a line is malformed, or when a Python test is listed twice. So a test a ledger names can be renamed or deleted only
+together with its ledger line.
 
 ## Running the worker
 
@@ -150,9 +150,11 @@ cp examples/worker.env.example /path/outside/the/repo/worker.env   # fill it in
 node --env-file=/path/outside/the/repo/worker.env --import tsx packages/teams/src/main.ts
 ```
 
-The worker reads its whole configuration from the environment once, at start. A setting it cannot use (missing,
-malformed, or a switch with a word other than on/off) stops it before it opens the store or takes a message: a secret
-it cannot read exits with status 2, any other unusable setting with status 1, with one line on stderr saying why.
+The worker reads its whole configuration from the environment once, at start. A setting it cannot use (a required one
+missing, a malformed number, an unknown word in a strict switch) stops it before it opens the store or takes a message:
+a secret it cannot read exits with status 2, any other unusable setting with status 1, with one line on stderr saying
+why. Some feature switches are lenient and read a typo as off (or, for `REMOTE_PUSH_ENABLED`, as on); the configuration
+reference says which.
 `SIGTERM` or `SIGINT` stops taking new work, finishes what is in hand and exits.
 
 To answer real people it needs, besides Claw: a Teams bot registration and app package, the ingress in front of the
@@ -162,7 +164,7 @@ outbound mode, a relay that posts the outbound queue to the Bot Connector.
 ## Configuration
 
 [`examples/worker.env.example`](examples/worker.env.example) lists every setting the worker reads, with placeholder
-values; [`docs/configuration.md`](docs/configuration.md) describes each one and marks the ones that arrive with #615.
+values (all but the release gate's test entry); [`docs/configuration.md`](docs/configuration.md) describes each one and marks the ones that arrive with #615.
 In short:
 
 - **Required:** `CLAW_API_URL`, `SAFE_API_URL`, `PUBLIC_BASE_URL`, `TEAMS_ENCRYPTION_KEYS`, and either

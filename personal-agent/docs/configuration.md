@@ -5,11 +5,13 @@ SPDX-License-Identifier: MIT
 
 # Configuration
 
-The worker reads its configuration from the environment once, at start, and checks all of it before it opens the store
-or takes a message: a missing required setting, a malformed number, or an on/off switch with any other word stops it.
-A typo never quietly picks a path.
+The worker reads its configuration from the environment once, at start, and checks it before it opens the store or
+takes a message: a missing required setting, a malformed number, a list or URL that cannot be used, an unknown word in a
+strict switch or an enumeration (`OUTBOUND_MODE`, `BOT_TOKEN_SOURCE`, `SECRETS_SOURCE`, `TEAMS_STREAMING`) stops it.
+**Not every switch is strict**, though; see "How switches read" below, and check the spelling of the lenient ones.
 
-[`../examples/worker.env.example`](../examples/worker.env.example) has every setting below with placeholder values.
+[`../examples/worker.env.example`](../examples/worker.env.example) has every setting below with placeholder values,
+except the release gate's test entry (last section).
 
 Where each group is read:
 
@@ -23,9 +25,19 @@ Where each group is read:
   process that calls every function above, arrive with pull request
   [#615](https://github.com/AMD-AGI/PrimusClaw/pull/615).
 
-Switches written "on/off" accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off` (any case); switches written
-"exactly `1`" are on only for `1`. Lists are comma separated; people are named by their Microsoft Entra object id, in
-any case.
+### How switches read
+
+Switches keep the readings of the worker they were ported from, so there are four kinds:
+
+| Kind          | Reading                                                                                                                     | Settings                                                                                                                                                                                                                                                                               |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| strict        | `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off` (any case); empty takes the default; any other word stops the worker. | `TEAMS_ASSISTANT_UNDERSTANDING`, `TEAMS_DIRECT_CHAT`, and the reply-style switches `TEAMS_AI_LABEL`, `TEAMS_STREAM_TEXT`, `TEAMS_ASSISTANT_RECEIPT`, `TEAMS_ASSISTANT_PROGRESS`, `TEAMS_ASSISTANT_STREAM_SAY`, `TEAMS_OWN_THUMBS_MOBILE`, `TEAMS_SUGGESTED_REPLIES`, `TEAMS_CITATIONS` |
+| lenient       | On for `1`, `true`, `yes`, `on` (any case); **anything else, a typo included, is off**.                                     | `ASSISTANT_ENABLED`, `TEAMS_EXCHANGE_ENABLED`, `TEAMS_EXCHANGE_FOR_CHAT`, `TEAMS_GITHUB_REVIEW_ENABLED`, `TEAMS_CLAW_EVENTS_GONE`                                                                                                                                                      |
+| exactly `1`   | On only for `1`; **anything else, `true` included, is off**.                                                                | `PROACTIVE_ENABLED`, `ASSISTANT_SCHEDULES_ENABLED`, `ASSISTANT_JOB_WATCH_ENABLED`, `BRIEF_ENABLED`, `REMOTE_AGENTS_ENABLED` [#615]                                                                                                                                                     |
+| on unless off | Off for `0`, `false`, `no`, `off` (any case); **anything else, a typo included, is on**.                                    | `REMOTE_PUSH_ENABLED` [#615]                                                                                                                                                                                                                                                           |
+
+`REMOTE_WINDOW_DEFAULT` is `chat` for `chat` and `card` for anything else. Lists are comma separated; people are named
+by their Microsoft Entra object id, in any case.
 
 ## Claw and the platform
 
