@@ -225,6 +225,70 @@ test("teams' own thumbs on the desktop become a vote on the answer they were giv
   assert.ok(other.ok && other.value === undefined);
 });
 
+/** An invoke as Teams sends it in a 1:1 chat, with `name` and `value` as given. */
+function invokeOf(name: string, value: unknown, type = "invoke") {
+  return {
+    type,
+    name,
+    id: "inv-3",
+    replyToId: "answer-8",
+    serviceUrl: "https://smba.trafficmanager.net/amer/",
+    from: { id: "29:a", aadObjectId: "aad-a", name: "Lin Mei" },
+    recipient: { id: "28:bot" },
+    conversation: { id: "a:1", conversationType: "personal" },
+    value,
+  };
+}
+
+/** The vote a body reads as: [reaction, comment], or null when it is not one (Python `thumb_of`'s (reaction, text)). */
+function voteOf(body: Record<string, unknown>): readonly [string, string] | null {
+  const read = toInboundEvent(body);
+  assert.ok(read.ok);
+  return read.value?.type === "vote" ? [read.value.reaction, read.value.comment] : null;
+}
+
+test("the feedback invoke is read tolerantly and nothing else is taken for it", () => {
+  const feedback = (actionValue: unknown, actionName = "feedback") => ({ actionName, actionValue });
+  const cases: readonly (readonly [unknown, readonly [string, string] | null])[] = [
+    [feedback({ reaction: "dislike", feedback: '{"feedbackText": "bad"}' }), ["dislike", "bad"]],
+    [feedback({ reaction: "like", feedback: '{"feedbackText": "Nice!"}' }), ["like", "Nice!"]],
+    [feedback({ reaction: "like", feedback: "{}" }), ["like", ""]],
+    [feedback({ reaction: "like" }), ["like", ""]],
+    [feedback({ reaction: "dislike", feedback: { feedbackText: "as an object" } }), ["dislike", "as an object"]],
+    [feedback({ reaction: "dislike", feedback: "plain words" }), ["dislike", "plain words"]],
+    [feedback({ reaction: "dislike", feedback: '{"feedbackText": 5}' }), ["dislike", ""]],
+    [feedback({ reaction: "meh" }), null],
+    [feedback("like"), null],
+    [feedback({ reaction: "like" }, "other"), null],
+    ["feedback", null],
+  ];
+  for (const [value, expected] of cases) {
+    assert.deepEqual(voteOf(invokeOf("message/submitAction", value)), expected, JSON.stringify(value));
+  }
+});
+
+test("only message/submitAction invokes are thumbs", () => {
+  const value = { actionName: "feedback", actionValue: { reaction: "like" } };
+  assert.equal(voteOf(invokeOf("adaptiveCard/action", value)), null);
+  assert.equal(voteOf(invokeOf("message/submitAction", value, "message")), null);
+});
+
+test("the card and the message thumbs are told apart by what they carry", () => {
+  // Teams' own thumbs are a message/submitAction invoke; the worker's thumbs card is an adaptiveCard/action with its own data
+  const native = toInboundEvent(
+    invokeOf("message/submitAction", { actionName: "feedback", actionValue: { reaction: "dislike", feedback: "x" } }),
+  );
+  const card = toInboundEvent(
+    invokeOf("adaptiveCard/action", {
+      action: { type: "Action.Execute", verb: "primusclaw.thumb", data: { primusclaw: "thumb", reaction: "dislike" } },
+    }),
+  );
+  assert.ok(native.ok && card.ok);
+  assert.equal(native.value?.type, "vote");
+  assert.ok(card.value?.type === "action");
+  assert.equal(card.value.verb, "thumb");
+});
+
 test("a card press names the card it was on by replyToId, a number as its digits", () => {
   // (Python's Agent._close_card edits `activity.get("replyToId")` whatever its type: 7 is edited as "7")
   const press = (replyToId: unknown) => ({
