@@ -7,9 +7,9 @@
  * a net, not a guarantee: a secret in a shape it does not know, or split across messages, gets through.
  */
 import { pyRegExp } from "../text/py-regex.js";
+import { MASK, maskJwts, maskSecretValues } from "./redact-scan.js";
 
-/** What a masked value is replaced with. */
-export const MASK = "[hidden]";
+export { MASK };
 
 /**
  * The one line a channel adds to a message it masked (the Python worker's text, byte for byte). Masking an outbound
@@ -17,18 +17,20 @@ export const MASK = "[hidden]";
  */
 export const NOTE = "Some sensitive-looking values were hidden. Ask me in a 1:1 chat if you need them.";
 
-/** What a base64-ish credential is made of. */
-const B64 = String.raw`[A-Za-z0-9+/=_-]`;
-
-/** A rule: the pattern (global, Python's `re` semantics) and whether only its last group is masked (else the whole match). */
-interface Rule {
-  readonly pattern: RegExp;
-  readonly lastGroupOnly: boolean;
-}
+/** A rule: the text with what it masks replaced, and whether it masked anything. */
+type Rule = (text: string) => { text: string; masked: boolean };
 
 /** `source` is the Python worker's pattern as written there; `pyRegExp` gives it Python's meaning. */
-function rule(source: string, flags = "", lastGroupOnly = false): Rule {
-  return { pattern: pyRegExp(source, `g${flags}`), lastGroupOnly };
+function rule(source: string, flags = ""): Rule {
+  const pattern = pyRegExp(source, `g${flags}`);
+  return (text) => {
+    let hit = false;
+    const out = text.replace(pattern, () => {
+      hit = true;
+      return MASK;
+    });
+    return { text: out, masked: hit };
+  };
 }
 
 const RULES: readonly Rule[] = [
@@ -46,28 +48,20 @@ const RULES: readonly Rule[] = [
   rule(String.raw`\bAIza[A-Za-z0-9_-]{30,}`), // Google API
   rule(String.raw`\bnpm_[A-Za-z0-9]{30,}`), // npm
   rule(String.raw`\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}`), // Stripe
-  rule(String.raw`\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}`), // JWT
-  // A long opaque value right after a word like token/secret/key/password (NAME=value, "name": "value", name is value).
-  rule(
-    String.raw`(?i)(?:token|secret|api[_-]?key|password|passwd|\bkey)[\w-]*["']?\s*(?::|=|\bis\b)\s*["']?(?=` +
-      `${B64}*\\d)(?=${B64}*[A-Za-z])(${B64}{32,})`,
-    "",
-    true,
-  ),
+  maskJwts, // JWT: \beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}, scanned (redact-scan.ts)
+  // A long opaque value right after a word like token/secret/key/password (NAME=value, "name": "value", name is value),
+  // scanned (redact-scan.ts): as a regular expression it backtracks polynomially.
+  maskSecretValues,
 ];
 
 /** `text` with credential-shaped values masked, and whether anything was masked. */
 export function redactText(text: string): { text: string; masked: boolean } {
   let masked = false;
   let out = text;
-  for (const { pattern, lastGroupOnly } of RULES) {
-    out = out.replace(pattern, (match: string, ...rest: unknown[]) => {
-      masked = true;
-      if (!lastGroupOnly) return MASK;
-      // The value is the pattern's last group and ends the match: what precedes it (the word, `=`, a quote) stays.
-      const value = typeof rest[0] === "string" ? rest[0] : "";
-      return match.slice(0, match.length - value.length) + MASK;
-    });
+  for (const apply of RULES) {
+    const done = apply(out);
+    out = done.text;
+    masked ||= done.masked;
   }
   return { text: out, masked };
 }

@@ -5,7 +5,7 @@
  * The words of a review request the rules and the assistant's understanding both read (github_review.py): "review 合入",
  * a review-only ask, and a model named in the text. Parsing a whole request is the review delegation's.
  */
-import { pyFullmatch, pyRegExp } from "../text/py-regex.js";
+import { pyRegExp } from "../text/py-regex.js";
 import { PY_SPACE, pyRstrip } from "../text/py-text.js";
 import { bareName } from "./text/unicode.js";
 
@@ -33,7 +33,8 @@ export function saysReviewAndMerge(text: string): boolean {
  * (its trailing white space left out), as the lazy group of the pattern gives.
  */
 const OPENING = new RegExp(`^[${PY_SPACE}]*请(?!问)[${PY_SPACE}]*(?:让|叫)?[${PY_SPACE}]*`, "u");
-const AFTER_HELP = pyFullmatch(String.raw`(?:我|忙)?(?:一下)?\s*review(?P<rest>.*)`, "is");
+/** What follows a 帮 of a review-only ask, read in place (sticky): no copy of the text per 帮. */
+const AFTER_HELP = pyRegExp(String.raw`(?:我|忙)?(?:一下)?\s*review(?P<rest>.*)\Z`, "isy");
 
 /** The name and the rest of a review-only ask. */
 export interface ReviewOnlyAsk {
@@ -43,7 +44,8 @@ export interface ReviewOnlyAsk {
 
 function splitAtHelp(body: string): ReviewOnlyAsk | undefined {
   for (let at = body.indexOf("帮"); at !== -1; at = body.indexOf("帮", at + 1)) {
-    const tail = AFTER_HELP.exec(body.slice(at + 1));
+    AFTER_HELP.lastIndex = at + 1;
+    const tail = AFTER_HELP.exec(body);
     if (tail !== null) return { who: pyRstrip(body.slice(0, at)), rest: tail.groups?.["rest"] ?? "" };
   }
   return undefined;
