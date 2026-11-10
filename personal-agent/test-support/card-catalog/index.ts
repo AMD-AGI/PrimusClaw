@@ -9,6 +9,7 @@ import { APPROVAL_CARDS } from "./approval.js";
 import { ASSISTANT_CARDS } from "./assistant.js";
 import type { CatalogEntry } from "./catalog.js";
 import { COMMAND_CARDS } from "./commands.js";
+import { FEEDBACK_CARDS } from "./feedback.js";
 import { PROACTIVE_CARDS } from "./proactive.js";
 import { REMOTE } from "./remote.js";
 import { REVIEW_CARDS } from "./review.js";
@@ -22,11 +23,10 @@ export const CATALOG: readonly CatalogEntry[] = [
   ...REMOTE,
   ...TURN,
   ...REVIEW_CARDS,
+  ...FEEDBACK_CARDS,
 ];
 
-const BY_LINE = {
-  W8: ["feedback_offer", "report", "thumb_comment", "thumbs"],
-} as const;
+const BY_LINE = {} as const;
 
 /** Snapshot ids whose builders are not ported yet. Each line removes its own as it registers them. */
 export const PENDING: ReadonlySet<string> = new Set<string>(Object.values(BY_LINE).flat());

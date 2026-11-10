@@ -1256,6 +1256,12 @@ record it.
   typed into like an idle one, instead of a message waiting 10 minutes and being refused. Enter is sent only on a screen that
   shows the input box holding exactly the typed text, no question or menu, and no running turn, so a phone's message never
   answers a permission question; otherwise the text stays in the box and the message is refused (#626).
+- `@primusclaw/connector` 0.1.17: a running Claude Code whose registry row is torn (Claude Code never writes it again) has the
+  conversation it holds proven where it can be, instead of every conversation of its folder staying "unknown": it keeps that
+  conversation's task folder open, the conversation was written since the process started, its own tmux pane names it in the rule
+  above its input box, and no other conversation of the folder written since may share that name. That conversation is then listed
+  live with Connect and typed into (gated on its screen); the rest of the folder can be taken over or hidden. Any doubt (an unnamed
+  conversation, a file or folder that cannot be read, a scan that does not answer in time) leaves it as before (#612).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,

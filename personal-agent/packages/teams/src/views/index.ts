@@ -8,6 +8,8 @@
 import { approvalRenderers } from "./approval/index.js";
 import { assistantRenderers } from "./assistant/index.js";
 import { COMMAND_RENDERERS } from "./commands/index.js";
+import { FEEDBACK_RENDERERS } from "./feedback/index.js";
+import { OBSERVE_RENDERERS } from "./observe/index.js";
 import { proactiveRenderers } from "./proactive/index.js";
 import type { Renderers } from "./registry.js";
 import { REMOTE_RENDERERS } from "./remote/index.js";
@@ -22,6 +24,8 @@ export const RENDERERS: Renderers = {
   ...proactiveRenderers,
   ...TURN_RENDERERS,
   ...REVIEW_RENDERERS,
+  ...FEEDBACK_RENDERERS,
+  ...OBSERVE_RENDERERS,
 };
 
 export { renderView, type Renderer, type Renderers, type TeamsMessage } from "./registry.js";

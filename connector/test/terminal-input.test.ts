@@ -134,7 +134,7 @@ after(async () => {
 });
 
 /** A tmux server on a socket of its own, with the stand-in interface in its one pane, working in `work`. */
-function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Record<string, string> = {}): {
+function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Record<string, string> = {}, asClaude = false): {
   socket: string; pid: number; row: string; transcript: string; tmux: (...a: string[]) => string; setMode: (m: string) => void;
 } {
   const dir = tmpdir("cc-tmux-");
@@ -152,7 +152,8 @@ function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Recor
   const env = { ...process.env, FAKE_TRANSCRIPT: transcript, FAKE_ROW: row, FAKE_SESSION: REF, FAKE_WORK_MS: String(workMs), FAKE_MODE_FILE: modeFile, ...extraEnv } as Record<string, string>;
   delete env.TMUX; delete env.TMUX_PANE;
   execFileSync("tmux", ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "120", "-y", "30", "-c", work,
-    `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TERMINAL)}`], { env });
+    // (`asClaude`: its arguments name the program `claude`, as a process the connector looks at for an unreadable row must)
+    `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TERMINAL)}${asClaude ? " claude" : ""}`], { env });
   const pid = Number(tmux("display-message", "-p", "-t", "%0", "#{pane_pid}").trim());
   // The registry row Claude Code keeps for its process, named by its pid, which the stand-in updates.
   const named = path.join(claudeDir, "sessions", `${pid}.json`);
@@ -465,6 +466,61 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["from the phone", "and again"]);
     assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.reason === "terminal_state_unknown"), "never held as a state it cannot read");
+  });
+
+  test("a terminal whose registry row is torn: proven by the task folder its process holds, listed live, typed into once its screen is free", { skip: process.platform !== "linux" }, async () => {
+    // (Claude Code never writes a torn row again: autopilot-devpod 2026-11-09, every conversation of the folder was "unknown" and
+    // the one in use had no Connect)
+    const work = tmpdir("cc-work-");
+    const OTHER = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [
+        { sessionId: REF, cwd: work, title: "autopilot", updatedAt: "2026-11-09T10:00:00.000Z" },
+        { sessionId: OTHER, cwd: work, title: "an old one", updatedAt: "2026-11-06T10:00:00.000Z" },
+      ] },
+    });
+    hs.push(h);
+    const uid = process.getuid!();
+    const project = fs.realpathSync(work).replace(/[^A-Za-z0-9]/g, "-");
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const t = terminal(fs.realpathSync(work), h.attachDir, 1_500, { FAKE_TORN_ROW: "1", FAKE_TASKS_DIR: tasks, FAKE_TITLE: "autopilot" }, true);
+    // The row is torn (empty, not just being written), and nothing lists the process; its conversation was written since it started.
+    fs.writeFileSync(t.row, "");
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(t.row, old, old);
+    h.setLive([]);
+    // Another interactive conversation of the folder written since it started (a /resume there would look the same): its screen
+    // decides, the name in the rule above its box being the held one's.
+    fs.writeFileSync(path.join(path.dirname(t.transcript), `${OTHER}.jsonl`),
+      `${JSON.stringify({ type: "user", sessionId: OTHER, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "an old one", sessionId: OTHER })}\n`);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", sessionId: REF, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "autopilot", sessionId: REF })}\n`);
+    await h.online();
+    const hb = await h.claw.until("a heartbeat that lists it live, typed into", () => [...h.claw.heartbeats].reverse().find((b) =>
+      b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal"));
+    const listed = hb.agents[0].capabilities.resumable;
+    assert.deepEqual(listed.map((r: any) => [r.ref, r.state]), [[REF, "live"], [OTHER, "idle"]], "the old one is free: that process holds REF");
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.input, "terminal");
+    const one = h.prompt(sid, "from the phone");
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone"]);
+    await h.claw.until("the reply", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "echo: from the phone"));
+    // A turn of the terminal's own runs (its box is empty, but `esc to interrupt` is under it, and no row says so): the phone's next
+    // message waits for it, and is typed once the screen is free.
+    t.tmux("send-keys", "-t", "%0", "-l", "typed at the terminal");
+    t.tmux("send-keys", "-t", "%0", "Enter");
+    await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
+    const two = h.prompt(sid, "while it works");
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === two));
+    assert.equal(queued.data.reason, "terminal_working");
+    assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal"], "not typed while that turn runs");
+    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
+    assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal", "while it works"]);
   });
 
   test("Enter is never sent onto a question: typed text with a permission question under its box is not submitted and nothing is approved", async () => {
