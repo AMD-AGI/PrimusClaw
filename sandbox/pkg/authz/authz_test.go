@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
@@ -81,5 +82,16 @@ func TestPlatformRoleReviewErrorIsUnavailable(t *testing.T) {
 	}
 	if metric("sessions", "unavailable") != before+1 {
 		t.Fatal("a failed review was not counted separately from a denial")
+	}
+}
+
+func TestFromClientsetRejectsAnEmptyPrefix(t *testing.T) {
+	t.Setenv(PrefixEnv, " ")
+	if _, err := FromClientset(k8sfake.NewSimpleClientset()); err == nil {
+		t.Fatal("empty RBAC_SUBJECT_PREFIX was accepted")
+	}
+	t.Setenv(PrefixEnv, "primus:")
+	if c, err := FromClientset(k8sfake.NewSimpleClientset()); err != nil || c.prefix != "primus:" {
+		t.Fatalf("client = %+v, %v", c, err)
 	}
 }

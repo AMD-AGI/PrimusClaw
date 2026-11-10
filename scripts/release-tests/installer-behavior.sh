@@ -131,6 +131,27 @@ grep -q -- 'safeApiUrl' "$capture" && {
 }
 grep -q -- '--set router.config.enableAuth=true' "$capture"
 grep -q -- '--set controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect' "$capture"
+grep -q -- 'workspaceSAR\|attestWorkloads' "$capture" && {
+  echo "installer turned on a switch that was not set" >&2
+  exit 1
+}
+
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
+  ENABLE_WORKSPACE_SAR=true \
+  ENABLE_WORKLOAD_ASSERTION=true \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q -- '--set controlplane.config.rbac.workspaceSAR=true' "$capture"
+grep -q -- '--set controlplane.config.identity.attestWorkloads=true' "$capture"
 grep -q -- '--set redis\.' "$capture" && {
   echo "installer still passes redis.* Helm sets" >&2
   exit 1

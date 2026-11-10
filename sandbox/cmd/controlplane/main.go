@@ -296,7 +296,12 @@ func main() {
 		os.Exit(1)
 	}
 	if authz.WorkspaceSARFromEnv() {
-		routerCfg.Authz = authz.FromClientset(clientset)
+		az, err := authz.FromClientset(clientset)
+		if err != nil {
+			log.Error("workspace SAR config is invalid", "error", err)
+			os.Exit(1)
+		}
+		routerCfg.Authz = az
 		wmCfg.Authz = routerCfg.Authz
 		log.Info("workspace SAR enabled", "subjectPrefix", authz.PrefixFromEnv())
 	} else {
@@ -627,6 +632,10 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Re
 	if az != nil {
 		authorizer = az
 	}
+	var users grant.UserReader
+	if dyn != nil {
+		users = grant.NewUserCRMembership(dyn)
+	}
 	ns := grant.Namespace(namespace)
 	svc := grant.New(grant.Options{
 		Client:     cl,
@@ -637,10 +646,13 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Re
 		Attest:     attest,
 		Identity:   introspector,
 		Authz:      authorizer,
+		Users:      users,
 		Workspaces: authz.NewWorkspaceLister(dyn),
 		Reclaimer:  workloadmanager.NewGrantReclaimer(api),
 		Exists:     workloadmanager.NewGrantExists(st, workloads),
 		Record:     api,
+
+		AttestWorkloads: workloads.AttestWorkloads(),
 	})
 	api.WithGrants(svc)
 	go svc.Run(ctx, 30*time.Second)

@@ -104,8 +104,14 @@ func PrefixFromEnv() string {
 }
 
 // FromClientset returns a client backed by the clientset's SubjectAccessReview API.
-func FromClientset(clientset kubernetes.Interface) *Client {
-	return NewClient(clientset.AuthorizationV1().SubjectAccessReviews(), PrefixFromEnv())
+// An empty subject prefix is refused, since identity subjects would then share the
+// Kubernetes user and group namespace.
+func FromClientset(clientset kubernetes.Interface) (*Client, error) {
+	prefix := PrefixFromEnv()
+	if prefix == "" {
+		return nil, fmt.Errorf("%s must not be empty when %s=true", PrefixEnv, WorkspaceSAREnv)
+	}
+	return NewClient(clientset.AuthorizationV1().SubjectAccessReviews(), prefix), nil
 }
 
 // CanUseWorkspace reports whether the subject may use workspace ws.
@@ -212,7 +218,7 @@ func observeReview(question, result, sub string, err error) {
 	case "unavailable":
 		log.Warn("permission review failed", "question", question, "subject", sub, "error", err)
 	case "deny":
-		log.Info("permission denied", "question", question, "subject", sub)
+		log.Debug("permission denied", "question", question, "subject", sub)
 	}
 }
 

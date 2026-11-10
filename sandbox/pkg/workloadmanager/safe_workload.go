@@ -118,6 +118,11 @@ func (c *SafeWorkloadCreator) SetAttestWorkloads(on bool) {
 	c.attestWorkloads = on
 }
 
+// AttestWorkloads reports whether every Workload carries an identity assertion.
+func (c *SafeWorkloadCreator) AttestWorkloads() bool {
+	return c != nil && c.attestWorkloads
+}
+
 // SetIdentityAttester records the client that signs sandbox attestations.
 func (c *SafeWorkloadCreator) SetIdentityAttester(attester IdentityAttester) {
 	if c == nil {
