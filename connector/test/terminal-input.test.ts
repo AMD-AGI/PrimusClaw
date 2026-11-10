@@ -783,6 +783,8 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     // A turn it started itself at an idle prompt (3 s of work): a cancel stops it with Esc, as before.
     const two = h.prompt(sid, "second");
     await until("its own turn running", () => typed(t.transcript).includes("second") && t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);
+    // (the connector reads the transcript on its own tick: the cancel goes once it has read the turn's start, well inside its 3 s)
+    await new Promise((r) => setTimeout(r, 1_000));
     h.claw.issue("cancel", sid);
     const end2 = await h.claw.until("the second's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
     assert.equal(end2.data.stopReason, "cancelled");
@@ -865,6 +867,29 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(enterGuard(box(["hello"], "  ⏵⏵ bypass permissions on · esc to interrupt"), "hello"), null);
     // The agent's own words above the box that look like a question do not hold Enter back.
     assert.equal(enterGuard(`● Do you want to proceed? Esc to cancel\n${box(["hello"])}`, "hello"), null);
+  });
+
+  test("someone typing in the terminal for longer than terminalWaitMs: the phone is told it waits, then that it was not sent (terminal_busy), never 'unconfirmed', and nothing is typed", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalWaitMs: 1_500, terminalEchoMs: 300 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    const sid = await h.attach(REF);
+    t.tmux("send-keys", "-t", "%0", "-l", "half typed by the person");
+    await until("their text in the box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
+    const seq = h.prompt(sid, "from the phone");
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    assert.equal(queued.data.reason, "terminal_typing");
+    const end = await h.claw.until("the refusal", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 10_000);
+    assert.equal(end.data.error, "terminal_busy", "said not sent, by name");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === seq)?.data.reason, "terminal_busy");
+    assert.ok(!h.turnEnds(sid).some((e) => e.data.error === "terminal_input_unconfirmed"), "never unconfirmed");
+    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("half typed by the person"), "their text left as it is");
+    assert.ok(!t.tmux("capture-pane", "-p", "-t", "%0").includes("from the phone"), "nothing typed");
   });
 
   test("a screen that cannot be read is refused by name after terminalScreenWaitMs, not held for terminalWaitMs", async () => {
