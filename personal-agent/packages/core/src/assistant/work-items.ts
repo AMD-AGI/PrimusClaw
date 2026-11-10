@@ -13,7 +13,7 @@ import type { Lang } from "../locales/lang.js";
 import { isoSeconds as pyIsoSeconds } from "../feedback/iso-time.js";
 import { isoSeconds } from "../proactive/quiet.js";
 import { clip } from "../text/plain.js";
-import { cpLength, cpSlice, pyRstrip, pyStrip } from "../text/py-text.js";
+import { cpLength, cpSlice, pyRstrip, pySplitlines, pyStrip } from "../text/py-text.js";
 
 /** What the assistant may say at most (Claw refuses a longer one); a card shows all of it. */
 export const WORK_TEXT_MAX = 600;
@@ -41,8 +41,6 @@ const ASKER_WAITING = new Set(["needs_you", "waiting", "waiting_for_reviewer"]);
 const ASKER_OPEN = new Set(["", "in_progress", "running", "queued", "pending", ...ASKER_WAITING]);
 
 const MARKDOWN = /([\\`*_[\]<])/g;
-/** What Python's `str.splitlines` breaks a line at ("\r\n" counts as one). */
-const LINE_BREAKS = new Set(["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]);
 
 /** `words[key]` when `key` is one of its own keys (never an inherited `constructor`), else undefined. */
 function own(words: Readonly<Record<string, string>>, key: string): string | undefined {
@@ -64,25 +62,9 @@ export function itemLabel(item: Pick<WorkItem, "seq" | "title">): string {
   return clip(pyStrip(`#${String(item.seq)} ${item.title}`), LABEL_MAX);
 }
 
-/** `text.splitlines()` (with a last empty line, which the callers drop). */
-function pyLines(text: string): string[] {
-  const lines: string[] = [];
-  let line = "";
-  for (const ch of text.replace(/\r\n/g, "\n")) {
-    if (LINE_BREAKS.has(ch)) {
-      lines.push(line);
-      line = "";
-    } else {
-      line += ch;
-    }
-  }
-  lines.push(line);
-  return lines;
-}
-
 /** `text` with every line its own paragraph (a card runs lines that are separated by one newline together). */
 export function cardParagraphs(text: string): string {
-  return pyLines(text)
+  return pySplitlines(text)
     .map((line) => pyStrip(line))
     .filter((line) => line !== "")
     .join("\n\n");
