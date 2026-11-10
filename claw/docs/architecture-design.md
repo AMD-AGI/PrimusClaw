@@ -267,7 +267,10 @@ read a page at a time and, when the client does not say where it resumes (`?afte
 `Last-Event-ID`), is the session's last `SSE_HISTORY_TAIL` events (2000 by default; the
 `historyComplete` marker's `has_more` says older ones exist; `?history=all` sends all of them).
 `after=claw-<seq>` is followed by every stream event of a higher sequence (whatever order the
-replicas stored them in) and by the other rows stored after it, so `claw-10` follows `claw-9`. The subscription is established
+replicas stored them in) and by the other rows stored after it, so `claw-10` follows `claw-9`. An `after`
+later than every id a session holds (`claw-` and more digits than a stream sequence has, such as
+`claw-99999999999999`) sends no history: the stream starts at its tail, for a client that wants only
+what happens from now on. The subscription is established
 *before* the history query runs, which closes the window in which an event published
 between the two would be lost.
 
