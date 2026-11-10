@@ -69,12 +69,17 @@ export class GithubDeviceFlow implements DeviceFlow {
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 
-  private async post(url: string, form: Readonly<Record<string, string>>): Promise<{ status: number; body: unknown }> {
+  private async post(
+    url: string,
+    form: Readonly<Record<string, string>>,
+    cancel?: AbortSignal,
+  ): Promise<{ status: number; body: unknown }> {
+    const timeout = AbortSignal.timeout(20_000);
     const response = await this.fetchImpl(url, {
       method: "POST",
       headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(form).toString(),
-      signal: AbortSignal.timeout(20_000),
+      signal: cancel === undefined ? timeout : AbortSignal.any([timeout, cancel]),
     });
     return { status: response.status, body: await response.json() };
   }
@@ -117,7 +122,9 @@ export class GithubDeviceFlow implements DeviceFlow {
         return cancelled();
       }
       if (clock.monotonicMs() >= deadline) return failed("expired");
-      const step = await this.poll(code);
+      const step = await this.poll(code, signal);
+      // (cancelled while GitHub was asked: a token it gave then is never bound)
+      if (signal?.aborted === true) return cancelled();
       if (step.kind === "wait") continue;
       if (step.kind === "slower") {
         interval = step.interval > interval ? step.interval : interval + SLOW_DOWN_SECONDS;
@@ -129,16 +136,21 @@ export class GithubDeviceFlow implements DeviceFlow {
 
   private async poll(
     code: DeviceCode,
+    signal: AbortSignal | undefined,
   ): Promise<
     { kind: "wait" } | { kind: "slower"; interval: number } | { kind: "done"; result: Result<string, DeviceFlowFailed> }
   > {
     let answer: { status: number; body: unknown };
     try {
-      answer = await this.post(ACCESS_TOKEN_URL, {
-        client_id: this.options.clientId,
-        device_code: code.deviceCode,
-        grant_type: DEVICE_GRANT,
-      });
+      answer = await this.post(
+        ACCESS_TOKEN_URL,
+        {
+          client_id: this.options.clientId,
+          device_code: code.deviceCode,
+          grant_type: DEVICE_GRANT,
+        },
+        signal,
+      );
     } catch {
       return { kind: "done", result: failed("unavailable") };
     }

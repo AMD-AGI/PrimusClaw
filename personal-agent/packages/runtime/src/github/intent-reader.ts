@@ -14,12 +14,13 @@ import {
   type IntentReader,
   type ListedMention,
   type Logger,
+  errorName,
   pyJsonDumps,
   pyRstrip,
 } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { errorName, type FetchLike } from "./api.js";
+import type { FetchLike } from "./api.js";
 
 /** Past this the rules read the request instead. */
 export const INTENT_MS = 10_000;

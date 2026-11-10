@@ -7,7 +7,7 @@
  * token (`app-token.ts`). Nothing here ever logs or keeps a response body: an error carries a status and a code only.
  */
 
-import { pyRstrip } from "@primusclaw/personal-agent";
+import { errorName, pyRstrip } from "@primusclaw/personal-agent";
 
 export const GITHUB_API = "https://api.github.com";
 
@@ -105,10 +105,6 @@ export class GithubApi {
       throw new GithubApiError(0, `transport_${errorName(err)}`);
     }
   }
-}
-
-export function errorName(err: unknown): string {
-  return err instanceof Error ? err.name : "Error";
 }
 
 /** A path segment as GitHub's URLs take it (`quote(x, safe='')`). */

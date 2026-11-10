@@ -14,13 +14,14 @@ import {
   type GithubState,
   type Result,
   credentialRefused,
+  errorName,
   err,
   ok,
   pyRstrip,
 } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { errorName, type FetchLike } from "./api.js";
+import type { FetchLike } from "./api.js";
 
 const PROVIDER = "github";
 
