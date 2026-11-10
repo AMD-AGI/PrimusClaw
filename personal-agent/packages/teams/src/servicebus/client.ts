@@ -18,10 +18,20 @@ export interface BusSender {
   close(): Promise<void>;
 }
 
-/** A received message: its raw body and when the broker took it. */
+/** A received message: its raw body, when the broker took it, and the broker's id and delivery count for the log line. */
 export interface Received {
   readonly body: Uint8Array;
   readonly enqueuedAt: Date | undefined;
+  /** The message's id as the sender set it (a string or number id; none for any other kind). */
+  readonly messageId?: string | undefined;
+  /** How many times the broker has delivered it, this time included. */
+  readonly deliveryCount?: number | undefined;
+}
+
+/** The SDK's message id as text, when it is a string or a number (a byte id is not written to a log line). */
+function messageIdOf(message: ServiceBusReceivedMessage): string | undefined {
+  const id: unknown = message.messageId;
+  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
 }
 
 /** A receiver locked on one session: messages in order, settled one by one. */
@@ -81,7 +91,12 @@ export function azureBusClient(connection: BusConnection, lockRenewalMs: number)
         async receive(count, waitMs) {
           const messages = await receiver.receiveMessages(count, { maxWaitTimeInMs: waitMs });
           return messages.map((m) => {
-            const received: Received = { body: rawBody(m), enqueuedAt: m.enqueuedTimeUtc };
+            const received: Received = {
+              body: rawBody(m),
+              enqueuedAt: m.enqueuedTimeUtc,
+              messageId: messageIdOf(m),
+              deliveryCount: m.deliveryCount,
+            };
             held.set(received, m);
             return received;
           });

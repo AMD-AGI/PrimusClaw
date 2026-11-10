@@ -109,6 +109,43 @@ test("the handled messages are counted with how long they waited in the queue", 
   assert.equal(queueLagMs(received("{}", new Date(5000)), 4000), 0);
 });
 
+test("every message taken gets one line: its id, outcome, queue lag and duration, never its body", async () => {
+  const now = Date.UTC(2026, 10, 10, 21);
+  const clock = new FakeClock(now);
+  const logger = new RecordingLogger();
+  const bus = new FakeBus();
+  bus.sessions = [
+    new FakeReceiver([
+      [received("not json SECRET-BODY-1", new Date(now - 100), "m-1", 1)],
+      [received(JSON.stringify({ text: "SECRET-BODY-2", boom: 1 }), new Date(now - 2500), "m-2", 3)],
+      [received(JSON.stringify({ text: "SECRET-BODY-3" }), undefined, "m-3", 1)],
+    ]),
+  ];
+  const consumer = new InboundConsumer({
+    client: bus,
+    queue: "q",
+    receivers: 1,
+    clock,
+    logger,
+    handle: (body) => (body["boom"] ? Promise.reject(new Error("x")) : Promise.resolve()),
+  });
+  const running = consumer.run();
+  await flushMicrotasks();
+  consumer.stop();
+  await clock.runAll();
+  await running;
+  const lines = logger.lines.filter((l) => l.message === "inbound message");
+  assert.deepEqual(
+    lines.map((l) => [l.level, l.fields]),
+    [
+      ["info", { id: "m-1", delivery: 1, outcome: "dead_lettered", lag_ms: 100, ms: 0 }],
+      ["info", { id: "m-2", delivery: 3, outcome: "abandoned", lag_ms: 2500, ms: 0 }],
+      ["info", { id: "m-3", delivery: 1, outcome: "completed", lag_ms: undefined, ms: 0 }],
+    ],
+  );
+  assert.doesNotMatch(logger.dump(), /SECRET-BODY/);
+});
+
 test("a sender idle for minutes is replaced before the send, not after it fails", async () => {
   const clock = new FakeClock();
   const bus = new FakeBus();
