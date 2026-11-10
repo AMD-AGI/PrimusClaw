@@ -9,7 +9,7 @@ import { cpLength } from "../text/py-text.js";
  * the words it is: no pattern runs over it, so no message can make the reading slow (the Python worker's
  * MAX_COMMAND_TEXT_CHARS). A feedback sentence ("反馈：…") is read before this is checked, so a long one is still /feedback.
  */
-export const MAX_COMMAND_TEXT_CHARS = 300;
+export const MAX_COMMAND_TEXT_CHARS = 1000;
 
 /** The same for a sentence about the sessions themselves (`sessionControl`; the Python worker's MAX_SESSION_CONTROL_CHARS). */
 export const MAX_SESSION_CONTROL_CHARS = 160;

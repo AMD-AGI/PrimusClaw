@@ -12,6 +12,7 @@ import { test } from "node:test";
 import { MAX_COMMAND_TEXT_CHARS, MAX_SESSION_CONTROL_CHARS } from "../../src/capabilities/command-text.js";
 import { cpLength } from "../../src/text/py-text.js";
 import { NATURAL_PATTERNS, naturalCommand } from "../../src/capabilities/natural.js";
+import { parseRepo } from "../../src/commands/repo.js";
 import { SESSION_PATTERNS, sessionControl, switchCommand } from "../../src/capabilities/sessions-words.js";
 
 /** Words that lead into the patterns' optional parts, so the run of spaces lands between two of them. */
@@ -111,4 +112,33 @@ test("the same command one character over its limit is an ordinary message", () 
 test("a long feedback sentence is still feedback: it is read before the limit", () => {
   const words = "太慢了".repeat(200);
   assert.equal(naturalCommand(`反馈：${words}`), `/feedback ${words}`);
+});
+
+test("a message just under the limit, built to make the readers work, is read quickly", () => {
+  let worst = 0;
+  for (const lead of LEADS) {
+    for (const tail of TAILS) {
+      const text = padded(lead, tail, MAX_COMMAND_TEXT_CHARS);
+      const start = performance.now();
+      naturalCommand(text);
+      switchCommand(text);
+      sessionControl(text);
+      worst = Math.max(worst, performance.now() - start);
+    }
+  }
+  assert.ok(worst < 100, `${worst.toFixed(1)} ms`); // (measured: ~31 ms the first time, before the patterns are warm)
+});
+
+/** The longest repository and branch GitHub and git (as the worker checks them) accept: owner 39, name 100, branch 200. */
+const OWNER = `a${"b-".repeat(18)}cd`;
+const NAME = "r".repeat(100);
+const BRANCH = `${"feature/".repeat(24)}x${"y".repeat(7)}`;
+
+test("the longest repository and branch can still be asked for in plain words, and with /repo", () => {
+  assert.equal([OWNER.length, NAME.length, BRANCH.length].join(","), "39,100,200");
+  const pick = parseRepo(`${OWNER}/${NAME} ${BRANCH}`);
+  assert.deepEqual(pick, { repo: `${OWNER}/${NAME}`, branch: BRANCH }); // (the typed /repo)
+  const command = `/repo ${OWNER}/${NAME} ${BRANCH}`;
+  assert.equal(naturalCommand(`切到 ${OWNER}/${NAME} ${BRANCH} 分支`), command);
+  assert.equal(naturalCommand(`switch to repo ${OWNER}/${NAME} ${BRANCH}`), command);
 });
