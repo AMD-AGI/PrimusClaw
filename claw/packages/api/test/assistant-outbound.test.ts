@@ -660,6 +660,10 @@ describe("assistant outbound", { skip }, () => {
       const text = (await saysRows()).at(-1).text as string;
       assert.equal(text, `#${itemNo} Review+merge AMD-AGI/demo#7 卡住了，需要你回复：请看一下 AMD-AGI/demo#7`);
       assert.doesNotMatch(text, /Look at/);
+      // A worker's own question that happens to read like one is not a review's: it is shown as the worker wrote it.
+      const own = await seedItem({ user_id: "u2", title: "看一下风险", last_report_kind: "blocked", pending_question: "Look at the risk report and suggest next steps" });
+      await outbound.recordNeedsYouFallback({ itemId: own }, deps());
+      assert.equal((await saysRows()).at(-1).text, `#${itemNo} 看一下风险 卡住了，需要你回复：Look at the risk report and suggest next steps`);
     });
 
     test("belongs to the item's owner, not to whoever asked", async () => {
