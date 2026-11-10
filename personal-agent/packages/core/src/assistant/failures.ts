@@ -18,6 +18,11 @@ export function unreachable(error: unknown): boolean {
   return error instanceof ClawUnreachable;
 }
 
+/** An answer this client does not understand (the Python worker's `ValueError` from reading it). */
+export function answerInvalid(error: unknown): boolean {
+  return error instanceof ClawAnswerInvalid;
+}
+
 /** Any of Claw's failures: refused, unreachable, or an answer not understood. */
 export function clawFailure(error: unknown): boolean {
   return error instanceof ClawError || error instanceof ClawUnreachable || error instanceof ClawAnswerInvalid;

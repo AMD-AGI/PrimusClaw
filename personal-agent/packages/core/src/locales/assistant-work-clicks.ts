@@ -16,6 +16,10 @@ const fixed = {
   notRetryable: (p: { label: string }) =>
     `${p.label} 现在不能重试（只有失败或已停止的任务可以）。 / It cannot be retried now (only a task that failed or was stopped can).`,
   noRetry: "这个版本的 PrimusClaw 还不能重试任务。 / This PrimusClaw cannot retry a task yet.",
+  /** A Retry drawn while the stop was recent, pressed after RETRY_STOPPED_SECONDS. */
+  stoppedLongAgo: (p: { label: string }) =>
+    `${p.label} 停止已超过一小时，看板上的重试已失效；要再做一次，直接告诉我。 / ${p.label} was stopped more than an hour ago, ` +
+    "so its Retry has expired; tell me if you want it done again.",
   watching: (p: { pull: string; label: string; short: string }) =>
     `已开启：${p.pull} 上的新评论会自动交给 ${p.label} 处理，并以你的身份直接回复，不再逐条等你批准。可随时关闭：点卡片上的「关闭自动处理」，` +
     `或对我说“别再自动回复 ${p.short} 了”。 / On: new comments on ${p.pull} go to ${p.label}, which answers them as you right away, ` +

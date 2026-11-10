@@ -228,9 +228,9 @@ it("the board offers accept all and a retry for each task that failed or was sto
   s.addItem(KEY, "Fix A", { board: "needs_you", last: "ready", version: 1 });
   s.addItem(KEY, "Fix B", { board: "needs_you", last: "ready", version: 3 });
   const failed = s.addItem(KEY, "Build", { board: "needs_you", last: "failed" });
-  const stopped = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped" });
+  const stopped = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped", at: w.store.now() - 60 });
   s.addItem(KEY, "Docs", { board: "done", outcome: "accepted" });
-  s.addItem(KEY, "Review", { board: "done", outcome: "stopped", kind: "review" });
+  s.addItem(KEY, "Review", { board: "done", outcome: "stopped", kind: "review", at: w.store.now() - 60 });
   await w.showBoard();
   const [card] = boardCards(w);
   assert.ok(card !== undefined);
@@ -244,6 +244,35 @@ it("the board offers accept all and a retry for each task that failed or was sto
       .map((b) => w.store.assistantCards.getAssistantCard(str((b["data"] as JsonObject)["card"]))?.itemId),
   );
   assert.deepEqual(retried, new Set([failed, stopped])); // (not an accepted task, not a review)
+});
+
+it("a task stopped long ago offers no retry and one stopped just now does", async () => {
+  // The person stopped these themselves, days ago: the board, which lists what ended in the last seven days, offers no Retry
+  // for them any more (it offered one for each, newest first, until the seventh day). A task stopped within the hour still has
+  // one, and so does a failed task, however long it has waited; a stopped task whose time Claw did not say has none.
+  const w = CardsWorld.start({ render });
+  const s = w.server;
+  const now = w.store.now();
+  const failed = s.addItem(KEY, "Build", { board: "needs_you", last: "failed", at: now - 5 * 86400 });
+  for (const [title, ago] of [
+    ["Old A", 5 * 86400],
+    ["Old B", 4 * 86400],
+    ["Old C", 2 * 3600],
+  ] as const) {
+    s.addItem(KEY, title, { board: "done", outcome: "stopped", at: now - ago });
+  }
+  const justNow = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped", at: now - 30 * 60 });
+  await w.showBoard();
+  const [card] = boardCards(w);
+  assert.ok(card !== undefined);
+  const buttons = w.buttons(card);
+  assert.deepEqual(titles(buttons), ["Retry #5", "Retry #1"]);
+  const retried = new Set(
+    buttons
+      .filter((b) => (b["data"] as JsonObject)["op"] === "retry")
+      .map((b) => w.store.assistantCards.getAssistantCard(str((b["data"] as JsonObject)["card"]))?.itemId),
+  );
+  assert.deepEqual(retried, new Set([failed, justNow]));
 });
 
 /** A result whose say names a pull request (a task's card): the item and its card's buttons. */

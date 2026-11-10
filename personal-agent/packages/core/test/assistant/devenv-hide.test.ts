@@ -32,6 +32,28 @@ it("a hide cards outcome says how many conversations were hidden shown again and
   assert.equal(devenvHideOutcome("failed", {}, "zh"), "没能完成（failed）。");
 });
 
+it("a hide card offers the way back only when it hid something", () => {
+  const done = (result: Record<string, number>) => ({ status: "done", answered_now: true, result });
+  assert.equal(
+    confirmOutcome("devenv_hide", done({ hidden: 3 }), "zh"),
+    "好了：隐藏了 3 段对话。发 /agents 看看；说“显示隐藏的会话”可以恢复。",
+  );
+  assert.equal(
+    confirmOutcome("devenv_hide", done({ hidden: 2, disconnected: 1 }), "en"),
+    "Done: hid 2 conversations, disconnected 1 sessions. Send /agents to see; say “show hidden sessions” to bring them back.",
+  );
+  // Showing hidden conversations again (the undo) has nothing left to bring back.
+  assert.equal(confirmOutcome("devenv_hide", done({ shown_again: 3 }), "zh"), "好了：恢复显示 3 段。发 /agents 看看。");
+  assert.equal(
+    confirmOutcome("devenv_hide", done({ shown_again: 3 }), "en"),
+    "Done: showed 3 again. Send /agents to see.",
+  );
+  assert.equal(
+    confirmOutcome("devenv_hide", done({ disconnected: 2 }), "zh"),
+    "好了：断开 2 个会话。发 /agents 看看。",
+  );
+});
+
 it("a held hide is a card this worker draws", () => {
   const event = {
     type: "assistant.say",
