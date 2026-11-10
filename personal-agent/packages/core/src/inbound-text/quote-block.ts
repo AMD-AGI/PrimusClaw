@@ -10,7 +10,7 @@
  */
 import { silentLogger, type Logger } from "../ports/logger.js";
 import type { InboundQuote } from "../ports/surface.js";
-import { cpHead, cpLength, cpSlice, pyRstrip, pyStrip } from "../text/py-text.js";
+import { cpHead, cpLength, cpSlice, pyRstrip, pySplitlines, pyStrip } from "../text/py-text.js";
 import { noRedact, type Redact } from "./redact.js";
 import { whenOf } from "./when.js";
 
@@ -29,16 +29,6 @@ export interface QuoteBlockOptions {
 }
 
 const AT_TAG = /<\/?[Aa][Tt]>/g;
-/** Python's `str.splitlines()` boundaries. */
-// eslint-disable-next-line no-control-regex -- \x1c-\x1e are line boundaries for Python's splitlines
-const LINE_BREAK = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/;
-
-function pySplitlines(text: string): string[] {
-  if (text === "") return [];
-  const lines = text.split(LINE_BREAK);
-  if (lines.at(-1) === "") lines.pop();
-  return lines;
-}
 
 function headOf(quote: InboundQuote, group: boolean, redact: Redact): string {
   let head: string;
