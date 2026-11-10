@@ -6,7 +6,7 @@
  * configuration needs (`wanted`), the vault entry each one is stored under (`VAULT_NAMES`), and the environment
  * setting each one replaces (`ENV_NAMES`, named in a warning when it is set anyway).
  */
-import { pyRstrip, type SecretName, SecretsUnavailable, pyStrip } from "@primusclaw/personal-agent";
+import { pyRstrip, type SecretName, SecretsUnavailable, pyStrip, own } from "@primusclaw/personal-agent";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -28,7 +28,7 @@ export const ENV_NAMES: Readonly<Record<SecretName, string>> = {
 };
 
 function get(env: Env, name: string): string {
-  return pyStrip(env[name] ?? "");
+  return pyStrip(own(env, name) ?? "");
 }
 
 function on(raw: string): boolean {

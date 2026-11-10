@@ -1,3 +1,4 @@
+import { own } from "@primusclaw/personal-agent";
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
@@ -46,7 +47,7 @@ export function caseless(literal: string): string {
       source += literalChar(ch);
       continue;
     }
-    source += `[${lower}${upper}${FOLDS[lower] ?? ""}]`;
+    source += `[${lower}${upper}${own(FOLDS, lower) ?? ""}]`;
   }
   return source;
 }

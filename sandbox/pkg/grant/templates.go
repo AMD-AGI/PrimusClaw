@@ -27,10 +27,14 @@ const grantIDKey = "agent-sandbox.io/grant-id"
 const gpuResourceName = "amd.com/gpu"
 
 // Per-card size applied to every GPU expansion. Card count scales these linearly.
-// Eight cards are 192 CPU, 2048Gi memory, and 1500Gi pod storage.
+// Each value is at most one eighth of what SaFE admits on one MI355X node, so
+// any mix of sandboxes holding the node's 8 cards fits that node, and the g8
+// template is admitted. The vk-mi355x flavor is 236 CPU and 2Ti memory; SaFE
+// reserves 7% CPU and 5% memory, leaving 219 CPU and 1945.6Gi. Eight cards are
+// 192 CPU, 1792Gi memory, 1000Gi shared memory, and 1500Gi pod storage.
 const (
 	cpuPerGPU      = 24
-	memoryGiPerGPU = 256
+	memoryGiPerGPU = 224
 	shmGiPerGPU    = 125
 	imageDigestEnv = "HYPERLOOM_ACTIVE_IMAGE_DIGEST"
 )

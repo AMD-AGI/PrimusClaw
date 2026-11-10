@@ -15,12 +15,13 @@ export interface ServerOptions {
   readonly maxBodyBytes: number;
 }
 
+/** The headers as sent (names lower case); Object.fromEntries keeps a "__proto__" header as an own key. */
 function headersOf(request: FastifyRequest): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [name, value] of Object.entries(request.headers)) {
-    if (value !== undefined) out[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
-  }
-  return out;
+  return Object.fromEntries(
+    Object.entries(request.headers).flatMap(([name, value]): [string, string][] =>
+      value === undefined ? [] : [[name.toLowerCase(), Array.isArray(value) ? value.join(", ") : value]],
+    ),
+  );
 }
 
 function toRequest(request: FastifyRequest): HttpRequest {

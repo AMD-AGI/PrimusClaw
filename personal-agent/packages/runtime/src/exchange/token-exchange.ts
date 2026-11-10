@@ -42,8 +42,28 @@ type Fetch = typeof fetch;
 export const EXCHANGE_TIMEOUT_MS = 30_000;
 
 async function jsonOf(response: Response): Promise<Record<string, unknown>> {
+  return objectIn(await textOf(response));
+}
+
+async function textOf(response: Response): Promise<string> {
   try {
-    const body: unknown = await response.json();
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Whether the answer writes `expires_in` as a whole number (`600`), as Python's `isinstance(v, int)` reads its JSON:
+ * `600.0` and `6e2` parse to the same JavaScript number but are floats to Python, and refused.
+ */
+function writtenAsInt(text: string): boolean {
+  return /"expires_in"\s*:\s*-?\d+\s*[,}]/u.test(text);
+}
+
+function objectIn(text: string): Record<string, unknown> {
+  try {
+    const body: unknown = JSON.parse(text);
     return body !== null && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
   } catch {
     return {};
@@ -194,9 +214,12 @@ export class HttpTokenExchange implements TokenExchange {
     } catch (error) {
       return err(unreachable("binding", error));
     }
-    const body = await jsonOf(response);
+    const text = await textOf(response);
+    const body = objectIn(text);
     const parsed = bindingAnswer.safeParse(body);
-    if (response.status !== 200 || !parsed.success) return err(failed("binding request", response.status, body));
+    if (response.status !== 200 || !parsed.success || !writtenAsInt(text)) {
+      return err(failed("binding request", response.status, body));
+    }
     const request: BindingRequest = { confirmUrl: parsed.data.confirm_url, expiresInSeconds: parsed.data.expires_in };
     if (request.expiresInSeconds > REQUEST_MARGIN_SECONDS) {
       this.requests.set(userId, { request, until: this.now() + request.expiresInSeconds - REQUEST_MARGIN_SECONDS });

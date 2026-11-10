@@ -5,6 +5,7 @@ import { redactText } from "../security/redact.js";
 import { cpHead, cpLength, cpSlice, pyRstrip, pyStrip, squashSpaces } from "../text/py-text.js";
 import { isObject } from "./lenient.js";
 import type { AskerView } from "./model.js";
+import { own } from "../own.js";
 
 /** A pull request's one-sentence summary is shown at most this long (code points): Chinese, Japanese, Korean / other. */
 export const PR_SUMMARY_MAX_CJK = 80;
@@ -21,7 +22,7 @@ const SUMMARY_MARKUP: Readonly<Record<string, string>> = { "[": "［", "]": "］
 export function clipPrSummary(value: unknown): string {
   if (typeof value !== "string") return "";
   const masked = redactText(squashSpaces(value)).text;
-  const line = pyStrip(masked.replace(/[[\]<>]/g, (ch) => SUMMARY_MARKUP[ch] ?? ch));
+  const line = pyStrip(masked.replace(/[[\]<>]/g, (ch) => own(SUMMARY_MARKUP, ch) ?? ch));
   if (line === "") return "";
   const limit = CJK.test(line) ? PR_SUMMARY_MAX_CJK : PR_SUMMARY_MAX_OTHER;
   return cpLength(line) <= limit ? line : pyRstrip(cpSlice(line, 0, limit - 1)) + "…";
