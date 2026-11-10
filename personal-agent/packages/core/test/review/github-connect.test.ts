@@ -292,3 +292,9 @@ test("a long line of review words is read in linear time", () => {
   assert.equal(asksAboutOwnGithub(`我的 github PR 状态 review ${" ".repeat(40)}o/r#1`), true);
   assert.equal(asksAboutOwnGithub(`我的 github PR 状态 review x-${"a".repeat(60)}/r#1`), false);
 });
+
+test("the dots after a repository name are dropped as python's rstrip drops them", () => {
+  assert.deepEqual(repositoriesNamed("看下 https://github.com/o/repo.../pull/1"), [["o", "repo"]]);
+  assert.deepEqual(repositoriesNamed("看下 https://github.com/o/.../pull/1"), []);
+  assert.deepEqual(repositoriesNamed("看下 https://github.com/o/a.b./pull/1"), [["o", "a.b"]]);
+});

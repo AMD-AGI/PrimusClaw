@@ -10,7 +10,7 @@
 
 import type { PublicErrors } from "../public-error/public-errors.js";
 import { own } from "../own.js";
-import { cpHead, squashSpaces } from "../text/py-text.js";
+import { cpHead, pyRstrip, squashSpaces } from "../text/py-text.js";
 import { oneLine, plainText } from "../review-text/names.js";
 
 /** What one confirmation flow says for what Claw holds: only these sentences differ between a merge and a review. */
@@ -81,7 +81,7 @@ function enqueueRefused(pull: string, outcome: Readonly<Record<string, unknown>>
   const message = plainText(outcome.message);
   let why = "";
   if (message.startsWith(ENQUEUE_PREFIX)) {
-    why = oneLine(message.slice(ENQUEUE_PREFIX.length).split(WROTE_TRAILER)[0] ?? "", 160).replace(/[ .]+$/u, "");
+    why = pyRstrip(oneLine(message.slice(ENQUEUE_PREFIX.length).split(WROTE_TRAILER)[0] ?? "", 160), " .");
   }
   why = errors.publicReason(why, "github_enqueue_refused", { pr: pull }); // GitHub's words as Claw passed them on
   // (the approval is written before the queue is asked, so a refusal here follows one)
