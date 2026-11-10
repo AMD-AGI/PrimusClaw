@@ -38,5 +38,6 @@
 
 # Core product code
 /claw/                                                          @AMD-AGI/SaFE
+/personal-agent/                                                @AMD-AGI/SaFE
 /sandbox/                                                       @AMD-AGI/SaFE
 /docs/                                                          @AMD-AGI/SaFE
