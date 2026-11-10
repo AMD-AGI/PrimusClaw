@@ -124,7 +124,9 @@
  * forget_memories), and every entry listed after it that was not before, the attempt's own, is deleted by id
  * (`DELETE /v1/users/me/memories/:id`) and seen gone from the list; an entry from before the attempt is never deleted by this.
  * One the run could not delete, or a list it could not read after an attempt, fails the cleanup (cleanup_failed); a list it could
- * not read before an attempt makes the attempt an error, with nothing sent. A case with `expect_memory` / `expect_no_memory` is graded
+ * not read before an attempt makes the attempt an error, with nothing sent. An entry that was not there when the run first listed them,
+ * and that an attempt's cleanup did not see (saved by a turn still running past its attempt), is the run's too: it is deleted before the
+ * next attempt, and in a last sweep after the run's sessions are closed. A case with `expect_memory` / `expect_no_memory` is graded
  * on the entries its attempt made, read once its turns are over and before they are deleted (`memoryChecks`); a list that cannot be
  * read then makes the attempt an error, not a grade.
  *
@@ -1368,6 +1370,24 @@ async function removeSetup(ids: readonly string[]): Promise<void> {
 
 /** Memory entries attempts made that the run has not seen gone: deleted after their attempt, and again at the end. */
 const RUN_MEMORIES = new Set<number>();
+/**
+ * The ids of the identity's memory entries when the run first listed them, before anything was sent: an entry not among them is the
+ * run's, also one saved after its attempt's cleanup (a turn still running past its attempt, after a stop or a timeout). Null until read.
+ */
+let RUN_START_MEMORIES: ReadonlySet<number> | null = null;
+
+/** Delete the run's entries listed in `rows` (not there when the run began) that are still listed; what is left stays in RUN_MEMORIES. */
+async function sweepRunMemories(rows: readonly MemoryEntrySeen[]): Promise<number[]> {
+  const start = RUN_START_MEMORIES;
+  const late = start ? rows.map((r) => r.id).filter((id) => !start.has(id)) : [];
+  for (const id of late) RUN_MEMORIES.add(id);
+  if (!RUN_MEMORIES.size) return [];
+  const left = new Set(await deleteMemories([...RUN_MEMORIES]));
+  for (const id of [...RUN_MEMORIES]) if (!left.has(id)) RUN_MEMORIES.delete(id);
+  if (late.length) log(`memory entries the run made after their attempt: ${late.length}, deleted ${late.filter((id) => !left.has(id)).length}`);
+  return [...left];
+}
+
 /** The ids of the identity's memory entries as the running attempt started (`memoriesBefore`); null between attempts. */
 let ATTEMPT_MEMORIES_BEFORE: ReadonlySet<number> | null = null;
 
@@ -1406,6 +1426,14 @@ async function memoriesBefore(c: EvalCase): Promise<Set<number>> {
   const unread = "infra: setup: GET /v1/users/me/memories could not be read: what the attempt saves could not be told apart";
   let rows = await memoriesNow();
   if (!rows) throw new Error(unread);
+  if (!RUN_START_MEMORIES) RUN_START_MEMORIES = new Set(rows.map((r) => r.id));
+  else if (rows.some((r) => !RUN_START_MEMORIES!.has(r.id))) {
+    // The run's own, saved after an earlier attempt's cleanup: deleted first, so this attempt neither meets it nor counts it as its own.
+    // One that cannot be deleted stays in RUN_MEMORIES (reported at the end) and in this attempt's before.
+    await sweepRunMemories(rows);
+    rows = await memoriesNow();
+    if (!rows) throw new Error(unread);
+  }
   const forget = memoriesMatching(rows, c.setup?.forget_memories ?? []);
   if (forget.length) {
     live();   // a stop deletes nothing more
@@ -1635,7 +1663,13 @@ async function main(): Promise<void> {
   }
   if (SETUP_TRIGGERS.size) await removeSetup([...SETUP_TRIGGERS]);
   if (SETUP_TRIGGERS.size) cleanupFailed.push(`setup triggers the run made not deleted: ${[...SETUP_TRIGGERS].join(",")}`);
-  const memoriesLeft = RUN_MEMORIES.size ? await deleteMemories([...RUN_MEMORIES]) : [];
+  // After the run's sessions are closed (their turns over): every entry not there when the run began is the run's, and is deleted.
+  let memoriesLeft: number[] = [];
+  if (RUN_START_MEMORIES) {
+    const now = await memoriesNow();
+    if (now) memoriesLeft = await sweepRunMemories(now);
+    else cleanupFailed.push("the memory entries could not be listed after the run: what it saved may be left");
+  } else if (RUN_MEMORIES.size) memoriesLeft = await deleteMemories([...RUN_MEMORIES]);
   if (memoriesLeft.length) cleanupFailed.push(`memory entries the run made not deleted: ${memoriesLeft.join(",")}`);
   if (sessionsLeft.length) cleanupFailed.push(`sessions the run made not deleted: ${sessionsLeft.join(",")}`);
   cleanupFailed.push(...new Set(CLEANUP_ISSUES));

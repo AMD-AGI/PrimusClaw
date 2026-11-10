@@ -70,6 +70,9 @@
  *      delete makes the attempt the run's error with nothing sent
  *   R23 expect_memory / expect_no_memory are graded on the entries the attempt made, read after its turns and before they are
  *      deleted: an entry saved before the attempt does not satisfy expect_memory; a failing check fails the attempt by name
+ *   R24 an entry the run made after its attempt's cleanup (a turn still running past its attempt: a stop, a timeout) is the run's: one
+ *      not there when the run began is deleted before the next attempt, and in a sweep after the run's sessions are closed; an
+ *      entry from before the run is kept
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -115,6 +118,9 @@ class FakeClaw {
   private assistantAsked = 0;
   /** The identity's memory entries, by id. */
   readonly memories = new Map<number, { id: number; title: string; body: string }>();
+  /** Called after each memory list was answered, with how many there were so far (this one included). */
+  onMemoryList: (n: number) => void = () => {};
+  private memoryLists = 0;
   /** Memory entries whose DELETE answers 500 and leaves them. */
   readonly failMemoryDelete = new Set<number>();
   /** The authorization each message to a session came with. */
@@ -200,7 +206,11 @@ class FakeClaw {
     // An oracle read that takes a while (a fact's `/v1/...#pick`).
     if (method === "GET" && path === "/v1/slow-oracle") { setTimeout(() => send(200, { data: { n: 3 } }), 2_000); return; }
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
-    if (method === "GET" && path === "/v1/users/me/memories") return send(200, { ok: true, data: [...this.memories.values()].map((e) => ({ ...e, content: e.body })) });
+    if (method === "GET" && path === "/v1/users/me/memories") {
+      send(200, { ok: true, data: [...this.memories.values()].map((e) => ({ ...e, content: e.body })) });
+      this.onMemoryList(++this.memoryLists);
+      return;
+    }
     if ((m = /^\/v1\/users\/me\/memories\/([^/]+)$/.exec(path)) && method === "DELETE") {
       const id = Number(m[1]);
       if (this.failMemoryDelete.has(id)) return send(500, { ok: false });
@@ -1467,6 +1477,49 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(run2.out, /FAIL t-expect-002#1 .*memory saved: opus/);
       assert.ok(stale.memories.has(1352), "the entry from before is kept");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R24 an entry saved after its attempt's cleanup is still the run's: deleted before the next attempt and after the run", { timeout: 120_000 }, async () => {
+    // A save that lands right after the first attempt's cleanup listed the entries (its 2nd list): the next attempt deletes it first.
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+    claw.onMemoryList = (n) => { if (n === 2) claw.memories.set(4000, { id: 4000, title: "Late", body: "saved by a turn still running" }); };
+    claw.router = (_content, id) => claw.turn(id, { say: "ok" });
+    const r = runner(base, [answerCase("t-late-001"), answerCase("t-late-002")]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      const del = claw.calls.indexOf("DELETE /v1/users/me/memories/4000");
+      const posts = claw.calls.map((c, k) => [c, k] as const).filter(([c]) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c)).map(([, k]) => k);
+      assert.ok(del > posts[0]! && del < posts[1]!, "deleted before the second attempt's message");
+      assert.deepEqual([...claw.memories.keys()], [5], "the entry from before the run is kept");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // The last attempt's late save: the sweep after the run deletes it; one it cannot delete is in cleanup_failed.
+    for (const fails of [false, true]) {
+      const last = new FakeClaw();
+      const base2 = await last.start();
+      last.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+      if (fails) last.failMemoryDelete.add(4001);
+      last.onMemoryList = (n) => { if (n === 2) last.memories.set(4001, { id: 4001, title: "Late", body: "saved late" }); };
+      last.router = (_content, id) => last.turn(id, { say: "ok" });
+      const r2 = runner(base2, [answerCase("t-late-003")]);
+      const run2 = await r2.done;
+      await last.stop();
+      try {
+        const report = JSON.parse(readFileSync(join(r2.dir, "out", "assistant.json"), "utf8"));
+        if (fails) {
+          assert.equal(run2.code, 1, run2.out);
+          assert.ok(report.cleanup_failed.some((x: string) => /memory entries the run made not deleted: 4001/.test(x)), JSON.stringify(report.cleanup_failed));
+        } else {
+          assert.equal(run2.code, 0, run2.out);
+          assert.deepEqual(report.cleanup_failed, []);
+          assert.deepEqual([...last.memories.keys()], [5]);
+        }
+      } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+    }
   });
 });
 
