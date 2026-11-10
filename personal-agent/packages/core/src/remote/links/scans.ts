@@ -472,3 +472,32 @@ export function breakDomainsAndMails(text: string): string {
   }
   return out + text.slice(from);
 }
+
+/** A bare domain left in prose next to a code span or a host made here: the scans read `docs.evil.mdmailto:` as one word, but
+ * once `mailto:` is code the client sees `docs.evil.md` on its own. Each stretch of prose between spans is read again for bare
+ * domains, its ends as a start and an end. */
+export function leftoverDomains(text: string, mark: Mark): string {
+  return (
+    text
+      // eslint-disable-next-line no-control-regex -- a host's token and a code span's marks are these control characters
+      .split(/(\x00\d+\x00|\x02[^\x02]*\x02)/u)
+      .map((part, n) => (n % 2 ? part : domainsIn(part, mark)))
+      .join("")
+  );
+}
+
+function domainsIn(text: string, mark: Mark): string {
+  const out: string[] = [];
+  let i = 0;
+  for (const [start, run] of domains(text)) {
+    if (start < i) continue;
+    let stop = run;
+    if (":/?#".includes(text.charAt(run) || " "))
+      while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
+    const url = trim(text.slice(start, stop));
+    out.push(text.slice(i, start), mark("", url.replaceAll("\\", "")) || code(url));
+    i = start + url.length;
+  }
+  out.push(text.slice(i));
+  return out.join("");
+}

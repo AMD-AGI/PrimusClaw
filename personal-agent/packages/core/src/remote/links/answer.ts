@@ -11,7 +11,7 @@
  */
 import { PY_SPACE, pyRstrip, pyStrip } from "../../text/py-text.js";
 import { hostOf } from "./hosts.js";
-import { CODE, type Mark, bare, emails, links, referenceDefinitions, tags } from "./scans.js";
+import { CODE, type Mark, bare, emails, leftoverDomains, links, referenceDefinitions, tags } from "./scans.js";
 
 const ZWSP = "\u{200b}";
 const LOOK_ALIKE = "\u{2cb}"; // (a backtick the rich text cannot pair: what a code span of a host shows for one too)
@@ -76,27 +76,46 @@ function closes(fence: Fence | null, marks: string): boolean {
     fence !== null &&
     fence.marks.charAt(0) === marks.charAt(0) &&
     fence.marks.length >= marks.length &&
-    fence.info.trim() === ""
+    pyStrip(fence.info) === ""
   );
 }
 
+/** Whether a fence opens a code block (a backtick fence whose info string holds a backtick is no fence). */
+function opens(fence: Fence | null): fence is Fence {
+  return fence !== null && !(fence.marks.startsWith("`") && fence.info.includes("`"));
+}
+
+/** Whether lines[n], which opens no code block, is a table's head: it holds a `|` and a separator line follows. */
+function isTableHead(lines: readonly string[], n: number): boolean {
+  const line = lines[n] ?? "";
+  const next = lines[n + 1];
+  return pyStrip(line) !== "" && line.includes("|") && next !== undefined && TABLE_SEP.test(pyRstrip(next, "\r\n"));
+}
+
 /** `text` in pieces, each with whether it is a fenced code block (one that is not closed runs to the end), lines and fences read
- * as the rich text reads them: a backtick fence whose info string holds a backtick is no fence. */
+ * as the rich text reads them: a backtick fence whose info string holds a backtick is no fence, and a table comes first (its
+ * head, its separator line and the rows after it that hold a `|` are prose, a row that looks like a fence included). */
 function blocks(text: string): [string, boolean][] {
   const pieces: [string, boolean][] = [];
   let prose: string[] = [];
   let code: string[] = [];
   let marks = "";
-  for (const line of linesOf(text)) {
+  let inTable = false;
+  const lines = linesOf(text);
+  for (const [n, line] of lines.entries()) {
+    inTable &&= pyStrip(line) !== "" && line.includes("|");
     const fence = fenceOf(line);
-    if (marks) {
+    if (inTable || (!marks && !opens(fence) && isTableHead(lines, n))) {
+      prose.push(line);
+      inTable = true;
+    } else if (marks) {
       code.push(line);
       if (closes(fence, marks)) {
         pieces.push([code.join(""), true]);
         code = [];
         marks = "";
       }
-    } else if (fence && !(fence.marks.startsWith("`") && fence.info.includes("`"))) {
+    } else if (opens(fence)) {
       if (prose.length > 0) pieces.push([prose.join(""), false]);
       prose = [];
       marks = fence.marks;
@@ -250,13 +269,12 @@ function inline(text: string): string {
     end = stop;
   }
   parts.push([words(text.slice(end)), false]);
-  return parts
-    .map(([part, isCode]) => (isCode ? part : spansMade(part)))
-    .filter(Boolean)
-    .reduce(
-      (joined, part) => (joined.endsWith("`") && part.startsWith("`") ? `${joined}${ZWSP}${part}` : joined + part),
-      "",
-    );
+  const out: string[] = [];
+  for (const part of parts.map(([piece, isCode]) => (isCode ? piece : spansMade(piece))).filter(Boolean)) {
+    if (out.at(-1)?.endsWith("`") && part.startsWith("`")) out.push(ZWSP);
+    out.push(part);
+  }
+  return out.join("");
 }
 
 /** Prose with its own backticks as look-alikes and the code spans made here (CODE ... CODE) as backticks. */
@@ -275,7 +293,7 @@ function words(text: string): string {
     if (!label) return token;
     return CJK.test(label.slice(-1)) ? `${label}（${token}）` : `${label} (${token})`;
   };
-  const shown = emails(bare(tags(links(referenceDefinitions(text, mark), mark), mark), mark));
+  const shown = leftoverDomains(emails(bare(tags(links(referenceDefinitions(text, mark), mark), mark), mark)), mark);
   // (a host is `\x00n\x00`: the input holds no NUL, so every odd part is a host's number; and what is left that a client could
   // still take for an address, `a@https://...` say, is made unlinkable too)
   const spans = shown

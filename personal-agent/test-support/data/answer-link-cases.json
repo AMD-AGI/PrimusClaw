@@ -616,6 +616,22 @@
    "expected": [
     "访问`example.com`看看"
    ]
+  },
+  {
+   "about": "a table row that looks like a fence is a table row (the rich text reads the table first)",
+   "input": "h|x\n---|---\n```info|x|\nvictim@example.com|row|",
+   "lang": "en",
+   "expected": [
+    "h|x\n---|---\nˋˋˋinfo|x|\n`victim@example.com`|row|"
+   ]
+  },
+  {
+   "about": "a table row that looks like a fence is a table row (the rich text reads the table first)",
+   "input": "h|x\n---|---\n```info|x|\nvictim@example.com|row|",
+   "lang": "zh",
+   "expected": [
+    "h|x\n---|---\nˋˋˋinfo|x|\n`victim@example.com`|row|"
+   ]
   }
  ]
 }
