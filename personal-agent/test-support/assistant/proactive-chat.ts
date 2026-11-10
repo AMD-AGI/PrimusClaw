@@ -4,10 +4,10 @@
 /**
  * What the proactive tests read of a chat and do to it, beside the delivery world (`test-support/assistant/proactive-world.ts`): a
  * second person, the views that were sent, a chat whose sends of approval cards fail or wait, and a turn that shows an approval
- * card the way the turn engine records it (`turnApprovalsFor`).
+ * card the way the turn engine records it (`turnApprovals`).
  */
 import {
-  turnApprovalsFor,
+  turnApprovals,
   type Conversation,
   type ConversationRef,
   type Envelope,
@@ -151,9 +151,9 @@ export async function turnShowsApproval(
   conversation: Conversation,
   turn: { userId: string; sessionId: string; toolUseId: string; send?: boolean; fails?: boolean },
 ): Promise<boolean> {
-  const records = turnApprovalsFor(store, turn.userId);
+  const records = turnApprovals(store);
   const envelope = conversation.outgoing(turnCard(turn.toolUseId));
-  if (!records.record(turn.sessionId, turn.toolUseId, "bash", undefined, envelope)) return false;
+  if (!records.record(turn.userId, turn.sessionId, turn.toolUseId, "bash", undefined, envelope)) return false;
   if (turn.send === false) return true;
   if (turn.fails === true) {
     records.unsent(turn.sessionId, turn.toolUseId); // (the turn's send failed: it says so and goes on)
