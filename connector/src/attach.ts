@@ -1066,7 +1066,13 @@ export async function blindHolders(configDir: string, procRoot = "/proc", uid: n
   if (process.platform !== "linux") return [];
   const dir = path.join(configDir, "sessions");
   let names: string[];
-  try { names = await fsp.readdir(dir); } catch { return []; }
+  try {
+    names = await fsp.readdir(dir);
+  } catch (e) {
+    // No registry at all: no row of anyone's, torn or not. One that cannot be read is no answer (codex r15): it throws.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
   const found: Array<Omit<BlindHolder, "sessionId">> = [];
   // The conversations a readable row says a live process has open (another process's, or one this machine cannot see).
   const held = new Set<string>();
@@ -1084,7 +1090,13 @@ export async function blindHolders(configDir: string, procRoot = "/proc", uid: n
     }
     // unreadable: whose is it?
     let argv: string[];
-    try { argv = (await fsp.readFile(path.join(procRoot, String(pid), "cmdline"), "utf8")).split("\0").filter(Boolean); } catch { continue; }
+    try {
+      argv = (await fsp.readFile(path.join(procRoot, String(pid), "cmdline"), "utf8")).split("\0").filter(Boolean);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") continue;   // (no such process: it holds nothing)
+      throw e;   // (a process that cannot be looked at may be one: no answer)
+    }
     if (!isClaudeArgv(argv)) continue;
     let cwd: string | null = null;
     try { cwd = await fsp.readlink(path.join(procRoot, String(pid), "cwd")); } catch { /* not readable */ }

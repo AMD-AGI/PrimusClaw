@@ -425,6 +425,18 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     await stop(blind);
   });
 
+  test("a registry that cannot be read is no answer: the scan throws, and a check refuses although the command lists nothing (codex r15)", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    fs.rmSync(path.join(dir, "sessions"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(dir, "sessions"), "not a folder");   // (readdir: ENOTDIR)
+    await assert.rejects(blindHolders(dir));
+    const f = fakeCli("ok", []);
+    const v = await support(dir, { cli: f.cli, cliEnv: f.env }).check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok, false, "not taken for free");
+    fs.rmSync(path.join(dir, "sessions"));
+    assert.deepEqual(await blindHolders(dir), [], "no registry at all: nothing");
+  });
+
   test("the twin check refuses: it cannot tell that the conversation is free, and a second writer is never started", { skip: process.platform !== "linux" }, async () => {
     const dir = configDir();
     const blind = claudeNamed(os.tmpdir());
