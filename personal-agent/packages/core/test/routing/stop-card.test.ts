@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Ported from internal #458 teams/tests/test_stop_button.py (head 7c1679d4): the Stop card of a turn a phone starts, and
- * its press, through the router (the card itself is the turn engine's `StopButtons`, used here as it is).
+ * Ported from teams/tests/test_stop_button.py after internal #481: a turn a phone starts gets no Stop card of the worker's
+ * own any more (the floating status's Stop is the one wanted; on a phone, saying 停止 or /stop stops the turn), and a press
+ * on a card sent before that stops nothing and says so.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { StopButtons } from "../../src/turn/stop-buttons.js";
-import type { OnSent, RemoteTurn } from "../../src/routing/features.js";
-import { ALICE, BOB } from "./fixtures.js";
+import type { AssistantRouteRequest, RemoteTurn } from "../../src/routing/features.js";
+import { ALICE } from "./fixtures.js";
 import { clickOf, link, message, said, world, type World } from "./world.js";
 
 const TURN_OVER = "That turn has already ended, so nothing was stopped.";
@@ -23,116 +23,76 @@ function gate(): { promise: Promise<void>; open: () => void } {
   return { promise, open };
 }
 
-function fromPhone(text: string, platform = "iOS", user = ALICE) {
-  return { ...message(text, { user }), clientPlatform: platform };
+function fromPhone(text: string, platform = "iOS") {
+  return { ...message(text), clientPlatform: platform };
 }
 
-/** The Stop cards posted: [message id, token]. */
-function stopCards(w: World): [string, string][] {
-  return w.surface.outbox.flatMap((r) => {
-    if (r.op !== "post" || r.message.body.type !== "view" || r.message.body.view.name !== "turnStop") return [];
-    return [[r.id, r.message.body.view.model.token] as [string, string]];
-  });
+/** The Stop cards posted (the turn engine's card, by its view's name). */
+function stopCards(w: World): string[] {
+  return w.surface.outbox.flatMap((r) =>
+    r.op === "post" && r.message.body.type === "view" && r.message.body.view.name === "turnStop" ? [r.id] : [],
+  );
 }
 
-function opsOn(w: World, id: string): string[] {
-  return w.surface.outbox.flatMap((r) => ("id" in r && r.id === id && r.op !== "post" ? [r.op] : []));
-}
-
-function press(token: string, cardId: string, user = ALICE) {
-  return clickOf("turn_stop", { primusclaw: "turn_stop", turn: token }, { user, card: cardId });
-}
-
-async function cardShows(w: World): Promise<void> {
+/** Long enough for a card to have been offered (StopButtons waits 3 s before it shows one). */
+async function cardWouldShow(w: World): Promise<void> {
   await w.clock.advance(4000);
 }
 
 function sessionWorld() {
   const w = world();
   link(w, ALICE.id, "ak-alice");
-  link(w, BOB.id, "ak-bob");
   const running = gate();
   w.turns.hold = running.promise;
   return { w, release: running.open };
 }
 
 for (const platform of ["iOS", "Android"]) {
-  test(`test_a_turn_from_a_phone_gets_the_card_and_its_press_interrupts_that_turn ${platform}`, async () => {
+  test(`test_a_turn_from_a_phone_gets_no_stop_card_and_saying_stop_interrupts_it ${platform}`, async () => {
     const { w, release } = sessionWorld();
     await w.router.handle(fromPhone("do it", platform));
-    await cardShows(w);
-    const [[cardId, token] = ["", ""]] = stopCards(w);
-    await w.router.handle(press(token, cardId));
+    await cardWouldShow(w);
+    assert.deepEqual(stopCards(w), []);
+    await w.router.handle(fromPhone("停止", platform));
     assert.deepEqual(
       w.claw.calls.filter((c) => c[0] === "interrupt"),
       [["interrupt", "ak-alice", "sess-ak-alice"]],
     );
     release();
     await w.router.settled();
-    await (w.deps.stopCards as StopButtons).drain();
-    assert.deepEqual(opsOn(w, cardId), ["delete"]); // (deleted by the press, once; never edited)
-    assert.ok(said(w).some((t) => t.includes("Stopping")));
-  });
-}
-
-for (const platform of ["Windows", "Mac", "Web", ""]) {
-  test(`test_a_turn_from_a_desktop_or_the_web_gets_no_card ${platform || "none"}`, async () => {
-    const { w, release } = sessionWorld();
-    await w.router.handle(fromPhone("do it", platform));
-    await cardShows(w);
-    release();
-    await w.router.settled();
     assert.deepEqual(stopCards(w), []);
   });
 }
 
-test("test_a_press_after_the_turn_ended_stops_nothing_and_says_so", async () => {
+test("test_a_press_on_a_card_sent_before_stops_nothing_and_says_so", async () => {
   const { w, release } = sessionWorld();
   await w.router.handle(fromPhone("do it"));
-  await cardShows(w);
-  const [[cardId, token] = ["", ""]] = stopCards(w);
+  await w.router.handle(
+    clickOf("turn_stop", { primusclaw: "turn_stop", turn: "a-token-from-before" }, { card: "teams-old-card" }),
+  );
   release();
   await w.router.settled();
-  await (w.deps.stopCards as StopButtons).drain();
-  await w.router.handle(press(token, cardId));
   assert.ok(!w.claw.calls.some((c) => c[0] === "interrupt"));
-  assert.equal(said(w).at(-1), TURN_OVER);
-  assert.ok(!opsOn(w, cardId).includes("update"));
+  assert.ok(said(w).includes(TURN_OVER));
+  const ops = w.surface.outbox.flatMap((r) => ("id" in r && r.id === "teams-old-card" ? [r.op] : []));
+  assert.deepEqual(ops, ["delete"]); // (the old card goes; it is never edited)
 });
 
-test("test_the_card_of_an_earlier_turn_never_stops_the_next_one", async () => {
-  const { w, release } = sessionWorld();
-  await w.router.handle(fromPhone("first"));
-  await cardShows(w);
-  release();
-  await w.router.settled();
-  const second = gate();
-  w.turns.hold = second.promise;
-  await w.router.handle(fromPhone("second"));
-  await cardShows(w);
-  const [[firstCard, first] = ["", ""], [, other] = ["", ""]] = stopCards(w);
-  await w.router.handle(press(first, firstCard));
-  assert.ok(!w.claw.calls.some((c) => c[0] === "interrupt"));
-  assert.equal(said(w).at(-1), TURN_OVER);
-  await w.router.handle(press(other, "teams-x", BOB)); // (someone else's press of the live card: not theirs to stop)
-  assert.ok(!w.claw.calls.some((c) => c[0] === "interrupt"));
-  second.open();
-  await w.router.settled();
+test("a pressed old card the channel will not delete is closed to a line, and left as it is in an agent's window", async () => {
+  for (const direct of [false, true]) {
+    const w = world({ remote: { direct: () => direct } });
+    link(w, ALICE.id, "ak-alice");
+    Object.assign(w.surface, { caps: { ...w.surface.caps, delete: false } });
+    await w.router.handle(clickOf("turn_stop", { primusclaw: "turn_stop", turn: "old" }, { card: "old-card" }));
+    const ops = w.surface.outbox.flatMap((r) => ("id" in r && r.id === "old-card" ? [r.op] : []));
+    assert.deepEqual(ops, direct ? [] : ["update"], String(direct));
+    assert.equal(said(w).at(-1), TURN_OVER);
+  }
 });
 
-function remoteWorld() {
-  let turn: (RemoteTurn & { end: () => void }) | undefined;
-  const turnOf = (): RemoteTurn & { end: () => void } => {
-    const ended = gate();
-    const task = { done: ended.promise, running: true };
-    return {
-      task,
-      end: () => {
-        task.running = false;
-        ended.open();
-      },
-    };
-  };
+test("test_a_phones_message_to_an_attached_agent_gets_no_stop_card_and_saying_stop_cancels_that_turn", async () => {
+  let turn: RemoteTurn | undefined;
+  const prompts: string[] = [];
   const stops: unknown[] = [];
   const w = world({
     remote: {
@@ -140,149 +100,44 @@ function remoteWorld() {
       attached: () => true,
       windowed: () => false,
       currentTurn: () => turn,
-      prompt: () => {
-        turn = turnOf();
+      prompt: (request) => {
+        prompts.push(request.prompt);
+        turn = { task: { done: new Promise(() => undefined), running: true } };
         return Promise.resolve();
       },
-      stop: (_chat, _key, _conv, only) => {
-        if (only !== undefined && only !== turn) return Promise.resolve(false);
+      stop: (_chat, _key, _conversation, only) => {
         stops.push(only);
-        turn?.end();
         turn = undefined;
         return Promise.resolve(true);
       },
     },
   });
   link(w, ALICE.id, "ak-alice");
-  return { w, stops, current: () => turn };
-}
-
-test("test_a_phones_message_to_an_attached_agent_gets_the_card_and_its_press_cancels_that_turn", async () => {
-  const r = remoteWorld();
-  await r.w.router.handle(fromPhone("run the tests"));
-  await cardShows(r.w);
-  const [[cardId, token] = ["", ""]] = stopCards(r.w);
-  await r.w.router.handle(press(token, cardId));
-  assert.equal(r.stops.length, 1);
-  assert.ok(!r.w.claw.calls.some((c) => c[0] === "interrupt")); // (the agent's turn, not the chat's own session)
-  await r.w.router.handle(press(token, cardId)); // (pressed again: the turn is over)
-  assert.equal(r.stops.length, 1);
-  assert.equal(said(r.w).at(-1), TURN_OVER);
+  await w.router.handle(fromPhone("run everything", "Android"));
+  await cardWouldShow(w);
+  assert.deepEqual(stopCards(w), []);
+  await w.router.handle(fromPhone("停止", "Android"));
+  assert.equal(stops.length, 1);
+  assert.deepEqual(prompts, ["run everything"], "停止 is not sent to the agent as a message");
+  assert.deepEqual(stopCards(w), []);
 });
 
-test("test_the_agents_next_turn_is_never_cancelled_by_the_card_of_the_one_before", async () => {
-  const r = remoteWorld();
-  await r.w.router.handle(fromPhone("one"));
-  await cardShows(r.w);
-  const [[cardId, token] = ["", ""]] = stopCards(r.w);
-  const before = r.current() as RemoteTurn & { end: () => void };
-  before.end(); // (the agent's turn ended on its own)
-  await r.w.router.handle(fromPhone("two")); // (its next turn runs)
-  await r.w.router.handle(press(token, cardId));
-  assert.deepEqual(r.stops, []);
-  assert.equal(said(r.w).at(-1), TURN_OVER);
-});
-
-test("test_an_attached_agents_turn_from_the_desktop_gets_no_card", async () => {
-  const r = remoteWorld();
-  await r.w.router.handle(fromPhone("hi", "Windows"));
-  await cardShows(r.w);
-  assert.deepEqual(stopCards(r.w), []);
-});
-
-test("test_a_phones_message_to_the_assistant_gets_the_card_and_its_press_interrupts_only_the_turn_answering_it", async () => {
-  const stopped: (string | undefined)[] = [];
-  let running = "msg-1";
+test("test_a_phones_message_to_the_assistant_gets_no_stop_card", async () => {
+  const routed: AssistantRouteRequest[] = [];
   const w = world({
     assistant: {
       on: () => true,
-      route: (request: { onSent?: OnSent }) => {
-        request.onSent?.("as-1", "msg-1");
-        return Promise.resolve(true);
-      },
-      stop: (_u, _k, _c, onlyMessage) => {
-        if (onlyMessage !== running) return Promise.resolve(false);
-        stopped.push(onlyMessage);
+      route: (request) => {
+        routed.push(request);
+        request.onSent?.("as-1", "msg-1"); // (Claw took it; a card would follow if the router had asked for one)
         return Promise.resolve(true);
       },
     },
-  });
-  Object.assign(w.deps.claw.sessions, {
-    turn: () => Promise.resolve({ running: running !== "", messageId: running }),
   });
   link(w, ALICE.id, "ak-alice");
   await w.router.handle(fromPhone("hello"));
-  await cardShows(w);
-  const [[cardId, token] = ["", ""]] = stopCards(w);
-  running = "msg-2"; // (another message's turn runs now: the card's turn is over)
-  await w.router.handle(press(token, cardId));
-  assert.deepEqual(stopped, []);
-  assert.equal(said(w).at(-1), TURN_OVER);
-});
-
-function assistantWorld() {
-  const stopped: (string | undefined)[] = [];
-  const claw = { running: "msg-1" };
-  const w = world({
-    assistant: {
-      on: () => true,
-      route: (request: { onSent?: OnSent }) => {
-        request.onSent?.("as-1", "msg-1");
-        return Promise.resolve(true);
-      },
-      stop: (_u, _k, _c, onlyMessage) => (stopped.push(onlyMessage), Promise.resolve(true)),
-    },
-  });
-  Object.assign(w.deps.claw.sessions, {
-    turn: () => Promise.resolve({ running: claw.running !== "", messageId: claw.running }),
-  });
-  link(w, ALICE.id, "ak-alice");
-  return { w, stopped, claw };
-}
-
-test("a phone's message to the assistant: the press stops the turn answering it, by its message", async () => {
-  const a = assistantWorld();
-  await a.w.router.handle(fromPhone("hello"));
-  await cardShows(a.w);
-  const [[cardId, token] = ["", ""]] = stopCards(a.w);
-  await a.w.router.handle(press(token, cardId));
-  assert.deepEqual(a.stopped, ["msg-1"]);
-  assert.deepEqual(opsOn(a.w, cardId), ["delete"]);
-});
-
-test("a phone's message to the assistant: the card goes once Claw says the turn ended", async () => {
-  const a = assistantWorld();
-  await a.w.router.handle(fromPhone("hello"));
-  await cardShows(a.w);
-  const [[cardId] = [""]] = stopCards(a.w);
-  a.claw.running = "";
-  await a.w.clock.advance(3000);
-  await (a.w.deps.stopCards as StopButtons).drain();
-  assert.deepEqual(opsOn(a.w, cardId), ["delete"]);
-  assert.deepEqual(a.stopped, []);
-});
-
-test("test_in_an_agents_window_a_card_teams_will_not_delete_is_left_as_it_is_never_edited", async () => {
-  const r = remoteWorld();
-  Object.assign(r.w.deps.remote, { direct: () => true });
-  Object.assign(r.w.surface, { caps: { ...r.w.surface.caps, delete: false } });
-  await r.w.router.handle(fromPhone("run the tests"));
-  await cardShows(r.w);
-  const [[cardId, token] = ["", ""]] = stopCards(r.w);
-  await r.w.router.handle(press(token, cardId));
-  assert.equal(r.stops.length, 1);
-  assert.deepEqual(opsOn(r.w, cardId), []); // (not deleted: Teams would not; not edited: a window is never edited)
-});
-
-test("a pressed card the channel will not delete is closed to a line, outside an agent's window", async () => {
-  const { w, release } = sessionWorld();
-  Object.assign(w.surface, { caps: { ...w.surface.caps, delete: false } });
-  await w.router.handle(fromPhone("do it"));
-  await cardShows(w);
-  const [[cardId, token] = ["", ""]] = stopCards(w);
-  await w.router.handle(press(token, cardId));
-  release();
-  await w.router.settled();
-  assert.deepEqual(opsOn(w, cardId), ["update"]);
-  assert.ok(said(w).includes("note::Stop was pressed."));
+  await cardWouldShow(w);
+  assert.equal(routed.length, 1);
+  assert.equal(routed[0]?.onSent, undefined);
+  assert.deepEqual(stopCards(w), []);
 });

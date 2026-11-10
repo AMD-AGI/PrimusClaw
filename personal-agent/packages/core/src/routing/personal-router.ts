@@ -142,7 +142,7 @@ export class PersonalRouter {
     if (action.verb === "repo") await this.sets.sessions.repoClick(action, chat);
     else if (action.verb === "create_pr") await this.sets.sessions.createPr(action, chat, key);
     else if (action.verb === "show") await this.showHere.click(action, chat, key);
-    else if (action.verb === "turn_stop") await this.stopPress.press(action, chat, key);
+    else if (action.verb === "turn_stop") await this.stopPress.press(action, chat);
   }
 }
 
