@@ -1198,6 +1198,17 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
   assert.deepEqual(failed(zh, observed({ final: english, calls: read })), ["reply in zh"]);
 });
 
+test("S36d a URL, a link or a fence ends where it ends, not at the next space: the Chinese after it is prose", () => {
+  // The reviewer's two cases (PR #620): Chinese prose has no spaces, so a URL taken up to the next whitespace took the prose too.
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const en = caseOf({ lang: "en", turns: [{ user: "did the runs pass?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(zh, observed({ final: "PR: https://github.com/AMD-AGI/PrimusClaw/pull/12，已经合并，所有检查都通过了，部署也完成了。 Status: merged, deployed and verified." })), []);
+  assert.deepEqual(failed(en, observed({ final: "Done.\n- https://x.invalid/run/1：任务已完成，没有错误。\n- https://x.invalid/run/2：全部检查通过，可以合并。" })), ["reply in en"]);
+  // The same after a markdown link's target, and after an unclosed fence.
+  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1，任务已完成没有错误全部检查通过可以合并) ok" })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "Done.\n```\n任务已完成，没有错误，全部检查通过，可以合并。" })), ["reply in en"]);
+});
+
 test("S36b the reply's own words are found in bounded time, however long the reply", () => {
   const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
   const started = Date.now();

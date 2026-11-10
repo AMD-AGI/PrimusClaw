@@ -1298,10 +1298,13 @@ export function replyProse(text: string): string {
   // The first LANGUAGE_SAMPLE characters say what language a reply is in; an unclosed `[` or `“` makes the link and quote
   // patterns rescan the rest of its line from every opener, so the text they read is bounded.
   return text.slice(0, LANGUAGE_SAMPLE)
-    .replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ")
+    // A fence counts as code only when it is closed: an unclosed one would take every word after it, prose included.
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ")
     .replace(/`[^`\n]*`/g, " ")
-    .replace(/!?\[[^\]\n]*\](?:\([^)\s]*\)|\[[^\]\n]*\])/g, " ")
-    .replace(/\b(?:https?|ftp):\/\/\S+/gi, " ")
+    // A link's target and a bare URL end at the first character a URL cannot hold unescaped: whitespace or anything outside
+    // printable ASCII, so the Chinese right after one ("…/pull/12，已经合并") stays prose.
+    .replace(/!?\[[^\]\n]*\](?:\([!-(*-~]*\)|\[[^\]\n]*\])/g, " ")
+    .replace(/\b(?:https?|ftp):\/\/[!-~]+/gi, " ")
     .replace(/^[ \t]*>.*$/gm, " ")
     // Single quotes only around a passage, not in a word ("don't", "John's").
     .replace(/"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’|「[^」\n]*」|『[^』\n]*』|(?<![A-Za-z])'[^'\n]*'(?![A-Za-z])/g, " ")
