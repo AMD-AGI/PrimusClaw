@@ -73,6 +73,8 @@
  *   R24 an entry the run made after its attempt's cleanup (a turn still running past its attempt: a stop, a timeout) is the run's: one
  *      not there when the run began is deleted before the next attempt, and in a sweep after the run's sessions are closed; an
  *      entry from before the run is kept
+ *   R25 an attempt's memory entries are listed only once the assistant session is idle: an entry an earlier turn still running
+ *      saves while the next attempt waits is not counted as that attempt's (expect_memory fails), and is deleted as the run's
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -1520,6 +1522,26 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
         }
       } finally { rmSync(r2.dir, { recursive: true, force: true }); }
     }
+  });
+
+  it("R25 the entries before an attempt are listed once the session is idle: a running turn's late save is not the next attempt's", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (content, id) => {
+      claw.turn(id, { say: "Done." });
+      if (content !== "first") return;
+      // The first turn's conversation goes on and saves an entry 1.5 s later, then the session is idle.
+      claw.sessions.get(claw.assistant)!.status = "running";
+      setTimeout(() => { claw.memories.set(5000, { id: 5000, title: "Review model", body: "reviews with opus" }); claw.sessions.get(claw.assistant)!.status = "idle"; }, 1_500);
+    };
+    const r = runner(base, [answerCase("t-idle-001", "first"), { ...answerCase("t-idle-002", "second"), expect_memory: ["opus"] }], { EVAL_TURN_WAIT_S: "10" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /pass t-idle-001#1/, run.out);
+      assert.match(run.out, /FAIL t-idle-002#1 .*memory saved: opus/, "the earlier turn's entry is not the attempt's");
+      assert.ok(!claw.memories.has(5000), "deleted as the run's");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
 

@@ -1583,6 +1583,11 @@ async function main(): Promise<void> {
               const left = cardsLeftError(filled, waiting, CASE_CARDS.get(c.id) ?? new Set());
               if (left) throw new Error(left);
             }
+            // The entries before the attempt are listed once no earlier turn is running (one past its attempt, after a timeout, may
+            // still save): its entry would otherwise be taken for this attempt's own.
+            if (MODE === "assistant" && !(await idle(session!.id, turnWaitMs(true)))) {
+              throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
+            }
             memBefore = await memoriesBefore(filled);
             ATTEMPT_MEMORIES_BEFORE = memBefore;
             setup = await makeSetup(filled);
