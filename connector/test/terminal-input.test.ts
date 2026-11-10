@@ -664,7 +664,9 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
   test("Enter's guard reads the one screen: the box there, exactly the text, no question; a long text the box wraps is still exact", () => {
     const box = (held: string[], below = "  ⏸ manual mode on") => `  ready\n${RULE}\n❯ ${held[0]}\n${held.slice(1).map((l) => `  ${l}`).join("\n")}${held.length > 1 ? "\n" : ""}${RULE}\n${below}`;
     assert.equal(enterGuard(box(["hello from the phone"]), "hello from the phone"), null);
-    assert.equal(enterGuard(box(["这是一段很长的手机消息，用来", "测试输入框如何显示。"]), "这是一段很长的手机消息，用来测试输入框如何显示。"), null, "wrapped");
+    // (RULE is 40 columns: a row holds 39 at most, its prompt or indent included; a wide character takes two)
+    assert.equal(enterGuard(box(["这是一段很长的手机消息，用来测试输入框", "如何显示。"]), "这是一段很长的手机消息，用来测试输入框如何显示。"), null, "wrapped, wide characters");
+    assert.equal(enterGuard(box(["这是一段很长的手机消息", "用来测试输入框如何显示。"]), "这是一段很长的手机消息用来测试输入框如何显示。"), "the box does not hold exactly what was typed", "a row ending short is a line break, not a wrap");
     assert.equal(enterGuard(box(["line one", "line two"]), "line one\nline two"), null);
     assert.equal(enterGuard(box(["[Pasted text #1 +2 lines]"]), "a\nb\nc"), null, "a long paste, its line breaks counted");
     assert.equal(enterGuard(box(["[Pasted text #1 +40 lines]"]), "a\nb\nc"), "the box does not hold exactly what was typed", "another paste");
@@ -672,7 +674,12 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(enterGuard(box(["[Pasted text #3]"]), "short"), "the box does not hold exactly what was typed", "a short line is never collapsed");
     assert.equal(enterGuard(box(["[Pasted text #3]", "more"]), "x".repeat(1500)), "the box does not hold exactly what was typed");
     // Exactly the text: a wrap may drop the space it broke at, nothing else may differ.
-    assert.equal(enterGuard(box(["hello from the", "phone"]), "hello from the phone"), null, "wrapped at a space");
+    assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccccccc dddddd", "eeeeee"]), "aaaaaaaa bbbbbbbb cccccccc dddddd eeeeee"), null, "wrapped at a space: the next word did not fit");
+    assert.equal(enterGuard(box(["x".repeat(37), "xxx"]), "x".repeat(40)), null, "wrapped inside a word: the row full");
+    // (codex r2 on #648) a line break of the box's own is not a wrapped space
+    assert.equal(enterGuard(box(["hello", "world"]), "hello world"), "the box does not hold exactly what was typed", "a line break is not a space");
+    assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccc", "dd"]), "aaaaaaaa bbbbbbbb cccc dd"), "the box does not hold exactly what was typed", "the next word would have fit");
+    assert.equal(enterGuard(box(["hello", "world"]), "hello\nworld"), null, "the text's own line break");
     assert.equal(enterGuard(box(["hellofrom the phone"]), "hello from the phone"), "the box does not hold exactly what was typed", "a space taken out");
     assert.equal(enterGuard(box(["hello from th e phone"]), "hello from the phone"), "the box does not hold exactly what was typed", "a space put in");
     assert.equal(enterGuard(box(["hello from the"]), "hello from the phone"), "the box does not hold exactly what was typed", "cut short");

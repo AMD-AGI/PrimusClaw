@@ -290,7 +290,7 @@ export function enterGuard(screen: string, text: string): string | null {
   if (at < 0 || end < 0) return "no input box on the screen";
   if (plain.slice(end + 1).some((l) => DIALOG_RE.test(l))) return "a question or a menu is on the screen";
   const lines = plain.slice(at, end).map((l, i) => (i === 0 ? l.trimStart().replace(PROMPT_RE, "") : l));
-  if (heldExactly(lines, text)) return null;
+  if (heldExactly(lines, plain.slice(at, end).map(displayWidth), displayWidth(plain[end]!.trim()), text)) return null;
   // A long paste shows collapsed, `[Pasted text #n +k lines]` (k: its line breaks) or, one long line, `[Pasted text #n]` (Claude Code
   // 2.1.285): only that, and only with this text's count of line breaks.
   const breaks = text.split("\n").length - 1;
@@ -302,26 +302,51 @@ export function enterGuard(screen: string, text: string): string | null {
 /** The longest one-line paste Claude Code 2.1.285 was measured to show as it is (700 characters did, 1500 did not). */
 const PASTE_INLINE_MAX = 700;
 
+/** How many terminal columns a string takes (East Asian wide and fullwidth characters take two). */
+function displayWidth(x: string): number {
+  let n = 0;
+  for (const ch of x) {
+    const c = ch.codePointAt(0)!;
+    n += (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff)
+      || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff)
+      || (c >= 0x20000 && c <= 0x3fffd) ? 2 : 1;
+  }
+  return n;
+}
+
 /**
- * Whether the box's lines are exactly `text` as the box draws it: each line of the text is one or more of the box's lines (a long
- * line wraps; a wrap may drop the one space it broke at), the continuation lines indented, nothing more or less. Runs of whitespace
- * count as one space (the box draws them so).
+ * Whether the box's lines are exactly `text` as the box draws it: each line of the text is one or more of the box's lines, nothing
+ * more or less. A text line goes on to the next box line only where the box wrapped it, which the widths tell (`widths`: each box
+ * row's columns, prompt or indent included; `boxWidth`: the rule's): at a space, when the next word would not have fit on the row
+ * (the space is not drawn); inside a word, when the row is full. A row that ends short of that is a line break of the text, never
+ * a wrap. Runs of whitespace count as one space (the box draws them so). Measured on Claude Code 2.1.285, a 200-column pane: rows
+ * filled to at most 199 columns.
  */
-function heldExactly(lines: string[], text: string): boolean {
+function heldExactly(lines: string[], widths: number[], boxWidth: number, text: string): boolean {
   const norm = (x: string) => x.replace(/\s+/g, " ").trim();
   const want = text.split("\n").map(norm);
   const got = lines.map(norm);
+  const limit = boxWidth - 1;
   let g = 0;
   for (const line of want) {
     // (an empty line of the text is an empty line of the box)
     if (!line) { if (got[g] !== "") return false; g++; continue; }
     let rest = line;
-    while (rest) {
+    for (;;) {
       const part = got[g];
       if (!part || !rest.startsWith(part)) return false;
       rest = rest.slice(part.length);
+      const row = widths[g]!;
       g++;
-      if (rest.startsWith(" ")) rest = rest.slice(1);   // (the space a wrap broke at)
+      if (!rest) break;
+      // (it goes on in the next row: only where the box wrapped it)
+      if (rest.startsWith(" ")) {
+        rest = rest.slice(1);
+        const next = rest.split(" ")[0]!;
+        if (row + 1 + displayWidth(next) <= limit - 1) return false;
+      } else if (row < limit - 1) {
+        return false;
+      }
     }
   }
   return g === got.length;
