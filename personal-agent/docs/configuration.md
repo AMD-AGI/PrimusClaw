@@ -5,13 +5,15 @@ SPDX-License-Identifier: MIT
 
 # Configuration
 
-The worker reads its configuration from the environment once, at start, and checks it before it opens the store or
-takes a message: a missing required setting, a malformed number, a list or URL that cannot be used, an unknown word in a
-strict switch or an enumeration (`OUTBOUND_MODE`, `BOT_TOKEN_SOURCE`, `SECRETS_SOURCE`, `TEAMS_STREAMING`) stops it.
-**Not every switch is strict**, though; see "How switches read" below, and check the spelling of the lenient ones.
+The worker reads its configuration from the environment once, at start, and stops before it takes a message when a
+required setting is missing, a number is malformed, a setting another one needs is absent, or a strict switch or an
+enumeration (`OUTBOUND_MODE`, `BOT_TOKEN_SOURCE`, `SECRETS_SOURCE`, `TEAMS_STREAMING`) has an unknown word. Addresses
+are checked only where this page says so (`KEYVAULT_URL`, `SERVICEBUS_NAMESPACE`, `BOT_ASSERTION_ISSUER`,
+`TEAMS_INSTALL_HINT_URL`); a wrong `CLAW_API_URL`, say, shows at the first request. **Not every switch is strict**,
+either; see "How switches read" below, and check the spelling of the lenient ones.
 
 [`../examples/worker.env.example`](../examples/worker.env.example) has every setting below with placeholder values,
-except the release gate's test entry (last section).
+except the feedback-plugin settings and the release gate's test entry (the last two sections).
 
 Where each group is read:
 

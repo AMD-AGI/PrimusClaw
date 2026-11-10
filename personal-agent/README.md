@@ -151,9 +151,9 @@ node --env-file=/path/outside/the/repo/worker.env --import tsx packages/teams/sr
 ```
 
 The worker reads its whole configuration from the environment once, at start. A setting it cannot use (a required one
-missing, a malformed number, an unknown word in a strict switch) stops it before it opens the store or takes a message:
-a secret it cannot read exits with status 2, any other unusable setting with status 1, with one line on stderr saying
-why. Some feature switches are lenient and read a typo as off (or, for `REMOTE_PUSH_ENABLED`, as on); the configuration
+missing, a malformed number, an unknown word in a strict switch) stops it before it takes a message, with one line on
+stderr saying why: a secret the secret source (`SECRETS_SOURCE`) cannot load exits with status 2, anything else that
+stops the start (a key file that cannot be read included) with status 1. Some feature switches are lenient and read a typo as off (or, for `REMOTE_PUSH_ENABLED`, as on); the configuration
 reference says which.
 `SIGTERM` or `SIGINT` stops taking new work, finishes what is in hand and exits.
 
