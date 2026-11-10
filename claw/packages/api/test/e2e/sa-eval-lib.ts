@@ -1279,7 +1279,6 @@ export const HOLD_CARD_MS = 5_000;
 export interface Check { name: string; pass: boolean; skipped?: true; unverified?: true; detail?: string }
 
 const CJK = /[㐀-鿿]/g;
-const LATIN = /[A-Za-z]/g;
 
 /**
  * The assistant's own words in a reply, which its language is judged by: the text without what it quotes or names. Taken out are
@@ -1333,21 +1332,22 @@ const TITLE_MIN_CHARS = 8;
 /** A message that is only a slash command with up to three plain arguments (`/brief off`, `/hlep`, `/pause 2h`), not a sentence. */
 const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:[ \t]+[A-Za-z0-9_\-.:/@#]+){0,3}\s*$/;
 
-/** Whether a text has a word at all: a Chinese character or a Latin letter. */
-export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(text);
+/** Whether a text has a word at all: a letter of any script. */
+export const hasWords = (text: string): boolean => /\p{L}/u.test(text);
 
 /**
- * The language check of `style.reply_lang`: the share of Chinese characters among the letters of the reply's own words
+ * The language check of `style.reply_lang`: the share of Chinese characters among the letters (of any script) of the reply's own words
  * (`replyProse`; digits, punctuation and markdown are no language). Chinese needs at least 0.2 of them, English under 0.05, as
  * before; the titles the turn read (`readTitles`) are names too. A reply with no letter at all ("2", "**0**", "10.1.0") is in no
  * language, and the check does not apply to it; one whose letters are all names, code or quotes counts as no Chinese.
  */
 export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly string[] = []): { applies: boolean; pass: boolean; detail: string } {
   // Only a reply with no letter at all is in no language; one whose letters are all in names, code or quotes is judged (as 0).
-  if (!/[㐀-鿿A-Za-z]/.test(text)) return { applies: false, pass: true, detail: "no words of its own" };
+  if (!/\p{L}/u.test(text)) return { applies: false, pass: true, detail: "no words of its own" };
   const prose = replyProse(titles.reduce((t, title) => t.split(title).join(" "), text));
   const cjk = prose.match(CJK)?.length ?? 0;
-  const letters = cjk + (prose.match(LATIN)?.length ?? 0);
+  // Every letter, of any script: a Greek or Cyrillic reply is not Chinese either.
+  const letters = prose.match(/\p{L}/gu)?.length ?? 0;
   const ratio = letters ? cjk / letters : 0;
   return { applies: true, pass: lang === "zh" ? ratio >= 0.2 : ratio < 0.05, detail: `cjk ${ratio.toFixed(2)}` };
 }

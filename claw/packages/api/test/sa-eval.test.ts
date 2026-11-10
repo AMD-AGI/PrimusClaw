@@ -1168,7 +1168,7 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
   // An English reply to a Chinese message still fails, with or without Chinese inside its code, quotes and links, and when every
   // word of it is hyphenated or a name.
   for (const final of ["well-known, user-facing, high-level.", "This is a well-known, user-facing, high-level 问题.", "`ls -la` [docs](https://x.invalid)",
-    "top-model-daily, hyperloom-main-daily-ci",
+    "top-model-daily, hyperloom-main-daily-ci", "Всё готово, задача выполнена.", "Η εργασία ολοκληρώθηκε.",
     "There are 7 plans in Dispatron: top-model-daily, hyperloom-main-daily-ci and five more.",
     "I renamed the item to “修复登录超时” and set `标题 = 修复登录超时`; see [修复登录超时](https://x.invalid/1). It is running now.",
     "Done. The workspace list is below.\n```\n工作区 global-cpu 正常\n```"]) {
@@ -1234,6 +1234,9 @@ test("S37 a reply with no words, or to a message with none, is in no language: t
     const check = grade(en, observed({ final: BRIEF_OFF_ZH })).find((x) => x.name === "reply in en");
     assert.equal(check?.skipped, true, user);
   }
+  // A message in any script has a language.
+  const ru = caseOf({ lang: "en", turns: [{ user: "Привет, что ты умеешь?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(ru, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
   // A command followed by a sentence has the sentence's language.
   const zhCommand = caseOf({ lang: "en", turns: [{ user: "/hlep 请用中文说明状态" }], style: { reply_lang: "follow_user" } });
   assert.deepEqual(failed(zhCommand, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
