@@ -173,15 +173,33 @@ const NAMES = [
   pyRegExp(String.raw`(?<=[a-z0-9])Key(?=${SEP})`, "g"),
 ];
 
-/** The leftmost name at or after UTF-16 index `from`: its index and length, or null. */
-function nameFrom(text: string, from: number): { index: number; length: number } | null {
-  let first: { index: number; length: number } | null = null;
-  for (const pattern of NAMES) {
-    pattern.lastIndex = from;
-    const found = pattern.exec(text);
-    if (found && (first === null || found.index < first.index)) first = { index: found.index, length: found[0].length };
-  }
-  return first;
+interface Found {
+  readonly index: number;
+  readonly length: number;
+}
+
+/**
+ * A reader of the leftmost name at or after a UTF-16 index that only moves forward: each pattern's next match is kept
+ * and searched for again only once the scan has passed it, so each pattern reads the text once (searching every
+ * pattern again from every place would read to the end of the text once per name).
+ */
+function names(text: string): (from: number) => Found | null {
+  // per pattern: its leftmost match at or after the last search's start; null once there is none
+  const next: Array<Found | null | undefined> = NAMES.map(() => undefined);
+  return (from) => {
+    let first: Found | null = null;
+    NAMES.forEach((pattern, i) => {
+      let found = next[i];
+      if (found === undefined || (found !== null && found.index < from)) {
+        pattern.lastIndex = from;
+        const match = pattern.exec(text);
+        found = match ? { index: match.index, length: match[0].length } : null;
+        next[i] = found;
+      }
+      if (found && (first === null || found.index < first.index)) first = found;
+    });
+    return first;
+  };
 }
 
 /**
@@ -204,9 +222,10 @@ export function maskSecretValues(text: string): { text: string; masked: boolean 
   const cpAt = (unit: number): number => cpOfUnit[unit] ?? cps.length;
   let table: ValueTable | null = null;
   const spans: Array<readonly [number, number]> = [];
+  const nameFrom = names(text);
   let from = 0;
   for (;;) {
-    const name = nameFrom(text, unitAt[from] ?? text.length);
+    const name = nameFrom(unitAt[from] ?? text.length);
     if (name === null) break;
     const s = cpAt(name.index);
     const e = cpAt(name.index + name.length);

@@ -65,6 +65,24 @@ describe("a compound key name (Python redact_text, AccountKey=)", () => {
     });
   }
 
+  // Many names that fail, so that the scan asks for the next name many times: each pattern must read the text once,
+  // not once per name. Measured on this code: 20-110 ms each; on a scan that searched every pattern again from every
+  // name: 1-8 s each.
+  for (const [label, hostile] of [
+    ["token ", "token ".repeat(80_000)],
+    ["xKey= ", "xKey= ".repeat(20_000)],
+    ["my_key: ", "my_key: ".repeat(40_000)],
+    ["accountkey is ", "accountkey is ".repeat(40_000)],
+  ] as const) {
+    it(`reads many failing names in linear time: ${JSON.stringify(label)} repeated`, () => {
+      const started = performance.now();
+      const got = redactText(hostile);
+      const took = performance.now() - started;
+      assert.deepEqual(got, { text: hostile, masked: false });
+      assert.ok(took < 500, `${took.toFixed(0)} ms`);
+    });
+  }
+
   it("reads hostile texts in linear time", () => {
     const value = "a1".repeat(20);
     for (const hostile of [
