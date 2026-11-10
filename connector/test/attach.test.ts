@@ -322,7 +322,12 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     titled(REF2, T);
     assert.equal(await proven(), null, "another one with the same name");
     titled(REF2, null);
+    // A candidate longer than the end that is read for a name, but not large, is read whole: one with no name is known to have none
+    // (autopilot-devpod: an interactive conversation of 1.09 MB without a name, written since its torn-row process started).
     fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, toolUseResult: "x".repeat(1_200_000) })}\n`);
+    assert.equal(await proven(), REF, "another one of 1.2 MB without a name, read whole");
+    // Too large to read whole: a name further back than what is read is not known.
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, toolUseResult: "x".repeat(8_000_000) })}\n`);
     assert.equal(await proven(), null, "another one whose name may be further back than what is read");
     // A readable one with a malformed line, or a name entry that is not a name: what it is named is not known (codex r9).
     fs.writeFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, entrypoint: "cli" })}\n{"type": "custom-title", "customTitle": "${T}\n`);

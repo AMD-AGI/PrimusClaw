@@ -416,7 +416,9 @@ export class AttachSupport {
   private blindHeld = new Map<number, string>();
 
   private scanBlind(): Promise<BlindHolder[]> {
-    this.blindScan ??= blindHolders(this.configDir).then((list) => {
+    const tmux = this.agent.attach?.tmux ?? "tmux";
+    this.blindScan ??= blindHolders(this.configDir, "/proc", typeof process.getuid === "function" ? process.getuid() : null,
+      (pid) => paneBoxName(pid, tmux)).then((list) => {
       this.blindHeld = new Map(list.filter((b) => b.sessionId !== null).map((b) => [b.pid, b.sessionId!]));
       return list;
     }).finally(() => { this.blindScan = null; });
@@ -1152,6 +1154,14 @@ export async function provenBlindHold(configDir: string, b: { pid: number; cwd: 
 
 /** How much of the end of a transcript is read for its name. */
 const TITLE_TAIL_BYTES = 1024 * 1024;
+/**
+ * A candidate (`strict`) is read whole up to this size, so that one with no name is known to have none (autopilot-devpod: an
+ * interactive conversation of 1.09 MB without a name, written since its torn-row process started, kept the proof from being made).
+ */
+const TITLE_WHOLE_BYTES = 8 * 1024 * 1024;
+/** What a transcript was found to be named, by its path, size and time: a heartbeat does not read it again while it is unchanged. */
+const titleCache = new Map<string, { size: number; mtimeMs: number; strict: boolean; title: string | null | undefined }>();
+const TITLE_CACHE_MAX = 512;
 
 /**
  * The name a conversation was last given (`custom-title` entries), read line by line from the end of its transcript (each line parsed
@@ -1163,43 +1173,58 @@ async function lastCustomTitle(file: string, strict = false): Promise<string | n
   let fh: fsp.FileHandle | null = null;
   try {
     fh = await fsp.open(file, "r");
-    const size = (await fh.stat()).size;
-    const len = Math.min(size, TITLE_TAIL_BYTES);
-    const buf = Buffer.alloc(len);
-    const { bytesRead } = await fh.read(buf, 0, len, size - len);
-    if (bytesRead !== len) return strict ? undefined : null;
-    const text = buf.toString("utf8");
-    let lines = text.split("\n");
-    if (size > len) lines = lines.slice(1);   // (the first line read is cut: it is not looked at)
-    // The last line may still be being written (no newline yet): a cut line that cannot be a name entry says nothing.
-    const open = text.endsWith("\n") ? null : lines.pop() ?? null;
-    if (lines.length && lines[lines.length - 1] === "") lines.pop();
-    let title: string | null = null;
-    // Something after the last name read that may be a name of its own (a line that does not parse, a name entry with no name):
-    // what it is named now is not known (codex r10).
-    let doubt = size > len;
-    for (const line of lines) {
-      let doc: unknown;
-      try { doc = JSON.parse(line); } catch { doubt = true; continue; }
-      if (isObject(doc) && doc.type === "custom-title") {
-        if (typeof doc.customTitle === "string") { title = doc.customTitle; doubt = false; } else doubt = true;
-      }
+    const st = await fh.stat();
+    const hit = titleCache.get(file);
+    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs && hit.strict === strict) return hit.title;
+    let title = await readCustomTitle(fh, st.size, strict, TITLE_TAIL_BYTES);
+    // (a candidate not settled by its end is read whole, when it is not large)
+    if (strict && title === undefined && st.size > TITLE_TAIL_BYTES && st.size <= TITLE_WHOLE_BYTES) {
+      title = await readCustomTitle(fh, st.size, strict, TITLE_WHOLE_BYTES);
     }
-    if (open !== null) {
-      let doc: unknown;
-      try { doc = JSON.parse(open); } catch { doc = undefined; }
-      if (doc === undefined ? mayBeNameEntry(open) : isObject(doc) && doc.type === "custom-title") {
-        if (isObject(doc) && typeof doc.customTitle === "string") title = doc.customTitle;
-        else return strict ? undefined : null;
-      }
-    }
-    if (title !== null) return doubt && strict ? undefined : doubt ? null : title;
-    return strict && doubt ? undefined : null;
+    titleCache.delete(file);
+    titleCache.set(file, { size: st.size, mtimeMs: st.mtimeMs, strict, title });
+    while (titleCache.size > TITLE_CACHE_MAX) titleCache.delete(titleCache.keys().next().value!);
+    return title;
   } catch {
     return strict ? undefined : null;
   } finally {
     await fh?.close().catch(() => undefined);
   }
+}
+
+/** {@link lastCustomTitle} on the last `max` bytes of a transcript of `size` bytes. */
+async function readCustomTitle(fh: fsp.FileHandle, size: number, strict: boolean, max: number): Promise<string | null | undefined> {
+  const len = Math.min(size, max);
+  const buf = Buffer.alloc(len);
+  const { bytesRead } = await fh.read(buf, 0, len, size - len);
+  if (bytesRead !== len) return strict ? undefined : null;
+  const text = buf.toString("utf8");
+  let lines = text.split("\n");
+  if (size > len) lines = lines.slice(1);   // (the first line read is cut: it is not looked at)
+  // The last line may still be being written (no newline yet): a cut line that cannot be a name entry says nothing.
+  const open = text.endsWith("\n") ? null : lines.pop() ?? null;
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  let title: string | null = null;
+  // Something after the last name read that may be a name of its own (a line that does not parse, a name entry with no name):
+  // what it is named now is not known (codex r10).
+  let doubt = size > len;
+  for (const line of lines) {
+    let doc: unknown;
+    try { doc = JSON.parse(line); } catch { doubt = true; continue; }
+    if (isObject(doc) && doc.type === "custom-title") {
+      if (typeof doc.customTitle === "string") { title = doc.customTitle; doubt = false; } else doubt = true;
+    }
+  }
+  if (open !== null) {
+    let doc: unknown;
+    try { doc = JSON.parse(open); } catch { doc = undefined; }
+    if (doc === undefined ? mayBeNameEntry(open) : isObject(doc) && doc.type === "custom-title") {
+      if (isObject(doc) && typeof doc.customTitle === "string") title = doc.customTitle;
+      else return strict ? undefined : null;
+    }
+  }
+  if (title !== null) return doubt && strict ? undefined : doubt ? null : title;
+  return strict && doubt ? undefined : null;
 }
 
 /** Whether a line cut short while it is written may be the start of a name entry (`{"type":"custom-title",...`). */
@@ -1209,11 +1234,11 @@ function mayBeNameEntry(line: string): boolean {
 }
 
 /** The conversation name a Claude Code process's tmux pane shows in the rule above its input box (`──── name ─`); null for none. */
-async function paneBoxName(pid: number): Promise<string | null> {
-  const pane = await findPane(pid, "tmux");
+async function paneBoxName(pid: number, cli = "tmux"): Promise<string | null> {
+  const pane = await findPane(pid, cli);
   if (!pane.ok) return null;
   try {
-    return boxName(await tmuxRunner("tmux", pane.pane.socket).run(["capture-pane", "-p", "-t", pane.pane.pane]));
+    return boxName(await tmuxRunner(cli, pane.pane.socket).run(["capture-pane", "-p", "-t", pane.pane.pane]));
   } catch {
     return null;
   }
