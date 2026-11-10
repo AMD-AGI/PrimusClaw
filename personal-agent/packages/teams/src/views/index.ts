@@ -10,9 +10,11 @@ import { assistantRenderers } from "./assistant/index.js";
 import { COMMAND_RENDERERS } from "./commands/index.js";
 import { proactiveRenderers } from "./proactive/index.js";
 import type { Renderers } from "./registry.js";
+import { REMOTE_RENDERERS } from "./remote/index.js";
 import { TURN_RENDERERS } from "./turn/index.js";
 
 export const RENDERERS: Renderers = {
+  ...REMOTE_RENDERERS,
   ...approvalRenderers,
   ...assistantRenderers,
   ...COMMAND_RENDERERS,
