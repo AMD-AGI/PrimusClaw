@@ -56,6 +56,17 @@ async function listenMetrics(parts: RunnerParts): Promise<void> {
   }
 }
 
+/** Run every close in turn, each even when one before it failed; a failure is logged by its kind. */
+export async function closeAll(logger: Logger, closes: readonly (() => unknown)[]): Promise<void> {
+  for (const close of closes) {
+    try {
+      await close();
+    } catch (error) {
+      logger.error("a part of the worker could not be closed", { error: errorName(error) });
+    }
+  }
+}
+
 export function runner(parts: RunnerParts): Worker {
   const stopped = new AbortController();
   return {
@@ -69,9 +80,8 @@ export function runner(parts: RunnerParts): Worker {
       } finally {
         stopped.abort();
         await timers;
-        await parts.app.close();
-        await parts.metricsApp.close();
-        await parts.close();
+        // (each part is closed even when one before it fails to: a failure is logged by its kind)
+        await closeAll(parts.logger, [() => parts.app.close(), () => parts.metricsApp.close(), () => parts.close()]);
       }
     },
     stop() {

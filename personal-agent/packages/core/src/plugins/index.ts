@@ -3,6 +3,7 @@
 
 import { noFeedbackSink, type FeedbackSink } from "./feedback-sink.js";
 import { noIdentityLookup, type IdentityLookup } from "./identity-lookup.js";
+import { noIntegrations, type Integrations } from "./integrations.js";
 import { noKeyRevoker, type KeyRevoker } from "./key-revoker.js";
 import { noModelRefusalPolicy, type ModelRefusalPolicy } from "./model-refusal-policy.js";
 import { noRouteExtensions, type RouteExtension } from "./route-extension.js";
@@ -20,6 +21,8 @@ export interface Plugins {
   readonly modelRefusalPolicy: ModelRefusalPolicy;
   readonly tokenExchange: TokenExchange;
   readonly routeExtensions: readonly RouteExtension[];
+  /** The deployment's MCP servers and /whoami lines (`integrations.ts`); none in the public build. */
+  readonly integrations: Integrations;
 }
 
 /** Every plugin at its neutral default, with `overrides` in their place. */
@@ -31,6 +34,7 @@ export function neutralPlugins(overrides: Partial<Plugins> = {}): Plugins {
     modelRefusalPolicy: noModelRefusalPolicy,
     tokenExchange: noTokenExchange,
     routeExtensions: noRouteExtensions,
+    integrations: noIntegrations,
     ...overrides,
   };
 }
