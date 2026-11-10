@@ -40,11 +40,17 @@ import { workCardPoster } from "../../src/assembly/features-review.js";
 const ALICE = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
 const ITEM = { item_id: "item-7", seq: 7, title: "Review acme/app#825", kind: "review", board_state: "in_progress" };
 const STOPPED = { ...ITEM, board_state: "done", status: "stopped" };
+const ENDED = { item_id: "item-8", seq: 8, title: "Fix the flaky test", board_state: "done", outcome: "stopped" };
 
 let claw: FakeHttpServer;
 
 before(async () => {
   claw = await FakeHttpServer.start([
+    {
+      method: "GET",
+      path: "/v1/work-items/item-8",
+      handle: () => ({ status: 200, json: { ok: true, data: ENDED } }),
+    },
     {
       method: "POST",
       path: "/v1/work-items/item-7/stop",
@@ -85,7 +91,9 @@ function reviewSettings(): Settings {
   };
 }
 
-function assembled(options: { readonly review?: boolean; readonly logger?: Logger } = {}) {
+function assembled(
+  options: { readonly review?: boolean; readonly logger?: Logger; readonly env?: Record<string, string> } = {},
+) {
   const { store } = openTestStore();
   const surface = new FakeSurface();
   const plugins = neutralPlugins();
@@ -112,7 +120,7 @@ function assembled(options: { readonly review?: boolean; readonly logger?: Logge
     plugins,
     exchange: plugins.tokenExchange,
     fetch: globalThis.fetch,
-    env: {},
+    env: options.env ?? {},
   };
   const features = buildFeatures(base);
   store.links.redeemPending(ALICE.id, ALICE.name, store.links.stashPending("ak-alice"));
@@ -227,6 +235,69 @@ describe("the review service in the worker", () => {
       features.timers.find((t) => t.name === "sweep_review_cards"),
       undefined,
     );
+  });
+});
+
+/** Alice's 1:1 chat as the store keeps it (a Bot Framework reference). */
+const ALICE_REFERENCE = {
+  serviceUrl: "https://smba.trafficmanager.net/amer/",
+  conversation: { id: "dm-a", conversationType: "personal", tenantId: "t1" },
+  bot: { id: "28:bot", name: "Clawy" },
+  user: { id: ALICE.channelUserId, aadObjectId: ALICE.id, name: ALICE.name },
+};
+
+describe("the review service's other parts in the worker", () => {
+  it("a review the assistant hands back for a message it was declared for is started by the review service", async () => {
+    // (Python Agent.run_action -> _review_handoff -> GithubReview.handoff, through the worker's assembly)
+    const env = { PROACTIVE_ENABLED: "1", NOTIFY_WEBHOOK_URL: "http://w/claw-events" };
+    const { features, store } = assembled({ env });
+    const service = features.review;
+    assert.ok(service !== undefined);
+    const started: string[] = [];
+    service.handoff = (_message, _sender, _conversation, handoff) => {
+      started.push(
+        `${handoff.reviewerUserId} ${handoff.pulls.map((p) => `${p.owner}/${p.repo}#${String(p.number)}`).join(",")}`,
+      );
+      return Promise.resolve();
+    };
+    // (Alice is understood and reachable: linked with a Claw user id, her subscription has the assistant's events)
+    store.links.setClawUserId(ALICE.id, "u-alice");
+    store.notifySubs.saveNotifySub(ALICE.id, { route: "r-a", subscriptionId: "sub-a", secret: "s", typesVersion: 1 });
+    store.references.saveReference(ALICE.id, ALICE_REFERENCE);
+    store.links.redeemPending("aad-b", "Bob", store.links.stashPending("ak-bob"));
+    store.links.setClawUserId("aad-b", "u-bob");
+    store.assistantMessages.noteAssistantMessage("cm-1", ALICE.id, ["review_for_other"], ["u-bob"]);
+    const event = {
+      type: "assistant.action",
+      action: { name: "review_for_other" },
+      channel_message_id: "cm-1",
+      event_id: "ev-1",
+      review: {
+        reviewer: { user_id: "u-bob", name: "Bob" },
+        prs: [{ owner: "acme", repo: "app", number: 9 }],
+        merge: false,
+      },
+    };
+    assert.equal(await features.deliverEvent(ALICE.id, ALICE_REFERENCE, event), "delivered");
+    await service.idle();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(started, ["u-bob acme/app#9"]);
+  });
+
+  it("a sweep edits the open card of an item that is over into its end", async () => {
+    const { features, store, surface } = assembled();
+    const cardId = store.assistantCards.addAssistantCard(ALICE.id, "item-8", 1, false);
+    store.assistantCards.placeAssistantCard(cardId, {
+      activityId: "card-8",
+      reference: ALICE_REFERENCE,
+      render: { kind: "work", title: "#8 Fix the flaky test", lang: "zh" },
+    });
+    const sweep = features.timers.find((t) => t.name === "sweep_review_cards");
+    assert.ok(sweep !== undefined);
+    await sweep.run();
+    const updated = surface.outbox.filter((r) => r.op === "update" && r.id === "card-8");
+    assert.equal(updated.length, 1, JSON.stringify(surface.outbox));
+    assert.equal(store.assistantCards.getAssistantCard(cardId)?.state, "ended");
   });
 });
 
