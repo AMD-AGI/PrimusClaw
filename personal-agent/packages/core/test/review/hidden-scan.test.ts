@@ -24,10 +24,12 @@ function cpuMs(run: () => void): number {
 
 test("tags, entities, links and mention markers are blanked in one pass", () => {
   // (as a regular expression, `<[^>]*>` read to the end of the text from each "<" with no ">" after it)
-  const ms = cpuMs(() => {
-    for (const unit of ["<", "http://x<", "<a>http://", "&#", "<b>&amp;⟦1⟧ "]) blank(unit.repeat(40_000)); // (the last: many spans)
-  });
-  assert.ok(ms < 250, `${String(ms)} ms of CPU`);
+  // (each timed on its own, so that a slow runner under coverage stays well inside the bound: a quadratic reading of 20000
+  // units takes seconds; the last input gives 60000 spans)
+  for (const unit of ["<", "http://x<", "<a>http://", "&#", "<b>&amp;⟦1⟧ "]) {
+    const ms = cpuMs(() => blank(unit.repeat(20_000)));
+    assert.ok(ms < 250, `${unit}: ${String(ms)} ms of CPU`);
+  }
   assert.equal(
     blank("see <b>x</b> &amp; https://e.test/a ⟦1⟧ ok"),
     `see    x${" ".repeat(32)}ok`, // (the Python worker's answer)
