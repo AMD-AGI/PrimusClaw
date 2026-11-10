@@ -42,6 +42,7 @@ export function routed<T>(
       testStore: rw.test,
       remoteChat: rw.remote,
       messageText: { quoteBlock: (m, group) => quoteBlock(m.quotes, { group }), withQuote },
+      handlers: { clicks: [rw.remote.clickHandler] }, // (as the worker registers the remote agents' buttons)
       ...(options.assistant ? { assistant: options.assistant } : {}),
       ...(options.limits ? { limits: options.limits } : {}),
     });

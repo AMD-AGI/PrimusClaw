@@ -106,12 +106,24 @@ test("test_a_group_message_never_goes_to_the_remote_agent_the_1on1_chat_is_attac
 
 test("test_a_remote_button_clicked_in_a_group_is_not_active_there", () =>
   routed(async (w) => {
-    const sid = await attachedThroughRouter(w);
-    const data = { primusclaw: "remote_decision", session_id: sid, action_id: "a", option_id: "allow_once" };
-    await w.r.router.handle(clickOf("primusclaw.remote_decision", data, { group: true, card: "card-9" }));
-    await w.rw.idle();
+    // A live permission request, its card on screen: its own Allow button is what is pressed in the group.
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      await srv.ask(sid, "act-1", "Edit", [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }]);
+    };
+    const sid = await attachedThroughRouter(w, script);
+    await w.r.router.handle(message("add a line to the README")); // (the turn now waits for the answer)
+    await w.rw.until(() => w.rw.permissionCards().length > 0);
+    const actions = (w.rw.permissionCards()[0]?.["actions"] ?? []) as Record<string, unknown>[];
+    const allow = actions.find((a) => (a["data"] as Record<string, unknown>)["option_id"] === "allow_once") ?? {};
+    const data = allow["data"] as Record<string, unknown>;
+    assert.equal(data["session_id"], sid);
+    await w.r.router.handle(clickOf(String(data["primusclaw"]), data, { group: true, card: "card-9" }));
     assert.equal(w.rw.last(), "That button is not active any more.");
     assert.deepEqual(w.rw.server.commandsOf("decision"), []);
+    // (the same button in the 1:1 chat is live: the group's press was refused for being in a group)
+    await w.r.router.handle(clickOf(String(data["primusclaw"]), data, { card: "card-9" }));
+    await w.rw.until(() => w.rw.server.commandsOf("decision").length === 1);
   }));
 
 test("test_unlinking_stops_everything_that_reads_with_the_key", () =>
