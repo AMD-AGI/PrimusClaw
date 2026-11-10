@@ -981,8 +981,11 @@ networkPolicy:
   sandboxIngress:
     enabled: false
     # Also admit this release's Brain and API pods, which reach Hands directly
-    # in kubernetes mode and in safe mode without secret.sandboxHandsViaRouter.
-    # "auto": exactly then; true / false: always / never.
+    # in kubernetes mode and in safe mode unless secret.sandboxHandsViaRouter
+    # is on (true, 1 or yes) with a non-empty secret.sandboxRouterUrl.
+    # "auto": exactly then, read from secret.*; true / false: always / never.
+    # A deployment that overrides those settings through api/brain extraEnv
+    # (EXTRA_ENV_*) instead of secret.* should set this explicitly.
     admitClaw: auto
     fromPods:
       - namespace: agent-sandbox-system

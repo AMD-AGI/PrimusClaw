@@ -228,7 +228,9 @@ elif case.startswith("claw-sandbox-ingress"):
                 for c in ("primus-claw-brain", "primus-claw-api")]
         admits_claw = {"claw-sandbox-ingress-direct": True, "claw-sandbox-ingress-router": False,
                        "claw-sandbox-ingress-k8s": True, "claw-sandbox-ingress-never": False,
-                       "claw-sandbox-ingress-always": True}[case]
+                       "claw-sandbox-ingress-always": True,
+                       "claw-sandbox-ingress-router-1": False, "claw-sandbox-ingress-router-yes": False,
+                       "claw-sandbox-ingress-router-no-url": True}[case]
         want = [want_cp] + (claw if admits_claw else [])
         if selectors != want:
             fail(f"selector peers {selectors}, want {want}")
@@ -316,6 +318,15 @@ check "$tmp/claw-sandbox-ingress-router.yaml" claw-sandbox-ingress-router
 render_claw "$tmp/claw-sandbox-ingress-k8s.yaml" -f "$tmp/si.yaml" --set secret.clawDeployMode=kubernetes \
   --set-string secret.sandboxHandsViaRouter=true
 check "$tmp/claw-sandbox-ingress-k8s.yaml" claw-sandbox-ingress-k8s
+# Brain's envBool spellings, and the flag without a Router base (Brain then
+# uses the sandbox's cluster DNS name).
+render_claw "$tmp/claw-sandbox-ingress-router-1.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=1
+check "$tmp/claw-sandbox-ingress-router-1.yaml" claw-sandbox-ingress-router-1
+render_claw "$tmp/claw-sandbox-ingress-router-yes.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=YES
+check "$tmp/claw-sandbox-ingress-router-yes.yaml" claw-sandbox-ingress-router-yes
+render_claw "$tmp/claw-sandbox-ingress-router-no-url.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true \
+  --set-string secret.sandboxRouterUrl=""
+check "$tmp/claw-sandbox-ingress-router-no-url.yaml" claw-sandbox-ingress-router-no-url
 render_claw "$tmp/claw-sandbox-ingress-never.yaml" -f "$tmp/si.yaml" --set networkPolicy.sandboxIngress.admitClaw=false
 check "$tmp/claw-sandbox-ingress-never.yaml" claw-sandbox-ingress-never
 render_claw "$tmp/claw-sandbox-ingress-always.yaml" -f "$tmp/si.yaml" --set-string secret.sandboxHandsViaRouter=true \

@@ -167,7 +167,11 @@ spec:
      proxy); only safe mode with sandboxHandsViaRouter goes through the
      control plane alone. */}}
 {{- $k8sMode := eq (.Values.secret.clawDeployMode | default "") "kubernetes" }}
-{{- $viaRouter := and (not $k8sMode) (eq (toString .Values.secret.sandboxHandsViaRouter) "true") }}
+{{- /* As Brain decides it: envBool (true, 1, yes) and at least one Router
+     base in sandboxRouterUrl (handsViaRouter in sandbox-router.ts). */}}
+{{- $viaFlag := has (lower (trim (toString .Values.secret.sandboxHandsViaRouter))) (list "true" "1" "yes") }}
+{{- $hasRouter := regexMatch "[^\\s,/]" (toString (.Values.secret.sandboxRouterUrl | default "")) }}
+{{- $viaRouter := and (not $k8sMode) $viaFlag $hasRouter }}
 {{- $admitMode := "auto" }}
 {{- if not (kindIs "invalid" $si.admitClaw) }}{{ $admitMode = toString $si.admitClaw }}{{ end }}
 {{- if not (has $admitMode (list "auto" "true" "false")) }}
