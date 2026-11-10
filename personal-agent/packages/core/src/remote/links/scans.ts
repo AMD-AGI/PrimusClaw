@@ -7,10 +7,9 @@
  * with no backtracking pattern. `mark(label, address)` says what a link becomes.
  */
 import { isPySpace, pyLstrip, pyRstrip, pySplit, pyStrip } from "../../text/py-text.js";
+import { CODE, DomainFinder, domains } from "./domains.js";
 
-/** Where a code span this scan made opens or closes (a backtick in the end, see `answer.ts`): the scans after it read it as the
- * backtick it will be, and an agent's own backtick left in the prose is told apart from it. */
-export const CODE = "\x02";
+export { CODE } from "./domains.js";
 
 const LINK_TEXT_MAX = 1000; // the words of a markdown link, at most
 const LINK_DEST_MAX = 2000; // its address, and an HTML tag, at most
@@ -309,10 +308,24 @@ function nextWww(text: string, low: string, at: number): number {
   return -1;
 }
 
-/** Where the next bare address (`scheme://`, `www.`, `mailto:`) at or after `at` starts, -1 if none. */
-function nextAddress(text: string, low: string, at: number): number {
-  const found = [nextScheme(text, at), nextWww(text, low, at), low.indexOf("mailto:", at)].filter((n) => n >= 0);
+/** Where the next bare address (`scheme://`, `www.`, `mailto:`, a bare domain) at or after `at` starts, -1 if none. */
+function nextAddress(finders: readonly ((at: number) => number)[], at: number): number {
+  const found = finders.map((next) => next(at)).filter((n) => n >= 0);
   return found.length > 0 ? Math.min(...found) : -1;
+}
+
+/** `next(at)` (where the first of something is at or after `at`, -1 if nowhere) for an `at` that never goes back: an answer
+ * still at or after `at` is the answer again, so a text with an address at every turn is searched once, not once per address. */
+function remembered(next: (at: number) => number): (at: number) => number {
+  let from = Infinity;
+  let found = -1;
+  return (at) => {
+    if (!(from <= at && (found < 0 || found >= at))) {
+      found = next(at);
+      from = at;
+    }
+    return found;
+  };
 }
 
 /** An address without the punctuation that ends its sentence, or the closing parentheses it did not open (counted once). One
@@ -339,13 +352,24 @@ function code(text: string): string {
  * a closing parenthesis it did not open; read with any markdown escape in it taken out, as the rich text reads it. */
 export function bare(text: string, mark: Mark): string {
   const low = asciiLower(text);
+  const bareDomains = new DomainFinder(text);
+  const finders = [
+    remembered((at) => nextScheme(text, at)),
+    remembered((at) => nextWww(text, low, at)),
+    remembered((at) => low.indexOf("mailto:", at)),
+    (at: number) => bareDomains.at(at),
+  ];
   const out: string[] = [];
   let i = 0;
   for (;;) {
-    const start = nextAddress(text, low, i);
+    const start = nextAddress(finders, i);
     if (start < 0) break;
+    // (a bare domain, not a `www.` one, is its run of labels, and goes on only with a port, a path, a query or a fragment:
+    // `example.com看看`)
+    const run = low.startsWith("www.", start) ? -1 : bareDomains.runEnd(start);
     let stop = start;
-    while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
+    if (run >= 0 && !":/?#".includes(text.charAt(run) || " ")) stop = run;
+    else while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
     const url = trim(text.slice(start, stop));
     out.push(text.slice(i, start));
     if (!url) {
@@ -410,4 +434,41 @@ function mailsIn(text: string): string {
   }
   out.push(text.slice(i));
   return out.join("");
+}
+
+/** Where the `@` of every mail address of `text` is (the rule `emails` makes code spans by). */
+function mailAts(text: string): number[] {
+  const found: number[] = [];
+  let i = 0;
+  for (let at = text.indexOf("@"); at >= 0; at = text.indexOf("@", i)) {
+    let start = at;
+    while (start > i && isMailLocal(charBefore(text, start))) start -= charBefore(text, start).length;
+    let stop = at + 1;
+    while (stop < text.length && isMailDomain(charAt(text, stop))) stop += charAt(text, stop).length;
+    const address = pyRstrip(text.slice(start, stop), ".-\\");
+    if (isMail(address)) {
+      found.push(at);
+      i = start + address.length;
+    } else {
+      i = at + 1;
+    }
+  }
+  return found;
+}
+
+/** A short line with no bare domain or mail address a client could link: a zero-width space before the dot of a domain's last
+ * label (`example\u200b.com`) and right after the `@` of a mail address. Neither shows. */
+export function breakDomainsAndMails(text: string): string {
+  const at = new Set<number>();
+  for (const [, end] of domains(text)) at.add(text.lastIndexOf(".", end - 1));
+  for (const sign of mailAts(text)) at.add(sign + 1);
+  if (at.size === 0) return text;
+  const cuts = [...at].sort((a, b) => a - b);
+  let out = "";
+  let from = 0;
+  for (const cut of cuts) {
+    out += `${text.slice(from, cut)}\u{200b}`;
+    from = cut;
+  }
+  return out + text.slice(from);
 }

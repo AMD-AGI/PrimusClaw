@@ -301,6 +301,9 @@ test("a code span made here pairs with no backtick of the text's own as sent", (
     "|",
     "\n- |",
     "\n---|---\n",
+    "example.com/p",
+    "docs.evil.md",
+    "x.co",
   ];
   const mail = /[\w.+-]@[\w-]+(?:\.[\w-]+)*\.[a-z]+(?!\w)/iu;
   const random = seeded(5);
@@ -312,6 +315,11 @@ test("a code span made here pairs with no backtick of the text's own as sent", (
     const outside = html.replace(/<code>[\s\S]*?<\/code>|<pre>[\s\S]*?<\/pre>/gu, "");
     assert.doesNotMatch(outside, mail, `${JSON.stringify(text)}: ${html}`);
     assert.ok(!outside.includes("://") && !outside.includes("www."), `${JSON.stringify(text)}: ${html}`);
+    assert.doesNotMatch(
+      outside,
+      /(?<![\w.@/-])(?:example\.com|docs\.evil\.md|x\.co)(?![\w.])/u,
+      `${JSON.stringify(text)}: ${html}`,
+    );
     // (an agent's own `<a href=...>` in a code span is text there: what may not be is a tag of the message's)
     assert.ok(!/<a[\s>]|<img[\s>]|href="/iu.test(html), `${JSON.stringify(text)}: ${html}`);
   }

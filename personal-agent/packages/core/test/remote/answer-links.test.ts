@@ -100,6 +100,11 @@ test("hostile text is made words in linear time", () => {
     "<a\u3000".repeat(80000),
     "\u{1d400}[".repeat(100000) + "]".repeat(100000),
     "\u{1d400}<".repeat(200000),
+    // (a bare domain at every turn, or labels that never end in one)
+    "x.co ".repeat(50000),
+    "a.".repeat(200000),
+    ("a".repeat(70) + ".").repeat(5000),
+    "www.x.co/".repeat(50000),
   ];
   for (const text of hostile) {
     const started = performance.now();
@@ -161,4 +166,63 @@ test("a character that lowers to two does not move where an address is read", ()
   assert.equal(inertAnswer("İİİİİwww."), "İİİİİwww​.");
   assert.equal(inertAnswer("see İİİ www.evil.example"), "see İİİ `www​.evil.example`");
   assert.equal(inertAnswer("İ<A HREF=https://e.example>go</a>"), "İgo (`e.example`)");
+});
+
+test("a bare domain is an address, and a file name or code is not", () => {
+  const domains: readonly (readonly [string, string])[] = [
+    ["example.com", "`example.com`"],
+    ["example.com/path", "`example.com`"],
+    ["Visit example.com.", "Visit `example.com`."],
+    ["sub.example.co.uk", "`sub.example.co.uk`"],
+    ["example\\.com", "`example.com`"],
+    ["api.github.io/x", "`api.github.io`"],
+    ["foo.app", "`foo.app`"],
+    ["evil.dev:8080/x", "`evil.dev`"],
+    ["EXAMPLE.COM", "`example.com`"],
+    ["a-b.org", "`a-b.org`"],
+    ["example.org?q=1", "`example.org`"],
+    ["example.net#top", "`example.net`"],
+    ["(example.com)", "(`example.com`)"],
+    ["example.ai", "`example.ai`"],
+    ["evil.md/login", "`evil.md`"],
+    ["docs.evil.md", "`docs.evil.md`"],
+    ["x.co", "`x.co`"],
+    ["_x.co_", "_`x.co`_"],
+    ["user.example.de/x", "`user.example.de`"],
+    ["\u8bbf\u95eeexample.com\u770b\u770b", "\u8bbf\u95ee`example.com`\u770b\u770b"],
+  ];
+  for (const [text, shown] of domains) assert.equal(inertAnswer(text), shown, text);
+  const words = [
+    "README.md",
+    "setup.py",
+    "run.sh",
+    "main.rs",
+    "self.id",
+    "user.name",
+    "arr.at",
+    "os.path",
+    "np.array",
+    "example.de",
+    "file.txt",
+    "v1.2",
+    "a.b",
+    "3.14",
+    "e.g.",
+    "node.js",
+    "package.json",
+    "index.html",
+    "image.png",
+    "archive.zip",
+    "a/b.com",
+    "my_module.py",
+    "version 1.2.3",
+  ];
+  for (const text of words) assert.equal(inertAnswer(text), text, text);
+});
+
+test("a short line breaks a bare domain and a mail address, and leaves a file name", () => {
+  assert.equal(neutral("Visit example.com/path"), "Visit example\u200b.com/path");
+  assert.equal(neutral("docs.evil.md README.md"), "docs.evil\u200b.md README.md");
+  assert.equal(neutral("me@evil.example"), "me@\u200bevil.example");
+  assert.equal(neutral("@user a@b x@1.2 self.id"), "@user a@b x@1.2 self.id");
 });

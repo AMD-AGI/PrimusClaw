@@ -1,5 +1,5 @@
 {
- "about": "remote_view.neutral(text, limit) after the fix: one short line of text an agent or a connector supplied (a connector's name, a health check's unknown detail, an agent's plan, a tool's title): control characters gone, credentials masked, `[`/`]` as `(`/`)`, `<`/`>` as look-alikes, a zero-width space after the colon of every `://` (the chat's rich text links a bare address by itself), clipped to `limit`. Generated from the Python worker; the TypeScript port must give the same.",
+ "about": "remote_view.neutral(text, limit) after the fix: one short line of text an agent or a connector supplied (a connector's name, a health check's unknown detail, an agent's plan, a tool's title): control characters gone, credentials masked, `[`/`]` as `(`/`)`, `<`/`>` as look-alikes, a zero-width space after the colon of every `://` (the chat's rich text links a bare address by itself), clipped to `limit`. Generated from the Python worker; the TypeScript port must give the same. A bare domain (the answer's rule) gets a zero-width space before the dot of its last label, and a mail address one right after its `@`.",
  "cases": [
   {
    "about": "connector name",
@@ -72,6 +72,30 @@
    "input": "connector www\\.evil.example",
    "limit": 200,
    "expected": "connector www​\\.evil.example"
+  },
+  {
+   "about": "a bare domain in a line",
+   "input": "see example.com/path or sub.example.co.uk",
+   "limit": 200,
+   "expected": "see example​.com/path or sub.example.co​.uk"
+  },
+  {
+   "about": "an escaped bare domain in a line",
+   "input": "example\\.com",
+   "limit": 200,
+   "expected": "example\\​.com"
+  },
+  {
+   "about": "a file name or code in a line is no domain",
+   "input": "README.md setup.py self.id v1.2 a/b.com",
+   "limit": 200,
+   "expected": "README.md setup.py self.id v1.2 a/b.com"
+  },
+  {
+   "about": "a mail address in a line",
+   "input": "write to me@evil.example (not @user or a@b)",
+   "limit": 200,
+   "expected": "write to me@​evil.example (not @user or a@b)"
   }
  ]
 }
