@@ -42,6 +42,7 @@ import type { ItemRefError } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
 import { requestedByOfItem } from "./requester-view.js";
+import { reviewQuestionZh } from "./review-questions.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
@@ -707,11 +708,16 @@ const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
   blocked: (i) => (i.pending_question ? `is blocked and needs your answer: ${i.pending_question}` : "is blocked and needs your help."),
   failed: () => "failed and needs your attention.",
 };
+/**
+ * The item's question for a person who writes Chinese: a review's question is the server's own English (`review-questions.ts`), read back
+ * into Chinese so the notice is not a Chinese frame around an English body (2026-11-10 daily gaps, N20); a worker's question is as it wrote it.
+ */
+const questionZh = (i: ItemRow): string => (i.pending_question ? reviewQuestionZh(i.pending_question) ?? i.pending_question : "");
 /** The same, for a person who writes Chinese (`personWritesChinese`). */
 const NEEDS_YOU_TEXT_ZH: Record<string, (item: ItemRow) => string> = {
   ready: (i) => `已完成，等你验收（v${i.result_version}）。`,
-  waiting: (i) => `需要你回复：${i.pending_question ?? ""}`,
-  blocked: (i) => (i.pending_question ? `卡住了，需要你回复：${i.pending_question}` : "卡住了，需要你帮忙。"),
+  waiting: (i) => `需要你回复：${questionZh(i)}`,
+  blocked: (i) => (i.pending_question ? `卡住了，需要你回复：${questionZh(i)}` : "卡住了，需要你帮忙。"),
   failed: () => "失败了，需要你看一下。",
 };
 

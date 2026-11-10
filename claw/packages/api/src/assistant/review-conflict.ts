@@ -13,6 +13,10 @@
  * has no `workflow` scope (`gh_pr_merge` refused `github_workflow_scope_missing`; 2026-11-09, daily gaps N17): no one can get past it
  * through Claw, binding again does not add the scope, and the pull request has to be merged by hand on GitHub. R is told so, the same way.
  *
+ * The same holds for a merge GitHub refused on merge state BLOCKED (2026-11-10, daily gaps N20): the branch's rules (a required check
+ * that has not passed, a required review still missing) stop it even after the review approved, and what unblocks it is the author's or
+ * CI's, not the reviewer's. Only the reviewer was told, so R, who waited on the merge, never learned it had stopped. R is told so, the same way.
+ *
  * What R is told is within what R may know of the item (`requester-view.ts`, which lists it): the pull request R named and one fact GitHub
  * shows on it to anyone who can read it, read through the reviewer's session as the view's `findings` and `merged` are; nothing of the
  * session itself (no summary, question or session id).
@@ -46,14 +50,30 @@ export function workflowScopeText(pr: string, url: string, zh: boolean): string 
       + `GitHub's workflow permission to merge it on someone's behalf, which it does not have. Please merge it by hand on GitHub. ${url}`;
 }
 
-/** Which refused merge R is told of, from the merge's audit row: a conflict (DIRTY), the missing `workflow` scope, or none. */
-function noticeOf(merge: { result: string; detail: string; merge_state: string | null }): "conflict" | "workflow_scope" | { skip: string; extra: Record<string, unknown> } {
+/** What R is told, by language, when GitHub's branch rules blocked the merge (merge state BLOCKED). */
+export function branchRulesText(pr: string, url: string, zh: boolean): string {
+  return zh
+    ? `你请人评审并合入的 ${pr} 没能合入：GitHub 的分支保护规则挡住了合入（比如必需的检查还没通过，或者还缺必需的评审）。需要作者或 CI 先满足这些规则，之后才能合入。${url}`
+    : `${pr}, which you asked to be reviewed and merged, was not merged: GitHub's branch protection rules block the merge (for example a required `
+      + `check has not passed, or a required review is still missing). The author or CI has to meet those rules before it can be merged. ${url}`;
+}
+
+type Notice = "conflict" | "workflow_scope" | "branch_rules";
+const NOTICE_TEXT: Record<Notice, (pr: string, url: string, zh: boolean) => string> = {
+  conflict: conflictText, workflow_scope: workflowScopeText, branch_rules: branchRulesText,
+};
+/** The notice's key prefix; the conflict's is the one it always had, so a conflict told before this is not told again. */
+const NOTICE_KEY: Record<Notice, string> = { conflict: "review_conflict", workflow_scope: "review_workflow_scope", branch_rules: "review_branch_rules" };
+
+/** Which refused merge R is told of, from the merge's audit row: a conflict (DIRTY), branch rules (BLOCKED), the missing `workflow` scope, or none. */
+function noticeOf(merge: { result: string; detail: string; merge_state: string | null }): Notice | { skip: string; extra: Record<string, unknown> } {
   if (merge.result === "refused" && merge.detail === WORKFLOW_SCOPE_REFUSAL) return "workflow_scope";
   if (merge.result !== "refused" || merge.detail !== "merge_state_not_clean") {
     return { skip: "merge_not_refused_on_state", extra: { result: merge.result, detail: merge.detail } };
   }
-  if (merge.merge_state !== "DIRTY") return { skip: "merge_state_not_dirty", extra: { mergeState: merge.merge_state ?? null } };
-  return "conflict";
+  if (merge.merge_state === "DIRTY") return "conflict";
+  if (merge.merge_state === "BLOCKED") return "branch_rules";
+  return { skip: "merge_state_not_told", extra: { mergeState: merge.merge_state ?? null } };
 }
 
 /** The ports a test stands in for: what reaches R. */
@@ -120,9 +140,8 @@ export async function tellRequesterOfConflict(itemId: string): Promise<boolean> 
     const zh = await personWritesChinese(q, requester);
     const url = `https://github.com/${merge.repo}/pull/${merge.pr}`;
     const told = await reviewConflictPorts.recordSystemNotice({
-      userId: requester, sessionId, text: kind === "conflict" ? conflictText(pr, url, zh) : workflowScopeText(pr, url, zh),
-      // The conflict's key is the one it always had, so a conflict told before this is not told again.
-      key: `${kind === "conflict" ? "review_conflict" : "review_workflow_scope"}:${item.item_id}:${merge.head_sha || "-"}`,
+      userId: requester, sessionId, text: NOTICE_TEXT[kind](pr, url, zh),
+      key: `${NOTICE_KEY[kind]}:${item.item_id}:${merge.head_sha || "-"}`,
     });
     if (told === null) return skipped("already_told", { requester, pr, head: merge.head_sha || "-", kind });
     logger.info({ itemId, requester, pr, kind }, "assistant.review_conflict_told");

@@ -403,7 +403,8 @@ A review asked of someone else meets the assistant in three places:
   (`.github/workflows/*`) cannot be merged, nor put in a merge queue, with a token that lacks GitHub's `workflow`
   scope; GitHub's 403 for it is refused as `github_workflow_scope_missing`, which says to merge it by hand on GitHub
   (binding again does not add the scope), and a review someone asked of another person tells the one who asked
-  so, as it tells them of a conflict (`assistant/review-conflict.ts`).
+  so, as it tells them of a conflict (merge state `DIRTY`) or of branch rules that still block the merge (`BLOCKED`)
+  (`assistant/review-conflict.ts`).
 - **High risk.** Whether an `APPROVE` or a merge is held for the acting user's own confirmation is
   decided in `packages/api/src/github-review/risk.ts` (`assessRisk`). Under the acting user's default review
   mode, `high_risk_confirm` (under `fully_auto` see the item above), it is held when
