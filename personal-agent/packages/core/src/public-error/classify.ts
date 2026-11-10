@@ -5,7 +5,7 @@
  * Whether a text the worker did not write carries internal detail, and where in a failed turn's answer the error that
  * ended it starts. Pure functions; `PublicErrorLog` (public-error-log.ts) is what withholds and logs.
  */
-import { cpHead, cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
+import { cpHead, cpLength, pyRstrip, pySplitlines, pyStrip } from "../text/py-text.js";
 import { ADDRESS, BRAIN_ERROR, FAILURE_WORDS, FENCE, INTERNAL, PUBLIC_LINK, SERVICE_ERROR } from "./patterns.js";
 
 /** How much of a text is looked at (the patterns stay cheap on a hostile text); a longer text is withheld. */
@@ -34,14 +34,6 @@ export function looksLikeFailure(text: unknown): boolean {
   return typeof text === "string" && (looksLikeServiceError(text) || failureAtAddress(text));
 }
 
-/** Python's `str.splitlines(keepends=True)`. */
-const BREAKS = "\\n\\r\\v\\f\\x1c\\x1d\\x1e\\x85\\u2028\\u2029";
-const LINE = new RegExp(`[^${BREAKS}]*(?:\\r\\n|[${BREAKS}]|$)`, "gu");
-
-function linesOf(text: string): string[] {
-  return (text.match(LINE) ?? []).filter((line) => line !== "");
-}
-
 interface Paragraph {
   readonly start: number;
   readonly text: string;
@@ -56,7 +48,7 @@ function paragraphsOf(text: string): Paragraph[] {
   let fenced = false;
   let inFence = false;
   let pos = 0;
-  for (const line of linesOf(text)) {
+  for (const line of pySplitlines(text, true)) {
     if (FENCE.test(line)) {
       inFence = !inFence;
       fenced = true;
