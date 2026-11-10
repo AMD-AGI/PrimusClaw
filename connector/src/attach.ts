@@ -830,9 +830,12 @@ export class AttachSupport {
       // Read whole, once, then only what was appended since (codex r2 on #632: a message queued long ago is still queued, so the
       // count of queued messages cannot start in the middle of the file). A transcript larger than this is not read: no answer.
       let seen = this.turnScans.get(file);
-      if (!seen || seen.ino !== st.ino || st.size < seen.offset) {
+      // Resumed only where what was read is still there: the same file, at least as long, and the bytes just before where the last
+      // read stopped unchanged (a file rewritten in place is read whole again, codex r3 on #632).
+      if (seen && (seen.ino !== st.ino || st.size < seen.offset || !(await sameBytes(fh, seen.offset, seen.tail)))) seen = undefined;
+      if (!seen) {
         if (st.size > MAIN_TURN_SCAN_MAX_BYTES) return null;
-        seen = { ino: st.ino, offset: 0, queued: 0, last: null };
+        seen = { ino: st.ino, offset: 0, queued: 0, last: null, tail: Buffer.alloc(0) };
       }
       if (st.size - seen.offset > MAIN_TURN_SCAN_MAX_BYTES) return null;
       const len = st.size - seen.offset;
@@ -857,7 +860,10 @@ export class AttachSupport {
         else if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment") last = "under_way";
       }
       const offset = seen.offset + Buffer.byteLength(text.slice(0, end), "utf8");
-      this.turnScans.set(file, { ino: st.ino, offset, queued, last });
+      const tailLen = Math.min(offset, CONTINUITY_BYTES);
+      const tail = Buffer.alloc(tailLen);
+      if (tailLen) await fh.read(tail, 0, tailLen, offset - tailLen);
+      this.turnScans.set(file, { ino: st.ino, offset, queued, last, tail });
       while (this.turnScans.size > 64) this.turnScans.delete(this.turnScans.keys().next().value!);
       if (end < text.length) return false;   // (an entry is being written: something is under way)
       if (queued > 0) return false;
@@ -870,7 +876,7 @@ export class AttachSupport {
   }
 
   /** What each transcript's main thread was found to be, up to which byte (`mainTurnEnded`, read incrementally). */
-  private turnScans = new Map<string, { ino: number; offset: number; queued: number; last: "ended" | "under_way" | null }>();
+  private turnScans = new Map<string, { ino: number; offset: number; queued: number; last: "ended" | "under_way" | null; tail: Buffer }>();
 
   /** The size of the conversation's transcript now, or null when there is none to look at. */
   transcriptSize(ref: string): number | null {
@@ -1186,6 +1192,17 @@ export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; w
   // `shell`: idle at its prompt with background shells still running (Claude Code 2.1.32x), as free to type into as `idle`.
   if (holders.some((e) => isIdleStatus(e.status))) return { activity: "idle" };
   return {};
+}
+
+/** How many bytes before where a transcript was last read are kept to tell it was not rewritten since. */
+const CONTINUITY_BYTES = 4096;
+
+/** Whether the `tail.length` bytes of `fh` just before `offset` are `tail`. */
+async function sameBytes(fh: fsp.FileHandle, offset: number, tail: Buffer): Promise<boolean> {
+  if (!tail.length) return offset === 0;
+  const now = Buffer.alloc(tail.length);
+  const { bytesRead } = await fh.read(now, 0, tail.length, offset - tail.length);
+  return bytesRead === tail.length && now.equals(tail);
 }
 
 /** A transcript larger than this is not read to tell whether its main turn has ended (no answer: a busy terminal waits). */

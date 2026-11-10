@@ -545,7 +545,8 @@ export class Session {
         };
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
-        const gated = viaBusy || this.holderStatus(term) === "busy";
+        // (a message let in as idle whose terminal says busy by now is refused below, not sent through the busy gate late)
+        const gated = viaBusy;
         // (the screen must show no running turn on every path; a terminal let in as idle that says busy by now is not typed into:
         // only the busy gate admits a busy one, codex r2 on #632)
         const again = gated
