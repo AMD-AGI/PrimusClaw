@@ -414,6 +414,7 @@ teams/tests/test_github_review_many.py::test_each_pull_request_gets_its_own_conf
 teams/tests/test_review_pr_summary.py::test_a_review_s_message_has_no_link_hidden_behind_the_sentence -> packages/core/test/review/review-pr-summary.test.ts::a review s message has no link hidden behind the sentence
 teams/tests/test_github_repo_scope.py::test_the_reconnect_line_never_holds_the_question_up -> packages/core/test/review/scope-hint.test.ts::the reconnect line never holds the question up
 teams/tests/test_github_repo_scope.py::test_repositories_are_read_from_links_and_names_next_to_a_github_word -> packages/core/test/review/github-connect.test.ts::repositories are read from links and names next to a github word
+teams/tests/test_review_pr_summary.py::test_a_tool_answer_gives_it_only_for_the_review_and_merge_tools -> packages/core/test/review/pr-summary-tools.test.ts::a tool answer gives it only for the review and merge tools
 
 # LATER: tests of another line's code, to be ported by that line (the checker skips comment lines; one per Python test).
 # LATER: W2 (HTTP client contract (ClawClient wire)) teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out
@@ -447,7 +448,6 @@ teams/tests/test_github_repo_scope.py::test_repositories_are_read_from_links_and
 # LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_one_message.py::test_a_review_stopped_after_its_result_keeps_the_result_in_its_one_message
 # LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_one_message.py::test_a_review_that_fails_after_its_result_keeps_the_result_in_its_one_message
 # LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_items.py::test_a_worker_with_the_plugin_follows_claws_session_and_never_makes_one_of_its_own
-# LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_pr_summary.py::test_a_tool_answer_gives_it_only_for_the_review_and_merge_tools
 # LATER: W4b (turn engine (session creation, plugin, fallback, stream end)) teams/tests/test_review_model_default.py::test_an_ordinary_chat_still_sends_clawy_model
 # LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_an_asker_without_a_key_of_her_own_can_stop_what_she_asked_of_bob
 # LATER: W5 (work-item Stop card clicks, approvals of acting sessions, subscriptions, assistant path) teams/tests/test_review_items.py::test_stop_on_the_card_stops_that_item_as_the_asker_and_says_so
