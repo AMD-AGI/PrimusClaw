@@ -44,6 +44,7 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
+import { reviewQuestionZh } from "../src/assistant/review-questions.js";
 import { startWorld, type World } from "./support/assistant-world.js";
 
 const skip = postgresSkipReason();
@@ -1089,6 +1090,12 @@ describe("assistant review items", { skip }, () => {
       const s = ri.reviewState({ ...base, ...facts } as never);
       const got = s.boardState === "done" ? `done/${s.outcome}` : s.boardState === "needs_you" ? `needs_you/${s.reportKind}` : s.boardState;
       assert.equal(got, expected, name);
+      // Every question the state asks reads back into Chinese for a reviewer who writes it (N20), with the pull request kept.
+      const question = s.boardState === "done" ? null : s.question;
+      if (question) {
+        const zh = reviewQuestionZh(question);
+        assert.ok(zh && /[\u4e00-\u9fff]/.test(zh) && (!question.includes("AMD-AGI/PrimusClaw#7") || zh.includes("AMD-AGI/PrimusClaw#7")), `${name}: ${question} -> ${zh}`);
+      }
     }
     const waiting = ri.reviewState({ ...base, actingAs: "bob", actingAsName: "Bob B", confirmations: [c("pending")] } as never);
     assert.equal(waiting.boardState === "in_progress" && waiting.question, "Waiting for Bob B to confirm the merge");

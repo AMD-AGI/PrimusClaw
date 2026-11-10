@@ -37,6 +37,7 @@ import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from
 import { queueRouterWake, tellUnwoken } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
 import { checkConflictLater } from "./review-conflict.js";
+import { REVIEW_QUESTIONS as RQ } from "./review-questions.js";
 import { clipOneLine, getWorkItem, insertWorkItem, itemView, MAX_QUEUED_ITEMS, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { modelAnswer, modelChoiceOn, ModelChoiceRefused, resolveItemModel, type ResolvedModel } from "./model-choice.js";
@@ -1133,8 +1134,8 @@ export function reviewState(f: ReviewFacts): ReviewState {
   if (pending) {
     const what = pending.kind === "review" ? "the approval" : "the merge";
     // Waiting for someone else is still work in progress for the owner; waiting for the owner is theirs to do.
-    if (own) return { boardState: "needs_you", reportKind: "blocked", summary: `${what} of ${pr} is held`, question: `Confirm or deny ${what} of ${pr}` };
-    return { boardState: "in_progress", summary: `${what} of ${pr} is held`, question: `Waiting for ${f.actingAsName || f.actingAs} to confirm ${what}` };
+    if (own) return { boardState: "needs_you", reportKind: "blocked", summary: `${what} of ${pr} is held`, question: (pending.kind === "review" ? RQ.confirmApproval : RQ.confirmMerge).en(pr) };
+    return { boardState: "in_progress", summary: `${what} of ${pr} is held`, question: (pending.kind === "review" ? RQ.waitingForApproval : RQ.waitingForMerge).en(f.actingAsName || f.actingAs) };
   }
   if (f.turn === "running") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   const submitted = latest([
@@ -1143,28 +1144,28 @@ export function reviewState(f: ReviewFacts): ReviewState {
   ]);
   // A review the server stopped before its turn ran: the owner's to look at, with the reason; never a review in progress for ever.
   if (f.halted && !submitted) {
-    return { boardState: "needs_you", reportKind: "failed", summary: `${pr} not run: ${f.halted.message}`, question: `Look at the review of ${pr}` };
+    return { boardState: "needs_you", reportKind: "failed", summary: `${pr} not run: ${f.halted.message}`, question: RQ.lookAtReview.en(pr) };
   }
   if (f.turn === "none") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status)));
   if (closed && (!submitted || closed.at >= submitted.at)) {
     switch (closed.status) {
       case "denied": return { boardState: "done", outcome: "stopped", summary: `the held write to ${pr} was denied` };
-      case "stale": return { boardState: "needs_you", reportKind: "blocked", summary: `${pr} got new commits, so the held write lapsed`, question: `Review ${pr} again?` };
-      case "expired": return { boardState: "needs_you", reportKind: "blocked", summary: `nobody answered the held write to ${pr} in time`, question: `Review ${pr} again?` };
-      default: return { boardState: "needs_you", reportKind: "blocked", summary: `the confirmed write to ${pr} was refused by a gate`, question: `Look at ${pr}` };
+      case "stale": return { boardState: "needs_you", reportKind: "blocked", summary: `${pr} got new commits, so the held write lapsed`, question: RQ.reviewAgain.en(pr) };
+      case "expired": return { boardState: "needs_you", reportKind: "blocked", summary: `nobody answered the held write to ${pr} in time`, question: RQ.reviewAgain.en(pr) };
+      default: return { boardState: "needs_you", reportKind: "blocked", summary: `the confirmed write to ${pr} was refused by a gate`, question: RQ.lookAt.en(pr) };
     }
   }
   const mergeRefused = latest(f.writes.filter((w) => w.tool === "gh_pr_merge" && w.result === "refused"));
   if (!f.reviewOnly && mergeRefused && (!submitted || mergeRefused.at >= submitted.at)) {
-    return { boardState: "needs_you", reportKind: "blocked", summary: `the merge of ${pr} was refused: ${mergeRefused.detail}`, question: `Look at ${pr}` };
+    return { boardState: "needs_you", reportKind: "blocked", summary: `the merge of ${pr} was refused: ${mergeRefused.detail}`, question: RQ.lookAt.en(pr) };
   }
   if (submitted) return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted` };
-  if (f.turn === "failed") return { boardState: "needs_you", reportKind: "failed", summary: `the review of ${pr} failed`, question: `Restart the review of ${pr}?` };
+  if (f.turn === "failed") return { boardState: "needs_you", reportKind: "failed", summary: `the review of ${pr} failed`, question: RQ.restartReview.en(pr) };
   if (f.writes.some((w) => w.result === "ok" && w.detail === "dry_run")) {
-    return { boardState: "needs_you", reportKind: "blocked", summary: `writes are off on this deployment: nothing was posted to ${pr}`, question: `Look at ${pr}` };
+    return { boardState: "needs_you", reportKind: "blocked", summary: `writes are off on this deployment: nothing was posted to ${pr}`, question: RQ.lookAt.en(pr) };
   }
-  return { boardState: "needs_you", reportKind: "blocked", summary: `the review of ${pr} ended without posting anything`, question: `Look at the review session of ${pr}` };
+  return { boardState: "needs_you", reportKind: "blocked", summary: `the review of ${pr} ended without posting anything`, question: RQ.lookAtSession.en(pr) };
 }
 
 async function readFacts(q: StatementRunner, row: { user_id: string; worker_session_id: string; params: ReviewParams }): Promise<ReviewFacts> {

@@ -15,6 +15,8 @@
  *       one who asked is told from there, once per head commit; a sync that finds the same state again tells nothing new
  *   C4  a merge GitHub refused for the missing `workflow` scope (`github_workflow_scope_missing`, 2026-11-09, N17) is told to the one who
  *       asked the same way: the pull request changes CI workflow files and has to be merged by hand on GitHub; once per head commit
+ *   C5  a merge GitHub refused on merge state BLOCKED (branch protection rules, after the approval; 2026-11-10, N20) is told to the one
+ *       who asked the same way: the branch rules block it and the author or CI has to meet them; once per head commit, in her language
  * The check runs after the report is answered, not waited for (`checkConflictLater`): the tests wait for it (`conflictChecksSettled`).
  * The audit rows are written as the review service writes them; that it records GitHub's merge state on a refused merge is
  * github-review-service.test.ts M8c.
@@ -233,6 +235,51 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     // Nor to bob through this path, and not for his own review.
     const own = await reviewFor(null);
     await merged(own, "refused", "github_workflow_scope_missing", null);
+    await blocked(own);
+    assert.equal((await toldAlice()).length, 2);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
+  });
+
+  test("C5 a merge blocked by the branch's protection rules (BLOCKED) after the approval is told to the one who asked: the author or CI has to meet them", async () => {
+    // The shape of 2026-11-10 06:49Z (daily gaps N20): the review was posted, the merge refused on BLOCKED, and only the reviewer was told.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    const run = await w.openRun(item.workerSid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, at)
+       VALUES ('alice', 'bob', $1, 'gh_review_submit', 'AMD-AGI/demo', $2, $3, 'ok', 'submitted', NOW() - interval '10 seconds')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED");
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 没能合入：GitHub 的分支保护规则挡住了合入`), told[0].text);
+    assert.match(told[0].text, /需要作者或 CI 先满足这些规则/);
+    assert.doesNotMatch(told[0].text, /[A-Za-z]{4,} [A-Za-z]{4,}/, "no English sentence in a Chinese notice");
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // The same head again: not told twice.
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED");
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // A new head still blocked, to one who writes English: told again, in English.
+    await w.q("UPDATE claw_assistant_messages SET content = 'Please ask bob to review and merge it' WHERE user_id = 'alice'");
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED", "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    assert.match(told[1].text, new RegExp(`^AMD-AGI/demo#${item.pr}, which you asked to be reviewed and merged, was not merged: GitHub's branch protection rules block the merge`));
+    assert.match(told[1].text, /The author or CI has to meet those rules/);
+    // Nor to bob through this path, and not for his own review.
+    const own = await reviewFor(null);
+    await merged(own, "refused", "merge_state_not_clean", "BLOCKED");
     await blocked(own);
     assert.equal((await toldAlice()).length, 2);
     assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);

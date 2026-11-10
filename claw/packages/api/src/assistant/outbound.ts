@@ -42,6 +42,7 @@ import type { ItemRefError } from "./item-ref.js";
 import { detectLanguage, languageToAnswerIn } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
 import { requestedByOfItem } from "./requester-view.js";
+import { reviewQuestionZh } from "./review-questions.js";
 
 const logger = pino({ name: "assistant-outbound" });
 
@@ -707,17 +708,24 @@ const NEEDS_YOU_TEXT: Record<string, (item: ItemRow) => string> = {
   blocked: (i) => (i.pending_question ? `is blocked and needs your answer: ${i.pending_question}` : "is blocked and needs your help."),
   failed: () => "failed and needs your attention.",
 };
+/**
+ * The item's question for a person who writes Chinese: a review's question is the server's own English (`review-questions.ts`), read back
+ * into Chinese so the notice is not a Chinese frame around an English body (2026-11-10 daily gaps, N20); any other item's question is its
+ * worker's, as it wrote it (a worker's "Look at the risk report" is not a review's "Look at <pull request>").
+ */
+const questionZh = (i: ItemRow, review: boolean): string =>
+  (i.pending_question ? (review ? reviewQuestionZh(i.pending_question) : null) ?? i.pending_question : "");
 /** The same, for a person who writes Chinese (`personWritesChinese`). */
-const NEEDS_YOU_TEXT_ZH: Record<string, (item: ItemRow) => string> = {
+const NEEDS_YOU_TEXT_ZH: Record<string, (item: ItemRow, review: boolean) => string> = {
   ready: (i) => `已完成，等你验收（v${i.result_version}）。`,
-  waiting: (i) => `需要你回复：${i.pending_question ?? ""}`,
-  blocked: (i) => (i.pending_question ? `卡住了，需要你回复：${i.pending_question}` : "卡住了，需要你帮忙。"),
+  waiting: (i, review) => `需要你回复：${questionZh(i, review)}`,
+  blocked: (i, review) => (i.pending_question ? `卡住了，需要你回复：${questionZh(i, review)}` : "卡住了，需要你帮忙。"),
   failed: () => "失败了，需要你看一下。",
 };
 
-function needsYouText(item: ItemRow, zh = false): string {
+function needsYouText(item: ItemRow, zh = false, review = false): string {
   if (zh) {
-    const what = (NEEDS_YOU_TEXT_ZH[item.last_report_kind ?? ""] ?? (() => "需要你处理。"))(item);
+    const what = (NEEDS_YOU_TEXT_ZH[item.last_report_kind ?? ""] ?? (() => "需要你处理。"))(item, review);
     return `#${item.seq} ${item.title} ${what}`;
   }
   const what = (NEEDS_YOU_TEXT[item.last_report_kind ?? ""] ?? (() => "needs your attention."))(item);
@@ -945,14 +953,14 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
   const where = await itemSession(q, item.item_id);
   // No session is read: nothing is stored, so a later call (the sweep's, once a session exists) says it.
   if (!where) return null;
-  const held = (await q("SELECT params, worker_session_id FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
-    { params: Record<string, unknown> | null; worker_session_id: string | null } | undefined;
+  const held = (await q("SELECT params, worker_session_id, kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
+    { params: Record<string, unknown> | null; worker_session_id: string | null; kind: string | null } | undefined;
   const params = answered ? null : held?.params ?? null;
   const heldWrite = answered ? null : heldWriteCard(item, params, held?.worker_session_id ?? null);
   const zh = await personWritesChinese(q, item.user_id, item.title, requestedByOfItem(held?.params ?? null));
   const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
-    : heldWriteText(item, params) ?? needsYouText(item, zh);
+    : heldWriteText(item, params) ?? needsYouText(item, zh, held?.kind === "review");
   const text = where.moved ? `${zh ? MOVED_PREFIX_ZH : MOVED_PREFIX_EN}${said}` : said;
   return {
     type: "work_item.needs_you",
