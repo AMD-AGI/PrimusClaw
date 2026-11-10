@@ -270,10 +270,119 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     emptyRow(dir, blind.pid!);
     emptyRow(dir, other.pid!);   // (an unreadable row of a process that is not Claude Code says nothing about a conversation)
     registryRow(dir, 4242, { procStart: "1" });
-    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, pgid: processGroup(blind.pid!), cwd: work }]);
+    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, pgid: processGroup(blind.pid!), cwd: work, sessionId: null }]);
     assert.equal(isClaudeArgv(["claude"]), true);
     assert.equal(isClaudeArgv(["/usr/bin/node", "/opt/x/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
     assert.equal(isClaudeArgv(["node", "/opt/claude-agent-acp/dist/index.js"]), false);
+  });
+
+  test("the conversation it has open is proven by the task folder it holds, only where nothing else of its folder may be it", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-blind-"));
+    const project = work.replace(/[^A-Za-z0-9]/g, "-");
+    const uid = process.getuid!();
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const blind = spawn(process.execPath, ["-e", "require('fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000)", tasks], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(blind);
+    await new Promise((r) => setTimeout(r, 300));
+    emptyRow(dir, blind.pid!);
+    const transcripts = path.join(dir, "projects", project);
+    fs.mkdirSync(transcripts, { recursive: true });
+    const titled = (ref: string, title: string | null, ageMs = 0, entrypoint = "cli") => {
+      const f = path.join(transcripts, `${ref}.jsonl`);
+      fs.writeFileSync(f, `${JSON.stringify({ type: "user", sessionId: ref, entrypoint })}\n${title === null ? "" : `${JSON.stringify({ type: "custom-title", customTitle: title, sessionId: ref })}\n`}`);
+      const t = (Date.now() - ageMs) / 1000;
+      fs.utimesSync(f, t, t);
+    };
+    const T = "autopilot重构";
+    const proven = async (shown: string | null = T, u = uid) =>
+      (await blindHolders(dir, "/proc", u, async () => shown)).find((b) => b.pid === blind.pid)?.sessionId;
+    // Not written since the process started: nothing says it is this process's (it may have moved on with /clear).
+    titled(REF, T, 3_600_000);
+    assert.equal(await proven(), null, "not written since it started");
+    titled(REF, T);
+    // An old conversation, and a headless one since without a name: its screen names the held one, which no other shares.
+    titled(REF2, "blog", 3_600_000);
+    titled(REF3, null, 0, "sdk-cli");
+    assert.equal(await proven(), REF, "its screen names the held conversation");
+    assert.equal(await proven(null), null, "its screen names none");
+    assert.equal(await proven("blog"), null, "its screen names another one: it moved there");
+    assert.equal((await blindHolders(dir)).find((b) => b.pid === blind.pid)?.sessionId, null, "the task folder alone proves nothing (no pane here)");
+    // Another user's view of it proves nothing: the uid in the folder's name is not the caller's.
+    assert.equal(await proven(T, uid + 1), null, "another uid");
+    // Another conversation written since, named otherwise, held by another process's row or not: the screen still tells them apart.
+    titled(REF2, "blog");
+    assert.equal(await proven(), REF, "another one written since, named otherwise");
+    const other = claudeNamed(work);
+    await new Promise((r) => setTimeout(r, 100));
+    registryRow(dir, other.pid!, { sessionId: REF2, procStart: processStart(other.pid!) });
+    assert.equal(await proven(), REF, "another one a live row names, named otherwise");
+    // ... but one that may share the name: the same name, a name too far back to be seen, one that cannot be read (codex r5, Wei Lei).
+    titled(REF2, T);
+    assert.equal(await proven(), null, "another one with the same name");
+    titled(REF2, null);
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, toolUseResult: "x".repeat(1_200_000) })}\n`);
+    assert.equal(await proven(), null, "another one whose name may be further back than what is read");
+    // A readable one with a malformed line, or a name entry that is not a name: what it is named is not known (codex r9).
+    fs.writeFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, entrypoint: "cli" })}\n{"type": "custom-title", "customTitle": "${T}\n`);
+    assert.equal(await proven(), null, "another one with a malformed line");
+    fs.writeFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "custom-title", customTitle: 7, sessionId: REF2 })}\n`);
+    assert.equal(await proven(), null, "another one whose name entry holds no name");
+    titled(REF2, "x".repeat(600));
+    assert.equal(await proven(), REF, "another one with a long name of its own");
+    // A name read, then something after it that may be a newer one: what it is named now is not known (codex r10).
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type": "custom-title", "customTitle": "${T}\n`);
+    assert.equal(await proven(), null, "a malformed line after its name");
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "custom-title", customTitle: null, sessionId: REF2 })}\n`);
+    assert.equal(await proven(), null, "a name entry with no name after its name");
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type":"custom-ti`);
+    assert.equal(await proven(), null, "a name entry being written after its name");
+    // A last line still being written that cannot be a name entry (the agent's output, mid-write) says nothing about its name.
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type":"assistant","message":{"content":"half`);
+    assert.equal(await proven(), REF, "a line being written that is no name entry");
+    fs.rmSync(path.join(transcripts, `${REF2}.jsonl`));
+    fs.mkdirSync(path.join(transcripts, `${REF2}.jsonl`));   // (a "transcript" that cannot be read: open succeeds, the read fails)
+    assert.equal(await proven(), null, "another one that cannot be read");
+    fs.rmdirSync(path.join(transcripts, `${REF2}.jsonl`));
+    fs.symlinkSync(path.join(transcripts, "nowhere"), path.join(transcripts, `${REF2}.jsonl`));
+    assert.equal(await proven(), null, "another one that cannot even be looked at (codex r6)");
+    fs.rmSync(path.join(transcripts, `${REF2}.jsonl`));
+    // A headless writer since says nothing about this process not being on it too (codex r8): it is a candidate like any other.
+    titled(REF3, T, 0, "sdk-cli");
+    assert.equal(await proven(), null, "a headless one with the same name");
+    titled(REF3, null, 0, "sdk-cli");
+    // The held conversation has no name: nothing on its screen can show it.
+    titled(REF, null);
+    assert.equal(await proven(), null, "the held conversation has no name");
+    titled(REF, T);
+    assert.equal(await proven(), REF);
+    // A second task folder it holds that was deleted (or cannot be looked at) is a doubt about which one it is on: no proof.
+    const tasks2 = path.join(path.dirname(path.dirname(tasks)), REF2, "tasks");
+    fs.mkdirSync(tasks2, { recursive: true });
+    const two = spawn(process.execPath, ["-e", "const fs = require('fs'); fs.openSync(process.argv[1], 'r'); fs.openSync(process.argv[2], 'r'); setInterval(() => {}, 1000)", tasks, tasks2], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(two);
+    await new Promise((r) => setTimeout(r, 300));
+    registryRow(dir, blind.pid!, { sessionId: REF3, procStart: processStart(blind.pid!) });   // (the only process whose row is torn: this one)
+    emptyRow(dir, two.pid!);
+    titled(REF, T);
+    assert.equal((await blindHolders(dir, "/proc", uid, async () => T)).find((b) => b.pid === two.pid)?.sessionId, null, "two task folders");
+    fs.rmSync(path.dirname(tasks2), { recursive: true });
+    assert.equal((await blindHolders(dir, "/proc", uid, async () => T)).find((b) => b.pid === two.pid)?.sessionId, null, "a deleted second task folder");
+    await stop(two);
+    emptyRow(dir, blind.pid!);
+    // Two such processes in the folder: which one wrote what cannot be told.
+    const second = claudeNamed(work);
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, second.pid!);
+    assert.deepEqual((await blindHolders(dir)).map((b) => b.sessionId), [null, null]);
+    await stop(second);
+    await stop(other);
+    await stop(blind);
   });
 
   test("the twin check refuses: it cannot tell that the conversation is free, and a second writer is never started", { skip: process.platform !== "linux" }, async () => {

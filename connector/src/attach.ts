@@ -35,7 +35,7 @@ import { REMOTE_AGENT_LIMITS } from "./protocol.js";
 import { redactText } from "./redact.js";
 import { checkCwd, resolveCwd } from "./roots.js";
 import { within } from "./statefile.js";
-import { findPane, type PaneLookup } from "./terminal-input.js";
+import { boxName, findPane, tmuxRunner, type PaneLookup } from "./terminal-input.js";
 import { SESSION_ID_RE, localPidDomain, readTerminals, readTerminalsAsync, terminalsDir } from "./terminals.js";
 import { errMessage, isObject, type Logger } from "./util.js";
 
@@ -86,8 +86,11 @@ export interface LiveEntry {
   cwd?: string | null;
   /** Registered by a process this machine cannot see (another host or container sharing the directory): not provably gone. */
   foreign: boolean;
-  /** Read from the rows the terminal hooks keep, not from Claude Code's own registry. */
-  via?: "hook";
+  /**
+   * `hook`: read from the rows the terminal hooks keep, not from Claude Code's own registry. `blind`: a process whose registry row
+   * cannot be read, proven to hold it by what it has open ({@link provenBlindHold}); Claude Code says nothing of what it is doing.
+   */
+  via?: "hook" | "blind";
 }
 
 export type Verdict =
@@ -409,9 +412,32 @@ export class AttachSupport {
    */
   private blindScan: Promise<BlindHolder[]> | null = null;
 
+  /** The conversation each proven blind holder has open, from the last scan (pid -> ref): what {@link holderStatus} reads. */
+  private blindHeld = new Map<number, string>();
+
   private scanBlind(): Promise<BlindHolder[]> {
-    this.blindScan ??= blindHolders(this.configDir).finally(() => { this.blindScan = null; });
+    this.blindScan ??= blindHolders(this.configDir).then((list) => {
+      this.blindHeld = new Map(list.filter((b) => b.sessionId !== null).map((b) => [b.pid, b.sessionId!]));
+      return list;
+    }).finally(() => { this.blindScan = null; });
     return this.blindScan;
+  }
+
+  /**
+   * A fresh look at the processes whose registry row cannot be read (what {@link holderStatus} then says of them). False when the
+   * look did not answer in time (or failed): what {@link holderStatus} says of them is then not fresh.
+   */
+  async refreshBlind(): Promise<boolean> {
+    // (a scan already under way may have started before the caller's wait ended: a new one is started after it, and a scan that
+    // is stuck on a stalled disk is no answer either; codex r2)
+    const prior = this.blindScan;
+    if (prior && !(await within(prior.then(() => true, () => true), BLIND_CHECK_MS, false))) {
+      this.blindHeld = new Map();
+      return false;
+    }
+    const fresh = await within(this.scanBlind().then(() => true, () => false), BLIND_CHECK_MS, false);
+    if (!fresh) this.blindHeld = new Map();   // (nothing proven, until a scan answers again)
+    return fresh;
   }
 
   async resumable(capMs = 3_000): Promise<Resumable[]> {
@@ -435,7 +461,8 @@ export class AttachSupport {
       let state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
       // A Claude Code process here whose registry row cannot be read may be the one that has it open: not "idle" (which a
       // client offers to take over, starting a second writer), but "unknown".
-      if (state === "idle" && (blind === null || blind.some((b) => mayHold(b, l.cwd)))) state = "unknown";
+      // One proven to have a conversation open holds that one (it is among `live`) and no other.
+      if (state === "idle" && (blind === null || blind.some((b) => b.sessionId === null && mayHold(b, l.cwd)))) state = "unknown";
       const out: Resumable = { ref: l.ref, title: l.title, cwd: l.cwd, updated_at: Math.floor(l.updatedAt / 1000), state };
       if (state === "live") {
         Object.assign(out, liveActivity(holders));
@@ -580,7 +607,8 @@ export class AttachSupport {
       const own = new Set(this.d.registry.list().map((r) => r.pgid));
       const scanned = await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null);
       if (scanned === null) return { ok: false, reason: "twin_check_failed", detail: "the Claude Code session registry did not answer in time" };
-      const blind = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && (cwd === null || mayHold(b, cwd)));
+      // (one proven to hold a conversation holds only that one, and is among the live entries above when it is this one)
+      const blind = scanned.find((b) => (b.pgid === null || !own.has(b.pgid)) && b.sessionId === null && (cwd === null || mayHold(b, cwd)));
       if (blind) return { ok: false, reason: "twin_check_failed", detail: describeBlind(blind, this.configDir) };
     }
     if (o.transcript) {
@@ -683,6 +711,10 @@ export class AttachSupport {
         if (e.sessionId.toLowerCase() === want) out.set(e.pid, typeof e.cwd === "string" ? e.cwd : null);
       }
     } catch { /* the rows below may still prove it */ }
+    // A process whose row cannot be read, proven to hold it by what it has open (`provenBlindHold`), with its own folder.
+    for (const b of (await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? []) {
+      if (b.sessionId === want && !out.has(b.pid)) out.set(b.pid, b.cwd);
+    }
     if (this.localDomain === null) return out;
     for (const dir of [path.join(this.configDir, "sessions"), terminalsDir(this.configDir)]) {
       let names: string[] = [];
@@ -730,6 +762,13 @@ export class AttachSupport {
       out = registry;
     } else {
       throw new TwinCheckError(`cannot tell which sessions are open: "${this.agent.attach?.cli ?? "claude"} agents --json" failed (${cliError}) and the session registry could not be read (${registryError})`);
+    }
+    // A process whose row cannot be read, proven to hold a conversation by what it has open, holds it as a row would say.
+    const own = new Set(this.d.registry.list().map((r) => r.pgid));
+    const blind = (await within(this.scanBlind().catch(() => [] as BlindHolder[]), BLIND_CHECK_MS, null)) ?? [];
+    for (const b of blind) {
+      if (b.sessionId === null || (b.pgid !== null && own.has(b.pgid)) || out.some((e) => e.pid === b.pid && !e.foreign)) continue;
+      out.push({ pid: b.pid, sessionId: b.sessionId, status: null, waitingFor: null, cwd: b.cwd, foreign: false, via: "blind" });
     }
     // The hook rows add to whatever the other two say (the same process may be in both, which changes nothing).
     return [...await this.terminalRowsAsync(), ...out];
@@ -791,8 +830,16 @@ export class AttachSupport {
    */
   holderStatus(pid: number, ref: string, procStart: string | null): string | null {
     if (procStart !== null && processStart(pid) !== procStart) return "other";
+    let doc: unknown;
     try {
-      const doc: unknown = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
+      doc = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
+    } catch {
+      // A row that cannot be read says nothing; a process proven to hold `ref` all the same (`provenBlindHold`) is `unread`: what it
+      // is doing is then read from its screen. Proven to hold another one now: `other`.
+      const held = this.blindHeld.get(pid);
+      return held === undefined ? null : held === ref.toLowerCase() ? "unread" : "other";
+    }
+    try {
       if (!isObject(doc) || doc.pid !== pid) return null;
       if (typeof doc.sessionId !== "string" || doc.sessionId.toLowerCase() !== ref.toLowerCase()) return "other";
       return typeof doc.status === "string" ? doc.status : null;
@@ -891,6 +938,7 @@ export class AttachSupport {
 }
 
 function describeTwin(e: LiveEntry): string {
+  if (e.via === "blind") return `process ${e.pid} has it open (its registry row cannot be read; the conversation it has open is known from the task folder it holds)`;
   if (e.via === "hook") return e.foreign ? `open in a terminal, registered by a process this machine cannot see (pid ${e.pid})` : `open in a terminal (pid ${e.pid}, registered by its session hook)`;
   return e.foreign ? `registered by a process this machine cannot see (pid ${e.pid})` : `process ${e.pid} has it open (${e.status ?? "running"})`;
 }
@@ -968,6 +1016,11 @@ export interface BlindHolder {
   pgid: number | null;
   /** Its working directory, or null when it cannot be read. */
   cwd: string | null;
+  /**
+   * The conversation it is proven to have open without its row ({@link provenBlindHold}), or null when that cannot be proven: then
+   * any conversation of its folder may be the one.
+   */
+  sessionId: string | null;
 }
 
 /** Whether a process's arguments are Claude Code's: the `claude` program, or its npm package's cli.js run by node. */
@@ -981,26 +1034,205 @@ export function isClaudeArgv(argv: string[]): boolean {
  * conversation open that no list says, so a conversation in its folder is not known to be free. Linux only (elsewhere a
  * process's arguments and folder are not read): none.
  */
-export async function blindHolders(configDir: string, procRoot = "/proc"): Promise<BlindHolder[]> {
+export async function blindHolders(configDir: string, procRoot = "/proc", uid: number | null = typeof process.getuid === "function" ? process.getuid() : null,
+  screenName: (pid: number) => Promise<string | null> = paneBoxName): Promise<BlindHolder[]> {
   if (process.platform !== "linux") return [];
   const dir = path.join(configDir, "sessions");
   let names: string[];
   try { names = await fsp.readdir(dir); } catch { return []; }
-  const out: BlindHolder[] = [];
+  const found: Array<Omit<BlindHolder, "sessionId">> = [];
+  // The conversations a readable row says a live process has open (another process's, or one this machine cannot see).
+  const held = new Set<string>();
+  const domain = localPidDomain();
   for (const name of names) {
     const m = /^(\d+)\.json$/.exec(name);
     if (!m) continue;
     const pid = Number(m[1]);
-    try { JSON.parse(await fsp.readFile(path.join(dir, name), "utf8")); continue; } catch { /* unreadable: whose is it? */ }
+    let doc: unknown;
+    try { doc = JSON.parse(await fsp.readFile(path.join(dir, name), "utf8")); } catch { doc = undefined; }
+    if (doc !== undefined) {
+      const entry = registryEntry(doc, domain);
+      if (entry) held.add(entry.sessionId.toLowerCase());
+      continue;
+    }
+    // unreadable: whose is it?
     let argv: string[];
     try { argv = (await fsp.readFile(path.join(procRoot, String(pid), "cmdline"), "utf8")).split("\0").filter(Boolean); } catch { continue; }
     if (!isClaudeArgv(argv)) continue;
     let cwd: string | null = null;
     try { cwd = await fsp.readlink(path.join(procRoot, String(pid), "cwd")); } catch { /* not readable */ }
-    out.push({ pid, pgid: processGroup(pid), cwd });
+    found.push({ pid, pgid: processGroup(pid), cwd });
+  }
+  const out: BlindHolder[] = [];
+  for (const b of found) {
+    let sessionId: string | null = null;
+    try { sessionId = await provenBlindHold(configDir, b, held, found.length, procRoot, uid, screenName); } catch { sessionId = null; }
+    out.push({ ...b, sessionId });
   }
   return out;
 }
+
+/** A per-conversation folder Claude Code keeps open for that conversation's background tasks: `<tmp>/claude-<uid>/<project>/<session>/tasks`. */
+const TASKS_DIR_RE = /\/claude-(\d+)\/([^/]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/tasks$/i;
+/** How far before its process started a conversation's last write may be and still be the process's own (clock steps, rounding). */
+const BLIND_START_SLACK_MS = 5_000;
+
+/**
+ * The conversation a Claude Code process whose registry row cannot be read has open, proven without that row; null when it cannot
+ * be. Claude Code never writes a row again once it is torn (a status change reads the row first and gives up on one that does not
+ * parse, measured on 2.1.321), so the row says nothing for as long as the process runs. What the process itself holds says it:
+ *
+ * - it keeps open the task folder of its conversation (`<tmp>/claude-<uid>/<project>/<session>/tasks`) once that conversation has
+ *   run a background task: exactly one such conversation, of this user (the uid in the folder's name, the folder's owner and the
+ *   process's owner all this connector's user: another person's process or folder proves nothing here), of the process's own folder;
+ * - it was written since the process started, and the process's own screen shows it: its tmux pane names the conversation in the
+ *   rule above its input box, and that name is the held conversation's (`customTitle`). A `/clear` or `/resume` leaves the old task
+ *   folder open while the process is on another conversation, which is written at once (measured on 2.1.321); every other
+ *   conversation of the folder written since the process started (or whose time cannot be told), whoever else wrote it, must be
+ *   known not to share that name. An unnamed conversation is never proven this way. Any doubt anywhere is no proof. Only one such
+ *   process may be in the folder (`blindCount`): with two, which one wrote what cannot be told.
+ */
+export async function provenBlindHold(configDir: string, b: { pid: number; cwd: string | null }, held: Set<string>, blindCount: number,
+  procRoot = "/proc", uid: number | null = typeof process.getuid === "function" ? process.getuid() : null,
+  screenName: (pid: number) => Promise<string | null> = paneBoxName): Promise<string | null> {
+  if (uid === null || b.cwd === null || blindCount !== 1) return null;
+  const status = await fsp.readFile(path.join(procRoot, String(b.pid), "status"), "utf8");
+  const owner = /^Uid:\s+(\d+)/m.exec(status);
+  if (!owner || Number(owner[1]) !== uid) return null;
+  const project = b.cwd.replace(/[^A-Za-z0-9]/g, "-");
+  const named = new Set<string>();
+  const fdDir = path.join(procRoot, String(b.pid), "fd");
+  for (const fd of await fsp.readdir(fdDir)) {
+    let target: string;
+    try {
+      target = await fsp.readlink(path.join(fdDir, fd));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;   // (closed meanwhile: it holds nothing any more)
+      return null;   // (an open file that cannot be named might be another conversation's task folder)
+    }
+    // Every task folder of this user's it holds counts, a deleted one or one that cannot be looked at too: any doubt is no proof.
+    const m = TASKS_DIR_RE.exec(target.replace(/ \(deleted\)$/, ""));
+    if (!m) continue;
+    if (Number(m[1]) !== uid || m[2] !== project || target.endsWith(" (deleted)")) return null;
+    try { if ((await fsp.stat(target)).uid !== uid) return null; } catch { return null; }
+    named.add(m[3]!.toLowerCase());
+  }
+  if (named.size !== 1) return null;
+  const ref = [...named][0]!;
+  if (held.has(ref)) return null;   // (a live row names another holder of it: this process is not the one to say)
+  const startedAt = processStartedAtMs(b.pid, procRoot);
+  if (startedAt === null) return null;
+  const dir = path.join(configDir, "projects", project);
+  let own = false;
+  const others: string[] = [];
+  for (const name of await fsp.readdir(dir)) {
+    const m = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(name);
+    if (!m) continue;
+    const id = m[1]!.toLowerCase();
+    const file = path.join(dir, name);
+    let mtime: number | null;
+    try { mtime = (await fsp.stat(file)).mtimeMs; } catch { mtime = null; }   // (when it was written cannot be told: it may be recent)
+    if (mtime !== null && mtime < startedAt - BLIND_START_SLACK_MS) continue;
+    if (id === ref) { if (mtime === null) return null; own = true; continue; }
+    // Any other conversation written since (or whose time cannot be told) may be the one it moved to: whoever else wrote it, a
+    // headless run or another process with a row (codex r5, r8; Wei Lei), says nothing about this process not being on it too.
+    others.push(file);
+  }
+  if (!own) return null;
+  // Its own screen decides, always: the task folder alone cannot tell a conversation it moved to in a way that wrote nothing to this
+  // folder. The name in the rule above its box is the held conversation's, and no other conversation written since may share it.
+  const title = await lastCustomTitle(path.join(dir, `${ref}.jsonl`));
+  if (!title) return null;
+  for (const file of others) {
+    const other = await lastCustomTitle(file, true);
+    if (other === undefined || other === title) return null;
+  }
+  return (await screenName(b.pid)) === title ? ref : null;
+}
+
+/** How much of the end of a transcript is read for its name. */
+const TITLE_TAIL_BYTES = 1024 * 1024;
+
+/**
+ * The name a conversation was last given (`custom-title` entries), read line by line from the end of its transcript (each line parsed
+ * as JSON). Null: none is found there. `strict` (a candidate that must be known not to share a name): undefined (not known) unless the
+ * whole transcript was read and every line of it parsed, so a malformed or cut-off line, a file longer than what is read, or one that
+ * cannot be read is never taken for a conversation without a name (codex r9).
+ */
+async function lastCustomTitle(file: string, strict = false): Promise<string | null | undefined> {
+  let fh: fsp.FileHandle | null = null;
+  try {
+    fh = await fsp.open(file, "r");
+    const size = (await fh.stat()).size;
+    const len = Math.min(size, TITLE_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await fh.read(buf, 0, len, size - len);
+    if (bytesRead !== len) return strict ? undefined : null;
+    const text = buf.toString("utf8");
+    let lines = text.split("\n");
+    if (size > len) lines = lines.slice(1);   // (the first line read is cut: it is not looked at)
+    // The last line may still be being written (no newline yet): a cut line that cannot be a name entry says nothing.
+    const open = text.endsWith("\n") ? null : lines.pop() ?? null;
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    let title: string | null = null;
+    // Something after the last name read that may be a name of its own (a line that does not parse, a name entry with no name):
+    // what it is named now is not known (codex r10).
+    let doubt = size > len;
+    for (const line of lines) {
+      let doc: unknown;
+      try { doc = JSON.parse(line); } catch { doubt = true; continue; }
+      if (isObject(doc) && doc.type === "custom-title") {
+        if (typeof doc.customTitle === "string") { title = doc.customTitle; doubt = false; } else doubt = true;
+      }
+    }
+    if (open !== null) {
+      let doc: unknown;
+      try { doc = JSON.parse(open); } catch { doc = undefined; }
+      if (doc === undefined ? mayBeNameEntry(open) : isObject(doc) && doc.type === "custom-title") {
+        if (isObject(doc) && typeof doc.customTitle === "string") title = doc.customTitle;
+        else return strict ? undefined : null;
+      }
+    }
+    if (title !== null) return doubt && strict ? undefined : doubt ? null : title;
+    return strict && doubt ? undefined : null;
+  } catch {
+    return strict ? undefined : null;
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
+
+/** Whether a line cut short while it is written may be the start of a name entry (`{"type":"custom-title",...`). */
+function mayBeNameEntry(line: string): boolean {
+  const flat = line.replace(/\s+/g, "");
+  return flat.includes("custom-title") || '{"type":"custom-title"'.startsWith(flat.slice(0, 22));
+}
+
+/** The conversation name a Claude Code process's tmux pane shows in the rule above its input box (`──── name ─`); null for none. */
+async function paneBoxName(pid: number): Promise<string | null> {
+  const pane = await findPane(pid, "tmux");
+  if (!pane.ok) return null;
+  try {
+    return boxName(await tmuxRunner("tmux", pane.pane.socket).run(["capture-pane", "-p", "-t", pane.pane.pane]));
+  } catch {
+    return null;
+  }
+}
+
+/** When a process started, in milliseconds since the epoch (Linux: the boot time plus its start in clock ticks); null when unreadable. */
+function processStartedAtMs(pid: number, procRoot: string): number | null {
+  try {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), "stat"), "utf8");
+    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+    const btime = Number(/^btime\s+(\d+)/m.exec(fs.readFileSync(path.join(procRoot, "stat"), "utf8"))?.[1]);
+    if (!Number.isFinite(ticks) || !Number.isFinite(btime) || btime <= 0) return null;
+    return btime * 1000 + (ticks / CLOCK_TICKS) * 1000;
+  } catch {
+    return null;
+  }
+}
+/** `getconf CLK_TCK`: 100 on every Linux this runs on. */
+const CLOCK_TICKS = 100;
 
 /** Whether a blind holder may have a conversation of `cwd` open: its own folder is that folder, or its folder is not known. */
 function mayHold(b: BlindHolder, cwd: string): boolean {
@@ -1008,7 +1240,7 @@ function mayHold(b: BlindHolder, cwd: string): boolean {
 }
 
 function describeBlind(b: BlindHolder, configDir: string): string {
-  return `Claude Code process ${b.pid}${b.cwd ? ` (in ${b.cwd})` : ""} is running, but its registry row ${path.join(configDir, "sessions", `${b.pid}.json`)} cannot be read, so whether it has this conversation open cannot be told; send anything in that terminal (Claude Code writes the row again) or restart it`;
+  return `Claude Code process ${b.pid}${b.cwd ? ` (in ${b.cwd})` : ""} is running, but its registry row ${path.join(configDir, "sessions", `${b.pid}.json`)} cannot be read, so whether it has this conversation open cannot be told; restart that Claude Code (Claude Code never writes a torn row again)`;
 }
 
 /**
