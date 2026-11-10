@@ -22,13 +22,11 @@ import type { WatchClicks } from "../../packages/core/src/assistant/watch-clicks
 import type { WorkClicks } from "../../packages/core/src/assistant/work-clicks.js";
 import type { TokenExchange } from "../../packages/core/src/plugins/token-exchange.js";
 import { silentLogger } from "../../packages/core/src/ports/logger.js";
+import { link, said, world } from "../routing/world.js";
 import { APPROVAL_CARDS } from "../card-catalog/approval.js";
 import { ASSISTANT_CARDS, wi } from "../card-catalog/assistant.js";
 import { assistantRenderers, boardButtons } from "../../packages/teams/src/views/assistant/index.js";
 import { PROACTIVE_CARDS } from "../card-catalog/proactive.js";
-
-/** The verbs of buttons other lines answer (W4b's Show here). */
-const ELSEWHERE = new Set(["show"]);
 
 interface Button {
   readonly card: string;
@@ -103,19 +101,23 @@ function actionOf(button: Button): InboundAction {
   return read.value;
 }
 
-/** The three handlers of these cards, each recording which of its features a press reached. */
+/** The three handlers of these cards, each recording which of its features a press reached and settling it, as they do. */
 function handlers(reached: string[]): ClickHandler[] {
+  const hit = async (click: ClickRoute, what: string): Promise<void> => {
+    reached.push(what);
+    await click.settle(what);
+  };
   const decisions = {
-    decide: (click: ClickRoute) => Promise.resolve(void reached.push(`decide ${click.action.verb}`)),
+    decide: (click: ClickRoute) => hit(click, `decide ${click.action.verb}`),
   } as unknown as ApprovalDecisions;
   const work = {
-    acceptOrStop: (_c: ClickRoute, _k: string, op: string) => Promise.resolve(void reached.push(`work ${op}`)),
-    retry: () => Promise.resolve(void reached.push("work retry")),
-    acceptAll: () => Promise.resolve(void reached.push("work accept_all")),
+    acceptOrStop: (click: ClickRoute, _k: string, op: string) => hit(click, `work ${op}`),
+    retry: (click: ClickRoute) => hit(click, "work retry"),
+    acceptAll: (click: ClickRoute) => hit(click, "work accept_all"),
   } as unknown as WorkClicks;
   const watch = {
-    watch: () => Promise.resolve(void reached.push("work watch")),
-    unwatch: () => Promise.resolve(void reached.push("work unwatch")),
+    watch: (click: ClickRoute) => hit(click, "work watch"),
+    unwatch: (click: ClickRoute) => hit(click, "work unwatch"),
   } as unknown as WatchClicks;
   return [
     new ApprovalClicks(
@@ -125,27 +127,49 @@ function handlers(reached: string[]): ClickHandler[] {
     ),
     new WorkCardClicks(work, watch, { enabled: false } as unknown as TokenExchange, () => true, silentLogger),
     new AssistantActionClicks({
-      actionClick: (click) => Promise.resolve(void reached.push(`action ${String(click.action.data["op"])}`)),
-      confirmClick: (click) => Promise.resolve(void reached.push(`confirm ${String(click.action.data["op"])}`)),
+      actionClick: (click) => hit(click as ClickRoute, `action ${String(click.action.data["op"])}`),
+      confirmClick: (click) => hit(click as ClickRoute, `confirm ${String(click.action.data["op"])}`),
     }),
   ];
 }
 
-/** Dispatch by verb, as the router does: the handler whose verbs name it, with the person's credential. */
-async function dispatch(action: InboundAction, reached: string[]): Promise<void> {
-  const handler = handlers(reached).find((h) => h.verbs.includes(action.verb));
-  assert.ok(handler !== undefined, `no handler answers the verb "${action.verb}"`);
-  const click = { action, sender: { id: "aad-a" } } as unknown as ClickRoute;
-  assert.ok(handler.withCredential !== undefined);
-  await handler.withCredential(click, "ak");
+const INACTIVE = "That button is not active any more.";
+
+/**
+ * A worker's router (W4's, as production assembles it) with the three handlers of these cards registered, Alice linked, and
+ * every session a Show here button names answered.
+ */
+function routed(reached: string[]) {
+  const w = world({ handlers: { clicks: handlers(reached) } });
+  link(w, "aad-a", "ak");
+  for (const button of BUTTONS) {
+    const session = button.data["session_id"];
+    if (button.data["primusclaw"] === "show" && typeof session === "string") {
+      w.turns.lastAnswers.set(session, `The answer of ${session}.`);
+    }
+  }
+  return w;
 }
 
-it("every button of these cards is read with a verb that a handler answers", () => {
+/** Press `button` as Teams sends it, read by the Teams adapter, handled by the router. */
+async function pressed(button: Button) {
+  const reached: string[] = [];
+  const w = routed(reached);
+  await w.router.handle(actionOf(button));
+  await w.router.settled();
+  return { w, reached, said: said(w) };
+}
+
+it("every button of these cards is answered by the handler of its kind, through the router", async () => {
   assert.ok(BUTTONS.length > 0);
-  const verbs = new Set(handlers([]).flatMap((h) => [...h.verbs]));
   for (const button of BUTTONS) {
-    const { verb } = actionOf(button);
-    assert.ok(verbs.has(verb) || ELSEWHERE.has(verb), `${button.card}: "${verb}" is answered by no handler`);
+    const { reached, said: out } = await pressed(button);
+    assert.ok(
+      !out.includes(INACTIVE),
+      `${button.card}: ${String(button.data["primusclaw"])} is answered by no handler`,
+    );
+    const shown = out.some((t) => t.startsWith("Here is the answer."));
+    assert.equal(reached.length + (shown ? 1 : 0), 1, `${button.card}: ${JSON.stringify(reached)} ${out.join(" | ")}`);
   }
 });
 
@@ -179,8 +203,25 @@ it("a press on each kind of card reaches what answers it", async () => {
   for (const [what, which, outcome] of expected) {
     const button = BUTTONS.find(which);
     assert.ok(button, `no ${what} button in the catalog`);
-    const reached: string[] = [];
-    await dispatch(actionOf(button), reached);
+    const { reached } = await pressed(button);
     assert.deepEqual(reached, [outcome], what);
+  }
+});
+
+it("Show here on a run's card and on the digest posts that session's answer and makes it the chat's session", async () => {
+  // W4's handler (Python agent.py `_show`): read with the presser's own key, answered in the chat, then the current session.
+  for (const card of ["run_completed", "run_failed", "digest"]) {
+    const button = BUTTONS.find((b) => b.card === card && b.data["primusclaw"] === "show");
+    assert.ok(button, `no Show here on ${card}`);
+    const session = String(button.data["session_id"]);
+    const { w, said: out } = await pressed(button);
+    assert.deepEqual(w.turns.lastAnswerReads, [["ak", session]], card);
+    assert.ok(
+      out.some(
+        (t) => t === `Here is the answer. Your next message continues this session.\n\nThe answer of ${session}.`,
+      ),
+      `${card}: ${out.join(" | ")}`,
+    );
+    assert.equal(w.store.sessions.getSession("aad-a"), session, card);
   }
 });
