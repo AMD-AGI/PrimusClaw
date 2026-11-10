@@ -68,6 +68,8 @@
  *      identity had before are kept; one that could not be deleted fails the cleanup (cleanup_failed); a case's
  *      setup.forget_memories deletes the identity's entries it names before the attempt's first message, and one it could not
  *      delete makes the attempt the run's error with nothing sent
+ *   R23 expect_memory / expect_no_memory are graded on the entries the attempt made, read after its turns and before they are
+ *      deleted: an entry saved before the attempt does not satisfy expect_memory; a failing check fails the attempt by name
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -1431,6 +1433,39 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.equal(run2.code, 1, run2.out);
       assert.match(run2.out, /ERROR cat-memory-wr-002#1 .*infra: setup: memory entries named by forget_memories not deleted: 1352/);
       assert.equal(stuck.sent.length, 0, "nothing sent");
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R23 expect_memory is graded on the entries the attempt made, before they are deleted", { timeout: 120_000 }, async () => {
+    const memCase = (id: string) => ({ ...answerCase(id, "remember that I review with opus"), expect_memory: ["opus"], expect_no_memory: ["sonnet"] });
+    // Saved by the attempt: passes, then deleted.
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (_content, id) => { claw.memories.set(3000, { id: 3000, title: "Review model", body: "Reviews with Opus" }); claw.turn(id, { say: "Saved." }); };
+    const r = runner(base, [memCase("t-expect-001")]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /pass t-expect-001#1/);
+      assert.ok(!claw.memories.has(3000), "deleted after it was graded");
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const names = report.results[0].attempts[0].checks.map((x: { name: string }) => x.name);
+      assert.ok(names.includes("memory saved: opus") && names.includes("no memory left: sonnet"), names.join("; "));
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // An entry from before the attempt (a residue) does not count: nothing new was saved, the attempt fails on that check.
+    const stale = new FakeClaw();
+    const base2 = await stale.start();
+    stale.memories.set(1352, { id: 1352, title: "Review model", body: "Reviews with opus" });
+    stale.router = (_content, id) => stale.turn(id, { say: "There is already an entry for that." });
+    const r2 = runner(base2, [memCase("t-expect-002")]);
+    const run2 = await r2.done;
+    await stale.stop();
+    try {
+      assert.equal(run2.code, 0, run2.out);
+      assert.match(run2.out, /FAIL t-expect-002#1 .*memory saved: opus/);
+      assert.ok(stale.memories.has(1352), "the entry from before is kept");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
   });
 });
