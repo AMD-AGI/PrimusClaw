@@ -62,6 +62,11 @@ export class FakeBus implements BusClient {
   }
 }
 
-export function received(body: string | Uint8Array, enqueuedAt?: Date): Received {
-  return { body: typeof body === "string" ? Buffer.from(body) : body, enqueuedAt };
+export function received(
+  body: string | Uint8Array,
+  enqueuedAt?: Date,
+  messageId?: string,
+  deliveryCount?: number,
+): Received {
+  return { body: typeof body === "string" ? Buffer.from(body) : body, enqueuedAt, messageId, deliveryCount };
 }

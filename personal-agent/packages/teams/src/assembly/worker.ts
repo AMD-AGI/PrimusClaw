@@ -27,6 +27,7 @@ import {
   ChatLog,
   createClawClient,
   cryptoRandom,
+  healthzRoute,
   HttpTokenExchange,
   lineLogger,
   openWorkerStore,
@@ -304,7 +305,12 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
           },
         });
   return runner({
-    app: buildServer({ routes: routesOf(base, features, handle, gate), maxBodyBytes: MAX_BODY_BYTES }),
+    app: buildServer({
+      routes: routesOf(base, features, handle, gate),
+      maxBodyBytes: MAX_BODY_BYTES,
+      accessLog: deps.logger,
+      quietRoutes: [healthzRoute.path],
+    }),
     metricsApp: buildServer({
       routes: metricsRoutes(
         withBuildInfo(() => parts.prometheus.render(), buildInfoText(teamsVersion(), process.version)),

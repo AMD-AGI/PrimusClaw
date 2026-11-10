@@ -5,7 +5,9 @@
  * The inbound queue: several receivers, each taking the next conversation session that has messages and handling them in
  * order until the session has been quiet for IDLE_MS. A body that is not a JSON object is dead-lettered at once (it can never
  * succeed); a handler failure abandons the message, so the broker redelivers it and, after its maximum delivery count,
- * dead-letters it. Either way the session moves on: one poison message never blocks a conversation.
+ * dead-letters it. Either way the session moves on: one poison message never blocks a conversation. Every message taken
+ * gets one line (`inbound message`): its id, what came of it (completed, abandoned, dead_lettered), how long it waited in
+ * the queue and how long it took; never its body.
  */
 import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
@@ -118,6 +120,7 @@ export class InboundConsumer {
       body = decode(message.body);
     } catch (error) {
       const why = error instanceof Error ? error.message : "undecodable";
+      this.logLine(message, "dead_lettered", queueLagMs(message, this.parts.clock.epochMs()), 0);
       await receiver.deadLetter(message, "malformed", Array.from(why).slice(0, 200).join(""));
       return;
     }
@@ -135,8 +138,20 @@ export class InboundConsumer {
   }
 
   private record(message: Received, started: number, ok: boolean): void {
-    if (!this.parts.stats) return;
     const handleMs = Math.trunc(this.parts.clock.monotonicMs() - started);
-    this.parts.stats.processed(queueLagMs(message, this.parts.clock.epochMs(), handleMs), handleMs, ok);
+    const lag = queueLagMs(message, this.parts.clock.epochMs(), handleMs);
+    this.logLine(message, ok ? "completed" : "abandoned", lag, handleMs);
+    this.parts.stats?.processed(lag, handleMs, ok);
+  }
+
+  /** The one line for a message taken: ids, outcome and times only. */
+  private logLine(message: Received, outcome: string, lagMs: number | undefined, handleMs: number): void {
+    this.logger.info("inbound message", {
+      id: message.messageId,
+      delivery: message.deliveryCount,
+      outcome,
+      lag_ms: lagMs,
+      ms: handleMs,
+    });
   }
 }
