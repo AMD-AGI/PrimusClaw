@@ -20,7 +20,6 @@ import {
   BOT_NAME,
   chatTurnKey,
   Guardrails,
-  noIntegrations,
   PublicErrorLog,
   Router,
   reviewStop,
@@ -109,7 +108,10 @@ function refuseMissing(base: AssemblyBase): void {
     throw new StartupError(
       "CLAWY_FALLBACK_MODEL is set, but no plugin says when a model refused (modelRefusalPolicy): the fallback would never be used",
     );
-  if (settings.onBehalfUsers.size > 0 && !plugins.routeExtensions.some((route) => route.path === ON_BEHALF_PATH))
+  if (
+    settings.onBehalfUsers.size > 0 &&
+    !plugins.routeExtensions.some((route) => route.method === "POST" && route.path === ON_BEHALF_PATH)
+  )
     throw new StartupError(
       `TEAMS_ON_BEHALF_USERS is set, but no plugin serves ${ON_BEHALF_PATH}: unset it or run with the plugin that does`,
     );
@@ -179,7 +181,7 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     limits: routerLimits(settings.userLimits, clock),
     assistant: assistant.chat,
     remote,
-    turns: turnRunner(base, { style: teams.style, errors, integrations: noIntegrations }),
+    turns: turnRunner(base, { style: teams.style, errors, integrations: plugins.integrations }),
     stopCards: stopCards(base),
     proactive: proactiveHold(proactive),
     observing: w8.observer,
@@ -188,13 +190,13 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     handoffs: [], // (`review_for_other` only with the review service)
     channelContext: channelContextBuilder(store),
     messageText,
-    connectionsText: whoamiConnections(noIntegrations),
+    connectionsText: whoamiConnections(plugins.integrations),
     reportView: (userId, scope) => w8.reportView(userId, scope),
     note: noteFactory,
     subscriptions:
       subs === undefined ? undefined : { ensure: (u) => subs.ensure(u), remove: (u, key) => subs.remove(u, key) },
     handlers: built.handlers,
-    integrations: noIntegrations,
+    integrations: plugins.integrations,
   };
 }
 
@@ -289,7 +291,7 @@ export function buildFeatures(given: AssemblyBase): Features {
   const guard = new Guardrails(clock, (event, fields) => securityLog.event(event, fields), settings.sensitiveLimits);
   const assistant = assistantParts(base, {
     style: teams.style,
-    integrations: noIntegrations,
+    integrations: base.plugins.integrations,
     notifyUrl: switches.notifyUrl,
     hooks,
   });
