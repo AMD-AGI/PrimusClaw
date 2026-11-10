@@ -1242,11 +1242,9 @@ record it.
   file); a session this connector already holds goes on. The scan is shared and time-limited, and `doctor` warns
   (`claude_registry_row_unreadable`) with the fix: send anything in that terminal (#572).
 - `@primusclaw/connector` 0.1.16: a terminal at its prompt with background shells running (Claude Code's `shell` status) is
-  typed into like an idle one, instead of a message waiting 10 minutes and being refused. A running Claude Code whose registry
-  row is torn (it never writes it again) has the conversation it holds proven from the task folder it keeps open, when nothing
-  else of its folder may be it: that conversation is listed live with Connect and typed into (gated on its screen), and the rest
-  of the folder is no longer "unknown". Enter is sent only on a screen that shows the input box holding exactly the typed text,
-  no question or menu, and no running turn, so a phone's message never answers a permission question (#612).
+  typed into like an idle one, instead of a message waiting 10 minutes and being refused. Enter is sent only on a screen that
+  shows the input box holding exactly the typed text, no question or menu, and no running turn, so a phone's message never
+  answers a permission question; otherwise the text stays in the box and the message is refused (#626).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
