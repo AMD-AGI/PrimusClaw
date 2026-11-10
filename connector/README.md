@@ -434,7 +434,15 @@ A running Claude Code process of this machine whose own row (`sessions/<pid>.jso
 write left, measured on a dev pod with a terminal open for days) has a conversation open that neither answer names: every
 conversation in that process's folder (every one, when its folder cannot be read) is then reported `unknown`, not `idle`, and
 a takeover of one is refused (`twin_check_failed`, naming the process and the file); `doctor` warns
-(`claude_registry_row_unreadable`). Anything sent in that terminal makes Claude Code write the row again.
+(`claude_registry_row_unreadable`). Claude Code never writes such a row again (a status change reads the row first and gives up on
+one that does not parse; measured on 2.1.321), so the connector proves the conversation that process has open another way where it
+can (Linux): the process keeps its conversation's task folder (`<tmp>/claude-<uid>/<project>/<session>/tasks`) open once that
+conversation ran a background task. When exactly one such folder is open, it is this user's (the uid in its name, its owner and the
+process's owner), of the process's own folder, written since the process started, its name (`/rename`, `--name`) shown by the
+process's own tmux pane in the rule above its input box, and no other conversation of that folder written since then known to share
+that name (a `/clear` or `/resume` leaves the old folder open), that conversation is reported `live` (and typed into, as below) and
+the rest of the folder is not held by it. Any doubt (an unnamed conversation, a file or folder that cannot be read) leaves the folder
+`unknown` as above.
 A transcript written within the last 10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
 `session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
 is not mistaken for a twin.
@@ -457,7 +465,8 @@ watch. Nothing else writes to the conversation, so its history never forks, and 
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
 accepted: it waits (one notice, `terminal_input_queued`, with `reason` `terminal_working`, `terminal_waiting`, `terminal_typing`,
 `terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle (`idle`, or `shell`: idle with background shells
-running) **and** its input box is empty on the screen, so that
+running) **and** its input box is empty on the screen (for a process whose registry row cannot be read, proven as above, the screen
+alone: an empty box with no `esc to interrupt` under it), so that
 half-typed text at the terminal is never sent along and a question or a menu on the screen is never answered by an Enter; after
 10 minutes it is refused (`terminal_busy`). It is then typed with `tmux send-keys -l` (literal: nothing in it is read as a key
 name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and submitted with Enter
