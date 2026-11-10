@@ -60,7 +60,7 @@ function speakerThatHangs(cutOff: AbortSignal, reachable = true) {
       remoteState: store.remoteState,
       references: store.references,
       conversationFor: () => conversation,
-      showPermission: () => Promise.resolve(),
+      showPermission: () => new Promise<never>(() => undefined), // (the card's send never comes back either)
       lang: () => "en",
       direct: () => false,
     },
@@ -112,4 +112,32 @@ test("what is held carries the id of the event it came with, and holding it agai
   speaker.feed(chunk("42", "Said later."));
   await speaker.flush({ force: false, holdOnFailure: false }, "42");
   assert.deepEqual(held.at(-1), { text: "Said later.", eventId: "42" });
+});
+
+test("a permission card that never goes out does not hold a cancelled reader", async () => {
+  const cancel = new AbortController();
+  const { speaker } = speakerThatHangs(cancel.signal);
+  let done = false;
+  void speaker.ask({ actionId: "a1", tool: "Run make" }).then(() => {
+    done = true;
+  });
+  await ready();
+  assert.equal(done, false); // (the card is in flight)
+  cancel.abort();
+  await ready();
+  assert.equal(done, true);
+});
+
+test("the end of a session that is never told does not hold a cancelled reader", async () => {
+  const cancel = new AbortController();
+  const { speaker } = speakerThatHangs(cancel.signal);
+  let done = false;
+  void speaker.ended("adapter_gone").then(() => {
+    done = true;
+  });
+  await ready();
+  assert.equal(done, false);
+  cancel.abort();
+  await ready();
+  assert.equal(done, true);
 });

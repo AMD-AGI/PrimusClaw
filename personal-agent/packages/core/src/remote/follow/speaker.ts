@@ -136,7 +136,7 @@ export class BurstSpeaker {
     this.pendingSince ??= now;
     if (this.deps.window === undefined || !this.mayWake()) return;
     try {
-      await this.deps.window(this.turn.answer, false); // (an edit, never a message; the burst is delivered when it is over)
+      await unlessCutOff(this.deps.window(this.turn.answer, false), this.cutOff); // (an edit, never a message; the burst is delivered when it is over)
     } catch (error) {
       this.deps.logger.info("the session card could not show the agent's text", { error: errorName(error) });
     }
@@ -219,7 +219,7 @@ export class BurstSpeaker {
   private async intoWindow(text: string): Promise<boolean | null> {
     if (this.deps.window === undefined) return null;
     try {
-      if (!(await this.deps.window(text, true))) return null;
+      if (!(await unlessCutOff(this.deps.window(text, true), this.cutOff))) return null;
     } catch (error) {
       this.deps.logger.warn("what the remote agent said on its own could not be shown on its card; trying again", {
         error: errorName(error),
@@ -287,7 +287,7 @@ export class BurstSpeaker {
     if (!this.settle || this.deps.windowSettled === undefined) return;
     this.settle = false;
     try {
-      await this.deps.windowSettled();
+      await unlessCutOff(this.deps.windowSettled(), this.cutOff);
     } catch (error) {
       this.deps.logger.info("the session card could not be refreshed after the agent's text", {
         error: errorName(error),
@@ -304,7 +304,13 @@ export class BurstSpeaker {
     const reference = this.deps.references.getReference(this.chatKey);
     if (reference === null) return;
     try {
-      await this.deps.showPermission(this.chatKey, this.sessionId, request, this.deps.conversationFor(reference));
+      const card = this.deps.showPermission(
+        this.chatKey,
+        this.sessionId,
+        request,
+        this.deps.conversationFor(reference),
+      );
+      await unlessCutOff(card, this.cutOff);
     } catch (error) {
       this.deps.logger.warn("the permission card of a remote agent could not be shown", { error: errorName(error) });
     }
@@ -347,7 +353,7 @@ export class BurstSpeaker {
     if (bare === TERMINAL_CLOSED) text = terminalClosedLine(this.langOr("en"));
     else if (this.deps.describeEnd !== undefined) {
       try {
-        text = await this.deps.describeEnd(bare);
+        text = await unlessCutOff(this.deps.describeEnd(bare), this.cutOff);
       } catch (error) {
         this.deps.logger.warn("the end of a remote session could not be described", { error: errorName(error) });
       }
@@ -370,14 +376,18 @@ export class BurstSpeaker {
 
   private async tell(to: Conversation, message: OutMessage, failed: string): Promise<void> {
     try {
-      await to.send(message);
+      await unlessCutOff(to.send(message), this.cutOff);
     } catch (error) {
       this.deps.logger.warn(failed, { error: errorName(error) });
     }
   }
 }
 
-/** `work`, or a rejection as soon as `signal` aborts (the work itself is left to settle on its own). */
+/**
+ * `work`, or a rejection as soon as `signal` aborts (the work itself is left to settle on its own). Every wait of the reader's on
+ * the chat goes through it: a cancelled reader is never held by one that does not come back (Python's task cancel ends any await).
+ * A message whose send was in flight may still arrive, and is also held: said at least once, never lost (Python's `_abandon`).
+ */
 function unlessCutOff<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return work;
   if (signal.aborted) return Promise.reject(new Error("cut off"));
