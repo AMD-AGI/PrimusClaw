@@ -1194,13 +1194,29 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
   assert.deepEqual(failed(zh, observed({ final: english, calls: read })), ["reply in zh"]);
 });
 
-test("S36b the reply's own words are found in one pass, however long the reply", () => {
+test("S36b the reply's own words are found in bounded time, however long the reply", () => {
   const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
   const started = Date.now();
-  for (const final of ["a".repeat(200_000), `${"ab1-".repeat(50_000)} done`, `${"x".repeat(100_000)}"${"y".repeat(100_000)}`]) {
+  for (const final of ["a".repeat(200_000), `done ${"ab1-".repeat(50_000)}`, `${"x".repeat(100_000)}"${"y".repeat(100_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  // Unclosed link and quote openers, which make those patterns rescan the rest of the line from each one.
+  for (const final of [`done ${"[".repeat(200_000)}`, `done ${"“".repeat(200_000)}`, `done ${"![x](".repeat(40_000)}`]) {
     assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
   }
   assert.ok(Date.now() - started < 3_000, `${Date.now() - started} ms`);
+});
+
+test("S36c only a distinctive title a tool answered as JSON is a name", () => {
+  const en = caseOf({ lang: "en", turns: [{ user: "is the line-count item done?" }], style: { reply_lang: "follow_user" } });
+  const final = "The item is 已完成，没有结果; there is no result for this run.";
+  const result = (title: string): ToolCall => ({ ...call("mcp__assistant__work_recall"), result: JSON.stringify({ item: { seq: 7, title } }) });
+  // A short title is an ordinary phrase too, and a "title" inside a command's output or a cut-short answer is none.
+  assert.deepEqual(failed(en, observed({ final, calls: [result("已完成")] })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final, calls: [{ ...call("bash"), result: 'stdout: code example contains "title": "已完成，没有结果" in a string' }] })), ["reply in en"]);
+  const cut = JSON.stringify({ item: { seq: 7, title: "已完成，没有结果" }, reports: ["x".repeat(50)] }).slice(0, -10);
+  assert.deepEqual(failed(en, observed({ final, calls: [{ ...call("mcp__assistant__work_recall"), result: cut }] })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final, calls: [result("已完成，没有结果")] })), []);
 });
 
 test("S37 a reply with no words, or to a message with none, is in no language: the check does not apply", () => {
@@ -1215,6 +1231,9 @@ test("S37 a reply with no words, or to a message with none, is in no language: t
     const check = grade(en, observed({ final: BRIEF_OFF_ZH })).find((x) => x.name === "reply in en");
     assert.equal(check?.skipped, true, user);
   }
+  // A command followed by a sentence has the sentence's language.
+  const zhCommand = caseOf({ lang: "en", turns: [{ user: "/hlep 请用中文说明状态" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(zhCommand, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
   // A message with words still has a language, even one that names a command.
   const en = caseOf({ lang: "en", turns: [{ user: "please turn /brief off for me" }], style: { reply_lang: "follow_user" } });
   assert.deepEqual(failed(en, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
@@ -1236,7 +1255,13 @@ test("S38 an id the person gave in their own message is not a leak when the repl
   assert.deepEqual(failed(asked, observed({ shown: ["已完成的是 #13。"], final: "已完成的是 #13。" })), ["items named by title"]);
   const said = caseOf({ turns: [{ user: "事项 7 的结果呢" }, { user: "那编号 8 呢" }], style: { no_ids: true } });
   assert.deepEqual(failed(said, observed({ shown: ["都已完成：#7、#8。"], final: "都已完成：#7、#8。" })), []);
-  // A pull request's number the person gave excuses no item of that number.
+  // A commit's, a pull request's or a repository's number the person gave excuses no item of that number.
+  for (const user of ["What happened in commit #12?", "PR #12 的状态是什么？", "AMD-AGI/PrimusClaw#12 合了吗", "议题 #12 还开着吗"]) {
+    const other = caseOf({ turns: [{ user }], style: { no_ids: true } });
+    assert.deepEqual(failed(other, observed({ shown: ["The internal item is #12."], final: "The internal item is #12." })), ["items named by title"], user);
+  }
+  const look = caseOf({ turns: [{ user: "看看 #12 的结果" }, { user: "task #13?" }], style: { no_ids: true } });
+  assert.deepEqual(failed(look, observed({ shown: ["都已完成：#12、#13。"], final: "都已完成：#12、#13。" })), []);
   const pr = caseOf({ turns: [{ user: "PR #12 的状态是什么？" }], style: { no_ids: true } });
   assert.deepEqual(failed(pr, observed({ shown: ["内部事项是 #12。"], final: "内部事项是 #12。" })), ["items named by title"]);
   // A number the person wrote for something else ("过去 3 天") does not excuse it.

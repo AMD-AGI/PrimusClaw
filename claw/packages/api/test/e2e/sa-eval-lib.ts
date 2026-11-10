@@ -823,7 +823,10 @@ export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; nu
   for (const m of text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)) {
     // "PR #12 的状态" or "AMD-AGI/PrimusClaw#12" names a pull request's number, which excuses no item of that number.
     const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
-    if (m[0].startsWith("#") && namesOther(clause)) continue;
+    // "#12" is the person's item only when nothing before it says what else it numbers: no Latin word right before it other than
+    // item or task ("commit #12", "PR #12", "AMD-AGI/PrimusClaw#12"), and nothing NOT_AN_ITEM names in its clause ("议题 #3").
+    const before = clause.match(/([A-Za-z][\w.-]*(?:\/[\w.-]+)?)\s*$/)?.[1];
+    if (m[0].startsWith("#") && ((before && !/^(?:items?|tasks?)$/i.test(before)) || namesOther(clause))) continue;
     numbers.add(String(Number(m[1])));
   }
   return { uuids, numbers };
@@ -1286,7 +1289,9 @@ const LATIN = /[A-Za-z]/g;
  * plan names, or an English one that quotes a Chinese item title, is still in the language it is written in.
  */
 export function replyProse(text: string): string {
-  return text
+  // The first LANGUAGE_SAMPLE characters say what language a reply is in; an unclosed `[` or `“` makes the link and quote
+  // patterns rescan the rest of its line from every opener, so the text they read is bounded.
+  return text.slice(0, LANGUAGE_SAMPLE)
     .replace(/```[\s\S]*?(?:```|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ")
     .replace(/!?\[[^\]\n]*\]\([^)\s]*\)/g, " ")
@@ -1296,6 +1301,7 @@ export function replyProse(text: string): string {
     // Word by word (one pass, no backtracking across a long run): a word that is an identifier goes.
     .replace(/[A-Za-z0-9\-_/.:#@]+/g, (w) => (IDENTIFIER.test(w) ? " " : w));
 }
+const LANGUAGE_SAMPLE = 8_000;
 const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|[a-z][A-Z]|^[A-Z][a-z]*[A-Z]/;
 
 /**
@@ -1304,17 +1310,27 @@ const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|
  */
 export function readTitles(calls: readonly ToolCall[], items: readonly ItemSeen[] = []): string[] {
   const out = new Set(items.map((i) => i.title.trim()));
-  for (const c of calls) {
-    for (const m of (c.result ?? "").matchAll(/"title"\s*:\s*"((?:[^"\\\n]|\\.)*)"/g)) {
-      try { out.add(String(JSON.parse(`"${m[1]}"`)).trim()); } catch { /* not a JSON string: no title */ }
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 8 || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) { for (const x of v) walk(x, depth + 1); return; }
+    for (const [k, x] of Object.entries(v)) {
+      if (k === "title" && typeof x === "string") out.add(x.trim());
+      else walk(x, depth + 1);
     }
+  };
+  for (const c of calls) {
+    // Only a result that is JSON as a whole: a `"title": "…"` inside a command's output or a cut-short answer is no title.
+    let parsed: unknown;
+    try { parsed = JSON.parse(c.result ?? ""); } catch { continue; }
+    walk(parsed, 0);
   }
-  // Too short a title would take ordinary words out with it ("test" in "latest").
-  return [...out].filter((t) => t.length >= 4 || /[㐀-鿿]{2}/.test(t)).sort((a, b) => b.length - a.length);
+  // A short title ("已完成", "Done") is also an ordinary phrase, which the reply may use as one: only a distinctive title is a name.
+  return [...out].filter((t) => [...t].length >= TITLE_MIN_CHARS).sort((a, b) => b.length - a.length);
 }
+const TITLE_MIN_CHARS = 8;
 
-/** A message that is a slash command and its arguments (`/brief off`, `/hlep`), not a sentence in some language. */
-const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:\s|$)/;
+/** A message that is only a slash command with up to three plain arguments (`/brief off`, `/hlep`, `/pause 2h`), not a sentence. */
+const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:[ \t]+[A-Za-z0-9_\-.:/@#]+){0,3}\s*$/;
 
 /** Whether a text has a word of its own (`replyProse`): a Chinese character or a Latin letter outside code, links, quotes and names. */
 export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(replyProse(text));
