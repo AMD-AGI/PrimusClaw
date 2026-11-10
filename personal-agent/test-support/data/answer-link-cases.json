@@ -1,0 +1,781 @@
+{
+ "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same. A backtick of the agent's own left in prose (one that opens no code span the rich text reads within a line) is shown as `ˋ`, so a code span made here pairs with nothing else; a mail address inside an address already made code is not made code again. Table rows (a line with a | over a separator line, and the rows after it that hold one) are read cell by cell, as the chat's rich text reads them. A bare domain is an address too: a run of labels (a dot or a hyphen possibly escaped) not right after an ASCII letter or digit, `.`, `-`, `@` or `/`, whose last label is any of two letters or more when it has three labels or more or a port, path, query or fragment after it, and a common generic top-level domain when it is `name.tld` alone (`README.md`, `self.id` stay words); it is shown whole, as the client shows it, in a code span (`main.py:42`).",
+ "cases": [
+  {
+   "about": "plain link",
+   "input": "See [the docs](https://docs.example.com/a?b=1) for details.",
+   "lang": "en",
+   "expected": [
+    "See the docs (`docs.example.com`) for details."
+   ]
+  },
+  {
+   "about": "plain link",
+   "input": "See [the docs](https://docs.example.com/a?b=1) for details.",
+   "lang": "zh",
+   "expected": [
+    "See the docs (`docs.example.com`) for details."
+   ]
+  },
+  {
+   "about": "image",
+   "input": "![diagram](https://img.example/p.png)",
+   "lang": "en",
+   "expected": [
+    "🖼 diagram (`img.example`)"
+   ]
+  },
+  {
+   "about": "image",
+   "input": "![diagram](https://img.example/p.png)",
+   "lang": "zh",
+   "expected": [
+    "🖼 diagram (`img.example`)"
+   ]
+  },
+  {
+   "about": "image without alt",
+   "input": "Here: ![](https://img.example/q.png)",
+   "lang": "en",
+   "expected": [
+    "Here: 🖼 (`img.example`)"
+   ]
+  },
+  {
+   "about": "image without alt",
+   "input": "Here: ![](https://img.example/q.png)",
+   "lang": "zh",
+   "expected": [
+    "Here: 🖼 (`img.example`)"
+   ]
+  },
+  {
+   "about": "bare URL",
+   "input": "Logs are at https://logs.example/run/42.",
+   "lang": "en",
+   "expected": [
+    "Logs are at `logs.example`."
+   ]
+  },
+  {
+   "about": "bare URL",
+   "input": "Logs are at https://logs.example/run/42.",
+   "lang": "zh",
+   "expected": [
+    "Logs are at `logs.example`."
+   ]
+  },
+  {
+   "about": "bare www",
+   "input": "Try www.example.org/page, then retry.",
+   "lang": "en",
+   "expected": [
+    "Try `www​.example.org`, then retry."
+   ]
+  },
+  {
+   "about": "bare www",
+   "input": "Try www.example.org/page, then retry.",
+   "lang": "zh",
+   "expected": [
+    "Try `www​.example.org`, then retry."
+   ]
+  },
+  {
+   "about": "credentials in the URL",
+   "input": "Pull from [here](https://user:pass@git.example:8443/r.git?token=abc123).",
+   "lang": "en",
+   "expected": [
+    "Pull from here (`git.example`)."
+   ]
+  },
+  {
+   "about": "credentials in the URL",
+   "input": "Pull from [here](https://user:pass@git.example:8443/r.git?token=abc123).",
+   "lang": "zh",
+   "expected": [
+    "Pull from here (`git.example`)."
+   ]
+  },
+  {
+   "about": "Chinese words",
+   "input": "请看[部署文档](https://wiki.example.cn/deploy)。",
+   "lang": "en",
+   "expected": [
+    "请看部署文档（`wiki.example.cn`）。"
+   ]
+  },
+  {
+   "about": "Chinese words",
+   "input": "请看[部署文档](https://wiki.example.cn/deploy)。",
+   "lang": "zh",
+   "expected": [
+    "请看部署文档（`wiki.example.cn`）。"
+   ]
+  },
+  {
+   "about": "parentheses in the words and the address",
+   "input": "[the (old) guide](https://x.example/p_(1)) is outdated",
+   "lang": "en",
+   "expected": [
+    "the (old) guide (`x.example`) is outdated"
+   ]
+  },
+  {
+   "about": "parentheses in the words and the address",
+   "input": "[the (old) guide](https://x.example/p_(1)) is outdated",
+   "lang": "zh",
+   "expected": [
+    "the (old) guide (`x.example`) is outdated"
+   ]
+  },
+  {
+   "about": "no scheme",
+   "input": "Open [the page](example.com/path) or [this](/relative/path).",
+   "lang": "en",
+   "expected": [
+    "Open the page (`example.com`) or this."
+   ]
+  },
+  {
+   "about": "no scheme",
+   "input": "Open [the page](example.com/path) or [this](/relative/path).",
+   "lang": "zh",
+   "expected": [
+    "Open the page (`example.com`) or this."
+   ]
+  },
+  {
+   "about": "javascript address",
+   "input": "[click](javascript:alert(1))",
+   "lang": "en",
+   "expected": [
+    "click"
+   ]
+  },
+  {
+   "about": "javascript address",
+   "input": "[click](javascript:alert(1))",
+   "lang": "zh",
+   "expected": [
+    "click"
+   ]
+  },
+  {
+   "about": "autolink and HTML",
+   "input": "<https://auto.example/z> and <a href=\"https://h.example/x\">this</a> and <img src='https://i.example/x.png' alt='pic'>",
+   "lang": "en",
+   "expected": [
+    "`auto.example` and this (`h.example`) and 🖼 pic (`i.example`)"
+   ]
+  },
+  {
+   "about": "autolink and HTML",
+   "input": "<https://auto.example/z> and <a href=\"https://h.example/x\">this</a> and <img src='https://i.example/x.png' alt='pic'>",
+   "lang": "zh",
+   "expected": [
+    "`auto.example` and this (`h.example`) and 🖼 pic (`i.example`)"
+   ]
+  },
+  {
+   "about": "reference link",
+   "input": "[1]: https://ref.example/x\nSee [the spec][1].",
+   "lang": "en",
+   "expected": [
+    "\\[1\\]: `ref.example`\nSee [the spec][1]."
+   ]
+  },
+  {
+   "about": "reference link",
+   "input": "[1]: https://ref.example/x\nSee [the spec][1].",
+   "lang": "zh",
+   "expected": [
+    "\\[1\\]: `ref.example`\nSee [the spec][1]."
+   ]
+  },
+  {
+   "about": "nested image in a link",
+   "input": "[![badge](https://badge.example/b.svg)](https://ci.example/run)",
+   "lang": "en",
+   "expected": [
+    "🖼 badge (`badge.example`) (`ci.example`)"
+   ]
+  },
+  {
+   "about": "nested image in a link",
+   "input": "[![badge](https://badge.example/b.svg)](https://ci.example/run)",
+   "lang": "zh",
+   "expected": [
+    "🖼 badge (`badge.example`) (`ci.example`)"
+   ]
+  },
+  {
+   "about": "link text that is an address",
+   "input": "[https://shown.example](https://elsewhere.example)",
+   "lang": "en",
+   "expected": [
+    "`shown.example` (`elsewhere.example`)"
+   ]
+  },
+  {
+   "about": "link text that is an address",
+   "input": "[https://shown.example](https://elsewhere.example)",
+   "lang": "zh",
+   "expected": [
+    "`shown.example` (`elsewhere.example`)"
+   ]
+  },
+  {
+   "about": "mail address link",
+   "input": "Write to [me](mailto:dev@mail.example).",
+   "lang": "en",
+   "expected": [
+    "Write to me (`mail.example`)."
+   ]
+  },
+  {
+   "about": "mail address link",
+   "input": "Write to [me](mailto:dev@mail.example).",
+   "lang": "zh",
+   "expected": [
+    "Write to me (`mail.example`)."
+   ]
+  },
+  {
+   "about": "code is kept",
+   "input": "Run `curl https://in.code/x` and\n\n```\n[a](https://fenced.example)\nhttps://fenced.example/b\n```\n\nthen https://after.example",
+   "lang": "en",
+   "expected": [
+    "Run `curl https:​//in.code/x` and\n\n```\n[a]​(https:​//fenced.example)\nhttps:​//fenced.example/b\n```\n\nthen `after.example`"
+   ]
+  },
+  {
+   "about": "code is kept",
+   "input": "Run `curl https://in.code/x` and\n\n```\n[a](https://fenced.example)\nhttps://fenced.example/b\n```\n\nthen https://after.example",
+   "lang": "zh",
+   "expected": [
+    "Run `curl https:​//in.code/x` and\n\n```\n[a]​(https:​//fenced.example)\nhttps:​//fenced.example/b\n```\n\nthen `after.example`"
+   ]
+  },
+  {
+   "about": "no links",
+   "input": "All 128 tests pass.",
+   "lang": "en",
+   "expected": [
+    "All 128 tests pass."
+   ]
+  },
+  {
+   "about": "no links",
+   "input": "All 128 tests pass.",
+   "lang": "zh",
+   "expected": [
+    "All 128 tests pass."
+   ]
+  },
+  {
+   "about": "a fence that is no fence for every client",
+   "input": "```lang`bad\nhttps://evil.example/x\n```",
+   "lang": "en",
+   "expected": [
+    "ˋˋˋlangˋbad\n`evil.example`\n```"
+   ]
+  },
+  {
+   "about": "a fence that is no fence for every client",
+   "input": "```lang`bad\nhttps://evil.example/x\n```",
+   "lang": "zh",
+   "expected": [
+    "ˋˋˋlangˋbad\n`evil.example`\n```"
+   ]
+  },
+  {
+   "about": "a code span across a blank line",
+   "input": "`intro\n\nhttps://evil.example/x`",
+   "lang": "en",
+   "expected": [
+    "ˋintro\n\n`evil.example`ˋ"
+   ]
+  },
+  {
+   "about": "a code span across a blank line",
+   "input": "`intro\n\nhttps://evil.example/x`",
+   "lang": "zh",
+   "expected": [
+    "ˋintro\n\n`evil.example`ˋ"
+   ]
+  },
+  {
+   "about": "other schemes",
+   "input": "Get ftp://files.example/a or file:///etc/passwd",
+   "lang": "en",
+   "expected": [
+    "Get `files.example` or `file:​///etc/passwd`"
+   ]
+  },
+  {
+   "about": "other schemes",
+   "input": "Get ftp://files.example/a or file:///etc/passwd",
+   "lang": "zh",
+   "expected": [
+    "Get `files.example` or `file:​///etc/passwd`"
+   ]
+  },
+  {
+   "about": "NUL in the text",
+   "input": "a \u00000\u0000 b https://n.example",
+   "lang": "en",
+   "expected": [
+    "a 0 b `n.example`"
+   ]
+  },
+  {
+   "about": "NUL in the text",
+   "input": "a \u00000\u0000 b https://n.example",
+   "lang": "zh",
+   "expected": [
+    "a 0 b `n.example`"
+   ]
+  },
+  {
+   "about": "mail address",
+   "input": "Write to dev@mail.example or mailto:ops@mail.example.",
+   "lang": "en",
+   "expected": [
+    "Write to `dev@mail.example` or `mail.example`."
+   ]
+  },
+  {
+   "about": "mail address",
+   "input": "Write to dev@mail.example or mailto:ops@mail.example.",
+   "lang": "zh",
+   "expected": [
+    "Write to `dev@mail.example` or `mail.example`."
+   ]
+  },
+  {
+   "about": "escaped address",
+   "input": "see www.example\\.com today",
+   "lang": "en",
+   "expected": [
+    "see `www​.example.com` today"
+   ]
+  },
+  {
+   "about": "escaped address",
+   "input": "see www.example\\.com today",
+   "lang": "zh",
+   "expected": [
+    "see `www​.example.com` today"
+   ]
+  },
+  {
+   "about": "an address after a slash",
+   "input": "x/www.evil.example and /var/www.example.com/logs, x/https://www.evil.example/p",
+   "lang": "en",
+   "expected": [
+    "x/`www​.evil.example` and /var/`www​.example.com/logs`, x/https:​//`www​.evil.example/p`"
+   ]
+  },
+  {
+   "about": "a stray backtick before a mail address",
+   "input": "`user@example.com",
+   "lang": "en",
+   "expected": [
+    "ˋ`user@example.com`"
+   ]
+  },
+  {
+   "about": "a stray backtick before a mail address",
+   "input": "`user@example.com",
+   "lang": "zh",
+   "expected": [
+    "ˋ`user@example.com`"
+   ]
+  },
+  {
+   "about": "a stray backtick before a link",
+   "input": "x `a https://evil.example/x",
+   "lang": "en",
+   "expected": [
+    "x ˋa `evil.example`"
+   ]
+  },
+  {
+   "about": "a stray backtick before a link",
+   "input": "x `a https://evil.example/x",
+   "lang": "zh",
+   "expected": [
+    "x ˋa `evil.example`"
+   ]
+  },
+  {
+   "about": "an escaped backtick opens no code span",
+   "input": "\\`mail me@evil.example or https://evil.example/x`",
+   "lang": "en",
+   "expected": [
+    "\\ˋmail `me@evil.example` or `evil.example`ˋ"
+   ]
+  },
+  {
+   "about": "an escaped backtick opens no code span",
+   "input": "\\`mail me@evil.example or https://evil.example/x`",
+   "lang": "zh",
+   "expected": [
+    "\\ˋmail `me@evil.example` or `evil.example`ˋ"
+   ]
+  },
+  {
+   "about": "a code span across lines is no code span here",
+   "input": "a `b\nme@evil.example https://evil.example/x` c",
+   "lang": "en",
+   "expected": [
+    "a ˋb\n`me@evil.example` `evil.example`ˋ c"
+   ]
+  },
+  {
+   "about": "a code span across lines is no code span here",
+   "input": "a `b\nme@evil.example https://evil.example/x` c",
+   "lang": "zh",
+   "expected": [
+    "a ˋb\n`me@evil.example` `evil.example`ˋ c"
+   ]
+  },
+  {
+   "about": "a mail address in an address made code is not made code again",
+   "input": "www.w.example(x@y.examplehttps://h.example/p",
+   "lang": "en",
+   "expected": [
+    "`www​.w.example(x@y.examplehttps:​//h.example/p`"
+   ]
+  },
+  {
+   "about": "a mail address in an address made code is not made code again",
+   "input": "www.w.example(x@y.examplehttps://h.example/p",
+   "lang": "zh",
+   "expected": [
+    "`www​.w.example(x@y.examplehttps:​//h.example/p`"
+   ]
+  },
+  {
+   "about": "a host made code next to a code span of the text's",
+   "input": "see https://evil.example/x`code`",
+   "lang": "en",
+   "expected": [
+    "see `evil.example`​`code`"
+   ]
+  },
+  {
+   "about": "a host made code next to a code span of the text's",
+   "input": "see https://evil.example/x`code`",
+   "lang": "zh",
+   "expected": [
+    "see `evil.example`​`code`"
+   ]
+  },
+  {
+   "about": "a backslash before a host made code",
+   "input": "a\\https://evil.example/x",
+   "lang": "en",
+   "expected": [
+    "a\\​`evil.example`"
+   ]
+  },
+  {
+   "about": "a backslash before a host made code",
+   "input": "a\\https://evil.example/x",
+   "lang": "zh",
+   "expected": [
+    "a\\​`evil.example`"
+   ]
+  },
+  {
+   "about": "a code span of the text's across a table cell's bar is no code span (a separator line under it)",
+   "input": "`|(`x@y.example\n- |",
+   "lang": "en",
+   "expected": [
+    "ˋ|(ˋ`x@y.example`\n- |"
+   ]
+  },
+  {
+   "about": "a code span of the text's across a table cell's bar is no code span (a separator line under it)",
+   "input": "`|(`x@y.example\n- |",
+   "lang": "zh",
+   "expected": [
+    "ˋ|(ˋ`x@y.example`\n- |"
+   ]
+  },
+  {
+   "about": "a table header and row read cell by cell: a code span across a bar, a host and a mail address made code",
+   "input": "a `x | https://e.example/p` b\n---|---\n`c|d` x@y.example",
+   "lang": "en",
+   "expected": [
+    "a ˋx | `e.example`ˋ b\n---|---\nˋc|dˋ `x@y.example`"
+   ]
+  },
+  {
+   "about": "a table header and row read cell by cell: a code span across a bar, a host and a mail address made code",
+   "input": "a `x | https://e.example/p` b\n---|---\n`c|d` x@y.example",
+   "lang": "zh",
+   "expected": [
+    "a ˋx | `e.example`ˋ b\n---|---\nˋc|dˋ `x@y.example`"
+   ]
+  },
+  {
+   "about": "a code span inside one cell is kept; a www address in another cell made code",
+   "input": "`ok` | b\n--|--\n`x` | www.w.example",
+   "lang": "en",
+   "expected": [
+    "`ok` | b\n--|--\n`x` | `www​.w.example`"
+   ]
+  },
+  {
+   "about": "a code span inside one cell is kept; a www address in another cell made code",
+   "input": "`ok` | b\n--|--\n`x` | www.w.example",
+   "lang": "zh",
+   "expected": [
+    "`ok` | b\n--|--\n`x` | `www​.w.example`"
+   ]
+  },
+  {
+   "about": "a bare domain is shown whole in a code span",
+   "input": "Visit example.com/path, or sub.example.co.uk.",
+   "lang": "en",
+   "expected": [
+    "Visit `example.com/path`, or `sub.example.co.uk`."
+   ]
+  },
+  {
+   "about": "a bare domain is shown whole in a code span",
+   "input": "Visit example.com/path, or sub.example.co.uk.",
+   "lang": "zh",
+   "expected": [
+    "Visit `example.com/path`, or `sub.example.co.uk`."
+   ]
+  },
+  {
+   "about": "an escaped bare domain is a domain too",
+   "input": "see example\\.com and api.github.io/x",
+   "lang": "en",
+   "expected": [
+    "see `example.com` and `api.github.io/x`"
+   ]
+  },
+  {
+   "about": "an escaped bare domain is a domain too",
+   "input": "see example\\.com and api.github.io/x",
+   "lang": "zh",
+   "expected": [
+    "see `example.com` and `api.github.io/x`"
+   ]
+  },
+  {
+   "about": "a two-label name with a country code and nothing after is a file name, not a domain",
+   "input": "README.md, setup.py, self.id and arr.at stay; docs.evil.md and evil.md/login do not",
+   "lang": "en",
+   "expected": [
+    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md/login` do not"
+   ]
+  },
+  {
+   "about": "a two-label name with a country code and nothing after is a file name, not a domain",
+   "input": "README.md, setup.py, self.id and arr.at stay; docs.evil.md and evil.md/login do not",
+   "lang": "zh",
+   "expected": [
+    "README.md, setup.py, self.id and arr.at stay; `docs.evil.md` and `evil.md/login` do not"
+   ]
+  },
+  {
+   "about": "no domain without a top-level domain, right after a path or a word, or a file name",
+   "input": "v1.2, a.b, node.js, os.path, a/b.com, my_module.py and user.name",
+   "lang": "en",
+   "expected": [
+    "v1.2, a.b, node.js, os.path, a/b.com, my_module.py and user.name"
+   ]
+  },
+  {
+   "about": "no domain without a top-level domain, right after a path or a word, or a file name",
+   "input": "v1.2, a.b, node.js, os.path, a/b.com, my_module.py and user.name",
+   "lang": "zh",
+   "expected": [
+    "v1.2, a.b, node.js, os.path, a/b.com, my_module.py and user.name"
+   ]
+  },
+  {
+   "about": "a bare domain after Chinese words",
+   "input": "访问example.com看看",
+   "lang": "en",
+   "expected": [
+    "访问`example.com`看看"
+   ]
+  },
+  {
+   "about": "a bare domain after Chinese words",
+   "input": "访问example.com看看",
+   "lang": "zh",
+   "expected": [
+    "访问`example.com`看看"
+   ]
+  },
+  {
+   "about": "a table row that looks like a fence is a table row (the rich text reads the table first)",
+   "input": "h|x\n---|---\n```info|x|\nvictim@example.com|row|",
+   "lang": "en",
+   "expected": [
+    "h|x\n---|---\nˋˋˋinfo|x|\n`victim@example.com`|row|"
+   ]
+  },
+  {
+   "about": "a table row that looks like a fence is a table row (the rich text reads the table first)",
+   "input": "h|x\n---|---\n```info|x|\nvictim@example.com|row|",
+   "lang": "zh",
+   "expected": [
+    "h|x\n---|---\nˋˋˋinfo|x|\n`victim@example.com`|row|"
+   ]
+  },
+  {
+   "about": "a bare address is shown whole in a code span, its port, path or line number kept",
+   "input": "fix it in main.py:42, or see example.com/path?x=1.",
+   "lang": "en",
+   "expected": [
+    "fix it in `main.py:42`, or see `example.com/path?x=1`."
+   ]
+  },
+  {
+   "about": "a bare address is shown whole in a code span, its port, path or line number kept",
+   "input": "fix it in main.py:42, or see example.com/path?x=1.",
+   "lang": "zh",
+   "expected": [
+    "fix it in `main.py:42`, or see `example.com/path?x=1`."
+   ]
+  },
+  {
+   "about": "three labels or a tail: any last label of two letters or more is a top-level domain",
+   "input": "docs.example.museum/path, a.b.example.zz and site.example.qq:8080 and os.path.join(x)",
+   "lang": "en",
+   "expected": [
+    "`docs.example.museum/path`, `a.b.example.zz` and `site.example.qq:8080` and `os.path.join`(x)"
+   ]
+  },
+  {
+   "about": "three labels or a tail: any last label of two letters or more is a top-level domain",
+   "input": "docs.example.museum/path, a.b.example.zz and site.example.qq:8080 and os.path.join(x)",
+   "lang": "zh",
+   "expected": [
+    "`docs.example.museum/path`, `a.b.example.zz` and `site.example.qq:8080` and `os.path.join`(x)"
+   ]
+  },
+  {
+   "about": "three labels or a tail, but no top-level domain",
+   "input": "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this",
+   "lang": "en",
+   "expected": [
+    "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this"
+   ]
+  },
+  {
+   "about": "three labels or a tail, but no top-level domain",
+   "input": "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this",
+   "lang": "zh",
+   "expected": [
+    "v1.2.3, a.b.c, x.y.z9, 1.2.3.4 and e.g. this"
+   ]
+  },
+  {
+   "about": "an escaped hyphen in a label is a hyphen",
+   "input": "foo\\-bar.com/path and docs.foo\\-bar.example.org",
+   "lang": "en",
+   "expected": [
+    "`foo-bar.com/path` and `docs.foo-bar.example.org`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen in a label is a hyphen",
+   "input": "foo\\-bar.com/path and docs.foo\\-bar.example.org",
+   "lang": "zh",
+   "expected": [
+    "`foo-bar.com/path` and `docs.foo-bar.example.org`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen and dot together",
+   "input": "see a\\-b\\.example.net:8080/x",
+   "lang": "en",
+   "expected": [
+    "see `a-b.example.net:8080/x`"
+   ]
+  },
+  {
+   "about": "an escaped hyphen and dot together",
+   "input": "see a\\-b\\.example.net:8080/x",
+   "lang": "zh",
+   "expected": [
+    "see `a-b.example.net:8080/x`"
+   ]
+  },
+  {
+   "about": "an escaped bar in a bare address in a table cell stays escaped, so it splits neither the cell nor the span",
+   "input": "h | docs.example.museum/p\\|\n---|---\nx | y",
+   "lang": "en",
+   "expected": [
+    "h | `docs.example.museum/p\\|`\n---|---\nx | y"
+   ]
+  },
+  {
+   "about": "an escaped bar in a bare address in a table cell stays escaped, so it splits neither the cell nor the span",
+   "input": "h | docs.example.museum/p\\|\n---|---\nx | y",
+   "lang": "zh",
+   "expected": [
+    "h | `docs.example.museum/p\\|`\n---|---\nx | y"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail: the bare domain is shown whole, its tail with it",
+   "input": "see site.museum\\/path now",
+   "lang": "en",
+   "expected": [
+    "see `site.museum/path` now"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail: the bare domain is shown whole, its tail with it",
+   "input": "see site.museum\\/path now",
+   "lang": "zh",
+   "expected": [
+    "see `site.museum/path` now"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail for a generic top-level domain too",
+   "input": "example.com\\/path and example.com\\:8080",
+   "lang": "en",
+   "expected": [
+    "`example.com/path` and `example.com:8080`"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail for a generic top-level domain too",
+   "input": "example.com\\/path and example.com\\:8080",
+   "lang": "zh",
+   "expected": [
+    "`example.com/path` and `example.com:8080`"
+   ]
+  },
+  {
+   "about": "a mail address followed by a label that is no top-level domain: the address a client links is made code",
+   "input": "write a@b.com.1 now",
+   "lang": "en",
+   "expected": [
+    "write `a@b.com`.1 now"
+   ]
+  },
+  {
+   "about": "a mail address followed by a label that is no top-level domain: the address a client links is made code",
+   "input": "write a@b.com.1 now",
+   "lang": "zh",
+   "expected": [
+    "write `a@b.com`.1 now"
+   ]
+  }
+ ]
+}

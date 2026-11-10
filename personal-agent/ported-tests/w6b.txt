@@ -134,3 +134,33 @@ teams/tests/test_wait_line_budget.py::test_a_dialog_on_the_terminal_says_so_and_
 teams/tests/test_wait_line_budget.py::test_the_fixed_floating_status_lines_fit_too -> packages/core/test/remote-view/wait-line-budget.test.ts::the fixed floating status lines fit too: received
 teams/tests/test_direct_chat.py::test_a_message_waiting_for_a_busy_terminal_says_why_in_the_floating_status_not_only_thinking -> packages/core/test/remote/e2e/wait-line.test.ts::a message waiting for a busy terminal says why in the floating status not only thinking
 teams/tests/test_direct_chat.py::test_the_wait_line_goes_once_anything_of_the_turn_shows_a_plan_too -> packages/core/test/remote-view/live-view.test.ts::the wait line goes once anything of the turn shows a plan too
+
+# A remote agent's links and short lines reach the chat as words (after the baseline: internal #479 and #499 at a2eaef50, and
+# the www and escaped-address follow-up of the short lines). The shared cases are test-support/data/answer-link-cases.json
+# and meta-link-cases.json, read by both sides.
+teams/tests/test_answer_links.py::test_an_answer_says_what_the_shared_cases_say -> packages/core/test/remote/answer-links.test.ts::an answer says what the shared cases say
+teams/tests/test_answer_links.py::test_nothing_clickable_is_left_in_the_message_as_sent -> packages/teams/test/remote/answer-links-sent.test.ts::nothing clickable is left in the message as sent
+teams/tests/test_answer_links.py::test_a_link_is_its_words_and_its_host -> packages/core/test/remote/answer-links.test.ts::a link is its words and its host
+teams/tests/test_answer_links.py::test_the_host_never_carries_the_user_the_password_the_port_or_the_path -> packages/core/test/remote/answer-links.test.ts::the host never carries the user the password the port or the path
+teams/tests/test_answer_links.py::test_claws_own_answer_keeps_its_links -> packages/teams/test/remote/answer-links-sent.test.ts::claws own answer keeps its links
+teams/tests/test_answer_links.py::test_the_live_view_shows_the_agents_link_as_words -> MERGED packages/teams/test/remote/answer-links-sent.test.ts::an agents plan and a tools title are no links as sent
+teams/tests/test_answer_links.py::test_an_agents_link_reaches_the_chat_as_words_in_the_stream_and_in_the_answer -> packages/core/test/remote/e2e/answer-links.test.ts::an agents link reaches the chat as words in the stream and in the answer
+teams/tests/test_answer_links.py::test_a_nul_in_the_text_cannot_make_the_answer_fail -> packages/core/test/remote/answer-links.test.ts::a nul in the text cannot make the answer fail
+teams/tests/test_answer_links.py::test_a_host_with_a_backtick_is_no_host -> packages/core/test/remote/answer-links.test.ts::a host with a backtick is no host
+teams/tests/test_answer_links.py::test_hostile_text_is_made_words_in_linear_time -> packages/core/test/remote/answer-links.test.ts::hostile text is made words in linear time
+teams/tests/test_answer_links.py::test_an_address_loses_only_the_parentheses_it_did_not_open -> packages/core/test/remote/answer-links.test.ts::an address loses only the parentheses it did not open
+teams/tests/test_answer_links.py::test_an_address_after_any_character_is_no_link_as_sent -> packages/teams/test/remote/answer-links-sent.test.ts::an address after any character is no link as sent
+teams/tests/test_answer_links.py::test_a_mail_address_and_an_escaped_address_are_no_links_either -> packages/core/test/remote/answer-links.test.ts::a mail address and an escaped address are no links either
+teams/tests/test_answer_links.py::test_what_the_agent_says_into_the_window_card_is_words_whichever_way_it_came -> packages/core/test/remote/answer-links.test.ts::what the agent says into the window card is words whichever way it came
+teams/tests/test_answer_links.py::test_closing_parentheses_after_an_address_are_counted_once -> packages/core/test/remote/answer-links.test.ts::closing parentheses after an address are counted once
+teams/tests/test_answer_links.py::test_the_plan_a_note_and_a_steps_title_in_the_progress_message_are_no_links_as_sent -> MERGED packages/teams/test/remote/answer-links-sent.test.ts::an agents plan and a tools title are no links as sent
+teams/tests/test_answer_links.py::test_a_block_is_code_here_exactly_when_the_rich_text_draws_it_as_code -> packages/teams/test/remote/answer-links-sent.test.ts::a block is code here exactly when the rich text draws it as code
+teams/tests/test_answer_links.py::test_no_address_reaches_the_message_as_prose_on_random_text -> packages/teams/test/remote/answer-links-sent.test.ts::no address reaches the message as prose on random text
+teams/tests/test_answer_links.py::test_a_character_the_rich_text_drops_cannot_hide_an_address -> packages/teams/test/remote/answer-links-sent.test.ts::a character the rich text drops cannot hide an address
+teams/tests/test_answer_links.py::test_a_markdown_escape_cannot_hide_an_address -> packages/teams/test/remote/answer-links-sent.test.ts::a markdown escape cannot hide an address
+teams/tests/test_answer_links.py::test_the_floating_status_holds_no_address_of_the_agents -> MERGED packages/teams/test/remote/answer-links-sent.test.ts::an agents plan and a tools title are no links as sent
+teams/tests/test_meta_links.py::test_a_line_says_what_the_shared_cases_say -> packages/core/test/remote/answer-links.test.ts::a line says what the shared cases say
+teams/tests/test_meta_links.py::test_a_connectors_name_and_a_health_checks_detail_are_no_links_as_sent -> packages/teams/test/remote/answer-links-sent.test.ts::a connectors name and a health checks detail are no links as sent
+teams/tests/test_meta_links.py::test_an_agents_plan_and_a_tools_title_are_no_links_as_sent -> packages/teams/test/remote/answer-links-sent.test.ts::an agents plan and a tools title are no links as sent
+teams/tests/test_meta_links.py::test_a_bidi_override_cannot_join_an_address_once_sent -> packages/teams/test/remote/answer-links-sent.test.ts::a bidi override cannot join an address once sent
+teams/tests/test_meta_links.py::test_a_www_address_or_an_escaped_one_is_no_address_once_read -> packages/teams/test/remote/answer-links-sent.test.ts::a www address or an escaped one is no address once read

@@ -8,7 +8,9 @@
  */
 import { redactText as redact } from "../security/redact.js";
 import { neutral as neutralText } from "../text/neutral.js";
-import { pyStr } from "../text/py-text.js";
+import { clipLine, pyStr } from "../text/py-text.js";
+import { DROPPED_BY_RICH_TEXT, breakAddresses } from "./links/answer.js";
+import { breakDomainsAndMails } from "./links/scans.js";
 
 const MARKDOWN = /([\\`*_[\]<])/g;
 
@@ -20,7 +22,14 @@ export function plain(text: string): string {
 /** One short line of untrusted text, safe in a card or a list (`text/neutral`), from whatever a connector reported: a value that
  * is not text is read as Python's `str(value or "")` would. */
 export function neutral(text: unknown, limit = 200): string {
-  return neutralText(pyStr(text), limit);
+  // (a bidi override the rich text drops before reading would join `https:\u{202e}//` into an address there: dropped here first;
+  // then no bare address the rich text or a client links by itself, `https://`, `www.`, a bare domain or a mail address,
+  // escaped or not; then the cut)
+  const flat = neutralText(
+    pyStr(text).replace(DROPPED_BY_RICH_TEXT, (ch) => (ch.charCodeAt(0) <= 0x7f ? " " : "")),
+    Infinity,
+  );
+  return clipLine(breakDomainsAndMails(breakAddresses(flat)), limit);
 }
 
 /** `neutral`, then markup escaped: text supplied by an agent, a machine or a session as it goes into a card TextBlock. */
