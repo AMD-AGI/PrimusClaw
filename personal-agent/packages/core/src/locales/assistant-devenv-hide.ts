@@ -9,8 +9,9 @@ export const devenvHideText = defineCatalog({
     hidden: (p: { n: number }) => `hid ${String(p.n)} conversations`,
     shownAgain: (p: { n: number }) => `showed ${String(p.n)} again`,
     disconnected: (p: { n: number }) => `disconnected ${String(p.n)} sessions`,
-    done: (p: { parts: readonly string[] }) =>
-      `Done: ${p.parts.join(", ")}. Send /agents to see; say “show hidden sessions” to bring them back.`,
+    /** The way back is said only when something was hidden: after showing again, or disconnecting, nothing is to bring back. */
+    done: (p: { parts: readonly string[]; hidden: boolean }) =>
+      `Done: ${p.parts.join(", ")}. Send /agents to see${p.hidden ? "; say “show hidden sessions” to bring them back" : ""}.`,
     nothing: "Done; nothing needed changing.",
     alreadyAnswered: "That card was already answered.",
     denied: "OK, nothing changed.",
@@ -21,7 +22,7 @@ export const devenvHideText = defineCatalog({
     hidden: (p) => `隐藏了 ${String(p.n)} 段对话`,
     shownAgain: (p) => `恢复显示 ${String(p.n)} 段`,
     disconnected: (p) => `断开 ${String(p.n)} 个会话`,
-    done: (p) => `好了：${p.parts.join("，")}。发 /agents 看看；说“显示隐藏的会话”可以恢复。`,
+    done: (p) => `好了：${p.parts.join("，")}。发 /agents 看看${p.hidden ? "；说“显示隐藏的会话”可以恢复" : ""}。`,
     nothing: "已处理，没有需要改的。",
     alreadyAnswered: "这张卡已经处理过了。",
     denied: "好的，什么都没改。",

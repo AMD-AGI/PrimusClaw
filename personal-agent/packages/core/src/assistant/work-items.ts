@@ -10,6 +10,7 @@ import type { ReviewAskedOfOther, AskerView, WorkItem } from "../claw/model.js";
 import { asText, pickLang } from "../language/detect.js";
 import { ASKED_STATE_ZH, ASKED_VERDICT, ASKED_WAITING, assistantCardText } from "../locales/assistant-cards.js";
 import type { Lang } from "../locales/lang.js";
+import { isoSeconds as pyIsoSeconds } from "../feedback/iso-time.js";
 import { isoSeconds } from "../proactive/quiet.js";
 import { clip } from "../text/plain.js";
 import { cpLength, cpSlice, pyRstrip, pyStrip } from "../text/py-text.js";
@@ -22,6 +23,12 @@ export const BOARD_LINES = 8;
 export const BOARD_CARDS = 5;
 /** Retry buttons on the board, beside Accept all within a card's three: tasks that failed or were stopped, newest first. */
 export const BOARD_RETRY_MAX = 3;
+/**
+ * A stopped task offers Retry only this long after it was stopped. Every stop is the person's own (the Stop button, or the
+ * assistant asked to), and the board lists what ended in the last seven days: past this, Retry would keep offering, for days, to
+ * undo a decision the person made on purpose. A failed task waits on the person (needs_you) and keeps its Retry while it waits.
+ */
+export const RETRY_STOPPED_SECONDS = 3600;
 /** Rows a section of the board shows; the rest of BOARD_LINES opens in place. */
 export const BOARD_SHOWN: Readonly<Record<string, number>> = { needs_you: 4, in_progress: 3, done: 3 };
 /** The longest title line a card has (the card kit's TITLE_MAX). */
@@ -99,12 +106,19 @@ export function workEventText(item: WorkItem | null, text: unknown): string {
   return assistantCardText.in("en").needsYou({ label: itemLabel(item) });
 }
 
-/** A task Claw runs again on Retry: its worker reported failed, or it was stopped. */
-export function retryable(item: WorkItem): boolean {
+/**
+ * A task Claw runs again on Retry (`POST /v1/work-items/:id/retry`): its worker reported failed, or it was stopped in the last
+ * RETRY_STOPPED_SECONDS before `now` (seconds since the epoch). A stop whose time (`updatedAt`) is not known is not offered.
+ */
+export function retryable(item: WorkItem, now: number): boolean {
+  if (item.kind !== "task") return false;
+  if (item.boardState === "needs_you" && item.lastReportKind === "failed") return true;
+  const stoppedAt = pyIsoSeconds(item.updatedAt);
   return (
-    item.kind === "task" &&
-    ((item.boardState === "needs_you" && item.lastReportKind === "failed") ||
-      (item.boardState === "done" && item.outcome === "stopped"))
+    item.boardState === "done" &&
+    item.outcome === "stopped" &&
+    stoppedAt !== undefined &&
+    now - stoppedAt <= RETRY_STOPPED_SECONDS
   );
 }
 

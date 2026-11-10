@@ -9,7 +9,7 @@
 import type { ClawWorkItemsPort, Decision, JsonObject, ReviewAskedOfOther, WorkItem } from "@primusclaw/personal-agent";
 import { ClawError } from "@primusclaw/personal-agent";
 
-type Call = "list" | "asked" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watch" | "unwatch";
+type Call = "list" | "asked" | "item" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watch" | "unwatch";
 
 export function workItem(extra: Partial<WorkItem> & { itemId: string }): WorkItem {
   return {
@@ -32,7 +32,7 @@ export function workItem(extra: Partial<WorkItem> & { itemId: string }): WorkIte
 
 export class FakeWorkItems implements Pick<
   ClawWorkItemsPort,
-  "list" | "askedOfOthers" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watchPull" | "unwatchPull"
+  "list" | "askedOfOthers" | "get" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watchPull" | "unwatchPull"
 > {
   readonly items = new Map<string, WorkItem>();
   readonly asked: ReviewAskedOfOther[] = [];
@@ -69,6 +69,11 @@ export class FakeWorkItems implements Pick<
   askedOfOthers(): Promise<ReviewAskedOfOther[]> {
     this.check("asked");
     return Promise.resolve([...this.asked]);
+  }
+
+  get(key: string, itemId: string): Promise<WorkItem> {
+    this.check("item", `${key} ${itemId}`);
+    return Promise.resolve(this.own(itemId));
   }
 
   accept(key: string, itemId: string, version: number): Promise<Decision> {
