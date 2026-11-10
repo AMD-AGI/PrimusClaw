@@ -119,8 +119,8 @@ test("the cards validate and are one column with at most three actions", () => {
 test("an asked line never fails on a link it cannot read", () => {
   const cases: Array<readonly [string, string]> = [
     ["https://github.com/AMD-AGI/PrimusClaw/pull/7", "AMD-AGI/PrimusClaw#7"],
-    ["https://github.com]/o/r/pull/1", "https://github.com]/o/r/pull/1"],
-    ["https://github.com/o/r/pull/x", "https://github.com/o/r/pull/x"],
+    ["https://github.com]/o/r/pull/1", "kwi_9"],
+    ["https://github.com/o/r/pull/x", "kwi_9"],
     ["", "kwi_9"],
   ];
   for (const [url, shown] of cases) {

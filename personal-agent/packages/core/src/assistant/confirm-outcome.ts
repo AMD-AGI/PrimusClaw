@@ -112,10 +112,18 @@ function failed(table: typeof CONFIRM_FAILED, error: string, lang: Lang): string
   return Object.hasOwn(table, error) ? table[error]?.[lang] : undefined;
 }
 
-/** A comment's address from GitHub, shown as a link only when it is a plain github.com address. */
+/**
+ * A comment's address on GitHub as Claw gives it back, shown as a link only when the whole value is exactly one (as the Python
+ * worker reads it): https, the host github.com, a pull request's or an issue's path and the comment's anchor (or none); no line
+ * break, space, query, port or user. A value that only starts like one could carry a second link.
+ */
+const COMMENT_URL =
+  /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}\/(?:pull|issues)\/[1-9][0-9]{0,6}(?:#(?:issuecomment-|discussion_r|pullrequestreview-)[1-9][0-9]{0,19})?$/;
+
+/** A comment's address from GitHub, shown as a link only when it is exactly one. */
 function commentLink(result: Fields): string {
   const url = or(result["url"], "");
-  return url.startsWith("https://github.com/") && !/[ <>()[\]]/.test(url) ? url : "";
+  return COMMENT_URL.test(url) ? url : "";
 }
 
 /** What came of a press on a drafted comment's card, or undefined for what every card says alike (answered before, lapsed). */
