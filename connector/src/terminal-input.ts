@@ -155,11 +155,12 @@ const RULE_RE = /^─{8,}(?: +\S(?:.*\S)? +─+)?$/;
 export function inputBox(screen: string): BoxState {
   const { raw, plain, at, end } = boxOf(screen);
   if (at < 0 || end < 0) return "unknown";
-  if (end !== at + 1) return "typed";
-  const text = plain[at]!.trimStart().replace(PROMPT_RE, "").trim();
-  if (!text) return "empty";
-  // The suggestion Claude Code shows in an empty box is the only thing on the line, dimmed (SGR 2) throughout.
-  return onlyDim(raw[at]!.replace(/^(?:\s|\x1b\[[0-9;:]*m)*(?:❯|>)/, "")) ? "empty" : "typed";
+  const text = plain.slice(at, end).map((l, i) => (i ? l : l.trimStart().replace(PROMPT_RE, ""))).join("").trim();
+  if (!text) return end === at + 1 ? "empty" : "typed";   // (blank rows: someone's line breaks)
+  // The placeholder or the prompt suggestion Claude Code shows in an empty box is dimmed (SGR 2) throughout, on every row it takes
+  // (a long one wraps), the cursor drawn reversed on its first character when the terminal shows one: none of that is anyone's text.
+  const rows = raw.slice(at, end).map((l, i) => (i ? l : l.replace(/^(?:\s|\x1b\[[0-9;:]*m)*(?:❯|>)/, "")));
+  return rows.every((r, i) => onlyDim(r, i === 0)) ? "empty" : "typed";
 }
 
 /** Where Claude Code's input box is on a screen: its prompt line (`at`) and the rule below it (`end`); -1 when there is none. */
@@ -241,23 +242,35 @@ export function cleanInput(text: string): string {
     .replace(/^\n+/, "");
 }
 
-/** Whether every visible character of `line` is drawn dim (SGR 2): a suggestion, not text. */
-function onlyDim(line: string): boolean {
+/**
+ * Whether every visible character of `line` is drawn dim (SGR 2): a suggestion, not text. `cursorFirst`: the first visible character
+ * may instead be drawn reversed (SGR 7), as a terminal's cursor on a suggestion is; only that one.
+ */
+function onlyDim(line: string, cursorFirst = false): boolean {
   let dim = false;
+  let reverse = false;
+  let first = true;
   let i = 0;
   while (i < line.length) {
     const m = /^\x1b\[([0-9;:]*)m/.exec(line.slice(i));
     if (m) {
       for (const p of (m[1] || "0").split(/[;:]/)) {
         if (p === "2") dim = true;
-        else if (p === "0" || p === "" || p === "22") dim = false;
+        else if (p === "7") reverse = true;
+        else if (p === "27") reverse = false;
+        else if (p === "0" || p === "") { dim = false; reverse = false; }
+        else if (p === "22") dim = false;
       }
       i += m[0].length;
       continue;
     }
     const ch = line[i]!;
     if (ch === "\x1b") return false;
-    if (!/[\s\u00a0]/.test(ch) && !dim) return false;
+    if (!/[\s\u00a0]/.test(ch)) {
+      const cursor = cursorFirst && first && reverse;
+      if (!dim && !cursor) return false;
+      first = false;
+    }
     i++;
   }
   return true;
@@ -367,13 +380,14 @@ export interface TypeOptions {
 }
 
 /**
- * The keys that submit what is in the box, sent in one `send-keys` (one write to the terminal, read by Claude Code as one input):
- * in the box End moves to the end of the text and Enter submits it; on a question or a menu that came up in the moment after the
- * screen was read, End moves to the last option (a permission question's "No") and Enter chooses that, so an Enter from the phone
- * never approves anything (measured on Claude Code 2.1.285, 2026-11-10: End on a permission question selects "4. No"; End then Enter
- * denies it; End then Enter in the box submits).
+ * What submits the box: End (`ESC [ F`) and Enter (`CR`) as the bytes of ONE key of `send-keys -H`, so tmux writes them to the terminal
+ * in one write and Claude Code reads them as one input, nothing between them. In the box End moves to the end of the text and Enter
+ * submits it; on a question or a menu that came up in the moment after the screen was read, End moves to its last option (a
+ * permission question's "No") and Enter chooses that, so an Enter from the phone never approves anything. Measured on Claude Code
+ * 2.1.285, 2026-11-10, with these four bytes in one write: on a permission question each time "No" ("Interrupted", nothing run);
+ * in the box, submitted. (A question cannot come up between the two: they are one input.)
  */
-export const SUBMIT_KEYS: readonly string[] = ["End", "Enter"];
+export const SUBMIT_BYTES: readonly string[] = ["1b", "5b", "46", "0d"];
 
 /** How often a screen with a question on it is read again, waiting for it to go. */
 const DIALOG_POLL_MS = 200;
@@ -501,9 +515,9 @@ export class TerminalInput {
           why = enterGuard(screen, text);
         }
         if (!why) {
-          // End and Enter in one write (SUBMIT_KEYS): the box takes them as "to the end, submit"; a question that came up after the read
+          // End and Enter in one write (SUBMIT_BYTES): the box takes them as "to the end, submit"; a question that came up after the read
           // above takes End as its last option, "No", and Enter chooses that. Never a "Yes".
-          await this.tmux.run(["send-keys", "-t", this.ref.pane, ...SUBMIT_KEYS]);
+          await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...SUBMIT_BYTES]);
           // Submitted, or did a question take the keys? A box that still holds exactly the text, or a question on the screen, means the
           // keys did not submit it: that is waited out and tried again.
           await sleep(this.settleMs);

@@ -192,8 +192,9 @@ export class Session {
     /** The keys are being typed, Enter not yet gone (a question on the screen may hold it): the echo is not waited for yet. */
     typing?: boolean;
     /**
-     * It started a turn of its own in the terminal (its prompt is the turn's: typed at an idle prompt, or taken from the queue once a
-     * turn ended). Only such a turn is the phone's to stop with Esc; one taken into a turn already running is the person's turn.
+     * It started a turn of its own in the terminal (its prompt is the turn's, submitted at an idle prompt). Only such a turn is the
+     * phone's to stop with Esc; one that went through Claude Code's queue (taken into a running turn, or out of the queue after it)
+     * is not told apart from the person's for certain, and is left alone.
      */
     own?: boolean;
     /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
@@ -432,7 +433,9 @@ export class Session {
     if (u.type === "user_message_chunk" && turn) {
       const said = String((u.update.content as { text?: unknown } | undefined)?.text ?? "");
       // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
-      if (!turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = true; return; }
+      // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
+      // queued before it could be the one that came out first, and its turn is the person's)
+      if (!turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
       if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
@@ -1414,7 +1417,8 @@ export class Session {
       // is still being put in (a question on the screen may be the person's, and Esc would deny it: the wait just ends, and any text
       // already in the box stays there), nor while Claude Code holds it queued or took it into a turn already running (the turn is
       // the person's: the phone stops following it, and the message, if still queued, is Claude Code's to run).
-      const interrupt = running?.own === true && running.typing !== true;
+      // (`own` is set only once the transcript shows its prompt starting a turn: by then it was submitted, whatever the typing still checks)
+      const interrupt = running?.own === true;
       if (interrupt && this.terminal) await this.terminal.interrupt().catch(() => undefined);
       this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true, interrupted: interrupt });
       if (running) this.endTerminalTurn("cancelled");

@@ -83,6 +83,17 @@ describe("the terminal's permission mode, and whether the agent's policy lets th
     assert.deepEqual([...MODES_THAT_DO_NOT_ASK].sort(), ["acceptEdits", "auto", "bypassPermissions", "dontAsk"]);
     for (const m of MODES_THAT_DO_NOT_ASK) assert.ok(MODES.includes(m), m);
   });
+  test("Claude Code's prompt suggestion in an empty box is not someone typing: dim on every row it wraps to, the cursor reversed on its first character (release line, #503 acceptance)", () => {
+    const boxed = (...rows: string[]) => `  ready\n${RULE}\n${rows.join("\n")}\n${RULE}\n  ⏵⏵ bypass permissions on`;
+    // (as Claude Code 2.1.322 draws one, measured 2026-11-10: `❯\u00a0` then the suggestion dim)
+    assert.equal(inputBox(boxed("\x1b[39m❯\u00a0\x1b[2mReply with exactly one line: ACC-SUGG-TWO.\x1b[0m")), "empty");
+    assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[2mReply with exactly one line: ACC503-P2-\x1b[0m", "  \x1b[2mBEFORE-RECONNECT\x1b[0m")), "empty", "a suggestion wrapped to two rows");
+    assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[7mR\x1b[27m\x1b[2meply with exactly one line\x1b[0m")), "empty", "the cursor on its first character");
+    assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[7mR\x1b[27meply typed by someone")), "typed", "the cursor on real text");
+    assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[2mdim\x1b[0m", "  typed below")), "typed", "a real row under a dim one");
+    assert.equal(inputBox(boxed("\x1b[39m❯ ", "  ")), "typed", "blank rows are someone's line breaks");
+  });
+
   test("a question or a menu on the screen: under the box, or in its place; the agent's words above the box are not one", () => {
     assert.equal(dialogOnScreen(screenIn("  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt")), false, "a running turn is not a question");
     assert.equal(dialogOnScreen(screenIn("  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel", "❯ hello")), true);
@@ -688,7 +699,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual(typed(t.transcript), [], "nothing submitted after the cancel");
   });
 
-  test("a phone cancel of a message Claude Code queued behind the person's running turn: no Esc (it would stop the person's turn); its own turn: Esc as before (Wei Lei on #648)", async () => {
+  test("a phone cancel of a message Claude Code queued behind the person's running turn: no Esc (it would stop the person's turn); a turn it started at an idle prompt: Esc as before (Wei Lei on #648)", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
       work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
@@ -706,7 +717,9 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const end1 = await h.claw.until("the queued one's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
     assert.equal(end1.data.stopReason, "cancelled");
     assert.equal(fs.existsSync(escs), false, "no Esc into the person's turn");
-    // Its own turn (taken from the queue once the person's ended, 3 s of work): a cancel then stops it with Esc, as before.
+    // (the queued one is still Claude Code's to run: it runs once the person's turn ends, and the phone no longer follows it)
+    await until("the queued one run and done", () => typed(t.transcript).includes("queued one") && !t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);
+    // A turn it started itself at an idle prompt (3 s of work): a cancel stops it with Esc, as before.
     const two = h.prompt(sid, "second");
     await until("its own turn running", () => typed(t.transcript).includes("second") && t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);
     h.claw.issue("cancel", sid);
@@ -739,6 +752,23 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(fs.existsSync(approved), false);
     assert.deepEqual(typed(t.transcript), [], "nothing was submitted");
     assert.match(String(h.audit().find((a) => a.kind === "terminal_input_refused")?.detail), /the box does not hold exactly what was typed/);
+  });
+
+  test("the submit is one write: End and Enter as the bytes of one send-keys -H key, after a bracketed paste (a question cannot come up between them)", async () => {
+    const calls: string[][] = [];
+    let submitted = false;
+    const screen = (held: string) => `  ready\n${RULE}\n❯ ${held}\n${RULE}\n  ⏸ manual mode on`;
+    const runner = { run: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "send-keys" && args.includes("-H")) submitted = true;
+      return args[0] === "capture-pane" ? screen(submitted ? "" : "from the phone") : args[0] === "display-message" ? `0 0 ${process.pid}` : "";
+    } };
+    const t = new TerminalInput({ socket: "/nonexistent", pane: "%0", pid: process.pid, procStart: null }, runner, 1_000, 1);
+    await t.type("from the phone");
+    const keys = calls.filter((c) => c[0] === "send-keys" || c[0] === "paste-buffer" || c[0] === "load-buffer");
+    assert.deepEqual(keys.map((c) => c[0]), ["load-buffer", "paste-buffer", "send-keys"], "a paste, then one send-keys");
+    assert.deepEqual(keys[2], ["send-keys", "-t", "%0", "-H", "1b", "5b", "46", "0d"]);
+    assert.ok(!calls.some((c) => c[0] === "send-keys" && c.includes("-l")), "never typed as keystrokes");
   });
 
   test("Enter's guard reads the one screen: the box there, exactly the text, no question; a long text the box wraps is still exact", () => {
