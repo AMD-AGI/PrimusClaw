@@ -167,11 +167,14 @@ export function maskSecretValues(text: string): { text: string; masked: boolean 
   const cps = Array.from(text);
   const unitAt = new Int32Array(cps.length + 1);
   const cpOfUnit = new Int32Array(text.length + 1);
-  for (let i = 0, unit = 0; i <= cps.length; i += 1) {
+  let unit = 0;
+  cps.forEach((cp, i) => {
     unitAt[i] = unit;
     cpOfUnit[unit] = i;
-    unit += (cps[i] ?? "").length;
-  }
+    unit += cp.length;
+  });
+  unitAt[cps.length] = text.length;
+  cpOfUnit[text.length] = cps.length;
   const cpAt = (unit: number): number => cpOfUnit[unit] ?? cps.length;
   let table: ValueTable | null = null;
   const spans: Array<readonly [number, number]> = [];
