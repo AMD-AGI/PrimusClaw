@@ -251,11 +251,57 @@ function onlyDim(line: string): boolean {
   return true;
 }
 
+/**
+ * Whether the footer below Claude Code's input box says a turn is running (`esc to interrupt`, 2.1.x): the box is drawn, and
+ * can be typed in, while one runs.
+ */
+export function turnRunning(screen: string): boolean {
+  const { plain, at, end } = boxOf(screen);
+  if (at < 0 || end < 0) return false;
+  return plain.slice(end + 1, end + 1 + FOOTER_LINES).some((l) => /\besc to interrupt\b/i.test(l));
+}
+
+/**
+ * The lines of a question, a menu or a confirmation on Claude Code's screen (a permission question, AskUserQuestion, a plan to
+ * approve, a /command's picker): Enter there chooses the highlighted option, so a message's Enter is never sent while one shows.
+ */
+const DIALOG_RE = /(?:Esc to cancel|Enter to confirm|Enter to select|Tab to amend|Do you want to (?:proceed|make this edit|create)|Would you like to proceed|^\s*[❯>]?\s*\d+\.\s+(?:Yes|No)\b)/i;
+
+/**
+ * Why Enter must not be sent now for a message typed into the box (null: it may). All on the one screen read: Claude Code's input
+ * box is there, the bottom-most thing on the screen apart from its footer; it holds exactly what was typed (whitespace aside, as the
+ * box wraps it; a long paste shows as `[Pasted text #n …]`); no line below the box is a question's or a menu's; and no turn runs
+ * (`esc to interrupt` is not under the box). The last one closes the moment between this read and the Enter: a question only comes
+ * from a tool call of a running turn, which a model's answer has to start first (hundreds of milliseconds at the least), so on a
+ * screen where no turn runs none can appear in the few milliseconds before the Enter.
+ */
+export function enterGuard(screen: string, text: string): string | null {
+  const { plain, at, end } = boxOf(screen);
+  if (at < 0 || end < 0) return "no input box on the screen";
+  if (plain.slice(end + 1).some((l) => DIALOG_RE.test(l))) return "a question or a menu is on the screen";
+  if (turnRunning(screen)) return "a turn is running there";
+  const held = plain.slice(at, end).map((l, i) => (i === 0 ? l.trimStart().replace(PROMPT_RE, "") : l)).join("");
+  const squash = (x: string) => x.replace(/\s+/g, "");
+  if (squash(held) === squash(text)) return null;
+  if (text.includes("\n") && /\[Pasted text #\d+/.test(held)) return null;
+  return "the box does not hold exactly what was typed";
+}
+
+/** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
+export const ENTER_SETTLE_MS = 250;
+
 export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" };
+
+/** What was typed is in the box but was not submitted: the screen did not pass {@link enterGuard}. */
+export class TerminalNotSubmitted extends Error {
+  constructor(readonly why: string) {
+    super(`typed but not submitted: ${why}`);
+  }
+}
 
 /** One tmux pane that holds a conversation open, and the typing into it. */
 export class TerminalInput {
-  constructor(readonly ref: PaneRef, private readonly tmux: TmuxRunner, private readonly echoWaitMs = 3_000) {}
+  constructor(readonly ref: PaneRef, private readonly tmux: TmuxRunner, private readonly echoWaitMs = 3_000, private readonly settleMs = ENTER_SETTLE_MS) {}
 
   /** Whether the process proven at the start is still the one there, and still runs in this pane. */
   private stillThere(panePid: number): boolean {
@@ -310,6 +356,14 @@ export class TerminalInput {
       if (inputBox(await this.screen()) === "typed") break;
       if (Date.now() >= by) throw new Error("the terminal did not show the typed text");
       await new Promise((r) => setTimeout(r, 100));
+    }
+    // Enter only on a screen that, read twice ENTER_SETTLE_MS apart, shows the box holding exactly this text, no question or menu and
+    // no running turn (`enterGuard`): an Enter on a permission question would approve it. Otherwise no key at all is sent (any key might
+    // reach the question): what was typed stays in the box, where the person at the terminal sees it, and the message is refused.
+    for (let i = 0; i < 2; i++) {
+      await new Promise((r) => setTimeout(r, this.settleMs));
+      const why = enterGuard(await this.screen(), text);
+      if (why) throw new TerminalNotSubmitted(why);
     }
     await this.tmux.run(["send-keys", "-t", this.ref.pane, "Enter"]);
   }
