@@ -18,6 +18,7 @@ import type { TurnHooks as RouterHooks, TurnOutcome, TurnRun, TurnRunner } from 
 import type { PullRef } from "../claw/model.js";
 import { newRecord, type TurnContext, type TurnHooks, type TurnRequest, type TurnStyle } from "./engine/context.js";
 import { runTurn } from "./engine/run-turn.js";
+import { lastAnswer } from "./last-answer.js";
 import type { GithubOutcome } from "./github-outcome.js";
 import type { TurnClaw } from "./ports.js";
 
@@ -200,6 +201,11 @@ export class TurnEngine implements TurnRunner {
       ...(this.deps.onFilesDropped ? { onFilesDropped: this.deps.onFilesDropped } : {}),
       ...(review ? reviewHooks(review) : {}),
     };
+  }
+
+  lastAnswer(credential: string, sessionId: string): Promise<string | undefined> {
+    const { claw, clock, log, errors } = this.deps;
+    return lastAnswer({ claw, clock, log, errors }, credential, sessionId);
   }
 
   async run(run: TurnRun, hooks: RouterHooks): Promise<TurnOutcome> {

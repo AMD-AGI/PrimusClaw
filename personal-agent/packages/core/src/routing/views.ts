@@ -3,7 +3,8 @@
 
 import { AI_NOTICE } from "../locales/transparency.js";
 import type { Lang } from "../locales/lang.js";
-import type { OutMessage } from "../ports/surface.js";
+import { noteMessage, type NoteTone } from "../note/note.js";
+import type { OutMessage, ViewButton } from "../ports/surface.js";
 import type { NoteButton, NoteFactory } from "./features.js";
 
 /**
@@ -102,6 +103,41 @@ export function showButton(sessionId: string, title = "Show here"): NoteButton {
 function view(message: OutMessage["body"]): OutMessage {
   return { body: message };
 }
+
+/** A Create PR button, under the changes card and on the notes that put it back (Python `create_pr_button`). */
+export function createPrButton(sessionId: string): NoteButton {
+  return { title: "Create PR", verb: "create_pr", data: { session_id: sessionId } };
+}
+
+/**
+ * A note button as the worker's click protocol carries it, field for field as the Python worker's `confirm_button`,
+ * `repo_button`, `show_button` and `create_pr_button` build it: the verb `primusclaw.<kind>`, and the data naming the
+ * kind first (`primusclaw: <kind>`), which is what a press is routed by.
+ */
+export function viewButtonOf(button: NoteButton): ViewButton {
+  const built = {
+    title: button.title,
+    verb: `primusclaw.${button.verb}`,
+    data: { primusclaw: button.verb, ...button.data },
+  };
+  return button.style ? { ...built, style: button.style } : built;
+}
+
+const TONES: ReadonlySet<string> = new Set<NoteTone>(["default", "good", "attention", "warning", "accent"]);
+
+/**
+ * The note card the router's clicks end as (Python `render.note_card(text, buttons, title, tone)`): what assembly passes
+ * as `RouterDeps.note`. A tone the note does not know is the default one.
+ */
+export const noteFactory: NoteFactory = (text, options = {}) => {
+  const tone = options.tone !== undefined && TONES.has(options.tone) ? (options.tone as NoteTone) : undefined;
+  return noteMessage({
+    text,
+    ...(options.title ? { title: options.title } : {}),
+    ...(tone ? { tone } : {}),
+    ...(options.buttons?.length ? { buttons: options.buttons.map(viewButtonOf) } : {}),
+  });
+};
 
 /** Builds the messages of the router's cards. */
 export class CommandViews {

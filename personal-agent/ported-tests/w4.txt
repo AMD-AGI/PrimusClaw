@@ -179,9 +179,12 @@ teams/tests/test_clawy_model.py::test_new_starts_a_session_that_is_created_with_
 # teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_goes_to_the_assistant_and_nothing_to_the_agent -> LATER: needs W6 test-support (follow-up PR)
 # teams/tests/test_remote_nl_control.py::test_attached_a_session_sentence_of_a_person_the_assistant_understands_goes_as_their_own_messages_do -> LATER: needs W6 test-support (follow-up PR)
 
+
+# Show here (agent.py `_show`): the click is the router's
+teams/tests/test_every_button_replaces_card.py::test_show_here_posts_the_answer_before_it_replaces_the_card -> packages/core/test/routing/show-here-click.test.ts::test_show_here_posts_the_answer_before_it_replaces_the_card
+teams/tests/test_rich_answer.py::test_show_here_sends_the_answer_as_xml -> packages/core/test/routing/show-here-click.test.ts::test_show_here_sends_the_answer_as_xml
 # Waiting for the real implementation of another line (ported once it is on this branch):
 #   test_every_button_replaces_card.py::test_a_click_ends_with_the_card_replaced (every kind) and ::test_a_card_pressed_again_after_a_failure_still_works: W5/W6/W6b/W7/W8 click handlers; W4's own kinds (repo, create_pr, bind, onboard) are covered in settings/create-pr/features/onboarding tests
-#   test_every_button_replaces_card.py::test_show_here_posts_the_answer_before_it_replaces_the_card: W4b (Show here)
 #   test_group_binds_agent_session.py::test_a_permission_of_a_bound_group_is_put_to_the_binder_in_their_1on1_chat, ::test_only_the_binders_status_card_buttons_act_in_the_group: W6 (RemoteChat, ClickHandler.inGroup)
 #   test_group_like_1on1.py (progress, answer parts, thumbs, approval and report cards in a group): W4b, W5, W8 views through the turn engine
 #   test_clawy_model.py (patching a session's model, the wire format): W4b engine and W2 client
