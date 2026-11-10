@@ -100,19 +100,22 @@ export class Permissions {
     }
     // A group binding's request goes to the binder's 1:1 chat: the group sees only that it waits, never what it asks for.
     const personal = isGroupKey(chatKey) ? this.ctx.references.getReference(personOf(chatKey)) : null;
-    const card = this.ctx.views.permission({
-      request,
-      options,
-      sessionId,
-      who,
-      expiresAt,
-      zone: this.state.zone(chatKey),
-      lang,
-    });
-    await (personal ? this.ctx.conversationFor(personal) : to).send(card).catch((error: unknown) => {
+    try {
+      // (a card that cannot be built, from a request no card can show, is forgotten as one that could not be sent)
+      const card = this.ctx.views.permission({
+        request,
+        options,
+        sessionId,
+        who,
+        expiresAt,
+        zone: this.state.zone(chatKey),
+        lang,
+      });
+      await (personal ? this.ctx.conversationFor(personal) : to).send(card);
+    } catch (error) {
       forget();
       throw error;
-    });
+    }
     if (personal) await to.send(textMessage(remoteAgentText.in(lang).approvalInPersonal({ who })));
   }
 

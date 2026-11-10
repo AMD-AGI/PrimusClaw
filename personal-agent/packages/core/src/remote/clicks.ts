@@ -16,6 +16,8 @@ import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type OutMessage, richMessage } from "../ports/surface.js";
 import { backLine } from "./lines.js";
 import { neutral } from "../text/neutral.js";
+import { cpSlice, pyStrip } from "../text/py-text.js";
+import { own } from "../own.js";
 import { type AgentCommands, type CommandParts, refusalOf } from "./commands.js";
 import { connectMarkdown } from "./connector/setup.js";
 import type { Provider } from "./ended.js";
@@ -215,7 +217,7 @@ export class SessionClicks {
   async send(click: Click): Promise<void> {
     const state = await this.ownSession(click);
     if (state === null) return;
-    const text = textOf(click.data[INPUT_ID]).trim().slice(0, INPUT_MAX);
+    const text = cpSlice(pyStrip(textOf(own(click.data, INPUT_ID))), 0, INPUT_MAX); // (Python's str.strip()[:INPUT_MAX])
     const view = this.p.state.view(click.chatKey, state);
     if (!text) {
       await this.closer(click)(remoteAgentText.in(this.lang(click)).emptySend); // (the card again, at the bottom)

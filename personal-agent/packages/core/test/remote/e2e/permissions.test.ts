@@ -415,3 +415,29 @@ test("the stored row has what the click is checked against", () =>
     );
     assert.ok(Math.abs(row.expiresAt - (w.test.clock.epochMs() / 1000 + 600)) <= 1);
   }));
+
+// --- found by review (#636 r1): a request whose card cannot be built is forgotten, so the connector's next resend shows it ------
+
+test("a request whose card cannot be built is forgotten and its resend gets the card", () =>
+  remoteWorld(async (w) => {
+    const views = (w.remote as unknown as { ctx: { views: { permission: (...args: unknown[]) => unknown } } }).ctx
+      .views;
+    const real = views.permission;
+    let tries = 0;
+    views.permission = (...args: unknown[]) => {
+      tries += 1;
+      if (tries === 1) throw new RangeError("Maximum call stack size exceeded"); // (what a request nested too deep does)
+      return real(...args);
+    };
+    w.server.addConnector(ALICE, "dev-pod", [["codex", "codex", "Codex"]]);
+    w.server.onCommand = new AskingAgent(CODEX_OPTIONS).hook;
+    await w.say("/agent new codex /home/me/repo");
+    const sid = w.test.store.remoteState.attachedRemote(AAD)?.sessionId ?? "";
+    await w.send("add a line to the README");
+    await w.until(() => tries === 1);
+    await w.until(() => perm(w, sid) === null); // forgotten, not left as shown
+    assert.equal(w.permissionCards().length, 0);
+    await w.server.ask(sid, "act-1", "Edit README.md", CODEX_OPTIONS, { input: { path: "README.md" } }); // the connector resends
+    await w.until(() => w.permissionCards().length > 0);
+    assert.equal(w.permissionCards().length, 1);
+  }));

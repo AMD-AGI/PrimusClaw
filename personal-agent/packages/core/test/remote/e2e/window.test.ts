@@ -268,3 +268,18 @@ test("an edit of the card cancelled while it waits for the chat does nothing", (
       ["update"],
     ); // the first refresh's edit, and nothing from the cancelled one
   }, CARD));
+
+// --- found by review (#636 r1): the box's words are cut and emptied as Python's str.strip()[:INPUT_MAX] -----------------------
+
+test("the box's words are cut by characters and a box of whitespace only is empty, as python reads them", () =>
+  remoteWorld(async (w) => {
+    const sid = await windowed(w, answering());
+    const long = "a".repeat(3999) + "😀"; // 4000 characters, 4001 UTF-16 units
+    await sendFromCard(w, sid, long);
+    await w.idle();
+    assert.deepEqual(prompts(w), [long]); // (the emoji whole: no half of a surrogate pair)
+    await sendFromCard(w, sid, "\u0085  ");
+    await w.idle();
+    assert.equal(prompts(w).length, 1); // nothing sent: Python's strip() takes these as white space
+    assert.ok(cardWords(lastWindow(w)).includes("Write in the box first"));
+  }, CARD));

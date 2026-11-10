@@ -16,6 +16,7 @@ import type { Settle } from "../permissions.js";
 import type { ChatState } from "../state.js";
 import { noteCard } from "../views.js";
 import { INPUT_ID, INPUT_MAX, markEdited } from "./view.js";
+import { cpSlice } from "../../text/py-text.js";
 
 /** The tap a settle answers: the card it was on, and the data it carried. */
 export interface Tap {
@@ -41,7 +42,7 @@ export function windowCloser(
     const view = state.view(tap.chatKey, attached);
     view.note = text;
     const typed = tap.data[INPUT_ID];
-    if (tap.data["op"] !== "send" && typeof typed === "string") view.draft = typed.slice(0, INPUT_MAX);
+    if (tap.data["op"] !== "send" && typeof typed === "string") view.draft = cpSlice(typed, 0, INPUT_MAX);
     const said = Boolean(text) && options.announce !== false; // (the line reaches the phone as the card itself, again at the bottom)
     if (tap.tapped === stored.statusCard) return onTheWindow({ ctx, state, board, tap, settle }, text, said);
     const note = noteCard(text || remoteAgentText.in(state.lang(tap.chatKey)).changedElsewhere);
