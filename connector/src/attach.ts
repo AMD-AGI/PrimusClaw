@@ -801,6 +801,56 @@ export class AttachSupport {
     }
   }
 
+  /** The Claude Code version the registry row of process `pid` names for `ref` (null: no such row, or it does not say). */
+  holderVersion(pid: number, ref: string): string | null {
+    try {
+      const doc: unknown = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
+      if (!isObject(doc) || doc.pid !== pid || typeof doc.sessionId !== "string" || doc.sessionId.toLowerCase() !== ref.toLowerCase()) return null;
+      return typeof doc.version === "string" ? doc.version : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Whether the conversation's main turn has ended, read from the end of its transcript: true when the last main-thread entry that
+   * belongs to a turn is Claude Code's `turn_duration` (the end of a turn); false when it is a user, assistant or attachment entry, or
+   * a queued message (`queue-operation`), of the main thread (a background agent's entries, `isSidechain`, do not count), or a line
+   * is still being written; null when that cannot be told (no transcript, a line that does not parse, nothing of a turn in what is
+   * read). With Claude Code's own `busy`, which background agents alone also cause, this is one of the two signals (the screen is the
+   * other) that its main turn waits for input.
+   */
+  async mainTurnEnded(ref: string): Promise<boolean | null> {
+    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
+    if (!file) return null;
+    let fh: fsp.FileHandle | null = null;
+    try {
+      fh = await fsp.open(file, "r");
+      const size = (await fh.stat()).size;
+      const len = Math.min(size, MAIN_TURN_TAIL_BYTES);
+      const buf = Buffer.alloc(len);
+      const { bytesRead } = await fh.read(buf, 0, len, size - len);
+      if (bytesRead !== len) return null;
+      const text = buf.toString("utf8");
+      if (len && !text.endsWith("\n")) return false;   // (an entry is being written: something is under way)
+      const lines = text.split("\n");
+      lines.pop();
+      if (size > len) lines.shift();   // (the first line read is cut)
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let doc: unknown;
+        try { doc = JSON.parse(lines[i]!); } catch { return null; }
+        if (!isObject(doc) || doc.isSidechain === true) continue;
+        if (doc.type === "system" && doc.subtype === "turn_duration") return true;
+        if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment" || doc.type === "queue-operation") return false;
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      await fh?.close().catch(() => undefined);
+    }
+  }
+
   /** The size of the conversation's transcript now, or null when there is none to look at. */
   transcriptSize(ref: string): number | null {
     const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
@@ -1116,6 +1166,17 @@ export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; w
   if (holders.some((e) => isIdleStatus(e.status))) return { activity: "idle" };
   return {};
 }
+
+/** How much of the end of a transcript is read to tell whether its main turn has ended. */
+const MAIN_TURN_TAIL_BYTES = 512 * 1024;
+
+/**
+ * The Claude Code versions measured to say `busy` while only background agents run with the main turn idle, the screen then showing
+ * an empty box with no `esc to interrupt` under it (and `esc to interrupt` while the main turn runs), and to end every main turn
+ * with `turn_duration` in the transcript (2026-11-10, real Claude Code in tmux). For any other version a `busy` terminal is waited
+ * for as before, and doctor says so (`claude_version_unverified`).
+ */
+export const BUSY_SCREEN_VERIFIED_VERSIONS: readonly string[] = ["2.1.285", "2.1.319", "2.1.321"];
 
 /** Whether Claude Code's status for a process says it waits at its prompt: `idle`, or `shell` (idle, background shells running). */
 export function isIdleStatus(status: string | null | undefined): boolean {

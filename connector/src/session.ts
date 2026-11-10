@@ -19,7 +19,7 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import { TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
+import { BUSY_SCREEN_VERIFIED_VERSIONS, TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { TerminalInput, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
@@ -191,6 +191,8 @@ export class Session {
     started?: () => void;
   } | null = null;
   private terminalPumping = false;
+  /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
+  private unverifiedTold = false;
   private terminalRestoring: Promise<void> | null = null;
   private tail: TranscriptTail | null = null;
   private tailTimer: NodeJS.Timeout | undefined;
@@ -465,12 +467,13 @@ export class Session {
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
           if (status === "busy") {
             // `busy` is also what Claude Code says while only background agents run and its main turn is idle (status is
-            // isLoading || delegatedActive, 2.1.321): a coordinator's terminal can say it for hours. Its screen tells the two apart:
-            // an empty box with no `esc to interrupt` under it, on two reads apart, is a prompt waiting for input.
-            const r = await term.readiness(true);
-            if (r.ready && await this.stillFree(term)) { ready = true; break; }
-            why = r.ready || r.why === "busy" || r.why === "screen" ? WAIT_WHY.busy : WAIT_WHY[r.why];
-            if (!r.ready && r.why === "gone") { told = why; break; }
+            // isLoading || delegatedActive in 2.1.285-2.1.321): a coordinator's terminal can say it for hours. Two signals must
+            // both say its main turn waits for input, twice: its transcript (the last main turn ended), and its screen (an empty
+            // box, no `esc to interrupt`); and only for a Claude Code version measured to behave so. Anything else: it waits.
+            const r = await this.busyButFree(term);
+            if (r === true) { ready = true; break; }
+            why = r === "gone" ? WAIT_WHY.gone : WAIT_WHY.busy;
+            if (r === "gone") { told = why; break; }
           } else if (!isIdleStatus(status)) {
             why = status === "waiting" ? WAIT_WHY.waiting : "terminal_state_unknown";
           } else {
@@ -540,12 +543,14 @@ export class Session {
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
         const before = this.holderStatus(term);
-        const again = await term.readiness(before === "busy");
+        const again = before === "busy"
+          ? ((await this.busyButFree(term)) === true ? await term.readiness(true) : { ready: false as const, why: "busy" as const })
+          : await term.readiness();
         if (!again.ready || !this.mayType(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
-          await term.type(text);
+          await term.type(text, before === "busy" ? () => this.mainTurnStillEnded() : undefined);
         } catch (e) {
           this.terminalTurn = null;
           this.env.store.endTurn(this.id);
@@ -572,12 +577,38 @@ export class Session {
     return isIdleStatus(status) || status === "busy";
   }
 
-  /** For a terminal that says `busy`: its screen shows no main turn running a second time, BUSY_SCREEN_SETTLE_MS later. */
-  private async stillFree(term: TerminalInput): Promise<boolean> {
-    await sleep(BUSY_SCREEN_SETTLE_MS);
-    if (this.holderStatus(term) !== "busy" && !isIdleStatus(this.holderStatus(term))) return false;
-    const r = await term.readiness(true);
-    return r.ready;
+  /**
+   * For a terminal Claude Code calls `busy`: true when its version is one measured to say so with only background agents running,
+   * and its transcript (the last main turn ended) and its screen (an empty box, no `esc to interrupt`) both say its main turn waits
+   * for input, on two looks BUSY_SCREEN_SETTLE_MS apart; "gone" when the terminal is gone; false otherwise (it waits).
+   */
+  private async busyButFree(term: TerminalInput): Promise<true | false | "gone"> {
+    const support = this.env.attach.get(this.agent.id);
+    if (!support || !this.acpId) return false;
+    const version = support.holderVersion(term.ref.pid, this.acpId);
+    if (!version || !BUSY_SCREEN_VERIFIED_VERSIONS.includes(version)) {
+      if (!this.unverifiedTold) {
+        this.unverifiedTold = true;
+        this.audit("terminal_version_unverified", { version, pid: term.ref.pid });
+      }
+      return false;
+    }
+    for (let look = 0; look < 2; look++) {
+      if (look) await sleep(BUSY_SCREEN_SETTLE_MS);
+      const status = this.holderStatus(term);
+      if (status !== "busy" && !isIdleStatus(status)) return false;
+      if ((await support.mainTurnEnded(this.acpId)) !== true) return false;
+      const r = await term.readiness(true);
+      if (!r.ready) return r.why === "gone" ? "gone" : false;
+    }
+    return true;
+  }
+
+  /** For a terminal Claude Code calls `busy`, what must still hold right before the Enter: its main turn has not started. */
+  private async mainTurnStillEnded(): Promise<string | null> {
+    const support = this.env.attach.get(this.agent.id);
+    if (!support || !this.acpId) return "the terminal's transcript cannot be read";
+    return (await support.mainTurnEnded(this.acpId)) === true ? null : "a main turn started there";
   }
 
   /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */

@@ -156,7 +156,7 @@ function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Recor
   const pid = Number(tmux("display-message", "-p", "-t", "%0", "#{pane_pid}").trim());
   // The registry row Claude Code keeps for its process, named by its pid, which the stand-in updates.
   const named = path.join(claudeDir, "sessions", `${pid}.json`);
-  fs.writeFileSync(named, JSON.stringify({ pid, sessionId: REF, status: extraEnv.FAKE_IDLE_STATUS ?? "idle", kind: "interactive", cwd: work, procStart: processStart(pid), pidDomain: localPidDomain() }));
+  fs.writeFileSync(named, JSON.stringify({ pid, sessionId: REF, status: extraEnv.FAKE_IDLE_STATUS ?? "idle", kind: "interactive", cwd: work, procStart: processStart(pid), pidDomain: localPidDomain(), version: extraEnv.FAKE_VERSION ?? "2.1.321" }));
   fs.symlinkSync(named, row);
   return { socket, pid, row: named, transcript, tmux, setMode: (m) => fs.writeFileSync(modeFile, m) };
 }
@@ -478,6 +478,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     hs.push(h);
     const t = terminal(work, h.attachDir, 1_500, { FAKE_IDLE_STATUS: "busy" });
     h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", subtype: "turn_duration", sessionId: REF })}\n`);   // (its last main turn ended)
     await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
     const sid = await h.attach(REF);
     const one = h.prompt(sid, "from the phone");
@@ -495,6 +496,53 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
     assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal", "while it works"]);
+  });
+
+  for (const c of [
+    { name: "the screen looks idle but the transcript's main turn has not ended", env: {} as Record<string, string>, ended: false, reverse: "the transcript signal" },
+    { name: "the transcript's main turn ended but the footer says esc to interrupt", env: { FAKE_FOOTER_ESC: "1" } as Record<string, string>, ended: true, reverse: "the screen signal" },
+    { name: "a Claude Code version not measured for busy", env: { FAKE_VERSION: "9.9.9" } as Record<string, string>, ended: true, reverse: "the version gate" },
+  ]) {
+    test(`busy, and ${c.name}: the message waits, nothing is typed (reverse proof: ${c.reverse})`, async () => {
+      const work = tmpdir("cc-work-");
+      const h = await Harness.create({
+        work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+        attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+      });
+      hs.push(h);
+      const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", ...c.env });
+      h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+      if (c.ended) fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", subtype: "turn_duration", sessionId: REF })}\n`);
+      await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+      const sid = await h.attach(REF);
+      const one = h.prompt(sid, "from the phone");
+      const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === one));
+      assert.equal(queued.data.reason, "terminal_working");
+      await new Promise((r) => setTimeout(r, 3_000));
+      assert.deepEqual(typed(t.transcript), [], "not typed");
+      assert.equal(inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")), "empty", "nothing left in the box");
+      if (c.env.FAKE_VERSION) assert.ok(h.audit().some((a) => a.kind === "terminal_version_unverified" && a.version === "9.9.9"));
+    });
+  }
+
+  test("busy and free by both signals, but a main turn starts after the text is typed: no Enter (reverse proof: the check right before Enter)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_TURN_ON_TYPE: "1" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", subtype: "turn_duration", sessionId: REF })}\n`);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "from the phone");
+    const end = await h.claw.until("the refusal", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    assert.equal(end.data.error, "terminal_input_failed");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.deepEqual(typed(t.transcript), [], "nothing was submitted");
+    assert.match(String(h.audit().find((a) => a.kind === "terminal_input_refused")?.detail), /a main turn started there/);
   });
 
   test("Enter is never sent onto a question: typed text with a permission question under its box is not submitted and nothing is approved", async () => {
