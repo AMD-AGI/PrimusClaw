@@ -7,7 +7,14 @@
  * refuses is edited into that message, and what the turn amends or replaces after the stream closed edits it too.
  */
 import type { Clock } from "../ports/clock.js";
-import type { Conversation, LiveStream, MessageId, OutMessage, StreamRefused } from "../ports/surface.js";
+import type {
+  Conversation,
+  LiveStream,
+  MessageId,
+  OutMessage,
+  StreamRefused,
+  UpdateOptions,
+} from "../ports/surface.js";
 import type { Result } from "../result.js";
 import type { ReceiptStream } from "./receipt.js";
 
@@ -36,12 +43,12 @@ export class TrackedStream implements ReceiptStream {
     return (this.clock.monotonicMs() - this.started) / 1000;
   }
 
-  inform(text: string): Promise<Result<void, StreamRefused>> {
-    return this.live.inform(text);
+  inform(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
+    return this.live.inform(text, options);
   }
 
-  async emit(text: string): Promise<Result<void, StreamRefused>> {
-    const sent = await this.live.emit(text);
+  async emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
+    const sent = await this.live.emit(text, options);
     if (sent.ok) this.streamed = text;
     return sent;
   }

@@ -18,7 +18,7 @@ import type { Lang } from "../locales/lang.js";
 import { receiptText } from "../locales/assistant.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
-import type { MessageId, OutMessage, StreamRefused } from "../ports/surface.js";
+import type { MessageId, OutMessage, StreamRefused, UpdateOptions } from "../ports/surface.js";
 import type { Result } from "../result.js";
 import { cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import { informativeText } from "./informative.js";
@@ -42,8 +42,10 @@ export interface ReceiptStream {
   readonly closable: boolean;
   /** Seconds since the stream's first request. */
   ageSeconds(): number;
-  inform(text: string): Promise<Result<void, StreamRefused>>;
-  emit(text: string): Promise<Result<void, StreamRefused>>;
+  /** A status update; once `options.signal` aborts it is given up at once (refused). */
+  inform(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>>;
+  /** The reply's words so far; as `inform`. */
+  emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>>;
   final(message: OutMessage): Promise<Result<void, StreamRefused>>;
   /** Replace the posted message `id` (the stream's, once it was closed). */
   update(id: MessageId, message: OutMessage): Promise<void>;
@@ -88,6 +90,8 @@ export class Receipt {
   private sender: Promise<void> | undefined;
   private readonly closedWaiters: (() => void)[] = [];
   private readonly closer = new AbortController();
+  /** Aborted when the receipt is dropped: an update on its way is given up. */
+  private readonly updates = new AbortController();
 
   constructor(
     readonly stream: ReceiptStream,
@@ -165,11 +169,12 @@ export class Receipt {
     while (this.want !== undefined && !this.done && this.stream.open) {
       const { kind, text } = this.want;
       this.want = undefined;
+      const options = { signal: this.updates.signal };
       const sent =
         kind === "informative"
-          ? await this.stream.inform(informativeText([text]))
+          ? await this.stream.inform(informativeText([text]), options)
           : text.startsWith(this.stream.streamed)
-            ? await this.stream.emit(text)
+            ? await this.stream.emit(text, options)
             : undefined;
       if (sent !== undefined && !sent.ok) return;
     }
@@ -189,10 +194,12 @@ export class Receipt {
 
   /**
    * The worker stops: the receipt is dropped, not closed (Python's shutdown cancels its tasks; the channel ends the stream
-   * itself). Its close timer is cancelled and what follows the turn stops (`closed()` resolves), so nothing keeps the process up.
+   * itself). Its close timer is cancelled, an update on its way to the channel is given up, and what follows the turn stops
+   * (`closed()` resolves), so nothing keeps the process up.
    */
   drop(): void {
     this.closer.abort();
+    this.updates.abort();
     this.done = true;
     this.want = undefined;
     for (const resolve of this.closedWaiters.splice(0)) resolve();

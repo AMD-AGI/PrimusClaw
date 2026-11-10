@@ -21,8 +21,11 @@ import { Mutex } from "./mutex.js";
 /** Teams takes one request a second per stream. */
 export const MIN_INTERVAL_MS = 1000;
 
-/** Sends one request of a stream and returns the id Teams answered with (the stream's id, for the first). */
-export type StreamPoster = (activity: JsonObject) => Promise<string | undefined>;
+/**
+ * Sends one request of a stream and returns the id Teams answered with (the stream's id, for the first). Once `signal`
+ * aborts, it rejects at once.
+ */
+export type StreamPoster = (activity: JsonObject, signal?: AbortSignal) => Promise<string | undefined>;
 
 export interface StreamParts {
   readonly post: StreamPoster;
@@ -68,17 +71,25 @@ export class TeamsStream {
     return this.openedAt === undefined ? 0 : this.parts.clock.monotonicMs() - this.openedAt;
   }
 
-  private async send(activity: JsonObject, final = false): Promise<string | undefined> {
+  private async send(activity: JsonObject, final = false, signal?: AbortSignal): Promise<string | undefined> {
     if (this.closed || (this.broken && !final)) throw new StreamRefusedError("the stream is over");
-    const wait = this.lastAt === undefined ? 0 : this.lastAt + MIN_INTERVAL_MS - this.parts.clock.monotonicMs();
-    if (wait > 0) await this.parts.clock.sleep(wait);
     try {
-      return await this.parts.post(activity);
+      const wait = this.lastAt === undefined ? 0 : this.lastAt + MIN_INTERVAL_MS - this.parts.clock.monotonicMs();
+      if (wait > 0) await this.parts.clock.sleep(wait, signal);
+      if (signal?.aborted === true) throw signal.reason as Error;
+      return await this.parts.post(activity, signal);
     } catch (error) {
+      if (signal?.aborted === true) throw this.dropped();
       throw this.refused(error);
     } finally {
       this.lastAt = this.parts.clock.monotonicMs();
     }
+  }
+
+  /** Whoever sent it gave the update up (the stream was dropped): it takes no more, and nothing went wrong. */
+  private dropped(): StreamRefusedError {
+    this.broken = true;
+    return new StreamRefusedError("the update was given up");
   }
 
   private refused(error: unknown): StreamRefusedError {
@@ -116,21 +127,29 @@ export class TeamsStream {
   }
 
   /** A new informative update (shown only until text is streamed). */
-  inform(text: string): Promise<void> {
+  inform(text: string, signal?: AbortSignal): Promise<void> {
     return this.lock.run(async () => {
       this.sequence += 1;
-      await this.send(streamActivity("informative", text, this.parts.replyTo, this.sequence, this.streamId));
+      await this.send(
+        streamActivity("informative", text, this.parts.replyTo, this.sequence, this.streamId),
+        false,
+        signal,
+      );
     });
   }
 
   /** The streamed text so far. What was streamed before must be its start (Teams refuses anything else). */
-  emit(text: string): Promise<void> {
+  emit(text: string, signal?: AbortSignal): Promise<void> {
     if (!text.startsWith(this.streamed)) {
       return Promise.reject(new RangeError("streamed text must grow from what was streamed before"));
     }
     return this.lock.run(async () => {
       this.sequence += 1;
-      await this.send(streamActivity("streaming", text, this.parts.replyTo, this.sequence, this.streamId));
+      await this.send(
+        streamActivity("streaming", text, this.parts.replyTo, this.sequence, this.streamId),
+        false,
+        signal,
+      );
       this.streamed = text;
     });
   }

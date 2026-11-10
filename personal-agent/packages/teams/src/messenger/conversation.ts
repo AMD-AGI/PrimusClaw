@@ -189,10 +189,10 @@ export class TeamsConversation implements Conversation {
       ref: this.ref,
       replyTo,
       status,
-      post: async (activity) => {
+      post: async (activity, signal) => {
         const body = envelope("send", reference(this.ref), this.prepare(activity));
         this.logger.info("outbound stream", { type: kindOf(body.activity), chars: streamChars(body.activity) });
-        return (await outbox.publishStream(body)).activityId;
+        return (await outbox.publishStream(body, { signal })).activityId;
       },
       render: (message) => activityOf(message, this.parts.render),
     });
