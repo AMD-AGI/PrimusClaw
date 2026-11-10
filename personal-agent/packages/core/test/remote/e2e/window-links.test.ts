@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
 
+import { fullBlockText } from "../../../src/remote/clicks.js";
 import { USER_A, remoteWorld } from "../../../../../test-support/remote-world.js";
 import { answering, lastWindow, sendFromCard, statusCardId, windowed } from "./window-helpers.js";
 
@@ -66,3 +67,10 @@ test("the agents output in the card and in the full output has no address that c
     },
     { windowDefault: "card" },
   ));
+
+test("a character the rich text drops cannot close the full output's block or join an address in it", () => {
+  // (the rich text drops controls and bidi overrides before it reads: a fence split by one closes the block once read, and
+  // `https:\x01//` is `https://`)
+  const shown = fullBlockText("`\u{202e}``\nhttps:\x01//127.0.0.1/x and www\u{2066}.w.example");
+  assert.equal(shown, "ʼʼʼ\nhttps:​//127.0.0.1/x and www​.w.example");
+});

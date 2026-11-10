@@ -16,6 +16,7 @@ import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type OutMessage, richMessage } from "../ports/surface.js";
 import { backLine } from "./lines.js";
 import { breakLinks } from "./inert.js";
+import { DROPPED_BY_RICH_TEXT } from "./links/answer.js";
 import { neutral } from "../text/neutral.js";
 import { cpSlice, pyStrip } from "../text/py-text.js";
 import { own } from "../own.js";
@@ -254,7 +255,7 @@ export class SessionClicks {
     await this.closer(click)("", { announce: false });
     for (const [i, part] of parts.entries()) {
       const head = words.fullOutputHead({ i: i + 1, n: parts.length, label: state.agentLabel, host: state.host });
-      const block = "```\n" + breakLinks(part).replaceAll("```", "ʼʼʼ") + "\n```";
+      const block = "```\n" + fullBlockText(part) + "\n```";
       await click.to.send(richMessage(`${neutral(head, 160)}\n\n${block}`, { aiGenerated: true }));
     }
   }
@@ -328,4 +329,10 @@ export class SessionClicks {
   async list(click: Click): Promise<void> {
     await this.home(click, "");
   }
+}
+
+/** One part of the full output as its fenced block holds it: what the rich text drops taken out first (else `https:\x01//` or a
+ * fence split by a bidi override would join once it reads them), every address broken in place, no fence that could close it. */
+export function fullBlockText(part: string): string {
+  return breakLinks(part.replace(DROPPED_BY_RICH_TEXT, "")).replaceAll("```", "ʼʼʼ");
 }
