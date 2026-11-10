@@ -1294,6 +1294,10 @@ record it.
   moment gets "No", never "Yes"; a question on the screen is waited out and the phone is told (`terminal_dialog`). Cancel presses
   Esc only into a turn the message started itself and takes a cancelled message's own text out of the box again. Claude Code's
   prompt suggestion in the box is not someone typing (#648).
+- `@primusclaw/connector` 0.1.20: a message held because someone is typing in the terminal (or it is scrolled back) ends as
+  `terminal_busy` ("not sent, send it again"), never as `terminal_input_unconfirmed` before its text went in (#671); a terminal
+  step written after a large transcript line (Claude Code's `prompt_snapshot`) reaches the phone while it runs, read on the first
+  look instead of 256 KB a second (#674).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
