@@ -1204,9 +1204,26 @@ test("S36d a URL, a link or a fence ends where it ends, not at the next space: t
   const en = caseOf({ lang: "en", turns: [{ user: "did the runs pass?" }], style: { reply_lang: "follow_user" } });
   assert.deepEqual(failed(zh, observed({ final: "PR: https://github.com/AMD-AGI/PrimusClaw/pull/12，已经合并，所有检查都通过了，部署也完成了。 Status: merged, deployed and verified." })), []);
   assert.deepEqual(failed(en, observed({ final: "Done.\n- https://x.invalid/run/1：任务已完成，没有错误。\n- https://x.invalid/run/2：全部检查通过，可以合并。" })), ["reply in en"]);
-  // The same after a markdown link's target, and after an unclosed fence.
-  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1，任务已完成没有错误全部检查通过可以合并) ok" })), ["reply in en"]);
+  // The same after a markdown link, and after one whose `)` never comes (its URL is then a bare one), and after an unclosed fence.
+  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1)，任务已完成没有错误全部检查通过可以合并 ok" })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1，任务已完成没有错误全部检查通过可以合并 ok" })), ["reply in en"]);
   assert.deepEqual(failed(en, observed({ final: "Done.\n```\n任务已完成，没有错误，全部检查通过，可以合并。" })), ["reply in en"]);
+  // A link's target ends at its `)`, not at the first character outside ASCII: an unencoded Chinese path (a zh Wikipedia page, an
+  // internal wiki) is part of the link, which goes whole (the reviewer's two cases).
+  assert.deepEqual(failed(en, observed({ final: "Fixed the two items: [修复调度器内存泄漏](https://wiki.example/修复调度器内存泄漏) and [优化日志](https://wiki.example/优化日志). Both are merged." })), []);
+  assert.deepEqual(failed(zh, observed({ final: "已完成。参考：[Kubernetes Scheduling Framework Overview Documentation](https://zh.wikipedia.org/wiki/调度) 。" })), []);
+});
+
+test("S36e a fenced block the reply closes is code even when it runs past the language sample", () => {
+  // The reviewer's case (PR #620): the block crosses the first 8,000 characters, so in the sample it has no closing fence.
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const log = "error: connection refused while pulling image layer from registry\n".repeat(130);
+  assert.ok(log.length > 8_000);
+  assert.deepEqual(failed(zh, observed({ final: `日志如下：\n\`\`\`\n${log}\n\`\`\`\n已修复。` })), []);
+  assert.deepEqual(failed(zh, observed({ final: `日志如下：\n~~~\n${log}\n~~~\n已修复。` })), []);
+  // A fence the reply itself leaves open is still prose, however long the reply.
+  const en = caseOf({ lang: "en", turns: [{ user: "did the runs pass?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(en, observed({ final: `Done.\n\`\`\`\n任务已完成，没有错误，全部检查通过，可以合并。${"。".repeat(9_000)}` })), ["reply in en"]);
 });
 
 test("S36b the reply's own words are found in bounded time, however long the reply", () => {
@@ -1216,7 +1233,11 @@ test("S36b the reply's own words are found in bounded time, however long the rep
     assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
   }
   // Unclosed link and quote openers, which make those patterns rescan the rest of the line from each one.
-  for (const final of [`done ${"[".repeat(200_000)}`, `done ${"“".repeat(200_000)}`, `done ${"![x](".repeat(40_000)}`]) {
+  for (const final of [`done ${"[".repeat(200_000)}`, `done ${"“".repeat(200_000)}`, `done ${"![x](".repeat(40_000)}`, `done ${"[x](é".repeat(40_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  // Unclosed fences, which the code pattern takes out of the whole reply before it is cut to its sample.
+  for (const final of [`done ${"`".repeat(200_000)}`, `done ${"~~~x".repeat(100_000)}`, `done \`\`\`${"a".repeat(1_000_000)}`]) {
     assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
   }
   assert.ok(Date.now() - started < 3_000, `${Date.now() - started} ms`);

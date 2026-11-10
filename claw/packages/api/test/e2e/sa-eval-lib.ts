@@ -1295,15 +1295,18 @@ const CJK = /[㐀-鿿]/g;
  * plan names, or an English one that quotes a Chinese item title, is still in the language it is written in.
  */
 export function replyProse(text: string): string {
-  // The first LANGUAGE_SAMPLE characters say what language a reply is in; an unclosed `[` or `“` makes the link and quote
-  // patterns rescan the rest of its line from every opener, so the text they read is bounded.
-  return text.slice(0, LANGUAGE_SAMPLE)
-    // A fence counts as code only when it is closed: an unclosed one would take every word after it, prose included.
-    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ")
+  // A fence counts as code only when it is closed: an unclosed one would take every word after it, prose included. Fences go
+  // before the text is cut to its sample, so a block that runs past the cut is still code (each opener scans only to the first
+  // closing mark after it, so this is one pass over the reply however long it is).
+  return text.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ")
+    // The first LANGUAGE_SAMPLE characters say what language a reply is in; an unclosed `[` or `“` makes the link and quote
+    // patterns rescan the rest of its line from every opener, so the text they read is bounded.
+    .slice(0, LANGUAGE_SAMPLE)
     .replace(/`[^`\n]*`/g, " ")
-    // A link's target and a bare URL end at the first character a URL cannot hold unescaped: whitespace or anything outside
-    // printable ASCII, so the Chinese right after one ("…/pull/12，已经合并") stays prose.
-    .replace(/!?\[[^\]\n]*\](?:\([!-(*-~]*\)|\[[^\]\n]*\])/g, " ")
+    // A markdown link goes whole: its target ends at its `)`, and may hold unencoded non-ASCII (a zh Wikipedia page, an internal
+    // wiki), so it cannot run into the prose after it. A bare URL has no such end: it ends at the first character a URL cannot
+    // hold unescaped, whitespace or anything outside printable ASCII, so the Chinese right after one ("…/pull/12，已经合并") stays prose.
+    .replace(/!?\[[^\]\n]*\](?:\([^)\s]*\)|\[[^\]\n]*\])/g, " ")
     .replace(/\b(?:https?|ftp):\/\/[!-~]+/gi, " ")
     .replace(/^[ \t]*>.*$/gm, " ")
     // Single quotes only around a passage, not in a word ("don't", "John's").
