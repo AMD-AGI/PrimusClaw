@@ -1262,12 +1262,13 @@ test("S38 an id the person gave in their own message is not a leak when the repl
   const said = caseOf({ turns: [{ user: "事项 7 的结果呢" }, { user: "那编号 8 呢" }], style: { no_ids: true } });
   assert.deepEqual(failed(said, observed({ shown: ["都已完成：#7、#8。"], final: "都已完成：#7、#8。" })), []);
   // A commit's, a pull request's or a repository's number the person gave excuses no item of that number.
-  for (const user of ["What happened in commit #12?", "PR #12 的状态是什么？", "AMD-AGI/PrimusClaw#12 合了吗", "议题 #12 还开着吗"]) {
+  for (const user of ["What happened in commit #12?", "PR #12 的状态是什么？", "PR 编号 12 的状态是什么？", "AMD-AGI/PrimusClaw#12 合了吗", "议题 #12 还开着吗",
+    "议题编号 12 还开着吗", "the run task 12 failed?"]) {
     const other = caseOf({ turns: [{ user }], style: { no_ids: true } });
     assert.deepEqual(failed(other, observed({ shown: ["The internal item is #12."], final: "The internal item is #12." })), ["items named by title"], user);
   }
-  const look = caseOf({ turns: [{ user: "看看 #12 的结果" }, { user: "task #13?" }], style: { no_ids: true } });
-  assert.deepEqual(failed(look, observed({ shown: ["都已完成：#12、#13。"], final: "都已完成：#12、#13。" })), []);
+  const look = caseOf({ turns: [{ user: "看看 #12 的结果" }, { user: "task #13?" }, { user: "show me task 14" }], style: { no_ids: true } });
+  assert.deepEqual(failed(look, observed({ shown: ["都已完成：#12、#13、#14。"], final: "都已完成：#12、#13、#14。" })), []);
   const pr = caseOf({ turns: [{ user: "PR #12 的状态是什么？" }], style: { no_ids: true } });
   assert.deepEqual(failed(pr, observed({ shown: ["内部事项是 #12。"], final: "内部事项是 #12。" })), ["items named by title"]);
   // A number the person wrote for something else ("过去 3 天") does not excuse it.

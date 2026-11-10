@@ -823,10 +823,12 @@ export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; nu
   for (const m of text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)) {
     // "PR #12 的状态" or "AMD-AGI/PrimusClaw#12" names a pull request's number, which excuses no item of that number.
     const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
-    // "#12" is the person's item only when nothing before it says what else it numbers: no Latin word right before it other than
-    // item or task ("commit #12", "PR #12", "AMD-AGI/PrimusClaw#12"), and nothing NOT_AN_ITEM names in its clause ("议题 #3").
+    // A number is the person's item only when nothing before it says what else it numbers: nothing NOT_AN_ITEM names in its clause
+    // ("议题 #3", "the run task 12"), and, for a "#12" or "编号 12" that does not say it is an item, no Latin word right before it
+    // other than item or task ("commit #12", "PR #12", "PR 编号 12", "AMD-AGI/PrimusClaw#12").
     const before = clause.match(/([A-Za-z][\w.-]*(?:\/[\w.-]+)?)\s*$/)?.[1];
-    if (m[0].startsWith("#") && ((before && !/^(?:items?|tasks?)$/i.test(before)) || namesOther(clause))) continue;
+    const named = /^(?:items?|tasks?|事项|任务)/i.test(m[0]);
+    if (namesOther(clause) || (!named && before && !/^(?:items?|tasks?)$/i.test(before))) continue;
     numbers.add(String(Number(m[1])));
   }
   return { uuids, numbers };
