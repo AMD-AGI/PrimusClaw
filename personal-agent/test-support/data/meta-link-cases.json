@@ -1,5 +1,5 @@
 {
- "about": "remote_view.neutral(text, limit) after the fix: one short line of text an agent or a connector supplied (a connector's name, a health check's unknown detail, an agent's plan, a tool's title): control characters gone, credentials masked, `[`/`]` as `(`/`)`, `<`/`>` as look-alikes, a zero-width space after the colon of every `://` (the chat's rich text links a bare address by itself), clipped to `limit`. Generated from the Python worker; the TypeScript port must give the same. A bare domain (the answer's rule) gets a zero-width space before the dot of its last label, and a mail address one right after its `@`.",
+ "about": "remote_view.neutral(text, limit) after the fix: one short line of text an agent or a connector supplied (a connector's name, a health check's unknown detail, an agent's plan, a tool's title): control characters gone, credentials masked, `[`/`]` as `(`/`)`, `<`/`>` as look-alikes, a zero-width space after the colon of every `://` and the `www` of every `www.`, escaped ones too (the chat's rich text and a client link a bare address by themselves), clipped to `limit`. Generated from the Python worker; the TypeScript port must give the same. A bare domain (the answer's rule) gets a zero-width space before the dot of its last label, and a mail address one right after its `@`.",
  "cases": [
   {
    "about": "connector name",
