@@ -279,3 +279,16 @@ test("repositories are read from links and names next to a github word", () => {
   assert.deepEqual(repositoriesNamed("a/b 是什么"), []); // (no GitHub word: "and/or" is no repository)
   assert.deepEqual(repositoriesNamed("CI/CD 的 PR 怎么写"), []); // (words, not a repository)
 });
+
+test("a long line of review words is read in linear time", () => {
+  // (each "review" looked ahead for owner/repo#N, which used to be tried again from every character of the run: cubic, ~0.4 s
+  // for one 2000-character message; Python's `_REVIEW` takes ~0.15 s on it)
+  const text = `我的 github PR 状态 ${"review-".repeat(282)}`;
+  const started = performance.now();
+  assert.equal(asksAboutOwnGithub(text), true);
+  assert.ok(performance.now() - started < 100, `took ${String(performance.now() - started)} ms`);
+  // (and the same reading as Python's: owner/repo#N within 40 characters of the word, from the start of its name)
+  assert.equal(asksAboutOwnGithub(`我的 github PR 状态 review ${" ".repeat(39)}o/r#1`), false);
+  assert.equal(asksAboutOwnGithub(`我的 github PR 状态 review ${" ".repeat(40)}o/r#1`), true);
+  assert.equal(asksAboutOwnGithub(`我的 github PR 状态 review x-${"a".repeat(60)}/r#1`), false);
+});

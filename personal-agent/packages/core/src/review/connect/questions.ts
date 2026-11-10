@@ -23,7 +23,12 @@ const STATE = pyRegExp(
   "i",
 );
 // A review asked for: reviews go their own way, and no card is offered beside one.
-const REVIEW_NEAR = pyRegExp(String.raw`(?:合入|merge|https?://|[A-Za-z0-9-]+/[A-Za-z0-9._-]+#\d)`, "i");
+// (owner/repo#N only from the start of its run of name characters: the same earliest start as Python's `_REVIEW`, without
+// trying the run again from each of its characters, which made a long line of "review-review-..." cubic)
+const REVIEW_NEAR = pyRegExp(
+  String.raw`(?:合入|merge|https?://|(?<![A-Za-z0-9-])[A-Za-z0-9-]+/[A-Za-z0-9._-]+#\d)`,
+  "i",
+);
 const REVIEW_WORD = pyRegExp(String.raw`(?<![A-Za-z])review(?![A-Za-z])`, "gi");
 const REVIEW_OTHER = pyRegExp(String.raw`代审|帮.{0,6}审`);
 
