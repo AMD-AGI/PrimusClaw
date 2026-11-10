@@ -819,7 +819,13 @@ const namedAsOtherElsewhere = (text: string, n: string): boolean =>
 export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; numbers: Set<string> } {
   const text = userTexts.join("\n");
   const uuids = new Set([...text.matchAll(UUID_G)].map((m) => m[0].toLowerCase()));
-  const numbers = new Set([...text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)].map((m) => String(Number(m[1]))));
+  const numbers = new Set<string>();
+  for (const m of text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)) {
+    // "PR #12 的状态" or "AMD-AGI/PrimusClaw#12" names a pull request's number, which excuses no item of that number.
+    const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
+    if (m[0].startsWith("#") && namesOther(clause)) continue;
+    numbers.add(String(Number(m[1])));
+  }
   return { uuids, numbers };
 }
 
@@ -1287,12 +1293,25 @@ export function replyProse(text: string): string {
     .replace(/\b(?:https?|ftp):\/\/\S+/gi, " ")
     .replace(/^[ \t]*>.*$/gm, " ")
     .replace(/"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』/g, " ")
-    .replace(/[A-Za-z0-9]*(?:[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|[a-z][A-Z])[A-Za-z0-9\-_/.:#@]*/g, " ")
-    .replace(/\b[A-Z][a-z]*[A-Z][A-Za-z]*\b/g, " ");
+    // Word by word (one pass, no backtracking across a long run): a word that is an identifier goes.
+    .replace(/[A-Za-z0-9\-_/.:#@]+/g, (w) => (IDENTIFIER.test(w) ? " " : w));
 }
+const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|[a-z][A-Z]|^[A-Z][a-z]*[A-Z]/;
 
-/** An item named by its number and title, the title up to the end of its line, a bracket, bold, a colon or a clause's end. */
-const ITEM_TITLE = /#\d+[ \t]+[^\n*(（:：。，,;；!！?？]+/g;
+/**
+ * The titles the turn read (an item's, a pull request's, a plan's: every `"title"` its tools answered, and the case's own items):
+ * names, in whatever language they were written, which a reply repeats ("**#78 写脚本统计 assistant 目录文件行数**" in English).
+ */
+export function readTitles(calls: readonly ToolCall[], items: readonly ItemSeen[] = []): string[] {
+  const out = new Set(items.map((i) => i.title.trim()));
+  for (const c of calls) {
+    for (const m of (c.result ?? "").matchAll(/"title"\s*:\s*"((?:[^"\\\n]|\\.)*)"/g)) {
+      try { out.add(String(JSON.parse(`"${m[1]}"`)).trim()); } catch { /* not a JSON string: no title */ }
+    }
+  }
+  // Too short a title would take ordinary words out with it ("test" in "latest").
+  return [...out].filter((t) => t.length >= 4 || /[㐀-鿿]{2}/.test(t)).sort((a, b) => b.length - a.length);
+}
 
 /** A message that is a slash command and its arguments (`/brief off`, `/hlep`), not a sentence in some language. */
 const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:\s|$)/;
@@ -1303,12 +1322,11 @@ export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(replyP
 /**
  * The language check of `style.reply_lang`: the share of Chinese characters among the letters of the reply's own words
  * (`replyProse`; digits, punctuation and markdown are no language). Chinese needs at least 0.2 of them, English under 0.05, as
- * before; an English reply's item titles in Chinese (`ITEM_TITLE`) are names too. A reply with no word of its own ("2", "**0**",
- * `10.1.0`) is in no language, and the check does not apply to it.
+ * before; the titles the turn read (`readTitles`) are names too. A reply with no word of its own ("2", "**0**", `10.1.0`) is in
+ * no language, and the check does not apply to it.
  */
-export function replyLanguage(lang: "zh" | "en", text: string): { applies: boolean; pass: boolean; detail: string } {
-  // An English reply names the person's items as they titled them, in Chinese too ("**#78 写脚本统计 assistant 目录文件行数**").
-  const prose = replyProse(lang === "en" ? text.replace(ITEM_TITLE, (t) => (/[㐀-鿿]/.test(t) ? " " : t)) : text);
+export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly string[] = []): { applies: boolean; pass: boolean; detail: string } {
+  const prose = replyProse(titles.reduce((t, title) => t.split(title).join(" "), text));
   const cjk = prose.match(CJK)?.length ?? 0;
   const letters = cjk + (prose.match(LATIN)?.length ?? 0);
   if (!letters) return { applies: false, pass: true, detail: "no words of its own" };
@@ -1383,7 +1401,7 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   if (c.style?.reply_lang === "follow_user" && c.lang !== "mixed") {
     // The person's messages must have words of their own to follow: "/hlep", "/brief off" or "？" are in no language.
     const lang = c.turns.some((t) => !SLASH_COMMAND.test(t.user) && hasWords(t.user))
-      ? replyLanguage(c.lang, o.final) : { applies: false, pass: true, detail: "the person wrote no words of a language" };
+      ? replyLanguage(c.lang, o.final, readTitles(o.calls, o.items)) : { applies: false, pass: true, detail: "the person wrote no words of a language" };
     if (lang.applies) out.push({ name: `reply in ${c.lang}`, pass: lang.pass, detail: lang.detail });
     else out.push({ name: `reply in ${c.lang}`, pass: true, skipped: true, detail: lang.detail });
   }

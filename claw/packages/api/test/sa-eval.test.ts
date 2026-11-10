@@ -1182,9 +1182,25 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
     + "- That approval was never given, and the item was stopped at 00:14 UTC, so no commit or PR exists.\n\n"
     + "**#78 写脚本统计 assistant 目录文件行数**\n- The worker started but reported nothing, and it was stopped at 00:15 UTC when you said to drop it.\n\n"
     + "*Note: the script itself was never delivered, so I can't give you line counts.*";
-  assert.deepEqual(failed(en, observed({ final: items })), []);
-  // A title does not carry the rest of a Chinese answer with it.
-  assert.deepEqual(failed(en, observed({ final: "#12 修复登录超时 已完成，worker 汇报共 1204 行。" })), ["reply in en"]);
+  // The titles are what the turn's work_recall answered (as the live turn did); Chinese the turn did not read as a title counts.
+  const recall = (seq: number, title: string): ToolCall => ({ ...call("mcp__assistant__work_recall"),
+    result: JSON.stringify({ ok: true, item: { item_id: `kwi_${seq}`, seq, title, board_state: "done", outcome: "stopped" }, reports: [] }) });
+  const read = [recall(77, "加统计 assistant 下 ts 行数的脚本"), recall(78, "写脚本统计 assistant 目录文件行数")];
+  assert.deepEqual(failed(en, observed({ final: items, calls: read })), []);
+  assert.deepEqual(failed(en, observed({ final: "Done; #12 这是中文内容。", calls: read })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "#12 修复登录超时 已完成，worker 汇报共 1204 行。", calls: read })), ["reply in en"]);
+  // An English reply whose only Chinese is those titles is not a Chinese one.
+  const english = "Both items stopped before finishing: #77 加统计 assistant 下 ts 行数的脚本 and #78 写脚本统计 assistant 目录文件行数. No result was produced.";
+  assert.deepEqual(failed(zh, observed({ final: english, calls: read })), ["reply in zh"]);
+});
+
+test("S36b the reply's own words are found in one pass, however long the reply", () => {
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const started = Date.now();
+  for (const final of ["a".repeat(200_000), `${"ab1-".repeat(50_000)} done`, `${"x".repeat(100_000)}"${"y".repeat(100_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  assert.ok(Date.now() - started < 3_000, `${Date.now() - started} ms`);
 });
 
 test("S37 a reply with no words, or to a message with none, is in no language: the check does not apply", () => {
@@ -1220,6 +1236,9 @@ test("S38 an id the person gave in their own message is not a leak when the repl
   assert.deepEqual(failed(asked, observed({ shown: ["已完成的是 #13。"], final: "已完成的是 #13。" })), ["items named by title"]);
   const said = caseOf({ turns: [{ user: "事项 7 的结果呢" }, { user: "那编号 8 呢" }], style: { no_ids: true } });
   assert.deepEqual(failed(said, observed({ shown: ["都已完成：#7、#8。"], final: "都已完成：#7、#8。" })), []);
+  // A pull request's number the person gave excuses no item of that number.
+  const pr = caseOf({ turns: [{ user: "PR #12 的状态是什么？" }], style: { no_ids: true } });
+  assert.deepEqual(failed(pr, observed({ shown: ["内部事项是 #12。"], final: "内部事项是 #12。" })), ["items named by title"]);
   // A number the person wrote for something else ("过去 3 天") does not excuse it.
   const days = caseOf({ turns: [{ user: "过去 3 天做完了哪些事？" }], style: { no_ids: true } });
   assert.deepEqual(failed(days, observed({ shown: ["做完了 #3。"], final: "做完了 #3。" })), ["items named by title"]);
