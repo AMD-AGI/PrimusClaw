@@ -1,0 +1,121 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "op": "switch",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "切换会话",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_switch"
+     },
+     {
+      "data": {
+       "op": "detach",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "回到助理",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_detach"
+     },
+     {
+      "data": {
+       "op": "stop",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "停止",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_stop"
+     },
+     {
+      "data": {
+       "op": "mode",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "模式",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_mode"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔌 已连到 robin-dev · Claude Code",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "/root/ws/active · 模式 default",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "spacing": "Small",
+      "text": "状态：正在处理",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "Small",
+      "text": "要跟 Clawy 说：消息以 @Clawy 开头，或用 Clawy 的 / 命令；协调者代发的请求也由 Clawy 处理，不会发给这个会话。",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "更新于 08:00:00Z",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

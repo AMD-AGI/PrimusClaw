@@ -1112,8 +1112,14 @@ export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; w
     return why ? { activity: "waiting", waiting_for: why } : { activity: "waiting" };
   }
   if (holders.some((e) => e.status === "busy")) return { activity: "working" };
-  if (holders.some((e) => e.status === "idle")) return { activity: "idle" };
+  // `shell`: idle at its prompt with background shells still running (Claude Code 2.1.32x), as free to type into as `idle`.
+  if (holders.some((e) => isIdleStatus(e.status))) return { activity: "idle" };
   return {};
+}
+
+/** Whether Claude Code's status for a process says it waits at its prompt: `idle`, or `shell` (idle, background shells running). */
+export function isIdleStatus(status: string | null | undefined): boolean {
+  return status === "idle" || status === "shell";
 }
 
 /** A title that is safe to send: no credential shapes, no control characters, one line, short. */

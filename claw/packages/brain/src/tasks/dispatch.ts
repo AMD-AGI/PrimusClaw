@@ -657,7 +657,7 @@ async function handleResolvedRequest(
   // The names this run can be interrupted by, taken from the same request the
   // gate key was computed from. Nobody publishes to a gate key: the stop
   // button, cancelTask and the sweeper all address a session or a DAG root.
-  registerRunAddressesFor(lockKey, request);
+  registerRunAddressesFor(lockKey, request, abortCtrl);
   // Track promise for graceful drain.
   const taskPromise = runHandleTask(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl,
@@ -666,8 +666,10 @@ async function handleResolvedRequest(
   trackInflight(taskPromise, () => {
     // The one place every dispatched run passes through on its way out. The
     // controller itself is cleared on several paths inside the run, and
-    // spreading this over those is how the two got out of step before.
-    forgetRunAddresses(lockKey);
+    // spreading this over those is how the two got out of step before. Only
+    // this run's: a Stop may have force-released it and a later run of the key
+    // registered its own names since.
+    forgetRunAddresses(lockKey, abortCtrl);
   });
   await taskPromise;
 }

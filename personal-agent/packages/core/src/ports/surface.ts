@@ -65,7 +65,10 @@ interface InboundBase {
   readonly conversation: ConversationRef;
   /** The locale of the person's client ("" when not said), e.g. "zh-CN". */
   readonly locale: string;
-  /** The client the person used ("Windows", "Web", "iOS", ...; "" when not said), letters and digits only. */
+  /**
+   * The client the person used ("Windows", "Mac", "Web", "iOS", "Android"; "" when not said), letters and digits only,
+   * at most 16 (Python `activity.client_platform`).
+   */
   readonly clientPlatform: string;
 }
 
@@ -77,12 +80,25 @@ export interface InboundLink {
 
 /** A message the person quoted or replied to. */
 export interface InboundQuote {
+  /** The channel's id of the quoted message ("" when not said): tells whether a reply quotes a card the bot posted. */
+  readonly messageId: string;
   readonly author: string;
   readonly text: string;
   /** Whether the quoted message is one this bot posted. */
   readonly fromBot: boolean;
   /** When it was written, as the channel said it ("" when not said). */
   readonly sentAt: string;
+  /**
+   * The channel says the quoted message was deleted. Independent of `text`: a deleted quote may still carry a preview,
+   * which is shown as any quote's text; only when `text` is empty does `deleted` decide what is said instead ("the
+   * quoted message was deleted" rather than "its text is not available"), as Python `quote_block` does.
+   */
+  readonly deleted: boolean;
+  /**
+   * Where the adapter read the quote (for a log line, never the text): a structured entity, the message's HTML, or a
+   * placeholder that came with no data (Python `Quote.source`).
+   */
+  readonly source: "entity" | "html" | "placeholder";
 }
 
 /** Someone the message @mentions (never the bot itself: the adapter removes its own mention). */
@@ -94,6 +110,11 @@ export interface InboundMention {
   readonly name: string;
   /** The mention as it appears in the message text. */
   readonly shown: string;
+  /**
+   * Where `shown` starts in `InboundMessage.text`, in code points: a mention is replaced at its position, never at the
+   * first occurrence of the name ("Dana, ask @Dana" mentions the second "Dana").
+   */
+  readonly offset: number;
 }
 
 /** A file that came with a message. The bytes are fetched through `Surface.fetchFile`, never by core directly. */
@@ -109,8 +130,19 @@ export interface InboundMessage extends InboundBase {
   readonly type: "message";
   /** What the person wrote, the bot's own mention removed. */
   readonly text: string;
-  /** In a group or channel: whether the bot was @mentioned or the message otherwise addressed to it. Always true in 1:1. */
-  readonly addressedToBot: boolean;
+  /** The bot itself is @mentioned; a mention of someone else does not count (Python `activity.is_mentioned`). */
+  readonly mentioned: boolean;
+  /**
+   * A targeted (private) message: in a group chat the person picked the bot under "/" and only the bot sees what they
+   * wrote (Python `activity.is_targeted`; Teams marks it on the recipient, `isTargeted`).
+   */
+  readonly targeted: boolean;
+  /**
+   * The message starts by naming the bot ("@<bot name> ...", typed as words or as the bot's mention put first): in a
+   * 1:1 chat attached to a remote session, the way the person says these words are for the bot and not for the session
+   * (Python `activity.addressed_to_bot`, with the configured bot name).
+   */
+  readonly namesBotFirst: boolean;
   /** The conversation's name (a group chat's title; "" in 1:1 or when the channel gave none). */
   readonly conversationName: string;
   /** The people the message @mentions, in order, the bot excluded. */
@@ -118,14 +150,33 @@ export interface InboundMessage extends InboundBase {
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
   readonly files: readonly InboundFile[];
+  /**
+   * The names of attachments the channel gave no way to fetch (a file shared as a link), told back to the person
+   * (Python `inbound.inbound_files`' second result, said with `inbound.unreadable_line`).
+   */
+  readonly unreadableFiles: readonly string[];
   readonly provenance: Provenance;
 }
 
 /** A button pressed on a card the bot posted. */
 export interface InboundAction extends InboundBase {
   readonly type: "action";
-  /** Which action (the card's own `kind`/verb; the adapter does not interpret it). */
+  /**
+   * Which action: the `primusclaw` field of the button's data, the worker's own kind that routing dispatches on
+   * (Python `activity._card_data`'s kind: "decision", "answer", "remote", ...). The adapter copies it, never interprets
+   * it; "" when the data names none.
+   */
   readonly verb: string;
+  /**
+   * The click came as an Action.Execute invoke, which the ingress answered with a placeholder card that the handler
+   * must replace (Python `activity.is_card_click`); false for an Action.Submit message.
+   */
+  readonly invoke: boolean;
+  /**
+   * The channel's own verb of the click, for a log line only: clipped to 40 characters, "unknown" when absent (Python
+   * `activity.card_verb`). It comes from the client: never dispatch on it.
+   */
+  readonly clickVerb: string;
   /** The data the card attached to the button: unvalidated, each handler reads it through its own schema. */
   readonly data: Readonly<Record<string, unknown>>;
   /** The message that holds the card, which the handler replaces to settle the click ("" when not said). */
@@ -162,6 +213,8 @@ export type View = { readonly [K in keyof ViewMap]: { readonly name: K; readonly
 
 /** A source a reply cites (`[n]` in its text). */
 export interface Citation {
+  /** The `n` of the `[n]` in the text that cites it. */
+  readonly position: number;
   readonly title: string;
   readonly url: string;
   readonly abstract: string;
@@ -175,6 +228,21 @@ export interface SuggestedReply {
   readonly title: string;
   readonly value: string;
 }
+
+/**
+ * A button on a view: one that sends an action back to the worker (`verb` and its `data`, which arrive as an
+ * `InboundAction`), or one that opens a link. This is the worker's own click protocol, not channel markup; a channel
+ * renders it as its own button (Teams: Action.Execute / Action.OpenUrl).
+ */
+export type ViewButton =
+  | { readonly title: string; readonly verb: string; readonly data: JsonObject; readonly style?: ButtonStyle }
+  | { readonly title: string; readonly url: string; readonly style?: ButtonStyle };
+
+/**
+ * How a button is emphasised (Teams: the action's `style`), carried as written so card JSON matches the Python worker
+ * byte for byte: an explicit "default" (the feedback offer's No) is not the same JSON as no style at all.
+ */
+export type ButtonStyle = "default" | "positive" | "destructive";
 
 /** What a message is. */
 export type OutBody =
@@ -233,11 +301,21 @@ export interface StreamRefused {
  * thing the way it would without a stream.
  */
 export interface LiveStream {
+  /**
+   * The id of the stream's message (Teams: the id the first stream request was answered with), so that what the same
+   * turn later amends or replaces after the stream closed edits this message instead of posting a new one (the Python
+   * worker keeps the stream id for that). "" when the channel did not say it.
+   */
+  readonly id: MessageId;
   /** Informative status lines ("Thinking…", the step in progress). */
   inform(text: string): Promise<Result<void, StreamRefused>>;
   /** The answer text so far; each call carries the whole text, which must start with the previous one. */
   emit(text: string): Promise<Result<void, StreamRefused>>;
   finish(message: OutMessage): Promise<Result<void, StreamRefused>>;
+}
+
+export interface UpdateOptions {
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -256,12 +334,21 @@ export interface Conversation {
   readonly ref: ConversationRef;
   /** The messages this conversation has tried to replace (a clicked card is settled when its id is here). */
   readonly edited: ReadonlySet<MessageId>;
+  /**
+   * Count message `id` as settled without editing it (it is about to be deleted): the safety net that closes an
+   * unsettled click then leaves it alone instead of editing a deleted message (Python `messenger.edited.add(id)`).
+   */
+  markSettled(id: MessageId): void;
   typing(): Promise<void>;
   /** Post and do not wait for the new message's id. */
   send(message: OutMessage): Promise<void>;
   /** Post and return the new message's id; undefined when the channel never said it (keep sending, do not edit). */
   post(message: OutMessage): Promise<MessageId | undefined>;
-  update(id: MessageId, message: OutMessage): Promise<void>;
+  /**
+   * Replace message `id`. With `signal`, an edit not yet sent when it is aborted is not sent, and the promise rejects
+   * with the signal's reason (a stop that must not let a late progress edit overwrite what it shows).
+   */
+  update(id: MessageId, message: OutMessage, options?: UpdateOptions): Promise<void>;
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>>;
   /** The envelope `send` would publish for `message` (masked in a group), built without sending it. */
   outgoing(message: OutMessage): Envelope;

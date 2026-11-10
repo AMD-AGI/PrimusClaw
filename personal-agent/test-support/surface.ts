@@ -4,6 +4,7 @@
 import {
   err,
   ok,
+  own,
   type Conversation,
   type ConversationRef,
   type DeleteUnsupported,
@@ -19,6 +20,7 @@ import {
   type StreamRefused,
   type Surface,
   type SurfaceCaps,
+  type UpdateOptions,
 } from "@primusclaw/personal-agent";
 
 /** One thing a conversation was asked to do, in order. */
@@ -28,7 +30,13 @@ export type Recorded =
   | { readonly op: "post"; readonly conversation: string; readonly message: OutMessage; readonly id: MessageId }
   | { readonly op: "update"; readonly conversation: string; readonly id: MessageId; readonly message: OutMessage }
   | { readonly op: "delete"; readonly conversation: string; readonly id: MessageId }
-  | { readonly op: "stream.open"; readonly conversation: string; readonly replyTo: MessageId; readonly text: string }
+  | {
+      readonly op: "stream.open";
+      readonly conversation: string;
+      readonly replyTo: MessageId;
+      readonly text: string;
+      readonly id: MessageId;
+    }
   | { readonly op: "stream.inform"; readonly conversation: string; readonly text: string }
   | { readonly op: "stream.emit"; readonly conversation: string; readonly text: string }
   | { readonly op: "stream.finish"; readonly conversation: string; readonly message: OutMessage };
@@ -47,6 +55,8 @@ export interface FakeSurfaceOptions {
   readonly caps?: Partial<SurfaceCaps>;
   /** Rosters `members` returns, by conversation id; any other conversation cannot be listed (undefined). */
   readonly rosters?: Readonly<Record<string, readonly RosterMember[]>>;
+  /** Awaited by every `update` before it is recorded: a test holds edits "in flight" with it (default: none). */
+  readonly beforeUpdate?: () => Promise<void>;
   /** The people `openPersonal` can open a 1:1 with, by directory id ("u1" opens "personal:u1"); others give undefined. */
   readonly reachable?: readonly string[];
   /** Files `fetchFile` returns, by name; any other file is refused as "unreachable". */
@@ -64,6 +74,8 @@ export class FakeSurface implements Surface {
   private readonly files: NonNullable<FakeSurfaceOptions["files"]>;
   private readonly rosters: NonNullable<FakeSurfaceOptions["rosters"]>;
   private readonly reachable: ReadonlySet<string>;
+  /** @internal */
+  readonly beforeUpdate: (() => Promise<void>) | undefined;
   private nextId = 1;
 
   constructor(options: FakeSurfaceOptions = {}) {
@@ -71,6 +83,7 @@ export class FakeSurface implements Surface {
     this.files = options.files ?? {};
     this.rosters = options.rosters ?? {};
     this.reachable = new Set(options.reachable ?? []);
+    this.beforeUpdate = options.beforeUpdate;
   }
 
   openPersonal(
@@ -85,7 +98,7 @@ export class FakeSurface implements Surface {
   }
 
   members(conversation: ConversationRef): Promise<readonly RosterMember[] | undefined> {
-    return Promise.resolve(this.rosters[conversation.id]);
+    return Promise.resolve(own(this.rosters, conversation.id));
   }
 
   conversation(ref: ConversationRef): Conversation {
@@ -93,7 +106,7 @@ export class FakeSurface implements Surface {
   }
 
   fetchFile(file: InboundFile): Promise<Result<FetchedFile, FileRefused>> {
-    const found = this.files[file.name];
+    const found = own(this.files, file.name);
     return Promise.resolve(
       found === undefined ? err({ kind: "file_refused", reason: "unreachable" }) : ok({ name: file.name, ...found }),
     );
@@ -122,6 +135,10 @@ class FakeConversation implements Conversation {
     private readonly surface: FakeSurface,
     readonly ref: ConversationRef,
   ) {}
+
+  markSettled(id: MessageId): void {
+    this.edited.add(id);
+  }
 
   typing(): Promise<void> {
     this.surface.record({ op: "typing", conversation: this.ref.id });
@@ -157,10 +174,37 @@ class FakeConversation implements Conversation {
     return Promise.resolve();
   }
 
-  update(id: MessageId, message: OutMessage): Promise<void> {
+  /**
+   * Refused (rejects) when the channel cannot edit. With a signal: aborted before the edit is sent (before the call, or
+   * while `beforeUpdate` holds it), the edit is not recorded and the promise rejects with the signal's reason. Without
+   * a `beforeUpdate` hook the edit is recorded at the call, so the outbox keeps the order of the calls.
+   */
+  update(id: MessageId, message: OutMessage, options: UpdateOptions = {}): Promise<void> {
+    const { signal } = options;
+    if (!this.surface.caps.edit) return Promise.reject(new Error("FakeConversation.update: this channel cannot edit"));
+    if (signal?.aborted === true) return Promise.reject(signal.reason as Error);
     this.edited.add(id);
-    this.surface.record({ op: "update", conversation: this.ref.id, id, message });
-    return Promise.resolve();
+    const record = (): void => {
+      signal?.throwIfAborted();
+      this.surface.record({ op: "update", conversation: this.ref.id, id, message });
+    };
+    const hold = this.surface.beforeUpdate;
+    if (hold === undefined) {
+      record();
+      return Promise.resolve();
+    }
+    if (signal === undefined) return hold().then(record);
+    // Aborted while held: reject at once, and the edit is not recorded when the hold ends.
+    const aborted = new Promise<never>((_, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          reject(signal.reason as Error);
+        },
+        { once: true },
+      );
+    });
+    return Promise.race([hold().then(record), aborted]);
   }
 
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>> {
@@ -175,8 +219,10 @@ class FakeConversation implements Conversation {
     if (!this.surface.caps.streaming) {
       return Promise.resolve(err(refused("this channel cannot stream")));
     }
-    this.surface.record({ op: "stream.open", conversation: this.ref.id, replyTo, text: status });
-    return Promise.resolve(ok(new FakeStream(this.surface, this.ref.id)));
+    // The stream's message takes the next message id, as a channel answers the first stream request with one.
+    const id = this.surface.newId();
+    this.surface.record({ op: "stream.open", conversation: this.ref.id, replyTo, text: status, id });
+    return Promise.resolve(ok(new FakeStream(this.surface, this.ref.id, id)));
   }
 }
 
@@ -191,6 +237,7 @@ class FakeStream implements LiveStream {
   constructor(
     private readonly surface: FakeSurface,
     private readonly conversation: string,
+    readonly id: MessageId,
   ) {}
 
   inform(text: string): Promise<Result<void, StreamRefused>> {

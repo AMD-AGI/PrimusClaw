@@ -15,7 +15,7 @@ import {
   SHUTDOWN_DEADLINE_MS, SHUTDOWN_DELAY_MS,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
-import { db, initDb } from "./infra/db.js";
+import { buildDeferredIndexes, db, initDb } from "./infra/db.js";
 import { GracefulShutdown } from "./infra/graceful-shutdown.js";
 import { bindApiAppGrant } from "./grants/app-grant.js";
 import { initNats, nc as natsConnection } from "./infra/nats.js";
@@ -473,6 +473,10 @@ async function main() {
   // Start
   await app.listen({ host: "0.0.0.0", port: API_PORT });
   logger.info({ port: API_PORT }, "api-v2.ready");
+  // The performance-only indexes over large tables, built while this replica serves rather than before it may
+  // (infra/db.ts, buildDeferredIndexes). Not awaited: a build can outlast any startup probe, and every query they
+  // serve works without them. One replica builds; the rest find the lock taken.
+  void buildDeferredIndexes().catch((err) => logger.warn({ err }, "db.deferred_indexes_failed"));
 }
 
 main().catch((err) => { logger.fatal({ err }, "api.startup_failed"); process.exit(1); });

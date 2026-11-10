@@ -1,0 +1,548 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "op": "stop",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "停止",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_stop"
+     },
+     {
+      "data": {
+       "op": "detach",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "回到助理",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_detach"
+     },
+     {
+      "data": {
+       "op": "switch",
+       "primusclaw": "remote",
+       "session_id": "rs-1"
+      },
+      "title": "切换会话",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_switch"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Attention",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔌 会话窗口 · robin-dev · Claude Code",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "/root/ws/active · 模式 default",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "spacing": "Small",
+      "text": "状态：等你批准",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "Small",
+      "text": "你从卡片发的：run the tests",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "window_tail",
+      "items": [
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 27 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 28 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 29 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 30 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 31 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 32 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 33 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 34 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 35 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 36 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 37 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 38 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 39 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "All 40 passed.",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "Small",
+      "style": "emphasis",
+      "type": "Container"
+     },
+     {
+      "id": "window_more",
+      "isVisible": false,
+      "items": [
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 0 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 1 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 2 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 3 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 4 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 5 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 6 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 7 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 8 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 9 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 10 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 11 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 12 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 13 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 14 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 15 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 16 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 17 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 18 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 19 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 20 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 21 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 22 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 23 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 24 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 25 items",
+        "type": "TextBlock",
+        "wrap": true
+       },
+       {
+        "fontType": "Monospace",
+        "size": "Small",
+        "spacing": "None",
+        "text": "collected 26 items",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "None",
+      "style": "emphasis",
+      "type": "Container"
+     },
+     {
+      "actions": [
+       {
+        "targetElements": [
+         "window_more"
+        ],
+        "title": "更多 / 收起",
+        "type": "Action.ToggleVisibility"
+       },
+       {
+        "data": {
+         "op": "full",
+         "primusclaw": "remote",
+         "session_id": "rs-1"
+        },
+        "title": "完整输出",
+        "type": "Action.Execute",
+        "verb": "primusclaw.remote_full"
+       },
+       {
+        "data": {
+         "op": "mode",
+         "primusclaw": "remote",
+         "session_id": "rs-1"
+        },
+        "title": "模式",
+        "type": "Action.Execute",
+        "verb": "primusclaw.remote_mode"
+       }
+      ],
+      "spacing": "None",
+      "type": "ActionSet"
+     },
+     {
+      "items": [
+       {
+        "size": "Small",
+        "text": "需要你批准：Bash: npm test（16:10 前有效）",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       },
+       {
+        "actions": [
+         {
+          "data": {
+           "action_id": "ac-1",
+           "in_window": true,
+           "option_id": "o1",
+           "primusclaw": "remote_decision",
+           "session_id": "rs-1"
+          },
+          "style": "positive",
+          "title": "Allow",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_decision"
+         },
+         {
+          "data": {
+           "action_id": "ac-1",
+           "in_window": true,
+           "option_id": "o3",
+           "primusclaw": "remote_decision",
+           "session_id": "rs-1"
+          },
+          "title": "Reject",
+          "type": "Action.Execute",
+          "verb": "primusclaw.remote_decision"
+         }
+        ],
+        "type": "ActionSet"
+       }
+      ],
+      "spacing": "Medium",
+      "style": "attention",
+      "type": "Container"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "这一轮结束后，输入框会回到卡片上（卡片会重新发到最下面）。",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "在聊天框里打字是跟 Clawy 说；发给这个会话请用卡片上的输入框，或引用回复这张卡片。想让聊天框直接发给会话：/agent mode chat",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "spacing": "None",
+      "text": "更新于 08:00:00Z",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

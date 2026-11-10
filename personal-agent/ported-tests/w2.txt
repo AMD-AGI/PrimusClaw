@@ -1,0 +1,185 @@
+# W2: the Claw port and client, settings, metrics, secret source (env), token exchange, redaction, security events,
+# public errors, limits, guardrails, typed answers, understanding. The ported modules and their tests are unchanged between
+# 26d66d75 (where the port started) and this baseline.
+python-baseline: f09c85233bb016544a733bc08ec6489dfdec5a56
+
+# W2 main: the Claw HTTP client (claw.py), settings (config.py), the env secret source (secret_source.py, env part)
+teams/tests/test_claw_request_paths.py::test_every_request_method_with_an_id_is_covered -> packages/runtime/test/claw/request-paths.test.ts::Claw request paths > every request method with an id is covered
+teams/tests/test_claw_request_paths.py::test_an_id_cannot_steer_the_host_or_the_path -> packages/runtime/test/claw/request-paths.test.ts::Claw request paths > an id cannot steer the host or the path: sessions.changes:sessionId
+teams/tests/test_claw_request_paths.py::test_a_real_id_goes_into_the_path_as_written -> packages/runtime/test/claw/request-paths.test.ts::Claw request paths > a real id goes into the path as written: sess-1
+teams/tests/test_rule_tool.py::test_rule_text_is_the_markdown_file_of_the_zip -> packages/runtime/test/claw/rule-tool.test.ts::the rule's text > is the markdown file of the zip
+teams/tests/test_rule_tool.py::test_what_is_not_one_small_markdown_rule_is_refused -> packages/runtime/test/claw/rule-tool.test.ts::the rule's text > what is not one small markdown rule is refused: two markdown files
+teams/tests/test_rule_tool.py::test_without_rule_takes_back_only_what_the_worker_appended -> packages/core/test/claw/message-text.test.ts::withoutRule > takes back only what the worker appended: both
+teams/tests/test_rule_tool.py::test_a_user_who_types_the_headings_keeps_every_word_they_wrote -> packages/core/test/claw/message-text.test.ts::withoutRule > a user who types the headings keeps every word they wrote: quoting both headings, both
+teams/tests/test_rule_tool.py::test_a_message_from_before_the_summary_request_is_cut_at_the_rules_heading -> packages/core/test/claw/message-text.test.ts::withoutRule > a message from before the summary request is cut at the rule's heading
+teams/tests/test_rule_tool.py::test_without_rule_keeps_the_users_own_blank_lines -> packages/core/test/claw/message-text.test.ts::withoutRule > keeps the user's own blank lines
+teams/tests/test_rule_tool.py::test_every_message_carries_the_rule_after_the_text_and_the_plugin_id_beside_it -> packages/runtime/test/claw/rule-tool.test.ts::the rule on the wire > every message carries the rule after the text and the plugin id beside it
+teams/tests/test_rule_tool.py::test_the_rule_is_read_with_the_callers_key_and_kept_for_later_messages -> packages/runtime/test/claw/rule-tool.test.ts::the rule on the wire > the rule is read with the caller's key and kept for later messages
+teams/tests/test_rule_tool.py::test_an_old_copy_is_read_again -> packages/runtime/test/claw/rule-tool.test.ts::the rule on the wire > an old copy is read again
+teams/tests/test_rule_tool.py::test_a_rule_that_cannot_be_read_does_not_stop_the_message -> packages/runtime/test/claw/rule-tool.test.ts::a rule that cannot be read > a rule that cannot be read does not stop the message: a 404
+teams/tests/test_rule_tool.py::test_a_rule_that_stops_being_readable_leaves_the_last_copy_in_use -> packages/runtime/test/claw/rule-tool.test.ts::what rides on a message > a rule that stops being readable leaves the last copy in use
+teams/tests/test_rule_tool.py::test_with_no_rule_tool_nothing_is_fetched_or_appended -> packages/runtime/test/claw/rule-tool.test.ts::what rides on a message > with no rule tool nothing is fetched or appended
+teams/tests/test_rule_tool.py::test_the_change_summary_request_asks_for_git_diff_stat_read_only_and_only_when_something_changed -> packages/core/test/claw/message-text.test.ts::messageContent > the change summary request asks for git diff stat, read only, and only when something changed
+teams/tests/test_rule_tool.py::test_the_change_summary_request_is_in_the_message_exactly_once_and_last -> packages/runtime/test/claw/rule-tool.test.ts::what rides on a message > the change summary request is in the message exactly once and last
+teams/tests/test_rule_tool.py::test_interrupt_and_decision_messages_carry_no_rule -> packages/runtime/test/claw/rule-tool.test.ts::what rides on a message > interrupt and decision messages carry no rule
+teams/tests/test_rule_tool.py::test_setting_is_read_from_the_environment -> packages/runtime/test/config/settings.test.ts::settings > setting is read from the environment
+teams/tests/test_log_hygiene.py::test_the_reply_style_rule_failing_logs_the_status_not_the_body -> packages/runtime/test/claw/rule-tool.test.ts::what rides on a message > the reply style rule failing logs the status not the body
+teams/tests/test_log_hygiene.py::test_a_claw_error_says_its_status_and_code_but_never_its_body -> packages/core/test/claw/errors.test.ts::ClawError > says the status and Claw's error word, never the rest of the body
+teams/tests/test_feedback_history.py::test_the_client_refuses_a_reply_past_max_bytes_and_a_compressed_one -> packages/runtime/test/claw/session-events.test.ts::session events > the client refuses a reply past max bytes and a compressed one
+teams/tests/test_feedback_history.py::test_an_error_reply_is_a_claw_error_quoted_from_its_start -> packages/runtime/test/claw/session-events.test.ts::session events > an error reply is a claw error quoted from its start
+teams/tests/test_feedback_history.py::test_without_tail_or_max_bytes_the_replay_is_the_whole_history_as_before -> packages/runtime/test/claw/session-events.test.ts::session events > without tail or max bytes the replay is the whole history as before
+teams/tests/test_feedback_history.py::test_a_tail_below_one_is_refused_before_anything_is_sent -> packages/runtime/test/claw/session-events.test.ts::session events > a tail below one is refused before anything is sent
+teams/tests/test_changes_card.py::test_the_whole_call_is_bounded_not_each_read_of_it -> packages/runtime/test/claw/changes.test.ts::a session's changes on the wire > the whole call is bounded, not each read of it
+teams/tests/test_changes_card.py::test_a_reply_larger_than_the_worker_reads_is_refused_and_not_read_to_its_end -> packages/runtime/test/claw/changes.test.ts::a session's changes on the wire > a reply larger than the worker reads is refused and not read to its end
+teams/tests/test_changes_card.py::test_a_reply_just_under_the_limit_is_still_read -> packages/runtime/test/claw/changes.test.ts::a session's changes on the wire > a reply just under the limit is still read
+teams/tests/test_changes_card.py::test_an_error_body_is_only_quoted_and_never_read_past_its_start -> packages/runtime/test/claw/changes.test.ts::a session's changes on the wire > an error body is only quoted and never read past its start
+teams/tests/test_changes_card.py::test_the_reply_is_asked_for_and_read_as_it_is_on_the_wire_and_a_compressed_one_is_refused -> packages/runtime/test/claw/changes.test.ts::a session's changes on the wire > the reply is asked for and read as it is on the wire, and a compressed one is refused
+teams/tests/test_changes_card.py::test_the_call_is_a_get_with_the_callers_key_and_its_own_short_timeout -> packages/runtime/test/claw/changes.test.ts::a session's changes, what the call is > the call is a get with the caller's key and its own short timeout
+teams/tests/test_changes_card.py::test_what_claw_answers_when_there_is_nothing_to_show_shows_nothing -> packages/runtime/test/claw/changes.test.ts::a session's changes, what the call is > what Claw answers when there is nothing to show is an error the reader can tell: a sandbox that is gone
+teams/tests/test_deliveries.py::test_the_link_is_claws_own_and_only_over_https -> packages/runtime/test/claw/sessions.test.ts::reading a session > the link is claw's own and only over https
+teams/tests/test_turn_stream_tail.py::test_last_event_id_asks_for_the_newest_event_alone -> packages/runtime/test/claw/last-event-id.test.ts::the newest stored event > last event id asks for the newest event alone
+teams/tests/test_turn_stream_tail.py::test_last_event_id_of_an_empty_session_is_none -> packages/runtime/test/claw/last-event-id.test.ts::the newest stored event > last event id of an empty session is none
+teams/tests/test_turn_stream_tail.py::test_an_older_claw_that_sends_the_whole_history_is_refused_unread -> packages/runtime/test/claw/last-event-id.test.ts::the newest stored event > an older claw that sends the whole history is refused unread
+teams/tests/test_apim_fallback.py::test_the_fallback_model_is_the_deployments_and_none_by_default -> packages/runtime/test/config/settings.test.ts::settings > the fallback model is the deployment's and none by default
+teams/tests/test_metrics.py::test_the_metrics_port_defaults_to_9090_and_never_shares_the_public_port -> packages/runtime/test/config/settings.test.ts::settings > the metrics port defaults to 9090 and never shares the public port
+teams/tests/test_user_limits.py::test_the_limits_have_safe_defaults_and_can_be_set -> packages/runtime/test/config/settings.test.ts::the per-person limits > the limits have safe defaults and can be set
+teams/tests/test_user_limits.py::test_a_limit_that_is_not_a_positive_number_stops_the_worker -> packages/runtime/test/config/settings.test.ts::the per-person limits > a limit that is not a positive number stops the worker: TEAMS_USER_MESSAGE_LIMIT=ten
+teams/tests/test_link_code_hardening.py::test_link_limits_default_and_come_from_the_environment -> packages/runtime/test/config/settings.test.ts::the per-person limits > link limits default and come from the environment
+teams/tests/test_link_code_hardening.py::test_a_bad_link_limit_refuses_to_start -> packages/runtime/test/config/settings.test.ts::the per-person limits > a bad link limit refuses to start: ten
+teams/tests/test_understanding.py::test_off_by_default_and_on_only_for_the_people_listed -> packages/runtime/test/config/exchange-settings.test.ts::the assistant's settings > off by default and on only for the people listed
+teams/tests/test_understanding.py::test_a_setting_that_cannot_be_meant_stops_the_start -> packages/runtime/test/config/exchange-settings.test.ts::the assistant's settings > a setting that cannot be meant stops the start: names nobody
+teams/tests/test_exchange.py::test_the_exchange_defaults_are_what_identity_registered_for_the_worker -> packages/runtime/test/config/exchange-settings.test.ts::the token exchange settings > the exchange defaults are what identity registered for the worker
+teams/tests/test_exchange.py::test_flag_off_by_default_in_settings -> packages/runtime/test/config/exchange-settings.test.ts::the token exchange settings > flag off by default in settings
+teams/tests/test_exchange.py::test_the_exchange_for_chat_flag_is_off_by_default_and_needs_the_exchange -> packages/runtime/test/config/exchange-settings.test.ts::the token exchange settings > the exchange for chat flag is off by default and needs the exchange
+teams/tests/test_secret_source.py::test_env_source_reads_nothing_from_the_vault -> packages/runtime/test/config/secrets.test.ts::where the secrets come from > the env source reads the environment and the key file, nothing from a vault
+teams/tests/test_secret_source.py::test_only_the_secrets_the_configuration_uses_are_read -> packages/runtime/test/config/secrets.test.ts::which secrets are read > only the secrets the configuration uses are read
+teams/tests/test_secret_source.py::test_settings_take_the_vault_values_and_never_the_environment -> packages/runtime/test/config/secrets.test.ts::which secrets are read > settings take the vault values and never the environment
+# test_secret_source.py::test_a_configuration_that_cannot_work_fails: its SECRETS_SOURCE typo case is covered by
+# runtime/test/config/secrets.test.ts::which secrets are read > a configuration that cannot work fails; the other four cases are Key Vault
+# (W3), which lists the Python test.
+# test_redact.py::test_activity_text_gets_one_note_when_something_was_masked and ::test_cards_are_masked_buttons_are_not_touched_and_the_note_is_added
+# test redactActivity, which is the Teams channel's (W3, teams/src/activity): W3 lists them.
+
+# --- redaction, security events, public errors, metrics
+teams/tests/test_redact.py::test_each_credential_shape_is_masked -> packages/core/test/security/redact.test.ts::redactText > masks each credential shape
+teams/tests/test_redact.py::test_pem_private_key_block_is_masked_even_when_truncated -> packages/core/test/security/redact.test.ts::redactText > masks a PEM private key block, even a truncated one
+teams/tests/test_redact.py::test_long_opaque_value_next_to_a_secret_word_is_masked_but_the_word_stays -> packages/core/test/security/redact.test.ts::redactText > masks a long opaque value next to a secret word, and the word stays
+teams/tests/test_redact.py::test_normal_code_and_pr_text_are_not_mangled -> packages/core/test/security/redact.test.ts::redactText > leaves ordinary code and pull request text as it is
+teams/tests/test_log_hygiene.py::test_the_worker_log_masks_credential_shapes_in_the_line_and_in_the_traceback -> packages/runtime/test/line-logger-redaction.test.ts::the worker log > masks credential shapes in the message and in every field
+teams/tests/test_log_hygiene.py::test_the_redacting_formatter_keeps_ordinary_lines_as_they_are -> packages/runtime/test/line-logger-redaction.test.ts::the worker log > keeps ordinary lines as they are
+teams/tests/test_log_hygiene.py::test_the_worker_log_masks_credential_query_parameters_whatever_their_shape -> packages/core/test/security/redact.test.ts::redactLogLine > masks credential query parameters whatever their shape
+teams/tests/test_security_events.py::test_each_event_is_one_json_record_with_the_event_first -> packages/core/test/observability/security-events.test.ts::security events > is one JSON record per event, the event first, at its level
+teams/tests/test_security_events.py::test_the_event_list_is_closed -> packages/core/test/observability/security-events.test.ts::security events > is a closed list of events
+teams/tests/test_security_events.py::test_alert_worthy_events_are_warnings -> packages/core/test/observability/security-events.test.ts::security events > logs the alert-worthy events as warnings
+teams/tests/test_security_events.py::test_allowed_fields_keep_their_values -> packages/core/test/observability/security-events.test.ts::security event values > keeps the values of allowed fields
+teams/tests/test_security_events.py::test_none_is_left_out_silently -> packages/core/test/observability/security-events.test.ts::security event values > leaves out null and undefined silently
+teams/tests/test_security_events.py::test_forbidden_content_never_reaches_the_log -> packages/core/test/observability/security-events.test.ts::security event fields > never lets forbidden content reach the log
+teams/tests/test_security_events.py::test_every_generated_link_code_is_refused_in_every_string_field -> packages/core/test/observability/security-events.test.ts::security event fields > refuses every generated link code in every string field
+teams/tests/test_security_events.py::test_real_ids_are_kept -> packages/core/test/observability/security-events.test.ts::security event ids > keeps real ids
+teams/tests/test_security_events.py::test_a_real_client_address_is_kept_normalised -> packages/core/test/observability/security-events.test.ts::security event ids > keeps a real client address, normalised
+teams/tests/test_security_events.py::test_an_8_character_segment_of_the_code_alphabet_is_dropped_as_a_code -> packages/core/test/observability/security-events.test.ts::security event ids > drops an 8-character segment of the code alphabet as a code
+teams/tests/test_security_events.py::test_a_field_name_that_is_itself_text_is_not_logged -> packages/core/test/observability/security-events.test.ts::security event ids > does not log a field name that is itself text
+teams/tests/test_security_events.py::test_module_logger_is_the_documented_one -> MERGED packages/core/test/observability/security-events.test.ts::security events > is one JSON record per event, the event first, at its level
+teams/tests/test_security_events.py::test_the_readme_lists_every_category_value -> INTERNAL
+teams/tests/test_security_events.py::test_the_ingress_function_has_the_same_helper -> INTERNAL
+teams/tests/test_security_events.py::test_the_function_package_ships_the_helper -> INTERNAL
+teams/tests/test_security_events.py::test_the_readme_lists_every_event_and_every_field -> INTERNAL
+teams/tests/test_security_events.py::test_the_runbook_appendix_lists_every_event_field_and_category_value -> INTERNAL
+teams/tests/test_user_errors_hide_internals.py::test_internal_shapes_are_recognised -> packages/core/test/public-error/public-error.test.ts::looksInternal > recognises internal shapes
+teams/tests/test_user_errors_hide_internals.py::test_plain_reasons_are_not_internal -> packages/core/test/public-error/public-error.test.ts::looksInternal > does not take plain reasons for internal ones
+teams/tests/test_user_errors_hide_internals.py::test_the_log_line_masks_credentials_in_the_detail -> packages/core/test/public-error/public-error.test.ts::withhold > masks credentials in the logged detail
+teams/tests/test_user_errors_hide_internals.py::test_the_log_line_masks_a_password_in_a_urls_user_info -> packages/core/test/public-error/public-error.test.ts::withhold > masks a password in a URL's user info
+teams/tests/test_user_errors_hide_internals.py::test_the_log_line_is_one_line_whatever_the_ids_hold -> packages/core/test/public-error/public-error.test.ts::withhold > writes one line whatever the ids hold
+teams/tests/test_user_errors_hide_internals.py::test_split_error_tail -> packages/core/test/public-error/public-error.test.ts::splitErrorTail > cuts off only Brain's error
+teams/tests/test_user_errors_hide_internals.py::test_a_public_lookalike_or_a_public_link_beside_an_internal_name_is_still_a_failure -> packages/core/test/public-error/public-error.test.ts::looksLikeFailure > still takes a public lookalike, or a public link beside an internal name, for a failure
+teams/tests/test_metrics.py::test_lockouts_are_counted_by_scope -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security events counted > counts lockouts by scope
+teams/tests/test_metrics.py::test_rate_limited_is_counted_by_reason -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security events counted > counts rate limits by reason
+teams/tests/test_metrics.py::test_link_attempts_are_counted_by_outcome -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security events counted > counts link attempts by outcome
+teams/tests/test_metrics.py::test_unlinked_keys_are_counted_by_reason -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security events counted > counts unlinked keys by reason
+teams/tests/test_metrics.py::test_the_info_events_are_counted_when_the_root_logger_is_quieter -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security event labels > counts every event, whatever the logger lets through
+teams/tests/test_metrics.py::test_no_label_names_a_user_or_carries_free_text -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security event labels > has no label that names a person or carries free text
+teams/tests/test_metrics.py::test_the_alerted_series_exist_before_their_first_event -> packages/runtime/test/metrics/prometheus-metrics.test.ts::security event labels > writes the alerted series before their first event
+teams/tests/test_metrics.py::test_dropped_files_are_counted_by_where_they_were_dropped_and_only_there -> packages/runtime/test/metrics/prometheus-metrics.test.ts::files and inbound counted > counts dropped files where they were dropped, and only there
+teams/tests/test_metrics.py::test_the_lag_gauge_is_the_longest_wait_of_the_last_minute -> packages/runtime/test/metrics/prometheus-metrics.test.ts::files and inbound counted > keeps the longest wait of the last minute as the lag gauge
+teams/tests/test_metrics.py::test_refusals_by_a_limit_are_counted_by_reason -> packages/runtime/test/metrics/prometheus-metrics.test.ts::files and inbound counted > counts refusals by a limit by reason
+teams/tests/test_metrics.py::test_every_series_has_help_and_type -> packages/runtime/test/metrics/prometheus-metrics.test.ts::files and inbound counted > gives every series its help and type
+teams/tests/test_metrics.py::test_installing_the_counter_twice_counts_once -> DROPPED: no logging handler is installed: SecurityLog calls MetricsPort.securityEvent once per event (counted once in "counts lockouts by scope")
+teams/tests/test_metrics.py::test_the_security_series_the_alerts_read_are_written_from_the_start -> INTERNAL
+teams/tests/test_metrics.py::test_the_pod_declares_the_metrics_port_and_the_service_does_not_expose_it -> INTERNAL
+teams/tests/test_metrics.py::test_the_kustomization_keeps_the_scrape_and_alerts_in_their_namespaces -> INTERNAL
+teams/tests/test_metrics.py::test_vmagent_scrapes_the_metrics_port_of_the_worker_pod -> INTERNAL
+teams/tests/test_metrics.py::test_each_alert_has_the_readme_threshold_and_goes_to_the_teams_contact_point -> INTERNAL
+teams/tests/test_metrics.py::test_every_alert_is_listed_here -> INTERNAL
+
+# --- limits, guardrails, typed answers, understanding, token exchange
+teams/tests/test_user_limits.py::test_the_limiter_does_not_count_refused_messages_and_forgets_idle_users -> packages/core/test/limits/limits.test.ts::the limiter does not count refused messages and forgets idle users
+teams/tests/test_user_limits.py::test_the_consumer_counts_queue_lag_handling_time_and_refusals -> packages/core/test/limits/limits.test.ts::the inbound counters log one line per interval and start again from zero
+# test_user_limits.py::test_the_limits_have_safe_defaults_and_can_be_set, ::test_a_limit_that_is_not_a_positive_number_stops_the_worker: Settings.from_env (runtime config reader, W2 main); the UserLimits part is in limits.test.ts::the user limits have safe defaults and refuse a value that is not a positive whole number
+# test_user_limits.py::test_queue_lag_is_none_without_an_enqueue_time: bus.queue_lag_ms (W3); the rest of test_user_limits drives Agent/assistant/review (W4/W5/W7)
+teams/tests/test_guardrails.py::test_a_limit_refuses_past_its_count_and_frees_up_as_the_window_slides -> packages/core/test/guardrails/guardrails.test.ts::a limit refuses past its count and frees up as the window slides
+teams/tests/test_guardrails.py::test_a_limit_of_zero_is_off_and_the_defaults_are_on -> packages/core/test/guardrails/guardrails.test.ts::a limit of zero is off and the defaults are on
+teams/tests/test_guardrails.py::test_the_limits_are_read_from_the_environment_and_a_typo_stops_the_worker -> packages/core/test/guardrails/guardrails.test.ts::the limits are read from the environment and a typo stops the worker
+teams/tests/test_guardrails.py::test_give_back_returns_one_count_and_never_more_than_were_taken -> packages/core/test/guardrails/guardrails.test.ts::give back returns one count and never more than were taken
+teams/tests/test_guardrails.py::test_give_back_undoes_its_own_count_and_never_a_later_one_that_was_done -> packages/core/test/guardrails/guardrails.test.ts::give back undoes its own count and never a later one that was done
+# test_guardrails.py: the Settings line of ..._read_from_the_environment... is the runtime config reader's (W2 main); every other test drives Agent / review / remote flows (W4, W5, W6, W7) or render/help (W4/W7)
+teams/tests/test_typed_answer.py::test_what_the_rules_read_from_a_typed_answer -> packages/core/test/typed-answer/typed-answer.test.ts::what the rules read from a typed answer
+teams/tests/test_typed_answer.py::test_with_a_reading_that_it_is_an_answer_what_the_rules_cannot_place_is_asked_back -> packages/core/test/typed-answer/typed-answer.test.ts::with a reading that it is an answer what the rules cannot place is asked back
+teams/tests/test_typed_answer.py::test_a_typed_choice_of_the_setting_needs_a_word_that_picks_one -> packages/core/test/typed-answer/typed-answer.test.ts::a typed choice of the setting needs a word that picks one
+# test_typed_answer.py: every other test drives the review flow in the worker (world, cards, clicks: W7). The pure parts of
+# ::test_every_request_to_review_and_merge_that_has_a_word_of_an_answer_names_a_review_and_a_merge (REVIEW_AND_MERGE list; the
+# REQUESTS table is W7's test-support), ::test_a_confirmation_that_names_no_review_still_confirms_the_merge (names_review_and_merge)
+# and ::test_whether_it_can_merge_is_a_question_never_a_choice_of_the_merge (the read_typed_answer line) are covered in
+# typed-answer.test.ts, and pick_row by "a pull request held for a merge and a review is asked which, ..."; W7 lists those tests.
+teams/tests/test_understanding.py::test_exact_command -> packages/core/test/understanding/understanding.test.ts::exact command
+teams/tests/test_understanding.py::test_review_stop -> packages/core/test/understanding/understanding.test.ts::review stop
+teams/tests/test_understanding.py::test_review_stop_is_linear_in_a_long_word -> packages/core/test/understanding/understanding.test.ts::review stop is linear in a long word
+# test_understanding.py: ::test_off_by_default_and_on_only_for_the_people_listed and ::test_a_setting_that_cannot_be_meant_stops_the_start
+# are Settings.from_env (the runtime config reader, W2 main). ::test_no_action_undoes_binds_or_loosens, ::test_the_actions_are_what_help_shows,
+# ::test_help_says_what_a_listed_person_can_now_say are the capability registry (W4). ::test_tokens_of_the_fake_are_the_people_of_their_keys
+# checks assistant_fake (W5). Every other test drives the worker against assistant_fake/assistant_world (W5, with W4 routing); people_of,
+# near_people, channel_context and pending_of are covered by understanding.test.ts (a Python-generated corpus of 88 readings).
+# test_log_hygiene.py: :343 (ClawError) is core/test/claw/errors.test.ts (W2 main); :358 (check_intent, IntentUnreadable) is W7's review
+# intent reader; :367, :393, :520 (the redacting formatter) are hA's.
+teams/tests/test_exchange.py::test_request_is_an_rfc8693_exchange_with_basic_client_auth -> packages/runtime/test/exchange/token-exchange.test.ts::request is an rfc8693 exchange with basic client auth
+teams/tests/test_exchange.py::test_token_is_cached_until_shortly_before_it_expires -> packages/runtime/test/exchange/token-exchange.test.ts::token is cached until shortly before it expires
+teams/tests/test_exchange.py::test_cache_is_per_user -> packages/runtime/test/exchange/token-exchange.test.ts::cache is per user
+teams/tests/test_exchange.py::test_token_that_is_nearly_expired_is_not_cached -> packages/runtime/test/exchange/token-exchange.test.ts::token that is nearly expired is not cached
+teams/tests/test_exchange.py::test_concurrent_calls_share_one_exchange -> packages/runtime/test/exchange/token-exchange.test.ts::concurrent calls share one exchange
+teams/tests/test_exchange.py::test_unbound_user_is_not_bound_and_is_remembered_only_briefly -> packages/runtime/test/exchange/token-exchange.test.ts::unbound user is not bound and is remembered only briefly
+teams/tests/test_exchange.py::test_other_failures_are_errors_not_unbound_and_never_quote_the_body -> packages/runtime/test/exchange/token-exchange.test.ts::other failures are errors not unbound and never quote the body
+teams/tests/test_exchange.py::test_unreachable_endpoint_is_an_error -> packages/runtime/test/exchange/token-exchange.test.ts::unreachable endpoint is an error
+teams/tests/test_exchange.py::test_malformed_success_is_an_error -> packages/runtime/test/exchange/token-exchange.test.ts::malformed success is an error
+teams/tests/test_exchange.py::test_binding_request_is_json_with_basic_client_auth_and_returns_the_link -> packages/runtime/test/exchange/token-exchange.test.ts::binding request is json with basic client auth and returns the link
+teams/tests/test_exchange.py::test_the_binding_request_url_is_beside_the_token_url_unless_one_is_given -> packages/runtime/test/exchange/token-exchange.test.ts::the binding request url is beside the token url unless one is given
+teams/tests/test_exchange.py::test_the_open_link_is_handed_out_again_until_shortly_before_it_runs_out -> packages/runtime/test/exchange/token-exchange.test.ts::the open link is handed out again until shortly before it runs out
+teams/tests/test_exchange.py::test_a_link_that_is_nearly_out_is_not_kept -> packages/runtime/test/exchange/token-exchange.test.ts::a link that is nearly out is not kept
+teams/tests/test_exchange.py::test_concurrent_binding_requests_share_one_request -> packages/runtime/test/exchange/token-exchange.test.ts::concurrent binding requests share one request
+teams/tests/test_exchange.py::test_binding_request_failures_are_errors_that_never_quote_the_body -> packages/runtime/test/exchange/token-exchange.test.ts::binding request failures are errors that never quote the body
+teams/tests/test_exchange.py::test_a_failed_binding_request_is_not_remembered -> packages/runtime/test/exchange/token-exchange.test.ts::a failed binding request is not remembered
+teams/tests/test_exchange.py::test_a_malformed_binding_reply_is_an_error -> packages/runtime/test/exchange/token-exchange.test.ts::a malformed binding reply is an error
+teams/tests/test_exchange.py::test_an_unreachable_binding_endpoint_is_an_error -> packages/runtime/test/exchange/token-exchange.test.ts::an unreachable binding endpoint is an error
+# test_exchange.py: ::test_the_exchange_defaults_are_what_identity_registered_for_the_worker, ::test_flag_off_by_default_in_settings and
+# ::test_the_exchange_for_chat_flag_is_off_by_default_and_needs_the_exchange are Settings.from_env (runtime config reader, W2 main); every
+# other test (from ::test_flag_off_unlinked_user_gets_the_text_instructions_and_no_exchange on) drives the Agent's link/bind flow (W4).
+
+# --- the Claw client's contract for a review for a colleague (left for W2 by the review delegation line)
+teams/tests/test_github_review.py::test_the_client_puts_the_reviewer_in_the_session_config_and_refuses_a_key_for_it_before_anything_goes_out -> packages/runtime/test/claw/review-wire.test.ts::the session of a review for a colleague > the client puts the reviewer in the session config and refuses a key for it before anything goes out
+teams/tests/test_github_review.py::test_the_client_carries_the_model_key_beside_the_token_and_nowhere_else -> packages/runtime/test/claw/review-wire.test.ts::the session of a review for a colleague > the client carries the model key beside the token and nowhere else
+teams/tests/test_github_review_many.py::test_on_the_wire_the_named_model_is_the_sessions_model_and_without_one_none_is_added -> packages/runtime/test/claw/review-wire.test.ts::the session of a review for a colleague > on the wire the named model is the session's model and without one none is added
+teams/tests/test_github_review.py::test_the_client_sends_the_exchanged_token_for_an_answer_in_a_session_that_acts_as_a_user_and_refuses_a_key_before_anything_goes_out -> packages/runtime/test/claw/review-wire.test.ts::answers in a session that acts as a user, and held merges > the client sends the exchanged token for an answer in a session that acts as a user and refuses a key before anything goes out
+teams/tests/test_github_review.py::test_the_client_sends_the_exchanged_token_to_the_decision_route_and_refuses_a_key_before_anything_goes_out -> packages/runtime/test/claw/review-wire.test.ts::answers in a session that acts as a user, and held merges > the client sends the exchanged token to the decision route and refuses a key before anything goes out
+teams/tests/test_github_review.py::test_on_the_wire_a_held_review_is_answered_at_the_decision_route_with_the_reviewers_token_and_the_choice -> packages/runtime/test/claw/review-wire.test.ts::answers in a session that acts as a user, and held merges > on the wire a held review is answered at the decision route with the reviewer's token and the choice
+teams/tests/test_github_review.py::test_the_client_hands_the_queued_answer_over_as_claw_sends_it -> packages/runtime/test/claw/review-wire.test.ts::answers in a session that acts as a user, and held merges > the client hands the queued answer over as claw sends it
+teams/tests/test_github_review.py::test_a_refusal_from_claw_carries_the_reason_it_named -> packages/runtime/test/claw/review-wire.test.ts::answers in a session that acts as a user, and held merges > a refusal from claw carries the reason it named
+teams/tests/test_github_review.py::test_on_the_wire_the_token_is_the_only_credential_and_the_askers_key_rides_only_the_call_that_makes_the_session -> packages/runtime/test/claw/review-wire.test.ts::the credentials of a whole review, call by call > on the wire the token is the only credential and the asker's key rides only the call that makes the session
+teams/tests/test_github_review_many.py::test_the_client_lists_the_models_with_the_key_it_is_given_and_never_reads_a_failure_as_none -> packages/runtime/test/claw/review-wire.test.ts::what the client reads with a person's key > the client lists the models with the key it is given and never reads a failure as none
+teams/tests/test_github_repo_scope.py::test_the_client_puts_the_setting_as_the_key_owner -> packages/runtime/test/claw/review-wire.test.ts::what the client reads with a person's key > the client puts the setting as the key owner
+teams/tests/test_review_items.py::test_the_client_never_starts_reviews_with_an_api_key -> packages/runtime/test/claw/review-wire.test.ts::starting reviews > the client never starts reviews with an api key
+teams/tests/test_review_items.py::test_the_client_never_asks_for_someone_else_without_their_key_or_with_a_key_as_their_token -> packages/runtime/test/claw/review-wire.test.ts::starting reviews > the client never asks for someone else without their key or with a key as their token
+teams/tests/test_review_items.py::test_the_requester_note_is_clipped_to_what_claw_takes -> packages/runtime/test/claw/review-wire.test.ts::starting reviews > the requester note is clipped to what claw takes
+teams/tests/test_review_items.py::test_a_refusal_is_read_from_the_whole_answer_not_from_its_first_200_characters -> packages/runtime/test/claw/review-wire.test.ts::starting reviews > a refusal is read from the whole answer, not from its first 200 characters
+teams/tests/test_review_items.py::test_a_404_is_how_the_client_says_the_route_is_missing -> packages/runtime/test/claw/review-wire.test.ts::starting reviews > a 404 is how the client says the route is missing
+teams/tests/test_review_items.py::test_replay_the_request_claw_gets_is_exactly_the_one_asked_for -> MERGED packages/runtime/test/claw/review-wire.test.ts::the request for reviews, replayed > replay: the request claw gets is exactly the one asked for: several, one line
+teams/tests/test_review_items.py::test_an_answer_that_cannot_be_followed_is_not_understood -> packages/runtime/test/claw/review-wire.test.ts::reading started reviews > an answer that cannot be followed is not understood: no session
+teams/tests/test_review_items.py::test_reviews_asked_of_someone_else_need_no_session_but_still_their_item_and_pull -> packages/runtime/test/claw/review-wire.test.ts::reading started reviews > reviews asked of someone else need no session but still their item and pull
+# (test_replay_... is MERGED: its reading of the message is the review delegation's; the request it makes is pinned here)

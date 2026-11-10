@@ -456,11 +456,14 @@ is sent is typed into that terminal, as the person at it would type it, and the 
 watch. Nothing else writes to the conversation, so its history never forks, and the terminal and the phone show the same
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
 accepted: it waits (one notice, `terminal_input_queued`, with `reason` `terminal_working`, `terminal_waiting`, `terminal_typing`,
-`terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle **and** its input box is empty on the screen, so that
+`terminal_screen` or `terminal_scrolled`) until Claude Code says it is idle (`idle`, or `shell`: idle with background shells
+running) **and** its input box is empty on the screen, so that
 half-typed text at the terminal is never sent along and a question or a menu on the screen is never answered by an Enter; after
 10 minutes it is refused (`terminal_busy`). It is then typed with `tmux send-keys -l` (literal: nothing in it is read as a key
 name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and submitted with Enter
-once the box shows it. Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
+once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that text, no question or
+menu, and no running turn (otherwise no further key is sent, the text stays in the box and the message is refused,
+`terminal_input_failed`: a phone's message never answers a permission question). Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
 become spaces), so nothing in a message can act as a key or end the paste. Its turn ends (`turn_end`, naming the prompt) when the
 transcript records the end of the terminal's turn, when the turn is stopped there (`cancelled`), or once Claude Code has said it is
 idle for 5 seconds; a message that does not appear in the transcript within 20 seconds ends as `terminal_input_unconfirmed`. A

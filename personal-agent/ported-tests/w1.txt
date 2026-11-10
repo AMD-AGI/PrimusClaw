@@ -1,0 +1,69 @@
+# W1: store.py (storage, Fernet, link-code HMAC, re-encryption). The store tests of the files below; their other tests
+# belong to other lines: the /link chat path (test_link_code_hardening: lockout answer, link from Teams) and
+# test_remote_store's /agent command parsing to W4; the link-limit environment settings to W2; the /claw-events endpoint
+# tests of test_claw_event_dedupe to W3. Concurrency the Python tests ran as threads or processes runs here as several
+# stores (connections) on one file: one Node process is single-threaded, so the races are between connections.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c
+tests/test_store.py::test_code_is_short_from_an_unambiguous_alphabet_and_stored_hashed -> packages/runtime/test/sqlite/link.test.ts::a code is short, from an unambiguous alphabet, and stored hashed
+tests/test_store.py::test_code_expires_after_ten_minutes -> MERGED packages/runtime/test/sqlite/link.test.ts::a code expires after ten minutes and works just before
+tests/test_store.py::test_code_works_just_before_expiry -> MERGED packages/runtime/test/sqlite/link.test.ts::a code expires after ten minutes and works just before
+tests/test_store.py::test_code_is_single_use -> packages/runtime/test/sqlite/link.test.ts::a code is single use: a second redeemer gets nothing
+tests/test_store.py::test_used_flag_alone_blocks_reuse -> MERGED packages/runtime/test/sqlite/link.test.ts::the used flag alone blocks reuse, and is reported as used
+tests/test_store.py::test_the_code_not_the_sender_decides_whose_key_is_bound -> packages/runtime/test/sqlite/link.test.ts::the code, not the sender, decides whose key is bound
+tests/test_store.py::test_no_api_creates_a_code_from_a_teams_identity -> packages/runtime/test/sqlite/link.test.ts::no store method makes a code from a chat identity: stashPending takes the key alone
+tests/test_store.py::test_wrong_codes_are_rate_limited_and_block_even_the_right_code -> packages/runtime/test/sqlite/link.test.ts::wrong codes are limited and block even the right code until the window ends
+tests/test_store.py::test_expired_pending_keys_are_deleted_and_handed_back_for_revocation -> packages/runtime/test/sqlite/link.test.ts::expired pending keys are deleted and handed back for revocation
+tests/test_store.py::test_pending_and_linked_keys_are_encrypted_at_rest -> packages/runtime/test/sqlite/link.test.ts::pending and linked keys are encrypted at rest
+tests/test_store.py::test_unlink_removes_key_and_session -> MERGED packages/runtime/test/sqlite/link.test.ts::unlink removes the key and the session; a re-link starts a fresh session
+tests/test_store.py::test_relinking_starts_a_fresh_session -> MERGED packages/runtime/test/sqlite/link.test.ts::unlink removes the key and the session; a re-link starts a fresh session
+tests/test_store.py::test_processed_ids -> packages/runtime/test/sqlite/link.test.ts::processed ids
+tests/test_key_rotation.py::test_every_encrypted_column_is_listed -> packages/runtime/test/sqlite/key-rotation.test.ts::every Fernet column of the schema is listed for re-encryption
+tests/test_key_rotation.py::test_after_reencrypt_the_old_key_can_be_removed -> packages/runtime/test/sqlite/key-rotation.test.ts::after reencrypt the old key can be removed
+tests/test_key_rotation.py::test_without_reencrypt_removing_the_old_key_loses_the_secrets -> packages/runtime/test/sqlite/key-rotation.test.ts::without reencrypt, removing the old key loses the secrets
+tests/test_key_rotation.py::test_a_second_run_changes_nothing -> packages/runtime/test/sqlite/key-rotation.test.ts::a second run changes nothing, not even to a fresh ciphertext
+tests/test_key_rotation.py::test_an_interrupted_run_is_finished_by_the_next -> packages/runtime/test/sqlite/key-rotation.test.ts::an interrupted run is finished by the next
+tests/test_key_rotation.py::test_a_row_rewritten_during_the_run_is_not_overwritten -> packages/runtime/test/sqlite/key-rotation.test.ts::a row rewritten during the run is not overwritten
+tests/test_key_rotation.py::test_a_token_no_key_reads_is_left_alone -> packages/runtime/test/sqlite/key-rotation.test.ts::a token no key reads is left alone
+tests/test_key_rotation.py::test_the_worker_reencrypts_when_it_opens_the_store -> packages/runtime/test/sqlite/key-rotation.test.ts::the worker re-encrypts when it opens the store, and logs counts but no secret
+tests/test_link_code_hardening.py::test_the_stored_hash_is_an_hmac_under_a_server_key_not_a_plain_digest -> packages/runtime/test/sqlite/link.test.ts::the stored hash is an HMAC under a key derived from the encryption key, not a plain digest
+tests/test_link_code_hardening.py::test_a_code_cannot_be_found_without_the_server_key -> MERGED packages/runtime/test/sqlite/link.test.ts::a code cannot be found without the server key, and survives a rotation that keeps its key
+tests/test_link_code_hardening.py::test_a_code_minted_before_a_key_rotation_still_works -> MERGED packages/runtime/test/sqlite/link.test.ts::a code cannot be found without the server key, and survives a rotation that keeps its key
+tests/test_link_code_hardening.py::test_a_code_stored_by_the_old_plain_sha256_is_void_but_still_revoked -> packages/runtime/test/sqlite/link.test.ts::a code stored by the old plain SHA-256 is void but still revoked
+tests/test_link_code_hardening.py::test_a_used_code_replayed_is_refused_and_logged -> packages/runtime/test/sqlite/link.test.ts::a used code replayed is refused and reported as wrong
+tests/test_link_code_hardening.py::test_an_expired_code_is_refused_and_logged_as_expired -> packages/runtime/test/sqlite/link.test.ts::an expired code is refused and reported as expired
+tests/test_link_code_hardening.py::test_a_used_flag_is_logged_as_used -> MERGED packages/runtime/test/sqlite/link.test.ts::the used flag alone blocks reuse, and is reported as used
+tests/test_link_code_hardening.py::test_two_requests_racing_for_one_code_bind_it_once -> packages/runtime/test/sqlite/link.test.ts::two stores on one file racing for one code bind it once
+tests/test_link_code_hardening.py::test_a_code_redeemed_by_a_cannot_be_redeemed_by_b -> MERGED packages/runtime/test/sqlite/link.test.ts::a code redeemed by A cannot be redeemed by B; a code binds only its own key to its redeemer
+tests/test_link_code_hardening.py::test_a_code_binds_only_its_own_key_to_only_its_redeemer -> MERGED packages/runtime/test/sqlite/link.test.ts::a code redeemed by A cannot be redeemed by B; a code binds only its own key to its redeemer
+tests/test_link_code_hardening.py::test_guessing_locks_the_user_out_and_logs_one_lockout -> packages/runtime/test/sqlite/link.test.ts::guessing locks the person out and reports one lockout
+tests/test_link_code_hardening.py::test_a_success_does_not_reset_the_users_wrong_codes -> packages/runtime/test/sqlite/link.test.ts::a success does not reset the person's wrong codes
+tests/test_link_code_hardening.py::test_the_global_limit_refuses_everyone_and_logs_a_warning -> packages/runtime/test/sqlite/link.test.ts::the global limit refuses everyone and reports the global lockout
+tests/test_link_code_hardening.py::test_with_the_default_limits_many_accounts_guessing_log_the_global_lockout -> packages/runtime/test/sqlite/link.test.ts::with the default limits, many accounts guessing report every user lockout and then the global one
+tests/test_link_code_hardening.py::test_refused_attempts_do_not_extend_a_lockout -> packages/runtime/test/sqlite/link.test.ts::refused attempts do not extend a lockout
+tests/test_link_code_hardening.py::test_concurrent_wrong_codes_cannot_overrun_the_limit -> packages/runtime/test/sqlite/link.test.ts::wrong codes from several stores on one file cannot overrun the limit
+tests/test_link_code_hardening.py::test_no_log_record_carries_the_code_or_the_key -> packages/runtime/test/sqlite/link.test.ts::no reported event carries the code (in any case or spacing) or the key
+tests/test_link_code_hardening.py::test_the_worker_builds_its_store_with_the_configured_link_limits -> packages/runtime/test/sqlite/key-rotation.test.ts::the worker's store takes its link limits and its security-event log from what it is opened with
+tests/test_remote_store.py::test_a_chat_is_attached_to_one_session_and_detaching_forgets_where_it_was -> packages/runtime/test/sqlite/remote-store.test.ts::a chat is attached to one session, and detaching forgets where it was
+tests/test_remote_store.py::test_the_read_position_only_moves_forward_and_only_for_the_attached_session -> packages/runtime/test/sqlite/remote-store.test.ts::the read position only moves forward, and only for the attached session
+tests/test_remote_store.py::test_ids_compare_as_numbers_not_as_text -> packages/runtime/test/sqlite/remote-store.test.ts::ids compare as numbers, not as text
+tests/test_remote_store.py::test_an_open_turn_and_the_modes_belong_to_the_session -> packages/runtime/test/sqlite/remote-store.test.ts::an open turn and the modes belong to the session
+tests/test_remote_store.py::test_the_listing_survives_attaching_and_detaching -> packages/runtime/test/sqlite/remote-store.test.ts::the listing survives attaching and detaching
+tests/test_remote_store.py::test_a_permission_row_is_written_once_and_closed_by_one_caller -> packages/runtime/test/sqlite/remote-store.test.ts::a permission row is written once and closed by one caller
+tests/test_remote_store.py::test_the_sessions_waiting_for_a_user_are_those_with_an_open_approval_card_of_theirs -> packages/runtime/test/sqlite/remote-store.test.ts::the sessions waiting for a person are those with an open approval card of theirs
+tests/test_remote_store.py::test_an_old_permission_row_is_dropped_after_a_week -> packages/runtime/test/sqlite/remote-store.test.ts::an old permission row is dropped after a week
+tests/test_remote_store.py::test_unlinking_forgets_the_attachment_and_the_cards -> packages/runtime/test/sqlite/remote-store.test.ts::unlinking forgets the attachment and the cards, and the group chats bound to them
+tests/test_remote_store.py::test_a_database_made_before_remote_agents_gets_the_tables_on_start -> packages/runtime/test/sqlite/remote-store.test.ts::a database made before remote agents gets the tables on start, and keeps them over a restart
+tests/test_remote_store.py::test_what_the_agent_said_about_asking_is_kept_apart_from_not_having_said -> packages/runtime/test/sqlite/remote-store.test.ts::what the agent said about asking is kept apart from not having said
+tests/test_remote_store.py::test_a_database_from_before_the_unattended_columns_gets_them_and_keeps_its_rows -> packages/runtime/test/sqlite/remote-store.test.ts::a database from before the unattended columns gets them and keeps its rows
+tests/test_repo_sessions.py::test_the_last_five_repositories_newest_first_and_a_repeat_moves_to_the_top -> packages/runtime/test/sqlite/repo-history.test.ts::the last five repositories, newest first; a repeat moves to the top
+tests/test_repo_sessions.py::test_the_same_repository_on_another_branch_is_another_entry_and_case_does_not_matter -> packages/runtime/test/sqlite/repo-history.test.ts::the same repository on another branch is another entry, and case does not matter
+tests/test_repo_sessions.py::test_two_picks_in_the_same_second_keep_their_order -> packages/runtime/test/sqlite/repo-history.test.ts::two picks in the same second keep their order
+tests/test_repo_sessions.py::test_what_is_remembered_is_per_user_and_forgotten_on_unlink_and_relink -> packages/runtime/test/sqlite/repo-history.test.ts::what is remembered is per person, and forgotten on unlink and on a link to another account
+tests/test_repo_sessions.py::test_the_pending_repository_is_replaced_by_the_next_pick_and_runs_out -> packages/runtime/test/sqlite/repo-history.test.ts::the pending repository is replaced by the next pick and runs out
+tests/test_repo_sessions.py::test_the_session_list_is_newest_first_keeps_title_and_repository_and_is_capped -> packages/runtime/test/sqlite/repo-history.test.ts::the session list is newest first, keeps title and repository, and is capped
+tests/test_repo_sessions.py::test_a_session_remembered_without_a_title_gets_it_when_it_becomes_known_and_never_loses_it_again -> packages/runtime/test/sqlite/repo-history.test.ts::a session remembered without a title gets it when it becomes known, and never loses it again
+tests/test_repo_sessions.py::test_the_limits_are_these_numbers -> packages/runtime/test/sqlite/repo-history.test.ts::the limits are these numbers, and they are what is kept, not only what is listed
+tests/test_repo_sessions.py::test_a_forgotten_session_is_off_the_list -> packages/runtime/test/sqlite/repo-history.test.ts::a forgotten session is off the list
+tests/test_repo_sessions.py::test_a_database_from_before_this_feature_gets_the_tables -> packages/runtime/test/sqlite/repo-history.test.ts::a database from before this feature gets the tables and keeps its session
+tests/test_claw_event_dedupe.py::test_claims_are_exclusive_across_processes -> packages/runtime/test/sqlite/delivery.test.ts::claims are exclusive across stores on one file: each event is claimed by exactly one
+tests/test_link_code_hardening.py::test_the_rotation_procedure_waits_out_the_life_of_a_link_code -> INTERNAL

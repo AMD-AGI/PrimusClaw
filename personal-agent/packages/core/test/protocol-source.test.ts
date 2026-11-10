@@ -11,6 +11,7 @@ import * as theirsApi from "../../../../claw/packages/protocol/src/claw-api/inde
 import * as theirsRemote from "../../../../claw/packages/protocol/src/remote-agents.js";
 import * as ours from "../src/protocol.js";
 import * as core from "../src/index.js";
+import { own } from "../src/own.js";
 
 const packages = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -30,8 +31,8 @@ test("src/protocol.ts re-exports the very objects of the shared modules (not cop
   const names = Object.keys(contract);
   assert.ok(names.length > 10, "the contract exports its constants");
   for (const name of names) {
-    assert.equal((ours as Record<string, unknown>)[name], contract[name], name);
-    assert.equal((core as Record<string, unknown>)[name], contract[name], `core index: ${name}`);
+    assert.equal(own(ours as Record<string, unknown>, name), own(contract, name), name);
+    assert.equal(own(core as Record<string, unknown>, name), own(contract, name), `core index: ${name}`);
   }
   assert.equal(ours.REMOTE_COMMANDS, theirsRemote.REMOTE_COMMANDS);
   assert.equal(ours.ASSISTANT_EVENT_TYPES, theirsApi.ASSISTANT_EVENT_TYPES);

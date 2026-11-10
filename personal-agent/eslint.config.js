@@ -8,6 +8,8 @@ import comments from "@eslint-community/eslint-plugin-eslint-comments/configs";
 import { createTypeScriptImportResolver } from "eslint-import-resolver-typescript";
 import { importX } from "eslint-plugin-import-x";
 import tseslint from "typescript-eslint";
+import asyncContext from "./eslint-rules/async-context.js";
+import noPrototypeKeys from "./eslint-rules/no-prototype-keys.js";
 
 /** Rules that are gates: no inline disable of these is accepted, with or without a reason. */
 const GATES = [
@@ -18,10 +20,15 @@ const GATES = [
   "@typescript-eslint/no-explicit-any",
   "@typescript-eslint/no-floating-promises",
   "@typescript-eslint/no-misused-promises",
+  "own-keys/no-prototype-keys",
+  "layers/async-context-in-runtime-context",
 ];
 
 export default tseslint.config(
-  { ignores: ["**/node_modules/**", "**/dist/**", "coverage/**", ".c8-tmp/**"] },
+  {
+    // test/fixtures holds code written to break a rule; test/no-prototype-keys.test.ts lints it on purpose.
+    ignores: ["**/node_modules/**", "**/dist/**", "coverage/**", ".c8-tmp/**", "test/fixtures/**"],
+  },
   {
     linterOptions: { reportUnusedDisableDirectives: "error", reportUnusedInlineConfigs: "error" },
   },
@@ -32,7 +39,7 @@ export default tseslint.config(
   importX.flatConfigs.typescript,
   {
     languageOptions: {
-      parserOptions: { projectService: { allowDefaultProject: ["*.js", "*.cjs", "scripts/*.mjs"] } },
+      parserOptions: { projectService: { allowDefaultProject: ["*.js", "*.cjs", "eslint-rules/*.js"] } },
     },
     settings: {
       "import-x/resolver-next": [createTypeScriptImportResolver({ project: "./tsconfig.json" })],
@@ -63,8 +70,21 @@ export default tseslint.config(
     },
   },
   {
-    // Config files and scripts are plain JavaScript run by Node.
-    files: ["*.js", "*.cjs", "scripts/*.mjs"],
+    // A plain-object lookup by an arbitrary string key reaches Object.prototype ("constructor", "__proto__"), which a
+    // Python dict never does (eslint-rules/no-prototype-keys.js says what is allowed instead).
+    files: ["**/*.ts"],
+    plugins: { "own-keys": { rules: { "no-prototype-keys": noPrototypeKeys } } },
+    rules: { "own-keys/no-prototype-keys": "error" },
+  },
+  {
+    // Asynchronous context only in packages/runtime/src/context/ (eslint-rules/async-context.js).
+    files: ["**/*.ts"],
+    plugins: { layers: { rules: { "async-context-in-runtime-context": asyncContext } } },
+    rules: { "layers/async-context-in-runtime-context": "error" },
+  },
+  {
+    // Config files, the local lint rules and scripts are plain JavaScript run by Node.
+    files: ["*.js", "*.cjs", "eslint-rules/*.js"],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: { process: "readonly", console: "readonly", module: "writable", require: "readonly" } },
   },

@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { own } from "../src/own.js";
 
 const core = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = path.join(core, "src");
@@ -69,7 +70,7 @@ test("core's sources import nothing but core, zod and (protocol.ts only) the wir
 test("core's package.json depends on nothing but zod", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(core, "package.json"), "utf8")) as Record<string, unknown>;
   for (const field of ["dependencies", "peerDependencies", "optionalDependencies"]) {
-    const deps = Object.keys(pkg[field] ?? {});
+    const deps = Object.keys(own(pkg, field) ?? {});
     assert.deepEqual(
       deps.filter((d) => !ALLOWED_PACKAGES.has(d)),
       [],

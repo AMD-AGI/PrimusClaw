@@ -41,3 +41,4 @@ export * from "./key-revoker.js";
 export * from "./model-refusal-policy.js";
 export * from "./route-extension.js";
 export * from "./token-exchange.js";
+export * from "./integrations.js";

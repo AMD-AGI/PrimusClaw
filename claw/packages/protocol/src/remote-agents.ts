@@ -331,6 +331,65 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
 }
 
 /**
+ * Hiding conversations of a machine from its owner's lists (`POST /v1/remote-agents/connectors/:cid/hidden`), and the
+ * listing that leaves them out (`GET /v1/remote-agents/connectors`, `?hidden=include` to list them too). Nothing on the
+ * machine changes: only which of the conversations it reports (`capabilities.resumable`) the owner's lists show.
+ */
+export const REMOTE_HIDE_LIMITS = {
+  /** Conversation refs one request names, at least one. */
+  maxRefs: 50,
+  /** A ref as the machine reported it: printable ASCII, no space. */
+  maxRefChars: 128,
+} as const;
+
+/** The value of `?hidden=` that lists the hidden conversations too, each marked `hidden: true`. */
+export const REMOTE_HIDDEN_INCLUDE = "include";
+
+const HIDE_REF_RE = new RegExp(`^[\\x21-\\x7e]{1,${REMOTE_HIDE_LIMITS.maxRefChars}}$`);
+
+/** The body of a hide (or, `hidden: false`, show again). */
+export interface RemoteHiddenRequest {
+  refs: string[];
+  hidden: boolean;
+}
+
+/** Why a conversation was not hidden: a process has it open (or a session holds it), or the machine does not report it now. */
+export type RemoteHideRefusalReason = "live" | "unknown_conversation";
+
+export interface RemoteHideRefusal {
+  ref: string;
+  reason: RemoteHideRefusalReason;
+}
+
+/** The answer of a hide or show (`data`): the refs that changed, and the ones refused with why. */
+export interface RemoteHidden {
+  changed: string[];
+  refused: RemoteHideRefusal[];
+}
+
+/** One conversation of `capabilities.resumable` as the owner's listing returns it: as the machine reported it, marked when hidden. */
+export type RemoteResumableListed = Record<string, unknown> & { hidden?: true };
+
+/**
+ * What the listing makes of an agent's `capabilities` once its owner hid any of its conversations: the conversations left
+ * (`?hidden=include`: all of them, the hidden ones marked) and how many are hidden. Absent while nothing of it is hidden.
+ */
+export interface RemoteHiddenCapabilities {
+  resumable: RemoteResumableListed[];
+  hidden_count: number;
+}
+
+/** A hide request as the route takes it: `hidden` a boolean, then 1 to 50 refs of printable ASCII. */
+export function parseHiddenRequest(body: unknown): Parsed<RemoteHiddenRequest> {
+  const fields = isObject(body) ? body : {};
+  if (typeof fields.hidden !== "boolean") return fail("hidden_must_be_boolean");
+  const refs = Array.isArray(fields.refs) ? (fields.refs as unknown[]) : null;
+  if (!refs || refs.length === 0 || refs.length > REMOTE_HIDE_LIMITS.maxRefs) return fail("invalid_refs");
+  if (!refs.every((r): r is string => typeof r === "string" && HIDE_REF_RE.test(r))) return fail("invalid_refs");
+  return { ok: true, value: { refs, hidden: fields.hidden } };
+}
+
+/**
  * The commands a user can issue into an existing session.
  *
  * `session.new` is not here: it creates the session and goes through
