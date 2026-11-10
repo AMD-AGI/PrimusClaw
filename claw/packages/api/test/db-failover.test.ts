@@ -9,7 +9,10 @@
  * ones the Service still routes there, is on a server that refuses writes (25006), and then new connections reach the
  * new primary while the old ones stay on the replica. That is what `failover()` makes of this file's database: each
  * idle connection of the pool is set read-only for good, as a connection to the demoted server is, and connections
- * opened during the window are read-only too, until `promote()`.
+ * opened during the window are read-only too, until `promote()`. A connection to the demoted server also says it is in
+ * recovery, and the pool asks every new connection that before handing it out; here a read-only one says so too
+ * (`demotedSaysInRecovery`), so a connection opened before `promote()` has landed is turned away as one to the demoted
+ * server is, rather than handed out to fail.
  *
  *   F1  a statement Postgres refused as read-only is sent again once, on a new connection, and is stored once
  *   F2  a failed transaction does not hand its read-only connection back, and no transaction after a failover runs on
@@ -57,14 +60,17 @@ describe("database failover", { skip }, () => {
   let w: World;
   let admin: pg.Client;
   let alice: { userId: string; routerSid: string };
+  let restoreQuery: (() => void) | undefined;
 
   before(async () => {
-    // Short enough for a test, long enough that `promote()` lands before the retry.
+    // The pause before a retry, and between connections that reached the demoted server.
     w = await startWorld({ PG_FAILOVER_RETRY_DELAY_MS: "300" });
     admin = await w.h.connect();
     await w.q("CREATE TABLE IF NOT EXISTS failover_probe (id serial PRIMARY KEY, note text NOT NULL)");
+    restoreQuery = await demotedSaysInRecovery();
   });
   after(async () => {
+    restoreQuery?.();
     await admin?.query(`ALTER DATABASE "${w.h.cluster.schema}" RESET default_transaction_read_only`).catch(() => {});
     await w?.stop();
   });
@@ -104,6 +110,26 @@ describe("database failover", { skip }, () => {
   }
 
   const promoteSoon = () => setTimeout(() => { void promote(); }, 50);
+
+  /**
+   * This file's demoted server is one database made read-only, which Postgres does not count as recovery, so the pool's
+   * question to each new connection -- is your server in recovery -- would be answered no on the demoted server too, and
+   * a connection opened before `promote()` landed would be handed out to fail its first write. A real demoted server
+   * answers yes. So the question is answered here as that server would: in recovery, or refusing writes. Matched by its
+   * text, which F10 pins: a pool that asked differently would fail F10, not quietly skip this. Returns the restore.
+   */
+  async function demotedSaysInRecovery(): Promise<() => void> {
+    const { default: pgModule } = await import("pg");
+    const proto = pgModule.Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const real = proto.query;
+    proto.query = function (this: unknown, ...args: unknown[]) {
+      if (args[0] === "SELECT pg_is_in_recovery() AS r") {
+        return real.call(this, "SELECT pg_is_in_recovery() OR current_setting('transaction_read_only')::boolean AS r");
+      }
+      return real.apply(this, args);
+    };
+    return () => { proto.query = real; };
+  }
 
   /**
    * The old primary going away under a statement in flight: the backend running the statement tagged `tag` is
