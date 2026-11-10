@@ -345,7 +345,8 @@ export function trim(address: string): string {
 
 /** `text` with markdown's backslash escapes resolved (`example\\.com` is `example.com`), as the client shows it. */
 function unescaped(text: string): string {
-  return text.replace(/\\([!-/:-@[-`{-~])/gu, "$1");
+  // (but `\|`, which a table row keeps as a bar in its cell: unescaped there it would split the cell, and the span, in two)
+  return text.replace(/\\([!-/:-@[-`{}~])/gu, "$1");
 }
 
 /** `text` in a code span, which no client makes a link of (a backtick in it made a look-alike). */

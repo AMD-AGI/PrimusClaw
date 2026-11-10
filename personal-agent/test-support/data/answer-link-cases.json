@@ -712,6 +712,22 @@
    "expected": [
     "see `a-b.example.net:8080/x`"
    ]
+  },
+  {
+   "about": "an escaped bar in a bare address in a table cell stays escaped, so it splits neither the cell nor the span",
+   "input": "h | docs.example.museum/p\\|\n---|---\nx | y",
+   "lang": "en",
+   "expected": [
+    "h | `docs.example.museum/p\\|`\n---|---\nx | y"
+   ]
+  },
+  {
+   "about": "an escaped bar in a bare address in a table cell stays escaped, so it splits neither the cell nor the span",
+   "input": "h | docs.example.museum/p\\|\n---|---\nx | y",
+   "lang": "zh",
+   "expected": [
+    "h | `docs.example.museum/p\\|`\n---|---\nx | y"
+   ]
   }
  ]
 }

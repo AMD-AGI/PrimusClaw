@@ -312,6 +312,7 @@ test("a code span made here pairs with no backtick of the text's own as sent", (
     "](",
     "<",
     "``x``",
+    "docs.example.museum/p\\|",
   ];
   const mail = /[\w.+-]@[\w-]+(?:\.[\w-]+)*\.[a-z]+(?!\w)/iu;
   const random = seeded(5);
