@@ -14,7 +14,7 @@ import { AAD } from "./helpers.js";
 const LIMIT = 10; // remote_agent: 10 an hour (guardrails/operations.ts)
 
 test("one person in two group chats uses one allowance", () =>
-  remoteWorld(async (w) => {
+  remoteWorld((w) => {
     // (the guard every part of the remote agents counts with)
     const guard = (w.remote as unknown as { ctx: { guard: RemoteGuard } }).ctx.guard;
     const first = groupChatKey(AAD, "19:first@thread.v2");
@@ -23,4 +23,5 @@ test("one person in two group chats uses one allowance", () =>
       assert.equal(guard.take(first, "remote_agent", {}), null, `take ${String(i + 1)}`);
     assert.notEqual(guard.take(second, "remote_agent", {}), null); // the same person, another group: no new allowance
     assert.notEqual(guard.take(AAD, "remote_agent", {}), null); // nor in the 1:1 chat
+    return Promise.resolve();
   }));
