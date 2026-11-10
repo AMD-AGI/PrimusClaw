@@ -19,7 +19,7 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import { TranscriptTail, type AttachSupport, type TranscriptUpdate } from "./attach.js";
+import { TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { TerminalInput, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
@@ -460,7 +460,7 @@ export class Session {
           const status = this.holderStatus(term);
           let why: string;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
-          if (status !== "idle") {
+          if (!isIdleStatus(status)) {
             why = status === "busy" || status === "waiting" ? WAIT_WHY[status] : "terminal_state_unknown";
           } else {
             const r = await term.readiness();
@@ -498,7 +498,7 @@ export class Session {
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
-        if (this.holderStatus(term) !== "idle") { refused("terminal_switched", "the terminal changed just before typing"); continue; }
+        if (!isIdleStatus(this.holderStatus(term))) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
           this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
@@ -529,7 +529,7 @@ export class Session {
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
         const again = await term.readiness();
-        if (!again.ready || this.holderStatus(term) !== "idle") { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        if (!again.ready || !isIdleStatus(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {
@@ -537,6 +537,7 @@ export class Session {
         } catch (e) {
           this.terminalTurn = null;
           this.env.store.endTurn(this.id);
+          // (`TerminalNotSubmitted`: typed, but the screen did not let Enter go; no key was sent after the text, which stays in the box)
           this.audit("terminal_input_refused", { reason: "terminal_input_failed", detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
           this.rejectCommand("prompt", next.cmdId, "terminal_input_failed", next.cmdSeq);
           this.emit("turn_end", { stopReason: "error", error: "terminal_input_failed", cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
@@ -570,7 +571,7 @@ export class Session {
     }
     const status = support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart);
     if (status === "other") { this.endTerminalTurn("end_turn"); return; }
-    if (status === "idle") {
+    if (isIdleStatus(status)) {
       turn.idleSince ??= now;
       if (now - turn.idleSince >= this.env.timing.terminalIdleMs) this.endTerminalTurn("end_turn");
     } else {

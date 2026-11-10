@@ -276,7 +276,7 @@ teams/tests/test_reply_style.py::test_a_status_message_without_a_stream_is_the_s
 # reassigned: teams/tests/test_turn_stream_tail.py::test_last_event_id_of_an_empty_session_is_none -> W2
 # reassigned: test_reply_language.py other 17 -> W4 (the conversation's language)
 # reassigned: test_rich_answer.py conversion/masking (:177 :192 :206 :211 :267 :287 :306 :317 :330 :356 :367) -> W3 (messenger.rich, richtext)
-# reassigned: test_rich_answer.py::test_show_here_sends_the_answer_as_xml -> W4 (show here click)
+# reassigned: test_rich_answer.py::test_show_here_sends_the_answer_as_xml -> W4 (show here click; ported in w4.txt)
 
 # A Python change after the baseline (ported ahead): stop_button.py and render.stop_card. Its agent, assistant and
 # remote tests (a press interrupts the turn, the card per kind of turn) are the router's, W5's and W6's.

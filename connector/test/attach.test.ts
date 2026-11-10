@@ -1325,7 +1325,9 @@ describe("the conversations already on the machine show up by themselves", () =>
     assert.deepEqual(liveActivity(rows), { activity: "waiting", waiting_for: "input needed" });
     assert.deepEqual(liveActivity([rows[1]!]), { activity: "working" });
     assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "idle" }]))), { activity: "idle" });
-    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "shell" }]))), {}, "a status it does not know says nothing");
+    // `shell` (Claude Code 2.1.32x): idle at its prompt with background shells running; it was read as a status it does not know.
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "shell" }]))), { activity: "idle" });
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "compacting" }]))), {}, "a status it does not know says nothing");
     assert.deepEqual(liveActivity([{ pid: 4, sessionId: REF, status: "waiting", waitingFor: `token sk-ant-api03-${"x".repeat(40)}\nnext`, foreign: false }]).waiting_for?.includes("sk-ant"), false, "scrubbed");
   });
 

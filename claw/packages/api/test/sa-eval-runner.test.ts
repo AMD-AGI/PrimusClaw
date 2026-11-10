@@ -68,6 +68,16 @@
  *      identity had before are kept; one that could not be deleted fails the cleanup (cleanup_failed); a case's
  *      setup.forget_memories deletes the identity's entries it names before the attempt's first message, and one it could not
  *      delete makes the attempt the run's error with nothing sent
+ *   R23 expect_memory / expect_no_memory are graded on the entries the attempt made, read after its turns and before they are
+ *      deleted: an entry saved before the attempt does not satisfy expect_memory; a failing check fails the attempt by name
+ *   R24 an entry the run made after its attempt's cleanup (a turn still running past its attempt: a stop, a timeout) is the run's: one
+ *      not there when the run began is deleted before the next attempt, and in a sweep after the run's sessions are closed; an
+ *      entry from before the run is kept
+ *   R25 an attempt's memory entries are listed only once the assistant session is idle: an entry an earlier turn still running
+ *      saves while the next attempt waits is not counted as that attempt's (expect_memory fails), and is deleted as the run's
+ *   R26 EVAL_FRESH_SESSION_EVERY=attempt with EVAL_INFRA_RETRY: an attempt whose assistant session is still running before it is the
+ *      run's error and is run again once, in a new session (the idle wait before an attempt's memory entries are listed is no
+ *      preflight failure)
  *   R6 a turn whose end the stream never shows: graded when the stored events have its exec_complete (a delivery Brain gave up
  *      on ends with that alone), an error and not a grade when they do not either, or only after the wait from its own message
  *      (an earlier turn of a case is held to its own); a turn still running when the run ends is reported
@@ -113,6 +123,9 @@ class FakeClaw {
   private assistantAsked = 0;
   /** The identity's memory entries, by id. */
   readonly memories = new Map<number, { id: number; title: string; body: string }>();
+  /** Called after each memory list was answered, with how many there were so far (this one included). */
+  onMemoryList: (n: number) => void = () => {};
+  private memoryLists = 0;
   /** Memory entries whose DELETE answers 500 and leaves them. */
   readonly failMemoryDelete = new Set<number>();
   /** The authorization each message to a session came with. */
@@ -198,7 +211,11 @@ class FakeClaw {
     // An oracle read that takes a while (a fact's `/v1/...#pick`).
     if (method === "GET" && path === "/v1/slow-oracle") { setTimeout(() => send(200, { data: { n: 3 } }), 2_000); return; }
     if (method === "GET" && path === "/v1/notification-subscriptions") return send(200, { ok: true, data: [] });
-    if (method === "GET" && path === "/v1/users/me/memories") return send(200, { ok: true, data: [...this.memories.values()].map((e) => ({ ...e, content: e.body })) });
+    if (method === "GET" && path === "/v1/users/me/memories") {
+      send(200, { ok: true, data: [...this.memories.values()].map((e) => ({ ...e, content: e.body })) });
+      this.onMemoryList(++this.memoryLists);
+      return;
+    }
     if ((m = /^\/v1\/users\/me\/memories\/([^/]+)$/.exec(path)) && method === "DELETE") {
       const id = Number(m[1]);
       if (this.failMemoryDelete.has(id)) return send(500, { ok: false });
@@ -1432,6 +1449,120 @@ describe("the runner against a fake Claw API", { concurrency: 8 }, () => {
       assert.match(run2.out, /ERROR cat-memory-wr-002#1 .*infra: setup: memory entries named by forget_memories not deleted: 1352/);
       assert.equal(stuck.sent.length, 0, "nothing sent");
     } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R23 expect_memory is graded on the entries the attempt made, before they are deleted", { timeout: 120_000 }, async () => {
+    const memCase = (id: string) => ({ ...answerCase(id, "remember that I review with opus"), expect_memory: ["opus"], expect_no_memory: ["sonnet"] });
+    // Saved by the attempt: passes, then deleted.
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (_content, id) => { claw.memories.set(3000, { id: 3000, title: "Review model", body: "Reviews with Opus" }); claw.turn(id, { say: "Saved." }); };
+    const r = runner(base, [memCase("t-expect-001")]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      assert.match(run.out, /pass t-expect-001#1/);
+      assert.ok(!claw.memories.has(3000), "deleted after it was graded");
+      const report = JSON.parse(readFileSync(join(r.dir, "out", "assistant.json"), "utf8"));
+      const names = report.results[0].attempts[0].checks.map((x: { name: string }) => x.name);
+      assert.ok(names.includes("memory saved: opus") && names.includes("no memory left: sonnet"), names.join("; "));
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // An entry from before the attempt (a residue) does not count: nothing new was saved, the attempt fails on that check.
+    const stale = new FakeClaw();
+    const base2 = await stale.start();
+    stale.memories.set(1352, { id: 1352, title: "Review model", body: "Reviews with opus" });
+    stale.router = (_content, id) => stale.turn(id, { say: "There is already an entry for that." });
+    const r2 = runner(base2, [memCase("t-expect-002")]);
+    const run2 = await r2.done;
+    await stale.stop();
+    try {
+      assert.equal(run2.code, 0, run2.out);
+      assert.match(run2.out, /FAIL t-expect-002#1 .*memory saved: opus/);
+      assert.ok(stale.memories.has(1352), "the entry from before is kept");
+    } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+  });
+
+  it("R24 an entry saved after its attempt's cleanup is still the run's: deleted before the next attempt and after the run", { timeout: 120_000 }, async () => {
+    // A save that lands right after the first attempt's cleanup listed the entries (its 2nd list): the next attempt deletes it first.
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+    claw.onMemoryList = (n) => { if (n === 2) claw.memories.set(4000, { id: 4000, title: "Late", body: "saved by a turn still running" }); };
+    claw.router = (_content, id) => claw.turn(id, { say: "ok" });
+    const r = runner(base, [answerCase("t-late-001"), answerCase("t-late-002")]);
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.equal(run.code, 0, run.out);
+      const del = claw.calls.indexOf("DELETE /v1/users/me/memories/4000");
+      const posts = claw.calls.map((c, k) => [c, k] as const).filter(([c]) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c)).map(([, k]) => k);
+      assert.ok(del > posts[0]! && del < posts[1]!, "deleted before the second attempt's message");
+      assert.deepEqual([...claw.memories.keys()], [5], "the entry from before the run is kept");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+
+    // The last attempt's late save: the sweep after the run deletes it; one it cannot delete is in cleanup_failed.
+    for (const fails of [false, true]) {
+      const last = new FakeClaw();
+      const base2 = await last.start();
+      last.memories.set(5, { id: 5, title: "Language", body: "Reply in Chinese" });
+      if (fails) last.failMemoryDelete.add(4001);
+      last.onMemoryList = (n) => { if (n === 2) last.memories.set(4001, { id: 4001, title: "Late", body: "saved late" }); };
+      last.router = (_content, id) => last.turn(id, { say: "ok" });
+      const r2 = runner(base2, [answerCase("t-late-003")]);
+      const run2 = await r2.done;
+      await last.stop();
+      try {
+        const report = JSON.parse(readFileSync(join(r2.dir, "out", "assistant.json"), "utf8"));
+        if (fails) {
+          assert.equal(run2.code, 1, run2.out);
+          assert.ok(report.cleanup_failed.some((x: string) => /memory entries the run made not deleted: 4001/.test(x)), JSON.stringify(report.cleanup_failed));
+        } else {
+          assert.equal(run2.code, 0, run2.out);
+          assert.deepEqual(report.cleanup_failed, []);
+          assert.deepEqual([...last.memories.keys()], [5]);
+        }
+      } finally { rmSync(r2.dir, { recursive: true, force: true }); }
+    }
+  });
+
+  it("R25 the entries before an attempt are listed once the session is idle: a running turn's late save is not the next attempt's", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.router = (content, id) => {
+      claw.turn(id, { say: "Done." });
+      if (content !== "first") return;
+      // The first turn's conversation goes on and saves an entry 1.5 s later, then the session is idle.
+      claw.sessions.get(claw.assistant)!.status = "running";
+      setTimeout(() => { claw.memories.set(5000, { id: 5000, title: "Review model", body: "reviews with opus" }); claw.sessions.get(claw.assistant)!.status = "idle"; }, 1_500);
+    };
+    const r = runner(base, [answerCase("t-idle-001", "first"), { ...answerCase("t-idle-002", "second"), expect_memory: ["opus"] }], { EVAL_TURN_WAIT_S: "10" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /pass t-idle-001#1/, run.out);
+      assert.match(run.out, /FAIL t-idle-002#1 .*memory saved: opus/, "the earlier turn's entry is not the attempt's");
+      assert.ok(!claw.memories.has(5000), "deleted as the run's");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  it("R26 attempt mode: a session still running before an attempt is run again once, in a new session", { timeout: 120_000 }, async () => {
+    const claw = new FakeClaw();
+    const base = await claw.start();
+    claw.freshAssistant = true;
+    // The second case's session (asst-2) has a turn going on (a person, or a turn past its attempt) for as long as it is there.
+    claw.onSessionGet = (sid) => { const s = claw.sessions.get(sid); if (sid === "asst-2" && s) s.status = "running"; };
+    claw.router = (_content, id, sid) => claw.turn(id, { say: `answered in ${sid}` });
+    const r = runner(base, [answerCase("t-retry-001"), answerCase("t-retry-002")], { EVAL_FRESH_SESSION_EVERY: "attempt", EVAL_INFRA_RETRY: "1", EVAL_TURN_WAIT_S: "3" });
+    const run = await r.done;
+    await claw.stop();
+    try {
+      assert.match(run.out, /ERROR t-retry-002#1 the assistant session was still running .*: running it again once/, run.out);
+      assert.match(run.out, /pass t-retry-002#1 .*\(second try\)/, run.out);
+      const posts = claw.calls.filter((c) => /^POST \/v1\/sessions\/[^/]+\/messages$/.test(c));
+      assert.deepEqual(posts, ["POST /v1/sessions/asst-1/messages", "POST /v1/sessions/asst-3/messages"], "nothing sent into the running session");
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
 

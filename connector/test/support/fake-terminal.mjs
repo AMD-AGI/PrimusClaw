@@ -12,7 +12,10 @@
  * below the box names, as Claude Code names it (`manual mode on` for `default`, `accept edits on`...); `none` draws a footer that
  * names no mode; `nobox` draws a screen with no input box at all (another program, a layout the connector does not know). Read
  * again every 50 ms, so the test can switch it as shift+tab would. FAKE_TITLE: a conversation name Claude Code writes into the rule
- * above the box (`/rename`).
+ * above the box (`/rename`). FAKE_IDLE_STATUS: what the row says between turns (`idle`; `shell` is what Claude Code 2.1.32x says
+ * when background shells run).
+ * FAKE_DIALOG_FILE: an adversary. Once anything is typed, a permission question is drawn under the box (the typed text still shows
+ * in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is submitted.
  */
 import fs from "node:fs";
 
@@ -20,6 +23,7 @@ const transcript = process.env.FAKE_TRANSCRIPT;
 const rowFile = process.env.FAKE_ROW;
 const sessionId = process.env.FAKE_SESSION;
 const workMs = Number(process.env.FAKE_WORK_MS || "300");
+const idleStatus = process.env.FAKE_IDLE_STATUS || "idle";
 let buffer = "";
 let pasting = false;
 let working = false;
@@ -29,6 +33,7 @@ const modeFile = process.env.FAKE_MODE_FILE;
 const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "accept edits", bypassPermissions: "bypass permissions", dontAsk: "don't ask", auto: "auto mode" };
 const readMode = () => { try { return fs.readFileSync(modeFile, "utf8").trim(); } catch { return "default"; } };
 let mode = readMode();
+let dialog = false;
 const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
   ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
   : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
@@ -48,7 +53,8 @@ function draw() {
   if (mode === "nobox") { process.stdout.write("\x1b[2J\x1b[H  another program\r\n  nothing to type into here\r\n"); return; }
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
-  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}\r\n`);
+  const question = dialog ? "\r\n Bash command\r\n   touch approved.txt\r\n Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n Esc to cancel · Tab to amend\r\n" : "";
+  process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working ? " · esc to interrupt" : ""}\r\n${question}`);
 }
 
 function submit() {
@@ -63,7 +69,7 @@ function submit() {
     line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${text}` }], stop_reason: "end_turn" } });
     line({ type: "system", subtype: "turn_duration", durationMs: workMs });
     working = false;
-    status("idle");
+    status(idleStatus);
     draw();
   }, workMs);
 }
@@ -80,10 +86,15 @@ process.stdin.on("data", (chunk) => {
     const ch = pending[0];
     pending = pending.slice(1);
     if (pasting) { buffer += ch === "\r" ? "\n" : ch; continue; }
-    if (ch === "\r") { if (!working) submit(); continue; }
+    if (ch === "\r") {
+      if (dialog) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
+      if (!working) submit();
+      continue;
+    }
     if (ch === "\x15") { buffer = ""; continue; }   // Ctrl-U
     if (ch === "\x1b" || ch < " ") continue;
     buffer += ch;
+    if (process.env.FAKE_DIALOG_FILE) dialog = true;
   }
   draw();
 });

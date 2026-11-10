@@ -29,6 +29,15 @@ export const sessionText = defineCatalog({
       "That session cannot be continued any more (it was started before a setting changed), so I cannot open the " +
       "pull request from it. Open it from the console, or tell me what to do in a new message.",
     createPrBusy: "I am still working on your previous message. Send /stop first, then tap Create PR again.",
+    showGone: "That button is no longer valid.",
+    showBusy: "I am still working on your previous message. Send /stop first, then press the button again.",
+    showRefused: "I could not open that session. It may have been deleted, or it is not yours.",
+    showFailed: (p: { status: number }) =>
+      `PrimusClaw could not show that session (error ${String(p.status)}). Please press the button again in a moment.`,
+    showUnreachable: "I could not reach PrimusClaw. Please press the button again in a moment.",
+    showNoAnswer: "That session has no finished answer yet. Press the button again when the run has finished.",
+    showLead: "Here is the answer. Your next message continues this session.",
+    showDone: "The answer is in the chat below. Your next message continues that session.",
     createPrAsking: "Asking the agent to open a pull request. If it needs to push, you will get an approval request.",
   },
   zh: {
@@ -54,6 +63,15 @@ export const sessionText = defineCatalog({
       "That session cannot be continued any more (it was started before a setting changed), so I cannot open the " +
       "pull request from it. Open it from the console, or tell me what to do in a new message.",
     createPrBusy: "I am still working on your previous message. Send /stop first, then tap Create PR again.",
+    showGone: "That button is no longer valid.",
+    showBusy: "I am still working on your previous message. Send /stop first, then press the button again.",
+    showRefused: "I could not open that session. It may have been deleted, or it is not yours.",
+    showFailed: (p: { status: number }) =>
+      `PrimusClaw could not show that session (error ${String(p.status)}). Please press the button again in a moment.`,
+    showUnreachable: "I could not reach PrimusClaw. Please press the button again in a moment.",
+    showNoAnswer: "That session has no finished answer yet. Press the button again when the run has finished.",
+    showLead: "Here is the answer. Your next message continues this session.",
+    showDone: "The answer is in the chat below. Your next message continues that session.",
     createPrAsking: "Asking the agent to open a pull request. If it needs to push, you will get an approval request.",
   },
 });
