@@ -12,7 +12,7 @@ import { it } from "node:test";
 import { flushMicrotasks } from "../../../../test-support/clock.js";
 import { finals, liveWorld, sent, streamed } from "../../../../test-support/assistant/live-world.js";
 import { modelOf, viewsOf } from "../../../../test-support/assistant/view-of.js";
-import { LIVE_ONLY, SAY_TOOL } from "../../src/assistant/follow.js";
+import { LIVE_ONLY, SAY_TOOL, TurnFollower } from "../../src/assistant/follow.js";
 import type { AssistantChat as AssistantChatPort } from "../../src/routing/features.js";
 import { ALICE as ROUTER_ALICE } from "../../../../test-support/routing/fixtures.js";
 import { message, world as routerWorld } from "../../../../test-support/routing/world.js";
@@ -500,7 +500,7 @@ async function handOver(o: {
   }
   await o.after?.(l);
   await flushMicrotasks();
-  return { order, outbox: l.w.surface.outbox, stillOpen: l.w.feed.open };
+  return { order, outbox: l.w.surface.outbox, stillOpen: l.w.feed.open, opened: l.w.feed.opened };
 }
 
 for (const understood of [false, true]) {
@@ -542,3 +542,27 @@ it("a send that fails in a way no handler names still closes the stream", async 
   });
   assert.equal(stillOpen, 0, "the stream is closed");
 });
+
+for (const understood of [false, true]) {
+  it(`a message cancelled while its stream opens leaves no stream open (${understood ? "understand" : "route"})`, async () => {
+    // (internal #505, codex r2) The message stopped while it waited for its turn's stream to open: the follower it started is
+    // settled all the same and its stream closed. A promise cannot be cancelled: here the wait ends in an error instead.
+    const wait = Object.getOwnPropertyDescriptor(TurnFollower.prototype, "waitOpen");
+    assert.ok(wait !== undefined);
+    Object.defineProperty(TurnFollower.prototype, "waitOpen", {
+      ...wait,
+      // (the stream opens at Claw while the message waits for it; then the message stops)
+      value: async () => {
+        for (let i = 0; i < 20; i += 1) await Promise.resolve();
+        throw new Error("the message was cancelled");
+      },
+    });
+    try {
+      const { stillOpen, opened } = await handOver({ queued: false, understood });
+      assert.equal(opened, 1, "the stream was asked for");
+      assert.equal(stillOpen, 0, "the stream is closed");
+    } finally {
+      Object.defineProperty(TurnFollower.prototype, "waitOpen", wait);
+    }
+  });
+}
