@@ -552,7 +552,8 @@ export class Session {
         if (!this.sameHolder(term)) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
-          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
+          // (`typing` from the start: until its text went in, no echo is waited for, so a wait below never ends it as unconfirmed)
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started, typing: true };
         });
         // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
         // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
@@ -587,13 +588,18 @@ export class Session {
         // (the screen read again after that wait: someone typing, a question or a scroll meanwhile is waited out as above, not typed over)
         let again = await term.readiness();
         const screenBy = Date.now() + this.env.timing.terminalScreenWaitMs;
+        // (someone typing or a screen scrolled back: as long as before the turn was recorded, then refused by name, terminal_busy)
+        const heldBy = Date.now() + this.env.timing.terminalWaitMs;
+        let held = false;
         while (!again.ready && again.why !== "gone" && !this.closed && this.terminalTurn === turn && this.sameHolder(term)) {
           if (again.why === "screen" && Date.now() >= screenBy) break;
+          if ((again.why === "typing" || again.why === "copy_mode") && Date.now() >= heldBy) { held = true; break; }
           await sleep(200);
           again = await term.readiness();
         }
         if (!again.ready && again.why === "gone") { giveUp("terminal_gone"); continue; }
         if (!this.sameHolder(term)) { giveUp("terminal_switched"); continue; }
+        if (held && this.terminalTurn === turn && !this.closed) { giveUp("terminal_busy"); continue; }
         if (!again.ready && this.terminalTurn === turn && !this.closed) { giveUp("terminal_screen_unknown"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;

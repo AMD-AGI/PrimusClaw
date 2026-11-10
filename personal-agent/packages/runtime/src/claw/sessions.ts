@@ -198,8 +198,14 @@ export class HttpSessions implements ClawSessionsPort {
     await this.http.json({ method: "PUT", path: `/v1/sessions/${segment(sessionId)}/feedback`, key, body });
   }
 
-  stream(key: ClawCredential, sessionId: string, after?: string, signal?: AbortSignal): AsyncIterable<SseEvent> {
-    return sseEvents(this.http, `/v1/chat/sessions/${segment(sessionId)}/messages`, key, after, signal);
+  stream(
+    key: ClawCredential,
+    sessionId: string,
+    after?: string,
+    signal?: AbortSignal,
+    onOpen?: () => void,
+  ): AsyncIterable<SseEvent> {
+    return sseEvents(this.http, `/v1/chat/sessions/${segment(sessionId)}/messages`, key, after, signal, {}, onOpen);
   }
 
   async #say(key: ClawCredential, sessionId: string, body: JsonObject, acting: boolean): Promise<void> {

@@ -370,3 +370,42 @@ it("a time is the persons wall clock in the triggers zone, else the text as sent
   ];
   for (const [zone, said] of zones) assert.equal(localTime("2026-11-07T01:00:00Z", zone), said, zone);
 });
+
+/** The Python worker's shared cases: Claw's comment address, and whether it is shown as the link. */
+const COMMENT_CASES: readonly (readonly [string, boolean])[] = [
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567", true],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#discussion_r987654", true],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#pullrequestreview-55", true],
+  ["https://github.com/AMD-AGI/Hyperloom/issues/3#issuecomment-1", true],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12", true],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567\nhttps://evil.example", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567\rhttps://evil.example", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567\thttps://evil.example", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567 https://evil.example", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1234567)[x](https://evil.example", false],
+  ["http://github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1", false],
+  ["https://github.com.evil.example/AMD-AGI/Hyperloom/pull/12#issuecomment-1", false],
+  ["https://evil.github.com/AMD-AGI/Hyperloom/pull/12#issuecomment-1", false],
+  ["https://github.com@evil.example/a/b/pull/1#issuecomment-1", false],
+  ["https://github.com:443/AMD-AGI/Hyperloom/pull/12#issuecomment-1", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12?x=1#issuecomment-1", false],
+  ["https://github.com/AMD-AGI/Hyperloom/pull/12#evil", false],
+  ["https://github.com/AMD-AGI/Hyperloom/commit/abc#issuecomment-1", false],
+  ["", false],
+];
+
+it("a posted comment's address is a link only when the whole value is exactly one, case for case as python", () => {
+  for (const [url, shown] of COMMENT_CASES) {
+    const out = { status: "done", answered_now: true, result: { url } };
+    assert.equal(
+      confirmOutcome("github_comment", out, "en"),
+      shown ? `Comment posted: [see it](${url})` : "Comment posted.",
+      JSON.stringify(url),
+    );
+    assert.equal(
+      confirmOutcome("github_comment", out, "zh"),
+      shown ? `评论已发出：[查看评论](${url})` : "评论已发出。",
+      JSON.stringify(url),
+    );
+  }
+});

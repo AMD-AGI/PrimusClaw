@@ -34,7 +34,6 @@ const ASKER_WAITING = new Set(["needs_you", "waiting", "waiting_for_reviewer"]);
 const ASKER_OPEN = new Set(["", "in_progress", "running", "queued", "pending", ...ASKER_WAITING]);
 
 const MARKDOWN = /([\\`*_[\]<])/g;
-const GITHUB = "https://github.com/";
 
 /** `words[key]` when `key` is one of its own keys (never an inherited `constructor`), else undefined. */
 function own(words: Readonly<Record<string, string>>, key: string): string | undefined {
@@ -149,14 +148,14 @@ export function askerWaits(view: AskerView): boolean {
   return ASKER_WAITING.has(view.status);
 }
 
+/** A pull request's address as Claw writes it, read only when the whole value is one (as the review's own lines read it). */
+const PULL_URL =
+  /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})\/pull\/([1-9][0-9]{0,6})$/;
+
+/** owner/repo#N of the review's pull request, or its item id: a value that is not exactly an address could carry a link. */
 function pullOf(asked: ReviewAskedOfOther): string {
-  const url = asked.view.prUrl;
-  const segs = url.startsWith(GITHUB) ? url.slice(GITHUB.length).split("/") : [];
-  const [owner = "", repo = "", pull = "", number = ""] = segs;
-  if (segs.length === 4 && owner && repo && pull === "pull" && /^[0-9]+$/.test(number)) {
-    return `${owner}/${repo}#${number}`;
-  }
-  return url || asked.itemId;
+  const found = PULL_URL.exec(asked.view.prUrl);
+  return found === null ? asked.itemId : `${found[1] ?? ""}/${found[2] ?? ""}#${found[3] ?? ""}`;
 }
 
 function askedState(view: AskerView, who: string): string {
