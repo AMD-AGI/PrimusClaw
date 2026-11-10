@@ -166,7 +166,7 @@ it("every button of these cards is answered by the handler of its kind, through 
     const { reached, said: out } = await pressed(button);
     assert.ok(
       !out.includes(INACTIVE),
-      `${button.card}: ${String(button.data["primusclaw"])} is answered by no handler`,
+      `${button.card}: ${JSON.stringify(button.data["primusclaw"])} is answered by no handler`,
     );
     const shown = out.some((t) => t.startsWith("Here is the answer."));
     assert.equal(reached.length + (shown ? 1 : 0), 1, `${button.card}: ${JSON.stringify(reached)} ${out.join(" | ")}`);
@@ -213,7 +213,8 @@ it("Show here on a run's card and on the digest posts that session's answer and 
   for (const card of ["run_completed", "run_failed", "digest"]) {
     const button = BUTTONS.find((b) => b.card === card && b.data["primusclaw"] === "show");
     assert.ok(button, `no Show here on ${card}`);
-    const session = String(button.data["session_id"]);
+    const session = button.data["session_id"];
+    assert.ok(typeof session === "string", card);
     const { w, said: out } = await pressed(button);
     assert.deepEqual(w.turns.lastAnswerReads, [["ak", session]], card);
     assert.ok(
