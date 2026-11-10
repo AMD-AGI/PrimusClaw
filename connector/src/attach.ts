@@ -1176,7 +1176,7 @@ const MAIN_TURN_TAIL_BYTES = 512 * 1024;
  * with `turn_duration` in the transcript (2026-11-10, real Claude Code in tmux). For any other version a `busy` terminal is waited
  * for as before, and doctor says so (`claude_version_unverified`).
  */
-export const BUSY_SCREEN_VERIFIED_VERSIONS: readonly string[] = ["2.1.285", "2.1.319", "2.1.321"];
+export const BUSY_SCREEN_VERIFIED_VERSIONS: readonly string[] = ["2.1.285", "2.1.319", "2.1.321", "2.1.322"];
 
 /** Whether Claude Code's status for a process says it waits at its prompt: `idle`, or `shell` (idle, background shells running). */
 export function isIdleStatus(status: string | null | undefined): boolean {
