@@ -7,7 +7,14 @@
  * (store, Claw client, Teams outbound, inbound queue, HTTP endpoints) is assembled from the environment the same way for
  * both.
  */
-import type { Clock, ConversationRef, Logger, MessageId, Plugins } from "@primusclaw/personal-agent";
+import type {
+  Clock,
+  ConversationRef,
+  IntegrationRegistry,
+  Logger,
+  MessageId,
+  Plugins,
+} from "@primusclaw/personal-agent";
 
 /** The environment the worker reads its settings from (`process.env`, or a copy a test or a gate made). */
 export type WorkerEnv = Readonly<Record<string, string | undefined>>;
@@ -17,6 +24,11 @@ export interface WorkerOptions {
   readonly clock?: Clock;
   readonly logger?: Logger;
   readonly fetch?: typeof fetch;
+  /**
+   * A deployment's own services (its MCP servers, its /whoami lines), registered as the worker is built, on top of
+   * whatever the plugins' `integrations` already hold. The public worker registers none.
+   */
+  readonly registerIntegrations?: (registry: IntegrationRegistry) => void;
 }
 
 /** A built worker: nothing runs until `run`. */

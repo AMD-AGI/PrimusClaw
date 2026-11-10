@@ -168,6 +168,22 @@ cp examples/worker.env.example /path/outside/the/repo/worker.env   # fill it in
 node --env-file=/path/outside/the/repo/worker.env --import tsx packages/teams/src/main.ts
 ```
 
+As an image (`personal-agent/Dockerfile`, built from the repository root: it builds and checks the three packages
+as a release would, installs them from their tarballs, and runs `dist/main.js` as uid 65534):
+
+```bash
+docker build -f personal-agent/Dockerfile -t personal-agent-teams .
+docker run --env-file /path/outside/the/repo/worker.env -v personal-agent-data:/data personal-agent-teams
+```
+
+The store defaults to `/data/state.db`; the volume must be writable by uid 65534. `--build-arg BASE_REGISTRY=<mirror>/`
+pulls the Node.js base image through a registry mirror. CI builds and smoke-tests the image on every change that
+touches it and never pushes it. `/metrics` names the running build as
+`personal_agent_build_info{version="<the teams package version>",node="<Node.js version>"} 1`.
+
+A deployment's own entry builds the worker with `buildWorker(env, plugins, options)` (or `main(env, plugins)`); its
+MCP servers and `/whoami` lines go in through `options.registerIntegrations(registry)`, on top of the plugins' own.
+
 The worker reads its whole configuration from the environment once, at start. A setting it cannot use (a required one
 missing, a malformed number, an unknown word in a strict switch) stops it before it takes a message, with one line on
 stderr saying why: a secret the secret source (`SECRETS_SOURCE`) cannot load exits with status 2, anything else that
