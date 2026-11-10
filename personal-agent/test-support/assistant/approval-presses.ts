@@ -13,9 +13,10 @@ import {
   type CardClick,
   type JsonObject,
   type OutMessage,
-  type SettleOptions,
   type StorePort,
 } from "@primusclaw/personal-agent";
+
+import type { SettleOptions } from "../../packages/core/src/ports/routing.js";
 
 /** A `approval.requested` notification (Python `approval_event`); `extra` is merged over the whole event. */
 export function approvalEvent(
