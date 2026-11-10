@@ -24,6 +24,7 @@ export async function* sseEvents(
   after: string | undefined,
   signal?: AbortSignal,
   timing: StreamTiming = {},
+  onOpen?: () => void,
 ): AsyncGenerator<SseEvent> {
   const controller = new AbortController();
   const onAbort = (): void => {
@@ -39,6 +40,7 @@ export async function* sseEvents(
       { signal: controller.signal },
     );
     if (response.status >= 400) throw new ClawError(response.status, head(await readText(response, path)));
+    onOpen?.(); // (Claw answered the request: what the session says from now on reaches this stream)
     yield* readFrames(response, watchdog, timing.idleMs ?? STREAM_IDLE_MS, path);
   } finally {
     watchdog.stop();

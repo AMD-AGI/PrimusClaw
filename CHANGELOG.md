@@ -1281,6 +1281,13 @@ record it.
   screen shows an empty box with no `esc to interrupt`, on two looks; the transcript is checked again right before the Enter, and
   the Enter guard of 0.1.16 applies. Any other version, or any doubt, waits as before; doctor reports an unmeasured version
   (`claude_version_unverified`) (#632).
+- `@primusclaw/connector` 0.1.19: a phone's message to a conversation open in a tmux terminal is typed in at once, whatever Claude
+  Code is doing there; one submitted while a turn runs is queued by Claude Code itself (no busy judgement, no version list, no
+  10-minute cap for a busy terminal). The one guard: the message goes in as a bracketed paste and is submitted with End+Enter in
+  one write only on a screen that shows the box holding exactly it and no question or menu, so a question that comes up at that
+  moment gets "No", never "Yes"; a question on the screen is waited out and the phone is told (`terminal_dialog`). Cancel presses
+  Esc only into a turn the message started itself and takes a cancelled message's own text out of the box again. Claude Code's
+  prompt suggestion in the box is not someone typing (#648).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
