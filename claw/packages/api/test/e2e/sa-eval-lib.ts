@@ -645,13 +645,15 @@ export const INTERNAL_TEXT: ReadonlyArray<[string, RegExp]> = [
   ["router tool", /\b(work_create|work_send|work_stop|work_list|review_start|review_restart|confirmation_answer)\b/],
   ["work_event marker", /\[work_event\]/],
   ["item id field", /\bitem_id\b/],
-  ["uuid", /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],
+  ["uuid", /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],   // not one the person wrote (`givenIds`)
   // Not a sandbox workload's name (`claw-<ms>-sandbox`), which SaFE lists among the person's own workloads.
   ["claw message id", /\bclaw-(pending-)?\d+\b(?!-sandbox)/],
   // The prompt's own tags, or the assistant speaking of its own prompt; "system prompt" as a subject (what one is, how a model
   // server takes one) is not a leak.
   ["prompt leak", /\b(?:my|the assistant's)\s+system\s+prompt\b|我的系统提示词?|<\/?(system|tool_result|function_calls)>/i],
 ];
+const UUID_G = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
 /**
  * An answer in which the assistant says that it itself cannot reach something: it cannot access, read, browse or query a
  * system, has no permission or no tool for it, cannot get on the internet. Said of itself, so a fact about a system ("the node
@@ -811,13 +813,26 @@ const namedAsOtherElsewhere = (text: string, n: string): boolean =>
   new RegExp(`(?:[\\w.-]+\\/[\\w.-]+|\\b(?:PRs?|pull requests?|pulls?|issues?)\\s*|(?:拉取请求|合并请求|议题)\\s*)#${n}(?!\\d)`, "i").test(text);
 
 /**
+ * The ids the person gave in their own messages, which an answer may repeat without leaking anything: the uuids they wrote
+ * (lower-cased), and the numbers they named an item by, as `#12`, `编号 12`, or after `item`, `task`, `事项` or `任务`.
+ */
+export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; numbers: Set<string> } {
+  const text = userTexts.join("\n");
+  const uuids = new Set([...text.matchAll(UUID_G)].map((m) => m[0].toLowerCase()));
+  const numbers = new Set([...text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)].map((m) => String(Number(m[1]))));
+  return { uuids, numbers };
+}
+
+/**
  * The first item named only by its number (`BARE_NUMBER`) that is not something else's number (`NOT_AN_ITEM` earlier in its
  * clause, or in the heading of the list it is an entry of, or the same number named elsewhere in the text as a pull request's
  * or an issue's, or, given `seqMax` (the highest item number on the person's board), a number above it); null when none is.
  */
-export function bareItemNumber(text: string, seqMax?: number): string | null {
+export function bareItemNumber(text: string, seqMax?: number, given: ReadonlySet<string> = new Set()): string | null {
   const re = new RegExp(BARE_NUMBER.source, "gm");
   for (let m = re.exec(text); m; m = re.exec(text)) {
+    // A number the person gave in their own message is theirs to see again ("#12 呢？" answered "#12 已完成。").
+    if (given.has(String(Number(m[0].match(/\d+/)![0])))) continue;
     if (m[0].startsWith("编号")) return m[0];
     // Item numbers count up per person: one above the highest on their board is no item of theirs (an upstream PR, #48043).
     if (seqMax && Number(m[0].match(/\d+/)![0]) > seqMax) continue;
@@ -1255,6 +1270,51 @@ export const HOLD_CARD_MS = 5_000;
 export interface Check { name: string; pass: boolean; skipped?: true; unverified?: true; detail?: string }
 
 const CJK = /[㐀-鿿]/g;
+const LATIN = /[A-Za-z]/g;
+
+/**
+ * The assistant's own words in a reply, which its language is judged by: the text without what it quotes or names. Taken out are
+ * fenced and inline code, links (a markdown link whole, a bare URL), quoted lines (`> …`), quoted passages ("…", “…”, 「…」, 『…』),
+ * and identifiers: a word with a digit or a `-`, `_`, `/`, `.`, `:`, `#` or `@` inside, or with a capital after its first letter
+ * (`global-control-plane`, `AMD-AGI/PrimusClaw`, `max_running`, `llama3`, `AgentX`, `SaFE`). A Chinese answer that lists English
+ * plan names, or an English one that quotes a Chinese item title, is still in the language it is written in.
+ */
+export function replyProse(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(?:```|$)/g, " ")
+    .replace(/`[^`\n]*`/g, " ")
+    .replace(/!?\[[^\]\n]*\]\([^)\s]*\)/g, " ")
+    .replace(/\b(?:https?|ftp):\/\/\S+/gi, " ")
+    .replace(/^[ \t]*>.*$/gm, " ")
+    .replace(/"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』/g, " ")
+    .replace(/[A-Za-z0-9]*(?:[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][-_/.:#@][A-Za-z0-9]|[a-z][A-Z])[A-Za-z0-9\-_/.:#@]*/g, " ")
+    .replace(/\b[A-Z][a-z]*[A-Z][A-Za-z]*\b/g, " ");
+}
+
+/** An item named by its number and title, the title up to the end of its line, a bracket, bold, a colon or a clause's end. */
+const ITEM_TITLE = /#\d+[ \t]+[^\n*(（:：。，,;；!！?？]+/g;
+
+/** A message that is a slash command and its arguments (`/brief off`, `/hlep`), not a sentence in some language. */
+const SLASH_COMMAND = /^\s*\/[A-Za-z][\w-]*(?:\s|$)/;
+
+/** Whether a text has a word of its own (`replyProse`): a Chinese character or a Latin letter outside code, links, quotes and names. */
+export const hasWords = (text: string): boolean => /[㐀-鿿A-Za-z]/.test(replyProse(text));
+
+/**
+ * The language check of `style.reply_lang`: the share of Chinese characters among the letters of the reply's own words
+ * (`replyProse`; digits, punctuation and markdown are no language). Chinese needs at least 0.2 of them, English under 0.05, as
+ * before; an English reply's item titles in Chinese (`ITEM_TITLE`) are names too. A reply with no word of its own ("2", "**0**",
+ * `10.1.0`) is in no language, and the check does not apply to it.
+ */
+export function replyLanguage(lang: "zh" | "en", text: string): { applies: boolean; pass: boolean; detail: string } {
+  // An English reply names the person's items as they titled them, in Chinese too ("**#78 写脚本统计 assistant 目录文件行数**").
+  const prose = replyProse(lang === "en" ? text.replace(ITEM_TITLE, (t) => (/[㐀-鿿]/.test(t) ? " " : t)) : text);
+  const cjk = prose.match(CJK)?.length ?? 0;
+  const letters = cjk + (prose.match(LATIN)?.length ?? 0);
+  if (!letters) return { applies: false, pass: true, detail: "no words of its own" };
+  const ratio = cjk / letters;
+  return { applies: true, pass: lang === "zh" ? ratio >= 0.2 : ratio < 0.05, detail: `cjk ${ratio.toFixed(2)}` };
+}
 
 /** The deterministic checks of a case. Checks that do not apply in a mode are listed as skipped, never as passed silently. */
 export function grade(c: EvalCase, o: Observed): Check[] {
@@ -1299,8 +1359,12 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     else out.push({ name: `cards=${c.cards}`, pass: o.cards === c.cards, detail: `was ${o.cards}` });
   }
   const shownText = o.shown.join("\n");
+  const given = givenIds(c.turns.map((t) => t.user));
   for (const [label, re] of INTERNAL_TEXT) {
-    const m = re.exec(shownText);
+    // A uuid the person wrote themselves ("把 pool 017a2636-… 调成 4") is theirs to see again, not an internal id.
+    const m = label === "uuid"
+      ? [...shownText.matchAll(new RegExp(re.source, "gi"))].find((x) => !given.uuids.has(x[0].toLowerCase())) ?? null
+      : re.exec(shownText);
     out.push({ name: `no internal text: ${label}`, pass: m === null, detail: m ? m[0] : undefined });
   }
   if (!c.may_deny) {
@@ -1313,13 +1377,15 @@ export function grade(c: EvalCase, o: Observed): Check[] {
       : { name: "no false denial", pass: true });
   }
   if (c.style?.no_ids) {
-    const m = bareItemNumber(shownText, o.itemSeqMax);
+    const m = bareItemNumber(shownText, o.itemSeqMax, given.numbers);
     out.push({ name: "items named by title", pass: m === null, detail: m ?? undefined });
   }
   if (c.style?.reply_lang === "follow_user" && c.lang !== "mixed") {
-    const letters = o.final.replace(/\s/g, "").length;
-    const ratio = letters ? (o.final.match(CJK)?.length ?? 0) / letters : 0;
-    out.push({ name: `reply in ${c.lang}`, pass: letters > 0 && (c.lang === "zh" ? ratio >= 0.2 : ratio < 0.05), detail: `cjk ${ratio.toFixed(2)}` });
+    // The person's messages must have words of their own to follow: "/hlep", "/brief off" or "？" are in no language.
+    const lang = c.turns.some((t) => !SLASH_COMMAND.test(t.user) && hasWords(t.user))
+      ? replyLanguage(c.lang, o.final) : { applies: false, pass: true, detail: "the person wrote no words of a language" };
+    if (lang.applies) out.push({ name: `reply in ${c.lang}`, pass: lang.pass, detail: lang.detail });
+    else out.push({ name: `reply in ${c.lang}`, pass: true, skipped: true, detail: lang.detail });
   }
   if (c.style?.max_chars !== undefined) out.push({ name: `<= ${c.style.max_chars} chars`, pass: o.final.length <= c.style.max_chars, detail: `${o.final.length}` });
   if (c.style?.min_chars !== undefined) out.push({ name: `>= ${c.style.min_chars} chars`, pass: o.final.length >= c.style.min_chars, detail: `${o.final.length}` });
