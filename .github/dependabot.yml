@@ -24,6 +24,26 @@ updates:
         update-types: ["minor", "patch"]
 
   # Python packages
+  - package-ecosystem: "npm"
+    directory: "/connector"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/personal-agent"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: "pip"
     directories:
       - "/sandbox/sdk-python"
