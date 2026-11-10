@@ -388,6 +388,10 @@ teams/tests/test_assistant_live_status.py::test_another_turns_reply_while_the_me
 teams/tests/test_assistant_live_status.py::test_a_reply_naming_no_turn_before_the_message_is_handed_over_is_a_message_of_its_own -> packages/core/test/assistant/live-status.test.ts::a reply naming no turn before the message is handed over is a message of its own
 teams/tests/test_assistant_live_status.py::test_a_tasks_own_notice_never_closes_the_receipt_of_a_message -> packages/core/test/assistant/live-status.test.ts::a tasks own notice never closes the receipt of a message
 teams/tests/test_assistant_live_status.py::test_a_reply_that_names_no_turn_still_closes_the_receipt -> packages/core/test/assistant/live-status.test.ts::a reply that names no turn still closes the receipt
+# from internal #505 (head 82b3d584a330bfa3782d629f6800f2f42d2a5d00): the turn is followed from just before the message is sent
+teams/tests/test_assistant_live_status.py::test_the_turn_is_followed_from_before_the_message_is_sent_and_after_the_turn_in_front_is_read -> packages/core/test/assistant/live-status.test.ts::the turn is followed from before the message is sent and after the turn in front is read (route, taken)
+teams/tests/test_assistant_live_status.py::test_a_turn_that_says_its_first_step_at_once_shows_it -> packages/core/test/assistant/live-status.test.ts::a turn that says its first step at once shows it (route)
+teams/tests/test_assistant_live_status.py::test_a_send_that_fails_in_a_way_no_handler_names_still_closes_the_stream -> packages/core/test/assistant/live-status.test.ts::a send that fails in a way no handler names still closes the stream
 
 # teams/tests/test_approval_card.py::test_a_turn_shows_the_summary_in_the_users_language -> LATER: W4b turn engine shows the card (TurnApprovals); view/body covered above
 # teams/tests/test_approval_card.py::test_a_turn_from_an_older_brain_follows_the_language_of_what_the_user_wrote -> LATER: W4b turn engine

@@ -23,7 +23,7 @@ import type { Conversation, InboundFile } from "../ports/surface.js";
 import { cpHead } from "../text/py-text.js";
 import type { DirectChat } from "../direct-chat/direct-chat.js";
 import { handOver, type MessageFiles } from "./files.js";
-import { TurnFollower, type StepLabel } from "./follow.js";
+import { FOLLOW_OPEN_SECONDS, TurnFollower, type StepLabel } from "./follow.js";
 import { clawFailure, refusal } from "./failures.js";
 import type { Receipt } from "./receipt.js";
 import type { Receipts } from "./receipts.js";
@@ -170,7 +170,7 @@ export class AssistantChat {
       return false;
     }
     const handing = { ...request };
-    const sent = await this.handTo(handing, async (sessionId, handingOver) => {
+    const sent = await this.handTo(handing, async (sessionId, ready) => {
       const folderId =
         typeof request.context["channel_message_id"] === "string" ? request.context["channel_message_id"] : "";
       const context = request.files.length
@@ -179,7 +179,7 @@ export class AssistantChat {
             files: await this.handOverFiles(handing, sessionId, folderId || this.o.random.hexId(), request.files),
           }
         : request.context;
-      handingOver();
+      await ready();
       return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
         ...(request.modelKey ? { modelKey: request.modelKey } : {}),
         context,
@@ -266,13 +266,13 @@ export class AssistantChat {
     const handing = { ...request, lang: this.langOf(request.userId, request.prompt) };
     const sent = await this.handTo(
       handing,
-      async (_sessionId, handingOver) => {
+      async (_sessionId, ready) => {
         const files = request.files.length
           ? { files: await this.handOverFiles(handing, sessionId, this.o.random.hexId(), request.files) }
           : {};
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
         const context = { ...files, ...attached };
-        handingOver();
+        await ready();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),
           ...(this.o.pluginId === undefined ? {} : { plugin: this.o.pluginId }),
@@ -292,14 +292,16 @@ export class AssistantChat {
 
   /**
    * Acknowledge the message (receipt or typing), follow its turn into the receipt, and send it with `send` (given the assistant's
-   * session id, and `handingOver`, which `send` calls just before the message goes to Claw). The turn in front of the message is
-   * read first (at most FRONT_TURN_SECONDS), so that only the message's own turn closes its receipt, and only then is its turn
-   * followed: the follower's first read never races the read of the turn in front. `ok` when the assistant has it; otherwise
-   * Claw's refusal (undefined when it did not answer).
+   * session id, and `ready`, which `send` awaits just before the message goes to Claw, after its files). The turn in front of
+   * the message is read beside the receipt being opened, so that only the message's own turn closes its receipt; `ready` waits
+   * for it, then starts following the turn and waits (at most FOLLOW_OPEN_SECONDS) until Claw has answered the stream's request:
+   * the requests to Claw come in one order (the turn in front, the stream, the message), and a turn Claw starts at once cannot
+   * say its first step before the stream is there. `ok` when the assistant has it; otherwise Claw's refusal (undefined when it
+   * did not answer).
    */
   private async handTo(
     handing: Handing,
-    send: (sessionId: string, handingOver: () => void) => Promise<string | null>,
+    send: (sessionId: string, ready: () => Promise<void>) => Promise<string | null>,
     knownSession?: string,
   ): Promise<{ ok: true } | { ok: false; error: { status: number } | undefined }> {
     let follower: TurnFollower | undefined;
@@ -307,15 +309,19 @@ export class AssistantChat {
     let front: TurnInFront | undefined;
     try {
       const sessionId = knownSession ?? (await this.o.claw.assistant.session(handing.credential)).sessionId;
-      const receipt = await this.acknowledge(handing);
-      front = new TurnInFront(
+      const inFront = new TurnInFront(
         { sessions: this.o.claw.sessions, clock: this.o.clock, logger: this.o.logger },
         handing.credential,
         sessionId,
       );
-      const behind = await front.before(receipt);
-      follower = this.follow(handing, sessionId, receipt);
-      const sent = await send(sessionId, () => receipt?.handingOver(behind));
+      front = inFront;
+      const receipt = await this.acknowledge(handing);
+      const sent = await send(sessionId, async () => {
+        const behind = await inFront.before(receipt);
+        follower = this.follow(handing, sessionId, receipt);
+        await follower?.waitOpen(FOLLOW_OPEN_SECONDS);
+        receipt?.handingOver(behind);
+      });
       receipt?.takenAs(sent);
       messageId = sent ?? undefined;
       this.tellSent(handing.onSent, sessionId, sent);
@@ -357,7 +363,8 @@ export class AssistantChat {
     const style = this.o.style();
     if (receipt === undefined || !style.assistantProgress) return undefined;
     const follower = new TurnFollower({
-      open: (after, signal) => this.o.claw.sessions.stream(handing.credential, sessionId, after, signal),
+      open: (after, signal, onOpen) =>
+        this.o.claw.sessions.stream(handing.credential, sessionId, after, signal, onOpen),
       receipt,
       lang: handing.lang,
       streamSay: style.assistantStreamSay,

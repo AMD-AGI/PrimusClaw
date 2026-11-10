@@ -26,6 +26,8 @@ export class FakeAssistantClaw {
   readonly uploads: { sessionId: string; folder: string; names: string[] }[] = [];
   /** The sessions `turn` was asked about, in order. */
   readonly turnsAsked: string[] = [];
+  /** How many streams of a session were asked for (Claw answered each at once: `onOpen`). */
+  streamsAsked = 0;
   /** Runs when `turn` is asked, before it answers (what a test does meanwhile). */
   onTurn: (() => Promise<void>) | undefined;
   /** The error the next call of a kind throws (kept until cleared). */
@@ -84,7 +86,7 @@ export class FakeAssistantClaw {
       this.running.delete(sessionId);
       return Promise.resolve();
     },
-    stream: (_key, _sessionId, _after, signal) => this.play(signal),
+    stream: (_key, _sessionId, _after, signal, onOpen) => this.play(signal, onOpen),
     uploadFiles: (_key, sessionId, folder, files: readonly UploadFile[]) => {
       this.check("upload");
       const taken = files.filter((f) => !this.refuseFiles.has(f.name));
@@ -97,7 +99,9 @@ export class FakeAssistantClaw {
   };
 
   /** The scripted events, then nothing until the stream is closed (a live stream does not end by itself). */
-  private async *play(signal: AbortSignal | undefined): AsyncGenerator<SseEvent> {
+  private async *play(signal: AbortSignal | undefined, onOpen?: () => void): AsyncGenerator<SseEvent> {
+    this.streamsAsked += 1;
+    onOpen?.();
     const events = this.script;
     this.script = [];
     const heard = this.heard.length;

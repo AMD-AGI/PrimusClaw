@@ -294,7 +294,12 @@ async function otherTurnMeanwhile(o: {
     return out;
   };
   // (the turn in front is read once the receipt is open and before the message is handed over)
-  l.w.claw.onTurn = () => (when === "before_send" ? pushOther() : Promise.resolve());
+  l.w.claw.onTurn = async () => {
+    if (when !== "before_send") return;
+    // (the read starts beside the receipt being opened and is waited for before the message is handed over)
+    for (let i = 0; i < 50 && l.w.receipts.openOf(conversation) === undefined; i += 1) await flushMicrotasks();
+    await pushOther();
+  };
   const asked = "写一句问候语存成 hello.md，先问我中文还是英文";
   try {
     if (o.viaRouter === true) {
@@ -438,4 +443,102 @@ it("a reply that names no turn still closes the receipt", async () => {
   assert.equal(r.openAfterOther, false);
   const closedWith = finals(r.outbox).map(textOf);
   assert.ok(closedWith.length === 1 && closedWith[0]?.includes("#797"), JSON.stringify(closedWith));
+});
+
+// --- the turn is followed from just before the message is sent (internal #505) ---------------------------------------------
+
+/**
+ * A 1:1 message to the assistant, logging in which order it reads the turn in front of it, starts following its turn and is sent
+ * (with how many streams of the session Claw had been asked for by then); `understood`: a person the assistant understands
+ * (`AssistantChat.understand`), else one it takes over (`AssistantChat.route`); `send` replaces the send, `afterSend` runs
+ * once Claw took it. Returns the order, the outbox and the streams still open at the end (Python `hand_over`).
+ */
+async function handOver(o: {
+  queued: boolean;
+  understood: boolean;
+  send?: () => Promise<string | null>;
+  afterSend?: (l: Awaited<ReturnType<typeof liveWorld>>, messageId: string | null) => Promise<void>;
+  /** Runs once the message was handed over (what the turn says next). */
+  after?: (l: Awaited<ReturnType<typeof liveWorld>>) => Promise<void>;
+}) {
+  const l = await liveWorld(o.understood ? { understanding: [ALICE] } : {});
+  l.w.claw.queue = o.queued;
+  const order: string[] = [];
+  const asked = () => l.w.feed.opened;
+  l.w.claw.onTurn = async () => {
+    // (the read of the turn in front is a round trip: a stream asked for meanwhile was asked before it was read)
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    if (l.w.feed.afters.length > 0) order.push("following");
+    order.push("turn in front read");
+  };
+  const send = l.w.claw.assistant.send;
+  (l.w.claw.assistant as { send: typeof send }).send = async (...args) => {
+    if (l.w.feed.afters.length > 0 && !order.includes("following")) order.push("following");
+    order.push(`sent, ${String(asked())} stream asked for`);
+    const out = o.send === undefined ? await send(...args) : await o.send();
+    await o.afterSend?.(l, out);
+    return out;
+  };
+  const text = "现在有多少节点在忙？";
+  try {
+    if (o.understood) {
+      await l.w.chat.understand({
+        userId: ALICE,
+        credential: "ak-alice",
+        modelKey: "",
+        prompt: text,
+        context: { channel_message_id: "m-1" },
+        lang: "zh",
+        conversation: l.w.conversation(),
+        files: [],
+      });
+    } else {
+      await l.w.say(text);
+    }
+  } catch {
+    // (a send that fails in a way no handler names comes back as it is)
+  }
+  await o.after?.(l);
+  await flushMicrotasks();
+  return { order, outbox: l.w.surface.outbox, stillOpen: l.w.feed.open };
+}
+
+for (const understood of [false, true]) {
+  for (const queued of [false, true]) {
+    it(`the turn is followed from before the message is sent and after the turn in front is read (${understood ? "understand" : "route"}, ${queued ? "queued" : "taken"})`, async () => {
+      // (L1 self-check) the turn in front is read, then the turn is followed, and the message is sent only once Claw has
+      // answered the stream's request: three requests to Claw in one order, every time.
+      const { order } = await handOver({ queued, understood });
+      assert.deepEqual(order, ["turn in front read", "following", "sent, 1 stream asked for"]);
+    });
+  }
+}
+
+for (const understood of [false, true]) {
+  it(`a turn that says its first step at once shows it (${understood ? "understand" : "route"})`, async () => {
+    // A turn whose first step comes the moment Claw takes the message: the stream was open before the message was sent.
+    const { outbox } = await handOver({
+      queued: false,
+      understood,
+      // (the turn's script: its first step the moment Claw takes the message, then its say 0.05 s later)
+      afterSend: async (l, messageId) => {
+        await l.live("toolUsed", { tool: "mcp__safe__node_list", actionId: "t1", status: "start" }, messageId ?? "");
+      },
+      after: (l) => l.live("toolUsed", { tool: SAY_TOOL, actionId: "t3", status: "start" }),
+    });
+    const informative = streamed(outbox, "inform");
+    assert.ok(
+      informative.some((line) => line.includes("查询 SaFE 节点")),
+      JSON.stringify(informative),
+    );
+  });
+}
+
+it("a send that fails in a way no handler names still closes the stream", async () => {
+  const { stillOpen } = await handOver({
+    queued: false,
+    understood: true,
+    send: () => Promise.reject(new Error("a failure no handler names")),
+  });
+  assert.equal(stillOpen, 0, "the stream is closed");
 });
