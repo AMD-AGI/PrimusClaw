@@ -175,8 +175,11 @@ record it.
   address; once that was used up every read failed (403), so a request to review pull requests merged days before was not answered as
   merged, and "#99999" was "could not be read" rather than "does not exist". With `CLAW_GITHUB_PUBLIC_READ_APP_ID`,
   `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` and `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` set, those reads use an installation token of
-  that App asked for with `metadata: read` alone (one that comes back with more is not used), kept until shortly before it expires, and
-  only a pull request or repository GitHub says is public is answered. A person with GitHub here is still read for as themselves;
+  that App asked for with `metadata: read` alone, and with `CLAW_GITHUB_PUBLIC_READ_REPOSITORIES` for those of the installation's
+  repositories alone, whatever more the App itself may do. A token GitHub grants with any other permission, or that reaches a repository
+  it does not say is public, is revoked, logged (`github.public_read_token_refused`) and not used. A token is kept until shortly before
+  it expires, and only a pull request or repository GitHub says is public is answered. Each `pr_state` call logs how it read
+  (`assistant.pr_state_read`, `via` app, anonymous, own or binding). A person with GitHub here is still read for as themselves;
   without the App, reads stay anonymous.
 - The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
   with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,

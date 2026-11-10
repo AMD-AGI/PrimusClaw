@@ -124,6 +124,8 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
   let audit: { id: number } | null = null;
   // Read with the deployment's App: only what GitHub says is public is answered, whatever else its installation could reach.
   let appToken: string | null = null;
+  // How the reads below are made, logged once per call (never the token): the deployment's App, anonymously, or the person's own.
+  let via: "app" | "anonymous" | "own" | "binding" = "anonymous";
   const publicRead = deps.publicRead !== undefined ? deps.publicRead : publicReadTokens(s.apiUrl);
   try {
     const cred = await resolveGithubToken(q, userId, { binding: s.binding, purpose: `github_mcp:${PR_STATE_TOOL}`, resolve: deps.resolveBinding });
@@ -135,6 +137,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
           const client = new GithubClient({ token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
           read = async (path) => (await client.get<Record<string, any>>(path)).json;
           appToken = token;
+          via = "app";
         } catch (err) {   // (no token now: read as anyone, as without the App)
           logger.warn({ sessionId, errorClass: (err as Error)?.constructor?.name, status: (err as { status?: number })?.status }, "assistant.pr_state_public_read_unavailable");
         }
@@ -142,6 +145,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
     } else {
       const client = new GithubClient({ token: cred.token, apiUrl: s.apiUrl, timeoutMs: READ_TIMEOUT_MS, fetchImpl: deps.fetchImpl });
       gh = client;
+      via = cred.source === "binding" ? "binding" : "own";
       read = async (path) => (await client.get<Record<string, any>>(path)).json;
       if (cred.source === "binding") {
         audit = {
@@ -187,6 +191,7 @@ export async function pullStates(userId: string, sessionId: string, prs: readonl
       }
     })));
   }
+  logger.info({ sessionId, via, prs: prs.length, failed }, "assistant.pr_state_read");
   if (audit && gh) {
     try {
       await auditFinish(q, audit.id, {

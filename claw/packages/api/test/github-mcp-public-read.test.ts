@@ -10,7 +10,10 @@
  *      installation, with metadata: read alone
  *   R3 a token is kept until five minutes before it expires, made once for callers that ask at the same time, and made again once
  *      dropped (GitHub answered 401 with it)
- *   R4 a token that comes back with any permission but metadata: read, an answer that is not 201, or no token is never used
+ *   R4 a token that comes back with any permission but metadata: read, an answer that is not 201, or no token is never used, and
+ *      a token that came back but is not used is revoked
+ *   R5 with CLAW_GITHUB_PUBLIC_READ_REPOSITORIES a token is asked for those repositories alone, and one that reaches a repository
+ *      GitHub does not say is public, or others than those asked for, is revoked and never used
  */
 import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
@@ -25,16 +28,23 @@ const ENV = { CLAW_GITHUB_PUBLIC_READ_APP_ID: "123", CLAW_GITHUB_PUBLIC_READ_INS
 
 function github(answer: (n: number) => { status: number; body: unknown }) {
   const calls: Array<{ url: string; auth: string; body: unknown }> = [];
+  const revoked: string[] = [];
   const fetchImpl = (async (input: URL | string, init: RequestInit = {}) => {
-    calls.push({ url: String(input), auth: new Headers(init.headers).get("authorization") ?? "", body: JSON.parse(String(init.body)) });
+    const auth = new Headers(init.headers).get("authorization") ?? "";
+    if (init.method === "DELETE") {
+      assert.equal(String(input), `${API}/installation/token`);
+      revoked.push(auth);
+      return new Response(null, { status: 204 });
+    }
+    calls.push({ url: String(input), auth, body: JSON.parse(String(init.body)) });
     await new Promise((r) => setTimeout(r, 5));
     const a = answer(calls.length);
     return new Response(JSON.stringify(a.body), { status: a.status, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
-  return { calls, fetchImpl };
+  return { calls, revoked, fetchImpl };
 }
-const minted = (n: number, expires = "2026-11-09T16:00:00Z", permissions: unknown = { metadata: "read" }) =>
-  ({ status: 201, body: { token: `ghs_token${n}`, expires_at: expires, permissions, repository_selection: "selected" } });
+const minted = (n: number, expires = "2026-11-09T16:00:00Z", permissions: unknown = { metadata: "read" }, repositories?: unknown) =>
+  ({ status: 201, body: { token: `ghs_token${n}`, expires_at: expires, permissions, repository_selection: "selected", ...(repositories ? { repositories } : {}) } });
 
 describe("the deployment's read-only GitHub App", () => {
   test("R1 all three settings or none", () => {
@@ -49,6 +59,11 @@ describe("the deployment's read-only GitHub App", () => {
     assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_APP_ID: "app" }, () => PEM), ["CLAW_GITHUB_PUBLIC_READ_APP_ID must be a number"]);
     assert.deepEqual(publicReadConfigErrors(ENV, () => { throw new Error("ENOENT"); }), ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE cannot be read"]);
     assert.deepEqual(publicReadConfigErrors(ENV, () => "not a key"), ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM private key"]);
+    assert.deepEqual(readPublicReadSettings({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: " Hyperloom , Other " })?.repositories, ["Hyperloom", "Other"]);
+    assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "Hyperloom" }, () => PEM), []);
+    assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "AMD-AGI/Hyperloom" }, () => PEM),
+      ["CLAW_GITHUB_PUBLIC_READ_REPOSITORIES must be repository names (no owner), separated by commas"]);
+    assert.equal(publicReadConfigErrors({ CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "Hyperloom" }).length, 1, "repositories alone are refused");
   });
 
   test("R2 a token is asked for with the App's own signed token, for metadata: read alone", async () => {
@@ -92,9 +107,10 @@ describe("the deployment's read-only GitHub App", () => {
       const gh = github(answer);
       return { gh, tokens: new PublicReadTokens(readPublicReadSettings(ENV)!, API, { fetchImpl: gh.fetchImpl, now: () => Date.parse("2026-11-09T15:00:00Z"), readKey: async () => PEM }) };
     };
-    for (const permissions of [{ metadata: "read", issues: "write" }, { metadata: "write" }, { contents: "read" }, {}, null]) {
-      const { tokens } = make((n) => minted(n, "2026-11-09T16:00:00Z", permissions));
+    for (const permissions of [{ metadata: "read", issues: "write" }, { metadata: "read", issues: "read" }, { metadata: "write" }, { contents: "read" }, {}, null]) {
+      const { gh, tokens } = make((n) => minted(n, "2026-11-09T16:00:00Z", permissions));
       await assert.rejects(tokens.token(), /permissions other than metadata: read/, JSON.stringify(permissions));
+      assert.deepEqual(gh.revoked, ["token ghs_token1"], `revoked: ${JSON.stringify(permissions)}`);
     }
     await assert.rejects(make(() => ({ status: 422, body: { message: "no" } })).tokens.token(), /GitHub answered 422/);
     await assert.rejects(make(() => ({ status: 201, body: { expires_at: "2026-11-09T16:00:00Z", permissions: { metadata: "read" } } })).tokens.token(), /no token/);
@@ -103,5 +119,28 @@ describe("the deployment's read-only GitHub App", () => {
     await assert.rejects(tokens.token());
     assert.equal(await tokens.token(), "ghs_token2");
     assert.equal(gh.calls.length, 2);
+  });
+
+  test("R5 a token limited to the named repositories, and refused when it reaches more or anything not public", async () => {
+    const env = { ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "Hyperloom" };
+    const make = (answer: (n: number) => { status: number; body: unknown }) => {
+      const gh = github(answer);
+      return { gh, tokens: new PublicReadTokens(readPublicReadSettings(env)!, API, { fetchImpl: gh.fetchImpl, now: () => Date.parse("2026-11-09T15:00:00Z"), readKey: async () => PEM }) };
+    };
+    const hl = { name: "Hyperloom", full_name: "AMD-AGI/Hyperloom", private: false };
+    const ok = make((n) => minted(n, undefined, undefined, [hl]));
+    assert.equal(await ok.tokens.token(), "ghs_token1");
+    assert.deepEqual(ok.gh.calls[0]!.body, { permissions: { metadata: "read" }, repositories: ["Hyperloom"] });
+    assert.deepEqual(ok.gh.revoked, []);
+    for (const repositories of [[{ ...hl, private: true }], [{ name: "Hyperloom", full_name: "AMD-AGI/Hyperloom" }], [hl, { name: "Other", full_name: "AMD-AGI/Other", private: false }], [{ name: "Other", full_name: "AMD-AGI/Other", private: false }], []]) {
+      const { gh, tokens } = make((n) => minted(n, undefined, undefined, repositories));
+      await assert.rejects(tokens.token(), /it is not used/, JSON.stringify(repositories));
+      assert.deepEqual(gh.revoked, ["token ghs_token1"], JSON.stringify(repositories));
+    }
+    // Not limited by name: a token GitHub says reaches a private repository is refused all the same.
+    const gh = github((n) => minted(n, undefined, undefined, [{ ...hl, private: true }]));
+    const tokens = new PublicReadTokens(readPublicReadSettings(ENV)!, API, { fetchImpl: gh.fetchImpl, now: () => Date.parse("2026-11-09T15:00:00Z"), readKey: async () => PEM });
+    await assert.rejects(tokens.token(), /a repository GitHub does not say is public/);
+    assert.deepEqual(gh.calls[0]!.body, { permissions: { metadata: "read" } });
   });
 });
