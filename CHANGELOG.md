@@ -1298,6 +1298,9 @@ record it.
   `terminal_busy` ("not sent, send it again"), never as `terminal_input_unconfirmed` before its text went in (#671); a terminal
   step written after a large transcript line (Claude Code's `prompt_snapshot`) reaches the phone while it runs, read on the first
   look instead of 256 KB a second (#674).
+- `@primusclaw/connector` 0.1.21: the Agent Client Protocol SDK the connector talks to its adapters with is 2.4.0 (was 2.1.0;
+  schema updates and an opt-in way to stop waiting for a cancelled request, which the connector does not use; no change in what it
+  does) (#652).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
