@@ -21,10 +21,13 @@
  * prompt).
  * FAKE_BUSY_MS: a turn of its own runs from the start for this long (a prompt that is not the phone's; `esc to interrupt` below the
  * box, the row `busy`).
- * FAKE_DIALOG_FILE: an adversary. Once anything is typed (the first time only), a permission question is drawn under the box (the
+ * FAKE_DIALOG_FILE: an adversary. Once anything is typed or pasted (the first time only), a permission question is drawn under the box (the
  * typed text still shows in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is
  * submitted. Once the file FAKE_DIALOG_DISMISS exists, the question is answered at the terminal and goes; with FAKE_DIALOG_CLEARS=1
  * that also empties the box.
+ * FAKE_DIALOG_ON_KEY=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the screen read and the keys. The question shows
+ * as the first input arrives, before it is read; while it shows, a typed digit answers it ("approved", as Claude Code 2.1.285 takes a
+ * lone `1`) and a paste is dropped (as Claude Code drops one, measured 2026-11-10).
  */
 import fs from "node:fs";
 
@@ -113,14 +116,21 @@ process.stdin.setRawMode?.(true);
 process.stdout.write("\x1b[?2004h");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
+  if (process.env.FAKE_DIALOG_ON_KEY === "1" && !dialogShown) { dialog = true; dialogShown = true; }
   pending += chunk;
   while (pending) {
     if (pending.startsWith("\x1b[200~")) { pasting = true; pending = pending.slice(6); continue; }
-    if (pending.startsWith("\x1b[201~")) { pasting = false; pending = pending.slice(6); continue; }
+    if (pending.startsWith("\x1b[201~")) {
+      pasting = false;
+      pending = pending.slice(6);
+      if (process.env.FAKE_DIALOG_FILE && !dialogShown && buffer) { dialog = true; dialogShown = true; }
+      continue;
+    }
     if (pending.startsWith("\x1b") && pending.length < 6 && "\x1b[200~".startsWith(pending)) break;   // the rest comes next
     const ch = pending[0];
     pending = pending.slice(1);
-    if (pasting) { buffer += ch === "\r" ? "\n" : ch; continue; }
+    if (pasting) { if (!(dialog && process.env.FAKE_DIALOG_ON_KEY === "1")) buffer += ch === "\r" ? "\n" : ch; continue; }
+    if (dialog && process.env.FAKE_DIALOG_ON_KEY === "1" && /[0-9]/.test(ch)) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
     if (ch === "\r") {
       if (dialog) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
       if (!working) submit();

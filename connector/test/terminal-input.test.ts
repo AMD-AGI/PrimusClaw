@@ -609,6 +609,32 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     });
   }
 
+  test("a question that shows in the very moment the message goes in does not take it as its choice (a lone 1): it goes in as a paste, then once the question is answered", async () => {
+    // (Claude Code 2.1.285, measured 2026-11-10: a typed `1` while a permission question shows approves it; a pasted one does not)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const dir = tmpdir("cc-dialog-");
+    const approved = path.join(dir, "approved");
+    const dismiss = path.join(dir, "dismiss");
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: approved, FAKE_DIALOG_DISMISS: dismiss, FAKE_DIALOG_ON_KEY: "1" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "1");
+    const told = await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    assert.equal(told.data.reason, "terminal_dialog");
+    assert.equal(fs.existsSync(approved), false, "the question did not take the message as its choice");
+    fs.writeFileSync(dismiss, "");
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
+    assert.equal(fs.existsSync(approved), false);
+    assert.deepEqual(typed(t.transcript), ["1"], "submitted once, after the question");
+  });
+
   test("a question shows after the text is typed, and the person at the terminal types into the box meanwhile: their text is left, the message refused", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
@@ -640,7 +666,18 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(enterGuard(box(["hello from the phone"]), "hello from the phone"), null);
     assert.equal(enterGuard(box(["这是一段很长的手机消息，用来", "测试输入框如何显示。"]), "这是一段很长的手机消息，用来测试输入框如何显示。"), null, "wrapped");
     assert.equal(enterGuard(box(["line one", "line two"]), "line one\nline two"), null);
-    assert.equal(enterGuard(box(["[Pasted text #1 +40 lines]"]), "a\nb\nc"), null, "a long paste");
+    assert.equal(enterGuard(box(["[Pasted text #1 +2 lines]"]), "a\nb\nc"), null, "a long paste, its line breaks counted");
+    assert.equal(enterGuard(box(["[Pasted text #1 +40 lines]"]), "a\nb\nc"), "the box does not hold exactly what was typed", "another paste");
+    assert.equal(enterGuard(box(["[Pasted text #3]"]), "x".repeat(1500)), null, "one long line, collapsed");
+    assert.equal(enterGuard(box(["[Pasted text #3]"]), "short"), "the box does not hold exactly what was typed", "a short line is never collapsed");
+    assert.equal(enterGuard(box(["[Pasted text #3]", "more"]), "x".repeat(1500)), "the box does not hold exactly what was typed");
+    // Exactly the text: a wrap may drop the space it broke at, nothing else may differ.
+    assert.equal(enterGuard(box(["hello from the", "phone"]), "hello from the phone"), null, "wrapped at a space");
+    assert.equal(enterGuard(box(["hellofrom the phone"]), "hello from the phone"), "the box does not hold exactly what was typed", "a space taken out");
+    assert.equal(enterGuard(box(["hello from th e phone"]), "hello from the phone"), "the box does not hold exactly what was typed", "a space put in");
+    assert.equal(enterGuard(box(["hello from the"]), "hello from the phone"), "the box does not hold exactly what was typed", "cut short");
+    assert.equal(enterGuard(box(["line one", "", "line three"]), "line one\n\nline three"), null, "an empty line");
+    assert.equal(enterGuard(box(["line one", "line three"]), "line one\n\nline three"), "the box does not hold exactly what was typed");
     assert.equal(enterGuard(box(["hello from the phone and more"]), "hello from the phone"), "the box does not hold exactly what was typed");
     assert.equal(enterGuard(box(["hello"], "  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"), "hello"), "a question or a menu is on the screen");
     assert.equal(enterGuard(" Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend", "hello"), "no input box on the screen");

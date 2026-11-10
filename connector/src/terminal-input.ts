@@ -7,9 +7,9 @@
  * A conversation open in a terminal has one writer, the terminal's own `claude` process; a second process that resumed it
  * would fork its transcript (attach.ts). So a message from the phone is not given to a second agent: it is typed into the
  * terminal itself, when that terminal is a tmux pane. tmux is the one place a terminal's input can be reached from outside
- * by its own user, with the user's own authority, without another process on the conversation: `send-keys -l` types the
- * text literally (no key names are read from it), and a multi-line message is pasted as one bracketed paste
- * (`paste-buffer -p`), the way a terminal pastes, so that its newlines do not submit it line by line. Claude Code records
+ * by its own user, with the user's own authority, without another process on the conversation: the message is pasted as one
+ * bracketed paste (`paste-buffer -p`), the way a terminal pastes, so that no key name is read from it, its newlines do not
+ * submit it line by line, and a question on the screen does not take any of it as its choice. Claude Code records
  * it as a typed prompt (`promptSource: "typed"`), and the terminal and the phone see the same conversation.
  *
  * It types only into an input box that is empty, whatever Claude Code is doing: a message typed while a turn runs is queued by
@@ -289,11 +289,42 @@ export function enterGuard(screen: string, text: string): string | null {
   const { plain, at, end } = boxOf(screen);
   if (at < 0 || end < 0) return "no input box on the screen";
   if (plain.slice(end + 1).some((l) => DIALOG_RE.test(l))) return "a question or a menu is on the screen";
-  const held = plain.slice(at, end).map((l, i) => (i === 0 ? l.trimStart().replace(PROMPT_RE, "") : l)).join("");
-  const squash = (x: string) => x.replace(/\s+/g, "");
-  if (squash(held) === squash(text)) return null;
-  if (text.includes("\n") && /\[Pasted text #\d+/.test(held)) return null;
+  const lines = plain.slice(at, end).map((l, i) => (i === 0 ? l.trimStart().replace(PROMPT_RE, "") : l));
+  if (heldExactly(lines, text)) return null;
+  // A long paste shows collapsed, `[Pasted text #n +k lines]` (k: its line breaks) or, one long line, `[Pasted text #n]` (Claude Code
+  // 2.1.285): only that, and only with this text's count of line breaks.
+  const breaks = text.split("\n").length - 1;
+  const marker = lines.length === 1 ? /^\[Pasted text #\d+(?: \+(\d+) lines)?\]$/.exec(lines[0]!.trim()) : null;
+  if (marker && (marker[1] === undefined ? breaks === 0 && text.length > PASTE_INLINE_MAX : Number(marker[1]) === breaks)) return null;
   return "the box does not hold exactly what was typed";
+}
+
+/** The longest one-line paste Claude Code 2.1.285 was measured to show as it is (700 characters did, 1500 did not). */
+const PASTE_INLINE_MAX = 700;
+
+/**
+ * Whether the box's lines are exactly `text` as the box draws it: each line of the text is one or more of the box's lines (a long
+ * line wraps; a wrap may drop the one space it broke at), the continuation lines indented, nothing more or less. Runs of whitespace
+ * count as one space (the box draws them so).
+ */
+function heldExactly(lines: string[], text: string): boolean {
+  const norm = (x: string) => x.replace(/\s+/g, " ").trim();
+  const want = text.split("\n").map(norm);
+  const got = lines.map(norm);
+  let g = 0;
+  for (const line of want) {
+    // (an empty line of the text is an empty line of the box)
+    if (!line) { if (got[g] !== "") return false; g++; continue; }
+    let rest = line;
+    while (rest) {
+      const part = got[g];
+      if (!part || !rest.startsWith(part)) return false;
+      rest = rest.slice(part.length);
+      g++;
+      if (rest.startsWith(" ")) rest = rest.slice(1);   // (the space a wrap broke at)
+    }
+  }
+  return g === got.length;
 }
 
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
@@ -368,12 +399,12 @@ export class TerminalInput {
     try { return await this.tmux.run(["capture-pane", "-p", "-e", "-t", this.ref.pane]); } catch { return ""; }
   }
 
-  /** Put `text` into the box: one line through `send-keys -l` (literal: no key names), several as one bracketed paste. */
+  /**
+   * Put `text` into the box as one bracketed paste (a named buffer, `paste-buffer -p`, deleted with `-d`), one line or several. Never
+   * as keystrokes: a question that shows in the moment between the screen read and the keys takes a typed digit as its choice (a lone
+   * `1` approves a permission question, measured on Claude Code 2.1.285, 2026-11-10), while a paste is not taken as one.
+   */
   private async put(text: string): Promise<void> {
-    if (!text.includes("\n")) {
-      await this.tmux.run(["send-keys", "-t", this.ref.pane, "-l", "--", text]);
-      return;
-    }
     const buffer = `claw-${randomUUID()}`;
     await this.tmux.run(["load-buffer", "-b", buffer, "-"], text);
     try {
@@ -386,8 +417,7 @@ export class TerminalInput {
 
   /**
    * Type `text` (already {@link cleanInput}) into the box and submit it, whatever Claude Code is doing (a running turn queues it).
-   * One line goes through `send-keys -l` (literal: no key names); several go through a named buffer pasted with `-p` (bracketed
-   * paste) and deleted (`-d`).
+   * It goes in as one bracketed paste ({@link put}).
    *
    * Enter goes only on a screen that, read twice ENTER_SETTLE_MS apart, shows the box holding exactly this text and no question or
    * menu ({@link enterGuard}): an Enter on a permission question would approve it. When a question shows instead (it came after the
@@ -398,7 +428,22 @@ export class TerminalInput {
   async type(text: string, opts: TypeOptions = {}): Promise<void> {
     if (!text) throw new Error("nothing to type");
     let told = false;
+    // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
+    const waitOutDialog = async () => {
+      if (!told) { told = true; opts.onDialog?.(); }
+      for (;;) {
+        if (opts.stillWanted && !opts.stillWanted()) throw new TerminalNotSubmitted("no longer wanted while a question was on the screen");
+        if (!(await this.alive())) throw new TerminalNotSubmitted("the terminal went away while a question was on the screen");
+        if (!dialogOnScreen(await this.screen())) return;
+        await sleep(DIALOG_POLL_MS);
+      }
+    };
     for (let typings = 1; ; typings++) {
+      // (read once more right before the paste: a question on the screen now gets nothing at all until it is gone)
+      const waited = dialogOnScreen(await this.screen());
+      if (waited) await waitOutDialog();
+      // (after a question, or to type again, the box is read anew: someone's text there is never pasted onto)
+      if ((waited || typings > 1) && inputBox(await this.screen()) !== "empty") throw new TerminalNotSubmitted("the box is no longer empty");
       await this.put(text);
       const by = Date.now() + this.echoWaitMs;
       let dialog = false;
@@ -411,13 +456,7 @@ export class TerminalInput {
       }
       for (;;) {
         if (dialog) {
-          if (!told) { told = true; opts.onDialog?.(); }
-          for (;;) {
-            if (opts.stillWanted && !opts.stillWanted()) throw new TerminalNotSubmitted("no longer wanted while a question was on the screen");
-            if (!(await this.alive())) throw new TerminalNotSubmitted("the terminal went away while a question was on the screen");
-            if (!dialogOnScreen(await this.screen())) break;
-            await sleep(DIALOG_POLL_MS);
-          }
+          await waitOutDialog();
           dialog = false;
         }
         let why: string | null = null;

@@ -468,8 +468,9 @@ itself and taken in at that turn's next step or once it ends, as one typed by th
 transcript reading and no footer decides when it may be typed). It waits (one notice, `terminal_input_queued`, with `reason`
 `terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
 box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
-question it would approve a tool call), or the pane is scrolled back. It is typed with `tmux send-keys -l` (literal: nothing in it
-is read as a key name), or, with several lines, pasted as one bracketed paste (`load-buffer` and `paste-buffer -p -d`), and
+question it would approve a tool call), or the pane is scrolled back. It is pasted as one bracketed paste (`load-buffer` and
+`paste-buffer -p -d`), one line or several: nothing in it is read as a key name, and a question that shows at that moment does not
+take it as its choice (a typed `1` would approve a permission question), and it is
 submitted with Enter once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
 text and no question or menu. A question that shows after the text went in holds the Enter: no key at all is sent while it shows,
 the phone is told (`terminal_dialog`), and once it is answered at the terminal the Enter goes if the box holds the text again, or
