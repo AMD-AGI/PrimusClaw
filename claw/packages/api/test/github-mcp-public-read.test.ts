@@ -5,7 +5,8 @@
  * The deployment's read-only GitHub App (`github-mcp/public-read.ts`), with GitHub stood in for.
  *
  *   R1 its settings are all three or none: none is no App; some is refused at start, as is an id that is not a number or a key that
- *      cannot be read or is not a PEM private key
+ *      cannot be read or is not a PEM RSA private key that parses; the API's start (`assertGithubMcpConfig`) refuses them while the
+ *      GitHub tools are on
  *   R2 a token is asked for with the App's own token (RS256, signed with its key, issued by its id, ten minutes at most) for that
  *      installation, with metadata: read alone
  *   R3 a token is kept until five minutes before it expires, made once for callers that ask at the same time, and made again once
@@ -17,9 +18,10 @@
  */
 import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 
-import { PublicReadTokens, publicReadConfigErrors, readPublicReadSettings } from "../src/github-mcp/public-read.js";
+import { githubMcpStartupErrors, PublicReadTokens, publicReadConfigErrors, readPublicReadSettings } from "../src/github-mcp/public-read.js";
 
 const API = "https://github.api.test";
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -58,12 +60,34 @@ describe("the deployment's read-only GitHub App", () => {
     assert.equal(readPublicReadSettings({ CLAW_GITHUB_PUBLIC_READ_APP_ID: "123" }), null);
     assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_APP_ID: "app" }, () => PEM), ["CLAW_GITHUB_PUBLIC_READ_APP_ID must be a number"]);
     assert.deepEqual(publicReadConfigErrors(ENV, () => { throw new Error("ENOENT"); }), ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE cannot be read"]);
-    assert.deepEqual(publicReadConfigErrors(ENV, () => "not a key"), ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM private key"]);
+    const notKey = ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM RSA private key"];
+    assert.deepEqual(publicReadConfigErrors(ENV, () => "not a key"), notKey);
+    const pemShaped = (k: string, body: string) => `-----BEGIN ${k}-----\n${body}\n-----END ${k}-----\n`;   // (built, so no key-shaped literal)
+    assert.deepEqual(publicReadConfigErrors(ENV, () => pemShaped("PRIVATE KEY", "not a valid key")), notKey, "a header alone");
+    const ec = generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    assert.deepEqual(publicReadConfigErrors(ENV, () => ec), notKey, "not RSA: cannot sign RS256");
+    assert.deepEqual(publicReadConfigErrors(ENV, () => privateKey.export({ type: "pkcs1", format: "pem" }).toString()), [], "PKCS#1, as GitHub issues them");
     assert.deepEqual(readPublicReadSettings({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: " Hyperloom , Other " })?.repositories, ["Hyperloom", "Other"]);
     assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "Hyperloom" }, () => PEM), []);
     assert.deepEqual(publicReadConfigErrors({ ...ENV, CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "AMD-AGI/Hyperloom" }, () => PEM),
       ["CLAW_GITHUB_PUBLIC_READ_REPOSITORIES must be repository names (no owner), separated by commas"]);
     assert.equal(publicReadConfigErrors({ CLAW_GITHUB_PUBLIC_READ_REPOSITORIES: "Hyperloom" }).length, 1, "repositories alone are refused");
+  });
+
+  test("R1 the API refuses to start with a broken App while the GitHub tools are on, and only then", () => {
+    const tools = { enabled: true, binding: false, secret: "s".repeat(40), mcpUrl: "http://api.test/mcp", apiUrl: API };
+    assert.deepEqual(githubMcpStartupErrors(tools, false, false, ENV, () => PEM), []);
+    assert.deepEqual(githubMcpStartupErrors(tools, false, false, {}, () => PEM), [], "no App: reads stay anonymous");
+    assert.deepEqual(githubMcpStartupErrors(tools, false, false, ENV, () => "not a key"), ["CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM RSA private key"]);
+    assert.equal(githubMcpStartupErrors(tools, false, false, { CLAW_GITHUB_PUBLIC_READ_APP_ID: "123" }, () => PEM).length, 1);
+    assert.deepEqual(githubMcpStartupErrors({ ...tools, enabled: false }, false, false, { CLAW_GITHUB_PUBLIC_READ_APP_ID: "123" }, () => PEM), [], "tools off");
+    assert.match(githubMcpStartupErrors({ ...tools, secret: "" }, false, false, ENV, () => PEM).join(";"), /CLAW_GITHUB_MCP_SECRET/, "the tools' own checks still run");
+    // The API's start throws on exactly these.
+    const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    const assertFn = index.slice(index.indexOf("function assertGithubMcpConfig"), index.indexOf("\n}\n", index.indexOf("function assertGithubMcpConfig")));
+    assert.match(assertFn, /const errors = githubMcpStartupErrors\(readGithubMcpSettings\(\), identityClient\(\) !== null, readGithubReviewSettings\(\)\.enabled\);/);
+    assert.match(assertFn, /if \(errors\.length === 0\) return;[\s\S]*throw new Error/);
+    assert.match(index, /\n  assertGithubMcpConfig\(\);\n/);
   });
 
   test("R2 a token is asked for with the App's own signed token, for metadata: read alone", async () => {

@@ -20,10 +20,11 @@
  *
  * The first three all, or none: with none, such reads stay anonymous.
  */
-import { sign } from "node:crypto";
+import { createPrivateKey, sign } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import pino from "pino";
+import { githubMcpConfigErrors, type GithubMcpSettings } from "./settings.js";
 
 const logger = pino({ name: "github-public-read" });
 
@@ -65,12 +66,35 @@ export function publicReadConfigErrors(env: Env = process.env, readKey: (file: s
   if (!/^\d{1,20}$/.test(s.appId)) errors.push("CLAW_GITHUB_PUBLIC_READ_APP_ID must be a number");
   if (!/^\d{1,20}$/.test(s.installationId)) errors.push("CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID must be a number");
   if ((s.repositories ?? []).some((r) => !REPO_NAME.test(r))) errors.push(`${REPOSITORIES} must be repository names (no owner), separated by commas`);
+  let pem: string | null = null;
   try {
-    if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(readKey(s.keyFile))) errors.push("CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM private key");
+    pem = readKey(s.keyFile);
   } catch {
     errors.push("CLAW_GITHUB_PUBLIC_READ_KEY_FILE cannot be read");
   }
+  if (pem !== null) {
+    // Parsed, not just matched: a key that cannot sign would otherwise only show at the first read, as reads quietly made anonymously.
+    let ok = /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(pem);
+    if (ok) {
+      try { ok = createPrivateKey(pem).asymmetricKeyType === "rsa"; } catch { ok = false; }
+    }
+    if (!ok) errors.push("CLAW_GITHUB_PUBLIC_READ_KEY_FILE does not hold a PEM RSA private key");
+  }
   return errors;
+}
+
+/**
+ * What refuses the GitHub tools at start: their own settings (`githubMcpConfigErrors`) and, while they are on, the read-only App's
+ * (the App is used only by their reads, `pr_state`). `assertGithubMcpConfig` in index.ts throws on any of these.
+ */
+export function githubMcpStartupErrors(
+  settings: GithubMcpSettings, identityClientBuilt: boolean, reviewEnabled: boolean,
+  env: Env = process.env, readKey?: (file: string) => string,
+): string[] {
+  return [
+    ...githubMcpConfigErrors(settings, identityClientBuilt, reviewEnabled),
+    ...(settings.enabled ? publicReadConfigErrors(env, readKey) : []),
+  ];
 }
 
 const b64url = (b: Buffer | string): string => Buffer.from(b).toString("base64url");
