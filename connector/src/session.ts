@@ -546,10 +546,13 @@ export class Session {
         if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
         if (!recorded) { giveUp("terminal_input_failed"); continue; }
         const gated = viaBusy || this.holderStatus(term) === "busy";
+        // (the screen must show no running turn on every path; a terminal let in as idle that says busy by now is not typed into:
+        // only the busy gate admits a busy one, codex r2 on #632)
         const again = gated
           ? ((await this.busyButFree(term)) === true ? await term.readiness(true) : { ready: false as const, why: "busy" as const })
-          : await term.readiness();
-        if (!again.ready || !this.mayType(this.holderStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+          : await term.readiness(true);
+        const statusNow = this.holderStatus(term);
+        if (!again.ready || !(gated ? this.mayType(statusNow) : isIdleStatus(statusNow))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
         try {

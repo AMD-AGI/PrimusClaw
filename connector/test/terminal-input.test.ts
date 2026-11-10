@@ -503,6 +503,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     { name: "the transcript's main turn ended but the footer says esc to interrupt", env: { FAKE_FOOTER_ESC: "1" } as Record<string, string>, ended: true, reverse: "the screen signal" },
     { name: "a Claude Code version not measured for busy", env: { FAKE_VERSION: "9.9.9" } as Record<string, string>, ended: true, reverse: "the version gate" },
     { name: "a message queued during the last turn has not been taken yet", env: {} as Record<string, string>, ended: true, queued: true, reverse: "the queued-message count" },
+    { name: "a message queued long before (more than any end of the file read) has not been taken yet", env: {} as Record<string, string>, ended: true, queued: true, pad: 700_000, reverse: "reading the whole transcript for the count" },
   ]) {
     test(`busy, and ${c.name}: the message waits, nothing is typed (reverse proof: ${c.reverse})`, async () => {
       const work = tmpdir("cc-work-");
@@ -515,6 +516,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
       h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
       // (queued: typed at the terminal while its last turn ran, written before that turn's end, not yet taken)
       if ("queued" in c && c.queued) fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "queue-operation", operation: "enqueue", sessionId: REF, content: "later" })}\n`);
+      if ("pad" in c && c.pad) fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "assistant", sessionId: REF, message: { role: "assistant", content: [{ type: "text", text: "x".repeat(c.pad) }] } })}\n`);
       if (c.ended) fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", subtype: "turn_duration", sessionId: REF })}\n`);
       await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
       const sid = await h.attach(REF);

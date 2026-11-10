@@ -826,21 +826,24 @@ export class AttachSupport {
     let fh: fsp.FileHandle | null = null;
     try {
       fh = await fsp.open(file, "r");
-      const size = (await fh.stat()).size;
-      const len = Math.min(size, MAIN_TURN_TAIL_BYTES);
+      const st = await fh.stat();
+      // Read whole, once, then only what was appended since (codex r2 on #632: a message queued long ago is still queued, so the
+      // count of queued messages cannot start in the middle of the file). A transcript larger than this is not read: no answer.
+      let seen = this.turnScans.get(file);
+      if (!seen || seen.ino !== st.ino || st.size < seen.offset) {
+        if (st.size > MAIN_TURN_SCAN_MAX_BYTES) return null;
+        seen = { ino: st.ino, offset: 0, queued: 0, last: null };
+      }
+      if (st.size - seen.offset > MAIN_TURN_SCAN_MAX_BYTES) return null;
+      const len = st.size - seen.offset;
       const buf = Buffer.alloc(len);
-      const { bytesRead } = await fh.read(buf, 0, len, size - len);
+      const { bytesRead } = await fh.read(buf, 0, len, seen.offset);
       if (bytesRead !== len) return null;
       const text = buf.toString("utf8");
-      if (len && !text.endsWith("\n")) return false;   // (an entry is being written: something is under way)
-      const lines = text.split("\n");
-      lines.pop();
-      if (size > len) lines.shift();   // (the first line read is cut)
-      // Read forward: which main-thread entry of a turn came last, and whether a message queued for the main thread (typed while
-      // a turn ran) is still waiting to be taken (an enqueue not yet answered by a dequeue or a removal: codex r1 on #632).
-      let last: "ended" | "under_way" | null = null;
-      let queued = 0;
-      for (const line of lines) {
+      const end = text.lastIndexOf("\n") + 1;   // (only whole lines; a line still being written is read next time)
+      let { queued, last } = seen;
+      for (const line of text.slice(0, end).split("\n")) {
+        if (!line) continue;
         let doc: unknown;
         try { doc = JSON.parse(line); } catch { return null; }
         if (!isObject(doc) || doc.isSidechain === true) continue;
@@ -853,6 +856,10 @@ export class AttachSupport {
         if (doc.type === "system" && doc.subtype === "turn_duration") last = "ended";
         else if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment") last = "under_way";
       }
+      const offset = seen.offset + Buffer.byteLength(text.slice(0, end), "utf8");
+      this.turnScans.set(file, { ino: st.ino, offset, queued, last });
+      while (this.turnScans.size > 64) this.turnScans.delete(this.turnScans.keys().next().value!);
+      if (end < text.length) return false;   // (an entry is being written: something is under way)
       if (queued > 0) return false;
       return last === null ? null : last === "ended";
     } catch {
@@ -861,6 +868,9 @@ export class AttachSupport {
       await fh?.close().catch(() => undefined);
     }
   }
+
+  /** What each transcript's main thread was found to be, up to which byte (`mainTurnEnded`, read incrementally). */
+  private turnScans = new Map<string, { ino: number; offset: number; queued: number; last: "ended" | "under_way" | null }>();
 
   /** The size of the conversation's transcript now, or null when there is none to look at. */
   transcriptSize(ref: string): number | null {
@@ -1178,8 +1188,8 @@ export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; w
   return {};
 }
 
-/** How much of the end of a transcript is read to tell whether its main turn has ended. */
-const MAIN_TURN_TAIL_BYTES = 512 * 1024;
+/** A transcript larger than this is not read to tell whether its main turn has ended (no answer: a busy terminal waits). */
+const MAIN_TURN_SCAN_MAX_BYTES = 128 * 1024 * 1024;
 
 /**
  * The Claude Code versions measured to say `busy` while only background agents run with the main turn idle, the screen then showing
