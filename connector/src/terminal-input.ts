@@ -377,7 +377,7 @@ export interface TypeOptions {
   stillWanted?: () => boolean;
   /** Whether the terminal's transcript already shows the message submitted (by the person at the terminal): it is not typed again. */
   submitted?: () => boolean;
-  /** Called right before the text first goes into the box: from here on what the transcript shows of it can be this message. */
+  /** Called right before the text first enters the pane (the paste itself): from then on what the transcript shows of it can be this message. */
   onPaste?: () => void;
 }
 
@@ -453,9 +453,11 @@ export class TerminalInput {
    * as keystrokes: a question that shows in the moment between the screen read and the keys takes a typed digit as its choice (a lone
    * `1` approves a permission question, measured on Claude Code 2.1.285, 2026-11-10), while a paste is not taken as one.
    */
-  private async put(text: string): Promise<void> {
+  private async put(text: string, onPaste?: () => void): Promise<void> {
     const buffer = `claw-${randomUUID()}`;
     await this.tmux.run(["load-buffer", "-b", buffer, "-"], text);
+    // (right before the text enters the pane: what the transcript shows of it from here on can be this message)
+    onPaste?.();
     try {
       await this.tmux.run(["paste-buffer", "-p", "-d", "-b", buffer, "-t", this.ref.pane]);
     } catch (e) {
@@ -494,8 +496,7 @@ export class TerminalInput {
       if (waited) await waitOutDialog();
       // (after a question, or to type again, the box is read anew: someone's text there is never pasted onto)
       if ((waited || typings > 1) && inputBox(await this.screen()) !== "empty") throw new TerminalNotSubmitted("the box is no longer empty");
-      if (typings === 1) opts.onPaste?.();
-      await this.put(text);
+      await this.put(text, typings === 1 ? opts.onPaste : undefined);
       const by = Date.now() + this.echoWaitMs;
       let dialog = false;
       for (;;) {
