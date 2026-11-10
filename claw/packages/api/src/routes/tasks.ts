@@ -32,7 +32,7 @@ import { withAdmissionTransaction } from "../tasks/admission.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { createAppRun } from "./app-run-create.js";
 import {
-  createSingleTask, expandDag, isCreateRefusal, isTopologyRefusal,
+  createSingleTask, expandDag, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal,
   type CreateRefusal, type ExpandResult,
 } from "../tasks/dag-expander.js";
 import { getTask, listTasksByDag } from "../tasks/db.js";
@@ -109,6 +109,10 @@ async function stampCredentialsOr403(
  * the other thing, and gets the status that says so.
  */
 async function sendCreateRefusal(reply: FastifyReply, refusal: CreateRefusal): Promise<void> {
+  if (isSandboxWorkspaceRefusal(refusal)) {
+    await reply.status(400).send(refusal.sandboxWorkspace);
+    return;
+  }
   if (isTopologyRefusal(refusal)) {
     await reply.status(400).send({
       ok: false, error: "invalid_topology", errors: refusal.invalidTopology,
@@ -314,6 +318,7 @@ function expandOptsFor(
 
 /** What a partially admitted batch reports about the run it stopped on. */
 function refusalReason(refusal: CreateRefusal): string {
+  if (isSandboxWorkspaceRefusal(refusal)) return refusal.sandboxWorkspace.error;
   return isTopologyRefusal(refusal) ? "invalid_topology" : refusal.reason;
 }
 
