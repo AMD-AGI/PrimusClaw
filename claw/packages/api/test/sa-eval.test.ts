@@ -1199,3 +1199,179 @@ test("S35 a turn's channel_context goes with its message, beside its files; a ca
   assert.ok(problemsOf(caseOf({ turns: [{ user: "q", channel_context: [] as unknown as Record<string, unknown> }] })).includes("channel_context must be an object"));
   assert.ok(!TURN_CONTEXT_KEYS.includes("files"));
 });
+
+// Replies of the live assistant to the evaluation identities (sa-eval-bot-4, 2026-11-09), which the language check failed although
+// each is in the person's language: Chinese answers that list English names, a command answered in the identity's language.
+const PLANS_ZH = "**Dispatron 里现在共 7 个 plan**\n\n- top-model-daily\n- hyperloom-main-daily-ci\n- hyperloom-release-qualification\n"
+  + "- hyperloom-release-legs-v1.1.5\n- mi355x-kernel-arena-daily-dag\n- ka-geak-canary-20261028\n- clawy-eval-main-daily-ci";
+const PULSE_ZH = "**✅ Pulse 排行榜（按相对基线的提升幅度 gain 排序）前 5 名如下：**\n\n"
+  + "- 1. **DeepSeek-V4.1-Flash**：提升 **+2341.78%**，状态 **failed**。mxfp4、sglang、mi355x。吞吐从 221.77 提升到 686.48 tok/s/GPU。\n"
+  + "- 2. **futurehouse-ether0**：提升 **+1203.96%**，状态 target_reached。fp8、sglang、mi300x。吞吐从 198.53 提升到 2588.79。\n"
+  + "- 3. **nerijs-animation2k-flux**：提升 **+1010.34%**，状态 target_reached。fp8、xdit、mi300x。吞吐从 0.1553 提升到 1.72。\n"
+  + "- 4. **DeepSeek-V4-Flash-0731**：提升 **+631.46%**，状态 target_reached。bf16、sglang、mi355x。吞吐从 600.98 提升到 4395.95。\n"
+  + "- 5. **stabilityai-stable-diffusion-3.5-large**：提升 **+618.75%**，状态 target_reached。fp8、xdit、mi355x。吞吐从 0.4348 提升到 3.12。\n\n"
+  + "*第 1 名的状态是 failed，它的高提升幅度不一定是有效结果，需要谨慎看待。*";
+const RUNS_ZH = "**最近 24 小时（2026-11-08 16:11 至 2026-11-09 16:11 UTC）共 7 个失败 run，分 3 类**\n\n"
+  + "- **启动失败，agent 退出且没有 optimize 命令（`failed(launch)`）：4 个**\n"
+  + "  - 例子：`hyperloom:11-13-g99-0ef0b5776f`（plan 11，claude-sonnet-5.5）。agent 在 16:05 退出，transcript 里没有 optimize 命令。\n"
+  + "  - 其余 3 个是 `hyperloom:11-13-g98-9220223036`、`hyperloom:oneoff-4b4cfeae3f4b41c8`、`hyperloom:oneoff-cf09ca0b725a4abd`。后两个是 Qwen3-0.6B 的 e2e 一次性 run。\n"
+  + "- **digest 分析未产出（`failed(abnormal)`，`triage_not_written`）：2 个**\n"
+  + "  - 例子：`digest:oneoff-f27b01edeed448e9`。会话没有写出 `analysis.json`。\n"
+  + "  - 另一个是 `digest:oneoff-017c61f49553472e`。两个都用 glm-5-3-with-fallback。\n"
+  + "- **被平台抢占（`failed(interrupted)`，cause 为 preempted）：1 个**\n"
+  + "  - 例子：`hyperloom:11-13-g97-7c0c447bf0`。11-08 17:11 它所在的 allocation 被调度器的更高优先级 job 抢占（job 274710 被 274711 抢占）。";
+const BRIEF_OFF_ZH = "**❌ 这里没能关闭每日简报**\n\n这条消息不是通过能执行设置的渠道发来的，所以 `/brief off` 没有生效。\n\n📌 请在 Teams 里直接对 Clawy 发送 `/brief off`。";
+
+test("S36 the reply's language is judged by its own words, not by the names, code, links and quotes in it", () => {
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  for (const final of [PLANS_ZH, PULSE_ZH, RUNS_ZH]) {
+    assert.deepEqual(failed(zh, observed({ final })), [], final.slice(0, 40));
+  }
+  // Code, a link and a quoted line in English around Chinese words are not the reply's language.
+  const wrapped = "已经改好了，下面是新的配置：\n\n```yaml\nreplicas: 4\nimage: docker.io/primussafe/claw:202611091908\nresources:\n  limits: {cpu: 8, memory: 32Gi}\n```\n"
+    + "详见 [the rollout guide](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md)。\n> Deployment updated successfully, waiting for rollout to finish.";
+  assert.deepEqual(failed(zh, observed({ final: wrapped })), []);
+  // An English reply to a Chinese message still fails, with or without Chinese inside its code, quotes and links, and when every
+  // word of it is hyphenated or a name.
+  for (const final of ["well-known, user-facing, high-level.", "This is a well-known, user-facing, high-level 问题.", "`ls -la` [docs](https://x.invalid)",
+    "top-model-daily, hyperloom-main-daily-ci", "Всё готово, задача выполнена.", "Η εργασία ολοκληρώθηκε.",
+    "OK, all done. 完成。", "It is end-to-end and up-to-date now. 完成。", "See below: ~~~\n// 已完成\n~~~", "See [状态页][guide].", "See **'状态页'** now.",
+    "There are 7 plans in Dispatron: top-model-daily, hyperloom-main-daily-ci and five more.",
+    "I renamed the item to “修复登录超时” and set `标题 = 修复登录超时`; see [修复登录超时](https://x.invalid/1). It is running now.",
+    "Done. The workspace list is below.\n```\n工作区 global-cpu 正常\n```"]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"], final.slice(0, 40));
+  }
+  // A Chinese reply to an English message still fails; an English one that quotes a Chinese title passes.
+  const en = caseOf({ lang: "en", turns: [{ user: "what did the worker report on the line-count item?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(en, observed({ final: "worker 汇报：统计完成，共 1,204 行，`src/` 下最多。" })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "The worker of “统计行数” reported 1,204 lines, most of them under `src/`." })), []);
+  // The live English answer to that question, which names the person's items by their Chinese titles (sa-eval-bot-8, 2026-11-10).
+  const items = "**⚠️ Neither line-count item produced a result; both were stopped before finishing.**\n\n"
+    + "**#77 加统计 assistant 下 ts 行数的脚本 (the one with the PR)**\n- The worker wrote `claw/scripts/count-assistant-ts-lines.sh`.\n"
+    + "- It then asked your approval to run a command that creates the branch `chore/count-assistant-ts-lines` and commits the script.\n"
+    + "- That approval was never given, and the item was stopped at 00:14 UTC, so no commit or PR exists.\n\n"
+    + "**#78 写脚本统计 assistant 目录文件行数**\n- The worker started but reported nothing, and it was stopped at 00:15 UTC when you said to drop it.\n\n"
+    + "*Note: the script itself was never delivered, so I can't give you line counts.*";
+  // The titles are what the turn's work_recall answered (as the live turn did); Chinese the turn did not read as a title counts.
+  const recall = (seq: number, title: string): ToolCall => ({ ...call("mcp__assistant__work_recall"),
+    result: JSON.stringify({ ok: true, item: { item_id: `kwi_${seq}`, seq, title, board_state: "done", outcome: "stopped" }, reports: [] }) });
+  const read = [recall(77, "加统计 assistant 下 ts 行数的脚本"), recall(78, "写脚本统计 assistant 目录文件行数")];
+  assert.deepEqual(failed(en, observed({ final: items, calls: read })), []);
+  assert.deepEqual(failed(en, observed({ final: "Done; #12 这是中文内容。", calls: read })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "#12 修复登录超时 已完成，worker 汇报共 1204 行。", calls: read })), ["reply in en"]);
+  // An English reply whose only Chinese is those titles is not a Chinese one.
+  const english = "Both items stopped before finishing: #77 加统计 assistant 下 ts 行数的脚本 and #78 写脚本统计 assistant 目录文件行数. No result was produced.";
+  assert.deepEqual(failed(zh, observed({ final: english, calls: read })), ["reply in zh"]);
+});
+
+test("S36d a URL, a link or a fence ends where it ends, not at the next space: the Chinese after it is prose", () => {
+  // The reviewer's two cases (PR #620): Chinese prose has no spaces, so a URL taken up to the next whitespace took the prose too.
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const en = caseOf({ lang: "en", turns: [{ user: "did the runs pass?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(zh, observed({ final: "PR: https://github.com/AMD-AGI/PrimusClaw/pull/12，已经合并，所有检查都通过了，部署也完成了。 Status: merged, deployed and verified." })), []);
+  assert.deepEqual(failed(en, observed({ final: "Done.\n- https://x.invalid/run/1：任务已完成，没有错误。\n- https://x.invalid/run/2：全部检查通过，可以合并。" })), ["reply in en"]);
+  // The same after a markdown link, and after one whose `)` never comes (its URL is then a bare one), and after an unclosed fence.
+  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1)，任务已完成没有错误全部检查通过可以合并 ok" })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "Done: [run 1](https://x.invalid/run/1，任务已完成没有错误全部检查通过可以合并 ok" })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final: "Done.\n```\n任务已完成，没有错误，全部检查通过，可以合并。" })), ["reply in en"]);
+  // A link's target ends at its `)`, not at the first character outside ASCII: an unencoded Chinese path (a zh Wikipedia page, an
+  // internal wiki) is part of the link, which goes whole (the reviewer's two cases).
+  assert.deepEqual(failed(en, observed({ final: "Fixed the two items: [修复调度器内存泄漏](https://wiki.example/修复调度器内存泄漏) and [优化日志](https://wiki.example/优化日志). Both are merged." })), []);
+  assert.deepEqual(failed(zh, observed({ final: "已完成。参考：[Kubernetes Scheduling Framework Overview Documentation](https://zh.wikipedia.org/wiki/调度) 。" })), []);
+});
+
+test("S36e a fenced block the reply closes is code even when it runs past the language sample", () => {
+  // The reviewer's case (PR #620): the block crosses the first 8,000 characters, so in the sample it has no closing fence.
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const log = "error: connection refused while pulling image layer from registry\n".repeat(130);
+  assert.ok(log.length > 8_000);
+  assert.deepEqual(failed(zh, observed({ final: `日志如下：\n\`\`\`\n${log}\n\`\`\`\n已修复。` })), []);
+  assert.deepEqual(failed(zh, observed({ final: `日志如下：\n~~~\n${log}\n~~~\n已修复。` })), []);
+  // A fence the reply itself leaves open is still prose, however long the reply.
+  const en = caseOf({ lang: "en", turns: [{ user: "did the runs pass?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(en, observed({ final: `Done.\n\`\`\`\n任务已完成，没有错误，全部检查通过，可以合并。${"。".repeat(9_000)}` })), ["reply in en"]);
+});
+
+test("S36b the reply's own words are found in bounded time, however long the reply", () => {
+  const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });
+  const started = Date.now();
+  for (const final of ["a".repeat(200_000), `done ${"ab1-".repeat(50_000)}`, `${"x".repeat(100_000)}"${"y".repeat(100_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  // Unclosed link and quote openers, which make those patterns rescan the rest of the line from each one.
+  for (const final of [`done ${"[".repeat(200_000)}`, `done ${"“".repeat(200_000)}`, `done ${"![x](".repeat(40_000)}`, `done ${"[x](é".repeat(40_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  // Unclosed fences, which the code pattern takes out of the whole reply before it is cut to its sample.
+  for (const final of [`done ${"`".repeat(200_000)}`, `done ${"~~~x".repeat(100_000)}`, `done \`\`\`${"a".repeat(1_000_000)}`]) {
+    assert.deepEqual(failed(zh, observed({ final })), ["reply in zh"]);
+  }
+  assert.ok(Date.now() - started < 3_000, `${Date.now() - started} ms`);
+});
+
+test("S36c only a distinctive title a tool answered as JSON is a name", () => {
+  const en = caseOf({ lang: "en", turns: [{ user: "is the line-count item done?" }], style: { reply_lang: "follow_user" } });
+  const final = "The item is 已完成，没有结果; there is no result for this run.";
+  const result = (title: string): ToolCall => ({ ...call("mcp__assistant__work_recall"), result: JSON.stringify({ item: { seq: 7, title } }) });
+  // A short title is an ordinary phrase too, and a "title" inside a command's output or a cut-short answer is none.
+  assert.deepEqual(failed(en, observed({ final, calls: [result("已完成")] })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final, calls: [{ ...call("bash"), result: 'stdout: code example contains "title": "已完成，没有结果" in a string' }] })), ["reply in en"]);
+  const cut = JSON.stringify({ item: { seq: 7, title: "已完成，没有结果" }, reports: ["x".repeat(50)] }).slice(0, -10);
+  assert.deepEqual(failed(en, observed({ final, calls: [{ ...call("mcp__assistant__work_recall"), result: cut }] })), ["reply in en"]);
+  assert.deepEqual(failed(en, observed({ final, calls: [result("已完成，没有结果")] })), []);
+});
+
+test("S37 a reply with no words, or to a message with none, is in no language: the check does not apply", () => {
+  // "顺便问下，你现在同时在做几件事？只回答数字。" answered "2", and "/brief off" or "/hlep" answered in the identity's language.
+  const zh = caseOf({ lang: "zh", turns: [{ user: "顺便问下，你现在同时在做几件事？只回答数字。" }], style: { reply_lang: "follow_user" } });
+  for (const final of ["2", "**0**", "10.1.0"]) {
+    const check = grade(zh, observed({ final })).find((x) => x.name === "reply in zh");
+    assert.equal(check?.skipped, true, final);
+  }
+  for (const user of ["/brief off", "/hlep", "？"]) {
+    const en = caseOf({ lang: "en", turns: [{ user }], style: { reply_lang: "follow_user" } });
+    const check = grade(en, observed({ final: BRIEF_OFF_ZH })).find((x) => x.name === "reply in en");
+    assert.equal(check?.skipped, true, user);
+  }
+  // A message in any script has a language.
+  const ru = caseOf({ lang: "en", turns: [{ user: "Привет, что ты умеешь?" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(ru, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
+  // A command followed by a sentence has the sentence's language.
+  const zhCommand = caseOf({ lang: "en", turns: [{ user: "/hlep 请用中文说明状态" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(zhCommand, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
+  // A message with words still has a language, even one that names a command.
+  const en = caseOf({ lang: "en", turns: [{ user: "please turn /brief off for me" }], style: { reply_lang: "follow_user" } });
+  assert.deepEqual(failed(en, observed({ final: BRIEF_OFF_ZH })), ["reply in en"]);
+  // An empty reply is not a pass of the language check's making: "answered" fails it.
+  assert.ok(failed(zh, observed({ final: "" })).includes("answered"));
+});
+
+test("S38 an id the person gave in their own message is not a leak when the reply repeats it", () => {
+  const pool = caseOf({ turns: [{ user: "把 pool 017a2636-bf3d-43b6-a45c-fe14263bda06 的 max_running 调成 4" }], style: { no_ids: true } });
+  const echo = "**⚠️ 需要你批准**：把 pool 017a2636-bf3d-43b6-a45c-fe14263bda06 的 max_running 从 2 调成 4。";
+  assert.deepEqual(failed(pool, observed({ shown: [echo], final: echo })), []);
+  // Another uuid beside it still leaks, and the same reply to a message without that uuid does too.
+  const other = `${echo}\n（item_ref 5f0c1e2a-3b4d-4c5e-8f9a-0b1c2d3e4f50）`;
+  assert.deepEqual(failed(pool, observed({ shown: [other], final: other })), ["no internal text: uuid"]);
+  assert.deepEqual(failed(caseOf({ style: { no_ids: true } }), observed({ shown: [echo], final: echo })), ["no internal text: uuid"]);
+  // A number the person named an item by is theirs; any other bare number is still bare.
+  const asked = caseOf({ turns: [{ user: "#12 怎么样了？" }], style: { no_ids: true } });
+  assert.deepEqual(failed(asked, observed({ shown: ["#12 已完成。"], final: "#12 已完成。" })), []);
+  assert.deepEqual(failed(asked, observed({ shown: ["已完成的是 #13。"], final: "已完成的是 #13。" })), ["items named by title"]);
+  const said = caseOf({ turns: [{ user: "事项 7 的结果呢" }, { user: "那编号 8 呢" }], style: { no_ids: true } });
+  assert.deepEqual(failed(said, observed({ shown: ["都已完成：#7、#8。"], final: "都已完成：#7、#8。" })), []);
+  // A commit's, a pull request's or a repository's number the person gave excuses no item of that number.
+  for (const user of ["What happened in commit #12?", "PR #12 的状态是什么？", "PR 编号 12 的状态是什么？", "AMD-AGI/PrimusClaw#12 合了吗", "议题 #12 还开着吗",
+    "议题编号 12 还开着吗", "the run task 12 failed?", "版本 #12 发了吗", "工单 #12 呢"]) {
+    const other = caseOf({ turns: [{ user }], style: { no_ids: true } });
+    assert.deepEqual(failed(other, observed({ shown: ["The internal item is #12."], final: "The internal item is #12." })), ["items named by title"], user);
+  }
+  const look = caseOf({ turns: [{ user: "看看 #12 的结果" }, { user: "task #13?" }, { user: "show me task 14" }, { user: "那 #15 呢，what about #016" }],
+    style: { no_ids: true } });
+  assert.deepEqual(failed(look, observed({ shown: ["都已完成：#12、#13、#14、#15、#16。"], final: "都已完成：#12、#13、#14、#15、#16。" })), []);
+  const pr = caseOf({ turns: [{ user: "PR #12 的状态是什么？" }], style: { no_ids: true } });
+  assert.deepEqual(failed(pr, observed({ shown: ["内部事项是 #12。"], final: "内部事项是 #12。" })), ["items named by title"]);
+  // A number the person wrote for something else ("过去 3 天") does not excuse it.
+  const days = caseOf({ turns: [{ user: "过去 3 天做完了哪些事？" }], style: { no_ids: true } });
+  assert.deepEqual(failed(days, observed({ shown: ["做完了 #3。"], final: "做完了 #3。" })), ["items named by title"]);
+});
