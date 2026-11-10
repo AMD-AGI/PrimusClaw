@@ -177,6 +177,7 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (ch === "\x15") { buffer = ""; continue; }   // Ctrl-U
+    if (ch === "\x7f") { if (!dialog) buffer = [...buffer].slice(0, -1).join(""); continue; }   // Backspace (nothing on a question)
     if (ch === "\x1b" || ch < " ") continue;
     buffer += ch;
     if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown) showDialog();

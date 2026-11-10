@@ -393,6 +393,8 @@ export const SUBMIT_BYTES: readonly string[] = ["1b", "5b", "46", "0d"];
 
 /** How often a screen with a question on it is read again, waiting for it to go. */
 const DIALOG_POLL_MS = 200;
+/** How long a message cancelled while a question shows waits for it to go, to take its own text out of the box again. */
+const CLEAR_WAIT_MS = 10 * 60_000;
 /** How many times a message whose text a question took out of the box is typed again, once the question is gone. */
 const MAX_TYPINGS = 3;
 
@@ -480,13 +482,24 @@ export class TerminalInput {
     if (!text) throw new Error("nothing to type");
     let told = false;
     let declined = 0;
-    // (a message cancelled or withdrawn meanwhile gets no further key: what is in the box stays there)
-    const stillWanted = () => { if (opts.stillWanted && !opts.stillWanted()) throw new TerminalNotSubmitted("no longer wanted"); };
+    let pasted = false;
+    // A message no longer wanted (cancelled, closed, the terminal switched) gets no further key but one: its own text, if the box holds
+    // exactly that and no question shows, is taken out again (clearOwn). Asked before every key that would go to the terminal.
+    const stillWanted = async () => {
+      if (!opts.stillWanted || opts.stillWanted()) return;
+      if (pasted) {
+        // (a question on the screen gets no key: its text is taken out once it is gone, if the box then holds exactly that)
+        const by = Date.now() + CLEAR_WAIT_MS;
+        while (dialogOnScreen(await this.screen()) && Date.now() < by && (await this.alive())) await sleep(DIALOG_POLL_MS);
+        await this.clearOwn(text);
+      }
+      throw new TerminalNotSubmitted("no longer wanted");
+    };
     // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
     const waitOutDialog = async () => {
       if (!told) { told = true; opts.onDialog?.(); }
       for (;;) {
-        if (opts.stillWanted && !opts.stillWanted()) throw new TerminalNotSubmitted("no longer wanted while a question was on the screen");
+        await stillWanted();
         if (!(await this.alive())) throw new TerminalNotSubmitted("the terminal went away while a question was on the screen");
         if (!dialogOnScreen(await this.screen())) return;
         await sleep(DIALOG_POLL_MS);
@@ -498,11 +511,13 @@ export class TerminalInput {
       if (waited) await waitOutDialog();
       // (after a question, or to type again, the box is read anew: someone's text there is never pasted onto)
       if ((waited || typings > 1) && inputBox(await this.screen()) !== "empty") throw new TerminalNotSubmitted("the box is no longer empty");
-      stillWanted();
+      await stillWanted();
       await this.put(text, typings === 1 ? opts.onPaste : undefined);
+      pasted = true;
       const by = Date.now() + this.echoWaitMs;
       let dialog = false;
       for (;;) {
+        await stillWanted();
         const screen = await this.screen();
         if (dialogOnScreen(screen)) { dialog = true; break; }
         if (inputBox(screen) === "typed") break;
@@ -517,12 +532,13 @@ export class TerminalInput {
         let why: string | null = null;
         let screen = "";
         for (let i = 0; i < 2 && !why; i++) {
+          await stillWanted();
           await sleep(this.settleMs);
           screen = await this.screen();
           why = enterGuard(screen, text);
         }
         if (!why) {
-          stillWanted();
+          await stillWanted();
           // End and Enter in one write (SUBMIT_BYTES): the box takes them as "to the end, submit"; a question that came up after the read
           // above takes End as its last option, "No", and Enter chooses that. Never a "Yes".
           await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...SUBMIT_BYTES]);
@@ -541,11 +557,28 @@ export class TerminalInput {
         // (the question took the text out of the box: typed again, unless the terminal already shows it submitted)
         if (told && inputBox(screen) === "empty" && typings < MAX_TYPINGS) {
           if (opts.submitted?.()) return;
+          await stillWanted();
           break;
         }
         throw new TerminalNotSubmitted(why);
       }
     }
+  }
+
+  /**
+   * Take the phone's own text out of the box again (a message cancelled after its paste, before its Enter): only when the box holds
+   * exactly that text and no question or menu shows, with Backspaces as the bytes of one `send-keys -H` key (one write). A collapsed
+   * paste goes with one Backspace, anything else with one per character. Backspace is never a choice on a question (measured on Claude
+   * Code 2.1.285: five on a permission question chose nothing). Anything else in the box, or a question, and nothing is sent.
+   */
+  private async clearOwn(text: string): Promise<boolean> {
+    const screen = await this.screen();
+    if (enterGuard(screen, text) !== null) return false;
+    const { plain, at, end } = boxOf(screen);
+    const collapsed = end === at + 1 && /^\[Pasted text #\d+/.test(plain[at]!.trimStart().replace(PROMPT_RE, "").trim());
+    const n = collapsed ? 1 : [...text].length;
+    await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...Array<string>(n).fill("7f")]);
+    return true;
   }
 
   /** Esc: Claude Code stops the turn it is running. */

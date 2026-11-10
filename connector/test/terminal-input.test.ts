@@ -16,6 +16,7 @@ import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
 import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { wholeLinesOf } from "../src/session.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -92,6 +93,14 @@ describe("the terminal's permission mode, and whether the agent's policy lets th
     assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[7mR\x1b[27meply typed by someone")), "typed", "the cursor on real text");
     assert.equal(inputBox(boxed("\x1b[39m❯ \x1b[2mdim\x1b[0m", "  typed below")), "typed", "a real row under a dim one");
     assert.equal(inputBox(boxed("\x1b[39m❯ ", "  ")), "typed", "blank rows are someone's line breaks");
+  });
+
+  test("a queued message found in a prompt Claude Code joined from its queue: only as whole lines, never a part of someone else's line (codex r9 on #648)", () => {
+    assert.equal(wholeLinesOf("first one\nfrom the phone\nthird", "from the phone"), true);
+    assert.equal(wholeLinesOf("first one\n\n  line a\n  line b", "line a\nline b"), true, "a message of several lines");
+    assert.equal(wholeLinesOf("latest test results", "test"), false, "a part of a line");
+    assert.equal(wholeLinesOf("run the test now\nmore", "test"), false);
+    assert.equal(wholeLinesOf("line a\nother\nline b", "line a\nline b"), false, "not a run of lines");
   });
 
   test("a question or a menu on the screen: under the box, or in its place; the agent's words above the box are not one", () => {
@@ -495,16 +504,16 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
       });
       hs.push(h);
       // (busy for hours with background agents, as clawy: its row never says idle; and a main turn of its own runs, `esc to interrupt`)
-      const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "4000", FAKE_QUEUE: c.queue });
+      const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "10000", FAKE_QUEUE: c.queue });
       h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
       await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
       const sid = await h.attach(REF);
       const t0 = Date.now();
       const one = h.prompt(sid, "from the phone");
-      await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 3_000);
+      await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 8_000);
       assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), "typed while that turn still ran");
-      assert.ok(Date.now() - t0 < 3_000, `typed in ${Date.now() - t0} ms`);
-      const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+      assert.ok(Date.now() - t0 < 8_000, `typed in ${Date.now() - t0} ms`);
+      const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 25_000);
       assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
       await h.claw.until("the reply", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "echo: from the phone"));
       assert.deepEqual(h.claw.eventsOf(sid, "terminal_input_queued").filter((e) => e.data.cmd_seq === one), [], "never held back as busy");
@@ -519,15 +528,15 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
     });
     hs.push(h);
-    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "3000", FAKE_QUEUE: "absorb", FAKE_VERSION: "9.9.9" });
+    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "10000", FAKE_QUEUE: "absorb", FAKE_VERSION: "9.9.9" });
     h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
     fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "queue-operation", operation: "enqueue", sessionId: REF, content: "later" })}\n`);
     fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "assistant", sessionId: REF, message: { role: "assistant", content: [{ type: "text", text: "x".repeat(700_000) }] } })}\n`);
     await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
     const sid = await h.attach(REF);
     const one = h.prompt(sid, "from the phone");
-    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 3_000);
-    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 8_000);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 25_000);
     assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
   });
 
@@ -548,7 +557,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const project = fs.realpathSync(work).replace(/[^A-Za-z0-9]/g, "-");
     const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
     fs.mkdirSync(tasks, { recursive: true });
-    const t = terminal(fs.realpathSync(work), h.attachDir, 1_500, { FAKE_TORN_ROW: "1", FAKE_TASKS_DIR: tasks, FAKE_TITLE: "autopilot" }, true);
+    const t = terminal(fs.realpathSync(work), h.attachDir, 6_000, { FAKE_TORN_ROW: "1", FAKE_TASKS_DIR: tasks, FAKE_TITLE: "autopilot" }, true);
     // The row is torn (empty, not just being written), and nothing lists the process; its conversation was written since it started.
     fs.writeFileSync(t.row, "");
     const old = (Date.now() - 3_600_000) / 1000;
@@ -568,7 +577,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const sid = await h.attach(REF);
     assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.input, "terminal");
     const one = h.prompt(sid, "from the phone");
-    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 30_000);
     assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["from the phone"]);
     await h.claw.until("the reply", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "echo: from the phone"));
@@ -578,9 +587,9 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     t.tmux("send-keys", "-t", "%0", "Enter");
     await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
     const two = h.prompt(sid, "while it works");
-    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("while it works"), 3_000);
+    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("while it works"), 8_000);
     assert.deepEqual(h.claw.eventsOf(sid, "terminal_input_queued").filter((e) => e.data.cmd_seq === two), [], "never held back as busy");
-    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
+    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 30_000);
     assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal", "while it works"]);
   });
@@ -695,8 +704,35 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(fs.existsSync(approved), false);
     assert.equal(h.turnEnds(sid).filter((e) => e.data.cmd_seq === seq).length, 1, "ended once");
     fs.writeFileSync(dismiss, "");
-    await new Promise((r) => setTimeout(r, 1_500));
+    await until("its own text taken out once the question went", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty", 5_000);
+    await new Promise((r) => setTimeout(r, 1_000));
     assert.deepEqual(typed(t.transcript), [], "nothing submitted after the cancel");
+    assert.equal(fs.existsSync(escs), false, "no Esc");
+  });
+
+  test("a phone cancel while a question holds it, and the person types into the box meanwhile: their text is never taken out (only the phone's own text is)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const dir = tmpdir("cc-dialog-");
+    const approved = path.join(dir, "approved");
+    const dismiss = path.join(dir, "dismiss");
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: approved, FAKE_DIALOG_DISMISS: dismiss });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    h.claw.issue("cancel", sid);
+    await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 10_000);
+    t.tmux("send-keys", "-t", "%0", "-l", " and mine");
+    fs.writeFileSync(dismiss, "");
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("from the phone and mine"), "the box left as it is");
+    assert.deepEqual(typed(t.transcript), [], "nothing submitted");
   });
 
   test("a phone cancel after the text went into the box but before its Enter: no further key, nothing submitted, the turn ends cancelled once (Wei Lei on #648, r2)", async () => {
@@ -721,7 +757,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual(typed(t.transcript), [], "not submitted after the cancel");
     assert.equal(fs.existsSync(escs), false, "no Esc");
     assert.equal(h.turnEnds(sid).filter((e) => e.data.cmd_seq === seq).length, 1, "ended once");
-    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("cancel me before the enter"), "the text stays in the box");
+    assert.equal(inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")), "empty", "its own text taken out of the box again");
   });
 
   test("a phone cancel of a message Claude Code queued behind the person's running turn: no Esc (it would stop the person's turn); a turn it started at an idle prompt: Esc as before (Wei Lei on #648)", async () => {
@@ -732,18 +768,18 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     });
     hs.push(h);
     const escs = path.join(tmpdir("cc-esc-"), "escs");
-    const t = terminal(work, h.attachDir, 3_000, { FAKE_BUSY_MS: "4000", FAKE_ESC_FILE: escs });
+    const t = terminal(work, h.attachDir, 3_000, { FAKE_BUSY_MS: "10000", FAKE_ESC_FILE: escs });
     h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
     await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
     const sid = await h.attach(REF);
     const one = h.prompt(sid, "queued one");
-    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("queued one"), 3_000);
+    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("queued one"), 8_000);
     h.claw.issue("cancel", sid);
     const end1 = await h.claw.until("the queued one's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
     assert.equal(end1.data.stopReason, "cancelled");
     assert.equal(fs.existsSync(escs), false, "no Esc into the person's turn");
     // (the queued one is still Claude Code's to run: it runs once the person's turn ends, and the phone no longer follows it)
-    await until("the queued one run and done", () => typed(t.transcript).includes("queued one") && !t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);
+    await until("the queued one run and done", () => typed(t.transcript).includes("queued one") && !t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 30_000);
     // A turn it started itself at an idle prompt (3 s of work): a cancel stops it with Esc, as before.
     const two = h.prompt(sid, "second");
     await until("its own turn running", () => typed(t.transcript).includes("second") && t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 15_000);

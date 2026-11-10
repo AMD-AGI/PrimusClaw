@@ -439,7 +439,7 @@ export class Session {
       // queued before it could be the one that came out first, and its turn is the person's)
       if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
       // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
-      if (turn.pasted && !turn.seen && turn.queued && said.replace(/\s+/g, " ").includes(turn.text.replace(/\s+/g, " ").trim())) { turn.seen = true; return; }
+      if (turn.pasted && !turn.seen && turn.queued && wholeLinesOf(said, turn.text)) { turn.seen = true; return; }
       if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
@@ -1517,6 +1517,18 @@ export function limitStrings<T>(value: T, max: number): T {
 }
 
 /** The same message, as Claude Code records what was typed: whitespace at the ends and inside runs does not count. */
+/**
+ * Whether `text` is in `joined` as whole lines (several prompts Claude Code took out of its queue as one): its lines, each trimmed, are
+ * a run of `joined`'s lines. A part of someone else's line is not it.
+ */
+export function wholeLinesOf(joined: string, text: string): boolean {
+  const lines = (x: string) => x.replace(/\r\n?/g, "\n").split("\n").map((l) => l.trim());
+  const have = lines(joined);
+  const want = lines(text.trim());
+  for (let i = 0; i + want.length <= have.length; i++) if (want.every((w, j) => have[i + j] === w)) return true;
+  return false;
+}
+
 function sameText(a: string, b: string): boolean {
   const norm = (t: string) => t.replace(/\s+/g, " ").trim();
   return norm(a) === norm(b);
