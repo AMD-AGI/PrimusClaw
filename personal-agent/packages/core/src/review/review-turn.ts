@@ -161,11 +161,11 @@ const FOLLOW_FIELDS = [
  */
 export function followRecord(review: ReviewTurn, wire: JsonObject): JsonObject {
   if (review.item === undefined) throw new TypeError("a followed review has an item");
-  const out: Record<string, JsonObject[string]> = { ...wire };
-  for (const pair of FOLLOW_FIELDS) {
+  const fields = FOLLOW_FIELDS.map((pair) => {
     const [field, key] = pair.split(":") as [keyof ReviewTurn, string];
-    out[key] = review[field] as JsonObject[string];
-  }
+    return [key, review[field] as JsonObject[string]] as const;
+  });
+  const out: Record<string, JsonObject[string]> = { ...wire, ...Object.fromEntries(fields) };
   out.pull = [review.pull.owner, review.pull.repo, review.pull.number];
   out.item_id = review.item.itemId;
   out.seq = review.item.seq;

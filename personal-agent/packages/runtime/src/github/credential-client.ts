@@ -14,12 +14,14 @@ import {
   type GithubState,
   type Result,
   credentialRefused,
+  errorName,
   err,
   ok,
+  pyRstrip,
 } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
-import { errorName, type FetchLike } from "./api.js";
+import type { FetchLike } from "./api.js";
 
 const PROVIDER = "github";
 
@@ -91,7 +93,7 @@ export class IdentityCredentialClient implements GithubCredentials {
   private readonly fetchImpl: FetchLike;
 
   constructor(private readonly options: CredentialClientOptions) {
-    this.base = options.baseUrl.replace(/\/+$/u, "");
+    this.base = pyRstrip(options.baseUrl, "/");
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 

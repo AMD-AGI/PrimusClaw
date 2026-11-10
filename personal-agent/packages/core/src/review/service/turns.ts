@@ -9,6 +9,7 @@
  */
 
 import { errorName } from "../../errors.js";
+import { own } from "../../own.js";
 import { correlationId } from "../../guardrails/correlation.js";
 import { REVIEW_MODES } from "../views.js";
 import type { Conversation } from "../../ports/surface.js";
@@ -45,7 +46,7 @@ const WROTE_EN: Readonly<Record<string, string>> = {
 };
 
 function wroteWords(wrote: readonly GithubOutcome[], words: Readonly<Record<string, string>>, join: string): string {
-  const said = wrote.map(([, status, event]) => words[`${status}:${event}`] ?? words[`${status}:`] ?? status);
+  const said = wrote.map(([, status, event]) => own(words, `${status}:${event}`) ?? own(words, `${status}:`) ?? status);
   return [...new Set(said)].join(join);
 }
 

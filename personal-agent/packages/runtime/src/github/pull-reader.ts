@@ -7,9 +7,17 @@
  * answer that is not a reading (GitHub down, a rate limit, a pull request that is not there) is "not known".
  */
 
-import { type Logger, type PullRef, type PullReader, cpHead, squashSpaces } from "@primusclaw/personal-agent";
+import {
+  type Logger,
+  type PullRef,
+  type PullReader,
+  cpHead,
+  errorName,
+  own,
+  squashSpaces,
+} from "@primusclaw/personal-agent";
 
-import { GithubApi, errorName, segment } from "./api.js";
+import { GithubApi, segment } from "./api.js";
 
 /** The one public read of who wrote a pull request: an early answer, never worth a long wait. */
 export const PULL_READ_MS = 5_000;
@@ -19,7 +27,7 @@ const oneLine = (value: string, limit: number): string => cpHead(squashSpaces(va
 
 const field = (body: unknown, key: string): unknown =>
   typeof body === "object" && body !== null && !Array.isArray(body)
-    ? (body as Record<string, unknown>)[key]
+    ? own(body as Record<string, unknown>, key)
     : undefined;
 
 export class PublicPullReader implements PullReader {

@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { own } from "../../src/own.js";
 import type { IntentReader, UserRef } from "../../src/index.js";
 import { pullsIn } from "../../src/review-text/pull-ref.js";
 import { MEMBERS, MENTIONS, REQUESTS, type ReviewReading } from "../../../../test-support/review-requests.js";
@@ -41,7 +42,7 @@ function messageOf(text: string, quoted: string) {
   const people: UserRef[] = Object.keys(MENTIONS)
     .filter((name) => text.includes(`{${name}}`))
     .sort((a, b) => b.length - a.length)
-    .map((name) => ({ id: "", channelUserId: MENTIONS[name] ?? "", name, email: "" }));
+    .map((name) => ({ id: "", channelUserId: own(MENTIONS, name) ?? "", name, email: "" }));
   const message = groupMessage(text, ALICE, people);
   const quote = {
     messageId: "q1",

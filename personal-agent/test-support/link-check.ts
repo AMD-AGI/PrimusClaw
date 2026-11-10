@@ -7,6 +7,7 @@
  * message; `stringsWithTextAfterALink` reads every string a TypeScript module builds.
  */
 import ts from "typescript";
+import { own } from "@primusclaw/personal-agent";
 
 /** In a scanned template: an expression that holds a URL, and any other expression. */
 const URL_MARK = "\u0001";
@@ -43,7 +44,7 @@ export function textAfterLinks(text: string): string[] {
     const rest = text.slice(end);
     const before = text.slice(Math.max(0, begin - 2), begin);
     const alone = /^[ \t]*(?:\n|$)/.test(rest);
-    const closer = CLOSERS[before.slice(-1)];
+    const closer = own(CLOSERS, before.slice(-1));
     const delimited = (before === "](" && rest.startsWith(")")) || (closer !== undefined && rest.startsWith(closer));
     if (!alone && !delimited) {
       found.push(

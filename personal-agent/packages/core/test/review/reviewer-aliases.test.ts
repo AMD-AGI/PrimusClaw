@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { own } from "../../src/own.js";
 import { peopleOf } from "../../src/understanding/people.js";
 import type { PersonRecord } from "../../src/understanding/record.js";
 import { openTestStore } from "../../../../test-support/store.js";
@@ -17,7 +18,7 @@ import { openTestStore } from "../../../../test-support/store.js";
 const LIN: PersonRecord = { id: "29:w", objectId: "aad-w", name: "Lin, Mei", email: "mlin@example.com" };
 const CAROL: PersonRecord = { id: "29:c", objectId: "aad-c", name: "Carol Chen" };
 const IDS: Readonly<Record<string, string>> = { "aad-w": "u-lin", "aad-w2": "u-lin2", "aad-c": "u-carol" };
-const userIdOf = (aad: string) => IDS[aad];
+const userIdOf = (aad: string) => own(IDS, aad);
 
 /** The store's members, as the people records a message is read against. */
 const records = (members: readonly object[]): PersonRecord[] => members.map((m) => ({ ...m }));
@@ -88,7 +89,7 @@ for (const text of [
 test("the closest people are at most three and closest first and linked", () => {
   const known = ["Linmex", "Linmen", "Linmeo", "Linmea"].map((n) => ({ id: `29:${n}`, objectId: `aad-${n}`, name: n }));
   const ids: Readonly<Record<string, string>> = { "aad-Linmex": "u1", "aad-Linmen": "u2", "aad-Linmeo": "u3" }; // (Linmea is not linked)
-  const of = (aad: string) => ids[aad];
+  const of = (aad: string) => own(ids, aad);
   // (a name written is that person; no guesses beside it)
   assert.deepEqual(
     peopleOf([], "请 linmen 帮我 review AMD-AGI/PrimusClaw#304", known, of).map((p) => p.source),

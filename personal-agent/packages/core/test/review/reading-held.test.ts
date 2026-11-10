@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { own } from "../../src/own.js";
 import type { IntentReader, UserRef } from "../../src/index.js";
 import { pullsIn, shortName } from "../../src/review-text/pull-ref.js";
 import { MEMBERS, MENTIONS, REQUESTS } from "../../../../test-support/review-requests.js";
@@ -49,7 +50,7 @@ function setup(answer: Record<string, unknown> | undefined): ReviewWorld {
 async function ask(world: ReviewWorld, text: string): Promise<boolean> {
   const people: UserRef[] = Object.keys(MENTIONS)
     .filter((name) => text.includes(`{${name}}`))
-    .map((name) => ({ id: "", channelUserId: MENTIONS[name] ?? "", name, email: "" }));
+    .map((name) => ({ id: "", channelUserId: own(MENTIONS, name) ?? "", name, email: "" }));
   const message = groupMessage(text, ALICE, people);
   return world.service.request({
     message,

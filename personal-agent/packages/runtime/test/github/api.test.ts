@@ -180,3 +180,14 @@ test("a plain token stands in when the App fails, and the App is not retried for
   const other = { token: () => Promise.reject(new RangeError("bug")), invalidate: () => undefined };
   assert.equal(await code(new FallbackTokenSource(other, () => Promise.resolve("p"))), "other");
 });
+
+test("every slash at the end of the base URL is dropped, in linear time", async () => {
+  const { fetch, seen } = recorder([() => new Response("{}", { status: 200 })]);
+  const api = new GithubApi({ fetch, apiUrl: "https://api.test///" });
+  await api.request({ method: "GET", path: "/repos/o/r" });
+  assert.equal(seen[0]?.url, "https://api.test/repos/o/r");
+  const started = performance.now();
+  const long = new GithubApi({ fetch, apiUrl: `https://api.test${"/".repeat(50_000)}x` });
+  assert.ok(long instanceof GithubApi);
+  assert.ok(performance.now() - started < 100);
+});

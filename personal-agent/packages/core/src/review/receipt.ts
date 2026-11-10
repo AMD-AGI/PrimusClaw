@@ -7,6 +7,7 @@
  */
 
 import { pyRegExp } from "../text/py-regex.js";
+import { own } from "../own.js";
 import {
   PLAIN_WORDS,
   mergeWords,
@@ -49,7 +50,7 @@ export type ToolResult = GithubOutcome;
 export function plainWords(text: string): string {
   const zh = CJK.test(text);
   const say = (_m: string, quoted: string | undefined, bare: string | undefined): string =>
-    PLAIN_WORDS[quoted ?? bare ?? ""]?.[zh ? 0 : 1] ?? "";
+    own(PLAIN_WORDS, quoted ?? bare ?? "")?.[zh ? 0 : 1] ?? "";
   return text
     .split("\n")
     .map((line) => (hasFileLine(line) ? line : line.replace(RAW_NAME, say)))

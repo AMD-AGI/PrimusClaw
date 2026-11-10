@@ -34,7 +34,7 @@ import {
 } from "../../cards/kit.js";
 import { action } from "../turn/note.js";
 import type { Renderers } from "../registry.js";
-import { BOT_NAME } from "@primusclaw/personal-agent";
+import { BOT_NAME, own } from "@primusclaw/personal-agent";
 
 const MARKDOWN = /([\\`*_[\]<])/gu;
 
@@ -70,8 +70,8 @@ export function reviewModeCard(model: ReviewModeView): CardMessage {
   if (model.lead) body.push(text(model.lead));
   const english: CardElement[] = [];
   for (const mode of order) {
-    const [zh, en] = REVIEW_MODES[mode as keyof typeof REVIEW_MODES];
-    const [whatZh = "", whatEn = ""] = MODE_WHAT[mode] ?? [];
+    const [zh, en] = own(REVIEW_MODES, mode) ?? ["", ""];
+    const [whatZh = "", whatEn = ""] = own(MODE_WHAT, mode) ?? [];
     const current = mode === model.current;
     body.push({
       type: "Container",
@@ -98,7 +98,7 @@ export function reviewModeCard(model: ReviewModeView): CardMessage {
   // (the card is Chinese: a bilingual hint keeps its Chinese half)
   if (model.hint) body.push(note(model.hint.split(" / ")[0] ?? ""));
   const choices = order.map((m) =>
-    execute(MODE_BUTTON[m] ?? m, "primusclaw.github_mode", { primusclaw: "github_mode", mode: m }),
+    execute(own(MODE_BUTTON, m) ?? m, "primusclaw.github_mode", { primusclaw: "github_mode", mode: m }),
   );
   return message(body, buttons([...choices, ...(model.hint ? addAppButton(model.installUrl) : [])]));
 }

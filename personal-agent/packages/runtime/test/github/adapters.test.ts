@@ -83,6 +83,26 @@ test("an answer github does not give is unavailable not a token", async () => {
   assert.deepEqual(await flow.waitForToken(code, stop.signal), { ok: false, error: { kind: "device_flow_cancelled" } });
 });
 
+test("a cancel while github is asked for the token binds nothing", async () => {
+  const clock = new FakeClock();
+  const stop = new AbortController();
+  const seen: (AbortSignal | null | undefined)[] = [];
+  const flow = new GithubDeviceFlow({
+    clientId: "c",
+    clock,
+    fetch: (_url, init) => {
+      seen.push(init?.signal);
+      stop.abort(); // (unbind while the poll is in flight; GitHub approves all the same)
+      return Promise.resolve(Response.json({ access_token: "gho_x" }));
+    },
+  });
+  assert.deepEqual(await drive(clock, flow.waitForToken(code, stop.signal)), {
+    ok: false,
+    error: { kind: "device_flow_cancelled" },
+  });
+  assert.equal(seen[0]?.aborted, true); // (the cancel reaches the request itself)
+});
+
 test("a credential call names the status and code and never the body", async () => {
   const answer = (status: number, body: unknown) => () => Promise.resolve(Response.json(body, { status }));
   const client = (fetch: () => Promise<Response>) =>

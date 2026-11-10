@@ -9,6 +9,7 @@
  */
 
 import type { PublicErrors } from "../public-error/public-errors.js";
+import { own } from "../own.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
 import { oneLine, plainText } from "../review-text/names.js";
 
@@ -217,7 +218,7 @@ export function checksText(checks: unknown): string {
   if (typeof checks !== "object" || checks === null) return "";
   const counts = checks as Readonly<Record<string, unknown>>;
   return ["passed", "failed", "pending"]
-    .filter((k) => isInt(counts[k]))
-    .map((k) => `${String(counts[k])} ${k}`)
+    .filter((k) => isInt(own(counts, k)))
+    .map((k) => `${String(own(counts, k))} ${k}`)
     .join(", ");
 }

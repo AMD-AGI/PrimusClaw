@@ -7,7 +7,6 @@
  */
 export * from "./views.js";
 export { REVIEW_MODE_NAMES, isReviewMode, type ReviewMode } from "./review-turn.js";
-export { INTENT_PROMPT, MODE_PROMPT } from "../locales/review-github.js";
 export { connectionsText, UNKNOWN, type ConnectionsInput } from "./connect/connections.js";
 export { GithubReview } from "./service/github-review.js";
 export { ReviewHandoffAction, type HandoffActionDeps } from "./service/handoff-action.js";

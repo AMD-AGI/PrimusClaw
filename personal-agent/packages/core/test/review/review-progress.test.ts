@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { own } from "../../src/own.js";
 import type { AskerView, Conversation, ConversationRef, OutMessage } from "../../src/index.js";
 import { progressWords, viewStage } from "../../src/review/progress.js";
 import { reviewTurn } from "../../src/review/review-turn.js";
@@ -35,10 +36,15 @@ const LINK: Record<string, string> = {
 
 /** A review whose approval is posted and whose merge waits for Bob (Claw's view for the asker). */
 function held(pr: string, more: Record<string, unknown> = {}): Record<string, unknown> {
-  return { status: "waiting_for_reviewer", prUrl: LINK[pr], verdict: "approve", merged: false, ...more };
+  return { status: "waiting_for_reviewer", prUrl: own(LINK, pr), verdict: "approve", merged: false, ...more };
 }
 
-const done = (pr: string, verdict: string, merged: boolean) => ({ status: "done", prUrl: LINK[pr], verdict, merged });
+const done = (pr: string, verdict: string, merged: boolean) => ({
+  status: "done",
+  prUrl: own(LINK, pr),
+  verdict,
+  merged,
+});
 
 function texts(world: HandoffWorld): string[] {
   return world.surface
@@ -77,7 +83,7 @@ test("handed over reviews tell the asker the conclusion while the merge waits fo
   assert.ok(summary.startsWith("Bob 代审进度（3 个 PR：3 个有结论，0 个已结束）："), summary);
   const lines = summary.split("\n");
   for (const pr of [PR, PR2, PR3]) {
-    const line = `- ${pr}：结论：批准，合入在等 Bob 确认  ${LINK[pr] ?? ""}`;
+    const line = `- ${pr}：结论：批准，合入在等 Bob 确认  ${own(LINK, pr) ?? ""}`;
     assert.ok(
       lines.some((l) => l === line),
       summary,
