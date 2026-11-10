@@ -191,6 +191,8 @@ export class Session {
     queued?: boolean;
     /** The keys are being typed, Enter not yet gone (a question on the screen may hold it): the echo is not waited for yet. */
     typing?: boolean;
+    /** Its text went into the box: only from then on can the transcript show it (the same words before are someone else's). */
+    pasted?: boolean;
     /**
      * It started a turn of its own in the terminal (its prompt is the turn's, submitted at an idle prompt). Only such a turn is the
      * phone's to stop with Esc; one that went through Claude Code's queue (taken into a running turn, or out of the queue after it)
@@ -423,7 +425,7 @@ export class Session {
     // What Claude Code did with a message submitted while a turn ran: queued it (taken: the echo), took it into that turn (its start
     // here), or handed the queue back to the terminal's box (withdrawn there). Never sent on: the phone sees the turn's own lines.
     if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
-      if (!turn || turn.seen) return;
+      if (!turn || turn.seen || !turn.pasted) return;
       const said = String(u.update.text ?? "");
       if (u.type === "queued" && sameText(said, turn.text)) turn.queued = true;
       else if (u.type === "queued_taken" && sameText(said, turn.text)) turn.seen = true;
@@ -435,7 +437,7 @@ export class Session {
       // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
       // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
       // queued before it could be the one that came out first, and its turn is the person's)
-      if (!turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
+      if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
       if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
@@ -594,6 +596,7 @@ export class Session {
             onDialog: () => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1 }),
             stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
             submitted: () => turn.seen || turn.queued === true,
+            onPaste: () => { turn.pasted = true; },
           });
           turn.typing = false;
           turn.sentAt = Date.now();

@@ -377,6 +377,8 @@ export interface TypeOptions {
   stillWanted?: () => boolean;
   /** Whether the terminal's transcript already shows the message submitted (by the person at the terminal): it is not typed again. */
   submitted?: () => boolean;
+  /** Called right before the text first goes into the box: from here on what the transcript shows of it can be this message. */
+  onPaste?: () => void;
 }
 
 /**
@@ -492,6 +494,7 @@ export class TerminalInput {
       if (waited) await waitOutDialog();
       // (after a question, or to type again, the box is read anew: someone's text there is never pasted onto)
       if ((waited || typings > 1) && inputBox(await this.screen()) !== "empty") throw new TerminalNotSubmitted("the box is no longer empty");
+      if (typings === 1) opts.onPaste?.();
       await this.put(text);
       const by = Date.now() + this.echoWaitMs;
       let dialog = false;
