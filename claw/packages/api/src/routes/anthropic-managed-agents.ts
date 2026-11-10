@@ -39,6 +39,7 @@ import {
 import { metrics } from "../infra/metrics.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import pino from "pino";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
 const logger = pino({ name: "anthropic-managed-agents" });
 
@@ -821,6 +822,10 @@ function registerAnthropicSessionCreateRoutes(app: FastifyInstance): void {
     // hint convention. Absent/unparseable metadata yields undefined, so the
     // Brain keeps falling back to its default namespace (prior behavior).
     const workspaceId = parsePrimusClawMetadata(body.metadata)?.workspace_id;
+    // A pin to a workspace the deployment does not isolate is refused here, before
+    // the session exists (SANDBOX_ALLOWED_NAMESPACES).
+    const refusedWorkspace = sandboxWorkspaceRefusal([workspaceId]);
+    if (refusedWorkspace) return sendError(reply, 400, "invalid_request_error", refusedWorkspace.message);
 
     const primusAnthropicCompat = {
       agent_id: agentId,

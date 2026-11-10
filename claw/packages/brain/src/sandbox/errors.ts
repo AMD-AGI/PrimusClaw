@@ -1,6 +1,14 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import {
+  SANDBOX_WORKSPACE_NOT_ALLOWED,
+  allowedSandboxWorkspaces,
+  sandboxWorkspaceAllowed,
+  sandboxWorkspaceNotAllowedText,
+} from "@claw/protocol";
+import { AGENT_SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
+
 /**
  * A sandbox this deployment has no way to stop, ever.
  *
@@ -88,6 +96,9 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
   // Not a wait, but the same answer to "what does a second try buy": the
   // platform refused the account, and it refuses it again a second later.
   "sandbox_workspace_forbidden",
+  // Nor this one: the deployment does not let a sandbox run in that workspace,
+  // and a second try names the same workspace.
+  "sandbox_workspace_not_allowed",
 ]);
 
 /**
@@ -97,6 +108,8 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
  * is not a member of it).
  */
 export const SANDBOX_WORKSPACE_FORBIDDEN = "sandbox_workspace_forbidden";
+
+export { SANDBOX_WORKSPACE_NOT_ALLOWED };
 
 /**
  * What the user is told when the platform will not let their account start a
@@ -334,4 +347,36 @@ export class DagHandleScanTimeoutError extends Error {
     super(message);
     this.name = "DagHandleScanTimeoutError";
   }
+}
+
+/**
+ * Refuse to create a sandbox in a workspace the deployment does not isolate
+ * (SANDBOX_ALLOWED_NAMESPACES, see @claw/protocol sandbox-workspaces.ts).
+ *
+ * The API refuses a request naming such a workspace with 400; this is the
+ * line behind it, for whatever reached a provider without passing that check
+ * (a session pinned before the list was set, a namespace only a template
+ * rendered). Called by each provider before it asks the platform for anything.
+ */
+export function assertSandboxWorkspaceAllowed(
+  workspace: string,
+  env: Record<string, string | undefined> = process.env,
+  deploymentDefaults: readonly string[] = brainDefaultSandboxWorkspaces(),
+): void {
+  const listed = allowedSandboxWorkspaces(env);
+  // The workspaces this Brain itself falls back to are on the list whatever
+  // the environment spells: SANDBOX_NAMESPACE and AGENT_SANDBOX_NAMESPACE
+  // default to "default" when unset, and a request that names nothing lands
+  // there; refusing it would refuse every unpinned sandbox.
+  const allowed = listed === null ? null : new Set([...listed, ...deploymentDefaults.map((d) => d.trim()).filter((d) => d !== "")]);
+  if (sandboxWorkspaceAllowed(workspace, allowed)) return;
+  throw new SandboxProvisionTerminalError(
+    SANDBOX_WORKSPACE_NOT_ALLOWED,
+    sandboxWorkspaceNotAllowedText(workspace.trim(), allowed!),
+  );
+}
+
+/** Where this Brain puts a sandbox that names no workspace, in the deploy mode it runs in. */
+function brainDefaultSandboxWorkspaces(): string[] {
+  return isKubernetesMode() ? [AGENT_SANDBOX_NAMESPACE] : [SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE];
 }

@@ -26,6 +26,7 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 import { randomUUID } from "node:crypto";
 import { redactStoredText } from "@claw/utils";
 import {
@@ -387,13 +388,30 @@ interface A2ARunSpec {
   teamRole?: string;
 }
 
+/** Why a peer's request is refused as invalid params, before anything is opened. */
+type A2AInvalidRequest = { invalidTopology: string[] } | { invalidParams: string };
+
+function isA2AInvalidRequest(r: { spec: A2ARunSpec } | A2AInvalidRequest): r is A2AInvalidRequest {
+  return "invalidTopology" in r || "invalidParams" in r;
+}
+
+function a2aInvalidText(r: A2AInvalidRequest): string {
+  return "invalidTopology" in r ? r.invalidTopology.join("; ") : r.invalidParams;
+}
+
 async function resolveA2ARunSpec(
   messageId: string,
   metadata: Record<string, unknown> | undefined,
   auth: A2AAuthContext,
-): Promise<{ spec: A2ARunSpec } | { invalidTopology: string[] }> {
+): Promise<{ spec: A2ARunSpec } | A2AInvalidRequest> {
   const invalid = topologyErrors(metadata);
   if (invalid) return { invalidTopology: invalid };
+  // The workspace a peer names for this run's sandbox (and its multi-node
+  // cluster) must be one the deployment isolates (SANDBOX_ALLOWED_NAMESPACES).
+  const refusedWorkspace = sandboxWorkspaceRefusal([
+    typeof metadata?.workspace_id === "string" ? metadata.workspace_id : undefined,
+  ]);
+  if (refusedWorkspace) return { invalidParams: refusedWorkspace.message };
 
   const rawPluginId = metadata?.plugin_id !== undefined ? Number(metadata.plugin_id) : undefined;
   const pluginId = rawPluginId !== undefined && Number.isFinite(rawPluginId) ? rawPluginId : undefined;
@@ -806,8 +824,8 @@ async function openContextRun(input: OpenRunInput<A2AAuthContext>): Promise<Cont
   const { text, callerId, rpcId, auth, metadata } = input;
   const message: Message = { ...input.message, messageId: input.message.messageId || randomUUID() };
   const resolved = await resolveA2ARunSpec(message.messageId, metadata, auth);
-  if ("invalidTopology" in resolved) {
-    return { kind: "error", error: makeInvalidParams(rpcId, resolved.invalidTopology.join("; ")).error };
+  if (isA2AInvalidRequest(resolved)) {
+    return { kind: "error", error: makeInvalidParams(rpcId, a2aInvalidText(resolved)).error };
   }
   const contextId = message.contextId || `ctx-${randomUUID()}`;
   const admitted = await admitAndOpenA2AContextSend(message, text, contextId, callerId, auth, resolved.spec);
@@ -1070,8 +1088,8 @@ async function handleSendMessage(
   }
 
   const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
-  if ("invalidTopology" in resolved) {
-    return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; "));
+  if (isA2AInvalidRequest(resolved)) {
+    return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, a2aInvalidText(resolved));
   }
 
   try {
@@ -1472,9 +1490,9 @@ async function handleSendStreamingMessage(
   }
 
   const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
-  if ("invalidTopology" in resolved) {
+  if (isA2AInvalidRequest(resolved)) {
     reply.status(400).send(
-      makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; ")),
+      makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, a2aInvalidText(resolved)),
     );
     return;
   }

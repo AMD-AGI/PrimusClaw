@@ -307,10 +307,13 @@ export interface LiveStream {
    * worker keeps the stream id for that). "" when the channel did not say it.
    */
   readonly id: MessageId;
-  /** Informative status lines ("Thinking…", the step in progress). */
-  inform(text: string): Promise<Result<void, StreamRefused>>;
-  /** The answer text so far; each call carries the whole text, which must start with the previous one. */
-  emit(text: string): Promise<Result<void, StreamRefused>>;
+  /**
+   * Informative status lines ("Thinking…", the step in progress). Once `options.signal` aborts, an update not yet sent
+   * or on its way is given up at once (refused); the stream takes no more.
+   */
+  inform(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>>;
+  /** The answer text so far; each call carries the whole text, which must start with the previous one. As `inform`. */
+  emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>>;
   finish(message: OutMessage): Promise<Result<void, StreamRefused>>;
 }
 

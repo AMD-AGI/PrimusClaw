@@ -3,7 +3,7 @@
 
 /** A recording live stream with Teams' rules: text only grows, a final closes it, refusals on demand. */
 import { err, ok, type Result } from "../../src/result.js";
-import type { MessageId, OutMessage, StreamRefused } from "../../src/ports/surface.js";
+import type { MessageId, OutMessage, StreamRefused, UpdateOptions } from "../../src/ports/surface.js";
 import type { ReceiptStream } from "../../src/assistant/receipt.js";
 
 export type StreamOp =
@@ -28,17 +28,33 @@ export class FakeReceiptStream implements ReceiptStream {
   refuseShrinkingFinal = false;
   refuseUpdates = false;
   refuseAll = false;
+  /** Updates are on their way and never answered: each ends only when its sender gives it up (refused then). */
+  hangUpdates = false;
 
   ageSeconds(): number {
     return this.age;
   }
 
-  inform(text: string): Promise<Result<void, StreamRefused>> {
+  /** An update that is never answered: refused once `options.signal` aborts, else pending for good. */
+  private hung(options: UpdateOptions | undefined): Promise<Result<void, StreamRefused>> {
+    return new Promise((resolve) => {
+      options?.signal?.addEventListener("abort", () => {
+        resolve(refused("given up"));
+      });
+    });
+  }
+
+  inform(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
     this.ops.push({ op: "inform", text });
+    if (this.hangUpdates) return this.hung(options);
     return Promise.resolve(this.refuseAll ? refused("refused") : ok(undefined));
   }
 
-  emit(text: string): Promise<Result<void, StreamRefused>> {
+  emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
+    if (this.hangUpdates) {
+      this.ops.push({ op: "emit", text });
+      return this.hung(options);
+    }
     if (this.refuseAll || !text.startsWith(this.streamed)) return Promise.resolve(refused("shrinks"));
     this.ops.push({ op: "emit", text });
     this.streamed = text;

@@ -42,7 +42,7 @@ import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
 import { withAdmissionTransaction, type AfterCommit } from "../tasks/admission.js";
 import {
-  expandDag, isCreateRefusal, isTopologyRefusal, type CreateRefusal,
+  expandDag, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal, type CreateRefusal,
 } from "../tasks/dag-expander.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { WorkbenchCtx, WorkbenchDef, RunsListItem } from "./types.js";
@@ -132,6 +132,10 @@ async function ensureSession(
 
 /** The wording every gated creation surface uses, so one refusal reads the same everywhere. */
 async function sendRunRefusal(reply: FastifyReply, refusal: CreateRefusal): Promise<void> {
+  if (isSandboxWorkspaceRefusal(refusal)) {
+    await reply.status(400).send(refusal.sandboxWorkspace);
+    return;
+  }
   if (isTopologyRefusal(refusal)) {
     await reply.status(400).send({
       ok: false, error: "invalid_topology", errors: refusal.invalidTopology,

@@ -29,7 +29,14 @@ export function neutral(text: unknown, limit = 200): string {
     pyStr(text).replace(DROPPED_BY_RICH_TEXT, (ch) => (ch.charCodeAt(0) <= 0x7f ? " " : "")),
     Infinity,
   );
-  return clipLine(breakDomainsAndMails(breakAddresses(flat)), limit);
+  return clipLine(breakLinks(flat), limit);
+}
+
+/** `text` with no address a client links by itself (`https://`, `www.`, a bare domain, a mail address, escaped or not): a
+ * zero-width space breaks each, which no one sees. Where the text is shown as it is (a short line, the window card's output, the
+ * full output), not made words as an answer is. */
+export function breakLinks(text: string): string {
+  return breakDomainsAndMails(breakAddresses(text));
 }
 
 /** `neutral`, then markup escaped: text supplied by an agent, a machine or a session as it goes into a card TextBlock. */

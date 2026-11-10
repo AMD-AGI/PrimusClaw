@@ -31,7 +31,7 @@ import {
 } from "./prompt-flags.js";
 import { multiNodeWorkloadName } from "../workload-naming.js";
 import { gpuWorkspaceFor } from "../workspace-select.js";
-import { SandboxProvisionTerminalError } from "../errors.js";
+import { SandboxProvisionTerminalError, assertSandboxWorkspaceAllowed } from "../errors.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
@@ -426,6 +426,9 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     // placed in the GPU workspace, the same rule a single-node GPU sandbox follows.
     const namespace = gpuWorkspaceFor(request.workspace_id);
     if (!namespace) throw new Error("multi-node request requires workspace_id");
+    // The cluster runs the run's code too, and is created before the Hands sandbox
+    // that would otherwise be the first to ask: same list, same refusal.
+    assertSandboxWorkspaceAllowed(namespace);
     const apiKey = (opts?.platformKey ?? request.platform_key ?? "").trim();
     if (!apiKey) throw new Error("multi-node request requires a SaFE platform key in safe mode");
     if (!SAFE_API_URL.trim()) throw new Error("SAFE_API_URL is not configured");

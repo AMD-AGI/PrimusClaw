@@ -11,6 +11,7 @@ import type {
   ConversationRef,
   LiveStream,
   Logger,
+  UpdateOptions,
   OutMessage,
   Result,
   StreamRefused,
@@ -77,12 +78,12 @@ class TeamsLiveStream implements LiveStream {
     return this.stream.streamId;
   }
 
-  inform(text: string): Promise<Result<void, StreamRefused>> {
-    return attempt(() => this.stream.inform(informativeText([text])));
+  inform(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
+    return attempt(() => this.stream.inform(informativeText([text]), options?.signal));
   }
 
-  emit(text: string): Promise<Result<void, StreamRefused>> {
-    return attempt(() => this.stream.emit(text));
+  emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
+    return attempt(() => this.stream.emit(text, options?.signal));
   }
 
   finish(message: OutMessage): Promise<Result<void, StreamRefused>> {

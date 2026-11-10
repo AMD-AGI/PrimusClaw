@@ -25,6 +25,7 @@ import { toolsAllowlistProblem } from "./dags/admission.js";
 import { BadRequestError } from "../shared/errors.js";
 import { appGpuNodesFromSpec, gpuNodesFromSpec, topologyErrors } from "./run-spec.js";
 import type { DagNode, NodeSandbox, TaskDagDef } from "./dags/types.js";
+import { sandboxWorkspaceRefusal, type SandboxWorkspaceRefusal } from "./sandbox-workspaces.js";
 
 // The URL Brain (and other workers) should call back into for agent_done /
 // event / backend-mcp. Defaults to the local API port so the dev harness
@@ -50,7 +51,37 @@ export interface TopologyRefusal {
  * Two arms because the caller owes two different answers: a malformed
  * declaration is the request's fault and a full fleet is not.
  */
-export type CreateRefusal = AdmissionRefusal | TopologyRefusal;
+export type CreateRefusal = AdmissionRefusal | TopologyRefusal | SandboxWorkspaceCreateRefusal;
+
+/**
+ * A node's sandbox names a workspace the deployment does not isolate
+ * (SANDBOX_ALLOWED_NAMESPACES), answered as 400 with `sandboxWorkspace` as the body.
+ */
+export interface SandboxWorkspaceCreateRefusal {
+  admitted: false;
+  sandboxWorkspace: SandboxWorkspaceRefusal;
+}
+
+export function isSandboxWorkspaceRefusal(refusal: CreateRefusal): refusal is SandboxWorkspaceCreateRefusal {
+  return "sandboxWorkspace" in refusal;
+}
+
+/**
+ * The workspaces a graph's nodes name for their sandboxes, as written. A value
+ * that is still a template (`{{ ... }}`) is rendered at dispatch, where the
+ * dispatcher asks the same question of the rendered spec; one that is not a
+ * string is not a workspace name at all, and Brain refuses it on its own.
+ */
+export function dagSandboxWorkspaces(nodes: readonly DagNode[]): string[] {
+  const found: string[] = [];
+  for (const node of nodes) {
+    const sandbox = node.sandbox as unknown;
+    if (!sandbox || typeof sandbox !== "object") continue;
+    const ns = (sandbox as Record<string, unknown>).namespace;
+    if (typeof ns === "string" && ns.trim() !== "" && !ns.includes("{{")) found.push(ns.trim());
+  }
+  return found;
+}
 
 export function isCreateRefusal(
   result: object,
@@ -364,6 +395,10 @@ export async function expandDag(
 ): Promise<ExpandResult | CreateRefusal> {
   const invalid = topologyErrors(opts.input);
   if (invalid) return { admitted: false, invalidTopology: invalid };
+  // Before the lock and before anything is written: a node whose sandbox would
+  // land in a workspace the deployment does not isolate refuses the whole graph.
+  const refusedWorkspace = sandboxWorkspaceRefusal(dagSandboxWorkspaces(opts.dag.nodes));
+  if (refusedWorkspace) return { admitted: false, sandboxWorkspace: refusedWorkspace };
 
   const dag = opts.dag;
   const rootTaskId = newTaskId();

@@ -16,7 +16,7 @@
  *      NATS `tasks.execute` subject (brain consumer needs no changes).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { taskSubject } from "@claw/protocol";
+import { SANDBOX_WORKSPACE_NOT_ALLOWED, taskSubject } from "@claw/protocol";
 import type { ExecuteRequest, ReasoningEffort, ScriptStep, TaskMode } from "@claw/protocol";
 import {
   MissingPlatformKeyError,
@@ -28,6 +28,7 @@ import { sessionEffortFromRow } from "../sessions/session-model.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { usesReviewProfile } from "../github-review/requested-by.js";
 import { applyReviewProfile, ReviewTurnBudgetUsedError, reviewTurnsLeft } from "../github-review/review-profile.js";
+import { sandboxWorkspaceRefusal } from "./sandbox-workspaces.js";
 import { defaultTaskWorkspaceId } from "./default-workspace.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { db } from "../infra/db.js";
@@ -422,7 +423,35 @@ function buildExecuteRequest(opts: {
   // A task in a review someone asked of the owner runs with the same fixed profile as its turns (`github-review/review-profile.ts`). One
   // whose turn budget is used up throws here, before anything is published, and is failed `review_turn_budget_used`.
   if (opts.session.review_turns_left !== null) applyReviewProfile(request as unknown as Record<string, unknown>, opts.session.review_turns_left);
+  assertSandboxWorkspaceAllowed(request);
   return request;
+}
+
+/**
+ * Raised before anything is published when the run's sandbox would land in a
+ * workspace the deployment does not isolate (SANDBOX_ALLOWED_NAMESPACES).
+ * The routes refuse such a request with 400; this catches what they cannot
+ * see, a namespace a DAG template renders only now and a session pinned before
+ * the list was set, and fails the row `sandbox_workspace_not_allowed`.
+ */
+export class SandboxWorkspaceNotAllowedError extends Error {
+  readonly code = SANDBOX_WORKSPACE_NOT_ALLOWED;
+  constructor(readonly workspace: string, message: string) {
+    super(message);
+    this.name = "SandboxWorkspaceNotAllowedError";
+  }
+}
+
+/** Throws SandboxWorkspaceNotAllowedError for a run with a sandbox in a workspace off the list. */
+export function assertSandboxWorkspaceAllowed(request: Pick<ExecuteRequest, "sandbox_spec" | "workspace_id">): void {
+  const spec = request.sandbox_spec as unknown;
+  if (spec === undefined || spec === null || spec === "none") return;
+  const sandboxWorkspace = typeof spec === "object" ? (spec as Record<string, unknown>).sandbox_workspace : undefined;
+  const refused = sandboxWorkspaceRefusal([
+    request.workspace_id,
+    typeof sandboxWorkspace === "string" ? sandboxWorkspace : undefined,
+  ]);
+  if (refused) throw new SandboxWorkspaceNotAllowedError(refused.workspace, refused.message);
 }
 
 function executeRequestOf(opts: Parameters<typeof buildExecuteRequest>[0]): ExecuteRequest {
@@ -508,6 +537,7 @@ async function resolveDispatchFailure(
   const bindFailure = isWorkspaceBindingError(e);
   const credentialFailure = e instanceof MissingPlatformKeyError;
   const reviewBudgetUsed = e instanceof ReviewTurnBudgetUsedError;
+  const workspaceNotAllowed = e instanceof SandboxWorkspaceNotAllowedError;
   // The one failure here that is worth another attempt on its own. Everything
   // else is either the task's own fault (an unrenderable template, a session
   // that does not exist) or already covered: a NATS publish that failed leaves
@@ -545,6 +575,8 @@ async function resolveDispatchFailure(
       ? "missing_platform_key"
       : reviewBudgetUsed
         ? "review_turn_budget_used"
+        : workspaceNotAllowed
+        ? SANDBOX_WORKSPACE_NOT_ALLOWED
         : bindFailure
         ? "workspace_bind_failed"
         : "agent_error",

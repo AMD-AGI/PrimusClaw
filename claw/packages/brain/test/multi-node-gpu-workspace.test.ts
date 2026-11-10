@@ -126,6 +126,31 @@ test("multi-node ensure: a workspace the request names that is not the CPU one i
   assert.equal(await workspaceOfCreate("gpu-ws"), "gpu-ws");
 });
 
+test("multi-node ensure: SANDBOX_ALLOWED_NAMESPACES refuses a cluster in a workspace off the list before any create", async () => {
+  const saved = process.env.SANDBOX_ALLOWED_NAMESPACES;
+  process.env.SANDBOX_ALLOWED_NAMESPACES = "team-ws";
+  try {
+    safeCalls.length = 0;
+    createdIn.length = 0;
+    await assert.rejects(
+      () => new SafeMultiNodeProvider().ensure(
+        SESSION,
+        request("other-ws", "optimize --nodes 2 --mn-backend rayjob --mn-image img:1"),
+        async () => {},
+      ),
+      (e: unknown) => (e as { reason?: string }).reason === "sandbox_workspace_not_allowed",
+    );
+    assert.deepEqual(createdIn, [], "a cluster was created in a workspace off the list");
+    assert.deepEqual(safeCalls.filter((c) => c.startsWith("POST")), []);
+    // Listed, and the deployment's own GPU workspace a request naming nothing goes to, still create.
+    assert.equal(await workspaceOfCreate("team-ws"), "team-ws");
+    assert.equal(await workspaceOfCreate(""), "gpu-ws");
+  } finally {
+    if (saved === undefined) delete process.env.SANDBOX_ALLOWED_NAMESPACES;
+    else process.env.SANDBOX_ALLOWED_NAMESPACES = saved;
+  }
+});
+
 // --- the run's own release ----------------------------------------------------
 
 function fakeMsg() {
