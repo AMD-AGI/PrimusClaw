@@ -12,6 +12,7 @@
 import {
   GithubReview,
   itemLabel,
+  pickLang,
   redactText,
   ReviewHandoffAction,
   routedReviewTurns,
@@ -53,12 +54,13 @@ export interface ReviewInputs {
  * A work item's card in the reviewer's chat when a review waits for them (Python `_tell_reviewer_waiting`: `work_card`,
  * then the card is placed so it is ended with its item).
  */
-function workCardPoster(base: AssemblyBase): PostWorkCard {
+export function workCardPoster(base: Pick<AssemblyBase, "store">): PostWorkCard {
   const cards = base.store.assistantCards;
   return async (conversation, owner, item, text) => {
     const cardId = cards.addAssistantCard(owner, item.itemId, item.resultVersion, item.canAccept);
     const watching = cards.autoReply(owner, item.itemId) !== null;
-    const model = { item, text, cardId, note: "", watch: false, watching, lang: "zh" as const };
+    // (Python `work_card(item, text, card_id)`: no language given, so that of what is said or the item's title)
+    const model = { item, text, cardId, note: "", watch: false, watching, lang: pickLang(text, item.title) };
     const messageId = await conversation.post({
       body: { type: "view", view: { name: "workCard", model }, fallbackText: "" },
     });

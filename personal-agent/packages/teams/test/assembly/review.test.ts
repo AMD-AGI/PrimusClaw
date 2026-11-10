@@ -35,6 +35,7 @@ import { FakeSurface } from "../../../../test-support/surface.js";
 import { toInboundEvent } from "../../src/activity/inbound/to-event.js";
 import { teamsSettingsFromEnv } from "../../src/config/env.js";
 import { buildFeatures, type AssemblyBase } from "../../src/assembly/features.js";
+import { workCardPoster } from "../../src/assembly/features-review.js";
 
 const ALICE = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
 const ITEM = { item_id: "item-7", seq: 7, title: "Review acme/app#825", kind: "review", board_state: "in_progress" };
@@ -226,5 +227,21 @@ describe("the review service in the worker", () => {
       features.timers.find((t) => t.name === "sweep_review_cards"),
       undefined,
     );
+  });
+});
+
+describe("the reviewer's work card", () => {
+  it("is in the language of what it says, or of the item's title, as Python's work_card without a language", async () => {
+    const { store } = openTestStore();
+    const surface = new FakeSurface();
+    const post = workCardPoster({ store });
+    const conversation = surface.conversation({ id: "dm-b", kind: "personal", tenantId: "t1", wire: {} });
+    const item = { itemId: "item-9", seq: 9, title: "Review acme/app#9", resultVersion: 0, canAccept: false } as never;
+    await post(conversation, "aad-b", item, "The review waits for you: approve or request changes.");
+    await post(conversation, "aad-b", item, "代审在等你：批准或者要求修改。");
+    const langs = surface.outbox.flatMap((r) =>
+      r.op === "post" && r.message.body.type === "view" ? [(r.message.body.view.model as { lang: string }).lang] : [],
+    );
+    assert.deepEqual(langs, ["en", "zh"]);
   });
 });
