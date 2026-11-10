@@ -1,0 +1,26 @@
+name: ghcr push probe
+on:
+  pull_request:
+    paths: ['.github/workflows/ghcr-push-probe.yaml']
+permissions:
+  contents: read
+  packages: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push a one-file image to ghcr.io/amd-agi and check anonymous pull
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          img=ghcr.io/amd-agi/primusclaw-push-probe:probe
+          mkdir ctx && echo "ghcr push probe for PrimusClaw; safe to delete" > ctx/README
+          printf 'FROM scratch\nCOPY README /README\nLABEL org.opencontainers.image.source=https://github.com/AMD-AGI/PrimusClaw\nLABEL org.opencontainers.image.description="Push probe, safe to delete"\n' > ctx/Dockerfile
+          docker build -t "$img" ctx
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if docker push "$img"; then echo "PROBE push=ok"; else echo "PROBE push=failed"; exit 1; fi
+          docker logout ghcr.io
+          tok=$(curl -s "https://ghcr.io/token?scope=repository:amd-agi/primusclaw-push-probe:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' https://ghcr.io/v2/amd-agi/primusclaw-push-probe/manifests/probe)
+          echo "PROBE anonymous_manifest_http=$code (200 = public, 401/403/404 = not public)"
