@@ -816,6 +816,12 @@ const namedAsOtherElsewhere = (text: string, n: string): boolean =>
  * The ids the person gave in their own messages, which an answer may repeat without leaking anything: the uuids they wrote
  * (lower-cased), and the numbers they named an item by, as `#12`, `编号 12`, or after `item`, `task`, `事项` or `任务`.
  */
+/**
+ * What may stand right before a "#12" or "编号 12" the person gave as their item's number: nothing, punctuation, an item word, or a
+ * word that asks about it ("#12 呢", "看看 #12", "那 #12 呢", "what about #12").
+ */
+const ASKS_FOR_ITEM = /(?:^|[,，、:：(（\[]|(?:^|[\s,，、:：(（\[])(?:items?|tasks?|事项|任务|看看|看下|看一下|查查|查下|查一下|查看|说说|关于|那个?|还有|about|check|show(?: me)?|see|is|was|did))\s*$/i;
+
 export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; numbers: Set<string> } {
   const text = userTexts.join("\n");
   const uuids = new Set([...text.matchAll(UUID_G)].map((m) => m[0].toLowerCase()));
@@ -823,13 +829,12 @@ export function givenIds(userTexts: readonly string[]): { uuids: Set<string>; nu
   for (const m of text.matchAll(/(?:#|编号\s*#?|\b(?:items?|tasks?)\s*#?|事项\s*#?|任务\s*#?)\s*(\d+)/gi)) {
     // "PR #12 的状态" or "AMD-AGI/PrimusClaw#12" names a pull request's number, which excuses no item of that number.
     const clause = text.slice(Math.max(0, m.index - 120), m.index).split(/[。!！?？\n;；]|\.\s/).at(-1) ?? "";
-    // A number is the person's item only when nothing before it says what else it numbers: nothing NOT_AN_ITEM names in its clause
-    // ("议题 #3", "the run task 12"), and, for a "#12" or "编号 12" that does not say it is an item, no Latin word right before it
-    // other than item or task ("commit #12", "PR #12", "PR 编号 12", "AMD-AGI/PrimusClaw#12").
-    const before = clause.match(/([A-Za-z][\w.-]*(?:\/[\w.-]+)?)\s*$/)?.[1];
+    // A number is the person's item only when nothing NOT_AN_ITEM names in its clause ("议题 #3", "the run task 12"), and a "#12" or
+    // "编号 12" that does not say it is an item only when what stands right before it asks about one (`ASKS_FOR_ITEM`): not
+    // "commit #12", "PR 编号 12", "版本 #12" or "AMD-AGI/PrimusClaw#12".
     const named = /^(?:items?|tasks?|事项|任务)/i.test(m[0]);
-    if (namesOther(clause) || (!named && before && !/^(?:items?|tasks?)$/i.test(before))) continue;
-    numbers.add(String(Number(m[1])));
+    if (namesOther(clause) || (!named && !ASKS_FOR_ITEM.test(clause))) continue;
+    numbers.add(m[1].replace(/^0+(?=\d)/, ""));
   }
   return { uuids, numbers };
 }
@@ -843,7 +848,7 @@ export function bareItemNumber(text: string, seqMax?: number, given: ReadonlySet
   const re = new RegExp(BARE_NUMBER.source, "gm");
   for (let m = re.exec(text); m; m = re.exec(text)) {
     // A number the person gave in their own message is theirs to see again ("#12 呢？" answered "#12 已完成。").
-    if (given.has(String(Number(m[0].match(/\d+/)![0])))) continue;
+    if (given.has(m[0].match(/\d+/)![0].replace(/^0+(?=\d)/, ""))) continue;
     if (m[0].startsWith("编号")) return m[0];
     // Item numbers count up per person: one above the highest on their board is no item of theirs (an upstream PR, #48043).
     if (seqMax && Number(m[0].match(/\d+/)![0]) > seqMax) continue;
@@ -1293,18 +1298,25 @@ export function replyProse(text: string): string {
   // The first LANGUAGE_SAMPLE characters say what language a reply is in; an unclosed `[` or `“` makes the link and quote
   // patterns rescan the rest of its line from every opener, so the text they read is bounded.
   return text.slice(0, LANGUAGE_SAMPLE)
-    .replace(/```[\s\S]*?(?:```|$)/g, " ")
+    .replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ")
-    .replace(/!?\[[^\]\n]*\]\([^)\s]*\)/g, " ")
+    .replace(/!?\[[^\]\n]*\](?:\([^)\s]*\)|\[[^\]\n]*\])/g, " ")
     .replace(/\b(?:https?|ftp):\/\/\S+/gi, " ")
     .replace(/^[ \t]*>.*$/gm, " ")
-    .replace(/"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』/g, " ")
+    // Single quotes only around a passage, not in a word ("don't", "John's").
+    .replace(/"[^"\n]*"|“[^”\n]*”|‘[^’\n]*’|「[^」\n]*」|『[^』\n]*』|(?<![A-Za-z])'[^'\n]*'(?![A-Za-z])/g, " ")
     // Word by word (one pass, no backtracking across a long run): a word that is an identifier goes.
-    .replace(/[A-Za-z0-9\-_/.:#@]+/g, (w) => (IDENTIFIER.test(w) ? " " : w));
+    .replace(/[A-Za-z0-9\-_/.:#@]+/g, (w) => (isIdentifier(w) ? " " : w));
 }
 const LANGUAGE_SAMPLE = 8_000;
-// One hyphen joins English words too ("well-known", "user-facing"): only two or more make a name of a plain word.
-const IDENTIFIER = /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][_/.:#@][A-Za-z0-9]|[A-Za-z0-9]-[A-Za-z0-9]+-[A-Za-z0-9]|[a-z][A-Z]|^[A-Z][a-z]*[A-Z]/;
+/**
+ * A word that names something rather than says it: a digit beside a letter, `_ / . : # @` inside, a capital after a lower-case
+ * letter (`SaFE`, `AgentX`), or three or more parts joined by hyphens (`top-model-daily`) none of which is an English function word
+ * (`end-to-end`, `state-of-the-art` are words). An all-capital word (`OK`, `PR`) and one hyphen (`well-known`) are words too.
+ */
+const isIdentifier = (w: string): boolean => /[0-9][A-Za-z]|[A-Za-z][0-9]|[A-Za-z0-9][_/.:#@][A-Za-z0-9]|[a-z][A-Z]/.test(w)
+  || (/[A-Za-z0-9]-[A-Za-z0-9]+-[A-Za-z0-9]/.test(w) && !w.split("-").some((part) => FUNCTION_WORD.test(part)));
+const FUNCTION_WORD = /^(?:a|an|the|to|of|in|on|at|by|for|and|or|with|from|up|out|over|off|per|as|is)$/i;
 
 /**
  * The titles the turn read (an item's, a pull request's, a plan's: every `"title"` its tools answered, and the case's own items):
