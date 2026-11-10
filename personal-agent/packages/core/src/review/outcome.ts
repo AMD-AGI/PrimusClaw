@@ -126,6 +126,19 @@ export function refusalLines(
       ];
     case "enqueue_refused":
       return enqueueRefused(pull, outcome, errors);
+    case "github_workflow_scope_missing": {
+      // (GitHub refused because the pull request changes `.github/workflows/*` and the binding has no `workflow` scope: known
+      // not merged, and binding again does not add the scope, so the line says to merge it by hand and nothing else)
+      const approved = outcome.wrote === true;
+      return [
+        `GitHub refused to merge ${pull}: it changes CI workflow files (.github/workflows/), and merging it on your behalf needs ` +
+          "GitHub's workflow permission, which I do not have, so it was not merged. Please merge it by hand on GitHub" +
+          (approved ? "; the approval may already be on the pull request." : "."),
+        `${pull} 改了 CI workflow 文件（.github/workflows/ 下），代 ${name} 合入需要 GitHub 的 workflow 权限，目前没有这个权限，` +
+          "没有合入；请在 GitHub 上手动合入" +
+          (approved ? "，批准可能已经留在 PR 上。" : "。"),
+      ];
+    }
     case "enqueue_unconfirmed":
       return [
         `GitHub did not confirm that ${pull} is in the merge queue, so it is not known to be queued or merged. Look at the pull request before asking again.`,
