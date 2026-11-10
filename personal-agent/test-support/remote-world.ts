@@ -11,6 +11,7 @@
 import {
   type Clock,
   type Conversation,
+  type InboundAction,
   type InboundMessage,
   type OutMessage,
   type ConversationRef,
@@ -28,6 +29,7 @@ import type { RemoteContext, RemoteErrors, RemoteGuard, RemoteSettings } from ".
 import type { FollowTimings } from "../packages/core/src/remote/follow/timings.js";
 import { RemoteAgents } from "../packages/core/src/remote/remote-agents.js";
 import { RENDERERS } from "../packages/teams/src/views/index.js";
+import { toInboundEvent } from "../packages/teams/src/activity/inbound/to-event.js";
 import { DEFAULT_STYLE } from "../packages/teams/src/config/style.js";
 import { activityOf } from "../packages/teams/src/messenger/render.js";
 import { FakeClock } from "./clock.js";
@@ -311,12 +313,38 @@ export class RemoteWorld {
     return naturalCommand(menuCommand(text, false), false, off);
   }
 
+  /**
+   * A press of a button with `data`, as Teams sends it (an Action.Execute invoke) and the Teams adapter reads it
+   * (`toInboundEvent`): the verb the router dispatches on is what the adapter makes of it, not what a test says.
+   */
+  asTeamsSendsIt(data: Json, user: typeof USER_A, cardId: string): InboundAction {
+    const raw = {
+      type: "invoke",
+      name: "adaptiveCard/action",
+      id: this.id("click"),
+      from: { aadObjectId: user.id, id: user.channelUserId, name: user.name },
+      recipient: { id: "28:bot", name: "Clawy" },
+      serviceUrl: "https://smba.test/",
+      channelId: "msteams",
+      conversation: { id: `conv-${user.id}`, conversationType: "personal" },
+      replyToId: cardId,
+      value: { action: { type: "Action.Execute", verb: "", data } },
+    };
+    const event = toInboundEvent(raw);
+    if (!event.ok || event.value?.type !== "action")
+      throw new Error(`the Teams adapter does not read this press: ${JSON.stringify(data)}`);
+    return event.value;
+  }
+
+  /** The verbs of presses no handler registered (the router drops them). */
+  readonly unhandled: string[] = [];
+
   /** A tap on a card's button. */
   async click(data: Json, user = USER_A, cardId = "card-1"): Promise<void> {
     const to = this.conversationOf(user);
     const key = KEY_OF[user.id] ?? "";
     const sender = user;
-    const action = { type: "action", id: this.id("click"), verb: "", data, cardMessageId: cardId, sender } as unknown;
+    const action = this.asTeamsSendsIt(data, user, cardId);
     const settle = async (
       card: OutMessage | string,
       options: { fallback?: string; announce?: boolean } = {},
@@ -333,6 +361,11 @@ export class RemoteWorld {
       return replaced;
     };
     const handler = this.remote.clickHandler;
+    // (the router hands a press to the handler that registered its verb: one whose verb nobody registered does nothing)
+    if (!handler.verbs.includes(action.verb)) {
+      this.unhandled.push(action.verb);
+      return;
+    }
     await handler.withCredential?.(
       { action, conversation: to, sender, scope: "", lang: () => "en", settle } as never,
       key,
