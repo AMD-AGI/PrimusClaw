@@ -54,7 +54,8 @@ import { db } from "../infra/db.js";
 import { canViewPlugin } from "../marketplace/plugins.js";
 import pino from "pino";
 import { withAdmissionTransaction } from "./admission.js";
-import { createSingleTask, isCreateRefusal, isTopologyRefusal } from "./dag-expander.js";
+import { createSingleTask, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal } from "./dag-expander.js";
+import { sandboxWorkspaceRefusal, type SandboxWorkspaceRefusal } from "./sandbox-workspaces.js";
 import { newTaskId, ulid } from "./ids.js";
 
 const logger = pino({ name: "app-run" });
@@ -295,6 +296,9 @@ const refuse = (statusCode: number, error: string, extra: Record<string, unknown
   statusCode, response: { ok: false, error, ...extra },
 });
 
+/** A workspace the deployment does not isolate: 400, with the same body every other route answers. */
+const refuseWorkspace = (body: SandboxWorkspaceRefusal): AppRunOutcome => ({ statusCode: 400, response: { ...body } });
+
 /** What an Idempotency-Key already created in a session. */
 export interface AppRunByKey {
   taskId: string;
@@ -396,6 +400,18 @@ export async function checkAppRunRequest(
   }
   const resolved = resolvedOrIssues.resources;
   const plan = planAppRun(manifest, resolved);
+
+  // 4a. Every workspace a sandbox of this run may be created in -- the app
+  // container's, the one its child sandboxes use, and any a sandbox template
+  // names, which is where the grant lets the application start sandboxes --
+  // must be one the deployment isolates (SANDBOX_ALLOWED_NAMESPACES). Before
+  // the SaFE calls: the answer does not depend on them, and a refused run
+  // costs nobody a round trip.
+  const refusedWorkspace = sandboxWorkspaceRefusal([
+    ...plan.workspaceIds,
+    ...appGrantTemplates(manifest, resolved).map((t) => (typeof t.workspace === "string" ? t.workspace : undefined)),
+  ]);
+  if (refusedWorkspace) return refuseWorkspace(refusedWorkspace);
 
   // 4. Every workspace the resources name, asked at once (they are independent
   // SaFE calls); the answer is read in the order the workspaces were named so the
@@ -501,7 +517,9 @@ export async function admitAppRun(
         sandbox_spec: plan.sandboxSpec,
       }, client);
       if (isCreateRefusal(created)) {
-        const value = isTopologyRefusal(created)
+        const value = isSandboxWorkspaceRefusal(created)
+          ? refuseWorkspace(created.sandboxWorkspace)
+          : isTopologyRefusal(created)
           ? refuse(400, "invalid_topology", { errors: created.invalidTopology })
           : refuse(429, "admission_rejected", { reason: created.reason });
         return { commit: false, value };

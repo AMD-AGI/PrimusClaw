@@ -34,6 +34,7 @@ import {
   SandboxGoneError,
   SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
+  assertSandboxWorkspaceAllowed,
 } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -106,6 +107,9 @@ export class SafeWorkloadProvider implements SandboxProvider {
 
   async create(params: SandboxCreateParams): Promise<SandboxInstance> {
     const ns = params.namespace || SANDBOX_NAMESPACE;
+    // Before the platform is asked for anything: a workspace the deployment does
+    // not isolate is refused by name (SANDBOX_ALLOWED_NAMESPACES).
+    assertSandboxWorkspaceAllowed(ns);
     const apiKey = params.platformKey ?? "";
 
     const timeout = workloadTimeoutSeconds(params.timeoutSec, AGENT_SANDBOX_MAX_SESSION_SECONDS);

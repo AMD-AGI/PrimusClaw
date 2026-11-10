@@ -28,6 +28,17 @@ record it.
 ## [Unreleased]
 
 ### Added
+- `SANDBOX_ALLOWED_NAMESPACES` (comma or space separated; unset or empty allows every workspace, as before): the SaFE
+  workspaces a sandbox may be created in, for a deployment whose sandbox network isolation (the egress and ingress policies
+  a sandbox relies on) exists only in some workspaces. The deployment's own `SANDBOX_NAMESPACE`, `SANDBOX_CPU_NAMESPACE`
+  and `AGENT_SANDBOX_NAMESPACE` are always on it. A request naming any other workspace is refused with 400
+  `sandbox_workspace_not_allowed` (with `workspace`, `allowed` and a `message`) before anything is written: a message's or a
+  session's first message's `workspaceId`, a managed-agents session's `metadata.primus_claw.workspace_id`, a DAG node's
+  `sandbox.namespace` on `POST /v1/sessions/:id/tasks`, `/v1/batches` and workbench runs, and an application run's
+  `resources.workspace`, `resources.sandbox_workspace` and its sandbox templates' `workspace` (which is what its grant
+  allows). Behind those, the dispatcher fails a run whose rendered sandbox lands off the list
+  (`failure_reason: sandbox_workspace_not_allowed`) before publishing it, and Brain's providers refuse to create such a
+  sandbox (a terminal `sandbox_workspace_not_allowed`, not retried). Set it on api and brain.
 - `CLAW_MEMORY_DEFAULT_ON` (default `false`): whether long-term memory is on for a user who has never turned it on or off (no
   row in `claw_user_memory_prefs`). A user's own choice still wins either way, so one who turned memory off keeps it off, and
   `CLAW_MEMORY_ENABLED` is still the deployment-wide switch: with it off, the default turns no one on, and `POST`/`PUT

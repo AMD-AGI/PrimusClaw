@@ -71,7 +71,7 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { SANDBOX_WORKSPACE_FORBIDDEN, provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
+import { SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -4289,7 +4289,7 @@ class TaskRunner {
     const taskFailure = sandboxReason
       ? {
         reason: sandboxReason,
-        userText: sandboxReason === SANDBOX_WORKSPACE_FORBIDDEN
+        userText: sandboxReason === SANDBOX_WORKSPACE_FORBIDDEN || sandboxReason === SANDBOX_WORKSPACE_NOT_ALLOWED
           ? rawMsg.slice(0, 500)
           : `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}`,
       }

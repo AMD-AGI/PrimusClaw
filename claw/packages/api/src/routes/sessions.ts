@@ -58,6 +58,7 @@ import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
 import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
 import { toolsAllowlistProblem } from "../tasks/dags/admission.js";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
 const logger = pino({ name: "sessions" });
 
@@ -1242,6 +1243,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       const vetted = await vetRequestMcpServers(fm.mcp_servers);
       if (!vetted.ok) return reply.status(400).send({ ok: false, error: `message.${vetted.error}` });
       firstMessage.mcpServers = vetted.servers;
+      // The workspace the first turn's sandbox lands in must be one the deployment isolates.
+      const refusedWorkspace = sandboxWorkspaceRefusal([fmWorkspaceId]);
+      if (refusedWorkspace) return reply.status(400).send(refusedWorkspace);
     }
 
     const sessionEnvResult = parseSessionEnv(body.env);
@@ -1782,6 +1786,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       typeof workspaceIdRaw === "string" && workspaceIdRaw.trim() !== ""
         ? workspaceIdRaw.trim()
         : undefined;
+    // Refused before anything is queued: the sandbox this message may open would
+    // land in a workspace the deployment does not isolate (SANDBOX_ALLOWED_NAMESPACES).
+    const refusedWorkspace = sandboxWorkspaceRefusal([workspaceId]);
+    if (refusedWorkspace) return reply.status(400).send(refusedWorkspace);
     const vettedMcp = await vetRequestMcpServers(body.mcp_servers);
     if (!vettedMcp.ok) return reply.status(400).send({ ok: false, error: vettedMcp.error });
     const mcpServers = vettedMcp.servers;

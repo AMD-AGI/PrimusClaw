@@ -1,6 +1,13 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import {
+  SANDBOX_WORKSPACE_NOT_ALLOWED,
+  allowedSandboxWorkspaces,
+  sandboxWorkspaceAllowed,
+  sandboxWorkspaceNotAllowedText,
+} from "@claw/protocol";
+
 /**
  * A sandbox this deployment has no way to stop, ever.
  *
@@ -88,6 +95,9 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
   // Not a wait, but the same answer to "what does a second try buy": the
   // platform refused the account, and it refuses it again a second later.
   "sandbox_workspace_forbidden",
+  // Nor this one: the deployment does not let a sandbox run in that workspace,
+  // and a second try names the same workspace.
+  "sandbox_workspace_not_allowed",
 ]);
 
 /**
@@ -97,6 +107,8 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
  * is not a member of it).
  */
 export const SANDBOX_WORKSPACE_FORBIDDEN = "sandbox_workspace_forbidden";
+
+export { SANDBOX_WORKSPACE_NOT_ALLOWED };
 
 /**
  * What the user is told when the platform will not let their account start a
@@ -334,4 +346,22 @@ export class DagHandleScanTimeoutError extends Error {
     super(message);
     this.name = "DagHandleScanTimeoutError";
   }
+}
+
+/**
+ * Refuse to create a sandbox in a workspace the deployment does not isolate
+ * (SANDBOX_ALLOWED_NAMESPACES, see @claw/protocol sandbox-workspaces.ts).
+ *
+ * The API refuses a request naming such a workspace with 400; this is the
+ * line behind it, for whatever reached a provider without passing that check
+ * (a session pinned before the list was set, a namespace only a template
+ * rendered). Called by each provider before it asks the platform for anything.
+ */
+export function assertSandboxWorkspaceAllowed(workspace: string, env: Record<string, string | undefined> = process.env): void {
+  const allowed = allowedSandboxWorkspaces(env);
+  if (sandboxWorkspaceAllowed(workspace, allowed)) return;
+  throw new SandboxProvisionTerminalError(
+    SANDBOX_WORKSPACE_NOT_ALLOWED,
+    sandboxWorkspaceNotAllowedText(workspace.trim(), allowed!),
+  );
 }

@@ -25,7 +25,7 @@ import {
   AGENT_SANDBOX_SESSION_TIMEOUT,
   AGENT_SANDBOX_MAX_SESSION_DURATION,
 } from "../config.js";
-import { SandboxStopUnavailable } from "./errors.js";
+import { SandboxStopUnavailable, assertSandboxWorkspaceAllowed } from "./errors.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
 import type {
   SandboxProvider,
@@ -268,6 +268,8 @@ export class AgentSandboxProvider implements SandboxProvider {
 
   async create(params: SandboxCreateParams): Promise<SandboxInstance> {
     const ns = params.namespace || AGENT_SANDBOX_NAMESPACE;
+    // Before the template is written: see assertSandboxWorkspaceAllowed.
+    assertSandboxWorkspaceAllowed(ns);
     const { name } = await this.ensureTemplate(params, ns);
 
     // Router blocks until pod Running + healthy before returning.
