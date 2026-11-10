@@ -232,16 +232,20 @@ const LINE_BREAKS: ReadonlySet<string> = new Set([
   "\u2029",
 ]);
 
-/** `text.splitlines()`: the lines without their breaks; a trailing break makes no empty last line. */
-export function pySplitlines(text: string): string[] {
+/**
+ * `text.splitlines(keepends)`: the lines, without their breaks or (`keepends`) each with its own ("\r\n" is one break);
+ * a trailing break makes no empty last line.
+ */
+export function pySplitlines(text: string, keepends = false): string[] {
   const lines: string[] = [];
   let start = 0;
   for (let i = 0; i < text.length; i += 1) {
     const ch = text.charAt(i);
     if (!LINE_BREAKS.has(ch)) continue;
-    lines.push(text.slice(start, i));
-    if (ch === "\r" && text.charAt(i + 1) === "\n") i += 1;
-    start = i + 1;
+    const end = ch === "\r" && text.charAt(i + 1) === "\n" ? i + 2 : i + 1;
+    lines.push(text.slice(start, keepends ? end : i));
+    start = end;
+    i = end - 1;
   }
   if (start < text.length) lines.push(text.slice(start));
   return lines;
