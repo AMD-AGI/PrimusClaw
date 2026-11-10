@@ -8,12 +8,15 @@
  */
 import {
   InboundStats,
+  integrationRegistry,
   neutralPlugins,
   type MetricsPort,
   NOTE,
   redactText,
   SecurityLog,
   type Clock,
+  type IntegrationRegistry,
+  type Integrations,
   type Logger,
   type Plugins,
   type RequestScope,
@@ -38,6 +41,7 @@ import { teamsSettingsFromEnv } from "../config/env.js";
 import { gateEntryFromEnv, LOOPBACK, type GateEntry } from "../gate/entry-env.js";
 import { gateRoutes } from "../gate/routes.js";
 import { TeamsFileFetcher } from "../inbound/fetcher.js";
+import { buildInfoText, teamsVersion, withBuildInfo } from "../observability/build-info.js";
 import { AckRegistry } from "../messenger/acks.js";
 import { InboundConsumer } from "../servicebus/consumer.js";
 import type { BusClient } from "../servicebus/client.js";
@@ -184,18 +188,37 @@ async function assemblyBase(env: WorkerEnv, gate: GateEntry | undefined, deps: B
 type Parts = Awaited<ReturnType<typeof assemblyBase>>;
 
 /**
+ * `integrations` with what `register` adds to them (`WorkerOptions.registerIntegrations`): a registry that starts with
+ * every server and line already there, in their order, then takes the deployment's. Without `register`, `integrations`.
+ */
+export function withRegistered(
+  integrations: Integrations,
+  register: ((registry: IntegrationRegistry) => void) | undefined,
+): Integrations {
+  if (register === undefined) return integrations;
+  const registry = integrationRegistry();
+  for (const [name, shown] of integrations.mcpServers) {
+    registry.addMcpServer(name, shown, { query: integrations.queryServers.has(name) });
+  }
+  for (const line of integrations.connectionLines) registry.addConnectionLine(line);
+  register(registry);
+  return registry;
+}
+
+/**
  * The plugins: given, or built by the deployment's factory with the worker's services (once the store and the channel
- * exist, before the features: what the router is built with must be known then); then the platform services where they
- * are neutral (`platformPlugins`), and the exchange.
+ * exist, before the features: what the router is built with must be known then), with the integrations the options
+ * register; then the platform services where they are neutral (`platformPlugins`), and the exchange.
  */
 function pluginsOf(
   given: Plugins | PluginFactory,
   env: WorkerEnv,
   parts: Parts,
   services: WorkerServices,
-  deps: Basics,
+  deps: Basics & { readonly registerIntegrations: WorkerOptions["registerIntegrations"] },
 ) {
-  const own = typeof given === "function" ? neutralPlugins(given(services)) : given;
+  const built = typeof given === "function" ? neutralPlugins(given(services)) : given;
+  const own = { ...built, integrations: withRegistered(built.integrations, deps.registerIntegrations) };
   const plugins = platformPlugins(own, {
     env,
     settings: parts.settings,
@@ -251,7 +274,10 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
   const { outbound, inbound } = transport(parts.teams, gate, deps);
   const { acks, surface } = surfaceOf(parts.teams, outbound, gate, deps);
   const bound = workerServices({ ...parts, surface, logger: deps.logger, botName: BOT_NAME });
-  const resolved = pluginsOf(plugins, env, parts, bound.services, deps);
+  const resolved = pluginsOf(plugins, env, parts, bound.services, {
+    ...deps,
+    registerIntegrations: options.registerIntegrations,
+  });
   const base: AssemblyBase = { ...parts, ...deps, ...resolved, surface, random: cryptoRandom, env };
   const features = buildFeatures(base);
   bound.bind(features.router);
@@ -279,7 +305,12 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
         });
   return runner({
     app: buildServer({ routes: routesOf(base, features, handle, gate), maxBodyBytes: MAX_BODY_BYTES }),
-    metricsApp: buildServer({ routes: metricsRoutes(() => parts.prometheus.render()), maxBodyBytes: 1024 }),
+    metricsApp: buildServer({
+      routes: metricsRoutes(
+        withBuildInfo(() => parts.prometheus.render(), buildInfoText(teamsVersion(), process.version)),
+      ),
+      maxBodyBytes: 1024,
+    }),
     host: gate === undefined ? "0.0.0.0" : LOOPBACK,
     port: parts.settings.listenPort,
     metricsPort: parts.settings.metricsPort,
