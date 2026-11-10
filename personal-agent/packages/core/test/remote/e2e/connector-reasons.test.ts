@@ -129,10 +129,11 @@ test("a session claw closed with its machine says why in words", async () => {
 });
 
 for (const [reason, words] of [
-  ["terminal_working", "终端里正在跑一轮"],
-  ["terminal_typing", "终端里有人正在输入"],
-  ["terminal_screen", "菜单或对话框"],
-  ["something_new", "菜单或对话框"],
+  ["terminal_working", "已排队"],
+  ["terminal_typing", "输入框"],
+  ["terminal_dialog", "弹窗"],
+  ["terminal_screen", "等终端"],
+  ["something_new", "等终端"],
 ] as const) {
   test(`a message waiting for its terminal says why in the chat language: ${reason}`, () => {
     const step = decode(
@@ -142,7 +143,7 @@ for (const [reason, words] of [
     assert.equal(step.queued, reason);
     assert.equal(step.finished, false);
     const zh = queuedLine(step.queued, "zh");
-    assert.ok(zh.includes(words) && zh.includes("排队中"), zh);
-    assert.ok(queuedLine(step.queued, "en").includes("queued"));
+    assert.ok(zh.includes(words), zh);
+    assert.notEqual(queuedLine(step.queued, "en"), zh);
   });
 }

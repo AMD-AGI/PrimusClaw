@@ -12,13 +12,16 @@ import { it } from "node:test";
 import { flushMicrotasks } from "../../../../test-support/clock.js";
 import { finals, liveWorld, sent, streamed } from "../../../../test-support/assistant/live-world.js";
 import { modelOf, viewsOf } from "../../../../test-support/assistant/view-of.js";
-import { LIVE_ONLY, SAY_TOOL } from "../../src/assistant/follow.js";
+import { LIVE_ONLY, SAY_TOOL, TurnFollower } from "../../src/assistant/follow.js";
+import type { AssistantChat as AssistantChatPort } from "../../src/routing/features.js";
+import { ALICE as ROUTER_ALICE } from "../../../../test-support/routing/fixtures.js";
+import { message, world as routerWorld } from "../../../../test-support/routing/world.js";
 import type { JsonObject } from "../../src/json.js";
 import type { OutMessage } from "../../src/ports/surface.js";
 
 const ANSWER = "节点：12 个就绪，3 个忙。";
 const ASKED = "现在有多少节点在忙？";
-const RECEIVED = "收到，正在处理…";
+const RECEIVED = "收到，处理中";
 const BOTH = "查询 SaFE 节点 · 查询 SaFE 工作负载…";
 
 type Live = Awaited<ReturnType<typeof liveWorld>>;
@@ -245,3 +248,321 @@ it("a streamed reply about a result is said once and its card follows with the b
   assert.equal(model.item.canAccept, true);
   assert.ok(!model.text.includes(words), "the words are not said again in the card");
 });
+
+// --- a reply closes only the receipt of the message it answers (internal #496) -------------------------------------------------
+
+const RESULT_796 = "**❌ #796 删除 SaFE workload（global-cpu）未执行**：你在审批卡片上拒绝了删除。";
+const STARTED_797 = "已开始：#797 写问候语存成 hello.md。有结果或需要你时我会告诉你。";
+const ALICE = "aad-a";
+const SID = "asst-ak-alice"; // (the fake's assistant session of Alice's key)
+
+/**
+ * A 1:1 message to the assistant while another turn of its session (a task's report woke it) is running, the turn
+ * `claw-pending-3934`. An event of `otherKind` arrives while the message's receipt is open, then the message's own reply, said
+ * by `ownTurn`. With `queued`, Claw queued the message behind the running turn (no message id). `when` the other event arrives:
+ * "after" the message was handed over, "before_send" (the receipt is open and the message not yet handed over) or "in_flight"
+ * (Claw has the message and has not answered the send yet). Returns the outbox and whether the receipt was still open after the
+ * other event (Python `other_turn_meanwhile`).
+ */
+async function otherTurnMeanwhile(o: {
+  queued: boolean;
+  otherKind: string;
+  otherText: string;
+  otherExtra: JsonObject;
+  ownTurn: string;
+  when?: "after" | "before_send" | "in_flight";
+  /** The message comes through the worker's router (its 1:1 chat, as Teams sends it), not straight to the assistant. */
+  viaRouter?: boolean;
+}) {
+  const when = o.when ?? "after";
+  const l = await liveWorld();
+  l.w.claw.running.add(SID);
+  l.w.claw.turnMessage = "claw-pending-3934";
+  l.w.claw.queue = o.queued;
+  const conversation = `c-${ALICE}`;
+  const seen: boolean[] = [];
+  const pushOther = async (): Promise<void> => {
+    assert.ok(l.w.receipts.openOf(conversation) !== undefined, "the message has a receipt of its own");
+    const other = { type: o.otherKind, event_id: "e-other", text: o.otherText, ...o.otherExtra };
+    assert.equal(await l.push(other), "delivered");
+    seen.push(l.w.receipts.openOf(conversation) !== undefined);
+  };
+  const send = l.w.claw.assistant.send;
+  (l.w.claw.assistant as { send: typeof send }).send = async (...args) => {
+    const out = await send(...args);
+    if (when === "in_flight") await pushOther();
+    return out;
+  };
+  // (the turn in front is read once the receipt is open and before the message is handed over)
+  l.w.claw.onTurn = async () => {
+    if (when !== "before_send") return;
+    // (the read starts beside the receipt being opened and is waited for before the message is handed over)
+    for (let i = 0; i < 50 && l.w.receipts.openOf(conversation) === undefined; i += 1) await flushMicrotasks();
+    await pushOther();
+  };
+  const asked = "写一句问候语存成 hello.md，先问我中文还是英文";
+  try {
+    if (o.viaRouter === true) {
+      const r = routerWorld({
+        testStore: { store: l.w.store, clock: l.w.clock } as never,
+        surface: l.w.surface,
+        // (the assistant as the assembly hands it to the router: its methods, bound)
+        assistant: {
+          on: (userId) => l.w.chat.on(userId),
+          understands: (userId) => l.w.chat.understands(userId),
+          reachable: (userId) => l.w.chat.reachable(userId),
+          route: (request) => l.w.chat.route(request),
+        } satisfies Partial<AssistantChatPort>,
+      });
+      const inbound = message(asked, { user: { ...ROUTER_ALICE, id: ALICE }, conversation, id: "act-1" });
+      // (Teams' reference of the chat names the activity being answered: the receipt stands under it)
+      const wire = { ...inbound.conversation.wire, activityId: "act-1" };
+      await r.router.handle({ ...inbound, conversation: { ...inbound.conversation, wire } });
+      await r.router.settled();
+      assert.deepEqual(l.w.heard(), [asked]);
+    } else {
+      assert.equal(await l.w.say(asked), true);
+    }
+  } finally {
+    l.w.claw.running.delete(SID);
+  }
+  if (when === "after") await pushOther();
+  await flushMicrotasks();
+  const openAfterOther = seen.length === 1 && seen[0] === true && l.w.receipts.openOf(conversation) !== undefined;
+  const own = { type: "assistant.say", event_id: "e-own", text: STARTED_797, turn_message_id: o.ownTurn };
+  assert.equal(await l.push(own), "delivered");
+  await flushMicrotasks();
+  return { outbox: l.w.surface.outbox, openAfterOther, calls: [...l.w.claw.calls] };
+}
+
+const textOf = (m: OutMessage) =>
+  m.body.type === "text" ? m.body.text : m.body.type === "rich" ? m.body.markdown : JSON.stringify(m.body);
+
+function assertClosedByItsOwnReply(r: Awaited<ReturnType<typeof otherTurnMeanwhile>>, otherMark: string): void {
+  assert.ok(r.openAfterOther, "the other turn's words leave the receipt open");
+  const closedWith = finals(r.outbox).map(textOf);
+  assert.ok(closedWith.length === 1 && closedWith[0]?.includes("#797"), JSON.stringify(closedWith));
+  const messages = sent(r.outbox).map(textOf);
+  assert.ok(
+    messages.some((t) => t.includes(otherMark)),
+    JSON.stringify(messages),
+  );
+  assert.ok(!messages.some((t) => t.includes("#797")), JSON.stringify(messages));
+}
+
+it("another turns reply while a queued message waits is a message of its own", async () => {
+  // The release gate's failure (2026-11-10 05:11Z): the message asking for #797 was queued behind the turn reporting #796
+  // (claw-pending-3934), whose "❌ #796 … 未执行" closed the receipt under the #797 message.
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "claw-pending-3935",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+  // (what goes to Claw, in order: the assistant's session, the turn in front of the message, the message)
+  assert.deepEqual(
+    r.calls.filter((c) => c !== "upload"),
+    ["session", "turn", "send"],
+  );
+});
+
+it("another turns reply while a queued message waits is a message of its own, through the router", async () => {
+  // (the same, end to end: Alice's message as Teams sends it, read by the router, which hands it to the assistant)
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "claw-pending-3935",
+    viaRouter: true,
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("another turns reply does not close the receipt of a message claw took at once", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: false,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: { turn_message_id: "claw-pending-3934" },
+    ownTurn: "msg-1", // (the message's id, as Claw gave it at once)
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+for (const queued of [true, false]) {
+  for (const when of ["before_send", "in_flight"] as const) {
+    it(`another turns reply while the message is being handed over is a message of its own (${when}, ${queued ? "queued" : "taken"})`, async () => {
+      const r = await otherTurnMeanwhile({
+        queued,
+        otherKind: "assistant.say",
+        otherText: RESULT_796,
+        otherExtra: { turn_message_id: "claw-pending-3934" },
+        ownTurn: queued ? "claw-pending-3935" : "msg-1",
+        when,
+      });
+      assertClosedByItsOwnReply(r, "#796");
+    });
+  }
+}
+
+it("a reply naming no turn before the message is handed over is a message of its own", async () => {
+  // (Claw's notice of a lost turn is an assistant.say with no turn_message_id)
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: RESULT_796,
+    otherExtra: {},
+    ownTurn: "claw-pending-3935",
+    when: "before_send",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("a tasks own notice never closes the receipt of a message", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "work_item.needs_you",
+    otherText: "#796 needs your attention.",
+    otherExtra: { fallback: true },
+    ownTurn: "claw-pending-3935",
+  });
+  assertClosedByItsOwnReply(r, "#796");
+});
+
+it("a reply that names no turn still closes the receipt", async () => {
+  const r = await otherTurnMeanwhile({
+    queued: true,
+    otherKind: "assistant.say",
+    otherText: STARTED_797,
+    otherExtra: {},
+    ownTurn: "claw-pending-3935",
+  });
+  assert.equal(r.openAfterOther, false);
+  const closedWith = finals(r.outbox).map(textOf);
+  assert.ok(closedWith.length === 1 && closedWith[0]?.includes("#797"), JSON.stringify(closedWith));
+});
+
+// --- the turn is followed from just before the message is sent (internal #505) ---------------------------------------------
+
+/**
+ * A 1:1 message to the assistant, logging in which order it reads the turn in front of it, starts following its turn and is sent
+ * (with how many streams of the session Claw had been asked for by then); `understood`: a person the assistant understands
+ * (`AssistantChat.understand`), else one it takes over (`AssistantChat.route`); `send` replaces the send, `afterSend` runs
+ * once Claw took it. Returns the order, the outbox and the streams still open at the end (Python `hand_over`).
+ */
+async function handOver(o: {
+  queued: boolean;
+  understood: boolean;
+  send?: () => Promise<string | null>;
+  afterSend?: (l: Awaited<ReturnType<typeof liveWorld>>, messageId: string | null) => Promise<void>;
+  /** Runs once the message was handed over (what the turn says next). */
+  after?: (l: Awaited<ReturnType<typeof liveWorld>>) => Promise<void>;
+}) {
+  const l = await liveWorld(o.understood ? { understanding: [ALICE] } : {});
+  l.w.claw.queue = o.queued;
+  const order: string[] = [];
+  const asked = () => l.w.feed.opened;
+  l.w.claw.onTurn = async () => {
+    // (the read of the turn in front is a round trip: a stream asked for meanwhile was asked before it was read)
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    if (l.w.feed.afters.length > 0) order.push("following");
+    order.push("turn in front read");
+  };
+  const send = l.w.claw.assistant.send;
+  (l.w.claw.assistant as { send: typeof send }).send = async (...args) => {
+    if (l.w.feed.afters.length > 0 && !order.includes("following")) order.push("following");
+    order.push(`sent, ${String(asked())} stream asked for`);
+    const out = o.send === undefined ? await send(...args) : await o.send();
+    await o.afterSend?.(l, out);
+    return out;
+  };
+  const text = "现在有多少节点在忙？";
+  try {
+    if (o.understood) {
+      await l.w.chat.understand({
+        userId: ALICE,
+        credential: "ak-alice",
+        modelKey: "",
+        prompt: text,
+        context: { channel_message_id: "m-1" },
+        lang: "zh",
+        conversation: l.w.conversation(),
+        files: [],
+      });
+    } else {
+      await l.w.say(text);
+    }
+  } catch {
+    // (a send that fails in a way no handler names comes back as it is)
+  }
+  await o.after?.(l);
+  await flushMicrotasks();
+  return { order, outbox: l.w.surface.outbox, stillOpen: l.w.feed.open, opened: l.w.feed.opened };
+}
+
+for (const understood of [false, true]) {
+  for (const queued of [false, true]) {
+    it(`the turn is followed from before the message is sent and after the turn in front is read (${understood ? "understand" : "route"}, ${queued ? "queued" : "taken"})`, async () => {
+      // (L1 self-check) the turn in front is read, then the turn is followed, and the message is sent only once Claw has
+      // answered the stream's request: three requests to Claw in one order, every time.
+      const { order } = await handOver({ queued, understood });
+      assert.deepEqual(order, ["turn in front read", "following", "sent, 1 stream asked for"]);
+    });
+  }
+}
+
+for (const understood of [false, true]) {
+  it(`a turn that says its first step at once shows it (${understood ? "understand" : "route"})`, async () => {
+    // A turn whose first step comes the moment Claw takes the message: the stream was open before the message was sent.
+    const { outbox } = await handOver({
+      queued: false,
+      understood,
+      // (the turn's script: its first step the moment Claw takes the message, then its say 0.05 s later)
+      afterSend: async (l, messageId) => {
+        await l.live("toolUsed", { tool: "mcp__safe__node_list", actionId: "t1", status: "start" }, messageId ?? "");
+      },
+      after: (l) => l.live("toolUsed", { tool: SAY_TOOL, actionId: "t3", status: "start" }),
+    });
+    const informative = streamed(outbox, "inform");
+    assert.ok(
+      informative.some((line) => line.includes("查询 SaFE 节点")),
+      JSON.stringify(informative),
+    );
+  });
+}
+
+it("a send that fails in a way no handler names still closes the stream", async () => {
+  const { stillOpen } = await handOver({
+    queued: false,
+    understood: true,
+    send: () => Promise.reject(new Error("a failure no handler names")),
+  });
+  assert.equal(stillOpen, 0, "the stream is closed");
+});
+
+for (const understood of [false, true]) {
+  it(`a message cancelled while its stream opens leaves no stream open (${understood ? "understand" : "route"})`, async () => {
+    // (internal #505, codex r2) The message stopped while it waited for its turn's stream to open: the follower it started is
+    // settled all the same and its stream closed. A promise cannot be cancelled: here the wait ends in an error instead.
+    const wait = Object.getOwnPropertyDescriptor(TurnFollower.prototype, "waitOpen");
+    assert.ok(wait !== undefined);
+    Object.defineProperty(TurnFollower.prototype, "waitOpen", {
+      ...wait,
+      // (the stream opens at Claw while the message waits for it; then the message stops)
+      value: async () => {
+        for (let i = 0; i < 20; i += 1) await Promise.resolve();
+        throw new Error("the message was cancelled");
+      },
+    });
+    try {
+      const { stillOpen, opened } = await handOver({ queued: false, understood });
+      assert.equal(opened, 1, "the stream was asked for");
+      assert.equal(stillOpen, 0, "the stream is closed");
+    } finally {
+      Object.defineProperty(TurnFollower.prototype, "waitOpen", wait);
+    }
+  });
+}

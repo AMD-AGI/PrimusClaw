@@ -117,10 +117,12 @@ export interface WorldOptions {
   readonly direct?: boolean;
   /** The follower's timings (TEST_TIMINGS when not given). */
   readonly timings?: FollowTimings;
+  /** A turn is shown by a stream (Teams' floating status, then the answer in its bubble), as in a 1:1 chat that streams. */
+  readonly streaming?: boolean;
 }
 
 export class RemoteWorld {
-  readonly surface = new FakeSurface({ caps: { streaming: false } });
+  readonly surface: FakeSurface;
   readonly virtual = new VirtualClock();
   /** The store, on a wall clock a test can move (`advanceSeconds`); it starts at the real time. */
   readonly test = openTestStore({ clock: new FakeClock(Date.now()) });
@@ -157,6 +159,7 @@ export class RemoteWorld {
     readonly server: FakeRemote,
     options: WorldOptions,
   ) {
+    this.surface = new FakeSurface({ caps: { streaming: options.streaming ?? false } });
     const store = this.test.store;
     const claw = createClawClient({ baseUrl: server.url, clock: systemClock });
     this.claw = claw.remoteAgents;
@@ -167,7 +170,7 @@ export class RemoteWorld {
       timings: options.timings ?? TEST_TIMINGS,
       watchTimings: TEST_TIMINGS,
       botName: "Clawy",
-      streaming: false,
+      streaming: options.streaming ?? false,
       ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
     };
     const ctx: RemoteContext = {

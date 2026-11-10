@@ -33,6 +33,8 @@ export interface AssemblyBase {
   readonly clock: Clock;
   readonly random: Random;
   readonly logger: Logger;
+  /** What the platform and GitHub clients send with (the global `fetch`; a test's fake). */
+  readonly fetch: typeof fetch;
   readonly metrics: MetricsPort;
   readonly securityLog: SecurityLog;
   /** The one request scope (runtime `alsRequestScope`): the router enters it per inbound event, everything else reads it. */

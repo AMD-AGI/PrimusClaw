@@ -122,6 +122,8 @@ function actionClicks(actions: AssistantActions): ClickHandler {
 export interface AssistantInputs {
   readonly style: Style;
   readonly integrations: Integrations;
+  /** A review the assistant handed back (`review_for_other`): to the review service, "dropped" without it. */
+  readonly reviewHandoff: (userId: string, event: Readonly<Record<string, unknown>>) => "delivered" | "dropped";
   /** NOTIFY_WEBHOOK_URL ("" off). */
   readonly notifyUrl: string;
   readonly hooks: RouterHooks;
@@ -154,7 +156,8 @@ export function assistantParts(base: AssemblyBase, inputs: AssistantInputs): Ass
     understands: (userId) => assistant.understands(userId),
     reachable: (userId) => assistant.reachable(userId),
     logger,
-    // (reviewHandoff: the review service is not wired here, so a handed-back review is dropped, as Python's with GITHUB_REVIEW off)
+    // (a review handed back: taken by the review service, dropped without it as Python's with GITHUB_REVIEW off)
+    reviewHandoff: inputs.reviewHandoff,
   });
   const work = new WorkClicks({
     store,

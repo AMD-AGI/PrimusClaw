@@ -8,7 +8,7 @@ import { workItem } from "../../../../test-support/assistant/work-items.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
 import { NO_RETRY_SECONDS } from "../../src/assistant/board.js";
 import { failureText, statusText } from "../../src/assistant/work-clicks.js";
-import { ClawError, ClawUnreachable } from "../../src/claw/errors.js";
+import { ClawAnswerInvalid, ClawError, ClawUnreachable } from "../../src/claw/errors.js";
 import { ALICE, clicksWorld, describe } from "./clicks-world.js";
 
 const KEY = "ak-alice";
@@ -126,9 +126,16 @@ it("claw refusing or not answering offers the card again and a gone item ends it
   await assert.rejects(w.handler.withCredential(bug.route, KEY), RangeError);
 });
 
+/** The store's clock now, as Claw writes an item's `updatedAt` (a stop just now: its Retry has not expired). */
+function justNow(w: { store: { now(): number } }): string {
+  return new Date(w.store.now() * 1000).toISOString();
+}
+
 it("retry runs a task again and the board takes the place of the pressed one", async () => {
   const w = clicksWorld();
-  w.claw.add(workItem({ itemId: "it-1", boardState: "done", outcome: "stopped", canAccept: false }));
+  w.claw.add(
+    workItem({ itemId: "it-1", boardState: "done", outcome: "stopped", canAccept: false, updatedAt: justNow(w) }),
+  );
   const { route, settled } = w.click({ primusclaw: "work", op: "retry", card: cardFor(w, "it-1", false) });
   await w.handler.withCredential(route, KEY);
   assert.equal(describe(settled[0]?.card), "view:board");
@@ -141,7 +148,8 @@ it("retry runs a task again and the board takes the place of the pressed one", a
 
 it("a claw without retry is not offered retry for a while", async () => {
   const w = clicksWorld();
-  w.claw.add(workItem({ itemId: "it-1", boardState: "done", outcome: "stopped", canAccept: false }));
+  // (a failed task: it keeps its Retry however long it waits, where a stopped one's expires within the hour)
+  w.claw.add(workItem({ itemId: "it-1", canAccept: false, lastReportKind: "failed" }));
   w.claw.fail.set("retry", new ClawError(404, "Not Found"));
   const { route, settled } = w.click({ primusclaw: "work", op: "retry", card: cardFor(w, "it-1", false) });
   await w.handler.withCredential(route, KEY);
@@ -156,6 +164,11 @@ it("a claw without retry is not offered retry for a while", async () => {
   const away = w.click({ primusclaw: "work", op: "retry", card: cardFor(w, "it-1", false) });
   await w.handler.withCredential(away.route, KEY);
   assert.equal(away.settled[0]?.card, "I could not reach PrimusClaw. Press Retry again in a moment.");
+  // the item read before a retry, in an answer this worker does not understand: as unreachable (Python's ValueError)
+  w.claw.fail.set("item", new ClawAnswerInvalid("work item"));
+  const unread = w.click({ primusclaw: "work", op: "retry", card: cardFor(w, "it-1", false) });
+  await w.handler.withCredential(unread.route, KEY);
+  assert.equal(unread.settled[0]?.card, "I could not reach PrimusClaw. Press Retry again in a moment.");
 });
 
 it("accept all takes each result at the version the board showed and says what was left", async () => {

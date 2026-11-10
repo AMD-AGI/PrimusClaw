@@ -15,16 +15,16 @@ import type { ClawWorkItemsPort } from "../ports/claw/index.js";
 import type { AssistantCard, StorePort } from "../ports/store/index.js";
 import type { OutMessage, View } from "../ports/surface.js";
 import type { Board } from "./board.js";
-import { refusal, unreachable } from "./failures.js";
+import { answerInvalid, refusal, unreachable } from "./failures.js";
 import { finish } from "./finish.js";
 import { ACCEPT_ALL_MAX, NO_RETRY_SECONDS } from "./board.js";
-import { itemLabel } from "./work-items.js";
+import { itemLabel, retryable } from "./work-items.js";
 
 export type WorkClickStore = Pick<StorePort, "now" | "assistantCards">;
 
 export interface WorkClickDeps {
   readonly store: WorkClickStore;
-  readonly claw: Pick<ClawWorkItemsPort, "accept" | "stop" | "retry">;
+  readonly claw: Pick<ClawWorkItemsPort, "get" | "accept" | "stop" | "retry">;
   readonly board: Board;
   /** An item was stopped here: whatever follows its work here ends as stopped. */
   readonly onStopped: (itemId: string) => void;
@@ -180,7 +180,10 @@ export class WorkClicks {
     await finish(click, t.updatedCard({ note, version: item.resultVersion }), card);
   }
 
-  /** Retry on the board: the task (failed, or stopped) runs again in its own session; Claw decides whether it may. */
+  /**
+   * Retry on the board: the task (failed, or stopped) runs again in its own session; Claw decides whether it may. A stopped task
+   * is read first: past RETRY_STOPPED_SECONDS its Retry has expired, as the board would no longer offer it, and Claw is not asked.
+   */
   async retry(click: CardClick, key: string): Promise<void> {
     const { store } = this.deps;
     const card = this.card(click);
@@ -194,6 +197,11 @@ export class WorkClicks {
     }
     let decision: Decision;
     try {
+      const item = await this.deps.claw.get(key, card.itemId);
+      if (item.boardState === "done" && item.outcome === "stopped" && !retryable(item, store.now())) {
+        await this.retryExpired(click, key, card, item);
+        return;
+      }
       decision = await this.deps.claw.retry(key, card.itemId);
     } catch (error) {
       await this.retryFailed(click, key, card, error);
@@ -209,8 +217,15 @@ export class WorkClicks {
     await finish(click, (await this.deps.board.now(click.sender.id, key)) ?? said, said);
   }
 
+  /** A Retry pressed after the stop it was drawn for has aged past RETRY_STOPPED_SECONDS: the card is done, Claw is not asked. */
+  private async retryExpired(click: CardClick, key: string, card: AssistantCard, item: WorkItem): Promise<void> {
+    this.deps.store.assistantCards.moveAssistantCard(card.cardId, "done");
+    const said = t.stoppedLongAgo({ label: itemLabel(item) });
+    await finish(click, (await this.deps.board.now(click.sender.id, key)) ?? said, said);
+  }
+
   private async retryFailed(click: CardClick, key: string, card: AssistantCard, error: unknown): Promise<void> {
-    if (!(refusal(error) || unreachable(error))) throw error;
+    if (!(refusal(error) || unreachable(error) || answerInvalid(error))) throw error;
     const { store } = this.deps;
     const refused = refusal(error);
     if (refused === undefined) {

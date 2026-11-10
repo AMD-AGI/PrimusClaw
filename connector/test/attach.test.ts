@@ -83,36 +83,20 @@ function fakeCli(mode: string, live: unknown[]): { cli: string; env: Record<stri
   return { cli, env: { FAKE_CLAUDE_MODE: mode, FAKE_CLAUDE_LIVE: liveFile } };
 }
 
-describe("whether a conversation's main turn has ended (a terminal Claude Code calls busy)", () => {
-  test("read from the transcript: turn_duration last, nothing queued; a file rewritten in place is read whole again (codex r3 on #632)", async () => {
-    const dir = configDir();
-    const projects = path.join(dir, "projects", "-w");
-    fs.mkdirSync(projects, { recursive: true });
-    const file = path.join(projects, `${REF}.jsonl`);
-    const l = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: REF, ...o })}\n`;
-    fs.writeFileSync(file, l({ type: "user" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
-    const s = support(dir);
-    assert.equal(await s.mainTurnEnded(REF), true);
-    fs.appendFileSync(file, l({ type: "user" }));
-    assert.equal(await s.mainTurnEnded(REF), false, "a new turn");
-    fs.appendFileSync(file, l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
-    assert.equal(await s.mainTurnEnded(REF), true);
-    // The same file (same inode) rewritten, longer than what was read, with a message still queued before its last turn's end.
-    // (every write from here goes through the one descriptor: the file is never reopened by its name)
-    const fd = fs.openSync(file, "r+");
-    let at = 0;
-    const put = (text: string) => { at += fs.writeSync(fd, text, at); };
-    try {
-      fs.ftruncateSync(fd, 0);
-      put(l({ type: "user", pad: "x".repeat(400) }) + l({ type: "queue-operation", operation: "enqueue" }) + l({ type: "assistant" }) + l({ type: "system", subtype: "turn_duration" }));
-      assert.equal(await s.mainTurnEnded(REF), false, "the queued message is seen");
-      put(l({ type: "queue-operation", operation: "remove" }));
-      assert.equal(await s.mainTurnEnded(REF), true, "taken");
-      put("{ not json\n");
-      assert.equal(await s.mainTurnEnded(REF), null, "a line that does not parse: no answer");
-    } finally {
-      fs.closeSync(fd);
-    }
+describe("what a transcript says of a message Claude Code queued (submitted while a turn ran)", () => {
+  test("enqueue, taken into the running turn (queued_command), and handed back to the box (popAll); nothing else of the queue", () => {
+    const l = (o: Record<string, unknown>) => JSON.stringify({ sessionId: REF, isSidechain: false, ...o });
+    // (the shapes Claude Code 2.1.285 writes, measured 2026-11-10)
+    assert.deepEqual(transcriptUpdates(l({ type: "queue-operation", operation: "enqueue", content: "from the phone" })), [{ type: "queued", update: { text: "from the phone" } }]);
+    assert.deepEqual(transcriptUpdates(l({ type: "attachment", attachment: { type: "queued_command", prompt: "from the phone", commandMode: "prompt" } })),
+      [{ type: "queued_taken", update: { text: "from the phone" } }]);
+    assert.deepEqual(transcriptUpdates(l({ type: "queue-operation", operation: "popAll" })), [{ type: "queue_withdrawn", update: {} }]);
+    for (const other of [
+      l({ type: "queue-operation", operation: "dequeue" }),
+      l({ type: "queue-operation", operation: "remove", content: "from the phone", reason: "absorbed_mid_turn" }),
+      l({ type: "attachment", attachment: { type: "date" } }),
+      l({ type: "queue-operation", operation: "enqueue", content: "a background agent's", isSidechain: true }),
+    ]) assert.deepEqual(transcriptUpdates(other), [], other);
   });
 });
 
@@ -700,6 +684,38 @@ describe("reading a transcript another process writes", () => {
     assert.deepEqual(tail.poll(), [], "a rewritten file is followed from its new end");
     fs.appendFileSync(file, say("after"));
     assert.deepEqual(texts(tail.poll()), ["after"]);
+  });
+
+  test("a read that fails part way through a look keeps what the reads before it gave; the next look reads on (codex r1 on #674)", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    fs.writeFileSync(file, "");
+    const tail = new TranscriptTail(() => file);
+    tail.fromEnd();
+    const line = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: "s", isSidechain: false, ...o })}\n`;
+    const step = (id: string) => line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command: "true" } }] } });
+    fs.appendFileSync(file, step("toolu_first") + line({ type: "attachment", attachment: { type: "prompt_snapshot", text: "x".repeat(600_000) } }) + step("toolu_after"));
+    const real = fs.readSync;
+    let reads = 0;
+    (fs as { readSync: unknown }).readSync = (...a: unknown[]) => { if (++reads === 2) throw new Error("EIO"); return (real as (...x: unknown[]) => number)(...a); };
+    let got: ReturnType<TranscriptTail["poll"]>;
+    try { got = tail.poll(); } finally { (fs as { readSync: unknown }).readSync = real; }
+    assert.deepEqual(got.filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), ["toolu_first"], "the first read's step is kept");
+    assert.deepEqual(tail.poll().filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), ["toolu_after"], "the next look reads on");
+  });
+
+  test("a step written after a large line (Claude Code's prompt_snapshot attachment) comes on the first look, not a look per 256 KB later (#505 acceptance)", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    fs.writeFileSync(file, "");
+    const tail = new TranscriptTail(() => file);
+    tail.fromEnd();
+    const line = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: "s", isSidechain: false, ...o })}\n`;
+    for (const size of [900_000, 1_500_000]) {   // (one Claude Code reads whole, one past the line limit it skips)
+      fs.appendFileSync(file, line({ type: "user", message: { role: "user", content: "run it" } })
+        + line({ type: "attachment", attachment: { type: "prompt_snapshot", text: "x".repeat(size) } })
+        + line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${size}`, name: "Bash", input: { command: "sleep 3" } }] } }));
+      const got = tail.poll();
+      assert.deepEqual(got.filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), [`toolu_${size}`], `after ${size} bytes`);
+    }
   });
 });
 

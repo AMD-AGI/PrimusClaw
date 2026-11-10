@@ -37,6 +37,12 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
 }
 
+/**
+ * A task's own notice: Claw says it in the system's words when one of the person's tasks needs them and nobody said so (no turn
+ * of the assistant said it), so it is never the reply to the message a receipt stands under.
+ */
+const NEEDS_YOU = "work_item.needs_you";
+
 export class Deliveries {
   constructor(
     private readonly deps: ProactiveDeps,
@@ -157,7 +163,13 @@ export class Deliveries {
     event: JsonObject,
     said: { words: string; head: string; replies: readonly (readonly [string, string])[] },
   ): Promise<void> {
-    const receipt = this.deps.receipts.take(conversation.ref.id);
+    // Only the reply of the message's own turn closes its receipt: another turn's (a task's report woke the assistant while the
+    // message waited) and a task's own notice (Claw's `work_item.needs_you`, said by no turn) are messages of their own.
+    const turn = event["turn_message_id"];
+    const receipt = this.deps.receipts.take(conversation.ref.id, undefined, {
+      turn: typeof turn === "string" && turn ? turn : undefined,
+      foreign: event["type"] === NEEDS_YOU,
+    });
     const shown = receipt ? await receipt.shownWords() : "";
     const messages = this.deps.say.messages(userId, event, {
       linkFor: this.deps.deliveryLink,

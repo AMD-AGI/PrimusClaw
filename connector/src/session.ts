@@ -19,7 +19,7 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import { BUSY_SCREEN_VERIFIED_VERSIONS, TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
+import { TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { TerminalInput, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
@@ -57,7 +57,11 @@ export interface SessionTiming {
   authWaitMs: number;
   /** How long a takeover waits for the terminal it ended to exit (the transcript's quiet, `recentWriteMs`, is waited on top). */
   takeoverWaitMs: number;
-  /** A message for a terminal that is busy (or being typed in) waits this long for it to be free, then is refused (`terminal_busy`). */
+  /**
+   * A message for a terminal whose process cannot be told to hold the conversation still (its Claude Code says nothing of it), or
+   * whose box holds someone's half-typed text, or whose screen is scrolled back, waits this long, then is refused
+   * (`terminal_state_unknown`, `terminal_busy`). Whether that Claude Code is busy is never waited on, nor a question on its screen.
+   */
   terminalWaitMs: number;
   /** A message typed into a terminal must show up in its transcript within this long, or its turn ends `terminal_input_unconfirmed`. */
   terminalEchoMs: number;
@@ -84,11 +88,9 @@ export const READ_ONLY_REASON = "read_only_live_session";
 /** Why a mode change or a decision for a conversation that is typed into in its terminal is refused: the terminal owns those. */
 export const TERMINAL_OWNS_REASON = "terminal_session";
 /** What a terminal that typed messages wait for is doing, as the queue notice says it. */
-/** How far apart the two screen reads are that let a message into a terminal Claude Code calls `busy` (background agents only). */
-const BUSY_SCREEN_SETTLE_MS = 500;
-
-const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "busy" | "waiting" | "other", string> = {
-  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", busy: "terminal_working", waiting: "terminal_waiting", other: "terminal_switched",
+const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "other" | "unknown", string> = {
+  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", dialog: "terminal_dialog", other: "terminal_switched",
+  unknown: "terminal_state_unknown",
 };
 
 export interface SessionEnv {
@@ -192,6 +194,18 @@ export class Session {
   private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private terminalTurn: {
     cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
+    /** Claude Code queued it (it was submitted while a turn ran): it is taken in at that turn's next step, or once the turn ends. */
+    queued?: boolean;
+    /** The keys are being typed, Enter not yet gone (a question on the screen may hold it): the echo is not waited for yet. */
+    typing?: boolean;
+    /** Its text went into the box: only from then on can the transcript show it (the same words before are someone else's). */
+    pasted?: boolean;
+    /**
+     * It started a turn of its own in the terminal (its prompt is the turn's, submitted at an idle prompt). Only such a turn is the
+     * phone's to stop with Esc; one that went through Claude Code's queue (taken into a running turn, or out of the queue after it)
+     * is not told apart from the person's for certain, and is left alone.
+     */
+    own?: boolean;
     /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
     keys?: boolean;
     /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
@@ -199,7 +213,6 @@ export class Session {
   } | null = null;
   private terminalPumping = false;
   /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
-  private unverifiedTold = false;
   private terminalRestoring: Promise<void> | null = null;
   private tail: TranscriptTail | null = null;
   private tailTimer: NodeJS.Timeout | undefined;
@@ -416,10 +429,24 @@ export class Session {
       if (turn?.seen) this.endTerminalTurn("end_turn");
       return;
     }
+    // What Claude Code did with a message submitted while a turn ran: queued it (taken: the echo), took it into that turn (its start
+    // here), or handed the queue back to the terminal's box (withdrawn there). Never sent on: the phone sees the turn's own lines.
+    if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
+      if (!turn || turn.seen || !turn.pasted) return;
+      const said = String(u.update.text ?? "");
+      if (u.type === "queued" && sameText(said, turn.text)) turn.queued = true;
+      else if (u.type === "queued_taken" && sameText(said, turn.text)) turn.seen = true;
+      else if (u.type === "queue_withdrawn" && turn.queued) this.endTerminalTurn("error", "terminal_input_withdrawn");
+      return;
+    }
     if (u.type === "user_message_chunk" && turn) {
       const said = String((u.update.content as { text?: unknown } | undefined)?.text ?? "");
       // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
-      if (!turn.seen && sameText(said, turn.text)) { turn.seen = true; return; }
+      // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
+      // queued before it could be the one that came out first, and its turn is the person's)
+      if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
+      // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
+      if (turn.pasted && !turn.seen && turn.queued && wholeLinesOf(said, turn.text)) { turn.seen = true; return; }
       if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
@@ -431,8 +458,10 @@ export class Session {
   // --- typing into the terminal ------------------------------------------------------------
 
   /**
-   * A message for a conversation open in a tmux pane: queued, then typed into the terminal once it is free (Claude Code says it
-   * is idle, and its input box is empty), one at a time. While it waits the phone is told once why (`terminal_input_queued`).
+   * A message for a conversation open in a tmux pane: typed into the terminal at once, one at a time, whatever Claude Code is doing
+   * there (a running turn queues it, as one the person at the terminal types). It waits only while it could not be typed safely: the
+   * box holds someone's half-typed text, the screen is scrolled back, or a question or a menu is on it (an Enter there would answer
+   * it). While it waits the phone is told once why (`terminal_input_queued`).
    */
   private enqueueTerminal(text: string, cmdId: string | null, cmdSeq: number | null, started: () => void, mayRun?: MayRun): void {
     if (this.terminalQueue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
@@ -460,58 +489,54 @@ export class Session {
         if (this.terminalRestoring) await this.terminalRestoring;
         const term = this.terminal;
         if (!term) { refused("terminal_input_unavailable"); continue; }
-        const waitBy = Date.now() + this.env.timing.terminalWaitMs;
         let told = "";
         let ready = false;
-        // Let in through the `busy` gate (codex r1 on #632): every later check and the Enter keep that gate's checks, whatever the
-        // status says by then.
-        let viaBusy = false;
         // Typed in any permission mode (the terminal's owner chose it); the mode is recorded with what was typed.
-        // Since when the screen has been one this connector cannot read (neither the idle box nor a Claude Code that says it works).
+        // Since when the screen has been one this connector cannot read (no input box, and no question it knows), and since when
+        // Claude Code has said nothing of the process (it cannot be told that the process still holds this conversation).
         let unreadableSince: number | null = null;
-        let unreadable = false;
+        let heldSince: number | null = null;
+        let refusal: string | null = null;
         while (!this.closed && this.terminalQueue[0] === next) {
-          // Claude Code's own word first (a turn running, a question on its screen), then the screen itself: both must say free.
+          // Not whether Claude Code is busy (a running turn queues what is typed): only that the process is still the one on this
+          // conversation, and that its screen can take the keys without anything on it answering to them.
           const status = this.holderStatus(term);
           let why: string;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
-          if (status === "busy") {
-            // `busy` is also what Claude Code says while only background agents run and its main turn is idle (status is
-            // isLoading || delegatedActive in 2.1.285-2.1.321): a coordinator's terminal can say it for hours. Two signals must
-            // both say its main turn waits for input, twice: its transcript (the last main turn ended), and its screen (an empty
-            // box, no `esc to interrupt`); and only for a Claude Code version measured to behave so. Anything else: it waits.
-            const r = await this.busyButFree(term);
-            if (r === true) { ready = true; viaBusy = true; break; }
-            why = r === "gone" ? WAIT_WHY.gone : WAIT_WHY.busy;
-            if (r === "gone") { told = why; break; }
-          } else if (!isIdleStatus(status) && status !== "unread") {
-            // (`unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation:
-            // its screen alone says whether it is free, below)
-            why = status === "waiting" ? WAIT_WHY.waiting : "terminal_state_unknown";
+          if (status === null) {
+            why = WAIT_WHY.unknown;
           } else {
-            const r = await term.readiness(status === "unread");
+            // (`unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation)
+            const r = await term.readiness();
             if (r.ready) { ready = true; break; }
             why = WAIT_WHY[r.why];
             if (r.why === "gone") { told = why; break; }
           }
-          // A busy or typed-in terminal is worth waiting for (the phone is told it is queued); one that cannot be read is not.
-          // (Only the screen itself read as unreadable: a Claude Code whose status row cannot be read now keeps the long wait.)
+          // A typed-in, scrolled-back or questioning terminal is waited for (the phone is told it is queued); one that cannot be read
+          // is not, nor one whose process cannot be told to be this conversation's.
           if (why === WAIT_WHY.screen) {
             unreadableSince ??= Date.now();
-            if (Date.now() - unreadableSince >= this.env.timing.terminalScreenWaitMs) { unreadable = true; told = why; break; }
+            if (Date.now() - unreadableSince >= this.env.timing.terminalScreenWaitMs) { refusal = "terminal_screen_unknown"; told = why; break; }
           } else {
             unreadableSince = null;
+          }
+          // (someone's half-typed text in the box, or a screen scrolled back, held for as long as terminalWaitMs: refused then, as
+          // before; a question on the screen is waited out however long it is up)
+          if (why === WAIT_WHY.unknown || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
+            heldSince ??= Date.now();
+            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
+          } else {
+            heldSince = null;
           }
           if (why !== told) {
             told = why;
             this.emit("terminal_input_queued", { reason: why, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length });
           }
-          if (Date.now() >= waitBy) break;
           await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
-        if (unreadable) { refused("terminal_screen_unknown", told); continue; }
-        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : told === WAIT_WHY.other ? "terminal_switched" : "terminal_busy", told); continue; }
+        if (refusal) { refused(refusal, told); continue; }
+        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : "terminal_switched", told); continue; }
         // Still live (connector.ts `gateFor`: Claw is asked if the connector stalled since the message came): if not, it was
         // reported as refused already and is only dropped here.
         const verdict = next.mayRun ? await verdictOf(next.mayRun) : "run";
@@ -524,10 +549,11 @@ export class Session {
         }
         if (this.closed || this.terminalQueue[0] !== next) continue;
         // Asked again just before the keys go: the same process, still on this conversation, still idle.
-        if (!(viaBusy ? this.mayType(this.holderStatus(term)) : this.freeStatus(term))) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
+        if (!this.sameHolder(term)) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
         this.terminalQueue.shift();
         const finished = new Promise<void>((resolve) => {
-          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started };
+          // (`typing` from the start: until its text went in, no echo is waited for, so a wait below never ends it as unconfirmed)
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started, typing: true };
         });
         // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
         // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
@@ -559,19 +585,38 @@ export class Session {
           giveUp("terminal_busy");
           continue;
         }
-        // (a message let in as idle whose terminal says busy by now is refused below, not sent through the busy gate late)
-        const gated = viaBusy;
-        // (the screen must show no running turn on every path; a terminal let in as idle that says busy by now is not typed into:
-        // only the busy gate admits a busy one, codex r2 on #632)
-        const again = gated
-          ? ((await this.busyButFree(term)) === true ? await term.readiness(true) : { ready: false as const, why: "busy" as const })
-          : await term.readiness(true);
-        if (!again.ready || !(gated ? this.mayType(this.holderStatus(term)) : this.freeStatus(term))) { giveUp(again.ready || again.why !== "gone" ? "terminal_busy" : "terminal_gone"); continue; }
+        // (the screen read again after that wait: someone typing, a question or a scroll meanwhile is waited out as above, not typed over)
+        let again = await term.readiness();
+        const screenBy = Date.now() + this.env.timing.terminalScreenWaitMs;
+        // (someone typing or a screen scrolled back: as long as before the turn was recorded, then refused by name, terminal_busy)
+        const heldBy = Date.now() + this.env.timing.terminalWaitMs;
+        let held = false;
+        while (!again.ready && again.why !== "gone" && !this.closed && this.terminalTurn === turn && this.sameHolder(term)) {
+          if (again.why === "screen" && Date.now() >= screenBy) break;
+          if ((again.why === "typing" || again.why === "copy_mode") && Date.now() >= heldBy) { held = true; break; }
+          await sleep(200);
+          again = await term.readiness();
+        }
+        if (!again.ready && again.why === "gone") { giveUp("terminal_gone"); continue; }
+        if (!this.sameHolder(term)) { giveUp("terminal_switched"); continue; }
+        if (held && this.terminalTurn === turn && !this.closed) { giveUp("terminal_busy"); continue; }
+        if (!again.ready && this.terminalTurn === turn && !this.closed) { giveUp("terminal_screen_unknown"); continue; }
         if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
         turn.keys = true;
+        turn.typing = true;
         try {
-          await term.type(text, gated ? () => this.mainTurnStillEnded() : undefined);
+          // (a question that shows after the text went in holds the Enter until it is gone; the phone is told why it waits)
+          await term.type(text, {
+            onDialog: () => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1 }),
+            stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
+            submitted: () => turn.seen || turn.queued === true,
+            onPaste: () => { turn.pasted = true; },
+          });
+          turn.typing = false;
+          turn.sentAt = Date.now();
         } catch (e) {
+          // (taken from here meanwhile, by a cancel or a withdraw, and answered for there: not a second time)
+          if (this.terminalTurn !== turn) continue;
           this.terminalTurn = null;
           this.env.store.endTurn(this.id);
           // (`TerminalNotSubmitted`: typed, but the screen did not let Enter go; no key was sent after the text, which stays in the box)
@@ -582,7 +627,7 @@ export class Session {
         }
         // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
         this.audit("terminal_input", {
-          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, terminal_mode: again.mode, length: text.length,
+          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, terminal_mode: again.ready ? again.mode : null, length: text.length,
           lines: text.split("\n").length, sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
         });
         await finished;
@@ -592,49 +637,13 @@ export class Session {
     }
   }
 
-  /** Whether what Claude Code says lets a message be typed, its screen permitting (`busy`: only on a screen with no main turn running). */
-  private mayType(status: string | null): boolean {
-    return isIdleStatus(status) || status === "busy";
-  }
-
   /**
-   * For a terminal Claude Code calls `busy`: true when its version is one measured to say so with only background agents running,
-   * and its transcript (the last main turn ended) and its screen (an empty box, no `esc to interrupt`) both say its main turn waits
-   * for input, on two looks BUSY_SCREEN_SETTLE_MS apart; "gone" when the terminal is gone; false otherwise (it waits).
+   * Whether the terminal's process is still the one proven to hold this conversation (whatever it is doing there): Claude Code's row
+   * names it, or it is proven so without one (`unread`).
    */
-  private async busyButFree(term: TerminalInput): Promise<true | false | "gone"> {
-    const support = this.env.attach.get(this.agent.id);
-    if (!support || !this.acpId) return false;
-    const version = support.holderVersion(term.ref.pid, this.acpId);
-    if (!version || !BUSY_SCREEN_VERIFIED_VERSIONS.includes(version)) {
-      if (!this.unverifiedTold) {
-        this.unverifiedTold = true;
-        this.audit("terminal_version_unverified", { version, pid: term.ref.pid });
-      }
-      return false;
-    }
-    for (let look = 0; look < 2; look++) {
-      if (look) await sleep(BUSY_SCREEN_SETTLE_MS);
-      const status = this.holderStatus(term);
-      if (status !== "busy" && !isIdleStatus(status)) return false;
-      if ((await support.mainTurnEnded(this.acpId)) !== true) return false;
-      const r = await term.readiness(true);
-      if (!r.ready) return r.why === "gone" ? "gone" : false;
-    }
-    return true;
-  }
-
-  /** For a terminal Claude Code calls `busy`, what must still hold right before the Enter: its main turn has not started. */
-  private async mainTurnStillEnded(): Promise<string | null> {
-    const support = this.env.attach.get(this.agent.id);
-    if (!support || !this.acpId) return "the terminal's transcript cannot be read";
-    return (await support.mainTurnEnded(this.acpId)) === true ? null : "a main turn started there";
-  }
-
-  /** Whether what Claude Code says of the terminal's process lets a message be typed now (`unread`: its screen says, see above). */
-  private freeStatus(term: TerminalInput): boolean {
+  private sameHolder(term: TerminalInput): boolean {
     const status = this.holderStatus(term);
-    return isIdleStatus(status) || status === "unread";
+    return status !== null && status !== "other";
   }
 
   /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */
@@ -648,7 +657,13 @@ export class Session {
     if (!turn || !this.terminal) return;
     const now = Date.now();
     if (!turn.seen) {
-      if (now - turn.sentAt >= this.env.timing.terminalEchoMs) this.endTerminalTurn("error", "terminal_input_unconfirmed");
+      // (the terminal went on to another conversation, or its process is gone: nothing there will take it in now)
+      if (!turn.typing && support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart) === "other") {
+        this.endTerminalTurn("error", "terminal_switched");
+        return;
+      }
+      // (queued by Claude Code: it waits for the running turn, however long; still being typed: not sent yet)
+      if (!turn.queued && !turn.typing && now - turn.sentAt >= this.env.timing.terminalEchoMs) this.endTerminalTurn("error", "terminal_input_unconfirmed");
       return;
     }
     const status = support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart);
@@ -1427,9 +1442,14 @@ export class Session {
       const queued = this.terminalQueue.length;
       this.dropTerminalQueue("cancelled");
       const running = this.terminalTurn;
-      // The typed message's turn is the terminal's own now: Esc stops it there, as the person at the terminal would.
-      if (running && this.terminal) await this.terminal.interrupt().catch(() => undefined);
-      this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true });
+      // Esc only for a turn the phone's message started itself, as the person at the terminal would stop it. Not while the message
+      // is still being put in (a question on the screen may be the person's, and Esc would deny it: the wait just ends, and any text
+      // already in the box stays there), nor while Claude Code holds it queued or took it into a turn already running (the turn is
+      // the person's: the phone stops following it, and the message, if still queued, is Claude Code's to run).
+      // (`own` is set only once the transcript shows its prompt starting a turn: by then it was submitted, whatever the typing still checks)
+      const interrupt = running?.own === true;
+      if (interrupt && this.terminal) await this.terminal.interrupt().catch(() => undefined);
+      this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true, interrupted: interrupt });
       if (running) this.endTerminalTurn("cancelled");
       else this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
       return;
@@ -1521,6 +1541,18 @@ export function limitStrings<T>(value: T, max: number): T {
 }
 
 /** The same message, as Claude Code records what was typed: whitespace at the ends and inside runs does not count. */
+/**
+ * Whether `text` is in `joined` as whole lines (several prompts Claude Code took out of its queue as one): its lines, each trimmed, are
+ * a run of `joined`'s lines. A part of someone else's line is not it.
+ */
+export function wholeLinesOf(joined: string, text: string): boolean {
+  const lines = (x: string) => x.replace(/\r\n?/g, "\n").split("\n").map((l) => l.trim());
+  const have = lines(joined);
+  const want = lines(text.trim());
+  for (let i = 0; i + want.length <= have.length; i++) if (want.every((w, j) => have[i + j] === w)) return true;
+  return false;
+}
+
 function sameText(a: string, b: string): boolean {
   const norm = (t: string) => t.replace(/\s+/g, " ").trim();
   return norm(a) === norm(b);

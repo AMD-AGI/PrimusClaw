@@ -104,6 +104,7 @@ export class CardsWorld {
   constructor(private readonly options: CardsWorldOptions = {}) {
     this.assistant = options.assistant ?? true;
     const { store, server, cardsRepo } = this;
+    server.clock = () => store.now(); // (an item's updatedAt is when the world's clock says it changed)
     const exchange = options.exchange ?? noTokenExchange;
     const locale = () => this.locale;
     this.say = new SayPlanner({

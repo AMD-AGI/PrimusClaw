@@ -3,7 +3,7 @@
 
 /**
  * The assistant's receipt (teams_agent/stream.py, the receipt half): a message to the assistant returns at once and the assistant
- * answers later, by notification; the receipt is a live stream opened when the message is handed over ("Got it, working on it…"
+ * answers later, by notification; the receipt is a live stream opened when the message is handed over ("Working on it…"
  * under it), and the assistant's first reply to that chat closes it, so the reply appears where the status was. A reply that does
  * not come before RECEIPT_CLOSE_SECONDS closes it with "running in the background", and the reply comes as a message of its own.
  *
@@ -76,6 +76,14 @@ export class Receipt {
   voided = false;
   /** The line the reply starts with (direct chat: Clawy's head), shown before its words. */
   head = "";
+  /**
+   * Which turn of the assistant's session answers the message this receipt stands under (`answeredBy`): its id, once Claw gave
+   * one; for a message Claw queued (no id), the turn it was queued behind, read just before it was sent. `unsent`: the message
+   * is not yet handed to Claw, so no turn there can be answering it.
+   */
+  messageId: string | undefined;
+  behind: string | undefined;
+  unsent = false;
   private want: Wanted | undefined;
   private sender: Promise<void> | undefined;
   private readonly closedWaiters: (() => void)[] = [];
@@ -87,6 +95,36 @@ export class Receipt {
     readonly lang: Lang,
     private readonly log: Logger,
   ) {}
+
+  /** The message is not yet handed to Claw (the assistant opened the receipt): nothing Claw says answers it yet. */
+  awaitHandOver(): void {
+    this.unsent = true;
+  }
+
+  /** The message is being handed to Claw now: from here on a turn may answer it, other than `behind` (a queued one runs after it). */
+  handingOver(behind: string | undefined): void {
+    this.behind = behind;
+    this.unsent = false;
+  }
+
+  /** Claw took the message: when it gave the message's id, only the turn of that id answers it (none: it was queued). */
+  takenAs(messageId: string | null | undefined): void {
+    if (messageId) this.messageId = messageId;
+  }
+
+  /**
+   * Whether a reply said by the turn `turn` (an `assistant.say`'s `turn_message_id`) may close this receipt: only the message's own
+   * turn's may (stream.py `Receipt.answered_by`). Another turn of the same session says something else, and its words under this
+   * message would read as the answer to it. Nothing Claw says before the message is handed over answers it, not even a reply that
+   * names no turn (Claw's notice of a lost turn names none). After that, a reply that names no turn, or a receipt that knows
+   * neither its turn nor the one in front of it, closes it as before.
+   */
+  answeredBy(turn: string | undefined): boolean {
+    if (this.unsent) return false;
+    if (!turn) return true;
+    if (this.messageId) return turn === this.messageId;
+    return turn !== this.behind;
+  }
 
   /** Resolves when the receipt is closed (or being closed): what follows the turn stops then. */
   closed(): Promise<void> {

@@ -103,6 +103,15 @@ export interface ClawSessionsPort {
   ): Promise<void>;
   /** The key owner's thumbs up or down on one answer of their session (a second vote replaces the first). */
   vote(key: ClawCredential, sessionId: string, messageId: string, vote: "up" | "down", reason?: string): Promise<void>;
-  /** The session's SSE stream: history first (ended by `historyComplete`), then live events. */
-  stream(key: ClawCredential, sessionId: string, after?: string, signal?: AbortSignal): AsyncIterable<SseEvent>;
+  /**
+   * The session's SSE stream: history first (ended by `historyComplete`), then live events. `onOpen` is called once Claw has
+   * answered the request (its status), before any event: from then on, what the session says reaches this stream.
+   */
+  stream(
+    key: ClawCredential,
+    sessionId: string,
+    after?: string,
+    signal?: AbortSignal,
+    onOpen?: () => void,
+  ): AsyncIterable<SseEvent>;
 }

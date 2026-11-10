@@ -450,22 +450,26 @@ export const remoteHealthText = defineCatalog({
   },
 });
 
-/** What a message for a terminal's conversation waits for, by the connector's reason. */
+/**
+ * What a message for a terminal's conversation waits for, by the connector's reason: one short line each, so that a phone shows all
+ * of it in the floating status (WAIT_LINE_MAX_ZH / WAIT_LINE_MAX_EN in remote/lines.ts, the "⏳ " included).
+ */
 export const remoteQueuedText = defineCatalog({
   en: {
-    terminalWorking: "The terminal is running a turn; your message is queued and goes in when it finishes.",
-    terminalWaiting: "The terminal is waiting for someone to answer there; your message is queued until that is done.",
-    terminalTyping:
-      "Someone is typing in the terminal; your message is queued and goes in once the input box is empty.",
-    terminalScrolled: "The terminal is scrolled back; your message is queued until it is back at the prompt.",
-    other: "The terminal cannot take input right now (a menu or a dialog is on its screen); your message is queued.",
+    terminalWorking: "Queued",
+    terminalWaiting: "Needs confirm",
+    terminalDialog: "Dialog open",
+    terminalTyping: "Box in use",
+    terminalScrolled: "Scrolled back",
+    other: "Waiting",
   },
   zh: {
-    terminalWorking: "终端里正在跑一轮，你的消息排队中，跑完就发给它。",
-    terminalWaiting: "终端里在等人确认，你的消息排队中，那边处理完就发。",
-    terminalTyping: "终端里有人正在输入，你的消息排队中，输入框清空后就发。",
-    terminalScrolled: "终端正在回滚查看，你的消息排队中，退出查看后就发。",
-    other: "终端暂时不能输入（屏幕上是菜单或对话框），你的消息排队中。",
+    terminalWorking: "已排队",
+    terminalWaiting: "待确认",
+    terminalDialog: "等弹窗",
+    terminalTyping: "输入框忙",
+    terminalScrolled: "回滚中",
+    other: "等终端",
   },
 });
 

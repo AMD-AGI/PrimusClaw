@@ -36,7 +36,7 @@ export function devenvHideOutcome(status: string, out: Fields, lang: Lang): stri
       count(result, "shown_again") ? t.shownAgain({ n: count(result, "shown_again") }) : "",
       count(result, "disconnected") ? t.disconnected({ n: count(result, "disconnected") }) : "",
     ].filter(Boolean);
-    return parts.length ? t.done({ parts }) : t.nothing;
+    return parts.length ? t.done({ parts, hidden: count(result, "hidden") !== 0 }) : t.nothing;
   }
   if (status === "done") return t.alreadyAnswered;
   if (status === "denied") return t.denied;

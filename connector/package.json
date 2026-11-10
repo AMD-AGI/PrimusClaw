@@ -1,6 +1,6 @@
 {
   "name": "@primusclaw/connector",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "Connects the coding agents on your own machine to Claw, over outbound HTTPS only.",
   "license": "MIT",
   "repository": {

@@ -119,8 +119,8 @@ test("the cards validate and are one column with at most three actions", () => {
 test("an asked line never fails on a link it cannot read", () => {
   const cases: Array<readonly [string, string]> = [
     ["https://github.com/AMD-AGI/PrimusClaw/pull/7", "AMD-AGI/PrimusClaw#7"],
-    ["https://github.com]/o/r/pull/1", "https://github.com]/o/r/pull/1"],
-    ["https://github.com/o/r/pull/x", "https://github.com/o/r/pull/x"],
+    ["https://github.com]/o/r/pull/1", "kwi_9"],
+    ["https://github.com/o/r/pull/x", "kwi_9"],
     ["", "kwi_9"],
   ];
   for (const [url, shown] of cases) {
@@ -352,11 +352,13 @@ test("a board row's emoji says the item's state at a glance", () => {
 });
 
 test("only a task that failed or was stopped is retried", () => {
-  assert.ok(retryable(wi({ canAccept: false, lastReportKind: "failed" })));
-  assert.ok(retryable(wi({ boardState: "done", outcome: "stopped" })));
-  assert.ok(!retryable(wi({ boardState: "done", outcome: "stopped", kind: "review" })));
-  assert.ok(!retryable(wi({ boardState: "done", outcome: "accepted" })));
-  assert.ok(!retryable(wi({ lastReportKind: "blocked" })));
+  const now = 1_761_800_000;
+  const updatedAt = new Date((now - 60) * 1000).toISOString();
+  assert.ok(retryable(wi({ canAccept: false, lastReportKind: "failed" }), now));
+  assert.ok(retryable(wi({ boardState: "done", outcome: "stopped", updatedAt }), now));
+  assert.ok(!retryable(wi({ boardState: "done", outcome: "stopped", kind: "review", updatedAt }), now));
+  assert.ok(!retryable(wi({ boardState: "done", outcome: "accepted", updatedAt }), now));
+  assert.ok(!retryable(wi({ lastReportKind: "blocked" }), now));
 });
 
 test("how long ago an item changed is short, and nothing when it is not known", () => {

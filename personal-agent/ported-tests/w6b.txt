@@ -127,6 +127,13 @@ teams/tests/test_session_window.py::test_the_output_is_bounded_with_more_behind_
 teams/tests/test_session_window.py::test_the_agents_words_outside_the_output_are_inert_too -> packages/teams/test/remote/window-card.test.ts::the agents words outside the output are inert too
 teams/tests/test_session_window.py::test_a_waiting_approval_and_a_busy_terminal_are_its_state -> packages/teams/test/remote/window-card.test.ts::a waiting approval and a busy terminal are its state
 teams/tests/test_session_window.py::test_stop_says_it_interrupts_the_terminal_where_messages_are_typed_into_one -> packages/teams/test/remote/window-card.test.ts::stop says it interrupts the terminal where messages are typed into one
+teams/tests/test_wait_line_budget.py::test_every_wait_line_fits_what_a_phone_shows -> packages/core/test/remote-view/wait-line-budget.test.ts::every wait line fits what a phone shows: terminal_working
+teams/tests/test_wait_line_budget.py::test_every_table_entry_and_the_fallback_fit_too -> packages/core/test/remote-view/wait-line-budget.test.ts::every table entry and the fallback fit too
+teams/tests/test_wait_line_budget.py::test_the_budget_is_written_down_where_the_lines_are -> packages/core/test/remote-view/wait-line-budget.test.ts::the budget is written down where the lines are
+teams/tests/test_wait_line_budget.py::test_a_dialog_on_the_terminal_says_so_and_does_not_fall_back -> packages/core/test/remote-view/wait-line-budget.test.ts::a dialog on the terminal says so and does not fall back
+teams/tests/test_wait_line_budget.py::test_the_fixed_floating_status_lines_fit_too -> packages/core/test/remote-view/wait-line-budget.test.ts::the fixed floating status lines fit too: received
+teams/tests/test_direct_chat.py::test_a_message_waiting_for_a_busy_terminal_says_why_in_the_floating_status_not_only_thinking -> packages/core/test/remote/e2e/wait-line.test.ts::a message waiting for a busy terminal says why in the floating status not only thinking
+teams/tests/test_direct_chat.py::test_the_wait_line_goes_once_anything_of_the_turn_shows_a_plan_too -> packages/core/test/remote-view/live-view.test.ts::the wait line goes once anything of the turn shows a plan too
 
 # A remote agent's links and short lines reach the chat as words (after the baseline: internal #479 and #499 at a2eaef50, and
 # the www and escaped-address follow-up of the short lines). The shared cases are test-support/data/answer-link-cases.json

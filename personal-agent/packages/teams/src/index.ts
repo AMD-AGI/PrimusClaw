@@ -14,3 +14,5 @@ export type { CardElement, Json, JsonObject as CardJson } from "./cards/json.js"
 export * from "./surface.js";
 export * from "./views/index.js";
 export * from "./worker-api.js";
+export { buildWorker } from "./assembly/worker.js";
+export { main } from "./main.js";

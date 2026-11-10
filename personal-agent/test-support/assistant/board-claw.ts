@@ -23,7 +23,8 @@ export const CLAW_USERS: Readonly<Record<string, string>> = {
 };
 export const TOKENS: Readonly<Record<string, string>> = { "tok-alice": "ak-alice", "tok-bob": "ak-bob" };
 
-export type BoardCall = "list" | "asked" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watch" | "unwatch";
+export type BoardCall =
+  "list" | "asked" | "item" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watch" | "unwatch";
 export type Failure = number | readonly [number, string] | Error;
 
 export interface Row {
@@ -40,6 +41,8 @@ export interface Row {
   acceptedVersion: number | null;
   readonly workerSessionId: string;
   tick: number;
+  /** When Claw last changed the row (seconds since the epoch), its `updatedAt`; undefined: the fake's tick. */
+  at: number | undefined;
   readonly kind: string;
   readonly params: JsonObject;
   readonly stopRefusal: string;
@@ -55,6 +58,8 @@ export interface AddItem {
   readonly kind?: string;
   readonly params?: JsonObject;
   readonly stopRefusal?: string;
+  /** When Claw last changed it (seconds since the epoch), its `updatedAt`: else the world's clock, or the fake's tick. */
+  readonly at?: number;
 }
 
 export interface Watch {
@@ -95,7 +100,7 @@ function refusedWith(status: number, error: string): ClawError {
 
 export class FakeBoardClaw implements Pick<
   ClawWorkItemsPort,
-  "list" | "askedOfOthers" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watchPull" | "unwatchPull"
+  "list" | "askedOfOthers" | "get" | "accept" | "stop" | "retry" | "pulls" | "watches" | "watchPull" | "unwatchPull"
 > {
   readonly items = new Map<string, Row>();
   /** owner (a key) -> the reviews they asked of others. */
@@ -119,12 +124,19 @@ export class FakeBoardClaw implements Pick<
   readonly watchEnded: number[] = [];
   /** The tokens Claw takes `reply: true` from (the person signed in themselves). */
   attendedTokens = new Set<string>();
+  /** Seconds since the epoch when a change is made (the world's clock); undefined: the fake's own ticks. */
+  clock: (() => number) | undefined;
   private ticks = 0;
   private n = 0;
 
   private tick(): number {
     this.ticks += 1;
     return this.ticks;
+  }
+
+  /** When a change to an item is made, its `updatedAt` as Claw sets it: the world's clock; undefined without one (the tick's). */
+  private now(): number | undefined {
+    return this.clock?.();
   }
 
   addItem(owner: string, title: string, o: AddItem = {}): string {
@@ -145,6 +157,7 @@ export class FakeBoardClaw implements Pick<
       acceptedVersion: null,
       workerSessionId: `worker-${itemId}`,
       tick: this.tick(),
+      at: o.at ?? this.now(),
       kind: o.kind ?? "task",
       params: o.params ?? {},
       stopRefusal: o.stopRefusal ?? "",
@@ -178,7 +191,7 @@ export class FakeBoardClaw implements Pick<
       kind: r.kind,
       params: r.params,
       pull: null,
-      updatedAt: new Date((1_700_000_000 + r.tick) * 1000).toISOString(),
+      updatedAt: new Date((r.at ?? 1_700_000_000 + r.tick) * 1000).toISOString(),
     };
   }
 
@@ -195,6 +208,7 @@ export class FakeBoardClaw implements Pick<
       resultVersion: row.resultVersion + (t.newResult ? 1 : 0),
       outcome: t.outcome,
       tick: this.tick(),
+      at: this.now(),
     });
   }
 
@@ -205,6 +219,7 @@ export class FakeBoardClaw implements Pick<
       lastReportKind: "progress",
       pendingQuestion: null,
       tick: this.tick(),
+      at: this.now(),
     });
   }
 
@@ -267,10 +282,21 @@ export class FakeBoardClaw implements Pick<
     return Promise.resolve(this.askedRoute ? [...(this.asked.get(owner) ?? [])] : []);
   }
 
+  get(key: string, itemId: string): Promise<WorkItem> {
+    this.own(this.enter("item", "GET", `/v1/work-items/${itemId}`, key), itemId);
+    return Promise.resolve(this.view(itemId));
+  }
+
   accept(key: string, itemId: string, version: number): Promise<Decision> {
     const row = this.own(this.enter("accept", "POST", `/v1/work-items/${itemId}/accept`, key), itemId);
     if (FakeBoardClaw.canAccept(row) && row.resultVersion === version) {
-      Object.assign(row, { boardState: "done", outcome: "accepted", acceptedVersion: version, tick: this.tick() });
+      Object.assign(row, {
+        boardState: "done",
+        outcome: "accepted",
+        acceptedVersion: version,
+        tick: this.tick(),
+        at: this.now(),
+      });
       return Promise.resolve({ ok: true, item: this.view(itemId), error: "" });
     }
     const error = FakeBoardClaw.canAccept(row) ? "version_mismatch" : "not_acceptable";
@@ -281,7 +307,13 @@ export class FakeBoardClaw implements Pick<
     const row = this.own(this.enter("stop", "POST", `/v1/work-items/${itemId}/stop`, key), itemId);
     if (row.stopRefusal) return Promise.resolve({ ok: false, item: this.view(itemId), error: row.stopRefusal });
     if (row.boardState !== "done") {
-      Object.assign(row, { boardState: "done", outcome: "stopped", pendingQuestion: null, tick: this.tick() });
+      Object.assign(row, {
+        boardState: "done",
+        outcome: "stopped",
+        pendingQuestion: null,
+        tick: this.tick(),
+        at: this.now(),
+      });
     } else if (row.outcome !== "stopped") {
       return Promise.resolve({ ok: false, item: this.view(itemId), error: "item_closed" });
     }
@@ -308,6 +340,7 @@ export class FakeBoardClaw implements Pick<
       outcome: null,
       pendingQuestion: null,
       tick: this.tick(),
+      at: this.now(),
     });
     this.retried.push(itemId);
     return Promise.resolve({ ok: true, item: this.view(itemId), error: "" });

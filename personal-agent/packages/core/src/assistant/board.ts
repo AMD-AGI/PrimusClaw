@@ -177,15 +177,16 @@ export class Board {
       acceptable.length > 1
         ? acceptable.map((i) => store.assistantCards.addAssistantCard(userId, i.itemId, i.resultVersion, true))
         : [];
-    const offerRetry = store.now() >= this.noRetryUntil;
+    const now = store.now();
+    const offerRetry = now >= this.noRetryUntil;
     const retry = items
-      .filter((i) => retryable(i) && offerRetry)
+      .filter((i) => retryable(i, now) && offerRetry)
       .slice(0, BOARD_RETRY_MAX)
       .map((item) => ({
         cardId: store.assistantCards.addAssistantCard(userId, item.itemId, item.resultVersion, false),
         item,
       }));
-    return { items, asked, now: store.now(), accept, retry, lang };
+    return { items, asked, now, accept, retry, lang };
   }
 
   /** The board as it is now, to replace the board a press was made on; undefined when it cannot be read. */

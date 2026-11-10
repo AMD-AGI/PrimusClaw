@@ -7,6 +7,9 @@
  * release gate's test entry, its routes on the loopback instead), and the features' timers. Nothing runs until `run`.
  */
 import {
+  InboundStats,
+  neutralPlugins,
+  type MetricsPort,
   NOTE,
   redactText,
   SecurityLog,
@@ -40,7 +43,7 @@ import { InboundConsumer } from "../servicebus/consumer.js";
 import type { BusClient } from "../servicebus/client.js";
 import { TeamsSurface } from "../surface.js";
 import { RENDERERS } from "../views/index.js";
-import type { BuildWorker, WorkerEnv, WorkerOptions } from "../worker-api.js";
+import type { BuildWorker, PluginFactory, WorkerEnv, WorkerOptions, WorkerServices } from "../worker-api.js";
 import { buildFeatures, type AssemblyBase, type Features } from "./features.js";
 import { metricsRoutes, workerRoutes } from "./http.js";
 import { inboundHandler } from "./inbound.js";
@@ -53,7 +56,8 @@ import {
   type Outbound,
 } from "./outbound.js";
 import { platformPlugins } from "./plugins.js";
-import { runner } from "./runner.js";
+import { workerServices } from "./worker-services.js";
+import { closeAll, runner } from "./runner.js";
 import { loadSecrets } from "./secrets.js";
 
 /** The largest body the worker's endpoint takes (a gate's file-carrying activity is the largest). */
@@ -127,11 +131,36 @@ function surfaceOf(teams: AssemblyBase["teams"], outbound: Outbound, gate: GateE
   return { acks, surface };
 }
 
-async function assemblyBase(env: WorkerEnv, plugins: Plugins, gate: GateEntry | undefined, deps: Basics) {
+/**
+ * The metrics, with the inbound path also counted for its `inbound_stats` line (Python `InboundStats(metrics=...)`: one line
+ * a minute of what was handled, how long it waited and took, what failed and what a limit refused).
+ */
+export function withInboundStats(prometheus: PrometheusMetrics, stats: InboundStats): MetricsPort {
+  return {
+    eventDelivered: (eventType, handleSeconds, since) => {
+      prometheus.eventDelivered(eventType, handleSeconds, since);
+    },
+    securityEvent: (record) => {
+      prometheus.securityEvent(record);
+    },
+    processed: (lagMs, handleMs, ok) => {
+      stats.processed(lagMs, handleMs, ok);
+    },
+    limited: (reason) => {
+      stats.limited(reason);
+    },
+    filesDropped: (path, count) => {
+      prometheus.filesDropped(path, count);
+    },
+  };
+}
+
+async function assemblyBase(env: WorkerEnv, gate: GateEntry | undefined, deps: Basics) {
   const secrets = await loadSecrets(env, deps);
   const settings = readSettings(env, secrets);
   const teams = teamsSettingsFromEnv(env, { queues: gate === undefined });
-  const metrics = new PrometheusMetrics(deps.clock);
+  const prometheus = new PrometheusMetrics(deps.clock);
+  const metrics = withInboundStats(prometheus, new InboundStats(deps.clock, deps.logger, prometheus));
   const securityLog = new SecurityLog(deps.logger, metrics, deps.requestScope);
   const store = openWorkerStore(settings, {
     securityEvent: (event, fields) => securityLog.event(event, fields),
@@ -149,18 +178,36 @@ async function assemblyBase(env: WorkerEnv, plugins: Plugins, gate: GateEntry | 
     clientLabel: settings.claw.clientLabel,
     fetch: (url, init) => deps.fetch(url, init),
   });
-  const exchange = settings.exchange.enabled
-    ? new HttpTokenExchange(settings.exchange, deps.clock, deps.fetch)
-    : plugins.tokenExchange;
-  const platform = platformPlugins(plugins, {
+  return { secrets, settings, teams, metrics, prometheus, securityLog, store, claw };
+}
+
+type Parts = Awaited<ReturnType<typeof assemblyBase>>;
+
+/**
+ * The plugins: given, or built by the deployment's factory with the worker's services (once the store and the channel
+ * exist, before the features: what the router is built with must be known then); then the platform services where they
+ * are neutral (`platformPlugins`), and the exchange.
+ */
+function pluginsOf(
+  given: Plugins | PluginFactory,
+  env: WorkerEnv,
+  parts: Parts,
+  services: WorkerServices,
+  deps: Basics,
+) {
+  const own = typeof given === "function" ? neutralPlugins(given(services)) : given;
+  const plugins = platformPlugins(own, {
     env,
-    settings,
-    secrets,
+    settings: parts.settings,
+    secrets: parts.secrets,
     fetch: deps.fetch,
     now: () => deps.clock.epochMs() / 1000,
     logger: deps.logger,
   });
-  return { settings, teams, metrics, securityLog, store, claw, exchange, plugins: platform };
+  const exchange = parts.settings.exchange.enabled
+    ? new HttpTokenExchange(parts.settings.exchange, deps.clock, deps.fetch)
+    : plugins.tokenExchange;
+  return { plugins, exchange };
 }
 
 function routesOf(
@@ -200,11 +247,14 @@ function routesOf(
 export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
   const deps = basics(options);
   const gate = gateEntryFromEnv(env);
-  const parts = await assemblyBase(env, plugins, gate, deps);
+  const parts = await assemblyBase(env, gate, deps);
   const { outbound, inbound } = transport(parts.teams, gate, deps);
   const { acks, surface } = surfaceOf(parts.teams, outbound, gate, deps);
-  const base: AssemblyBase = { ...parts, ...deps, surface, random: cryptoRandom, env };
+  const bound = workerServices({ ...parts, surface, logger: deps.logger, botName: BOT_NAME });
+  const resolved = pluginsOf(plugins, env, parts, bound.services, deps);
+  const base: AssemblyBase = { ...parts, ...deps, ...resolved, surface, random: cryptoRandom, env };
   const features = buildFeatures(base);
+  bound.bind(features.router);
   const handle = inboundHandler({
     acks,
     route: (event) => features.router.handle(event),
@@ -229,7 +279,7 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
         });
   return runner({
     app: buildServer({ routes: routesOf(base, features, handle, gate), maxBodyBytes: MAX_BODY_BYTES }),
-    metricsApp: buildServer({ routes: metricsRoutes(() => parts.metrics.render()), maxBodyBytes: 1024 }),
+    metricsApp: buildServer({ routes: metricsRoutes(() => parts.prometheus.render()), maxBodyBytes: 1024 }),
     host: gate === undefined ? "0.0.0.0" : LOOPBACK,
     port: parts.settings.listenPort,
     metricsPort: parts.settings.metricsPort,
@@ -238,10 +288,14 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
     timers: features.timers,
     clock: deps.clock,
     logger: deps.logger,
-    close: async () => {
-      await outbound.close();
-      await inbound?.close();
-      parts.store.close();
-    },
+    close: () =>
+      closeAll(deps.logger, [
+        () => bound.idle(),
+        () => outbound.close(),
+        () => inbound?.close(),
+        () => {
+          parts.store.close();
+        },
+      ]),
   });
 };

@@ -212,7 +212,7 @@ export class StopClaw {
   /** [status, body]: the answer of `POST /v1/work-items/:id/stop` (Python `stop_answer`). */
   answer: [number, unknown] | undefined;
 
-  port(): Pick<ClawWorkItemsPort, "accept" | "stop" | "retry"> {
+  port(): Pick<ClawWorkItemsPort, "get" | "accept" | "stop" | "retry"> {
     const real = new HttpWorkItems(
       new ClawHttp("https://claw.test", () => {
         const [status, body] = this.answer ?? [500, {}];
@@ -222,6 +222,7 @@ export class StopClaw {
       }),
     );
     return {
+      get: () => Promise.reject(new Error("no get here")),
       accept: () => Promise.reject(new Error("no accept here")),
       retry: () => Promise.reject(new Error("no retry here")),
       stop: (key, itemId) => {

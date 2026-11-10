@@ -21,6 +21,7 @@ export const PLAIN_WORDS: Readonly<Record<string, readonly [string, string]>> = 
   cannot_approve_own_pull_request: ["不能批准自己提交的 PR", "it cannot approve its own pull request"],
   acting_login_unknown: ["不知道对方的 GitHub 用户名", "the GitHub username is not known"],
   enqueue_refused: ["合并队列拒绝了", "the merge queue refused it"],
+  github_workflow_scope_missing: ["缺少 GitHub 的 workflow 权限", "GitHub's workflow permission is missing"],
   enqueue_unconfirmed: ["不确定是否已进入合并队列", "it is not known whether it is in the merge queue"],
   review_target_mismatch: ["这次 review 绑定的是另一个 PR", "this review is bound to another pull request"],
   queue_position: ["队列位置", "queue position"],

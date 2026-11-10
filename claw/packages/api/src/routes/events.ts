@@ -275,6 +275,12 @@ function shownSql(opts: ForwardOpts, params: unknown[]): string {
  */
 const STREAM_SEQ_DIGITS = 12;
 const STREAM_ID = new RegExp(`^claw-([0-9]{1,${STREAM_SEQ_DIGITS}})$`);
+/**
+ * An id later than every event id of a session: `claw-` and more digits than a stream sequence has. A client that wants
+ * only what happens from now on asks for what follows such an id (the Teams worker sends `claw-99999999999999`); when it
+ * is no row of the session it names the end of the stream, so the stream sends no history and starts at its tail.
+ */
+const BEYOND_STREAM_ID = new RegExp(`^claw-[0-9]{${STREAM_SEQ_DIGITS + 1},}$`);
 /** A stream event id's sequence (`claw-<seq>`) in SQL; NULL for any other id. Cast only where it matches. */
 const STREAM_SEQ_SQL = `(CASE WHEN event_id ~ '^claw-[0-9]{1,${STREAM_SEQ_DIGITS}}$' THEN substr(event_id, 6)::bigint END)`;
 
@@ -330,8 +336,9 @@ async function newestRowId(sessionId: string): Promise<number> {
 }
 
 /**
- * Where an SSE connection's history starts. After `after` when it names a place in this session; otherwise the
- * whole history when `all`, else the last `tail` events the caller is shown (the sub-agent filter applies), with
+ * Where an SSE connection's history starts. After `after` when it names a place in this session; at the newest row
+ * (no history) when `after` is later than every id a session holds (BEYOND_STREAM_ID); otherwise the whole history
+ * when `all`, else the last `tail` events the caller is shown (the sub-agent filter applies), with
  * `hasMore` when older ones exist. Reads ids only.
  */
 export async function historyStart(
@@ -350,6 +357,9 @@ export async function historyStart(
       const afterId = first?.id == null ? cursor.row : Number(first.id) - 1;
       return { afterId, after: cursor, upTo, hasMore: false };
     }
+    // Later than every event: nothing stored is after it. (Read as an unknown place, it sent the last
+    // SSE_HISTORY_TAIL events to a client that had asked for none, on every turn it followed.)
+    if (BEYOND_STREAM_ID.test(after)) return { afterId: upTo, after: null, upTo, hasMore: false };
   }
   if (all) return { afterId: 0, after: null, upTo, hasMore: false };
   const params: unknown[] = [sessionId, upTo];

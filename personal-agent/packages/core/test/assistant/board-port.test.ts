@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 
 import { ALICE, BOB, CardsWorld } from "../../../../test-support/assistant/cards-world.js";
+import { workItem } from "../../../../test-support/assistant/work-items.js";
+import { retryable } from "../../src/assistant/work-items.js";
 import { boardText } from "../../src/locales/assistant-board.js";
 import { workClickText } from "../../src/locales/assistant-work-clicks.js";
 import type { JsonObject } from "../../src/json.js";
@@ -124,7 +126,7 @@ it("retry of a stopped task with no slot left says why and changes nothing", asy
   const w = CardsWorld.start();
   const s = w.server;
   s.maxActive = 1;
-  const stopped = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped" });
+  const stopped = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped", at: w.store.now() - 60 });
   s.addItem(KEY, "Running", { board: "in_progress", last: "progress" });
   await w.showBoard();
   const [shown] = lastBoard(w).retry;
@@ -133,6 +135,44 @@ it("retry of a stopped task with no slot left says why and changes nothing", asy
   assert.deepEqual(s.retried, []);
   assert.equal(s.row(stopped).outcome, "stopped");
   assert.ok(textOf(w, w.sent().length - 1).includes("进行中的任务已经到上限"));
+});
+
+it("a retry drawn within the hour and pressed after it has expired", async () => {
+  // The board drawn 30 minutes after the stop offers Retry; pressed an hour later, the card has expired as the board's offer
+  // has: Claw is not asked, and the person is told to ask for the task again.
+  const w = CardsWorld.start();
+  const s = w.server;
+  const stopped = s.addItem(KEY, "Deploy", { board: "done", outcome: "stopped", at: w.store.now() - 1800 });
+  await w.showBoard();
+  const [press] = lastBoard(w).retry;
+  assert.ok(press !== undefined);
+  w.advance(3600);
+  const before = w.mark();
+  await w.click(retry(press.cardId));
+  assert.ok(s.retried.length === 0 && s.row(stopped).outcome === "stopped");
+  assert.deepEqual(
+    s.calls.filter(([, path]) => path.endsWith("/retry")),
+    [],
+  );
+  assert.ok(textOf(w, w.sent().length - 1).includes("停止已超过一小时"), String(w.since(before).length));
+  assert.deepEqual(lastBoard(w).retry, []);
+});
+
+it("a stopped task without a time is not retryable", () => {
+  const now = 1_761_800_000;
+  const stopped = workItem({
+    itemId: "wi-1",
+    title: "Deploy",
+    boardState: "done",
+    canAccept: false,
+    lastReportKind: null,
+    outcome: "stopped",
+  });
+  assert.ok(!retryable(stopped, now));
+  assert.ok(!retryable({ ...stopped, updatedAt: "yesterday" }, now));
+  const at = "2025-10-30T04:52:20+00:00"; // (now - 60, as Python's isoformat writes it)
+  assert.ok(retryable({ ...stopped, updatedAt: at }, now));
+  assert.ok(retryable({ ...stopped, updatedAt: at.replace("+00:00", "Z") }, now));
 });
 
 it("retry on a claw without it says so", async () => {

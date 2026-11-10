@@ -7,6 +7,7 @@
  * note card a settled click ends as, `/whoami`'s connection lines, and fetching a message's files through the surface.
  */
 import type {
+  PendingEntry,
   ChannelContextBuilder,
   Clock,
   ConnectionsText,
@@ -87,7 +88,11 @@ export function routerLimits(limits: UserLimits, clock: Clock): RouterLimits {
 }
 
 /** Python `understanding.channel_context` as `Agent._understood` builds it (the people named, the chat's actions). */
-export function channelContextBuilder(store: ContextStore): ChannelContextBuilder {
+export function channelContextBuilder(
+  store: ContextStore,
+  /** What waits for the person's answer (the review service's held confirmations; none without it). */
+  pending: (userId: string) => readonly PendingEntry[] = () => [],
+): ChannelContextBuilder {
   return (request) => {
     const mentions = request.message.mentions.map((m) => ({
       mentioned: { id: m.channelUserId, name: m.name, aadObjectId: m.userId },
@@ -109,7 +114,7 @@ export function channelContextBuilder(store: ContextStore): ChannelContextBuilde
     const context = channelContext({
       channelMessageId: request.channelMessageId,
       people,
-      pending: [], // (the review service's confirmations: none while it is off)
+      pending: [...pending(request.userId)],
       actions: actions as unknown as Parameters<typeof channelContext>[0]["actions"],
       handoffs: request.handoffs,
       ...("attached" in request ? { attached: request.attached } : {}),

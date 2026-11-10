@@ -875,82 +875,6 @@ export class AttachSupport {
     }
   }
 
-  /** The Claude Code version the registry row of process `pid` names for `ref` (null: no such row, or it does not say). */
-  holderVersion(pid: number, ref: string): string | null {
-    try {
-      const doc: unknown = JSON.parse(fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8"));
-      if (!isObject(doc) || doc.pid !== pid || typeof doc.sessionId !== "string" || doc.sessionId.toLowerCase() !== ref.toLowerCase()) return null;
-      return typeof doc.version === "string" ? doc.version : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Whether the conversation's main turn has ended, read from the end of its transcript: true when the last main-thread entry that
-   * belongs to a turn is Claude Code's `turn_duration` (the end of a turn); false when it is a user, assistant or attachment entry, or
-   * a queued message (`queue-operation`), of the main thread (a background agent's entries, `isSidechain`, do not count), or a line
-   * is still being written; null when that cannot be told (no transcript, a line that does not parse, nothing of a turn in what is
-   * read). With Claude Code's own `busy`, which background agents alone also cause, this is one of the two signals (the screen is the
-   * other) that its main turn waits for input.
-   */
-  async mainTurnEnded(ref: string): Promise<boolean | null> {
-    const file = SESSION_REF_RE.test(ref) ? this.transcriptFile(ref.toLowerCase()) : null;
-    if (!file) return null;
-    let fh: fsp.FileHandle | null = null;
-    try {
-      fh = await fsp.open(file, "r");
-      const st = await fh.stat();
-      // Read whole, once, then only what was appended since (codex r2 on #632: a message queued long ago is still queued, so the
-      // count of queued messages cannot start in the middle of the file). A transcript larger than this is not read: no answer.
-      let seen = this.turnScans.get(file);
-      // Resumed only where what was read is still there: the same file, at least as long, and the bytes just before where the last
-      // read stopped unchanged (a file rewritten in place is read whole again, codex r3 on #632).
-      if (seen && (seen.ino !== st.ino || st.size < seen.offset || !(await sameBytes(fh, seen.offset, seen.tail)))) seen = undefined;
-      if (!seen) {
-        if (st.size > MAIN_TURN_SCAN_MAX_BYTES) return null;
-        seen = { ino: st.ino, offset: 0, queued: 0, last: null, tail: Buffer.alloc(0) };
-      }
-      if (st.size - seen.offset > MAIN_TURN_SCAN_MAX_BYTES) return null;
-      const len = st.size - seen.offset;
-      const buf = Buffer.alloc(len);
-      const { bytesRead } = await fh.read(buf, 0, len, seen.offset);
-      if (bytesRead !== len) return null;
-      const text = buf.toString("utf8");
-      const end = text.lastIndexOf("\n") + 1;   // (only whole lines; a line still being written is read next time)
-      let { queued, last } = seen;
-      for (const line of text.slice(0, end).split("\n")) {
-        if (!line) continue;
-        let doc: unknown;
-        try { doc = JSON.parse(line); } catch { return null; }
-        if (!isObject(doc) || doc.isSidechain === true) continue;
-        if (doc.type === "queue-operation") {
-          if (doc.operation === "enqueue") queued += 1;
-          else if (doc.operation === "dequeue" || doc.operation === "remove") queued = Math.max(0, queued - 1);
-          else return null;   // (an operation not known: no answer)
-          continue;
-        }
-        if (doc.type === "system" && doc.subtype === "turn_duration") last = "ended";
-        else if (doc.type === "user" || doc.type === "assistant" || doc.type === "attachment") last = "under_way";
-      }
-      const offset = seen.offset + Buffer.byteLength(text.slice(0, end), "utf8");
-      const tailLen = Math.min(offset, CONTINUITY_BYTES);
-      const tail = Buffer.alloc(tailLen);
-      if (tailLen) await fh.read(tail, 0, tailLen, offset - tailLen);
-      this.turnScans.set(file, { ino: st.ino, offset, queued, last, tail });
-      while (this.turnScans.size > 64) this.turnScans.delete(this.turnScans.keys().next().value!);
-      if (end < text.length) return false;   // (an entry is being written: something is under way)
-      if (queued > 0) return false;
-      return last === null ? null : last === "ended";
-    } catch {
-      return null;
-    } finally {
-      await fh?.close().catch(() => undefined);
-    }
-  }
-
-  /** What each transcript's main thread was found to be, up to which byte (`mainTurnEnded`, read incrementally). */
-  private turnScans = new Map<string, { ino: number; offset: number; queued: number; last: "ended" | "under_way" | null; tail: Buffer }>();
 
   /** The size of the conversation's transcript now, or null when there is none to look at. */
   transcriptSize(ref: string): number | null {
@@ -1488,27 +1412,6 @@ export function liveActivity(holders: LiveEntry[]): { activity?: LiveActivity; w
   return {};
 }
 
-/** How many bytes before where a transcript was last read are kept to tell it was not rewritten since. */
-const CONTINUITY_BYTES = 4096;
-
-/** Whether the `tail.length` bytes of `fh` just before `offset` are `tail`. */
-async function sameBytes(fh: fsp.FileHandle, offset: number, tail: Buffer): Promise<boolean> {
-  if (!tail.length) return offset === 0;
-  const now = Buffer.alloc(tail.length);
-  const { bytesRead } = await fh.read(now, 0, tail.length, offset - tail.length);
-  return bytesRead === tail.length && now.equals(tail);
-}
-
-/** A transcript larger than this is not read to tell whether its main turn has ended (no answer: a busy terminal waits). */
-const MAIN_TURN_SCAN_MAX_BYTES = 128 * 1024 * 1024;
-
-/**
- * The Claude Code versions measured to say `busy` while only background agents run with the main turn idle, the screen then showing
- * an empty box with no `esc to interrupt` under it (and `esc to interrupt` while the main turn runs), and to end every main turn
- * with `turn_duration` in the transcript (2026-11-10, real Claude Code in tmux). For any other version a `busy` terminal is waited
- * for as before, and doctor says so (`claude_version_unverified`).
- */
-export const BUSY_SCREEN_VERIFIED_VERSIONS: readonly string[] = ["2.1.285", "2.1.319", "2.1.321", "2.1.322"];
 
 /** Whether Claude Code's status for a process says it waits at its prompt: `idle`, or `shell` (idle, background shells running). */
 export function isIdleStatus(status: string | null | undefined): boolean {
@@ -1546,8 +1449,14 @@ export function fitResumable(base: Record<string, unknown>, items: Resumable[], 
 
 /** One thing the transcript says happened, shaped as the ACP `session/update` an adapter would have sent for it. */
 export interface TranscriptUpdate {
-  /** `turn_done`: the terminal finished a turn (Claude Code's `turn_duration` line); never sent on, it ends a typed prompt's turn. */
-  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done";
+  /**
+   * `turn_done`: the terminal finished a turn (Claude Code's `turn_duration` line); never sent on, it ends a typed prompt's turn.
+   * A prompt submitted while a turn runs is queued by Claude Code, and these say what became of it (never sent on either):
+   * `queued` (`queue-operation` enqueue, `update.text` the prompt: it was taken, and waits), `queued_taken` (a `queued_command`
+   * attachment, `update.text` the prompt: the running turn took it in), `queue_withdrawn` (`popAll`: the queue went back into the
+   * terminal's box, to be edited there).
+   */
+  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done" | "queued" | "queued_taken" | "queue_withdrawn";
   update: Record<string, unknown>;
 }
 
@@ -1563,6 +1472,16 @@ export function transcriptUpdates(line: string): TranscriptUpdate[] {
   try { doc = JSON.parse(line); } catch { return []; }
   if (!isObject(doc) || doc.isSidechain === true || doc.isMeta === true) return [];
   if (doc.type === "system" && doc.subtype === "turn_duration") return [{ type: "turn_done", update: {} }];
+  if (doc.type === "queue-operation") {
+    if (doc.operation === "enqueue" && typeof doc.content === "string") return [{ type: "queued", update: { text: doc.content } }];
+    if (doc.operation === "popAll") return [{ type: "queue_withdrawn", update: {} }];
+    return [];
+  }
+  if (doc.type === "attachment") {
+    const a = isObject(doc.attachment) ? doc.attachment : null;
+    if (a?.type === "queued_command" && typeof a.prompt === "string") return [{ type: "queued_taken", update: { text: a.prompt } }];
+    return [];
+  }
   if (doc.type !== "user" && doc.type !== "assistant") return [];
   const msg = isObject(doc.message) ? doc.message : null;
   if (!msg) return [];
@@ -1608,8 +1527,14 @@ function cleanTitleTo(raw: string, max: number): string {
 
 /** How much of the end of a transcript is read for what came just before a watcher arrived. */
 const TAIL_BACKLOG_BYTES = 64 * 1024;
-/** What one look reads at most; a burst larger than this is read over the next looks. */
+/** What one read takes at most; one look reads on, read after read, up to TAIL_LOOK_BYTES. */
 const TAIL_READ_BYTES = 256 * 1024;
+/**
+ * What one look reads at most: everything new up to this, so that a large line Claude Code writes before a step (a `prompt_snapshot`
+ * attachment is 0.2 MB and more) does not hold the step back a look per 256 KB (a tool_call came after its tool had ended, #505
+ * acceptance). A burst larger than this is read over the next looks.
+ */
+const TAIL_LOOK_BYTES = 32 * 1024 * 1024;
 /** A line longer than this (one huge tool result) is skipped rather than held. */
 const TAIL_MAX_LINE = 1024 * 1024;
 /** How many of the backlog's updates are passed on. */
@@ -1677,10 +1602,18 @@ export class TranscriptTail {
       if (this.offset === null) this.offset = 0;   // it did not exist when the watch began: all of it is new
       if (size < this.offset) { this.offset = size; this.partial = ""; this.decoder = new StringDecoder("utf8"); return []; }
       if (size === this.offset) return [];
-      const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, size - this.offset));
-      const n = fs.readSync(fd, buf, 0, buf.length, this.offset);
-      this.offset += n;
-      return this.take(this.decoder.write(buf.subarray(0, n)));
+      const out: TranscriptUpdate[] = [];
+      const until = Math.min(size, this.offset + TAIL_LOOK_BYTES);
+      const buf = Buffer.alloc(Math.min(TAIL_READ_BYTES, until - this.offset));
+      while (this.offset < until) {
+        let n: number;
+        // (a read that fails after others went through: what they gave is returned, and the next look reads on from there)
+        try { n = fs.readSync(fd, buf, 0, Math.min(buf.length, until - this.offset), this.offset); } catch { break; }
+        if (n <= 0) break;
+        this.offset += n;
+        out.push(...this.take(this.decoder.write(buf.subarray(0, n))));
+      }
+      return out;
     } catch {
       return [];
     } finally {
