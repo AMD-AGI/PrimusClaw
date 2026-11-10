@@ -22,7 +22,7 @@ import {
 import { MARK_CLOSE, pullsIn } from "../review-text/pull-ref.js";
 import type { PullRef } from "../claw/model.js";
 import { isPySpace } from "../text/py-chars.js";
-import { pyStrip } from "../text/py-text.js";
+import { cpLength, pyStrip } from "../text/py-text.js";
 import { MODEL_ID, asksReviewOnly, modelFieldPattern, saysReviewAndMerge } from "../review-text/asks.js";
 import { bareName, flat, unique } from "../review-text/text/unicode.js";
 
@@ -109,17 +109,17 @@ function nameBefore(text: string, start: number, end: RegExp): Asked | undefined
   };
 }
 
-/** A message longer than this (code points) is never read for "请 XX ... review 合入": who it names is not looked for. */
-export const NAMED_ASK_MAX = 1000;
-const REVIEW_WORD = pyRegExp("review", "i");
-const MERGE_WORD = pyRegExp("合入|merge", "i");
-
 /**
- * Whether "请 XX ... review 合入" may be looked for at all: a short message with a review word and 合入 or merge in it (two
- * linear searches first, as the Python worker checks before its patterns; each later 请 is otherwise scanned to the end).
+ * A named request is read only when its "review 合入" starts within this many code points of the text (Python
+ * `MAX_ASK_HEAD_CHARS`): the name before it is a few words, and a long list of pull requests may follow it.
  */
+export const NAMED_ASK_MAX = 1000;
+const REVIEW_MERGE = pyRegExp(REVIEW_AND_MERGE, "i");
+
+/** Whether "请 XX ... review 合入" is looked for: its first "review 合入" starts within NAMED_ASK_MAX code points. */
 function mayName(text: string): boolean {
-  return Array.from(text).length <= NAMED_ASK_MAX && REVIEW_WORD.test(text) && MERGE_WORD.test(text);
+  const said = REVIEW_MERGE.exec(text);
+  return said !== null && cpLength(text.slice(0, said.index)) <= NAMED_ASK_MAX;
 }
 
 /** "请 XX [帮我] review 合入 <rest>" at the start of the text (spaces before 请 allowed). */
@@ -130,14 +130,44 @@ function namedAskAt(text: string): Asked | undefined {
   return nameBefore(text, afterPlease(text, i + 1), NAMED_END);
 }
 
+/** Where "帮" or "review" may start the end of a name. */
+const END_START = pyRegExp("帮|review", "gi");
+/** The end of a name ("帮我 review 合入", "review 合入"), matched only where it starts. */
+const NAMED_END_HERE = pyRegExp(`(?:${HELP})?${REVIEW_AND_MERGE}`, "iy");
+
+/**
+ * "请 XX ... review 合入" again, from `start` (just past 请, 让/叫 and the spaces): the name is on one line and has no 请 in it,
+ * so its end starts before the next newline or 请 (after the spaces that follow it). Only that stretch is searched for where
+ * the end may start, and the end is matched only there: each part of the text is read once (Python `_ASK_AGAIN`).
+ */
+function askedAgainAt(text: string, start: number): Asked | undefined {
+  let stop = start;
+  while (stop < text.length && text[stop] !== "\n" && text[stop] !== "请") stop += 1;
+  let limit = stop;
+  while (isSpace(text[limit])) limit += 1;
+  const stretch = text.slice(start, limit + "review".length);
+  END_START.lastIndex = 0;
+  for (let found = END_START.exec(stretch); found !== null; found = END_START.exec(stretch)) {
+    const at = start + found.index;
+    if (at > limit) return undefined;
+    NAMED_END_HERE.lastIndex = at;
+    const end = NAMED_END_HERE.exec(text);
+    if (end === null) continue;
+    let whoStop = at;
+    while (whoStop > start && isSpace(text[whoStop - 1])) whoStop -= 1;
+    const restAt = at + end[0].length;
+    return { who: text.slice(start, whoStop), help: text[at] === "帮", restAt, rest: "", end: restAt };
+  }
+  return undefined;
+}
+
 /** Who each later "请 XX ... review 合入" of the text names, from `from` on (a name is on one line and has no 请 in it). */
 function askedAgain(text: string, from: number): string[] {
   const whos: string[] = [];
   let i = text.indexOf("请", from);
   while (i >= 0) {
-    const start = afterPlease(text, i + 1);
-    const asked = nameBefore(text, start, NAMED_END);
-    if (asked !== undefined && !/[\n请]/u.test(asked.who)) {
+    const asked = askedAgainAt(text, afterPlease(text, i + 1));
+    if (asked !== undefined) {
       whos.push(asked.who);
       i = text.indexOf("请", asked.end);
     } else {

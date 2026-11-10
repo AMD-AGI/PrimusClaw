@@ -173,10 +173,17 @@ test("a long message is read in linear time, and who it names only up to the lim
     parseReviewAsk(head + tail, []);
     assert.ok(performance.now() - started < 100, `took ${String(performance.now() - started)} ms`);
   }
-  // (up to NAMED_ASK_MAX code points the reviewer is read as before; past it, never)
-  const filler = (n: number) => " ".repeat(n - Array.from(head).length);
-  assert.equal(parseReviewAsk(head + filler(NAMED_ASK_MAX), [])?.who, "Bob");
-  assert.equal(parseReviewAsk(head + filler(NAMED_ASK_MAX + 1), [])?.who, "");
-  // (with no review word, or no 合入 or merge, there is nothing to name)
+  // (a name is read when its "review 合入" starts within NAMED_ASK_MAX code points; a long list may follow it)
+  const named = (k: number) => parseReviewAsk(`请${" ".repeat(k)}Bob 帮我 review 合入 AMD-AGI/x#1`, [])?.who;
+  assert.equal(NAMED_ASK_MAX, 1000);
+  assert.equal(named(992), "Bob"); // ("review" at 1000, as Python reads it)
+  assert.equal(named(993), ""); // (at 1001: no name, the request is still read)
+  assert.equal(parseReviewAsk(`${head}${"AMD-AGI/x#2 ".repeat(200)}`, [])?.who, "Bob");
+  assert.deepEqual(parseReviewAsk(`${head}${"请 Carol review 合入\n".repeat(3)}`, [])?.again, [
+    "Carol",
+    "Carol",
+    "Carol",
+  ]);
+  // (no "review 合入": nothing to name)
   assert.equal(parseReviewAsk("请 Bob 帮我看看 AMD-AGI/x#1", []), undefined);
 });
