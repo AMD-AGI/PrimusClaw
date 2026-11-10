@@ -9,6 +9,7 @@
  * `://` and into every `](`; and every `www.` and `://` of the result, an escaped one too, holds one. Claw's own answers keep their
  * links: they are the assistant's, with citations a person follows on purpose.
  */
+import { PY_SPACE, pyRstrip, pyStrip } from "../../text/py-text.js";
 import { hostOf } from "./hosts.js";
 import { CODE, type Mark, bare, emails, links, referenceDefinitions, tags } from "./scans.js";
 
@@ -34,7 +35,7 @@ export function breakAddresses(text: string): string {
 export function inertAnswer(text: string): string {
   // (the rich text drops these before it reads anything: `https:\x01//` is `https://` to it, so they are dropped first here too)
   const kept = text.replace(DROPPED_BY_RICH_TEXT, "");
-  const out = blocks(kept).map(([chunk, isCode]) => (isCode ? unlinkable(chunk) : inline(chunk)));
+  const out = blocks(kept).map(([chunk, isCode]) => (isCode ? unlinkable(chunk) : prose(chunk)));
   // (a code span added next to a stray backtick of the text's can pair with it differently in the client: every address breaks)
   return breakAddresses(out.join(""));
 }
@@ -119,6 +120,52 @@ function firstAfter(positions: readonly number[], at: number): number | undefine
     else hi = mid;
   }
   return positions[lo];
+}
+
+/** A table's separator line as the rich text reads one (`|---|:--:|`), and where it splits a row into cells (a bar not escaped). */
+const TABLE_SEP = new RegExp(
+  `^[${PY_SPACE}]*(?:\\|[${PY_SPACE}]*)?:?-+:?[${PY_SPACE}]*\\|(?:[${PY_SPACE}]*:?-+:?[${PY_SPACE}]*\\|)*(?:[${PY_SPACE}]*:?-+:?[${PY_SPACE}]*)?$`,
+  "u",
+);
+const CELL_BAR = /((?<!\\)\|)/u;
+
+/** Prose as the rich text reads it: a table (a line with a `|` over a separator line, and the rows after it that hold a `|`) is
+ * read cell by cell, each cell's code spans within it alone; the rest is read whole (`inline`). A code span read across a `|` of
+ * a row would be split by the client, and the address made code next to it left outside. */
+function prose(text: string): string {
+  const lines = linesOf(text);
+  const out: string[] = [];
+  let plain: string[] = [];
+  const flush = (): void => {
+    if (plain.length > 0) out.push(inline(plain.join("")));
+    plain = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    const next = lines[i + 1];
+    if (line.includes("|") && next !== undefined && TABLE_SEP.test(pyRstrip(next, "\r\n"))) {
+      flush();
+      out.push(row(line), next);
+      i += 2;
+      while (i < lines.length && pyStrip(lines[i] ?? "") && (lines[i] ?? "").includes("|")) {
+        out.push(row(lines[i] ?? ""));
+        i += 1;
+      }
+      continue;
+    }
+    plain.push(line);
+    i += 1;
+  }
+  flush();
+  return out.join("");
+}
+
+/** A table row with each cell read on its own (the bars that split it, and its line end, kept). */
+function row(line: string): string {
+  const body = pyRstrip(line, "\r\n");
+  const parts = body.split(CELL_BAR);
+  return parts.map((part, n) => (n % 2 ? part : inline(part))).join("") + line.slice(body.length);
 }
 
 /** What a backslash escapes in the chat's rich text (so a backtick after one opens no code span there). */

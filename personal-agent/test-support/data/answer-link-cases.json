@@ -1,5 +1,5 @@
 {
- "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same. A backtick of the agent's own left in prose (one that opens no code span the rich text reads within a line) is shown as `ˋ`, so a code span made here pairs with nothing else; a mail address inside an address already made code is not made code again.",
+ "about": "remote_view.answer_parts(text, lang) after the fix: a remote agent's final answer, credentials masked, with every markdown link, image, autolink, HTML anchor or image, reference definition and bare address shown as its words with its host in a code span, `words (`host`)` or, after Chinese words, `文字（`host`）`; an image as `🖼 alt`; a link with no host as its words; code (spans and fenced blocks) keeps its text, with a zero-width space after the colon of every `://` and inside every `](`, so nothing in it can be followed whether or not a client draws it as code; a NUL is dropped; an address with no host, and a mail address, in a code span whole; an address is read with any markdown escape in it taken out. `expected` is the list of messages. Generated from the Python worker (teams/teams_agent/answer_links.py); the TypeScript port must give the same. A backtick of the agent's own left in prose (one that opens no code span the rich text reads within a line) is shown as `ˋ`, so a code span made here pairs with nothing else; a mail address inside an address already made code is not made code again. Table rows (a line with a | over a separator line, and the rows after it that hold one) are read cell by cell, as the chat's rich text reads them.",
  "cases": [
   {
    "about": "plain link",
@@ -487,6 +487,54 @@
    "lang": "zh",
    "expected": [
     "a\\​`evil.example`"
+   ]
+  },
+  {
+   "about": "a code span of the text's across a table cell's bar is no code span (a separator line under it)",
+   "input": "`|(`x@y.example\n- |",
+   "lang": "en",
+   "expected": [
+    "ˋ|(ˋ`x@y.example`\n- |"
+   ]
+  },
+  {
+   "about": "a code span of the text's across a table cell's bar is no code span (a separator line under it)",
+   "input": "`|(`x@y.example\n- |",
+   "lang": "zh",
+   "expected": [
+    "ˋ|(ˋ`x@y.example`\n- |"
+   ]
+  },
+  {
+   "about": "a table header and row read cell by cell: a code span across a bar, a host and a mail address made code",
+   "input": "a `x | https://e.example/p` b\n---|---\n`c|d` x@y.example",
+   "lang": "en",
+   "expected": [
+    "a ˋx | `e.example`ˋ b\n---|---\nˋc|dˋ `x@y.example`"
+   ]
+  },
+  {
+   "about": "a table header and row read cell by cell: a code span across a bar, a host and a mail address made code",
+   "input": "a `x | https://e.example/p` b\n---|---\n`c|d` x@y.example",
+   "lang": "zh",
+   "expected": [
+    "a ˋx | `e.example`ˋ b\n---|---\nˋc|dˋ `x@y.example`"
+   ]
+  },
+  {
+   "about": "a code span inside one cell is kept; a www address in another cell made code",
+   "input": "`ok` | b\n--|--\n`x` | www.w.example",
+   "lang": "en",
+   "expected": [
+    "`ok` | b\n--|--\n`x` | `www​.w.example`"
+   ]
+  },
+  {
+   "about": "a code span inside one cell is kept; a www address in another cell made code",
+   "input": "`ok` | b\n--|--\n`x` | www.w.example",
+   "lang": "zh",
+   "expected": [
+    "`ok` | b\n--|--\n`x` | `www​.w.example`"
    ]
   }
  ]
