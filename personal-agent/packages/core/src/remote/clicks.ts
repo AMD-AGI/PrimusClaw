@@ -15,6 +15,7 @@ import { remoteAgentText } from "../locales/remote-agents.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type OutMessage, richMessage } from "../ports/surface.js";
 import { backLine } from "./lines.js";
+import { breakLinks } from "./inert.js";
 import { neutral } from "../text/neutral.js";
 import { cpSlice, pyStrip } from "../text/py-text.js";
 import { own } from "../own.js";
@@ -253,7 +254,7 @@ export class SessionClicks {
     await this.closer(click)("", { announce: false });
     for (const [i, part] of parts.entries()) {
       const head = words.fullOutputHead({ i: i + 1, n: parts.length, label: state.agentLabel, host: state.host });
-      const block = "```\n" + part.replaceAll("```", "ʼʼʼ") + "\n```";
+      const block = "```\n" + breakLinks(part).replaceAll("```", "ʼʼʼ") + "\n```";
       await click.to.send(richMessage(`${neutral(head, 160)}\n\n${block}`, { aiGenerated: true }));
     }
   }

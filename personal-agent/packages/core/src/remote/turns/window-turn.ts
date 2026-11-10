@@ -13,7 +13,6 @@ import { redactText } from "../../security/redact.js";
 import type { StatusBoard } from "../board.js";
 import type { ChatState } from "../state.js";
 import type { TurnDisplay } from "./display.js";
-import { inertAnswer } from "../links/answer.js";
 
 export class WindowTurn implements TurnDisplay {
   tail = "";
@@ -38,7 +37,7 @@ export class WindowTurn implements TurnDisplay {
       .map((s) => pyStrip(s))
       .filter(Boolean)
       .join("\n\n");
-    return pyRstrip(inertAnswer(this.cutError(redactText(text).text)));
+    return pyRstrip(this.cutError(redactText(text).text));
   }
 
   begin(): void {

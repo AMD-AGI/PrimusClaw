@@ -16,6 +16,7 @@ import { inertAnswer } from "../../src/remote/links/answer.js";
 import { hostOf } from "../../src/remote/links/hosts.js";
 import { trim } from "../../src/remote/links/scans.js";
 import { WindowView } from "../../src/remote/window/view.js";
+import { outputLine } from "../../src/remote-view/window-view.js";
 
 interface AnswerCase {
   readonly about: string;
@@ -143,7 +144,13 @@ test("what the agent says into the window card is words whichever way it came", 
   const view = new WindowView();
   view.reset("rs-1");
   view.setText("look at https://evil.example/x and [docs](https://docs.example/y)");
-  assert.equal(view.text, "look at `evil.example` and docs (`docs.example`)");
+  // (kept as the agent wrote it, and each address broken where it stands as the card shows the line: the card's TextBlock
+  // escapes markdown, so a code span made for a host would only show its backticks with the host whole between them)
+  assert.equal(view.text, "look at https://evil.example/x and [docs](https://docs.example/y)");
+  assert.equal(
+    outputLine(view.text),
+    "look at https:\u200b//evil.example/x and \\[docs\\]\u200b(https:\u200b//docs.example/y)",
+  );
 });
 
 test("a character, a bracket and a space are read as Python reads them", () => {
