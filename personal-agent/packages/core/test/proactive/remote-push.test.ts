@@ -13,6 +13,8 @@ import { advanceSeconds } from "../../../../test-support/store.js";
 import { ALICE, at, shown, world } from "../../../../test-support/assistant/proactive-world.js";
 import type { JsonObject } from "../../src/json.js";
 import type { RemoteAskRequest } from "../../src/proactive/deps.js";
+import { DirectChat } from "../../src/direct-chat/direct-chat.js";
+import type { RequestContext, RequestScope } from "../../src/ports/request-scope.js";
 
 const LABEL = "\u{1F7E0} Claude Code on dev-pod";
 const SECRET = "ghp_" + "a".repeat(36);
@@ -252,4 +254,81 @@ it("a finish and an error are pushed to a chat that is not attached", async () =
   const said = shown(w.surface.outbox);
   assert.ok(said.some((line) => line.includes("做完了 #7")));
   assert.ok(said.some((line) => line.includes("出错了，#7")));
+});
+
+/** A synchronous stack of request contexts (what a router's scope holds while it handles an event). */
+class StackScope implements RequestScope {
+  private readonly stack: RequestContext[] = [];
+
+  run<T>(context: RequestContext, fn: () => T): T {
+    this.stack.push(context);
+    const out = fn();
+    if (out instanceof Promise) return out.finally(() => this.stack.pop()) as T;
+    this.stack.pop();
+    return out;
+  }
+
+  current(): RequestContext | undefined {
+    return this.stack.at(-1);
+  }
+}
+
+/** A chat in an agent's window, paused, holding an English say and an English permission request of its agent. */
+async function heldInEnglish(scope: RequestScope) {
+  const asked: RemoteAskRequest[] = [];
+  const w = world({
+    requestScope: scope,
+    direct: new DirectChat(true, [ALICE]),
+    remote: {
+      options: (raw): readonly unknown[] => (Array.isArray(raw) ? (raw as unknown[]) : []),
+      askCard: (request) => {
+        asked.push(request);
+        return { body: { type: "text", text: `ask ${request.sessionId}` } };
+      },
+      saidParts: (label, text) => [`${label}: ${text}`],
+    },
+  });
+  attach(w, "rs-1");
+  longAgo(w);
+  w.store.prefs.setPausedUntil(ALICE, w.store.now() + 3600);
+  const say = { type: "assistant.say", event_id: "s1", text: "The build is green again." };
+  assert.equal(await w.proactive.handle(ALICE, w.reference, say), "held");
+  assert.equal(
+    await w.proactive.handle(
+      ALICE,
+      w.reference,
+      remoteSay("rs-1", "needs_you", "p1", { text: "Run make test?", ask: anAsk("act-1", "2026-10-28T00:00:00Z") }),
+    ),
+    "held",
+  );
+  w.store.prefs.setPausedUntil(ALICE, null);
+  return { w, asked };
+}
+
+function suggested(w: ReturnType<typeof world>): string[] {
+  return w.surface.outbox.flatMap((r) => ("message" in r ? (r.message.suggestions ?? []).map((s) => s.title) : []));
+}
+
+it("held messages released while the person's message is handled answer in their client's language", async () => {
+  // Python: `/resume` (agent.py `_release_if_open`) runs inside Agent.handle, where answer_lang reads CLIENT_LOCALE.
+  const scope = new StackScope();
+  const { w, asked } = await heldInEnglish(scope);
+  const context = { clientLocale: "zh-CN", activityId: "a1", userId: ALICE, conversationId: `c-${ALICE}` };
+  await scope.run(context, () => w.release.release(ALICE));
+  assert.deepEqual(
+    asked.map((r) => r.lang),
+    ["zh"],
+  );
+  assert.ok(suggested(w).includes("回到 Clawy"), suggested(w).join(" | "));
+});
+
+it("a push or a sweep outside any message answers in the language of the text", async () => {
+  // Python: a push (link_api) and the release sweep run with CLIENT_LOCALE unset: pick_lang of the text.
+  const { w, asked } = await heldInEnglish(new StackScope());
+  await w.release.release(ALICE);
+  assert.deepEqual(
+    asked.map((r) => r.lang),
+    ["en"],
+  );
+  assert.ok(suggested(w).includes("Back to Clawy"), suggested(w).join(" | "));
 });

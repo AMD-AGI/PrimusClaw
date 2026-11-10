@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** What the delivery of unasked messages needs (teams_agent/proactive.py `Proactive.__init__`, and what it imported). */
+import type { RequestScope } from "../ports/request-scope.js";
 import type { DirectChat } from "../direct-chat/direct-chat.js";
 import type { JsonObject } from "../json.js";
 import type { ClawWorkItemsPort } from "../ports/claw/index.js";
@@ -88,4 +89,9 @@ export interface ProactiveDeps {
   readonly publicEvent: (event: JsonObject) => JsonObject;
   /** The bot's display name (branding; "Clawy" by default). */
   readonly botName: string;
+  /**
+   * The inbound event being handled, if any (Python CLIENT_LOCALE): held messages released while a message of the person's is
+   * handled (`/resume`, quiet hours off) answer in their client's language; a push or a sweep reads none. Default: none.
+   */
+  readonly requestScope?: RequestScope;
 }

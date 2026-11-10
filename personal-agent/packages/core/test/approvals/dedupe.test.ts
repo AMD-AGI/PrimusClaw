@@ -3,7 +3,7 @@
 
 // One approval is one card (teams/tests/test_approval_dedupe.py): the turn's own card and Claw's approval.requested notification
 // never show the same (session, tool_use_id) twice, and a card that never reached the chat does not use the approval up. The turn
-// is what the turn engine does with an approval it shows (`turnApprovalsFor`: recorded with its card before the send, marked sent
+// is what the turn engine does with an approval it shows (`turnApprovals`: recorded with its card before the send, marked sent
 // after it, given back when the send fails); the notification goes through the proactive delivery, both over one real store.
 import assert from "node:assert/strict";
 import { it } from "node:test";
