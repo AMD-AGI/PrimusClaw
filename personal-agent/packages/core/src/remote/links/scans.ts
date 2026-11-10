@@ -7,7 +7,7 @@
  * with no backtracking pattern. `mark(label, address)` says what a link becomes.
  */
 import { isPySpace, pyLstrip, pyRstrip, pySplit, pyStrip } from "../../text/py-text.js";
-import { CODE, DomainFinder, domains } from "./domains.js";
+import { CODE, DomainFinder, domains, tailAt } from "./domains.js";
 
 export { CODE } from "./domains.js";
 
@@ -374,7 +374,7 @@ export function bare(text: string, mark: Mark): string {
     // `example.com看看`)
     const run = low.startsWith("www.", start) ? -1 : bareDomains.runEnd(start);
     let stop = start;
-    if (run >= 0 && !":/?#".includes(text.charAt(run) || " ")) stop = run;
+    if (run >= 0 && !tailAt(text, run)) stop = run;
     else while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
     const url = trim(text.slice(start, stop));
     out.push(text.slice(i, start));
@@ -446,20 +446,17 @@ function mailsIn(text: string): string {
 
 /** Where the `@` of every mail address of `text` is (the rule `emails` makes code spans by). */
 function mailAts(text: string): number[] {
+  // (each `@` read on its own, its name back to the `@` before it: in `john.doe@example.comx@y.example` the second is a mail
+  // address too, `example.comx@y.example`, and a client may link it)
   const found: number[] = [];
-  let i = 0;
-  for (let at = text.indexOf("@"); at >= 0; at = text.indexOf("@", i)) {
+  let after = 0;
+  for (let at = text.indexOf("@"); at >= 0; at = text.indexOf("@", at + 1)) {
     let start = at;
-    while (start > i && isMailLocal(charBefore(text, start))) start -= charBefore(text, start).length;
+    while (start > after && isMailLocal(charBefore(text, start))) start -= charBefore(text, start).length;
     let stop = at + 1;
     while (stop < text.length && isMailDomain(charAt(text, stop))) stop += charAt(text, stop).length;
-    const address = pyRstrip(text.slice(start, stop), ".-\\");
-    if (isMail(address)) {
-      found.push(at);
-      i = start + address.length;
-    } else {
-      i = at + 1;
-    }
+    if (isMail(pyRstrip(text.slice(start, stop), ".-\\"))) found.push(at);
+    after = at + 1;
   }
   return found;
 }
@@ -500,8 +497,7 @@ function domainsIn(text: string): string {
   for (const [start, run] of domains(text)) {
     if (start < i) continue;
     let stop = run;
-    if (":/?#".includes(text.charAt(run) || " "))
-      while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
+    if (tailAt(text, run)) while (stop < text.length && !URL_END.has(text.charAt(stop))) stop += 1;
     const url = trim(text.slice(start, stop));
     out.push(text.slice(i, start), code(unescaped(url)));
     i = start + url.length;

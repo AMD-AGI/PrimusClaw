@@ -21,13 +21,19 @@ const ASCII_WORD = /^[A-Za-z0-9]$/u;
 /** Whether the run of labels `run`, followed by `after`, is a bare domain: not too long, and its last label a top-level domain
  * (any of two letters or more when it has three labels or more or a tail, a generic one when it is `name.tld` alone, so
  * `README.md` and `self.id` stay words). */
-function isDomain(run: string, after: string): boolean {
+function isDomain(run: string, after: string, tail: boolean): boolean {
   const labels = run.replaceAll("\\", "").split(".");
   const tld = (labels.at(-1) ?? "").toLowerCase();
   // (followed by `@` it is a mail address's name, the mail rule's: `john.doe.jr@example.com`)
   if (labels.join(".").length > DOMAIN_MAX || ASCII_WORD.test(after) || after === "@") return false;
-  if (labels.length > 2 || ":/?#".includes(after || " ")) return /^[a-z]{2,63}$/u.test(tld);
+  if (labels.length > 2 || tail) return /^[a-z]{2,63}$/u.test(tld);
   return GENERIC_TLDS.has(tld);
+}
+
+/** Whether a port, a path, a query or a fragment starts at `at` (`:`, `/`, `?`, `#`), escaped too (`\/`: the client shows `/`). */
+export function tailAt(text: string, at: number): boolean {
+  const ch = text.charAt(at) === "\\" ? text.charAt(at + 1) : text.charAt(at);
+  return ch !== "" && ":/?#".includes(ch);
 }
 
 /** The bare domains of one text, found left to right: [start, end of its run of labels] each. */
@@ -39,7 +45,7 @@ export function* domains(text: string, from = 0): Generator<[number, number]> {
     const end = start + m[0].length;
     const before = start > 0 ? text.charAt(start - 1) : "";
     const startsHere = !before || !(ASCII_WORD.test(before) || ".-@/\x00".includes(before) || before === CODE);
-    if (startsHere && isDomain(m[0], text.charAt(end))) yield [start, end];
+    if (startsHere && isDomain(m[0], text.charAt(end), tailAt(text, end))) yield [start, end];
   }
 }
 

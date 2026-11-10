@@ -235,6 +235,8 @@ test("a short line breaks a bare domain and a mail address, and leaves a file na
   assert.equal(neutral("Visit example.com/path"), "Visit example\u200b.com/path");
   assert.equal(neutral("docs.evil.md README.md"), "docs.evil\u200b.md README.md");
   assert.equal(neutral("me@evil.example"), "me@\u200bevil.example");
+  assert.equal(neutral("john.doe@example.comx@y.example"), "john.doe@\u200bexample.comx@\u200by.example");
+  assert.equal(neutral("site.museum\\/path"), "site\u200b.museum\\/path");
   assert.equal(neutral("@user a@b x@1.2 self.id"), "@user a@b x@1.2 self.id");
 });
 

@@ -728,6 +728,38 @@
    "expected": [
     "h | `docs.example.museum/p\\|`\n---|---\nx | y"
    ]
+  },
+  {
+   "about": "an escaped tail is a tail: the bare domain is shown whole, its tail with it",
+   "input": "see site.museum\\/path now",
+   "lang": "en",
+   "expected": [
+    "see `site.museum/path` now"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail: the bare domain is shown whole, its tail with it",
+   "input": "see site.museum\\/path now",
+   "lang": "zh",
+   "expected": [
+    "see `site.museum/path` now"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail for a generic top-level domain too",
+   "input": "example.com\\/path and example.com\\:8080",
+   "lang": "en",
+   "expected": [
+    "`example.com/path` and `example.com:8080`"
+   ]
+  },
+  {
+   "about": "an escaped tail is a tail for a generic top-level domain too",
+   "input": "example.com\\/path and example.com\\:8080",
+   "lang": "zh",
+   "expected": [
+    "`example.com/path` and `example.com:8080`"
+   ]
   }
  ]
 }

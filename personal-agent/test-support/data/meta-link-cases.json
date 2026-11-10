@@ -108,6 +108,18 @@
    "input": "foo\\-bar.com/path",
    "limit": 200,
    "expected": "foo\\-bar​.com/path"
+  },
+  {
+   "about": "an escaped tail in a line is a tail",
+   "input": "site.museum\\/path and site.museum\\:8080",
+   "limit": 200,
+   "expected": "site​.museum\\/path and site​.museum\\:8080"
+  },
+  {
+   "about": "two mail addresses that overlap in a line: each @ is broken",
+   "input": "john.doe@example.comx@y.example",
+   "limit": 200,
+   "expected": "john.doe@​example.comx@​y.example"
   }
  ]
 }
