@@ -7,6 +7,8 @@
  * token (`app-token.ts`). Nothing here ever logs or keeps a response body: an error carries a status and a code only.
  */
 
+import { pyRstrip } from "@primusclaw/personal-agent";
+
 export const GITHUB_API = "https://api.github.com";
 
 export const GITHUB_HEADERS: Readonly<Record<string, string>> = {
@@ -63,7 +65,7 @@ export class GithubApi {
   private readonly timeoutMs: number;
 
   constructor(options: GithubApiOptions = {}) {
-    this.apiUrl = (options.apiUrl ?? GITHUB_API).replace(/\/+$/u, "");
+    this.apiUrl = pyRstrip(options.apiUrl ?? GITHUB_API, "/");
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
     this.tokens = options.tokens;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;

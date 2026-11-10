@@ -15,6 +15,7 @@ import {
   type ListedMention,
   type Logger,
   pyJsonDumps,
+  pyRstrip,
 } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
@@ -56,7 +57,7 @@ export class GatewayIntentReader implements IntentReader {
   private readonly fetchImpl: FetchLike;
 
   constructor(private readonly options: IntentReaderOptions) {
-    this.url = `${options.baseUrl.replace(/\/+$/u, "")}/chat/completions`;
+    this.url = `${pyRstrip(options.baseUrl, "/")}/chat/completions`;
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 

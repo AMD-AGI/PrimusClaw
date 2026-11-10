@@ -16,6 +16,7 @@ import {
   credentialRefused,
   err,
   ok,
+  pyRstrip,
 } from "@primusclaw/personal-agent";
 import { z } from "zod";
 
@@ -91,7 +92,7 @@ export class IdentityCredentialClient implements GithubCredentials {
   private readonly fetchImpl: FetchLike;
 
   constructor(private readonly options: CredentialClientOptions) {
-    this.base = options.baseUrl.replace(/\/+$/u, "");
+    this.base = pyRstrip(options.baseUrl, "/");
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 

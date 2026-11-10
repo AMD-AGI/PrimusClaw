@@ -9,6 +9,8 @@
 
 import { createPrivateKey, sign, type KeyObject } from "node:crypto";
 
+import { pyRstrip } from "@primusclaw/personal-agent";
+
 import { GITHUB_API, GITHUB_HEADERS, errorName, segment, type FetchLike, type GithubTokenSource } from "./api.js";
 
 /** No usable GitHub credential right now. `code` says why and never carries a secret. */
@@ -68,7 +70,7 @@ export class AppTokenSource implements GithubTokenSource {
 
   constructor(private readonly options: AppTokenOptions) {
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
-    this.apiUrl = (options.apiUrl ?? GITHUB_API).replace(/\/+$/u, "");
+    this.apiUrl = pyRstrip(options.apiUrl ?? GITHUB_API, "/");
     this.clock = options.clock ?? (() => Date.now() / 1000);
   }
 
