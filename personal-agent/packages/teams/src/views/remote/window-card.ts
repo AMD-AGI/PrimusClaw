@@ -91,7 +91,6 @@ export function windowCard(view: remoteView.WindowCardView): CardMessage {
   const body: CardElement[] = [...headBlocks(view), ...outputBlocks(view.output)];
   if (view.note) body.push(text(view.note, { subtle: true, size: "Small", spacing: "Small" }));
   body.push(...waitingBlocks(view), ...boxBlocks(view), note(view.chatBox));
-  if (view.page) body.push(block(view.page, { size: "Small", spacing: "Small" }));
   body.push(block(view.updated, { isSubtle: true, size: "Small", spacing: "None" }));
   return message(body, view.actions.map(remoteAction), WINDOW_BUTTONS_MAX);
 }

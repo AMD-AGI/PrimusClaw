@@ -20,8 +20,6 @@ function line(item: remoteView.StatusLine): CardElement {
       return warningNote(item.text, (value) => text(value, { size: "Small" }));
     case "assistant":
       return block(item.text, { isSubtle: true, size: "Small", spacing: "Small" });
-    case "window":
-      return block(item.text, { size: "Small", spacing: "Small" });
     case "lastSession":
     case "folder":
     case "updated":

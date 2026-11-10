@@ -77,7 +77,6 @@ export class StatusBoard {
       lead,
       conversation: state.conversation,
       takeover,
-      page: "",
       terminal: this.state.typesIntoTerminal(chatKey, state),
       bot: this.ctx.settings.botName,
     };

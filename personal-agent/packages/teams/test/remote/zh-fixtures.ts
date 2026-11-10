@@ -25,7 +25,6 @@ import { decisionAction } from "../../src/views/remote/elements.js";
 
 export const NOW = 1_794_000_000.0; // 2026-11-07
 export const TZ = "Asia/Shanghai";
-export const PAGE = "https://claw.example.com/primus-claw/agent-sessions";
 const BASE = 1_793_990_000;
 
 export function entries(): Record<string, unknown>[] {
@@ -236,7 +235,6 @@ function statuses(lang: Lang): Record<string, Rendered> {
             unattended: true,
             lead: "说明",
             conversation: named,
-            page: PAGE,
             takeover: { connector_id: "c-on", agent_id: "cx", resume: "r-watch" },
             bot: "Clawy",
           }),
@@ -448,7 +446,6 @@ export function renders(lang: Lang): Record<string, unknown> {
         now: NOW,
         lang,
         waiting: WAITING,
-        page: PAGE,
         setup: SETUP,
       }),
     ),
@@ -480,7 +477,7 @@ export function fixtureStrings(): Set<string> {
     else if (value instanceof Set) [...(value as Set<unknown>)].forEach(walk);
     else if (value && typeof value === "object") Object.values(value).forEach(walk);
   };
-  walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), PAGE, "m-a", "m-b", "#3 修复"]);
+  walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), "m-a", "m-b", "#3 修复"]);
   for (const kind of ["claude", "codex", "cursor"]) found.add(remoteDomain.kindLabel(kind).label);
   found.add("Agent");
   return found;

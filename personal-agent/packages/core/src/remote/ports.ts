@@ -36,8 +36,6 @@ export interface StatusInput {
   readonly conversation?: string;
   /** What Take over… carries, for a watched conversation the connector can take over; null for none. */
   readonly takeover?: ButtonFields | null;
-  /** The link to the same session in a page of its own, "" for none. */
-  readonly page?: string;
   /** What is sent is typed into a terminal on the machine, so Stop says it interrupts the turn running there. */
   readonly terminal?: boolean;
   /** The assistant's display name. */
@@ -71,8 +69,6 @@ export interface SessionsInput {
   readonly setup: ConnectorSetupWords;
   /** Session ids with an approval card open. */
   readonly waiting?: ReadonlySet<string>;
-  /** The console's list of sessions, "" for none. */
-  readonly page?: string;
 }
 
 /** One approval the session waits on: the tool, when it runs out, and the agent's own options as buttons. */
@@ -102,8 +98,6 @@ export interface WindowInput {
   readonly conversation?: string;
   readonly hasModes?: boolean;
   readonly takeover?: ButtonFields | null;
-  /** The link to the session in a page of its own, "" for none. */
-  readonly page?: string;
   /** A group chat bound to the session: its approvals go to the binder's 1:1 chat, never here. */
   readonly group?: boolean;
   readonly terminal?: boolean;

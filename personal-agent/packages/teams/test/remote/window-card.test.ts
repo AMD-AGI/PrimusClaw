@@ -210,18 +210,11 @@ test("a watched session can be taken over and a starting one says when the box c
   });
   assert.ok(!words(watching).includes('"op":"mode"'));
   const starting = card("en", windowOf(), [], "starting", {
-    page: "https://h.example/p",
     unattended: true,
     conversation: "fix",
     lead: "Attached.",
   });
-  for (const w of [
-    "Once the session has started",
-    "[Open in its own window](https://h.example/p)",
-    "Unattended: runs",
-    "conversation “fix”",
-    "Attached.",
-  ]) {
+  for (const w of ["Once the session has started", "Unattended: runs", "conversation “fix”", "Attached."]) {
     assert.ok(words(starting).includes(w), w);
   }
   assert.ok(words(card("en", windowOf(), [], "offline")).includes("the machine is offline"));

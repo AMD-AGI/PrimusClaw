@@ -30,7 +30,6 @@ export type StatusLine =
   | { readonly kind: "unattended"; readonly text: string }
   /** Which messages stay with the assistant. */
   | { readonly kind: "assistant"; readonly text: string }
-  | { readonly kind: "window"; readonly text: string }
   | { readonly kind: "updated"; readonly text: string };
 
 export interface StatusView {
@@ -60,13 +59,6 @@ function phaseWords(phase: StatusPhase, lang: Lang): string {
     : phase;
 }
 
-/** One small line with the link to open a session (or the list) in a window of its own; null with no link. */
-export function windowText(url: string, lang: Lang, listing = false): string | null {
-  if (!url) return null;
-  const words = remoteText.in(lang);
-  return listing ? words.openSessionsWindow({ url }) : words.openWindow({ url });
-}
-
 function titleOf(input: StatusInput, attached: boolean, named: string, where: string): string {
   const words = remoteText.in(input.lang ?? "en");
   if (input.phase === "watching") return words.titleWatching({ where });
@@ -75,15 +67,13 @@ function titleOf(input: StatusInput, attached: boolean, named: string, where: st
   return input.phase === "detached" ? words.titleDetached : words.titleEnded;
 }
 
-/** The lines only a chat still in the session gets: how it stands, the unattended note, which messages stay with the
- * assistant, and the session's own page. */
+/** The lines only a chat still in the session gets: how it stands, the unattended note, and which messages stay with the
+ * assistant. (No card links a web page of the session: a phone, where the cards are used, cannot open one.) */
 function attachedLines(input: StatusInput, lang: Lang): StatusLine[] {
   const words = remoteText.in(lang);
   const lines: StatusLine[] = [{ kind: "phase", text: words.status + phaseWords(input.phase, lang) }];
   if (input.unattended) lines.push({ kind: "unattended", text: words.unattendedNote });
   lines.push({ kind: "assistant", text: clawyLine(lang, input.bot) });
-  const window = windowText(input.page ?? "", lang);
-  if (window) lines.push({ kind: "window", text: window });
   return lines;
 }
 

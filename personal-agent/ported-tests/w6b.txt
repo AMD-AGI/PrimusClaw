@@ -21,8 +21,6 @@
 #   teams/tests/test_remote_cards_zh.py::test_every_sentence_of_the_worker_has_its_chinese
 #   teams/tests/test_remote_cards_zh.py::test_agents_in_a_chinese_chat_is_chinese_end_to_end
 #   teams/tests/test_remote_cards_zh.py::test_a_tap_that_cannot_go_through_says_why_in_a_chinese_chat
-#   teams/tests/test_remote_own_window.py::test_attaching_sends_the_status_card_with_no_link_to_a_web_page
-#   teams/tests/test_remote_own_window.py::test_the_sessions_and_agents_cards_link_no_web_page
 #   teams/tests/test_machine_health.py::test_the_agents_card_says_under_the_machine_what_is_wrong_and_how_to_fix_it
 #   teams/tests/test_machine_health.py::test_a_connector_without_health_shows_the_card_as_before
 #   teams/tests/test_agents_card_refresh.py::test_every_op_on_the_card_is_classified
@@ -115,7 +113,9 @@ teams/tests/test_remote_cards_zh.py::test_english_is_unchanged_in_shape -> packa
 teams/tests/test_remote_cards_zh.py::test_agent_refs_are_inert_in_a_list_of_names -> packages/core/test/remote-view/agents.test.ts::agent refs are inert in a list of names
 teams/tests/test_remote_cards_zh.py::test_an_always_option_named_in_chinese_keeps_its_english_title -> packages/teams/test/remote/cards-zh.test.ts::an always option named in chinese keeps its english title
 teams/tests/test_remote_own_window.py::test_the_page_of_a_session_and_of_the_list_are_under_the_console -> packages/teams/test/remote/cards.test.ts::the page of a session and of the list are under the console
-teams/tests/test_remote_own_window.py::test_the_status_card_links_its_session_page_only_while_the_chat_is_in_the_session -> packages/teams/test/remote/cards.test.ts::the status card links its session page only while the chat is in the session
+teams/tests/test_remote_own_window.py::test_the_status_card_links_its_session_page_only_while_the_chat_is_in_the_session -> DROPPED: the Python worker no longer links a session page from any card (every caller passes no page); the TS port drops the dead parameter, so the cards cannot carry one; that they link none is "attaching sends the status card with no link to a web page" and "the sessions and agents cards link no web page"
+teams/tests/test_remote_own_window.py::test_attaching_sends_the_status_card_with_no_link_to_a_web_page -> packages/core/test/remote/e2e/no-page-links.test.ts::attaching sends the status card with no link to a web page
+teams/tests/test_remote_own_window.py::test_the_sessions_and_agents_cards_link_no_web_page -> packages/core/test/remote/e2e/no-page-links.test.ts::the sessions and agents cards link no web page
 teams/tests/test_machine_health.py::test_each_problem_once_failures_first_with_the_fix_in_the_users_language -> packages/core/test/remote-view/health.test.ts::each problem once failures first with the fix in the users language
 teams/tests/test_machine_health.py::test_no_health_is_unknown_and_no_problems_is_nothing_to_say -> packages/core/test/remote-view/health.test.ts::no health is unknown and no problems is nothing to say
 teams/tests/test_machine_health.py::test_what_the_connector_wrote_is_inert_and_an_unknown_code_shows_its_detail -> packages/core/test/remote-view/health.test.ts::what the connector wrote is inert and an unknown code shows its detail
