@@ -676,6 +676,8 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     // Exactly the text: a wrap may drop the space it broke at, nothing else may differ.
     assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccccccc dddddd", "eeeeee"]), "aaaaaaaa bbbbbbbb cccccccc dddddd eeeeee"), null, "wrapped at a space: the next word did not fit");
     assert.equal(enterGuard(box(["x".repeat(37), "xxx"]), "x".repeat(40)), null, "wrapped inside a word: the row full");
+    assert.equal(enterGuard(box(["x".repeat(36), "x"]), "x".repeat(37)), "the box does not hold exactly what was typed", "one more column was free (codex r3)");
+    assert.equal(enterGuard(box([`${"x".repeat(36)}`, "你好"]), `${"x".repeat(36)}你好`), null, "a wide character does not fit the last free column");
     // (codex r2 on #648) a line break of the box's own is not a wrapped space
     assert.equal(enterGuard(box(["hello", "world"]), "hello world"), "the box does not hold exactly what was typed", "a line break is not a space");
     assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccc", "dd"]), "aaaaaaaa bbbbbbbb cccc dd"), "the box does not hold exactly what was typed", "the next word would have fit");
