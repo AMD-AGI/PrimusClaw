@@ -14,7 +14,7 @@ import {
   humanizeTool,
   rawDetails,
 } from "../../src/approvals/approval-view.js";
-import { credentialValues, isSensitiveName, maskValue, scrub } from "../../src/approvals/sensitive.js";
+import { credentialValues, isSensitiveName, maskValue, nameWords, scrub } from "../../src/approvals/sensitive.js";
 import { answerLang, pickLang, writtenLang } from "../../src/language/detect.js";
 
 const TOOL = "mcp__ops__patch_plans_plan_id_labels";
@@ -341,6 +341,15 @@ it("an mcp name is read as the shortest server and the rest without a line break
   assert.equal(humanizeTool("_bash_"), "bash");
   const started = Date.now();
   assert.ok(humanizeTool(`mcp__${"_".repeat(50000)}`).endsWith(" (_)"));
+  assert.ok(Date.now() - started < 2000);
+});
+
+it("a long run of capitals in an argument name splits in linear time (the Python regex takes seconds)", () => {
+  // Python's re.sub(r"([A-Z]+)([A-Z][a-z])", ...) takes 3.3 s on 20 000 capitals; the expected words are its own.
+  assert.deepEqual(nameWords("AAPIKeyToken"), ["aapi", "key", "token"]);
+  const started = Date.now();
+  assert.deepEqual(nameWords(`${"A".repeat(100_000)}b`), [`${"a".repeat(99_999)}`, "ab"]);
+  assert.deepEqual(nameWords("A".repeat(100_000)), ["a".repeat(100_000)]);
   assert.ok(Date.now() - started < 2000);
 });
 
