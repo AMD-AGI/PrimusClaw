@@ -7,6 +7,8 @@
  * the machine's owner pauses it.
  */
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import fsp from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
@@ -17,9 +19,11 @@ import { ClawClient, HttpError, RevokedError, TransportError } from "./claw-clie
 import type { ConnectorConfig } from "./config.js";
 import { GrantRevokedError, TransientAuthError } from "./credentials.js";
 import { recordDisconnect } from "./health.js";
+import { resolveCwd } from "./roots.js";
 import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
+import { ApprovalBroker, serveApprovals } from "./approvals.js";
 import {
   childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
 } from "./paths.js";
@@ -50,6 +54,8 @@ export function withHealth(base: Record<string, unknown>, health: AgentHealth | 
 
 export interface ConnectorTiming extends SessionTiming {
   heartbeatMs: number;
+  /** How long a terminal's question waits on the phone before its card is withdrawn (it stays open in the terminal). */
+  approvalTtlMs: number;
   /** No byte on the command stream for this long: drop it and reconnect. */
   watchdogMs: number;
   /** Events are posted this long after the first one is waiting, or at once when `batchMax` are. */
@@ -125,6 +131,7 @@ export const READ_ONLY_HINT = `sessions of this agent start read-only: it answer
 export const DEFAULT_TIMING: ConnectorTiming = {
   ...DEFAULT_SESSION_TIMING,
   heartbeatMs: REMOTE_AGENT_TIMING.heartbeatMs,
+  approvalTtlMs: 60 * 60_000,
   watchdogMs: REMOTE_AGENT_TIMING.watchdogMs,
   batchMs: 150,
   batchMax: 20,
@@ -297,6 +304,10 @@ export class Connector {
   readonly manager: SessionManager;
   readonly store: SessionStore;
   private readonly attach = new Map<string, AttachSupport>();
+  /** The questions terminals ask through the approval hooks (approvals.ts). */
+  readonly approvals: ApprovalBroker;
+  /** Claw said the owner turned approvals off: until then (ms since the epoch), the terminal answers alone. */
+  private approvalsOffUntil = 0;
   private ledger: CommandLedger = new CommandLedger();
   private cid = "";
   private revoked = false;
@@ -404,6 +415,34 @@ export class Connector {
       emit: (sid, type, data, after) => this.emit(sid, type, data, after),
     };
     this.manager = new SessionManager(env);
+    this.approvals = new ApprovalBroker({
+      openSession: (p) => this.openTerminalSession(p),
+      emit: (sid, type, data) => this.emit(sid, type, data),
+      audit: (event, detail) => d.audit.record(event, detail),
+      ttlMs: this.timing.approvalTtlMs,
+    });
+    this.manager.approvals = this.approvals;
+  }
+
+  /**
+   * The Claw session for a terminal conversation's approvals, or why there is none: this machine is paused or not connected,
+   * the owner turned approvals off, no agent reads that Claude config directory, or the folder is outside the agent's roots.
+   */
+  private async openTerminalSession(p: { configDir: string; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }> {
+    if (this.paused) return { refused: "paused" };
+    if (!this.cid || this.revoked) return { refused: "not_connected" };
+    if (Date.now() < this.approvalsOffUntil) return { refused: "approvals_off" };
+    const dir = path.resolve(p.configDir);
+    const agent = this.d.config.agents.find((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
+    if (!agent) return { refused: "no_agent_for_config_dir" };
+    const where = await resolveCwd(p.cwd, agent.roots, { home: agent.env.HOME?.trim() || os.homedir(), timeoutMs: this.timing.rootCheckMs });
+    if (!where.ok) return { refused: `cwd_${where.reason}` };
+    try {
+      return { sessionId: await this.d.client.openTerminalSession(this.cid, { agent_id: agent.id, ref: p.ref, cwd: where.real, title: p.title }) };
+    } catch (e) {
+      if (e instanceof HttpError && e.code === "approvals_off") { this.approvalsOffUntil = Date.now() + 60_000; return { refused: "approvals_off" }; }
+      return { refused: e instanceof HttpError ? `claw_${e.status}_${e.code}`.slice(0, 80) : "claw_unreachable" };
+    }
   }
 
   /** Every event leaves through here: scrubbed of credential shapes, numbered, written to disk, then posted. */
@@ -1241,10 +1280,14 @@ export class Connector {
     this.paused = fs.existsSync(pauseFile(this.d.dirs));
     let result: RunResult = "stopped";
     let failure = "";
+    let closeApprovals: (() => Promise<void>) | null = null;
     try {
       const up = await this.startup();
       if (up !== "ok") return (result = up);
       await this.manager.restoreReadOnly();
+      // The approval hooks reach this run through a socket in the state directory; one that cannot be opened costs only them.
+      closeApprovals = await serveApprovals(this.d.dirs.state, this.approvals, (m) => (typeof m.dir === "string" ? m.dir : ""),
+        (msg, detail) => this.d.log.warn(msg, detail)).catch((e: unknown) => { this.d.log.warn("the approval socket could not be opened; terminals answer their own questions", { error: errMessage(e) }); return null; });
       // Signed in and not revoked: the turns the previous run left running end, or (one that was waiting for a person's
       // approval) go on and ask again, never while paused; the sessions used lately are told they are back.
       this.manager.recover({ downForMs, mayContinue: !this.paused && !fs.existsSync(pauseFile(this.d.dirs)) });
@@ -1264,6 +1307,7 @@ export class Connector {
       failure = errMessage(e);
       throw e;
     } finally {
+      await closeApprovals?.().catch(() => undefined);
       // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
       await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);
       // A command still being carried out (a session that was opening) ends now that its adapter is gone. It is waited for,

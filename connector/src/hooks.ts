@@ -191,3 +191,115 @@ export function hooksStatus(configDir: string): HooksStatus {
 }
 
 export { TERMINALS_DIR };
+
+// --- the approval hooks (approvals.ts) --------------------------------------------------
+
+/**
+ * The approval hooks, installed only when asked for (`hooks install --approvals`): `PermissionRequest` hands a question the
+ * terminal is asking to the connector and waits for the owner's answer (Claude Code shows its own dialog meanwhile, so the hook
+ * may wait as long as the question is open); the others run in the background (`async`) and only tell the connector that the
+ * terminal answered. `SessionEnd` cannot run in the background and has about a second, which is plenty for one local write.
+ */
+export const APPROVAL_HOOKED = [
+  { event: "PermissionRequest", arg: "ask", timeout: 3600, async: false },
+  { event: "PostToolUse", arg: "settled", timeout: 5, async: true },
+  { event: "PostToolUseFailure", arg: "settled", timeout: 5, async: true },
+  { event: "UserPromptSubmit", arg: "settled", timeout: 5, async: true },
+  { event: "Stop", arg: "settled", timeout: 5, async: true },
+  { event: "SessionEnd", arg: "settled", timeout: 1, async: false },
+] as const;
+
+const APPROVAL_RE = /approval-hook\.(?:js|ts)["']?\s+(?:ask|settled)\s/;
+const isOursApproval = (h: unknown): boolean =>
+  isObject(h) && h.type === "command" && typeof h.command === "string" && h.command.endsWith(` ${MANAGED_MARK}`) && APPROVAL_RE.test(h.command);
+
+export function approvalHookCommand(node: string, script: string, arg: "ask" | "settled", configDir: string, socket: string): string {
+  return `${shellQuote(node)} ${shellQuote(script)} ${arg} --dir ${shellQuote(configDir)} --socket ${shellQuote(socket)} ${MANAGED_MARK}`;
+}
+
+/** Add (or bring up to date) the approval hooks; the same merge rules as {@link installHooks}. */
+export function installApprovalHooks(configDir: string, node: string, script: string, socket: string): InstallResult {
+  const l = load(configDir);
+  const where = settingsFile(configDir);
+  const before = JSON.stringify(l.doc);
+  const doc: Json = JSON.parse(before);
+  const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
+  for (const h of APPROVAL_HOOKED) {
+    const entry: Json = { type: "command", command: approvalHookCommand(node, script, h.arg, configDir, socket), timeout: h.timeout, ...(h.async ? { async: true } : {}) };
+    const groups = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
+    let seen = false;
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+      const kept: unknown[] = [];
+      let dropped = false;
+      for (const x of g.hooks) {
+        if (!isOursApproval(x)) { kept.push(x); continue; }
+        if (seen) { dropped = true; continue; }
+        seen = true;
+        const { async: _a, ...rest } = x as Json;
+        kept.push({ ...rest, ...entry });
+      }
+      g.hooks = kept;
+      if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
+    }
+    if (!seen) groups.push({ hooks: [entry] });
+  }
+  const changed = JSON.stringify(doc) !== before || l.text === null;
+  if (changed) save(l, doc);
+  return { changed, file: l.file };
+}
+
+/** Remove the approval hooks only (the session hooks stay). */
+export function uninstallApprovalHooks(configDir: string): InstallResult {
+  const l = load(configDir);
+  const where = settingsFile(configDir);
+  const doc: Json = JSON.parse(JSON.stringify(l.doc));
+  const hooks = hooksOf(doc, where);
+  let touchedAny = false;
+  if (hooks) {
+    for (const event of new Set(APPROVAL_HOOKED.map((h) => h.event))) {
+      const groups = groupsOf(hooks, event, where);
+      if (!groups) continue;
+      let touched = false;
+      for (let i = groups.length - 1; i >= 0; i--) {
+        const g = groups[i];
+        if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+        const rest = g.hooks.filter((x) => !isOursApproval(x));
+        if (rest.length === g.hooks.length) continue;
+        touched = true;
+        g.hooks = rest;
+        if (rest.length === 0) groups.splice(i, 1);
+      }
+      if (touched && groups.length === 0) delete hooks[event];
+      touchedAny ||= touched;
+    }
+    if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
+  }
+  if (touchedAny) save(l, doc);
+  return { changed: touchedAny, file: l.file };
+}
+
+/** Whether the approval hooks are in place (all of them), and whether what they run still exists; never throws. */
+export function approvalHooksStatus(configDir: string): HooksStatus {
+  let l: Loaded;
+  try { l = load(configDir); } catch (e) { return { installed: false, events: [], healthy: false, problem: (e as Error).message }; }
+  const events: string[] = [];
+  let healthy = true;
+  let problem: string | null = null;
+  const hooks = isObject(l.doc.hooks) ? l.doc.hooks : {};
+  for (const h of APPROVAL_HOOKED) {
+    const groups = Array.isArray(hooks[h.event]) ? (hooks[h.event] as unknown[]) : [];
+    const mine = groups.flatMap((g) => (isObject(g) && Array.isArray(g.hooks) ? g.hooks.filter(isOursApproval) : []) as Json[]);
+    if (mine.length === 0) continue;
+    events.push(h.event);
+    for (const x of mine) {
+      const m = /^'((?:[^']|'\\'')*)' '((?:[^']|'\\'')*)' /.exec(String(x.command));
+      if (!m) continue;
+      for (const f of [m[1]!, m[2]!].map((s) => s.replace(/'\\''/g, "'"))) {
+        if (!fs.existsSync(f)) { healthy = false; problem ??= `${f} (named by the ${h.event} approval hook) does not exist; run: claw-connector hooks install --approvals`; }
+      }
+    }
+  }
+  return { installed: events.length === APPROVAL_HOOKED.length, events, healthy, problem };
+}

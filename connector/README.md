@@ -538,12 +538,47 @@ set aside until the ask mode (`default`) is locked and read back from the adapte
 that is not confirmed, closes the session. The phone can select only the safe modes, as for every agent. Closing the
 session stops the agent process; it never deletes the conversation.
 
+## Questions asked in a terminal, answered from the chat
+
+A Claude Code session you started yourself, in your own terminal, still stops and waits for you when it wants to run a command,
+edit a file, leave plan mode or put a multiple-choice question to you. With the approval hooks installed, that question is also
+put to you in the chat as a card with the same choices, so you can answer it away from the screen:
+
+```sh
+claw-connector hooks install --approvals      # opt-in; "hooks uninstall --approvals" takes them out again
+```
+
+This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
+background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
+hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this
+installation, which talks to the running connector over a socket in its state directory (`approvals.sock`, 0600, in a
+directory only you can enter).
+
+- **The terminal keeps asking.** Claude Code shows its own dialog while the hook waits (measured on 2.1.322). The first answer,
+  in the terminal or in the chat, decides; the other is withdrawn (the card says it was answered in the terminal). A
+  connector that is not running, not connected, paused, or a question no card can carry (a multi-select question, more than
+  eight answers) leaves the question to the terminal at once.
+- **What a card offers.** A command, an edit or another tool: *Yes*, *No*, *No, and stop*, and, when Claude Code suggests an
+  allow rule for it, *Yes, and don't ask again this session* (kept for this session only, never written to a settings file).
+  A plan: *Approve the plan (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep
+  planning*. A question (`AskUserQuestion`): its own answers, one card per question, and *Don't answer*. No card switches a
+  session into a mode that stops asking (auto, accept edits, bypass).
+- **Which conversations.** Only sessions in a terminal (`CLAUDE_CODE_ENTRYPOINT=cli`); one this connector runs already asks
+  through its own cards. The folder must be inside the roots of the agent that reads that Claude config directory (a
+  `claude-attach` agent, or the one derived from a `claude` agent). A session in `bypassPermissions` asks only its questions
+  and plan approvals, so only those reach the chat.
+- **On Claw's side** each conversation's questions go on a session of its own (`origin: "terminal_hook"`) that carries
+  nothing but these cards: it cannot be sent a prompt. Turning the cards off there (`/approvals off`) makes the connector
+  leave every question to the terminal.
+- A card nobody answers is withdrawn after an hour; the terminal still has the question. The audit log records each request,
+  answer and withdrawal (`approval_requested`, `permission_resolved`, `approval_withdrawn`), never what was typed.
+
 ## Commands
 
 | Command | |
 |---|---|
 | `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks before adding the Claude Code session hooks to Claude's `settings.json`; `--hooks` adds them without asking, `--no-hooks` skips them, and with nobody to answer (a script, a pipe) they are not added and the `hooks install` command is printed instead. |
-| `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
+| `hooks install\|uninstall\|status [--approvals]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |

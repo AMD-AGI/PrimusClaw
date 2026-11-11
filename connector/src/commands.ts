@@ -17,7 +17,8 @@ import {
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
-import { HooksError, hooksStatus, installHooks, settingsFile, uninstallHooks } from "./hooks.js";
+import { approvalHooksStatus, HooksError, hooksStatus, installApprovalHooks, installHooks, settingsFile, uninstallApprovalHooks, uninstallHooks } from "./hooks.js";
+import { approvalSocketFile } from "./approvals.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
@@ -55,6 +56,8 @@ export interface Ctx {
   onConnector?: (c: Connector) => void;
   /** The file the terminal hooks run (default: `terminal-hook.js` next to this program) and the node that runs it. */
   hookScript?: string;
+  /** The file the approval hooks run (default: `approval-hook.js` next to this program). */
+  approvalHookScript?: string;
   node?: string;
   /** Claude Code's managed settings file and the effective uid, as the Claude adapter sees them (tests set them). */
   claudeManagedSettings?: string;
@@ -116,10 +119,13 @@ terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
     run: (rest, ctx) => cmdInit(rest, ctx),
   },
   hooks: {
-    usage: "hooks install|uninstall|status [--config-dir DIR]",
+    usage: "hooks install|uninstall|status [--approvals] [--config-dir DIR]",
     about: `the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
 in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
-directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed`,
+directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed.
+--approvals also adds the approval hooks: a question Claude Code asks in a terminal (run a command,
+edit a file, approve a plan, a multiple-choice question) is also put to you in the chat, and the
+first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those`,
     run: (rest, ctx) => cmdHooks(rest, ctx),
   },
   pair: {
@@ -408,14 +414,25 @@ function installOne(ctx: Ctx, dir: string) {
   return installHooks(dir, ctx.node ?? process.execPath, hookScript(ctx));
 }
 
+function approvalScript(ctx: Ctx): string {
+  const script = ctx.approvalHookScript ?? fileURLToPath(new URL("./approval-hook.js", import.meta.url));
+  if (!fs.existsSync(script)) throw new HooksError(`${script} does not exist (a source checkout needs "npm run build" first)`);
+  return script;
+}
+
+function installApprovalsOne(ctx: Ctx, dir: string) {
+  return installApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state));
+}
+
 const describeInstall = (dir: string, changed: boolean): string =>
   changed ? `installed the Claude Code session hooks in ${settingsFile(dir)}` : `the Claude Code session hooks are already in ${settingsFile(dir)}`;
 
 function cmdHooks(args: string[], ctx: Ctx): number {
   const [sub, ...rest] = args;
   if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--config-dir DIR]"); return EXIT.usage; }
-  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" } } });
+  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" } } });
   const dirs = claudeDirs(ctx, values["config-dir"]);
+  const approvals = !!values.approvals;
   let code: number = EXIT.ok;
   const report: Array<Record<string, unknown>> = [];
   for (const dir of dirs) {
@@ -423,12 +440,20 @@ function cmdHooks(args: string[], ctx: Ctx): number {
       if (sub === "install") {
         if (values["config-dir"] === undefined && !fs.existsSync(dir)) { ctx.err(`no Claude Code directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
         ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
+        // The approval hooks are added only when asked for: they put what a terminal asks on the owner's phone.
+        if (approvals) ctx.out(installApprovalsOne(ctx, dir).changed
+          ? `installed the approval hooks in ${settingsFile(dir)}: questions Claude Code asks in a terminal also go to your chat, and the first answer wins`
+          : `the approval hooks are already in ${settingsFile(dir)}`);
       } else if (sub === "uninstall") {
-        ctx.out(uninstallHooks(dir).changed ? `removed the Claude Code session hooks from ${settingsFile(dir)}` : `no session hooks of ours in ${settingsFile(dir)}`);
+        // `--approvals` takes out only the approval hooks; without it, both sets go.
+        if (!approvals) ctx.out(uninstallHooks(dir).changed ? `removed the Claude Code session hooks from ${settingsFile(dir)}` : `no session hooks of ours in ${settingsFile(dir)}`);
+        ctx.out(uninstallApprovalHooks(dir).changed ? `removed the approval hooks from ${settingsFile(dir)}` : `no approval hooks of ours in ${settingsFile(dir)}`);
       } else {
         const st = hooksStatus(dir);
-        report.push({ dir, ...st });
-        if (!values.json) ctx.out(`${dir}: ${st.installed ? (st.healthy ? "installed" : "installed, but broken") : st.events.length ? `partly installed (${st.events.join(", ")})` : "not installed"}${st.problem ? `; ${st.problem}` : ""}`);
+        const ap = approvalHooksStatus(dir);
+        report.push({ dir, ...st, approvals: ap });
+        const say = (s: typeof st) => (s.installed ? (s.healthy ? "installed" : "installed, but broken") : s.events.length ? `partly installed (${s.events.join(", ")})` : "not installed");
+        if (!values.json) ctx.out(`${dir}: ${say(st)}${st.problem ? `; ${st.problem}` : ""}; approvals: ${say(ap)}${ap.problem ? `; ${ap.problem}` : ""}`);
       }
     } catch (e) {
       ctx.err(e instanceof HooksError ? e.message : `error: ${errMessage(e)}`);
