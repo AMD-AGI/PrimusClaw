@@ -31,8 +31,9 @@ import {
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
-import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_REVIEW_MODEL, CLAW_GITHUB_REVIEW_ENABLED, MEMORY_LLM_MODEL } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { callLlmText } from "../llm/client.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
 import { mergeNeedsConfirmationOf, reviewOnlyOf, reviewTargetOf } from "./review-target.js";
@@ -127,6 +128,12 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       comments: z.array(z.object({
         path: z.string(), line: z.number().int(), side: z.enum(["RIGHT", "LEFT"]).optional(), body: z.string(),
       })).max(30).optional().describe("Inline comments; each must be on a line the diff shows"),
+      non_blocking: z.array(z.object({
+        path: z.string(), line: z.number().int().nullable().optional(), body: z.string(),
+      })).max(30).optional().describe("Non-blocking suggestions and open questions, one each: they are listed under the review body, not posted inline"),
+      coverage: z.array(z.object({
+        path: z.string(), status: z.enum(["reviewed", "skipped"]), note: z.string().optional(),
+      })).max(3000).optional().describe("A conclusion for every file in coverage.required of gh_pr_get: reviewed, or skipped with the reason in note (deep review)"),
     },
     async (a) => toResult(await service.submitReview(actor, a)),
   );
@@ -175,6 +182,10 @@ function newGithubReview(settings: () => GithubReviewSettings, database: Queryab
   return new GithubReview({
     settings, db: database, sessionStopped: reviewSessionStopped,
     ...reviewItemServiceDeps(),
+    // The independent finding check runs on the review's own model, on behalf of the person who asked for the review.
+    completeFindingCheck: (call, signal, requesterUserId) => callLlmText(requesterUserId, call.prompt, {
+      system: call.system, model: CLAW_ASSISTANT_REVIEW_MODEL || MEMORY_LLM_MODEL, maxTokens: 16_000, signal,
+    }),
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");

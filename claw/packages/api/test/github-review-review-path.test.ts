@@ -15,6 +15,7 @@ import { chooseReviewPath, isNonTestSource, reviewPathAdvice } from "../src/gith
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DEEP_FIXED_REVIEW_RULES, DEEP_PR_REVIEW_INSTRUCTIONS, FIXED_REVIEW_RULES, PR_REVIEW_INSTRUCTIONS, PR_REVIEW_SKILL } from "../src/github-review/default-skill.js";
+import { languageChecksText } from "../src/github-review/review-rules.js";
 import { readGithubReviewSettings } from "../src/github-review/settings.js";
 import { PR, SECRET, closeShared, credential, readSection, reviewEnv } from "./support/review-env.js";
 
@@ -367,7 +368,8 @@ test("with the deep review on, the instructions, the fixed rules and the advice 
   assert.doesNotMatch(PR_REVIEW_INSTRUCTIONS, /Second pass|adversarial/);
   assert.match(reviewPathAdvice({ path: "sandbox", reason: "too_many_files" }, true), /must use a sandbox/);
   const { e, service } = await envWith(DEEP);
-  assert.equal((await readSection(service, e.actor, PR, "instructions")).text, DEEP_PR_REVIEW_INSTRUCTIONS);
+  const checks = languageChecksText(e.gh.files.map((f) => f.filename));
+  assert.equal((await readSection(service, e.actor, PR, "instructions")).text, checks ? `${DEEP_PR_REVIEW_INSTRUCTIONS.trimEnd()}\n\n${checks}\n` : DEEP_PR_REVIEW_INSTRUCTIONS);
   e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
   e.gh.contents[".claude/skills/review-pr/SKILL.md"] = "# Review\nLook at the rules index first.";
   const withSkill = (await readSection(service, e.actor, PR, "instructions")).text;

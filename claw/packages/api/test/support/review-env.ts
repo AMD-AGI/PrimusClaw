@@ -107,7 +107,12 @@ export async function reviewEnv(
   over: {
     actor?: Partial<ReviewActor>; cred?: Partial<ResolvedCredential>; reviewed?: boolean; approved?: boolean;
     /** What a review item adds to the service (`continuationOf`, `recordPosted`, `sessionStopped`). */
-    deps?: Pick<ReviewDeps, "continuationOf" | "recordPosted" | "sessionStopped">;
+    deps?: Pick<ReviewDeps, "continuationOf" | "recordPosted" | "sessionStopped" | "completeFindingCheck">;
+    /**
+     * `auto` (the default): a review submitted without `coverage` is given one that reviewed every changed file of the fake pull request,
+     * so a test about another gate is not refused for coverage. `strict` passes the arguments as the test wrote them.
+     */
+    coverage?: "auto" | "strict";
   } = {},
 ): Promise<ReviewEnv> {
   const pg = (shared ??= new PGlite());
@@ -135,6 +140,10 @@ export async function reviewEnv(
     resolveCredential: async (req) => { resolved.push(req); return identity.answer(req); },
     ...over.deps,
   });
+  if (over.coverage !== "strict") {
+    const submit = service.submitReview.bind(service);
+    service.submitReview = (a, args) => submit(a, "coverage" in args ? args : { ...args, coverage: gh.files.map((f) => ({ path: f.filename, status: "reviewed" })) });
+  }
   const actor: ReviewActor = { sessionId: "s-1", requesterUserId: "u-alice", actorUserId: "u-bob", requesterLabel: "Alice A", ...over.actor };
   const made = {
     pg, db, gh, service, get settings() { return current; }, resolved, sleeps, get onSleep() { return hooks.onSleep; }, set onSleep(f: (ms: number) => void) { hooks.onSleep = f; }, identity, actor,

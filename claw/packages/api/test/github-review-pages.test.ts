@@ -26,6 +26,7 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach } from "node:test";
 import { DEEP_PR_REVIEW_INSTRUCTIONS } from "../src/github-review/default-skill.js";
 import { PAGE_MAX_CHARS, diffText, fitPage } from "../src/github-review/pages.js";
+import { languageChecksText } from "../src/github-review/review-rules.js";
 import type { RiskFile } from "../src/github-review/risk.js";
 import { BASE_TIP, HEAD, type FakeFile } from "./support/fake-github.js";
 import { PR, TOKEN, closeShared, readSection, reviewEnv, type ReviewEnv } from "./support/review-env.js";
@@ -47,6 +48,12 @@ afterEach(async () => { await e.close(); });
 after(closeShared);
 
 /** `files` files of three hunks each; every changed line is unique and full of what JSON escapes. */
+/** The deep instructions as the review reads them for these changed files: the default ones and the checks for their languages. */
+function deepInstructions(files: readonly FakeFile[]): string {
+  const checks = languageChecksText(files.map((f) => f.filename));
+  return checks ? `${DEEP_PR_REVIEW_INSTRUCTIONS.trimEnd()}\n\n${checks}\n` : DEEP_PR_REVIEW_INSTRUCTIONS;
+}
+
 function bigChange(files: number, linesPerHunk: number): FakeFile[] {
   return Array.from({ length: files }, (_, f) => {
     const hunks: string[] = [];
@@ -119,7 +126,7 @@ test("G1 a pull request of about 1800 changed lines is read whole within the req
   for (const f of files) {
     for (const line of (f.patch as string).split("\n")) assert.ok(read.texts.diff.includes(`${line}\n`), line);
   }
-  assert.equal(read.texts.instructions, DEEP_PR_REVIEW_INSTRUCTIONS);
+  assert.equal(read.texts.instructions, deepInstructions(files));
   assert.equal(read.texts.files.trim().split("\n").length, 24);
   const requests = e.gh.calls.length;
   const audited = (await e.sql("SELECT sum(github_requests)::int AS n FROM claw_github_audit WHERE session_id = 's-1'"))[0]?.n;
@@ -133,12 +140,14 @@ test("G1 a pull request of about 1800 changed lines is read whole within the req
 });
 
 test("G2 the review instructions reach the model whole: the default skill, and a repository's skill far longer than one answer", async () => {
-  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, DEEP_PR_REVIEW_INSTRUCTIONS);
+  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, deepInstructions(e.gh.files));
   const skill = Array.from({ length: 700 }, (_, i) => `- rule ${i}: check "the ${i}th thing" before you approve.`).join("\n");
   e.gh.dirs[".claude/skills"] = [{ name: "review-pr", type: "dir" }];
   e.gh.contents[".claude/skills/review-pr/SKILL.md"] = skill;
   const { text, pages } = await readSection(e.service, e.actor, PR, "instructions");
-  assert.ok(text.endsWith(skill), "the last rule of the skill is read");
+  // The checks for the changed files' languages follow the repository's own instructions, which reach the model whole before them.
+  assert.ok(text.includes(`${skill}\n`), "the last rule of the skill is read");
+  assert.ok(text.endsWith(`${languageChecksText(e.gh.files.map((f) => f.filename))}\n`), "then the language checks");
   assert.match(text, /^The repository's own review instructions/);
   assert.ok(pages >= Math.ceil(text.length / PAGE_MAX_CHARS), `pages ${pages}`);
 });
@@ -176,7 +185,8 @@ test("G4 a head that moved refuses the page with the new head, and the next over
 });
 
 test("G5 `file` narrows the diff to one file and `max_diff_chars` makes its pages shorter; each still fits", async () => {
-  const files = bigChange(6, 25);
+  // Each file longer than one answer, so that its diff is read in pages and never inline.
+  const files = bigChange(6, 120);
   useChange(files);
   const target = files[3] as FakeFile;
   const { text, pages } = await readSection(e.service, e.actor, PR, "diff", { file: target.filename, max_diff_chars: 1500 });
@@ -208,7 +218,7 @@ test("G6 an overview longer than one answer is itself read in pages, and nothing
   assert.equal(overview.how_to_read.length > 0, true);
   assert.deepEqual(Object.keys(overview.sections).sort(), ["conversation", "diff", "files", "instructions"]);
   assert.ok(Object.values(overview.sections).every((s: any) => s.inline === false));
-  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, DEEP_PR_REVIEW_INSTRUCTIONS);
+  assert.equal((await readSection(e.service, e.actor, PR, "instructions")).text, deepInstructions(e.gh.files));
 });
 
 test("G8 a page from the session's read is still held to the repository as it is now: owner, public, not archived", async () => {

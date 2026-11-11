@@ -24,13 +24,16 @@ import { createHash } from "node:crypto";
 import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
 import { evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
+import { checkCoverage, coverageFiles, coverageText, type CoverageCheck } from "./coverage.js";
 import { commentableLines } from "./diff.js";
+import { bodyWithNotes, runFindingCheck, type Finding, type FindingCheckOutcome } from "./finding-check.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type GithubAnswer, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
 import { MAX_FILES_READ, REPO_CONFIG_PATH, assessRisk, type InstructionChanges, diffNotSent, normaliseJudgement, parseRepoConfig, type RepoConfig, type ReviewerJudgement, type RiskFile, type RiskResult } from "./risk.js";
 import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, filesText, fitPage, isSection, type Comment, type Section } from "./pages.js";
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
+import { languageChecksText } from "./review-rules.js";
 import { clipPrSummary } from "./pr-summary.js";
 import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
@@ -117,6 +120,11 @@ export interface ReviewDeps {
   continuationOf?: (sessionId: string) => Promise<ReviewContinuation | null>;
   /** Keep what a posted review said, with its threads, on its audit row (`posted`): for review items only, so that a re-review can continue it. */
   recordPosted?: boolean;
+  /**
+   * One model call for the independent check of a review's findings (finding-check.ts): the prompt in, the answer's text out, on behalf
+   * of the person who asked for the review. Without it, or with `findingCheck` off, findings are posted as the reviewer wrote them.
+   */
+  completeFindingCheck?: (call: { system: string; prompt: string }, signal: AbortSignal, requesterUserId: string) => Promise<string>;
 }
 
 /** What a re-review is given of the review before it: the head it read and its findings, each with the thread GitHub opened for it. */
@@ -264,6 +272,7 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const FILE_PAGE = 100;
 const MAX_REVIEW_COMMENTS = 30;
 const MAX_COMMENT_CHARS = 4000;
+const MAX_REVIEW_NOTES = 30;
 const MAX_BODY_CHARS = 20_000;
 /** How long the lock of an approval or a merge decision lasts without renewal (`oneAtATime` renews it every quarter of this). */
 const WRITE_LOCK_SECONDS = 120;
@@ -450,7 +459,10 @@ export class GithubReview {
     const shown = scope && scope.scope !== "full" ? scope.files : change.files;
     const state = await this.readState(ctx, ref, pr, repo);
     // At the base commit the head was compared with (instructionChanges), not wherever the branch is by now.
-    const instructions = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha, ctx.settings.deepReview);
+    const selected = await selectReviewInstructions(ctx.client, ref, pr.baseRef, pr.baseSha, ctx.settings.deepReview);
+    // The deep review is also given the checks for the languages the change touches (review-rules.ts), whoever wrote the instructions.
+    const checks = ctx.settings.deepReview ? languageChecksText(change.files.map((f) => f.path)) : "";
+    const instructions = checks ? { ...selected, text: `${selected.text.trimEnd()}\n\n${checks}\n` } : selected;
     const choice = chooseReviewPath({
       changedFiles: pr.changedFiles, changedLines: pr.additions + pr.deletions, filesComplete: change.complete,
       diffMissing: change.files.some(diffNotSent),
@@ -505,6 +517,8 @@ export class GithubReview {
         sandbox_recipe_note: choice.path === "sandbox" && !recipe ? "the base branch name is not one the checkout recipe will put in a command: review from this result alone" : null,
       },
       review_instructions_source: { source: instructions.source, path: instructions.skillPath ?? null, base_sha: instructions.baseSha ?? null, note: instructions.note ?? null },
+      // The files gh_review_submit asks a conclusion for (coverage.ts): those of this read, without the ones there is nothing to read in.
+      ...(ctx.settings.deepReview ? { coverage: coverageFiles(shown) } : {}),
       ...(continuation && scope ? { continuation: this.continuationBlock(continuation, scope) } : {}),
     };
     const previousNotes = continuation
@@ -700,6 +714,7 @@ export class GithubReview {
       if (text.length > MAX_BODY_CHARS) throw new Refusal("body_too_long", `the body is longer than ${MAX_BODY_CHARS} characters`);
       const review = () => this.submit(ctx, ref, headSha, {
         event: event as ReviewEvent, text, rawComments: args.comments, flags: this.flags(args), judgement: this.judgement(ctx, args), confirmation: null,
+        notes: this.checkNotes(args.non_blocking), coverage: args.coverage,
       });
       // A comment approves nothing and is never held, so it does not wait for an approval or a merge being decided. Except where reviews
       // are items (`recordPosted`): a restart reads what the old session posted and stops it under this lock, so a review still being
@@ -718,7 +733,10 @@ export class GithubReview {
    */
   private async submit(
     ctx: Ctx, ref: PrRef, headSha: string,
-    o: { event: ReviewEvent; text: string; rawComments: unknown; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null },
+    o: {
+      event: ReviewEvent; text: string; rawComments: unknown; flags: string[]; judgement: ReviewerJudgement | null; confirmation: Confirmation | null;
+      notes?: Finding[]; coverage?: unknown;
+    },
   ): Promise<Record<string, unknown>> {
     const { repo, pr } = await this.load(ctx, ref);
     this.requireOpen(pr);
@@ -726,23 +744,41 @@ export class GithubReview {
     ctx.acc.confirmationId = o.confirmation?.id;
     // Before the diff, CI or the threads are read and before anyone is asked: an approval by the person who wrote the change is no review.
     if (o.event === "APPROVE") this.requireNotAuthor(ctx, pr, "an approval");
-    const needsChange = Array.isArray(o.rawComments) && o.rawComments.length > 0;
+    // A held review that its person allowed is posted as it was held: its coverage and its findings were checked before it was held.
+    const deep = ctx.settings.deepReview && !o.confirmation;
+    // An approval reads the whole change for its gates anyway (requireApprovable): read once, here.
+    const needsChange = (Array.isArray(o.rawComments) && o.rawComments.length > 0) || (deep && o.event === "APPROVE");
     const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
+    // The deep review's coverage and finding check need the changed files only (the rest of a change is read where it is needed).
+    const files = change ? change.files : deep ? await this.readChangedFiles(ctx, ref, pr) : null;
     const comments = this.checkComments(o.rawComments, change);
-    await this.requireEvent(ctx, repo, o.event);
-    if (o.event === "APPROVE") {
+    const event = o.event;
+    let text = o.text;
+    let checked: FindingCheckOutcome | null = null;
+    let coverage: CoverageCheck | null = null;
+    if (deep && files) {
+      coverage = await this.requireCoverage(ctx, ref, repo, pr, change, files, o.coverage, event);
+      // The check withdraws notes only: every inline finding is posted as the reviewer wrote it (finding-check.ts).
+      checked = await this.checkFindings(ctx, pr, files, comments, o.notes ?? []);
+      text = this.composeBody(text, checked.nonBlocking, coverage, files);
+    } else if (o.notes?.length) {
+      text = this.composeBody(text, o.notes, null, null);
+    }
+    await this.requireEvent(ctx, repo, event);
+    if (event === "APPROVE") {
       if (!o.confirmation) await this.requireSecondPass(ctx, ref, headSha);
       const risk = await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
       if (!o.confirmation && risk.level === "high") {
-        const review: HeldReview = { event: o.event, body: o.text, comments };
-        return this.hold(ctx, ref, pr, headSha, {
+        const review: HeldReview = { event: event, body: text, comments };
+        const held = await this.hold(ctx, ref, pr, headSha, {
           kind: "review", review, reasons: risk.reasons, checks: {},
           message: `The approval is held for ${ctx.cred.login} to confirm. Nothing was posted. Say that the approval waits for their decision and why, in the words of the reasons.`,
         });
+        return { ...held, ...this.checkSummary(checked, coverage) };
       }
     }
-    const result = await this.writeReview(ctx, ref, pr, o.event, o.text, comments);
-    return { status: result.status, head_sha: headSha, ...result.detail };
+    const result = await this.writeReview(ctx, ref, pr, event, text, comments);
+    return { status: result.status, head_sha: headSha, ...result.detail, ...this.checkSummary(checked, coverage) };
   }
 
   /** `gh_pr_merge`: merge what this session approved, if every gate is open; a merge a person confirmed approves first when needed. */
@@ -1359,7 +1395,8 @@ export class GithubReview {
     return pr;
   }
 
-  private async collectChange(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<Change> {
+  /** The pull request's changed files with their patches, up to {@link MAX_FILES_READ}, within the session's request budget. */
+  private async readChangedFiles(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<RiskFile[]> {
     const files: RiskFile[] = [];
     const limit = Math.min(pr.changedFiles, MAX_FILES_READ);
     // Every page is a request against the session's budget, which is checked here as well as at the start of the call: a large pull request
@@ -1380,6 +1417,11 @@ export class GithubReview {
       }
       if (batch.length < FILE_PAGE) break;
     }
+    return files;
+  }
+
+  private async collectChange(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<Change> {
+    const files = await this.readChangedFiles(ctx, ref, pr);
     let repoConfig: Change["repoConfig"] = null;
     try {
       // The earlier name is read only where the current one is absent, so a repository that has both is read by the current one.
@@ -1630,6 +1672,98 @@ export class GithubReview {
     });
     if (problems.length) throw new Refusal("comments_outside_diff", "some inline comments cannot be placed; nothing was posted", { problems });
     return out;
+  }
+
+  /** The non-blocking notes of a review (`non_blocking`), each with a path and a body; an entry without them is left out. */
+  private checkNotes(raw: unknown): Finding[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.slice(0, MAX_REVIEW_NOTES).flatMap((e) => {
+      const item = (e ?? {}) as Record<string, unknown>;
+      const path = typeof item.path === "string" ? item.path.trim() : "";
+      const body = typeof item.body === "string" ? item.body.trim().slice(0, MAX_COMMENT_CHARS) : "";
+      const line = Number.isInteger(item.line) && (item.line as number) > 0 ? item.line as number : null;
+      return path && body ? [{ path, line, body, blocking: false }] : [];
+    });
+  }
+
+  /**
+   * The deep review's coverage (coverage.ts): every changed file there is something to read in has a conclusion, or nothing is posted, and
+   * an approval needs every one of them reviewed. A re-review that reads only the change since the last head concludes on that change.
+   */
+  private async requireCoverage(
+    ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, changed: RiskFile[], raw: unknown, event: ReviewEvent,
+  ): Promise<CoverageCheck> {
+    const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
+    // The scope needs the repository's configuration of the change too; read here only for a re-review, and only when not read yet.
+    const scope = continuation ? await this.continuationScope(ctx, ref, repo, pr, change ?? await this.collectChange(ctx, ref, pr), continuation) : null;
+    const files = scope && scope.scope !== "full" ? scope.files : changed;
+    const c = checkCoverage(files, raw);
+    if (c.missing.length) {
+      throw new Refusal("coverage_missing", `${c.missing.length} changed files have no conclusion in coverage (reviewed, or skipped with the reason): conclude on each and submit again. Nothing was posted.`,
+        { missing: c.missing.slice(0, 100), problems: c.problems.slice(0, 20) });
+    }
+    if (event === "APPROVE" && c.skipped.length) {
+      throw new Refusal("coverage_incomplete", "an approval needs every changed file reviewed, and coverage skips some: review them, or post the review as COMMENT and name what was not reviewed. Nothing was posted.",
+        { skipped: c.skipped.map((x) => x.path).slice(0, 100) });
+    }
+    return c;
+  }
+
+  private findingsOf(comments: ReviewComment[], notes: Finding[]): Finding[] {
+    return [...comments.map((c) => ({ path: c.path, line: c.line, body: c.body, blocking: true })), ...notes];
+  }
+
+  /**
+   * The independent check of the findings (finding-check.ts), when it is on and a model is wired: the inline comments that stay blocking,
+   * and what became of the rest. Off, or with nothing to check, everything is kept as written.
+   */
+  private async checkFindings(ctx: Ctx, pr: PrInfo, changed: RiskFile[], comments: ReviewComment[], notes: Finding[]): Promise<FindingCheckOutcome> {
+    const findings = this.findingsOf(comments, notes);
+    const complete = this.deps.completeFindingCheck;
+    if (!ctx.settings.findingCheck || !complete || findings.length === 0) {
+      return { ran: false, error: findings.length ? "off" : undefined, blocking: findings.filter((f) => f.blocking), nonBlocking: notes, demoted: [], withdrawn: [], doubted: [] };
+    }
+    const outcome = await runFindingCheck((call, signal) => complete(call, signal, ctx.actor.requesterUserId), {
+      intent: `${clip(pr.title, 300)}\n\n${clip(pr.body, 8000)}`.trim(),
+      files: changed.map((f) => ({ path: f.path, previousPath: f.previousPath, patch: f.patch })),
+      findings,
+    });
+    (this.deps.logger ?? logger).info({
+      session_id: ctx.actor.sessionId, ran: outcome.ran, error: outcome.error ?? null, findings: findings.length,
+      withdrawn: outcome.withdrawn.length, doubted: outcome.doubted.length,
+    }, "github_review.finding_check");
+    return outcome;
+  }
+
+  /** The body that is posted: the reviewer's text, the notes that hold up and what was not reviewed, within the body limit. */
+  private composeBody(text: string, notes: Finding[], coverage: CoverageCheck | null, changed: RiskFile[] | null): string {
+    const tail = coverage && changed ? coverageText(coverage, coverageFiles(changed).required.length) : "";
+    const withTail = tail ? `${text.trimEnd()}\n\n${tail}` : text;
+    let kept = notes;
+    let body = bodyWithNotes(withTail, kept);
+    while (body.length > MAX_BODY_CHARS && kept.length) {
+      kept = kept.slice(0, -1);
+      body = bodyWithNotes(withTail, kept);
+    }
+    return body.length > MAX_BODY_CHARS ? body.slice(0, MAX_BODY_CHARS) : body;
+  }
+
+  /** What the result says of the check and the coverage, so that the reviewer's answer can say what was posted. */
+  private checkSummary(checked: FindingCheckOutcome | null, coverage: CoverageCheck | null): Record<string, unknown> {
+    if (!checked && !coverage) return {};
+    const item = (w: FindingCheckOutcome["withdrawn"][number]) => ({ path: w.path, line: w.line, reason: w.reason, why: w.analysis });
+    return {
+      ...(checked ? {
+        finding_check: {
+          ran: checked.ran, ...(checked.error ? { error: checked.error } : {}),
+          withdrawn_notes: checked.withdrawn.map(item),
+          // Posted all the same: the check never decides a blocking finding. Read them again if you have doubts of your own.
+          doubted_blocking: checked.doubted.map(item),
+          posted_blocking: checked.blocking.length, posted_notes: checked.nonBlocking.length,
+        },
+      } : {}),
+      ...(coverage ? { coverage: { skipped: coverage.skipped, not_required: coverage.exempt.map((e) => e.path).slice(0, 50) } } : {}),
+    };
   }
 
   /** Whether a review's body carries the marker of an approval this session (`runId`) posted on this head. */

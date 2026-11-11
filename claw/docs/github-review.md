@@ -715,6 +715,38 @@ diff (written once to `.pr-review/pr.diff` in the checkout, excluded from git), 
 read, and the callers a search showed but it did not open, which it opens first; and the diff is
 read once from the checkout rather than in `gh_pr_get` pages.
 
+#### Coverage, checks by language and the finding check
+
+Three parts of the deep review are mechanisms rather than instructions, borrowed in idea from
+[alibaba/open-code-review](https://github.com/alibaba/open-code-review):
+
+- **Coverage.** `gh_pr_get` names, in `coverage.required`, every changed file there is something to
+  read in (a lock file, a binary, a diff GitHub did not send and a Git LFS pointer are in
+  `coverage.exempt`). `gh_review_submit` takes a conclusion for each of them in `coverage`
+  (`reviewed`, or `skipped` with the reason): a file with none refuses the review as
+  `coverage_missing` with nothing posted, a skipped file is named in the posted body under
+  "Not reviewed", and an approval with a skipped file is refused as `coverage_incomplete`. A
+  re-review that reads only the change since the last head concludes on that change.
+- **Checks by language.** The instructions end with short lists of what usually goes wrong in the
+  languages and file types the change touches (Go, Python, TypeScript and JavaScript, shell, GitHub
+  Actions workflows, containers and Kubernetes; `review-rules.ts`). They name defect classes only,
+  never style, and every finding they lead to is verified like any other.
+- **The finding check.** Non-blocking suggestions and open questions go in `non_blocking` of
+  `gh_review_submit`, not in the body. Before anything is posted, the service has every finding,
+  inline and non-blocking, checked by one separate model call that sees the pull request's title and
+  description, its diff and the findings, and nothing of the review's own reasoning. Its instructions
+  are the call's system prompt and the material its user message, and the ids it answers with are
+  drawn for each call. It rejects a finding the diff contradicts, one about a problem the change did
+  not introduce, one that names no wrong outcome, and a repeat, and estimates for each the chance
+  (`p_act`, 0 to 100) that the author changes the code for it. A rejected note, and one under 20,
+  is withdrawn; the notes that remain are listed under the body. Everything the check reads can be
+  written by the pull request's author, so it never decides a blocking finding: inline findings are
+  posted as the reviewer wrote them, and the ones the check doubted are reported back in the result
+  (`finding_check.doubted_blocking`, next to `withdrawn_notes`). The check runs on the review model
+  (`CLAW_ASSISTANT_REVIEW_MODEL`, else `MEMORY_LLM_MODEL`) with the requester's model key, and fails
+  open: when the call fails or times out (3 minutes), every finding is posted as written and the
+  result says the check did not run. `CLAW_GITHUB_REVIEW_FINDING_CHECK=false` turns it off.
+
 `CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review has no model or
 reasoning effort of its own: the session runs on the `model` and `effort` its creator sent with
 `POST /v1/sessions` (or set later with `PATCH /v1/sessions/:id`), or on the deployment's defaults, as any
@@ -791,6 +823,7 @@ logs and the audit rows.
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 (600 with the deep review off) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
 | `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | on | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. `false` (or `0`, `no`) gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
+| `CLAW_GITHUB_REVIEW_FINDING_CHECK` | on (with the deep review) | The independent check of a deep review's findings before they are posted ("Coverage, checks by language and the finding check" above). `false` (or `0`, `no`) posts the findings as the reviewer wrote them. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential
