@@ -399,8 +399,14 @@ test("the turn ends on the session before the workspace is saved, and the task i
   });
 
   assert.deepEqual(
-    eventsAtSave.slice(-2), ["executionStats", "exec_complete"],
-    `the session had been told the turn ended before the save began: ${eventsAtSave.join(", ")}`,
+    eventsAtSave.slice(-3), ["executionStats", "exec_complete", "workspaceSave"],
+    `the session had been told the turn ended, and that its files are being saved, before the save began: ${eventsAtSave.join(", ")}`,
+  );
+  const saves = r.events.filter((e) => e.type === "workspaceSave");
+  assert.deepEqual(
+    saves.map((e) => [e.phase, e.outcome, e.message_id]),
+    [["started", undefined, MESSAGE], ["finished", "partial", MESSAGE]],
+    "the file listing is told the save started, and how it ended",
   );
   assert.ok(!callsAtSave.includes("postAgentDone"), "Backend is not told the task is done before its files are saved");
   const types = r.events.map((e) => (e.type === "sandboxStatus" ? `sandboxStatus:${String(e.status)}` : String(e.type)));
@@ -409,9 +415,34 @@ test("the turn ends on the session before the workspace is saved, and the task i
     types.indexOf("exec_complete") < types.indexOf("sandboxStatus:workspace_sync_partial"),
     `what the save reports follows the turn's end: ${types.join(", ")}`,
   );
+  assert.ok(
+    types.indexOf("sandboxStatus:workspace_sync_partial") < types.lastIndexOf("workspaceSave"),
+    `the save is over only after what it reports: ${types.join(", ")}`,
+  );
   assert.equal(r.completion?.failed, false);
   assert.ok(r.calls.indexOf("syncWorkspaceToS3") < r.calls.indexOf("postAgentDone"), r.calls.join(", "));
   assert.deepEqual(r.verdicts, ["ack"]);
+});
+
+test("a save that could not be done still says it is over", async () => {
+  // Otherwise the file listing reads "saving" until the event goes stale, for a
+  // save nobody is doing.
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    sideEffects: {
+      syncWorkspaceToS3: (async () => { throw new Error("sandbox gone"); }) as never,
+    },
+  });
+  const saves = r.events.filter((e) => e.type === "workspaceSave").map((e) => [e.phase, e.outcome]);
+  assert.deepEqual(saves, [["started", undefined], ["finished", "failed"]]);
+  assert.equal(r.completion?.failed, false, "the turn itself succeeded");
+  assert.deepEqual(r.verdicts, ["ack"]);
+});
+
+test("a run with no sandbox has no save to announce", async () => {
+  const r = await runScenario({ engineBehavior: async () => result() });
+  assert.ok(r.completion, "the turn ended");
+  assert.deepEqual(r.events.filter((e) => e.type === "workspaceSave"), []);
 });
 
 // ── fatal ────────────────────────────────────────────────────────────────

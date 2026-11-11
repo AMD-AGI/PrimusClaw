@@ -84,7 +84,7 @@ import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import { taskSubject, type RunTimeReport } from "@claw/protocol";
+import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, type WorkspaceSaveEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
@@ -3479,6 +3479,17 @@ class TaskRunner {
     }
   }
 
+  /**
+   * Tell the session where the end-of-turn workspace save is. Never fails the
+   * save: an event the stream refused costs the listing its "saving" hint, while
+   * a save abandoned for it would cost the files.
+   */
+  private async announceWorkspaceSave(evt: WorkspaceSaveEvent): Promise<void> {
+    await this.onEvent({ ...evt }).catch((e: unknown) => {
+      logger.warn({ err: e, sessionId: this.sessionId, phase: evt.phase }, "s3.save_event_failed");
+    });
+  }
+
   private async finalizeSuccess(result: ExecuteResult): Promise<void> {
     // 4. Emit stats before completion
     await this.onEvent({
@@ -3575,68 +3586,81 @@ class TaskRunner {
         "s3.sync_skipped_workspace_throwaway",
       );
     } else {
-      logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
-      let syncedGit: GitReport | undefined;
+      // The turn has already ended on the session (above), so its files in the
+      // object store trail it until this save is over. Said on the session, so
+      // the file listing can tell "still being saved" from "not there"
+      // (WORKSPACE_SAVE_EVENT). `finished` goes out however the save ends.
+      await this.announceWorkspaceSave({ type: WORKSPACE_SAVE_EVENT, phase: "started", message_id: this.messageId });
+      let saveOutcome: WorkspaceSaveOutcome = "failed";
       try {
-        const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
-        syncOk = !r.exhausted && !r.empty;
-        syncedGit = r.git;
-        if (r.empty) {
+        logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
+        let syncedGit: GitReport | undefined;
+        try {
+          const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
+          syncOk = !r.exhausted && !r.empty;
+          saveOutcome = r.empty ? "empty" : r.exhausted ? "partial" : "synced";
+          syncedGit = r.git;
+          if (r.empty) {
+            await this.onEvent({
+              type: "sandboxStatus",
+              status: "workspace_sync_empty",
+              reason: "empty_workspace",
+              message: "no files under /workspace at sync time",
+              message_id: this.messageId,
+            });
+          } else if (r.exhausted) {
+            await this.onEvent({
+              type: "sandboxStatus",
+              status: "workspace_sync_partial",
+              reason: "upload_exhausted",
+              // Out of what this sync tried to upload: files the last sync that
+              // landed already put in S3 are not attempts.
+              message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
+              message_id: this.messageId,
+            });
+          }
+        } catch (e: unknown) {
+          const errMsg = (e as { message?: string })?.message
+            ? String((e as { message: string }).message).slice(0, 500)
+            : String(e);
+          const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
+          const reason = isHandsNetworkError(e)
+            ? "sandbox_unreachable"
+            : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
+              ? "payload_too_large"
+              : errType;
+          logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
           await this.onEvent({
             type: "sandboxStatus",
-            status: "workspace_sync_empty",
-            reason: "empty_workspace",
-            message: "no files under /workspace at sync time",
+            status: "workspace_sync_failed",
+            reason,
+            message: errMsg,
             message_id: this.messageId,
           });
-        } else if (r.exhausted) {
-          await this.onEvent({
-            type: "sandboxStatus",
-            status: "workspace_sync_partial",
-            reason: "upload_exhausted",
-            // Out of what this sync tried to upload: files the last sync that
-            // landed already put in S3 are not attempts.
-            message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
-            message_id: this.messageId,
-          });
+          // Recovery: if a periodic in-flight checkpoint had been written, copy
+          // it server-side back to the session prefix. This is the safety net
+          // for long sessions whose sandbox dies right at sync time — we still
+          // surface the artifacts captured at the last checkpoint window.
+          await this.recoverInflightCheckpoint("from_inflight_checkpoint");
         }
-      } catch (e: unknown) {
-        const errMsg = (e as { message?: string })?.message
-          ? String((e as { message: string }).message).slice(0, 500)
-          : String(e);
-        const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
-        const reason = isHandsNetworkError(e)
-          ? "sandbox_unreachable"
-          : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
-            ? "payload_too_large"
-            : errType;
-        logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
-        await this.onEvent({
-          type: "sandboxStatus",
-          status: "workspace_sync_failed",
-          reason,
-          message: errMsg,
-          message_id: this.messageId,
+        // Independent of the above: a sync can land and still have left a repository
+        // behind. Outside the try on purpose: the upload succeeded, and an event the
+        // stream refused must not turn it into the failure above, whose recovery
+        // copies an older in-flight checkpoint over the files just uploaded.
+        await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
+          logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
         });
-        // Recovery: if a periodic in-flight checkpoint had been written, copy
-        // it server-side back to the session prefix. This is the safety net
-        // for long sessions whose sandbox dies right at sync time — we still
-        // surface the artifacts captured at the last checkpoint window.
-        await this.recoverInflightCheckpoint("from_inflight_checkpoint");
-      }
-      // Independent of the above: a sync can land and still have left a repository
-      // behind. Outside the try on purpose: the upload succeeded, and an event the
-      // stream refused must not turn it into the failure above, whose recovery
-      // copies an older in-flight checkpoint over the files just uploaded.
-      await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
-        logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
-      });
-      if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
-        try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
+        if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
+          try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
+            logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
+          }
         }
+        logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
+      } finally {
+        await this.announceWorkspaceSave({
+          type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, message_id: this.messageId,
+        });
       }
-      logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
     }
 
     // 5b. Write execution transcript as JSONL to S3

@@ -45,6 +45,7 @@ import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import { metrics } from "../infra/metrics.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
+import { workspaceSaving } from "../workspace/save-state.js";
 import {
   acquireAdmissionLock, envAdmitLimits, sessionTreeShape, treeCeilingRefusal,
   type AdmissionAsk,
@@ -2189,7 +2190,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       }
       ct = res.IsTruncated ? res.NextContinuationToken : undefined;
     } while (ct);
-    return { ok: true, data: files };
+    // The session's last turn may still be uploading these: a turn ends before
+    // its workspace is saved. Null when no save is running; left out when that
+    // could not be read, which is not the same answer.
+    const saving = await workspaceSaving(sessionId).catch((err: unknown) => {
+      logger.warn({ err, sessionId }, "session.files.saving_unreadable");
+      return undefined;
+    });
+    return { ok: true, data: files, ...(saving === undefined ? {} : { saving }) };
   });
 
   // --- Download/Stream File (V1/V2 split) ---
