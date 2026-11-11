@@ -44,6 +44,9 @@
  *       and its approval goes to the merge card; never twice; a waiting review holds no slot
  *   RS3 a wait for CI ends on a new head or after a day, and says so; a restart does not carry the end over
  *   RS4 CI green with a review thread open ends the wait instead of running the review again, and says what is left
+ *   RS5 a re-review of a head the same account already reviewed that posts nothing (no new commits) is not stuck: the reviewer is not
+ *       asked, whoever asked for it is told why; it waits for CI on that head and is run once more when it is green, then ends with
+ *       nothing new to post; a head nobody reviewed, or reviewed by another account, is still the reviewer's to look at (N25, #532)
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1093,6 +1096,12 @@ describe("assistant review items", { skip }, () => {
       ["turn failed", { turn: "failed" }, "needs_you/failed"],
       ["writes off", { writes: [wr("gh_pr_merge", "ok", "dry_run")] }, "needs_you/blocked"],
       ["ended and posted nothing", {}, "needs_you/blocked"],
+      ["re-review of a head already reviewed, nothing posted", { unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1 }, "in_progress"],
+      ["the same, asked of someone else", { actingAs: "bob", ownReview: false, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1 }, "in_progress"],
+      ["the same, run again once CI was green", { unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 2 }, "done/accepted"],
+      ["the same, its wait for CI ended", { unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, ciWaitEnded: "timeout" }, "done/accepted"],
+      ["the same, its turn failed", { unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, turn: "failed" }, "needs_you/failed"],
+      ["the same, a merge held", { unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, confirmations: [c("pending")] }, "needs_you/blocked"],
     ];
     for (const [name, facts, expected] of cases) {
       const s = ri.reviewState({ ...base, ...facts } as never);
@@ -1105,6 +1114,12 @@ describe("assistant review items", { skip }, () => {
         assert.ok(zh && /[\u4e00-\u9fff]/.test(zh) && (!question.includes("AMD-AGI/PrimusClaw#7") || zh.includes("AMD-AGI/PrimusClaw#7")), `${name}: ${question} -> ${zh}`);
       }
     }
+    const unchanged = ri.reviewState({ ...base, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1 } as never);
+    assert.deepEqual([unchanged.summary, unchanged.boardState === "in_progress" && unchanged.result],
+      ["no new commits: waiting for CI, then reviewing AMD-AGI/PrimusClaw#7 again", "unchanged_wait"]);
+    const nothingNew = ri.reviewState({ ...base, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 2 } as never);
+    assert.deepEqual([nothingNew.summary, nothingNew.boardState === "done" && nothingNew.result],
+      ["AMD-AGI/PrimusClaw#7 has no new commits since its last review", "unchanged"]);
     const waiting = ri.reviewState({ ...base, actingAs: "bob", actingAsName: "Bob B", confirmations: [c("pending")] } as never);
     assert.equal(waiting.boardState === "in_progress" && waiting.question, "Waiting for Bob B to confirm the merge");
     // Every status the confirmations table allows is in the table above.
@@ -1807,5 +1822,125 @@ describe("assistant review items", { skip }, () => {
     } finally {
       ri.reviewItemPorts.followPullRequest = null;
     }
+  });
+
+  test("RS5 a re-review of a head already reviewed that posts nothing is not stuck: whoever asked is told, it waits for CI, runs once more, then ends (N25, #532)", async () => {
+    const alice = await w.user("alice");
+    const bob = await w.user("bob");
+    const HEAD = "a".repeat(40);
+    /** A review the account `actor` posted of PR 254 at `head` in an earlier session. */
+    const reviewedBefore = (actor: string, head = HEAD) => w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, posted, write, at)
+       VALUES ('alice', $1, 'earlier-session', 'AMD-AGI/PrimusClaw', 254, $2, 'gh_review_submit', '{"event":"COMMENT"}', 'ok', 'submitted',
+               '{"event":"COMMENT","review_id":1,"findings":[]}', true, NOW() - INTERVAL '1 hour')`,
+      [actor, head],
+    );
+    /** The session read PR 254 at `head` (`gh_pr_get`), as the review's first call does. */
+    const readAt = (sessionId: string, actor: string, head = HEAD) => w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
+       VALUES ('alice', $1, $2, 'AMD-AGI/PrimusClaw', 254, $3, 'gh_pr_get', 'ok', 'ok')`,
+      [actor, sessionId, head],
+    );
+    // A head nobody reviewed, or one another account reviewed: posting nothing is still the reviewer's to look at.
+    await reviewedBefore("carol");
+    const fresh = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    const freshItem = await w.item(fresh.body.data.items[0].item_id);
+    await firstTurnWords(freshItem.worker_session_id);
+    await readAt(freshItem.worker_session_id, "bob");
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    assert.deepEqual([(await w.item(freshItem.item_id)).board_state, (await w.item(freshItem.item_id)).summary],
+      ["needs_you", "the review of AMD-AGI/PrimusClaw#254 ended without posting anything"]);
+    await w.q("UPDATE claw_work_items SET board_state = 'done', outcome = 'stopped' WHERE item_id = $1", [freshItem.item_id]);
+    await w.q("DELETE FROM claw_assistant_says; DELETE FROM claw_pending_messages");
+
+    // #532: bob already reviewed this head; the re-review alice asked for read it, saw no new commits and, with CI not finished, posted nothing.
+    await reviewedBefore("bob");
+    const asked = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    const it = await w.item(asked.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    const words = await firstTurnWords(sid);
+    await readAt(sid, "bob");
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    let item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.summary, item.pending_question],
+      ["in_progress", "no new commits: waiting for CI, then reviewing AMD-AGI/PrimusClaw#254 again", null]);
+    assert.equal(item.params.ci_waiting, true, "a waiting review holds no slot");
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "the reviewer is not asked to look at it");
+    assert.equal((await toldTo("bob")).length, 0);
+    let told = await toldTo("alice");
+    assert.equal(told.length, 1, "the one who asked is told, once");
+    assert.equal(told[0], [
+      "**No new review of AMD-AGI/PrimusClaw#254, which you asked for: the code is what was already reviewed**", "",
+      "- Head `aaaaaaa` was already reviewed and has no new commits since, so no second review was posted.",
+      "- Next: I am watching the pull request. Once CI on this head is all green I review it once more (once, for up to 24 hours) and approve it and go on to the merge if it passes.",
+      "- After new commits: ask for a review again.",
+      "- The pull request: https://github.com/AMD-AGI/PrimusClaw/pull/254",
+    ].join("\n"));
+    assert.equal(alice.routerSid !== undefined, true);
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    assert.equal((await toldTo("alice")).length, 1, "the same facts tell nothing again");
+
+    let ci: Record<string, unknown> = { green: false, failed: [], advisory: [], pending: ["e2e"] };
+    const seen = await followed(async () => ({ status: "open", head_sha: HEAD, ci } as never));
+    try {
+      let now = Date.now();
+      await ri.followReviewItems(now);
+      assert.deepEqual(seen.map((f) => [f.withChecks, f.actingUserId]), [[true, "bob"]], "CI is read with the pull request, as bob");
+      assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0, "not green: nothing is run");
+      // Green: the same words once more in the same session, for a review asked of someone else too (its turn still passes the queued gates).
+      ci = { green: true, failed: [], advisory: [], pending: [], unresolved_threads: 0 };
+      now += 100_000;
+      w.drains.length = 0;
+      await ri.followReviewItems(now);
+      const queued = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [sid]);
+      assert.deepEqual(queued.map((r: { content: string }) => r.content), [words], "the same words once more, in the same session");
+      assert.deepEqual(w.drains.map((d) => d.sessionId), [sid]);
+      // The second turn has nothing new to post either: done, not stuck, and alice is told why.
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [sid]);
+      const run = await w.openRun(sid);
+      await w.closeRun(run.taskId, "completed");
+      await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [run.taskId, words]);
+      await readAt(sid, "bob");
+      await ri.sweepReviewItems();
+      await reviewResultsSettled();
+      item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.outcome, item.summary],
+        ["done", "accepted", "AMD-AGI/PrimusClaw#254 has no new commits since its last review"]);
+      assert.equal((await w.pending(bob.routerSid)).length, 0, "still nothing for the reviewer");
+      told = await toldTo("alice");
+      assert.equal(told.length, 2);
+      assert.match(told[1]!, /No new review of AMD-AGI\/PrimusClaw#254, which you asked for[\s\S]*- It was already run again once after CI turned green, and still had nothing new to post\.\n- Next: once the pull request has new commits, ask for a review again\./);
+      // Never a third turn.
+      now += 100_000;
+      await ri.followReviewItems(now);
+      assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0);
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+
+    // The owner's own re-review: told in their own words (`再审 #N`), and a new head ends the wait.
+    await w.q("DELETE FROM claw_assistant_says");
+    await reviewedBefore("alice", "c".repeat(40));
+    const own = await one("alice", { prs: [PR(254)], review_only: true });
+    await firstTurnWords(own.session_id);
+    await readAt(own.session_id, "alice", "c".repeat(40));
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    assert.equal((await w.item(own.item_id)).board_state, "in_progress");
+    assert.match((await toldTo("alice"))[0]!, new RegExp(`^\\*\\*No new review of AMD-AGI/PrimusClaw#254: the code[\\s\\S]*approve it if it passes\\.\\n- After new commits: reply \`review again #${own.seq}\`\\.`));
+    await followed(async () => ({ status: "open", head_sha: "d".repeat(40), ci: { green: false, failed: [], advisory: [], pending: [] } } as never));
+    try {
+      await ri.followReviewItems(Date.now() + 1_000_000);
+      await reviewResultsSettled();
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    const ownItem = await w.item(own.item_id);
+    assert.deepEqual([ownItem.board_state, ownItem.outcome, ownItem.params.ci_wait_ended.reason], ["done", "accepted", "head_moved"]);
+    assert.match((await toldTo("alice")).at(-1)!, /- The pull request got new commits, so I stopped waiting for CI on the old head\.\n- Next: once the pull request has new commits, reply `review again #\d+`\./);
   });
 });

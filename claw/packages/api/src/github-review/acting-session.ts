@@ -134,6 +134,11 @@ export async function proofForFirstMessageAgain(
  * other, that turn completed and its words are `content`, nothing is queued, its approval was refused `ci_not_green`, and it is the session of
  * an open review item of the owner's own (nobody else asked for it) whose wait for CI has not ended. Null otherwise: never twice, since the
  * turn it lets through is the session's second.
+ *
+ * Or, for a review asked of anyone (2026-11-11, N25): its one completed turn read a head the same acting account had already reviewed in
+ * another session and posted, merged and held nothing, as a re-review of a pull request with no new commits does, and the head is green now.
+ * The same words, once more; a review someone asked of the owner still passes every gate a queued turn does (`gateRequestedReviewTurn`:
+ * the reviewer's say asked again, and the turn budget).
  */
 export async function proofForReviewAfterGreenCi(
   q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
@@ -144,15 +149,28 @@ export async function proofForReviewAfterGreenCi(
             (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
             (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
             (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
-            EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool = 'gh_review_submit'
-                     AND a.result = 'refused' AND a.detail = 'ci_not_green') AS ci_refused,
             EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state <> 'done'
-                     AND NOT (w.params ? 'requested_by') AND NOT (w.params ? 'ci_wait_ended')) AS waiting
+                     AND NOT (w.params ? 'ci_wait_ended')
+                     AND ((NOT (w.params ? 'requested_by')
+                           AND EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool = 'gh_review_submit'
+                                        AND a.result = 'refused' AND a.detail = 'ci_not_green'))
+                       OR (NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id
+                                        AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result = 'ok')
+                           AND NOT EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = s.session_id)
+                           AND EXISTS (SELECT 1 FROM (SELECT g.repo, g.pr, g.head_sha FROM claw_github_audit g
+                                                       WHERE g.session_id = s.session_id AND g.tool = 'gh_pr_get' AND g.result = 'ok'
+                                                         AND g.head_sha <> '' AND g.pr IS NOT NULL
+                                                       ORDER BY g.at DESC, g.id DESC LIMIT 1) g
+                                        WHERE EXISTS (SELECT 1 FROM claw_github_audit a
+                                                       WHERE a.actor_user_id = s.config->>'acting_as' AND a.session_id <> s.session_id
+                                                         AND a.tool = 'gh_review_submit' AND a.result = 'ok'
+                                                         AND a.detail IN ('submitted', 'already_submitted') AND lower(a.repo) = lower(g.repo)
+                                                         AND a.pr = g.pr AND lower(a.head_sha) = lower(g.head_sha)))))) AS waiting
        FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
     [sessionId],
-  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; ci_refused: boolean; waiting: boolean } | undefined;
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; waiting: boolean } | undefined;
   if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
-  if (row.status !== "completed" || row.words !== content || !row.ci_refused || !row.waiting) return null;
+  if (row.status !== "completed" || row.words !== content || !row.waiting) return null;
   return { via: null } as AttendedProof;
 }
 

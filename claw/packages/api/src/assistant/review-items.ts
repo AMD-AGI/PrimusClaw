@@ -1114,6 +1114,11 @@ export interface ReviewFacts {
   ciRefusal?: { headSha: string; failed: string[]; pending: string[] } | null;
   /** Why the wait for CI ended (`ReviewParams.ci_wait_ended`), or null while it may wait. */
   ciWaitEnded?: CiWaitEnd | null;
+  /**
+   * The head this session last read (`gh_pr_get`), when the same acting account had already posted a review of that pull request at that
+   * very head in another session: a re-review of a pull request with no new commits, which has nothing new to post. Else null.
+   */
+  unchanged?: { headSha: string; at: number } | null;
 }
 
 /** How long a review waits for CI on its head to turn green before it stops waiting and says so. */
@@ -1126,12 +1131,25 @@ export const CI_WAIT_MS = 24 * HOUR_MS;
  * head is green (`followReviewItems`): the person asked for a review that approves and merges, and only CI stood in the way. Never after a
  * second turn (it is run again at most once), and never once the wait ended (`ciWaitEnded`).
  */
-export function ciWaitOf(f: ReviewFacts): { headSha: string; failed: string[]; pending: string[]; since: number } | null {
+export function ciWaitOf(f: ReviewFacts): { headSha: string; failed: string[]; pending: string[]; since: number; unchanged?: true } | null {
   const p = f.lastPosted;
   const c = f.ciRefusal;
-  if (!f.ownReview || f.turns !== 1 || f.ciWaitEnded || !p || !c) return null;
+  if (f.turns !== 1 || f.ciWaitEnded) return null;
+  // A re-review of a head already reviewed, that posted nothing (`unchangedReview`): it waits for CI on that head the same way, for whoever
+  // asked, and is run once more when CI is green, when it can approve (2026-11-11, N25: #532 was judged stuck and its reviewer asked).
+  if (unchangedReview(f)) return { headSha: f.unchanged!.headSha, failed: [], pending: [], since: f.unchanged!.at, unchanged: true };
+  if (!f.ownReview || !p || !c) return null;
   if (p.event === "APPROVE" || p.findings > 0 || c.headSha !== p.headSha) return null;
   return { headSha: p.headSha, failed: c.failed, pending: c.pending, since: p.at };
+}
+
+/**
+ * A review whose turn ended without posting or holding anything, having read a head the same acting account had already reviewed
+ * (`ReviewFacts.unchanged`): with no new commits it rightly posts no second review, and it is not stuck. Nothing for the reviewer to do.
+ */
+export function unchangedReview(f: ReviewFacts): boolean {
+  if (!f.unchanged || f.turn !== "finished" || f.lastPosted || f.confirmations.length > 0) return false;
+  return !f.writes.some((w) => w.result === "ok" && (w.tool === "gh_review_submit" || w.tool === "gh_pr_merge"));
 }
 
 /** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
@@ -1141,8 +1159,10 @@ const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_m
 /**
  * What the owner of their own review is told of its end by the server (`review-result.ts`): it waits for CI to turn green before it is run
  * again (`ci_wait`), or it posted a review that does not approve (`not_approved`). An approval goes on to the merge's confirmation card.
+ * A re-review of a head already reviewed that posted nothing (`unchangedReview`) is told to whoever asked for it, the owner or the requester:
+ * it waits for CI on that head before it is run again (`unchanged_wait`), or it ends with nothing new to post (`unchanged`).
  */
-export type ReviewResult = "ci_wait" | "not_approved";
+export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged";
 
 export type ReviewState =
   | { boardState: "in_progress"; summary: string; question: string | null; result?: ReviewResult }
@@ -1224,6 +1244,13 @@ export function reviewState(f: ReviewFacts): ReviewState {
   if (f.writes.some((w) => w.result === "ok" && w.detail === "dry_run")) {
     return { boardState: "needs_you", reportKind: "blocked", summary: `writes are off on this deployment: nothing was posted to ${pr}`, question: RQ.lookAt.en(pr) };
   }
+  // Nothing posted because nothing changed since the head was reviewed: not stuck, and nothing the reviewer can do about it.
+  if (unchangedReview(f)) {
+    if (ciWaitOf(f)) {
+      return { boardState: "in_progress", summary: `no new commits: waiting for CI, then reviewing ${pr} again`, question: null, result: "unchanged_wait" };
+    }
+    return { boardState: "done", outcome: "accepted", summary: `${pr} has no new commits since its last review`, result: "unchanged" };
+  }
   return { boardState: "needs_you", reportKind: "blocked", summary: `the review of ${pr} ended without posting anything`, question: RQ.lookAtSession.en(pr) };
 }
 
@@ -1261,6 +1288,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
         AND detail = 'ci_not_green' ORDER BY at DESC, id DESC LIMIT 1`,
     [sessionId],
   )).rows[0] as { head_sha: string; risk_reasons: unknown } | undefined;
+  const unchanged = (await q.query(UNCHANGED_HEAD_SQL, [sessionId, row.params.acting_as])).rows[0] as { head_sha: string; at: unknown } | undefined;
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
@@ -1274,8 +1302,23 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     lastPosted: posted ? { headSha: String(posted.head_sha).toLowerCase(), event: String(posted.event), findings: Number(posted.findings), at: ms(posted.at) } : null,
     ciRefusal: ci ? { headSha: String(ci.head_sha).toLowerCase(), ...ciNamesOf(ci.risk_reasons) } : null,
     ciWaitEnded: row.params.ci_wait_ended?.reason ?? null,
+    unchanged: unchanged ? { headSha: String(unchanged.head_sha).toLowerCase(), at: ms(unchanged.at) } : null,
   };
 }
+
+/**
+ * The head session $1 last read (`gh_pr_get`), with when, if the acting account $2 had already posted a review of the same pull request at
+ * that head in another session (`ReviewFacts.unchanged`); no row otherwise.
+ */
+export const UNCHANGED_HEAD_SQL = `
+  SELECT g.head_sha, g.at FROM (
+    SELECT repo, pr, head_sha, at FROM claw_github_audit
+     WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND head_sha <> '' AND pr IS NOT NULL
+     ORDER BY at DESC, id DESC LIMIT 1) g
+   WHERE EXISTS (SELECT 1 FROM claw_github_audit a
+                  WHERE a.actor_user_id = $2 AND a.session_id <> $1 AND a.tool = 'gh_review_submit' AND a.result = 'ok'
+                    AND a.detail IN ('submitted', 'already_submitted') AND lower(a.repo) = lower(g.repo) AND a.pr = g.pr
+                    AND lower(a.head_sha) = lower(g.head_sha))`;
 
 
 /**
@@ -1309,7 +1352,7 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
     if (recordChanged) await query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
     // A review that waits for CI holds no slot (`RUNNING`): it may wait a day, and the owner's other work is not held back by it. The mark
     // goes as soon as it stops waiting, so the turn run when CI turned green counts again.
-    const ciWaiting = state.boardState === "in_progress" && state.result === "ci_wait";
+    const ciWaiting = state.boardState === "in_progress" && (state.result === "ci_wait" || state.result === "unchanged_wait");
     if (ciWaiting !== ((row.params as Record<string, unknown> | null)?.ci_waiting === true)) {
       await query(
         ciWaiting ? "UPDATE claw_work_items SET params = params || '{\"ci_waiting\": true}'::jsonb WHERE item_id = $1"

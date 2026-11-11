@@ -3,11 +3,12 @@
 
 /**
  * What the owner of their own review is told when it ends without an approval (`assistant/review-result.ts`), in each language: why,
- * and what is next. The paths that send it run against Postgres in `assistant-review-items.test.ts` (RS1-RS3).
+ * and what is next; and what whoever asked is told of a re-review with no new commits that posted nothing. The paths that send them run
+ * against Postgres in `assistant-review-items.test.ts` (RS1-RS5).
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ciNamesOf, resultText, type ResultFacts } from "../src/assistant/review-result.js";
+import { ciNamesOf, resultText, unchangedText, type ResultFacts, type UnchangedFacts } from "../src/assistant/review-result.js";
 
 const facts = (over: Partial<ResultFacts> = {}): ResultFacts => ({
   pr: "AMD-AGI/Primus-SaFE#873", url: "https://github.com/AMD-AGI/Primus-SaFE/pull/873", seq: 195,
@@ -48,4 +49,33 @@ test("every way a review ends without an approval says why and what is next, in 
 test("the check names are read back from the refusal's audit lines, and nothing else is", () => {
   assert.deepEqual(ciNamesOf(["evidence: x", "ci_failed: codecov/patch", "ci_pending: e2e", "ci_failed: ", 7]), { failed: ["codecov/patch"], pending: ["e2e"] });
   assert.deepEqual(ciNamesOf(null), { failed: [], pending: [] });
+});
+
+test("a re-review with no new commits that posted nothing (N25, #532) says so to whoever asked, and what is next, in both languages", () => {
+  const f = (over: Partial<UnchangedFacts> = {}): UnchangedFacts => ({
+    pr: "AMD-AGI/PrimusClaw#712", url: "https://github.com/AMD-AGI/PrimusClaw/pull/712", seq: 532,
+    headSha: "1d6a0c3e2f4b5a6978877665544332211aabbccd", reviewOnly: false, turns: 1, ended: null, forRequester: true, ...over,
+  });
+  assert.equal(unchangedText("unchanged_wait", f(), true), [
+    "**你请人评审的 AMD-AGI/PrimusClaw#712 这次没有发新评审：代码和上次审过的一样**", "",
+    "- head `1d6a0c3` 已经审过，之后没有新提交，所以没有重复发评审。",
+    "- 接下来：我盯着这个 PR，这个 head 的 CI 全绿后自动再审一次（只再审一次，最多等 24 小时），审过就批准并继续合入。",
+    "- PR 有了新提交：再请一次评审。",
+    "- PR：https://github.com/AMD-AGI/PrimusClaw/pull/712",
+  ].join("\n"));
+  // The owner's own: no "you asked for", and the reply that reviews it again.
+  const own = unchangedText("unchanged_wait", f({ forRequester: false, reviewOnly: true }), true);
+  assert.match(own, /^\*\*AMD-AGI\/PrimusClaw#712 这次没有发新评审/);
+  assert.match(own, /审过就批准。\n- PR 有了新提交：回复 `再审 #532`。/);
+  const cases: Array<[Partial<UnchangedFacts>, RegExp, RegExp]> = [
+    [{ turns: 2 }, /已经在 CI 转绿后自动再审过一次，还是没有新内容可发。\n- 接下来：PR 有了新提交后再请一次评审。/, /already run again once after CI turned green[\s\S]*once the pull request has new commits, ask for a review again/],
+    [{ ended: "threads_open" }, /CI 已经全绿，但 PR 上还有没解决的评审讨论，所以没有自动再审。\n- 接下来：讨论都解决后再请一次评审。/, /review threads are still open[\s\S]*once every thread is resolved, ask for a review again/],
+    [{ ended: "timeout" }, /等了 24 小时 CI 还没全绿/, /still not green after 24 hours/],
+    [{ ended: "head_moved" }, /PR 有了新提交，原来那个 head 的 CI 不再等了/, /got new commits/],
+  ];
+  for (const [over, zh, en] of cases) {
+    assert.match(unchangedText("unchanged", f(over), true), zh, JSON.stringify(over));
+    assert.match(unchangedText("unchanged", f(over), false), en, JSON.stringify(over));
+    assert.doesNotMatch(unchangedText("unchanged", f(over), true), /卡住|需要你回复/);
+  }
 });

@@ -397,6 +397,11 @@ A review asked of someone else meets the assistant in three places:
   that head: the sweep reads its checks with the pull request, runs the review once more in the same session when they are green (an
   approval then goes on to the merge's confirmation card), and stops waiting on a new head or after 24 hours, saying so. A waiting
   review holds no slot. `再审 #N` / `review again #N` restarts it.
+- **A re-review with no new commits.** A review whose turn read a head the same acting account had already reviewed, and posted,
+  merged and held nothing (it has nothing new to say), is not reported as stuck and does not ask the reviewer anything. Whoever
+  asked for it (the owner, or the person who asked someone else for it) is told why; the item then waits for CI on that head the
+  same way, runs the review once more when it is green (a review asked of someone else still passes the reviewer's say and turn
+  budget first), and ends with nothing new to post if that turn posts nothing either.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
