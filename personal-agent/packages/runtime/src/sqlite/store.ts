@@ -34,6 +34,7 @@ import { SqliteMemberDirectoryRepository } from "./member-repository.js";
 import { migrate } from "./migrations.js";
 import { SqliteNotifySubscriptionRepository } from "./notify-repository.js";
 import { SqliteObserveRepository } from "./observe-repository.js";
+import { SqliteGroupContextRepository } from "./group-context-repository.js";
 import { SqliteOnboardingRepository } from "./onboarding-repository.js";
 import {
   SqliteConversationRefRepository,
@@ -76,6 +77,7 @@ export class SqliteStore implements StorePort {
   readonly notifySubs;
   readonly approvals;
   readonly observe;
+  readonly groupContext;
   readonly assistantCards;
   readonly assistantButtons;
   readonly assistantMessages;
@@ -108,6 +110,7 @@ export class SqliteStore implements StorePort {
     this.notifySubs = new SqliteNotifySubscriptionRepository(ctx);
     this.approvals = new SqliteApprovalRepository(ctx);
     this.observe = new SqliteObserveRepository(ctx);
+    this.groupContext = new SqliteGroupContextRepository(ctx);
     this.assistantCards = new SqliteAssistantCardRepository(ctx);
     this.assistantButtons = new SqliteAssistantButtonRepository(ctx);
     this.assistantMessages = new SqliteAssistantMessageRepository(ctx);

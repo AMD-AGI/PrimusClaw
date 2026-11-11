@@ -3,7 +3,8 @@
 
 // The storage format: a database this store makes, fresh or upgraded, has exactly the structure of the one the Python
 // worker makes (test-support/data/store-structure.json, taken from a database the Python store created), so either
-// worker can open what the other wrote. Its SQL text counts too: SQLite keeps each ALTER in the table's stored SQL.
+// worker can open what the other wrote; tables added since (group_context_off) only extend it. Its SQL text counts
+// too: SQLite keeps each ALTER in the table's stored SQL.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -32,9 +33,9 @@ function structureAfter(prepare: (path: string) => void, opens = 1): StoreStruct
   }
 }
 
-test("a fresh database has the Python store's structure: 41 tables, their columns, indexes and SQL", () => {
+test("a fresh database has the Python store's structure: 42 tables, their columns, indexes and SQL", () => {
   const actual = structureAfter(() => undefined);
-  assert.equal(Object.keys(actual.tables).length, 41);
+  assert.equal(Object.keys(actual.tables).length, 42);
   assert.deepEqual(actual, EXPECTED.fresh);
 });
 

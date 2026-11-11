@@ -160,6 +160,17 @@ export interface Observing {
   board(userId: string, credential: string, conversation: Conversation): Promise<void>;
 }
 
+/**
+ * The recent messages of a group chat, as background when the bot is @mentioned there (`group-context/buffer.ts`). Fed
+ * only by group messages that do not address the bot, which a channel delivers only where the chat allowed it.
+ */
+export interface GroupHistory {
+  /** A group message not addressed to the bot: kept in memory, never answered. */
+  record(message: InboundMessage): void;
+  /** The chat's kept messages as background for a turn ("" none). */
+  background(chatId: string): string;
+}
+
 /** The review service's part in the chat (Python `github_review.GithubReview` and `github_connect.GithubConnect`). */
 export interface GithubChat {
   /** Which channel id is whose, for reading a mention in a group. */

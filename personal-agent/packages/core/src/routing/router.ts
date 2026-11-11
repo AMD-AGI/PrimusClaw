@@ -120,7 +120,8 @@ export class Router {
     const kind = event.conversation.kind;
     if (event.type === "message" && !(await this.withinRate(event, chat))) return; // (dropped before anything is read)
     if (kind === "group" && event.type === "message" && !event.mentioned && !event.targeted) {
-      await this.ctx.deps.observing.forward(event); // (to the group's observer, if it has one; else dropped unread)
+      this.ctx.deps.groupHistory.record(event); // (kept in memory as background for the next @mention; never answered)
+      await this.ctx.deps.observing.forward(event); // (to the group's observer, if it has one)
       return;
     }
     if (event.type === "message") this.ctx.deps.github?.remember(event); // (which channel id is whose, for mentions)

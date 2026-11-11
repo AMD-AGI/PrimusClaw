@@ -20,6 +20,7 @@ export { INTENT_PROMPT, MODE_PROMPT } from "./locales/review-github.js";
 export * from "./typed-answer/index.js";
 export * from "./understanding/index.js";
 export * from "./locales/index.js";
+export * from "./group-context/index.js";
 export * from "./observe/index.js";
 export * from "./plugins/index.js";
 export * from "./ports/crypto.js";

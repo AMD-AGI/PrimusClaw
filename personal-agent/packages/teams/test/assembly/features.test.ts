@@ -217,6 +217,7 @@ describe("the assembled features", () => {
         ["sweep_expired", 60_000, false],
         ["retry_feedback", 60_000, false],
         ["release_held", 60_000, false],
+        ["sweep_group_context", 60_000, false],
         ["resend_approval_cards", 60_000, true],
       ],
     );

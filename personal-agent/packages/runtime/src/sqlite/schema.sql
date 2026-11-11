@@ -120,3 +120,5 @@ CREATE TABLE IF NOT EXISTS observe_cards (
   tool TEXT NOT NULL, args TEXT NOT NULL, message TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open',
   created_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS observe_cards_by_suggestion ON observe_cards (aad_id, run_id, seq);
+CREATE TABLE IF NOT EXISTS group_context_off (
+  conversation_id TEXT PRIMARY KEY, updated_at REAL NOT NULL);

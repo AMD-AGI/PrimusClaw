@@ -6,11 +6,13 @@ import {
   DEFAULT_MAX_CONCURRENT_TASKS,
   DEFAULT_MESSAGE_LIMIT,
   DEFAULT_MESSAGE_WINDOW_SECONDS,
+  DEFAULT_GROUP_CONTEXT,
   decimalBigInt,
   parseLimits,
   type AssistantSettings,
   type ExchangeSettings,
   type GithubReviewSettings,
+  type GroupContextSettings,
   type SecretName,
   type Settings,
   type SecretsSourceName,
@@ -23,6 +25,8 @@ import { secretsSourceOf } from "./secrets.js";
 export const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 /** The default of ASSISTANT_REPLY_WINDOW_SECONDS. */
 export const ASSISTANT_REPLY_WINDOW_SECONDS = 30 * 60;
+/** The most messages TEAMS_GROUP_CONTEXT_MESSAGES may keep per group chat. */
+export const MAX_GROUP_CONTEXT_MESSAGES = 200;
 
 /** What a setting reads its secrets from: the values a source loaded, and which source that was. */
 interface Secrets {
@@ -74,6 +78,7 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
     directChat: directChat(read),
     onBehalfUsers: new Set(read.list("TEAMS_ON_BEHALF_USERS")),
     observeUsers: new Set(read.list("TEAMS_OBSERVE_USERS", true)),
+    groupContext: groupContextSettings(read),
     sensitiveLimits: limitsOf(read),
     linkLimits: {
       perUser: read.positiveInt("TEAMS_LINK_MAX_FAILURES_PER_USER", 5),
@@ -86,6 +91,21 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
       maxConcurrentTasks: read.positiveInt("TEAMS_USER_MAX_CONCURRENT_TASKS", DEFAULT_MAX_CONCURRENT_TASKS),
     },
     secretsSource: store.source,
+  };
+}
+
+/** The recent messages of a group chat kept as background (0 messages: off). */
+function groupContextSettings(read: EnvReader): GroupContextSettings {
+  const messages = read.int("TEAMS_GROUP_CONTEXT_MESSAGES", String(DEFAULT_GROUP_CONTEXT.messages));
+  if (messages < 0 || messages > MAX_GROUP_CONTEXT_MESSAGES) {
+    throw new ConfigError(
+      `TEAMS_GROUP_CONTEXT_MESSAGES must be between 0 and ${String(MAX_GROUP_CONTEXT_MESSAGES)}, not ${String(messages)}`,
+    );
+  }
+  return {
+    messages,
+    maxAgeSeconds: read.positiveInt("TEAMS_GROUP_CONTEXT_HOURS", DEFAULT_GROUP_CONTEXT.maxAgeSeconds / 3600) * 3600,
+    messageChars: read.positiveInt("TEAMS_GROUP_CONTEXT_CHARS", DEFAULT_GROUP_CONTEXT.messageChars),
   };
 }
 

@@ -15,6 +15,7 @@ import {
   FeedbackReporting,
   FeedbackService,
   FeedbackThumbs,
+  GroupContext,
   noFeedbackSink,
   Observer,
   pyStr,
@@ -61,6 +62,8 @@ export interface W8Parts {
   readonly flow: FeedbackFlow;
   readonly thumbs: FeedbackThumbs;
   readonly observer: Observer;
+  /** The recent messages of group chats, in memory, as background for an @mention. */
+  readonly groupContext: GroupContext;
   readonly brief: DailyBrief;
   /** The Report a problem card under a message of the person's that went wrong. */
   reportView(userId: string, scope: string): OutMessage;
@@ -132,6 +135,13 @@ export function w8Parts(
     pluginId: settings.claw.pluginId ?? undefined,
     log: logger,
   });
+  const groupContext = new GroupContext({
+    settings: settings.groupContext,
+    clock,
+    mask,
+    off: store.groupContext,
+    log: logger,
+  });
   const brief = new DailyBrief({
     enabled: options.briefEnabled,
     links: store.links,
@@ -147,6 +157,7 @@ export function w8Parts(
     flow: new FeedbackFlow({ reports: store.feedback, reporting, service, log: logger }),
     thumbs,
     observer,
+    groupContext,
     brief,
     reportView: (userId, scope) => {
       const view = service.reportView(userId, scope);

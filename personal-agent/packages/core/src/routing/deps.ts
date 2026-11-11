@@ -21,6 +21,7 @@ import type {
   ChannelContextBuilder,
   ConnectionsText,
   GithubChat,
+  GroupHistory,
   MessageText,
   NoteFactory,
   Observing,
@@ -131,6 +132,8 @@ export interface RouterDeps {
   readonly stopCards: StopCards;
   readonly proactive: ProactiveHold;
   readonly observing: Observing;
+  /** The recent messages of group chats, as background when the bot is @mentioned there. */
+  readonly groupHistory: GroupHistory;
   readonly github: GithubChat | undefined;
   /** The review-stop words of a group (with the review service on). */
   readonly reviewStop: ReviewStopReader | undefined;
