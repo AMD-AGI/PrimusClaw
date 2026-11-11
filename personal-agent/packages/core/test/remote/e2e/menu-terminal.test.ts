@@ -271,6 +271,24 @@ test("what is typed at the shared terminal shows on the phone before its reply a
     assert.deepEqual(w.server.commandsOf("cancel"), []);
   }));
 
+test("the reply to a prompt typed at a terminal the chat types into is told after the watch's few quiet seconds", () =>
+  remoteWorld(
+    async (w) => {
+      w.server.addConnector(ALICE, "dev-pod", ATTACH_AGENT, { caps: typingCaps(w) });
+      w.server.onCommand = new Typing().hook;
+      await press(w, await agentsCard(w), CONNECT);
+      await w.idle();
+      const sid = w.test.store.remoteState.attachedRemote(AAD)?.sessionId ?? "";
+      const says = (kind: string, text: string) => w.server.emit(sid, kind, chunk(kind, text));
+      // Typed at the terminal: no turn of the phone's, so nothing but quiet ends it (2026-11-11 guide re-check).
+      await says("user_message_chunk", "Reply with TERMINAL only");
+      await says("agent_message_chunk", "TERMINAL");
+      // (the session's own timings here are a minute of quiet: only the watch's, TEST_TIMINGS, get it out in time)
+      await w.until(() => w.said().some((t) => t.includes("TERMINAL") && !t.includes("Typed in the terminal")), 5_000);
+    },
+    { timings: { quietMs: 60_000, toolQuietMs: 60_000, gapMs: 0, maxAgeMs: 120_000, reconnectMs: 50 } },
+  ));
+
 test("the reply to a prompt typed at the shared terminal says so in the chats language", () =>
   remoteWorld(async (w) => {
     w.setLang(AAD, "zh");

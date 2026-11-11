@@ -54,7 +54,10 @@ export class FollowControl {
     const current = chats.followers.get(chatKey);
     if (current?.alive === true && current.sessionId === attached.sessionId) return;
     this.drop(chatKey);
-    const watched = this.state.watches(chatKey, attached);
+    // A conversation open in a terminal, watched or typed into: what is typed there is answered there, with no turn of the phone's to
+    // end it, so its reply is told after a few quiet seconds, as a watch's is. With the half-minute of a session of the phone's own it
+    // came after the person had left (2026-11-11 guide re-check: nothing within 20 s, although the card says replies show up here).
+    const watched = this.state.watches(chatKey, attached) || this.state.typesIntoTerminal(chatKey, attached);
     const follower = new Follower(chatKey, attached.sessionId ?? "", {
       clock: this.ctx.clock,
       logger: this.ctx.logger,
