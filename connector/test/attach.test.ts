@@ -475,6 +475,51 @@ describe("a Claude Code process whose registry row cannot be read", () => {
     assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "anyone else's: refused");
   });
 
+  test("a conversation only this connector's own adapter holds is reported attached, never as a terminal that waits (guide re-check 2026-11-11)", { skip: process.platform !== "linux" }, async () => {
+    // Another agent of this connector (a session started from the phone) runs Claude Code in the same config directory: its row says
+    // it waits (a permission card on the phone). It is no terminal, so nothing may tell the owner a terminal waits for them.
+    const dir = configDir();
+    const mine = sleeper({ detached: true });   // (an adapter this connector started: it leads its own group)
+    const term = sleeper();                     // (a terminal: not in any group this connector leads)
+    await new Promise((r) => setTimeout(r, 100));
+    const registry = new ChildRegistry(path.join(tmpdir(), "children.json"));
+    registry.add({ pid: mine.pid!, pgid: mine.pid!, agent_id: "claude", session_id: "s-phone" });
+    const row = (pid: number, ref: string, status: string) => fs.writeFileSync(path.join(dir, "sessions", `${pid}.json`),
+      JSON.stringify({ pid, sessionId: ref, status, waitingFor: "permission prompt", kind: "interactive", procStart: processStart(pid), pidDomain: localPidDomain() }));
+    row(mine.pid!, REF, "waiting");
+    const cfg = parseConfig(`
+[[agents]]
+id = "a"
+preset = "claude-attach"
+roots = [${JSON.stringify(os.tmpdir())}]
+attach_cli = "/nonexistent/claude-for-tests"
+[agents.env]
+CLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}
+`);
+    const s = new AttachSupport(cfg.agents[0]!, {
+      registry, audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test", env: process.env, catalogMs: 60_000,
+      cliTimeoutMs: 1500, recentWriteMs: 10_000, attachedRefs: () => new Set(),
+    });
+    const any = s as unknown as { listed: unknown[]; waitedOnce: boolean; listedAt: number };
+    any.listed = [{ ref: REF, title: "phone", cwd: os.tmpdir(), updatedAt: Date.now() }, { ref: REF2, title: "both", cwd: os.tmpdir(), updatedAt: Date.now() }];
+    any.waitedOnce = true;
+    any.listedAt = Date.now();
+    let [phone] = await s.resumable(1_000);
+    assert.equal(phone!.state, "attached", "its own adapter's conversation is not open in a terminal");
+    assert.equal(phone!.activity, undefined, "and nothing says it waits");
+    // A terminal that holds a conversation too is a terminal, with what that terminal says (not what its own adapter says).
+    row(mine.pid!, REF2, "waiting");
+    row(term.pid!, REF2, "busy");
+    const listed = await s.resumable(1_000);
+    const both = listed.find((r) => r.ref === REF2)!;
+    assert.equal(both.state, "live");
+    assert.equal(both.activity, "working", "the terminal's own activity, not the adapter's wait");
+    [phone] = listed;
+    assert.equal(phone!.state, "idle", "the adapter's row moved to the other conversation: the first is held by nobody");
+    await stop(term);
+    await stop(mine);
+  });
+
   test("a session this connector holds with its own adapter is not stopped by another process's unreadable row (each prompt checks)", { skip: process.platform !== "linux" }, async () => {
     const dir = configDir();
     const unrelated = claudeNamed(os.tmpdir());   // (an unrelated terminal in the same folder, its row empty)

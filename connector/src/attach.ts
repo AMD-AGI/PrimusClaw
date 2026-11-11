@@ -466,8 +466,20 @@ export class AttachSupport {
     const scanned = await within(this.scanBlind().catch(() => null), capMs, null);
     const blind = scanned === null ? null : scanned.filter((b) => b.pgid === null || !own.has(b.pgid));
     const attached = this.d.attachedRefs();
+    // (a process of a group this connector leads is the adapter of one of its own sessions, of any of its agents: asked once per pid)
+    const groupOf = new Map<number, number | null>();
+    const ownHolder = (e: LiveEntry): boolean => {
+      if (e.foreign) return false;
+      if (!groupOf.has(e.pid)) groupOf.set(e.pid, processGroup(e.pid));
+      const g = groupOf.get(e.pid);
+      return g != null && own.has(g);
+    };
     return this.listed.slice(0, MAX_REPORTED).map((l) => {
-      const holders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
+      const listedHolders = live?.filter((e) => e.sessionId.toLowerCase() === l.ref) ?? [];
+      // This connector's own adapter is no terminal (a session started from the phone, by another agent of this connector that shares
+      // the Claude config directory): reported as `live`, its permission card that waited a minute on the phone was said to be "waiting
+      // in a terminal" (2026-11-11 guide re-check, 3 of 3).
+      const holders = listedHolders.filter((e) => !ownHolder(e));
       // A process proven by this very scan to have it open holds it, whatever the live list (made from another scan) says
       // (Wei Lei, #612: two scans that disagree must not make it free).
       for (const b of blind ?? []) {
@@ -475,7 +487,9 @@ export class AttachSupport {
           holders.push({ pid: b.pid, sessionId: b.sessionId, status: null, waitingFor: null, cwd: b.cwd, foreign: false, via: "blind" });
         }
       }
-      let state: ResumableState = attached.has(l.ref) ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
+      // Held by its own adapter and by nothing else: this connector's, as an attached one is.
+      const mine = holders.length === 0 && listedHolders.length > 0;
+      let state: ResumableState = attached.has(l.ref) || mine ? "attached" : live === null ? "unknown" : holders.length ? "live" : "idle";
       // A Claude Code process here whose registry row cannot be read may be the one that has it open: not "idle" (which a
       // client offers to take over, starting a second writer), but "unknown".
       // One proven to have a conversation open holds that one (it is among `live`) and no other.
