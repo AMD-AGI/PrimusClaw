@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - run: python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+      - run: python3 -c 'import yaml' || sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3-yaml
 
       # connector-release.yml publishes to a public registry with an OIDC identity, and the file a
       # release runs is the one at the release's tag, so what keeps a publish behind the

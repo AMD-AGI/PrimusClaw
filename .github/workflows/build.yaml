@@ -169,10 +169,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # The runner image ships Buildah; apt runs only where it is missing, bounded, so a mirror that hangs fails the
+      # step in minutes instead of holding the job to its timeout.
       - name: Install Buildah
         run: |
-          sudo apt-get update
-          sudo apt-get install -y buildah
+          set -euo pipefail
+          if ! command -v buildah >/dev/null; then
+            apt=(sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+            "${apt[@]}" update
+            "${apt[@]}" install -y buildah
+          fi
+          buildah --version
 
       # Pull requests build but never push, so they need no registry credentials
       # at all. A failed login now fails the job: previously it was swallowed by
@@ -228,7 +235,7 @@ jobs:
         run: |
           set -euo pipefail
           # The runner image ships podman (it shares Buildah's image store); install it only where it is missing.
-          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          command -v podman >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y podman; }
           VERSION=$(node -p 'require("./personal-agent/packages/teams/package.json").version')
           USER_ID=$(podman run --rm "$IMAGE" id -u)
           echo "user in image: $USER_ID"
