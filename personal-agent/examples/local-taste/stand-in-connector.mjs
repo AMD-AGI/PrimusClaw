@@ -20,11 +20,11 @@ createServer((request, response) => {
       const cards = (activity.attachments ?? []).map((attachment) => attachment.contentType);
       line = JSON.stringify({ type: activity.type, text: activity.text, cards: cards.length ? cards : undefined });
     } catch {
-      // (not JSON: printed as it came, on one line)
+      // (not JSON: printed as it came, without its line breaks)
     }
-    // One line per request: a line break in what was sent cannot start a line of its own in the output.
+    // One line per request: line breaks in what was sent are dropped, so none can start a line of its own here.
     const path = (request.url ?? "").replace(/\n|\r/g, "");
-    console.log(`${request.method ?? ""} ${path} ${line.replace(/\n|\r/g, " ")}`);
+    console.log(`${request.method ?? ""} ${path} ${line.replace(/\n|\r/g, "")}`);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ id: `stand-in-${++sent}` }));
   });
