@@ -43,6 +43,12 @@ updates:
       npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # typescript-eslint 8.72 declares a peer of typescript >=4.8.4 <6.1.0, so any
+    # bump past 6.0.x (7.0.2 was one) fails `npm ci` with ERESOLVE. Raise this
+    # bound together with typescript-eslint once its peer range allows more.
+    ignore:
+      - dependency-name: "typescript"
+        versions: [">=6.1.0"]
 
   - package-ecosystem: "pip"
     directories:
