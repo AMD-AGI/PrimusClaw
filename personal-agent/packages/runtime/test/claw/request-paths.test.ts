@@ -131,6 +131,8 @@ const WITHOUT_ID = new Set([
   "remoteAgents.setup",
   "remoteAgents.connectors",
   "remoteAgents.pair",
+  "remoteAgents.approvals",
+  "remoteAgents.setApprovals",
   "remoteAgents.sessions",
 ]);
 
