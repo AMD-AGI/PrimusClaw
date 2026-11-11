@@ -74,15 +74,21 @@ With `keyvault` the vault entries are `clawy-encryption-keys` and `clawy-exchang
 
 ## How the worker reaches Teams
 
-| Setting                  | Default      | Meaning                                                                                                                                                     |
-| ------------------------ | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OUTBOUND_MODE`          | `servicebus` | `servicebus`: replies go to the outbound queue for a relay. `direct`: the worker posts to the Bot Connector itself (streaming, deletes), queue as fallback. |
-| `BOT_TOKEN_SOURCE`       | `imds`       | The bot's token in direct mode: `imds` (managed identity) or `federated` (workload identity federation; needs `direct`).                                    |
-| `BOT_MSI_CLIENT_ID`      | —            | Required in direct mode: the bot's identity.                                                                                                                |
-| `BOT_TENANT_ID`          | —            | Required with `federated` or the worker identity.                                                                                                           |
-| `BOT_ASSERTION_KEY_FILE` | —            | Required with `federated` or the worker identity: the private key the assertions are signed with, as a mounted file.                                        |
-| `BOT_ASSERTION_ISSUER`   | —            | Required with `federated` or the worker identity: the https issuer registered in the federated credential.                                                  |
-| `BOT_ASSERTION_SUBJECT`  | —            | Required with `federated`.                                                                                                                                  |
+| Setting                  | Default      | Meaning                                                                                                                                                                                          |
+| ------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `OUTBOUND_MODE`          | `servicebus` | `servicebus`: replies go to the outbound queue for a relay. `direct`: the worker posts to the Bot Connector itself (streaming, deletes), queue as fallback.                                      |
+| `BOT_TOKEN_SOURCE`       | see below    | The bot's token in direct mode: `imds` (managed identity), `federated` (workload identity federation) or `secret` (an app registration's client secret); `federated` and `secret` need `direct`. |
+| `BOT_MSI_CLIENT_ID`      | —            | Required in direct mode with `imds` or `federated`: the bot's managed identity.                                                                                                                  |
+| `BOT_CLIENT_ID`          | —            | Required with `secret`: the app registration's client id (the Teams manifest's `botId`).                                                                                                         |
+| `BOT_CLIENT_SECRET`      | —            | Required with `secret`: the app registration's client secret. Never logged.                                                                                                                      |
+| `BOT_TENANT_ID`          | —            | Required with `federated`, `secret` or the worker identity.                                                                                                                                      |
+| `BOT_ASSERTION_KEY_FILE` | —            | Required with `federated` or the worker identity: the private key the assertions are signed with, as a mounted file.                                                                             |
+| `BOT_ASSERTION_ISSUER`   | —            | Required with `federated` or the worker identity: the https issuer registered in the federated credential.                                                                                       |
+| `BOT_ASSERTION_SUBJECT`  | —            | Required with `federated`.                                                                                                                                                                       |
+
+`BOT_TOKEN_SOURCE` when set always wins. Unset, it is `secret` when `BOT_CLIENT_SECRET` is set and `imds` otherwise; a
+`BOT_CLIENT_SECRET` beside an explicit `imds` or `federated` is ignored (in direct mode the worker warns at start). `BOT_CLIENT_SECRET` is
+read from the environment only (`SECRETS_SOURCE=keyvault` does not read it).
 
 ## Service Bus and the worker identity
 

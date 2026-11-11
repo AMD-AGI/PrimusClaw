@@ -3,7 +3,8 @@
 
 /**
  * How this worker reaches Teams, as its settings say: the outbound queue by default; in direct mode the Bot Connector, with
- * the queue behind it as the fallback and the bot's token from IMDS or by workload identity federation; in the release
+ * the queue behind it as the fallback and the bot's token from IMDS, by workload identity federation or with an app
+ * registration's client secret; in the release
  * gate's test entry the gate's recording connector alone, with a made-up token and no queue at all.
  */
 import { readFileSync } from "node:fs";
@@ -16,6 +17,7 @@ import type { TeamsSettings } from "../config/env.js";
 import { DEFAULT_CONNECTOR_HOSTS, onlyConnector, type ServiceUrlPolicy } from "../connector/hosts.js";
 import { ConnectorOutbox } from "../connector/outbox.js";
 import type { TokenSource } from "../connector/tokens/cached.js";
+import { ClientSecretTokenProvider } from "../connector/tokens/client-secret.js";
 import { FederatedTokenProvider } from "../connector/tokens/federated.js";
 import { ImdsTokenProvider } from "../connector/tokens/imds.js";
 import type { GateEntry } from "../gate/entry-env.js";
@@ -44,6 +46,22 @@ export function botTokenSource(settings: TeamsSettings, deps: AssemblyDeps): Tok
   const { bot } = settings;
   const logger = deps.logger ?? silentLogger;
   const base = { clock: deps.clock, logger, ...(deps.fetch ? { fetch: deps.fetch } : {}) };
+  if (bot.clientSecretIgnored) {
+    logger.warn("BOT_CLIENT_SECRET is set but not used: BOT_TOKEN_SOURCE names another source", {
+      tokenSource: bot.tokenSource,
+    });
+  }
+  if (bot.tokenSource === "secret") {
+    // (the settings checked all three: the provider cannot refuse them)
+    const provider = new ClientSecretTokenProvider({
+      ...base,
+      clientId: bot.clientId,
+      tenantId: bot.tenantId,
+      clientSecret: bot.clientSecret,
+    });
+    logger.info("bot token source: secret", { clientId: bot.clientId, tenantId: bot.tenantId });
+    return provider;
+  }
   if (bot.tokenSource !== "federated") {
     logger.info("bot token source: imds", { clientId: bot.msiClientId });
     return new ImdsTokenProvider(bot.msiClientId, base);

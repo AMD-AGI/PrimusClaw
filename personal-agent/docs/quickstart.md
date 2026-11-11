@@ -21,7 +21,7 @@ the agent loop against your LLM gateway. What you bring, and what this page sets
 | --------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------- |
 | The worker (chat logic, Teams cards, its own store) | yes             | a host to run it, one Fernet key                                                                            |
 | Claw and its LLM gateway                            | yes, separately | a running deployment ([`deploy/`](../../deploy/README.md)) and its SaFE endpoint, a Claw API key per person |
-| Teams bot registration and app package              | no              | an Azure Bot, a user-assigned managed identity, a Teams app manifest                                        |
+| Teams bot registration and app package              | no              | an Azure Bot, an app registration with a client secret (or a managed identity), a Teams app manifest        |
 | Service Bus queues                                  | no              | an Azure Service Bus namespace with two queues                                                              |
 | The ingress between the bot and the inbound queue   | **not yet**     | a small HTTPS service you write; [its contract](#4-the-ingress) is below                                    |
 
@@ -135,8 +135,56 @@ To install Claw, see [`deploy/README.md`](../../deploy/README.md) and [`claw/dep
 
 ### 2. The bot's identity and registration
 
-The worker posts to Teams as the bot's **user-assigned managed identity**, with no client secret. Create the identity
-and a bot registered to it, with the ingress's URL (step 4) as the messaging endpoint, and switch the Teams channel on:
+The worker posts to Teams as the bot, with a Bot Connector token it gets from Entra ID. The bot is one of two kinds of
+identity; pick one:
+
+- **An app registration with a client secret** (`BOT_TOKEN_SOURCE=secret`): the usual choice, and it works on any host.
+  It needs a worker newer than 0.2.0 (0.1.1 and 0.2.0 do not have it).
+- **A user-assigned managed identity**, with no secret at all: its token comes from the Azure host it runs on (`imds`)
+  or, anywhere else, by workload identity federation with a key of yours (`federated`).
+
+#### 2a. App registration and client secret
+
+Register an application in your tenant, give it a service principal and a client secret, and register the bot to it,
+with the ingress's URL (step 4) as the messaging endpoint; then switch the Teams channel on:
+
+```bash
+az ad app create --display-name <bot-name> --sign-in-audience AzureADMyOrg --query appId -o tsv    # BOT_CLIENT_ID
+az account show --query tenantId -o tsv                                                            # BOT_TENANT_ID
+az ad sp create --id <app-id>
+# The secret goes into a file only you can read, never onto the screen or into the shell's history.
+(umask 077; az ad app credential reset --id <app-id> --display-name personal-agent --years 1 \
+  --query password -o tsv > bot-client-secret)
+az bot create -g <group> -n <bot-name> --app-type SingleTenant --appid <app-id> --tenant-id <tenant-id> \
+  --endpoint https://<your-ingress>/api/messages
+az bot msteams create -g <group> -n <bot-name>
+```
+
+In the portal the same is **Microsoft Entra ID > App registrations > New registration** (single tenant), then
+**Certificates & secrets > New client secret** (copy the _Value_, not the _Secret ID_), then an **Azure Bot** resource
+with _Type of App_ **Single Tenant** and _Use existing app registration_ naming that application.
+
+Permissions: none to add. The worker asks Entra ID only for the Bot Connector scope
+(`https://api.botframework.com/.default`) with the client credentials grant, which an app registered as a bot gets
+without any API permission or admin consent; leave **API permissions** as they are (no Microsoft Graph permission is
+used). The service principal (`az ad sp create`) must exist in the tenant, or Entra ID answers `AADSTS7000229`.
+
+The settings are `BOT_CLIENT_ID` (the application's client id), `BOT_TENANT_ID` and `BOT_CLIENT_SECRET`. The worker
+puts the secret only into its token request: it is never logged, never shown in an error, and Entra ID's error
+descriptions (which can echo the request) are reduced to their `AADSTS` codes. A client secret expires (one year
+above); before it does, add a new one with the same command plus `--append` (without it the old secret is removed at
+once), put it in `.env`, restart the worker, then delete the old one (`az ad app credential delete`). An expired or wrong secret shows in the
+log as `Entra ID answered 401 (invalid_client: AADSTS7000222)` or `AADSTS7000215`.
+
+Which source the worker uses: `BOT_TOKEN_SOURCE` when it is set, always; when it is unset, `secret` if
+`BOT_CLIENT_SECRET` is set, else `imds`. So with `BOT_TOKEN_SOURCE=imds` or `federated` a `BOT_CLIENT_SECRET` is
+ignored, and the worker says so in a warning at start (`BOT_CLIENT_SECRET is set but not used`). Every source but
+`imds` needs `OUTBOUND_MODE=direct`.
+
+#### 2b. Managed identity
+
+Create the identity and a bot registered to it, with the ingress's URL (step 4) as the messaging endpoint, and switch
+the Teams channel on:
 
 ```bash
 az identity create -g <group> -n <bot-identity>
@@ -174,8 +222,9 @@ The identity's client id is `BOT_MSI_CLIENT_ID`. The worker gets its Bot Connect
   [workload identity federation](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation)
   overview.
 
-Finally, make a Teams app package (a `manifest.json` whose `bots` entry names the client id as `botId`, with
-`personal` scope, plus its two icons) and upload it to your tenant. See Microsoft's
+Finally, make a Teams app package (a `manifest.json` whose `bots` entry names the bot's client id as `botId`:
+`BOT_CLIENT_ID` for an app registration, `BOT_MSI_CLIENT_ID` for a managed identity; with `personal` scope, plus its
+two icons) and upload it to your tenant. See Microsoft's
 [app manifest reference](https://learn.microsoft.com/en-us/microsoftteams/platform/resources/schema/manifest-schema).
 
 ### 3. Service Bus
@@ -217,7 +266,7 @@ The component between Azure Bot Service and the inbound queue is not published y
 ### 5. Configure the worker
 
 Copy [`examples/minimal-teams/.env.example`](../examples/minimal-teams/.env.example) to `.env` and fill it in. Keep the
-filled-in file out of any repository; it holds the encryption key and the connection strings.
+filled-in file out of any repository; it holds the encryption key, the bot's client secret and the connection strings.
 
 | Setting                                                                    | What to put there                                                                   |
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -225,8 +274,9 @@ filled-in file out of any repository; it holds the encryption key and the connec
 | `PUBLIC_BASE_URL`                                                          | the worker's public https origin (your reverse proxy in front of port 8080)         |
 | `TEAMS_ENCRYPTION_KEYS`                                                    | `openssl rand -base64 32 \| tr '+/' '-_'`; it encrypts the linked keys in the store |
 | `SERVICEBUS_LISTEN_CONNECTION_STRING`, `SERVICEBUS_SEND_CONNECTION_STRING` | step 3                                                                              |
-| `OUTBOUND_MODE=direct`, `BOT_MSI_CLIENT_ID`                                | step 2: the worker posts to the Bot Connector itself                                |
-| `BOT_TOKEN_SOURCE=federated` and the four `BOT_*` settings after it        | step 2, outside Azure only; delete them on an Azure host (`imds`)                   |
+| `OUTBOUND_MODE=direct`                                                     | the worker posts to the Bot Connector itself                                        |
+| `BOT_CLIENT_ID`, `BOT_TENANT_ID`, `BOT_CLIENT_SECRET`                      | step 2a; paste the secret from `bot-client-secret` with an editor, then delete it   |
+| `BOT_MSI_CLIENT_ID`, `BOT_TOKEN_SOURCE=federated` and the four after it    | step 2b instead of 2a; on an Azure host delete the five federated lines (`imds`)    |
 
 Everything else has a default; [configuration.md](configuration.md) describes every setting. The default
 `OUTBOUND_MODE=servicebus` needs a relay that posts the outbound queue to Teams, which is not published either, so use
@@ -235,7 +285,8 @@ Everything else has a default; [configuration.md](configuration.md) describes ev
 ### 6. Run it
 
 With Docker Compose, from a copy of [`examples/minimal-teams`](../examples/minimal-teams) holding your `.env` (and
-`assertion-key.pem` for the federated token, which the image reads as uid 65534):
+`assertion-key.pem` for the federated token, which the image reads as uid 65534; uncomment its line in
+`docker-compose.yml` for that source only, and drop the `-v ...assertion-key.pem...` below for the others):
 
 ```bash
 sudo chown 65534 assertion-key.pem && sudo chmod 0400 assertion-key.pem   # federated token only
@@ -277,7 +328,8 @@ curl -fsS http://127.0.0.1:9090/metrics | grep build_info   # personal_agent_bui
 ```
 
 `/healthz` says the process is up, not that it reaches anything. Read the start of the log too: it names the outbound
-mode and the token source (`outbound mode: direct to the Bot Connector`, `bot token source: federated ...`), and
+mode and the token source (`outbound mode: direct to the Bot Connector`, `bot token source: secret ...` or
+`federated` or `imds`), and
 repeated `inbound receiver error` lines mean the inbound queue cannot be read.
 
 Then the first message. In Teams, open a chat with the app and say `hello`: the bot answers that you need to connect
@@ -333,13 +385,13 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
 
 ## Troubleshooting
 
-| What you see                                                                                     | What it means, and the fix                                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error. |
-| `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                |
-| The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check `BOT_MSI_CLIENT_ID`, and for `federated` the issuer, subject, tenant and the published key set. With no relay, a reply that went to the queue never reaches Teams.                                                                          |
-| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                            |
-| A switch seems to do nothing                                                                     | Some switches read anything but their own words as off: `PROACTIVE_ENABLED` and `REMOTE_AGENTS_ENABLED` are on for exactly `1` (`true` is off). See [How switches read](configuration.md#how-switches-read).                                                                                                              |
+| What you see                                                                                     | What it means, and the fix                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error.                          |
+| `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                                         |
+| The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check the client id and tenant (and for `secret` the secret's expiry; the `AADSTS` code in `Entra ID answered ...` names the cause), and for `federated` the issuer, subject and the published key set. With no relay, a reply that went to the queue never reaches Teams. |
+| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                                                     |
+| A switch seems to do nothing                                                                     | Some switches read anything but their own words as off: `PROACTIVE_ENABLED` and `REMOTE_AGENTS_ENABLED` are on for exactly `1` (`true` is off). See [How switches read](configuration.md#how-switches-read).                                                                                                                                       |
 
 A store the worker cannot write stops the start with `CRITICAL the worker does not start: unable to open database file`.
 The image runs as uid 65534, so a bind-mounted host directory must be writable by that user.

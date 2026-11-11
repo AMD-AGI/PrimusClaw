@@ -14,8 +14,8 @@ services:
     volumes:
       # The SQLite store (TEAMS_DB_PATH defaults to /data/state.db). The image runs as uid 65534.
       - personal-agent-data:/data
-      # The assertion key of BOT_TOKEN_SOURCE=federated; delete this line when the token comes from imds.
-      - ./assertion-key.pem:/run/secrets/assertion-key.pem:ro
+      # The assertion key of BOT_TOKEN_SOURCE=federated: uncomment it for that source only.
+      # - ./assertion-key.pem:/run/secrets/assertion-key.pem:ro
     restart: unless-stopped
 
 volumes:

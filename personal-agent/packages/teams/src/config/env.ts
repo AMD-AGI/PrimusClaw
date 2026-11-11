@@ -22,11 +22,17 @@ export class TeamsConfigError extends Error {
 const ON = ["1", "true", "yes", "on"];
 const OFF = ["0", "false", "no", "off"];
 
-export type BotTokenSource = "imds" | "federated";
+export type BotTokenSource = "imds" | "federated" | "secret";
 
 export interface BotSettings {
   readonly tokenSource: BotTokenSource;
   readonly msiClientId: string;
+  /** BOT_CLIENT_ID: the app registration's client id, with `secret`. */
+  readonly clientId: string;
+  /** BOT_CLIENT_SECRET, with `secret` ("" otherwise). Not enumerable: a dump of the settings does not show it. */
+  readonly clientSecret: string;
+  /** BOT_CLIENT_SECRET is set but BOT_TOKEN_SOURCE names another source, which wins (the worker warns at start). */
+  readonly clientSecretIgnored: boolean;
   readonly tenantId: string;
   readonly assertionKeyFile: string;
   readonly assertionIssuer: string;
@@ -141,20 +147,37 @@ export function busNamespace(raw: string): string {
   return value;
 }
 
+/**
+ * BOT_TOKEN_SOURCE when it is set (it always wins); unset, `secret` when BOT_CLIENT_SECRET is set, else `imds`. So a
+ * deployment that sets neither keeps the managed identity, and one that only adds an app registration's secret uses it.
+ */
+function tokenSourceOf(env: Env, secretSet: boolean): BotTokenSource {
+  const fallback = secretSet ? "secret" : "imds";
+  return oneOf<BotTokenSource>(env, "BOT_TOKEN_SOURCE", ["imds", "federated", "secret"], fallback);
+}
+
 function botFromEnv(env: Env, mode: OutboundMode): BotSettings {
-  const tokenSource = oneOf<BotTokenSource>(env, "BOT_TOKEN_SOURCE", ["imds", "federated"], "imds");
+  const secretSet = get(env, "BOT_CLIENT_SECRET") !== "";
+  const tokenSource = tokenSourceOf(env, secretSet);
   const federated = tokenSource === "federated";
+  const secret = tokenSource === "secret";
   // (only direct mode holds a bot token; set alone it would do nothing)
-  if (federated && mode !== "direct")
-    throw new TeamsConfigError("BOT_TOKEN_SOURCE=federated needs OUTBOUND_MODE=direct");
-  return {
+  if ((federated || secret) && mode !== "direct") {
+    const what = get(env, "BOT_TOKEN_SOURCE") ? `BOT_TOKEN_SOURCE=${tokenSource}` : "BOT_CLIENT_SECRET";
+    throw new TeamsConfigError(`${what} needs OUTBOUND_MODE=direct`);
+  }
+  const settings = {
     tokenSource,
-    msiClientId: mode === "direct" ? required(env, "BOT_MSI_CLIENT_ID") : "",
-    tenantId: federated ? required(env, "BOT_TENANT_ID") : get(env, "BOT_TENANT_ID"),
+    msiClientId: mode === "direct" && !secret ? required(env, "BOT_MSI_CLIENT_ID") : get(env, "BOT_MSI_CLIENT_ID"),
+    clientId: secret ? required(env, "BOT_CLIENT_ID") : get(env, "BOT_CLIENT_ID"),
+    clientSecretIgnored: secretSet && !secret,
+    tenantId: federated || secret ? required(env, "BOT_TENANT_ID") : get(env, "BOT_TENANT_ID"),
     assertionKeyFile: federated ? required(env, "BOT_ASSERTION_KEY_FILE") : get(env, "BOT_ASSERTION_KEY_FILE"),
     assertionIssuer: federated ? httpsIssuer(env) : "",
     assertionSubject: federated ? required(env, "BOT_ASSERTION_SUBJECT") : get(env, "BOT_ASSERTION_SUBJECT"),
   };
+  const clientSecret = secret ? required(env, "BOT_CLIENT_SECRET") : "";
+  return Object.defineProperty(settings, "clientSecret", { value: clientSecret, enumerable: false }) as BotSettings;
 }
 
 function wholeNumber(env: Env, name: string, fallback: number): number {

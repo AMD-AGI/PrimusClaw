@@ -4,6 +4,7 @@
 /** How the worker reaches Teams, as its settings say, and the settings that cannot work stopping it at start. */
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
+import { inspect } from "node:util";
 import { test } from "node:test";
 
 import { FakeClock } from "../../../../test-support/clock.js";
@@ -18,11 +19,13 @@ import {
 import { teamsSettingsFromEnv, TeamsConfigError, styleFromEnv, type Env } from "../../src/config/env.js";
 import { STREAM_SCOPES } from "../../src/config/style.js";
 import { ConnectorOutbox } from "../../src/connector/outbox.js";
+import { ClientSecretTokenProvider } from "../../src/connector/tokens/client-secret.js";
 import { FederatedTokenProvider } from "../../src/connector/tokens/federated.js";
 import { ImdsTokenProvider } from "../../src/connector/tokens/imds.js";
 import { inboundFiles } from "../../src/inbound/attachments.js";
 import { TeamsFileFetcher } from "../../src/inbound/fetcher.js";
 import { ServiceBusOutbox } from "../../src/servicebus/outbox.js";
+import { RecordingLogger } from "../connector/fakes.js";
 import { FakeBus } from "../servicebus/fakes.js";
 import { own } from "@primusclaw/personal-agent";
 
@@ -86,6 +89,92 @@ test("federated selects the federated provider with the mounted key", () => {
   assert.ok(tokens instanceof FederatedTokenProvider);
 });
 
+const APP_ID = "00000000-0000-0000-0000-0000000000c1";
+const CLIENT_SECRET = "Sx8Q~not-a-real-secret.but-shaped~like_one";
+const SECRET: Env = {
+  ...BASE,
+  OUTBOUND_MODE: "direct",
+  BOT_CLIENT_ID: APP_ID,
+  BOT_TENANT_ID: "tenant-1",
+  BOT_CLIENT_SECRET: CLIENT_SECRET,
+};
+
+test("a client secret alone selects the client secret provider", () => {
+  for (const env of [SECRET, { ...SECRET, BOT_TOKEN_SOURCE: "Secret" }, { ...SECRET, BOT_TOKEN_SOURCE: " " }]) {
+    const settings = teamsSettingsFromEnv(env);
+    assert.equal(settings.bot.tokenSource, "secret");
+    assert.equal(settings.bot.clientSecret, CLIENT_SECRET);
+    const logger = new RecordingLogger();
+    const tokens = botTokenSource(settings, { ...deps(), logger });
+    assert.ok(tokens instanceof ClientSecretTokenProvider);
+    assert.equal(tokens.clientId, APP_ID);
+    assert.ok(logger.text().includes("bot token source: secret"));
+    assert.ok(!logger.text().includes(CLIENT_SECRET));
+  }
+});
+
+test("the client secret is not shown in a dump of the settings", () => {
+  const settings = teamsSettingsFromEnv(SECRET);
+  assert.ok(!JSON.stringify(settings).includes(CLIENT_SECRET));
+  assert.ok(!inspect(settings, { depth: 5 }).includes(CLIENT_SECRET));
+});
+
+test("an explicit token source wins over a client secret, with a warning", () => {
+  const imds = teamsSettingsFromEnv({ ...SECRET, BOT_TOKEN_SOURCE: "imds", BOT_MSI_CLIENT_ID: CLIENT_ID });
+  assert.equal(imds.bot.tokenSource, "imds");
+  assert.equal(imds.bot.clientSecret, "");
+  const logger = new RecordingLogger();
+  assert.ok(botTokenSource(imds, { ...deps(), logger }) instanceof ImdsTokenProvider);
+  const warned = logger.records.filter((r) => r.level === "warn");
+  assert.deepEqual(
+    warned.map((r) => [r.message, r.fields]),
+    [["BOT_CLIENT_SECRET is set but not used: BOT_TOKEN_SOURCE names another source", { tokenSource: "imds" }]],
+  );
+  assert.ok(!logger.text().includes(CLIENT_SECRET));
+  const federated = teamsSettingsFromEnv({
+    ...FEDERATED,
+    BOT_CLIENT_SECRET: CLIENT_SECRET,
+    BOT_ASSERTION_KEY_FILE: "/k.pem",
+  });
+  assert.equal(federated.bot.tokenSource, "federated");
+  assert.ok(botTokenSource(federated, deps({ "/k.pem": KEY_PEM })) instanceof FederatedTokenProvider);
+  // without a client secret nothing changes and nothing is warned
+  const plain = new RecordingLogger();
+  botTokenSource(teamsSettingsFromEnv({ ...BASE, OUTBOUND_MODE: "direct", BOT_MSI_CLIENT_ID: CLIENT_ID }), {
+    ...deps(),
+    logger: plain,
+  });
+  assert.deepEqual(
+    plain.records.filter((r) => r.level === "warn"),
+    [],
+  );
+});
+
+test("client secret settings that cannot work refuse to start", () => {
+  for (const missing of ["BOT_CLIENT_ID", "BOT_TENANT_ID"]) {
+    const env = Object.fromEntries(Object.entries(SECRET).filter(([k]) => k !== missing));
+    assert.throws(() => teamsSettingsFromEnv(env), new RegExp(`${missing} is required`));
+  }
+  assert.throws(
+    () => teamsSettingsFromEnv({ ...SECRET, BOT_TOKEN_SOURCE: "secret", BOT_CLIENT_SECRET: "" }),
+    /BOT_CLIENT_SECRET is required/,
+  );
+  // (BOT_MSI_CLIENT_ID is not needed with a client secret)
+  assert.equal(teamsSettingsFromEnv(SECRET).bot.msiClientId, "");
+  for (const env of [
+    { ...SECRET, OUTBOUND_MODE: "servicebus" },
+    { ...SECRET, OUTBOUND_MODE: "servicebus", BOT_TOKEN_SOURCE: "secret" },
+  ]) {
+    assert.throws(
+      () => teamsSettingsFromEnv(env),
+      (e: unknown) =>
+        e instanceof TeamsConfigError &&
+        /needs OUTBOUND_MODE=direct/.test(e.message) &&
+        !e.message.includes(CLIENT_SECRET),
+    );
+  }
+});
+
 test("federated settings that cannot work refuse to start", () => {
   assert.throws(
     () =>
@@ -93,7 +182,7 @@ test("federated settings that cannot work refuse to start", () => {
         ...BASE,
         OUTBOUND_MODE: "direct",
         BOT_MSI_CLIENT_ID: CLIENT_ID,
-        BOT_TOKEN_SOURCE: "secret",
+        BOT_TOKEN_SOURCE: "password",
       }),
     /BOT_TOKEN_SOURCE/,
   );
