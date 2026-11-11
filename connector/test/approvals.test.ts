@@ -45,7 +45,8 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     assert.equal(m.cards[0]!.kind, "execute");
     assert.equal(m.cards[0]!.tool, "Run: npm test");
     assert.deepEqual(m.cards[0]!.options.map((o) => [o.optionId, o.kind]), [["allow", "allow_once"], ["allow-session", "allow_always"], ["deny", "reject_once"], ["deny-stop", "reject_once"]]);
-    assert.match(m.cards[0]!.options[1]!.name, /Bash\(npm test\)/);
+    assert.equal(m.cards[0]!.options[1]!.name, "Always allow (this session only)");
+    assert.equal((m.cards[0]!.input as Record<string, unknown>).always_allows, "Bash(npm test)");
     assert.deepEqual(m.decide(["allow"]), { behavior: "allow" });
     assert.deepEqual(m.decide(["allow-session"]), { behavior: "allow", updatedPermissions: [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "npm test" }], behavior: "allow", destination: "session" }] });
     assert.equal(m.decide(["deny"])!.behavior, "deny");
@@ -74,10 +75,11 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     const m = mapRequest(ev(req("AskUserQuestion", { questions: [QUESTION] })))!;
     assert.equal(m.cards.length, 1);
     assert.equal(m.cards[0]!.kind, "question");
-    assert.deepEqual(m.cards[0]!.options.map((o) => o.optionId), ["a0", "a1", "skip"]);
-    assert.equal(m.cards[0]!.options[1]!.name, "Blue — cool");
+    // The buttons are the labels (at most four: the chat shows four buttons); what each means is in the card's body.
+    assert.deepEqual(m.cards[0]!.options.map((o) => [o.optionId, o.name]), [["a0", "Red"], ["a1", "Blue"]]);
+    assert.match(JSON.stringify(m.cards[0]!.input), /cool/);
     assert.deepEqual(m.decide(["a1"]), { behavior: "allow", updatedInput: { questions: [QUESTION], answers: { "Which color?": "Blue" } } });
-    assert.equal(m.decide(["skip"])!.behavior, "deny");
+    assert.equal(m.decide(["a7"]), null);
   });
 
   test("AskUserQuestion with several questions: a card each, answered together", () => {
@@ -87,9 +89,9 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     assert.deepEqual((m.decide(["a0", "a1"]) as unknown as { updatedInput: { answers: unknown } }).updatedInput.answers, { "Which color?": "Red", "Which size?": "L" });
   });
 
-  test("a question no card can carry is left to the terminal: multi-select, too many answers, duplicate labels", () => {
+  test("a question no card can carry is left to the terminal: multi-select, more than four answers, duplicate labels", () => {
     assert.equal(mapRequest(ev(req("AskUserQuestion", { questions: [{ ...QUESTION, multiSelect: true }] }))), null);
-    assert.equal(mapRequest(ev(req("AskUserQuestion", { questions: [{ ...QUESTION, options: Array.from({ length: 9 }, (_, i) => ({ label: `o${i}` })) }] }))), null);
+    assert.equal(mapRequest(ev(req("AskUserQuestion", { questions: [{ ...QUESTION, options: Array.from({ length: 5 }, (_, i) => ({ label: `o${i}` })) }] }))), null);
     assert.equal(mapRequest(ev(req("AskUserQuestion", { questions: [{ ...QUESTION, options: [{ label: "A" }, { label: "A" }] }] }))), null);
     assert.equal(mapRequest(ev(req("AskUserQuestion", { questions: [] }))), null);
   });
@@ -100,6 +102,26 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     assert.equal(m.cards[0]!.tool, "Plan: Refactor auth");
     assert.deepEqual(m.decide(["plan-approve"]), { behavior: "allow", updatedInput: PLAN, updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }] });
     assert.equal(m.decide(["plan-keep"])!.behavior, "deny");
+  });
+
+  test("a request too long to show in full can only be turned down from the phone (nothing is approved unseen)", () => {
+    const long = "x".repeat(30 * 1024);
+    const cmd = mapRequest(ev(req("Bash", { command: `echo ok; ${long}; rm -rf ~` }, { permission_suggestions: BASH_SUGGESTIONS })))!;
+    assert.deepEqual(cmd.cards[0]!.options.map((o) => o.optionId), ["deny", "deny-stop"]);
+    assert.equal((cmd.cards[0]!.input as Record<string, unknown>).truncated, true);
+    assert.equal(cmd.decide(["allow"]), null);
+    assert.equal(cmd.decide(["allow-session"]), null);
+    assert.equal(cmd.decide(["deny"])!.behavior, "deny");
+    assert.ok(Buffer.byteLength(JSON.stringify(cmd.cards[0]!.input)) < 32 * 1024);
+
+    const plan = mapRequest(ev(req("ExitPlanMode", { plan: `## Big\n${long}` })))!;
+    assert.deepEqual(plan.cards[0]!.options.map((o) => o.optionId), ["plan-keep"]);
+    assert.equal(plan.decide(["plan-approve"]), null);
+
+    // A plan or command that fits is carried whole, its last line included.
+    const fits = mapRequest(ev(req("ExitPlanMode", { plan: `## Ok\n${"y".repeat(10_000)}\nLAST STEP` })))!;
+    assert.match(JSON.stringify(fits.cards[0]!.input), /LAST STEP/);
+    assert.deepEqual(fits.cards[0]!.options.map((o) => o.optionId), ["plan-approve", "plan-keep"]);
   });
 
   test("only a PermissionRequest with a usable session id, folder, tool and input is taken", () => {
@@ -199,7 +221,7 @@ describe("the broker: each request settled exactly once", () => {
     assert.deepEqual(r.replies, [{ v: 1, decision: null, why: "timeout" }]);
   });
 
-  test("several questions: the decision waits for every card, and 'Don't answer' on one ends them all", async () => {
+  test("several questions: the decision waits for every card", async () => {
     const r = rig();
     const q2 = { question: "Which size?", header: "Size", options: [{ label: "S" }, { label: "L" }] };
     await r.ask(req("AskUserQuestion", { questions: [QUESTION, q2] }));
@@ -209,12 +231,6 @@ describe("the broker: each request settled exactly once", () => {
     r.broker.decide(c2!, "a0", null);
     assert.deepEqual((r.replies[0]!.decision as unknown as { updatedInput: { answers: unknown } }).updatedInput.answers, { "Which color?": "Blue", "Which size?": "S" });
 
-    const r2 = rig();
-    await r2.ask(req("AskUserQuestion", { questions: [QUESTION, q2] }));
-    const [d1, d2] = r2.cards().map((c) => String(c.data.actionId));
-    r2.broker.decide(d1!, "skip", null);
-    assert.equal(r2.replies[0]!.decision!.behavior, "deny");
-    assert.equal(r2.emitted.filter((e) => e.type === "permission_resolved" && e.data.actionId === d2).length, 1);
   });
 
   test("Claw will not take it (approvals off, not connected): the hook is answered at once and nothing is shown", async () => {

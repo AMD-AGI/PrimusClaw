@@ -71,10 +71,15 @@ const oneLine = (s: unknown, max: number): string => {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 };
 
-/** A question card offers at most this many answers (the chat shows each as a button). */
-export const MAX_QUESTION_OPTIONS = 8;
-/** How much of a plan a card carries; the rest is in the terminal (and the plan file). */
-export const PLAN_MAX = 1500;
+/** A question card offers at most this many answers: the chat shows at most four buttons on a card. */
+export const MAX_QUESTION_OPTIONS = 4;
+/**
+ * The most of a request's input (as JSON, after masking credentials) a card carries. A request is approved from the phone only
+ * when the card shows all of it: one that is longer is shown cut, with only the options that turn it down, and has to be
+ * approved at the terminal, so nothing can be approved that the owner was not shown. Well inside one event's limit.
+ */
+export const CARD_INPUT_MAX = 24 * 1024;
+export const TOO_LONG_NOTE = "Too long to show in full here: it can only be turned down from the phone; approve it at the terminal.";
 /** What Claude reads when the owner turns a request down from the phone. */
 export const DENIED_MESSAGE = "The user declined this from their phone (Claw).";
 export const PLAN_KEEP_MESSAGE = "The user asked to keep planning (answered from their phone via Claw); do not start yet.";
@@ -141,22 +146,31 @@ export function mapRequest(e: PermissionEvent): Mapping | null {
   if (e.tool_name === "AskUserQuestion") return mapQuestions(e);
   if (e.tool_name === "ExitPlanMode") return mapPlan(e);
   const rules = sessionRules(e.permission_suggestions);
+  const shown = shownInput(redactDeep(e.tool_input));
   const options: OfferedOption[] = [
-    { optionId: "allow", name: "Yes", kind: "allow_once" },
-    ...(rules.length ? [{ optionId: "allow-session", name: oneLine(`Yes, and don't ask again this session for ${ruleText(rules)}`, 200), kind: "allow_always" }] : []),
+    ...(shown.complete ? [{ optionId: "allow", name: "Yes", kind: "allow_once" }] : []),
+    ...(shown.complete && rules.length ? [{ optionId: "allow-session", name: "Always allow (this session only)", kind: "allow_always" }] : []),
     { optionId: "deny", name: "No", kind: "reject_once" },
     { optionId: "deny-stop", name: "No, and stop", kind: "reject_once" },
   ];
+  const input = shown.complete && rules.length ? { ...(shown.input as Record<string, unknown>), always_allows: ruleText(rules) } : shown.input;
   return {
-    cards: [{ tool: toolTitle(e), kind: toolKind(e.tool_name), input: boundedInput(redactDeep(e.tool_input)), options }],
+    cards: [{ tool: toolTitle(e), kind: toolKind(e.tool_name), input, options }],
     decide([c]) {
-      if (c === "allow") return { behavior: "allow" };
-      if (c === "allow-session" && rules.length) return { behavior: "allow", updatedPermissions: rules };
+      if (c === "allow" && shown.complete) return { behavior: "allow" };
+      if (c === "allow-session" && shown.complete && rules.length) return { behavior: "allow", updatedPermissions: rules };
       if (c === "deny") return { behavior: "deny", message: DENIED_MESSAGE };
       if (c === "deny-stop") return { behavior: "deny", message: DENIED_MESSAGE, interrupt: true };
       return null;
     },
   };
+}
+
+/** The input as the card carries it: whole when it fits, else cut and marked (`complete: false`). */
+export function shownInput(masked: unknown): { input: unknown; complete: boolean } {
+  const text = JSON.stringify(masked ?? null);
+  if (Buffer.byteLength(text, "utf8") <= CARD_INPUT_MAX) return { input: masked ?? null, complete: true };
+  return { input: { truncated: true, note: TOO_LONG_NOTE, shown: boundedInput(text, CARD_INPUT_MAX - 512) }, complete: false };
 }
 
 interface Question { question: string; header: string; labels: string[]; descriptions: string[] }
@@ -174,21 +188,23 @@ function mapQuestions(e: PermissionEvent): Mapping | null {
     if (new Set(labels).size !== labels.length) return null;
     qs.push({ question: q.question, header: typeof q.header === "string" ? q.header : "", labels, descriptions: opts.map((o) => (typeof o.description === "string" ? o.description : "")) });
   }
-  const cards: CardSpec[] = qs.map((q, qi) => ({
-    tool: oneLine(q.question, 200),
-    kind: "question",
-    input: redactDeep({ header: q.header, question: q.question, options: q.labels.map((l, i) => ({ label: l, description: q.descriptions[i] })) }),
-    options: [
-      ...q.labels.map((l, i) => ({ optionId: `a${i}`, name: oneLine(q.descriptions[i] ? `${l} — ${q.descriptions[i]}` : l, 200), kind: "allow_once" })),
-      { optionId: "skip", name: "Don't answer", kind: "reject_once" },
-    ],
-    ...(qs.length > 1 ? { questionIndex: qi, questionCount: qs.length } : {}),
-  }));
+  const cards: CardSpec[] = [];
+  for (const [qi, q] of qs.entries()) {
+    // The answers are the buttons (their labels, as the terminal shows them); what each means is in the card's body.
+    const shown = shownInput(redactDeep({ header: q.header, question: q.question, options: q.labels.map((l, i) => ({ label: l, description: q.descriptions[i] })) }));
+    if (!shown.complete) return null;
+    cards.push({
+      tool: oneLine(q.question, 200),
+      kind: "question",
+      input: shown.input,
+      options: q.labels.map((l, i) => ({ optionId: `a${i}`, name: oneLine(l, 200), kind: "allow_once" })),
+      ...(qs.length > 1 ? { questionIndex: qi, questionCount: qs.length } : {}),
+    });
+  }
   return {
     cards,
     decide(chosen) {
       if (chosen.length !== qs.length) return null;
-      if (chosen.includes("skip")) return { behavior: "deny", message: "The user chose not to answer the question from their phone (Claw)." };
       const answers: Record<string, string> = {};
       for (let i = 0; i < qs.length; i++) {
         const m = /^a(\d+)$/.exec(chosen[i]!);
@@ -204,21 +220,21 @@ function mapQuestions(e: PermissionEvent): Mapping | null {
 function mapPlan(e: PermissionEvent): Mapping {
   const plan = typeof e.tool_input.plan === "string" ? e.tool_input.plan : "";
   const heading = /^\s*#+\s*(.+)$/m.exec(plan)?.[1] ?? plan.split("\n").find((l) => l.trim() !== "") ?? "";
-  const shown = plan.length > PLAN_MAX ? `${plan.slice(0, PLAN_MAX)}\n…` : plan;
+  const shown = shownInput(redactDeep({ plan, ...(typeof e.tool_input.planFilePath === "string" ? { planFilePath: e.tool_input.planFilePath } : {}) }));
   return {
     cards: [{
       tool: oneLine(`Plan: ${oneLine(heading, 150) || "ready to start"}`, 200),
       kind: "switch_mode",
-      input: redactDeep({ plan: shown, ...(typeof e.tool_input.planFilePath === "string" ? { planFilePath: e.tool_input.planFilePath } : {}) }),
+      input: shown.input,
       options: [
-        { optionId: "plan-approve", name: "Approve the plan (ask before each edit)", kind: "allow_once" },
+        ...(shown.complete ? [{ optionId: "plan-approve", name: "Approve (ask before each edit)", kind: "allow_once" }] : []),
         { optionId: "plan-keep", name: "Keep planning", kind: "reject_once" },
       ],
     }],
     decide([c]) {
       // Approved with the mode set back to the one that asks: leaving it out would continue in `acceptEdits` (measured on 2.1.322),
       // a mode a phone may not choose.
-      if (c === "plan-approve") return { behavior: "allow", updatedInput: e.tool_input, updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }] };
+      if (c === "plan-approve" && shown.complete) return { behavior: "allow", updatedInput: e.tool_input, updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }] };
       if (c === "plan-keep") return { behavior: "deny", message: PLAN_KEEP_MESSAGE };
       return null;
     },
@@ -318,7 +334,8 @@ export class ApprovalBroker {
     if (this.sessions.get(e.session_id) !== sid) {
       this.sessions.set(e.session_id, sid);
       this.owned.add(sid);
-      this.d.emit(sid, "session_started", { origin: "terminal_hook", read_only: true, ref: e.session_id, title, agent: "claude", cwd: e.cwd });
+      // Not `read_only`: Claw refuses a decision on a read-only session. What makes it carry nothing but cards is its origin.
+      this.d.emit(sid, "session_started", { origin: "terminal_hook", ref: e.session_id, title, agent: "claude", cwd: e.cwd });
     }
     const p: Pending = {
       id: randomUUID(), ref: e.session_id, sessionId: sid, tool: e.tool_name, input: canon(e.tool_input), mapping,
@@ -353,10 +370,9 @@ export class ApprovalBroker {
     this.byAction.delete(actionId);
     this.d.emit(p.sessionId, "permission_resolved", { actionId, optionId, by: by ?? "phone" });
     this.d.audit("permission_resolved", { session_id: p.sessionId, action_id: actionId, option_id: optionId, by: by ?? "phone" });
-    // A question asked as several cards is answered once all of them are, unless one of them declines it.
-    const declined = card.spec.kind === "question" && optionId === "skip";
-    if (!declined && p.cards.some((c) => c.chosen === null)) return true;
-    const decision = declined ? { behavior: "deny" as const, message: "The user chose not to answer the question from their phone (Claw)." } : p.mapping.decide(p.cards.map((c) => c.chosen!));
+    // A question asked as several cards is answered once all of them are.
+    if (p.cards.some((c) => c.chosen === null)) return true;
+    const decision = p.mapping.decide(p.cards.map((c) => c.chosen!));
     this.settle(p, decision, "phone");
     return true;
   }

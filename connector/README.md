@@ -557,12 +557,14 @@ directory only you can enter).
 - **The terminal keeps asking.** Claude Code shows its own dialog while the hook waits (measured on 2.1.322). The first answer,
   in the terminal or in the chat, decides; the other is withdrawn (the card says it was answered in the terminal). A
   connector that is not running, not connected, paused, or a question no card can carry (a multi-select question, more than
-  eight answers) leaves the question to the terminal at once.
+  four answers) leaves the question to the terminal at once.
 - **What a card offers.** A command, an edit or another tool: *Yes*, *No*, *No, and stop*, and, when Claude Code suggests an
-  allow rule for it, *Yes, and don't ask again this session* (kept for this session only, never written to a settings file).
-  A plan: *Approve the plan (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep
-  planning*. A question (`AskUserQuestion`): its own answers, one card per question, and *Don't answer*. No card switches a
-  session into a mode that stops asking (auto, accept edits, bypass).
+  allow rule for it, *Always allow (this session only)* (the rule is on the card; it is never written to a settings file).
+  A plan: *Approve (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep planning*. A
+  question (`AskUserQuestion`): its own answers, one card per question. No card switches a session into a mode that stops
+  asking (auto, accept edits, bypass).
+- **Nothing is approved unseen.** A card carries the request whole (credentials masked). One too long for that (over 24 KB
+  as JSON) is shown cut and offers only the options that turn it down; it is approved at the terminal.
 - **Which conversations.** Only sessions in a terminal (`CLAUDE_CODE_ENTRYPOINT=cli`); one this connector runs already asks
   through its own cards. The folder must be inside the roots of the agent that reads that Claude config directory (a
   `claude-attach` agent, or the one derived from a `claude` agent). A session in `bypassPermissions` asks only its questions
