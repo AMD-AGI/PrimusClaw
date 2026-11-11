@@ -1,0 +1,22 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# The Teams worker from the published image, configured by .env (copy .env.example). See ../../docs/quickstart.md.
+services:
+  personal-agent:
+    image: docker.io/primussafe/personal-agent-teams:0.1.1
+    env_file: .env
+    ports:
+      # /healthz and the account-link endpoint, plain HTTP: reachable from this host only, for your HTTPS reverse proxy.
+      - "127.0.0.1:8080:8080"
+      # /metrics: reachable from this host only.
+      - "127.0.0.1:9090:9090"
+    volumes:
+      # The SQLite store (TEAMS_DB_PATH defaults to /data/state.db). The image runs as uid 65534.
+      - personal-agent-data:/data
+      # The assertion key of BOT_TOKEN_SOURCE=federated; delete this line when the token comes from imds.
+      - ./assertion-key.pem:/run/secrets/assertion-key.pem:ro
+    restart: unless-stopped
+
+volumes:
+  personal-agent-data:
