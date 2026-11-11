@@ -21,6 +21,9 @@
  *       to that same message (one message in the channel, as without the line); but never once the line's message shows something
  *       else: after the router's say took its place, or for a second item's notice, the notice is its own message, as without the line;
  *       two notices stored at once included
+ *   F8  the answer stored while the line was being decided keeps it unsaid: the line is decided again under the say lock the answer
+ *       is stored under, so the person never gets the answer and then "On it" (2026-11-11 guide re-check, 2 of ~80 messages); for the
+ *       lookup's line as for the clock's
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -340,6 +343,36 @@ describe("assistant first ack by the clock", { skip }, () => {
       await Promise.all([notice(1), notice(2)]);
       const replacing = await w.q("SELECT 1 FROM claw_notification_outbox WHERE payload->>'replaces' = $1", [ack.lookupAckSayId("alice", t.mid)]);
       assert.equal(replacing.length, 1, `round ${round}: one notice in the line's place, the other its own message`);
+    }
+  });
+  test("F8 an answer stored while the line was being decided keeps the line unsaid, by the clock or by a lookup", async () => {
+    const { inTransaction } = await import("../src/infra/db.js");
+    for (const how of ["clock", "lookup"] as const) {
+      await w.q("TRUNCATE claw_assistant_says");
+      const t = await turn(how === "clock" ? "what is 2+2? answer with the number only" : "search the web for ROCm 7 news");
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      let locked!: () => void;
+      const held = new Promise<void>((r) => { locked = r; });
+      // The router's answer being stored, as `recordAssistantSay` stores it: under the user's say lock, its row written, not committed.
+      const answering = inTransaction(async (q) => {
+        await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", ["alice"]);
+        await q("INSERT INTO claw_assistant_says (say_id, user_id, text, fallback) VALUES (gen_random_uuid(), 'alice', '4', false)");
+        locked();
+        await gate;
+      });
+      await held;
+      // The line's first look sees nothing said yet (the answer is not committed); it must not be stored after the answer.
+      const acking = how === "clock"
+        ? first(alice.routerSid, t.mid)
+        : ack.ackBeforeLookup(alice.routerSid, { type: "toolUsed", status: "start", tool: "web_search", message_id: t.mid }, {
+          ...w.sayDeps, graceMs: 0, enabled: true,
+        });
+      await sleep(500);
+      release();
+      await answering;
+      assert.equal(await acking, "spoke", `${how}: the answer was said meanwhile`);
+      assert.deepEqual((await says()).map((s) => s.text), ["4"], `${how}: the answer alone, no "On it" after it`);
     }
   });
 });

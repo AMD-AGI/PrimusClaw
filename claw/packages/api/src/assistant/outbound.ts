@@ -1028,16 +1028,24 @@ export async function recordSystemNotice(
      * turn's message, and without this the person would read the line and the notice as two messages.
      */
     replacesTurnAck?: boolean;
+    /**
+     * Stored only while this still says yes, asked under the user's say lock (the lock every say of the router's is stored under): a
+     * notice that is only right while nothing else was said (the turn's "on it", `lookup-ack.ts`) is never stored just after the
+     * answer it was to come before. Read before the lock, the answer could be stored in between, and the person got the answer and
+     * then "On it: looking into it now." (2026-11-11 guide re-check, 2 of ~80 messages). False: nothing is stored (`null`).
+     */
+    onlyIf?: (q: Querier) => Promise<boolean>;
   }, deps: SayDeps = {},
 ): Promise<SayOutcome | null> {
   const stored = await storeSettled(async (q, storeOne) => {
     let replaced: { replaces?: string } = {};
-    if (input.replacesTurnAck && input.turnMessageId) {
+    if ((input.replacesTurnAck && input.turnMessageId) || input.onlyIf) {
       // Under the user's say lock, as a say is stored: two notices of one turn (two items started at once), or a notice and the
       // router's say, never both find the line still showing and both take its place.
       await q("SELECT pg_advisory_xact_lock(hashtext('claw_assistant_say'), hashtext($1))", [input.userId]);
-      replaced = await turnAckReplaced(q, input.userId, input.turnMessageId);
     }
+    if (input.onlyIf && !(await input.onlyIf(q))) return null;
+    if (input.replacesTurnAck && input.turnMessageId) replaced = await turnAckReplaced(q, input.userId, input.turnMessageId);
     return storeOne({
       type: "assistant.say", fallback: true, item: input.itemId ? await loadItem(q, input.itemId, input.userId) : null,
       sayId: deterministicEventId("assistant.notice", input.userId, input.key),

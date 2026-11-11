@@ -204,9 +204,12 @@ export async function ackBeforeLookup(sessionId: string, event: Record<string, u
     why = await reasonToStaySilent(q, sessionId, userId, messageId);
     if (why) return why;
   }
+  let late: string | null = null;
   const stored = await recordSystemNotice({
     userId, sessionId, text: lookupAckText(message.content, tool), key: lookupAckKey(messageId), turnMessageId: messageId,
+    onlyIf: async (tq) => !(late = await reasonToStaySilent(tq, sessionId, userId, messageId)),
   }, deps);
+  if (late) return late;
   if (!stored) return "said_before";
   logger.info({ sessionId, messageId, tool }, "assistant.lookup_ack_said");
   return "said";
@@ -247,9 +250,13 @@ export async function ackFirstReply(sessionId: string, messageId: string, deps: 
   if (mayHandOff(message)) return "may_hand_off";
   const why = await reasonToStaySilent(q, sessionId, userId, messageId, new Date(message.receivedAt));
   if (why) return why;
+  // (asked again under the say lock, where the answer is stored: an answer stored since the look above keeps the line unsaid)
+  let late: string | null = null;
   const stored = await recordSystemNotice({
     userId, sessionId, text: firstAckText(message.content), key: lookupAckKey(messageId), turnMessageId: messageId,
+    onlyIf: async (tq) => !(late = await reasonToStaySilent(tq, sessionId, userId, messageId, new Date(message.receivedAt))),
   }, deps);
+  if (late) return late;
   if (!stored) return "said_before";
   logger.info({ sessionId, messageId }, "assistant.first_ack_said");
   return "said";
