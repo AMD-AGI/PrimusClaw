@@ -331,6 +331,24 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     created_at: formatTs(r.created_at),
     updated_at: formatTs(r.updated_at),
     deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    // Only on a collapsed listing row: how many versions of this name the caller can see.
+    ...(r.version_count !== undefined && r.version_count !== null ? { version_count: Number(r.version_count) } : {}),
+  };
+}
+
+/** One entry of `GET /v1/plugins/:id/versions`: enough to pick a version, then address it by id. */
+export function formatPluginVersionRow(r: JsonObject): JsonObject {
+  return {
+    id: Number(r.id),
+    name: r.name,
+    version: r.version,
+    status: r.status ?? "active",
+    is_public: r.is_public ?? true,
+    owner_user_id: r.owner_user_id,
+    author: r.author,
+    created_at: formatTs(r.created_at),
+    updated_at: formatTs(r.updated_at),
+    deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
   };
 }
 

@@ -31,6 +31,7 @@ import {
   createPluginNewVersion,
   createToolNewVersion,
   formatPluginRow,
+  formatPluginVersionRow,
   formatResourceRow,
   canViewPlugin,
   ownerOrAdmin,
@@ -557,7 +558,9 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
     const offset = Math.max(0, Number(req.query.offset ?? 0));
     const includeDeleted = req.query.include_deleted === "true" && isAdmin(u);
-    const latestPerName = req.query.latest_per_name === "true";
+    // One entry per name (its latest active version) unless the caller asks
+    // for every row; the other versions are at GET /v1/plugins/:id/versions.
+    const latestPerName = req.query.latest_per_name !== "false";
     const nameExact = String(req.query.name_exact ?? "").trim();
     const nameFuzzy = String(req.query.name ?? "").trim();
     const { rows, total } = await MarketplaceDb.listPluginsRepo({
@@ -596,6 +599,29 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     }
     return { ok: true, data: await formatPluginRow(row, true) };
   });
+
+  app.get<{ Params: { pluginId: string }; Querystring: Record<string, string | undefined> }>(
+    "/v1/plugins/:pluginId/versions",
+    async (req, reply) => {
+      const u = getUser(req)!;
+      const id = Number(req.params.pluginId);
+      if (!Number.isFinite(id)) return reply.status(400).send(authErrorPayload("bad_request", "invalid id"));
+      // The same answer GET /v1/plugins/:id gives for this id, so neither is an
+      // existence oracle the other is not.
+      const row = await MarketplaceDb.pluginGetById(id, false);
+      if (!row) return reply.status(404).send(authErrorPayload("not_found", "plugin not found"));
+      if (!canViewPlugin(row, u.userId, isAdmin(u))) {
+        return reply.status(403).send(authErrorPayload("access_denied", "cannot view plugin"));
+      }
+      const rows = await MarketplaceDb.listPluginVersions({
+        name: String(row.name),
+        viewerUserId: u.userId,
+        isAdmin: isAdmin(u),
+        includeDeleted: req.query.include_deleted === "true" && isAdmin(u),
+      });
+      return { ok: true, data: { name: row.name, versions: rows.map(formatPluginVersionRow) } };
+    },
+  );
 
   const patchPlugin = async (
     req: FastifyRequest<{ Params: { pluginId: string }; Body?: JsonObject }>,

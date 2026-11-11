@@ -2866,6 +2866,17 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
     // covers every row the old index did.
 }
 
+/**
+ * "Newest version first", in SQL: the first three dot-separated parts compared
+ * by their leading digits (a missing or non-numeric part is 0), then the most
+ * recently updated, then the highest id. The same order `latestRowByVersion`
+ * (marketplace/plugins.ts) uses to pick the version an upsert extends.
+ */
+const versionPart = (n: number) =>
+  `COALESCE(NULLIF(substring(split_part(version, '.', ${n}) from '^[0-9]+'), '')::numeric, 0)`;
+export const PLUGIN_VERSION_ORDER =
+  `${versionPart(1)} DESC, ${versionPart(2)} DESC, ${versionPart(3)} DESC, updated_at DESC, id DESC`;
+
 /** Row shapes from tools/plugins/resources (JSONB columns parsed). */
 export type JsonObject = Record<string, unknown>;
 
@@ -3373,11 +3384,18 @@ export const MarketplaceDb = {
       conds.push(`name ILIKE ${p()}`);
       args.push(`%${params.nameContains.trim()}%`);
     }
+    // Collapsed, a name is one entry: its latest active version. Without an
+    // explicit status filter only active rows compete, so a disabled newer
+    // version never hides the one that runs.
+    if (params.latestPerName && !params.status) conds.push("status = 'active'");
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
     const sortCol = params.sortField === "updated_at" ? "updated_at" : "created_at";
     const ord = params.sortOrder === "asc" ? "ASC" : "DESC";
+    // `version_count` is counted over the same rows (window functions run
+    // before DISTINCT ON), so it is the number of versions this caller can see.
     const baseFrom = params.latestPerName
-      ? `(SELECT DISTINCT ON (name) * FROM plugins ${where} ORDER BY name, ${sortCol} DESC, id DESC) t`
+      ? `(SELECT DISTINCT ON (name) *, COUNT(*) OVER (PARTITION BY name)::int AS version_count
+           FROM plugins ${where} ORDER BY name, ${PLUGIN_VERSION_ORDER}) t`
       : `(SELECT * FROM plugins ${where}) t`;
     const cnt = await db.query(`SELECT COUNT(*)::int AS c FROM ${baseFrom}`, args);
     const total = (cnt.rows[0] as { c: number }).c;
@@ -3389,6 +3407,33 @@ export const MarketplaceDb = {
       args,
     );
     return { rows: data.rows as JsonObject[], total };
+  },
+
+  /**
+   * Every version of a plugin's name the viewer may see, newest first by the
+   * version order `upsertPlugin` uses. Deleted rows are left out unless asked for.
+   */
+  async listPluginVersions(params: {
+    name: string;
+    viewerUserId?: string;
+    isAdmin: boolean;
+    includeDeleted: boolean;
+  }): Promise<JsonObject[]> {
+    const conds = ["name = $1"];
+    const args: unknown[] = [params.name];
+    if (!params.includeDeleted) conds.push("deleted_at IS NULL");
+    if (!params.isAdmin) {
+      if (params.viewerUserId) {
+        conds.push("(is_public = true OR owner_user_id = $2)");
+        args.push(params.viewerUserId);
+      } else conds.push("is_public = true");
+    }
+    const r = await db.query(
+      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at
+         FROM plugins WHERE ${conds.join(" AND ")} ORDER BY ${PLUGIN_VERSION_ORDER}`,
+      args,
+    );
+    return r.rows as JsonObject[];
   },
 
   async listResourcesRepo(params: {

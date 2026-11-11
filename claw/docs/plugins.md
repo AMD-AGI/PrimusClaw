@@ -469,3 +469,45 @@ also stores the manifest it actually ran with. The API logs
 `plugin_overrides.applied` with the task, plugin, user and the overridden keys,
 never the values. For an app run, `overrides` is part of what an
 `Idempotency-Key` is bound to; a request without it hashes as before.
+
+---
+
+## 5. Listing Plugins and Their Versions
+
+`GET /v1/plugins` lists **one entry per name**: the latest active version of
+that name the caller may see. "Latest" is the version order an upsert uses
+(the first three dot-separated parts compared by their leading digits, so
+`1.10.0` is newer than `1.9.0`; ties go to the most recently updated row), not
+the row touched last. A collapsed entry carries `version_count`, the number of
+versions of the name the caller may see.
+
+| Query parameter | Effect |
+| --------------- | ------ |
+| `latest_per_name` | Defaults to `true`. `false` lists every row (every version), as before this default. |
+| `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
+| `name_exact`, `name`, `owner`, `limit`, `offset` | Unchanged. |
+
+The other versions are listed on demand:
+
+```
+GET /v1/plugins/:id/versions
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "name": "my-plugin",
+    "versions": [
+      { "id": 12, "name": "my-plugin", "version": "1.10.0", "status": "active", "is_public": true,
+        "owner_user_id": "...", "author": "...", "created_at": "...", "updated_at": "...", "deleted_at": null }
+    ]
+  }
+}
+```
+
+Versions come newest first and only those the caller may see; deleted versions
+are left out (an admin may pass `include_deleted=true`). The route answers `404`
+or `403` exactly as `GET /v1/plugins/:id` does for the same id. Every version
+keeps its own id, and every other route (`GET`, `PATCH`, `DELETE`, launches)
+still addresses a plugin by id.
