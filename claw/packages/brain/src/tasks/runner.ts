@@ -84,7 +84,7 @@ import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, type WorkspaceSaveEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
+import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
@@ -3480,11 +3480,11 @@ class TaskRunner {
   }
 
   /**
-   * Tell the session where the end-of-turn workspace save is. Never fails the
-   * save: an event the stream refused costs the listing its "saving" hint, while
-   * a save abandoned for it would cost the files.
+   * Tell the session the end-of-turn workspace save is over. Never fails the
+   * run: an event the stream refused leaves the listing saying "saving" until the
+   * mark goes stale, while a run failed for it would cost the turn.
    */
-  private async announceWorkspaceSave(evt: WorkspaceSaveEvent): Promise<void> {
+  private async announceWorkspaceSave(evt: WorkspaceSaveFinishedEvent): Promise<void> {
     await this.onEvent({ ...evt }).catch((e: unknown) => {
       logger.warn({ err: e, sessionId: this.sessionId, phase: evt.phase }, "s3.save_event_failed");
     });
@@ -3523,6 +3523,11 @@ class TaskRunner {
     // mid-publish. The ending is the stand-down's, as if the abort had been seen
     // before this method was entered.
     if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
+    // Whether the save below will run, on the completion itself: the file
+    // listing reads it to say the turn's files are still on their way, and it
+    // is stored before the session is set idle, so no read falls between them.
+    const hands = this.workHands();
+    const saves = !!hands && this.request.workspace_throwaway !== true;
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3541,6 +3546,7 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      ...(saves ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING } : {}),
       ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
       if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
@@ -3568,7 +3574,6 @@ class TaskRunner {
     //    /workspace to upload and no sandbox GC to outlive. Logged rather than
     //    passed over silently, because "nothing was uploaded" otherwise reads
     //    exactly like an upload that failed.
-    const hands = this.workHands();
     let syncOk = false;
     if (!hands) {
       logger.info(
@@ -3586,11 +3591,10 @@ class TaskRunner {
         "s3.sync_skipped_workspace_throwaway",
       );
     } else {
-      // The turn has already ended on the session (above), so its files in the
-      // object store trail it until this save is over. Said on the session, so
-      // the file listing can tell "still being saved" from "not there"
-      // (WORKSPACE_SAVE_EVENT). `finished` goes out however the save ends.
-      await this.announceWorkspaceSave({ type: WORKSPACE_SAVE_EVENT, phase: "started", message_id: this.messageId });
+      // The turn has already ended on the session (above), saying a save follows,
+      // so its files in the object store trail it until this is over. `finished`
+      // goes out however the save ends, so the file listing stops saying "saving"
+      // (WORKSPACE_SAVE_EVENT).
       let saveOutcome: WorkspaceSaveOutcome = "failed";
       try {
         logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
