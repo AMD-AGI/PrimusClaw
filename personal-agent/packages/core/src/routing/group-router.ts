@@ -101,7 +101,7 @@ export class GroupRouter {
       const lang = helpLang(this.ctx.deps.store, chat.sender.id, chat.locale, message.text);
       // (`assistant`: what help says a 1:1 chat adds is what the asker's own 1:1 chat offers; nothing of their settings is shown)
       const assistant = this.ctx.deps.assistant.on(chat.sender.id);
-      const groupContext = this.ctx.deps.groupHistory.kept();
+      const groupContext = this.ctx.deps.groupHistory.kept(message.conversation.id); // (a group that said /context off keeps none)
       await chat.say(
         renderHelp(lang, {
           group: true,

@@ -87,9 +87,9 @@ export class GroupContext {
     return this.deps.settings.messages > 0;
   }
 
-  /** How much a chat keeps, as help says it (undefined when the deployment keeps nothing). */
-  kept(): GroupContextKept | undefined {
-    if (!this.enabled) return undefined;
+  /** How much a chat keeps, as help says it (undefined when the deployment keeps nothing, or `chatId` turned it off). */
+  kept(chatId?: string): GroupContextKept | undefined {
+    if (!this.enabled || (chatId !== undefined && this.deps.off.contextOff(chatId))) return undefined;
     return { messages: this.deps.settings.messages, hours: this.deps.settings.maxAgeSeconds / 3600 };
   }
 

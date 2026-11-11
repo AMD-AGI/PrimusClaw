@@ -77,14 +77,14 @@ test("where a group's recent messages are kept, the data statement says what, fo
   assert.equal(
     groupContextLine("zh", kept),
     "群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息（不单独存库，也不回复）；" +
-      "有人 @我 时，它们作为不可信的背景随那条消息进入 TA 的会话，和会话一起保留。在群里 @我 /context off 可关闭。",
+      "有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。在群里 @我 /context off 可关闭。",
   );
   assert.equal(
     groupContextLine("en", kept),
     "In a group that allows me to read its messages, I also keep its newest 30 messages that do not @mention me, " +
-      "for up to 4 hours, in memory (not stored on their own, never answered). When someone @mentions me, they go " +
-      "with that message, as untrusted background, into that person's session and are kept with it. @mention me " +
-      "with /context off in the group to turn it off.",
+      "for up to 4 hours, in memory (not stored on their own, never answered). When someone @mentions me, they may " +
+      "go with that message, as untrusted background, into that person's session, and are then kept with it. " +
+      "@mention me with /context off in the group to turn it off.",
   );
   const one = groupContextLine("en", { messages: 1, hours: 1 });
   assert.ok(one.includes("newest 1 message that does not @mention me, for up to 1 hour,"), one);

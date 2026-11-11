@@ -177,8 +177,8 @@ export interface GroupHistory {
   record(message: InboundMessage): void;
   /** The chat's kept messages as background for a turn ("" none). */
   background(chatId: string): string;
-  /** How much a chat keeps, for help to say (undefined: the deployment keeps nothing). */
-  kept(): GroupContextKept | undefined;
+  /** How much a chat keeps, for help to say (undefined: the deployment keeps nothing, or `chatId` turned it off). */
+  kept(chatId?: string): GroupContextKept | undefined;
 }
 
 /** The review service's part in the chat (Python `github_review.GithubReview` and `github_connect.GithubConnect`). */
