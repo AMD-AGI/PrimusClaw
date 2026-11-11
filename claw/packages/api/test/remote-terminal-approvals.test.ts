@@ -200,6 +200,7 @@ describe("approvals from terminals", { skip }, () => {
     assert.equal(got[0].text, "laptop 上终端里的 claude（修 CI，work/claw）在等你回答：Which color?。在下面选，或直接在终端里回答，先答的算数。");
     assert.deepEqual([got[0].remote.kind, got[0].remote.session_id, got[0].remote.ask.action_id], ["needs_you", sid, "act-1"]);
     assert.deepEqual(got[0].remote.ask.options, OPTIONS);
+    assert.deepEqual([got[0].remote.ask.title, got[0].remote.ask.cwd], ["修 CI", "/home/u/work/claw"], "where it asks, for the card");
 
     // Answered at the terminal after its card went out: the card is marked (kind resolved, one line for a channel that cannot).
     await events("alice", cid, sid, [resolved("act-1", "terminal")]);
@@ -243,8 +244,8 @@ describe("approvals from terminals", { skip }, () => {
       { optionId: "plan-approve", name: "Approve", kind: "allow_once" }, { optionId: "plan-reject", name: "Keep planning", kind: "reject_once" },
     ];
     await events("alice", cid, sid, [started,
-      ["permissionRequest", { ...ask("act-1", "Plan: refactor auth")[1], kind: "switch_mode", input: { plan }, options }],
-      ["permissionRequest", { ...ask("act-2", "Which color?")[1], question_index: 1, question_count: 2 }],
+      ["permissionRequest", { ...ask("act-1", "Plan: refactor auth")[1], kind: "switch_mode", input: { plan }, options, cwd: undefined }],
+      ["permissionRequest", { ...ask("act-2", "Which color?")[1], question_index: 1, question_count: 2, cwd: "/home/u/other\u0007dir" }],
       ["permissionRequest", { ...ask("act-3", "Plan: huge")[1], kind: "switch_mode", input: { plan: "x".repeat(20_000) }, options }],
       ["permissionRequest", { ...ask("act-4", "Write big.txt")[1], kind: "edit", input: { content: "y".repeat(20_000) }, options: [OPTIONS[0]] }],
     ]);
@@ -252,9 +253,12 @@ describe("approvals from terminals", { skip }, () => {
     assert.equal(got.length, 4, JSON.stringify(got.map((g) => g.text)));
     assert.equal(await filed((await remoteItem(sid)).item_id), 1, "one message is filed as the one that told of the wait");
     const [a1, a2, a3, a4] = got.map((g) => g.remote);
+    assert.equal(a2.ask.cwd, "/home/u/other dir");
     assert.deepEqual([a1.ask.origin, a1.ask.kind, a1.ask.input.plan], ["terminal", "switch_mode", plan], "the whole plan, not cut");
     assert.deepEqual(a1.ask.options, options);
     assert.deepEqual([a2.ask.question_index, a2.ask.question_count, a2.ask.kind], [1, 2, "question"]);
+    // A request that names no folder takes the session's; control characters never reach the card.
+    assert.deepEqual([a1.ask.title, a1.ask.cwd], ["修 CI", "/home/u/work/claw"]);
     // Too large to carry whole: only the options that refuse, and no input.
     assert.deepEqual([a3.ask.input, a3.ask.options.map((o: Recorded) => o.optionId)], [undefined, ["plan-reject"]]);
     // Nothing left that may be chosen: said in words, to the terminal.

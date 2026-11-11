@@ -967,6 +967,13 @@ async function applyTerminal(
       if (!enabled) continue;
       const recent = (Array.isArray(p.asked_at) ? p.asked_at : []).filter((t) => Number.isFinite(t) && now - t < MINUTE_MS);
       const ask = askOf(e, actionId, what);
+      if (ask) {
+        // Where it asks: the conversation's name, and the folder the request names (the session's own when it names none).
+        const title = flat(p.title, 80);
+        const cwd = flat(e.data.cwd, 300) || flat(p.cwd, 300);
+        if (title) ask.title = title;
+        if (cwd) ask.cwd = cwd;
+      }
       if (recent.length < TERMINAL_ASKS_PER_MINUTE) {
         p.asked_at = [...recent, now];
         // Nothing that can be answered from a card (no option, or none that may be chosen without seeing all of it): said, to the terminal.
