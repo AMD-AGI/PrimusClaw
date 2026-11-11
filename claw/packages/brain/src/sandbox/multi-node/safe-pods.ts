@@ -14,9 +14,6 @@
 
 import { serviceRolesFor, sshPortForPod } from "./safe-body.js";
 
-/** Substrings marking a pod as the LWS worker role rather than the frontend. */
-const WORKER_PODID_HINTS = ["worker", "-lws-", "lws-"];
-
 /** Pods in these phases keep a stale podIP but no live sshd. */
 const DEAD_PHASES = new Set(["failed", "succeeded", "terminating"]);
 
@@ -36,12 +33,6 @@ export interface RolePodGroups {
   worker: RolePodTarget[];
 }
 
-/** Slot index from an Infera pod name `<wid>-role<N>-<hash>`. */
-function parseRoleIndex(podId: string): number | null {
-  const m = /-role(\d+)-/.exec(podId);
-  return m ? Number.parseInt(m[1]!, 10) : null;
-}
-
 /** LWS ordinal from a pod name; leader pods end without a worker suffix. */
 function parseLwsOrdinal(podId: string): number | null {
   const m = /-(\d+)$/.exec(podId);
@@ -49,23 +40,14 @@ function parseLwsOrdinal(podId: string): number | null {
 }
 
 /**
- * Classify one pod. Explicit role substrings win; otherwise the slot index
- * from the pod name maps onto the positional serviceRoles. `resourceId` is only
- * a fallback because SaFE leaves it 0 for Infera pods, which would otherwise
- * map every pod onto role 0.
+ * Classify one pod by its `resourceId`, the index of the workload resource it
+ * belongs to, which maps onto the positional serviceRoles. SaFE serialises
+ * `resourceId` with omitempty, so an absent value is resource 0.
  */
-function classifyPodRole(podId: string, resourceId: unknown, serviceRoles: string[]): string | null {
-  const pl = podId.toLowerCase();
-  if (pl.includes("prefill")) return "prefill";
-  if (pl.includes("decode")) return "decode";
-  if (pl.includes("frontend")) return "frontend";
-
-  let idx = parseRoleIndex(podId);
-  if (idx === null && typeof resourceId === "number") idx = resourceId;
-  if (idx !== null && idx >= 0 && idx < serviceRoles.length) return serviceRoles[idx]!;
-
-  if (WORKER_PODID_HINTS.some((h) => pl.includes(h))) return "worker";
-  return null;
+function classifyPodRole(resourceId: unknown, serviceRoles: string[]): string | null {
+  const idx = resourceId === undefined || resourceId === null ? 0 : Number(resourceId);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= serviceRoles.length) return null;
+  return serviceRoles[idx]!;
 }
 
 /**
@@ -91,7 +73,7 @@ export function discoverRolePods(
     if (DEAD_PHASES.has(String(p.phase ?? "").trim().toLowerCase())) continue;
 
     const podId = String(p.podId ?? "");
-    const role = classifyPodRole(podId, p.resourceId, serviceRoles);
+    const role = classifyPodRole(p.resourceId, serviceRoles);
     if (!role || !(role in groups)) continue;
 
     const lwsIndex = parseLwsOrdinal(podId);

@@ -202,9 +202,16 @@ function sanitizeLabels(
   return out;
 }
 
-/** SSH port offset for a GPU role; decode is strided so it can co-locate. */
+/** SSH port offset for a role; decode and the frontend are strided so they can co-locate. */
 export function sshRolePortOffset(role: string): number {
-  return role.toLowerCase() === "decode" ? INFERA_SSH_PORT_ROLE_STRIDE : 0;
+  switch (role.toLowerCase()) {
+    case "decode":
+      return INFERA_SSH_PORT_ROLE_STRIDE;
+    case "frontend":
+      return 2 * INFERA_SSH_PORT_ROLE_STRIDE;
+    default:
+      return 0;
+  }
 }
 
 /**
@@ -473,10 +480,14 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
     return res;
   };
 
-  const frontendEp = b64(
-    `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-    `--router-tokenizer-path ${shellSingleQuote(p.model.trim())}`,
-  );
+  const frontendEp = b64([
+    "set -euo pipefail",
+    `export MN_SSH_PORT=${sshPortForPod("frontend", null, sshPortBase)}`,
+    ...PD_SSHD_BOOTSTRAP,
+    `( setsid python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
+      `--router-tokenizer-path ${shellSingleQuote(p.model.trim())} < /dev/null & )`,
+    PD_HOLD,
+  ].join("\n"));
 
   let resources: Record<string, unknown>[];
   let images: string[];
@@ -576,7 +587,7 @@ function shellSingleQuote(value: string): string {
 }
 
 /**
- * Last line of every PD entrypoint. The launcher waits on this process, so a
+ * Last line of every PD and Infera frontend entrypoint. The launcher waits on this process, so a
  * server stopped or relaunched by any tool never ends the container. The server
  * itself runs detached in its own session, reaped by the launcher as PID 1.
  */

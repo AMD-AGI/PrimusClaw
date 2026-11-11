@@ -217,6 +217,7 @@ export function applyMultiNodeExternalEnv(
   // needs the key path plus at least one role's pod IPs.
   if (ctx.sshKeyPath) env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath;
   if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);
+  if (ctx.routerIps?.length) env.HYPERLOOM_MN_EXT_ROUTER_IPS = ctx.routerIps.join(",");
   if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
   if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
   if (ctx.workerIps?.length) env.HYPERLOOM_MN_EXT_WORKER_IPS = ctx.workerIps.join(",");
@@ -279,6 +280,7 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
       decode_ips: [...(ctx.decodeIps ?? [])],
       worker_ips: [...(ctx.workerIps ?? [])],
     };
+    if (ctx.routerIps?.length) infera.router_ips = [...ctx.routerIps];
     if (hasSshKeyFile(ctx)) infera.ssh_key_file = ctx.sshKeyPath;
     if (ctx.sshPortBase) infera.ssh_port_base = ctx.sshPortBase;
     infera.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;

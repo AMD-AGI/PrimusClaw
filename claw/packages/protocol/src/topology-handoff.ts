@@ -36,6 +36,8 @@ export interface TopologyHandoffInfera {
   ssh_port_base?: number;
   /** File ssh may record and read host keys in. */
   known_hosts_file?: string;
+  /** Frontend pods. */
+  router_ips?: string[];
   prefill_ips: string[];
   decode_ips: string[];
   worker_ips: string[];
@@ -114,6 +116,7 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
         ssh_key_file: { type: "string", minLength: 1 },
         ssh_port_base: { type: "integer", minimum: 1, maximum: 65535 },
         known_hosts_file: { type: "string", minLength: 1 },
+        router_ips: IP_LIST,
         prefill_ips: IP_LIST,
         decode_ips: IP_LIST,
         worker_ips: IP_LIST,
