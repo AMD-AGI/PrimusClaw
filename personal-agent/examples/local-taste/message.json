@@ -1,0 +1,14 @@
+{
+  "type": "message",
+  "id": "__ID__",
+  "channelId": "msteams",
+  "serviceUrl": "http://127.0.0.1:3978/",
+  "text": "__TEXT__",
+  "from": { "id": "29:local-person", "aadObjectId": "00000000-0000-0000-0000-000000000001", "name": "Local Person" },
+  "recipient": { "id": "28:local-bot", "name": "Clawy" },
+  "conversation": {
+    "id": "a:local-chat",
+    "conversationType": "personal",
+    "tenantId": "00000000-0000-0000-0000-0000000000aa"
+  }
+}

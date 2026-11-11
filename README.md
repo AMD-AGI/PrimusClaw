@@ -123,6 +123,9 @@ storage and LLM gateway, follow [`claw/README.md`](claw/README.md#build-and-run)
 
 ### Run the personal agent
 
+[`personal-agent/docs/quickstart.md`](personal-agent/docs/quickstart.md) walks through it end to end: trying the worker
+on your own machine without Teams, a Teams deployment, and connecting a developer machine.
+
 The worker reads its whole configuration from the environment.
 [`personal-agent/examples/worker.env.example`](personal-agent/examples/worker.env.example)
 lists the settings (all but the release gate's test entry and the settings
@@ -218,7 +221,8 @@ connector's and the personal agent's READMEs.
   plugins, remote agents, identity, GitHub review, ...).
 - [`claw/deploy/README.md`](claw/deploy/README.md): Docker and Kubernetes
   deployment of Claw.
-- [`personal-agent/README.md`](personal-agent/README.md) and its
+- [`personal-agent/README.md`](personal-agent/README.md), its
+  [quick start](personal-agent/docs/quickstart.md) and its
   [configuration reference](personal-agent/docs/configuration.md).
 - [`connector/README.md`](connector/README.md): install, `agents.toml`, what
   the connector enforces, keeping it running.

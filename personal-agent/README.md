@@ -14,6 +14,9 @@ name defaults to "Clawy".
 The entry point today is **Microsoft Teams**. The domain logic is channel-neutral, so another channel is a new adapter
 package rather than a rewrite.
 
+To run your own from the published packages or image, start with the [quick start](docs/quickstart.md): the worker on
+your own machine without Teams in about five minutes, then a Teams deployment and a connected developer machine.
+
 > **Status.** Released as 0.x: the three npm packages and the `docker.io/primussafe/personal-agent-teams` image (see
 > [CHANGELOG.md](CHANGELOG.md)). Configuration and plugin interfaces may still change between minor releases.
 
@@ -156,6 +159,8 @@ a line is malformed, or when a Python test is listed twice. So a test a ledger n
 together with its ledger line.
 
 ## Running the worker
+
+From the published npm packages or image, follow the [quick start](docs/quickstart.md). From a checkout:
 
 ```bash
 cd personal-agent
