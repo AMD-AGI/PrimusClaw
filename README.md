@@ -97,7 +97,7 @@ You do not need SaFE to evaluate the project:
 | Exercise the tool-execution layer end to end | Node 26. Run `make demo`: no cluster, GPU, LLM key, or network egress |
 | Run api / brain / hands locally | Node 26, PostgreSQL, NATS, S3-compatible storage, an LLM gateway |
 | Run the personal agent | Node 26 (or Docker), a Claw API and its SaFE endpoint; to answer real people, also a Teams bot registration and an Azure Service Bus namespace (see [its README](personal-agent/README.md#running-the-worker)) |
-| Connect a developer machine | Node.js 22 or newer, a working Claude Code, Codex or Cursor CLI, and the address of a Claw API |
+| Connect a developer machine | Node.js 22 or newer, a working Claude Code, Codex or Cursor CLI, and the two addresses of your Claw deployment: its API URL and its identity service URL |
 | Install the full stack on a cluster | Kubernetes, `kubectl`, `helm`, a storage class, and a SaFE endpoint |
 | Install on an **isolated** cluster with no SaFE | `deploy/deploy.sh --insecure-sandbox`, which turns sandbox authentication **off entirely**: never on a shared or reachable cluster |
 
