@@ -121,7 +121,9 @@ test("test_with_the_assistant_help_says_it_looks_up_github_and_the_web_itself", 
         renderHelp(lang, { group: true, parts }),
         renderHelp(lang, { group: true, assistant: true, parts }),
       ]) {
-        assert.ok(!lookupWords.some((w) => text.includes(w)), text);
+        // (a group's help names them only as what a 1:1 chat adds, after the group's own capabilities)
+        const own = text.split(lang === "en" ? "**More in a 1:1 chat with me**" : "**私聊我还可以**")[0] ?? "";
+        assert.ok(!lookupWords.some((w) => own.includes(w)), text);
       }
     }
   }
@@ -149,5 +151,68 @@ test("test_whether_a_merge_waits_for_a_tap_is_said_without_a_fixed_list", () => 
   assert.equal(c.zh, "合入前是否要审的人点确认，按 TA 的设置和审查结论决定");
   for (const text of [c.zh, c.en]) {
     assert.ok(!/架构|接口|安全|依赖|architecture|interface|security|dependenc/iu.test(text));
+  }
+});
+
+const ONE_TO_ONE_TITLE = { zh: "**私聊我还可以**", en: "**More in a 1:1 chat with me**" } as const;
+
+/** The block of a group's help that names what a 1:1 chat adds, as its lines ([] when there is none). */
+function oneToOneBlock(text: string, lang: "zh" | "en"): string[] {
+  const at = text.split("\n\n").find((block) => block.startsWith(ONE_TO_ONE_TITLE[lang]));
+  return at === undefined ? [] : at.split("\n");
+}
+
+test("a capability named as what a 1:1 chat adds is one a group does not show, named in both languages", () => {
+  const named = CAPABILITIES.filter((c) => c.dmZh !== "" || c.dmEn !== "");
+  assert.ok(named.some((c) => c.key === "agents") && named.some((c) => c.key === "memory"));
+  for (const c of named) {
+    assert.ok(c.dmZh !== "" && c.dmEn !== "", c.key);
+    assert.equal(c.where, "dm", c.key);
+  }
+});
+
+test("a group's help names the main things of a 1:1 chat and how to open one; a 1:1 chat's help does not", () => {
+  const all = new Set<Part>(["github", "remote", "brief", "schedule", "watch_job"]);
+  for (const lang of ["zh", "en"] as const) {
+    for (const assistant of [false, true]) {
+      const group = renderHelp(lang, { group: true, assistant, parts: all, bot: "Clawy" });
+      const lines = oneToOneBlock(group, lang);
+      const names = CAPABILITIES.filter(
+        (c) => c.dmZh !== "" && shown(c, { group: false, assistant, parts: all, understanding: false }),
+      ).map((c) => `- ${lang === "zh" ? c.dmZh : c.dmEn}`);
+      assert.deepEqual([...lines.slice(1, -1)].sort(), [...new Set(names)].sort(), group);
+      assert.equal(lines[1], `- ${lang === "zh" ? byKey("agents").dmZh : byKey("agents").dmEn}`); // (it leads)
+      assert.ok((lines.at(-1) ?? "").includes(lang === "zh" ? "发起私聊" : "start a chat"));
+      assert.ok(
+        lines.every((line) => cpLength(line) <= (lang === "zh" ? 90 : 150)),
+        group,
+      );
+      // the block sits after the group's own capabilities and before what the bot does as whom
+      const blocks = group.split("\n\n").map((block) => block.split("\n")[0]);
+      const at = blocks.indexOf(ONE_TO_ONE_TITLE[lang]);
+      assert.ok(at > blocks.indexOf(lang === "zh" ? "**反馈**" : "**Feedback**"));
+      assert.ok(at < blocks.indexOf(lang === "zh" ? "**我能做什么、以谁的身份做**" : "**What I can do, and as whom**"));
+      for (const values of [{}, { quiet: "23:00-07:00", timezone: "Asia/Tokyo" }]) {
+        assert.deepEqual(oneToOneBlock(renderHelp(lang, { assistant, parts: all, values }), lang), []);
+      }
+    }
+    const zh = lang === "zh";
+    // what is off is not named: no machine without remote agents, no GitHub binding without the review service
+    const none = renderHelp(lang, { group: true, assistant: true, parts: new Set<Part>() });
+    const noneLines = oneToOneBlock(none, lang).join("\n");
+    for (const key of ["agents", "github_bind", "brief", "schedule", "watch_job"]) {
+      assert.ok(!noneLines.includes(zh ? byKey(key).dmZh : byKey(key).dmEn), key);
+    }
+    assert.ok(noneLines.includes(zh ? byKey("memory").dmZh : byKey("memory").dmEn));
+  }
+});
+
+test("a group's help never shows a setting's value, even in what a 1:1 chat adds", () => {
+  const values = { quiet: "23:00-07:00", delegation: "开", timezone: "Asia/Tokyo", memory: "开" };
+  for (const lang of ["zh", "en"] as const) {
+    const text = renderHelp(lang, { group: true, assistant: true, parts: PARTS, values });
+    assert.ok(
+      !text.includes("23:00-07:00") && !text.includes("Asia/Tokyo") && !text.includes(lang === "zh" ? "当前" : "now:"),
+    );
   }
 });

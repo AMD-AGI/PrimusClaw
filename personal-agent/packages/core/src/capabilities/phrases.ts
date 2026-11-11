@@ -26,6 +26,33 @@ export const HELP = [
   "how do i use you",
   "how does this work",
 ];
+/**
+ * Asking the bot to introduce itself, read as help in a group only: there the answer is said to everyone, and help is what knows
+ * what the bot does (a group's session is shared and knows nothing of it). In a 1:1 chat the words stay the person's, as before.
+ */
+export const INTRODUCE = [
+  "介绍一下你自己",
+  "介绍下你自己",
+  "介绍你自己",
+  "介绍一下自己",
+  "介绍下自己",
+  "介绍一下你",
+  "做个自我介绍",
+  "自我介绍一下",
+  "自我介绍",
+  "你是谁",
+  "你是干什么的",
+  "你是做什么的",
+  "你能帮我们做什么",
+  "你能帮大家做什么",
+  "introduce yourself",
+  "please introduce yourself",
+  "tell us about yourself",
+  "tell me about yourself",
+  "who are you",
+  "what are you",
+  "what can you help with",
+];
 export const STOP = ["停", "停下", "停止", "停一下", "先停一下", "先停下", "别做了", "不用做了"];
 /**
  * "Stop it" said to a chat attached to an agent's session: that agent's turn is stopped (`/stop`). With the assistant the same words

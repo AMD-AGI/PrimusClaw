@@ -146,6 +146,32 @@ test("test_help_works_unlinked_and_mentions_the_review_flow_and_approval", async
   assert.deepEqual(w.turns.calls, []);
 });
 
+test("asking a group to introduce itself answers with help, which names what a 1:1 chat adds", async () => {
+  for (const [text, title, machine] of [
+    ["介绍一下你自己", "**私聊我还可以**", "连接你自己的开发机"],
+    ["what can you do", "**More in a 1:1 chat with me**", "Connect your own dev machine"],
+  ] as const) {
+    const w = world({ remote: { enabled: true } });
+    link(w, ALICE.id, "ak-alice");
+    await w.router.handle(gmsg(text));
+    await w.router.settled();
+    const answer = said(w).at(-1) ?? "";
+    assert.ok(answer.includes(title) && answer.includes(machine), answer);
+    assert.deepEqual(w.turns.calls, []); // (not a turn of the shared group session, which knows nothing of the bot)
+    // (one message of words only: nothing in it to tap in the group)
+    assert.equal(w.surface.outbox.length, 1);
+    assert.ok(w.surface.outbox.every((r) => r.op === "send" && r.message.body.type === "text"));
+  }
+});
+
+test("asking a 1:1 chat to introduce itself is still the person's words", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak-alice");
+  await w.router.handle(message("介绍一下你自己"));
+  await w.router.settled();
+  assert.deepEqual(w.turns.calls, [["create", "ak-alice", "介绍一下你自己"]]);
+});
+
 test("test_new_and_stop_only_touch_the_senders_own_group_session", async () => {
   const w = world();
   link(w, ALICE.id, "ak-alice");

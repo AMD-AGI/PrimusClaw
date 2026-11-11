@@ -133,6 +133,8 @@ const GROUP_PHRASES: readonly (readonly [ReadonlySet<string>, string])[] = [
   [keys(P.NEW), "/new"],
   [keys(P.WHOAMI), "/whoami"],
 ];
+/** Phrase lists read only in a group chat. */
+const GROUP_ONLY_PHRASES: readonly (readonly [ReadonlySet<string>, string])[] = [[keys(P.INTRODUCE), "/help"]];
 const STOP_IT = keys(P.STOP_IT);
 const DETACH = keys(P.DETACH);
 const FEEDBACK_ALONE = keys(P.FEEDBACK_ALONE);
@@ -252,13 +254,13 @@ function natural(text: string, group: boolean): string {
   if (FEEDBACK_ALONE.has(key)) return "/feedback";
   const command = lookUp(key, GROUP_PHRASES);
   if (command !== null) return command;
-  return group ? text : personal(text, flat, key);
+  return group ? (lookUp(key, GROUP_ONLY_PHRASES) ?? text) : personal(text, flat, key);
 }
 
 /**
  * `text` as the command it means when it is one of the plain sentences help teaches (or a close way of saying it), else `text`
  * itself. Only the whole message counts. `group`: a group chat reads only what a group may do (help, stop, a new session, which
- * account, feedback). `off`: what this chat cannot do right now, as a command word (`board` without the assistant, `github` without
+ * account, feedback), and asking it to introduce itself, read as help. `off`: what this chat cannot do right now, as a command word (`board` without the assistant, `github` without
  * the review service, `agents` and `agent` with remote agents off) or a command and its verb (`agent detach` with no agent
  * attached): a sentence that would mean one of them stays the words it is, for Claw.
  */
