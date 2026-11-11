@@ -149,8 +149,9 @@ const assistantSayUnreachableTotal = new Counter({
 // K2 (2026-11-06) was a turn of the second kind that nobody counted: the user got only the early line. `silent_notice`: a turn that looked
 // things up and ended with no word and no text at all, told so by the system (bczh-202). `report_answer`: a turn a worker's answer woke
 // that ended without saying it (stopped for the user's next message, failed, or plain text), the answer said by the system instead.
+// `redacted`: plain text whose only internal text was an id, said with the id left out.
 export type RouterUnsaidOutcome =
-  | "delivered" | "replaced_early_line" | "lost_notice" | "withheld" | "refused" | "after_say" | "silent_notice" | "report_answer";
+  | "delivered" | "replaced_early_line" | "lost_notice" | "withheld" | "redacted" | "refused" | "after_say" | "silent_notice" | "report_answer";
 const assistantRouterUnsaidTotal = new Counter({
   name: "claw_assistant_router_unsaid_total",
   help: "Router turns answering the user that ended without their answer said, by what the turn end did about it.",
