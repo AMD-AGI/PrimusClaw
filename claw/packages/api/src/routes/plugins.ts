@@ -82,6 +82,15 @@ function mapServiceError(reply: FastifyReply, e: unknown): ReturnType<FastifyRep
   return null;
 }
 
+/** A boolean query flag: `true`/`1`/`yes`, `false`/`0`/`no` (any case), `fallback` when absent, null otherwise. */
+export function parseListFlag(raw: string | undefined, fallback: boolean): boolean | null {
+  if (raw === undefined || raw === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "true" || v === "1" || v === "yes") return true;
+  if (v === "false" || v === "0" || v === "no") return false;
+  return null;
+}
+
 function parseTagsCsv(tags: string): string[] {
   if (!(tags || "").trim()) return [];
   return tags.split(",").map((t) => t.trim()).filter(Boolean);
@@ -553,14 +562,19 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     }
   });
 
-  app.get<{ Querystring: Record<string, string | undefined> }>("/v1/plugins", async (req) => {
+  app.get<{ Querystring: Record<string, string | undefined> }>("/v1/plugins", async (req, reply) => {
     const u = getUser(req)!;
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
     const offset = Math.max(0, Number(req.query.offset ?? 0));
     const includeDeleted = req.query.include_deleted === "true" && isAdmin(u);
-    // One entry per name (its latest active version) unless the caller asks
-    // for every row; the other versions are at GET /v1/plugins/:id/versions.
-    const latestPerName = req.query.latest_per_name !== "false";
+    // One entry per plugin (an owner's name: its latest active version) unless
+    // the caller asks for every row; the other versions are at
+    // GET /v1/plugins/:id/versions. On by default here, unlike the tool
+    // listings, so it is parsed strictly rather than as "anything but true".
+    const latestPerName = parseListFlag(req.query.latest_per_name, true);
+    if (latestPerName === null) {
+      return reply.status(400).send(authErrorPayload("bad_request", "latest_per_name must be true or false"));
+    }
     const nameExact = String(req.query.name_exact ?? "").trim();
     const nameFuzzy = String(req.query.name ?? "").trim();
     const { rows, total } = await MarketplaceDb.listPluginsRepo({
@@ -615,6 +629,7 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
       }
       const rows = await MarketplaceDb.listPluginVersions({
         name: String(row.name),
+        ownerUserId: (row.owner_user_id as string | null) ?? null,
         viewerUserId: u.userId,
         isAdmin: isAdmin(u),
         includeDeleted: req.query.include_deleted === "true" && isAdmin(u),

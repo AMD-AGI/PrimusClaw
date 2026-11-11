@@ -18,6 +18,10 @@
  *   C4 /versions lists the name's versions newest first, only those the caller may see
  *   C5 /versions answers 404/403 exactly as GET /v1/plugins/:id does
  *   C6 another user's private version neither shows nor counts
+ *   C7 names are not owned: another user's higher version of the same name is a separate entry, never one of these versions
+ *   C8 with include_deleted (admins), a deleted newer version does not win over a live one
+ *   C9 latest_per_name is parsed strictly
+ *   C10 the upsert's version pick breaks a tie by time, not by the date's string form
  */
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
@@ -32,6 +36,7 @@ const user = (id: string, roles = ["default"]) => ({
 });
 const U1 = user("u1");
 const U2 = user("u2");
+const ADMIN = user("admin", ["system-admin"]);
 
 describe("plugin listing collapses versions", { skip }, () => {
   let h: AdmissionCluster;
@@ -142,5 +147,68 @@ describe("plugin listing collapses versions", { skip }, () => {
     const beta = own.plugins.find((p) => p.name === "beta")!;
     assert.equal(beta.id, ids.bpriv, "its owner sees 3.0.0 as the latest");
     assert.equal(beta.version_count, 2);
+  });
+
+  // C7
+  test("another user's version of the same name is its own entry, not one of these versions", async () => {
+    const r = await q(
+      "INSERT INTO plugins (name, version, owner_user_id, is_public) VALUES ('alpha', '99.0.0', 'u2', true) RETURNING id",
+    );
+    const squat = Number((r.rows[0] as { id: string }).id);
+    try {
+      caller = U1;
+      const d = await list();
+      const alphas = d.plugins.filter((p) => p.name === "alpha").map((p) => [p.id, p.owner_user_id, p.version_count]);
+      assert.deepEqual(alphas.sort((a, b) => Number(a[0]) - Number(b[0])), [[ids.a10, "u1", 3], [squat, "u2", 1]].sort((a, b) => Number(a[0]) - Number(b[0])));
+      const vs = await app.inject({ method: "GET", url: `/v1/plugins/${ids.a1}/versions` });
+      assert.ok(!vs.json().data.versions.some((x: any) => x.id === squat), "u2's alpha is not a version of u1's");
+      const theirs = await app.inject({ method: "GET", url: `/v1/plugins/${squat}/versions` });
+      assert.deepEqual(theirs.json().data.versions.map((x: any) => x.id), [squat]);
+    } finally {
+      await q("DELETE FROM plugins WHERE id = $1", [squat]);
+    }
+  });
+
+  // C8
+  test("with include_deleted a deleted newer version does not win", async () => {
+    const r = await q(
+      "INSERT INTO plugins (name, version, owner_user_id, is_public, deleted_at) VALUES ('alpha', '5.0.0', 'u1', true, NOW()) RETURNING id",
+    );
+    const deleted = Number((r.rows[0] as { id: string }).id);
+    try {
+      caller = ADMIN;
+      const d = await list("?include_deleted=true");
+      const alpha = d.plugins.find((p) => p.name === "alpha" && p.owner_user_id === "u1")!;
+      assert.equal(alpha.id, ids.a10, "the live 1.10.0, not the deleted 5.0.0");
+      const vs = await app.inject({ method: "GET", url: `/v1/plugins/${ids.a1}/versions?include_deleted=true` });
+      assert.ok(vs.json().data.versions.some((x: any) => x.id === deleted), "but /versions shows it to an admin who asks");
+    } finally {
+      await q("DELETE FROM plugins WHERE id = $1", [deleted]);
+    }
+  });
+
+  // C9
+  test("latest_per_name is parsed strictly", async () => {
+    caller = U1;
+    for (const off of ["false", "FALSE", "0", "no"]) {
+      assert.equal((await list(`?latest_per_name=${off}`)).total, 5, off);
+    }
+    for (const on of ["true", "1", "yes", ""]) {
+      assert.equal((await list(`?latest_per_name=${on}`)).total, 2, on);
+    }
+    const bad = await app.inject({ method: "GET", url: "/v1/plugins?latest_per_name=maybe" });
+    assert.equal(bad.statusCode, 400, bad.body);
+  });
+
+  // C10
+  test("the upsert's version pick breaks a tie by time", async () => {
+    const { latestRowByVersion } = await import("../src/marketplace/plugins.js");
+    // Thursday then the next Monday: as strings "Thu ..." sorts after "Mon ...".
+    const thu = { id: 1, version: "1.0.0", updated_at: new Date("2026-11-12T00:00:00Z") };
+    const mon = { id: 2, version: "1.0.0", updated_at: new Date("2026-11-16T00:00:00Z") };
+    assert.equal(String(thu.updated_at) > String(mon.updated_at), true, "the fixture separates the two orders");
+    assert.equal(latestRowByVersion([thu, mon]).id, 2);
+    assert.equal(latestRowByVersion([mon, thu]).id, 2);
+    assert.equal(latestRowByVersion([mon, { id: 3, version: "1.0.1", updated_at: new Date(0) }]).id, 3);
   });
 });

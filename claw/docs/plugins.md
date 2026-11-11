@@ -474,17 +474,22 @@ never the values. For an app run, `overrides` is part of what an
 
 ## 5. Listing Plugins and Their Versions
 
-`GET /v1/plugins` lists **one entry per name**: the latest active version of
-that name the caller may see. "Latest" is the version order an upsert uses
-(the first three dot-separated parts compared by their leading digits, so
-`1.10.0` is newer than `1.9.0`; ties go to the most recently updated row), not
-the row touched last. A collapsed entry carries `version_count`, the number of
-versions of the name the caller may see.
+`GET /v1/plugins` lists **one entry per plugin**, where a plugin is an owner's
+name: the latest active version of that (owner, name) the caller may see.
+Names are not owned, so two users' plugins called `alpha` are two entries, and
+one user's versions never replace or count towards another's. "Latest" is the
+version order an upsert uses (the first three dot-separated parts compared by
+their leading digits, so `1.10.0` is newer than `1.9.0`; ties go to the most
+recently updated row, then the highest id), not the row touched last. A
+collapsed entry carries `version_count`: the number of versions of that
+(owner, name) the listing covers, which is the active ones unless `status`
+says otherwise.
 
 | Query parameter | Effect |
 | --------------- | ------ |
-| `latest_per_name` | Defaults to `true`. `false` lists every row (every version), as before this default. |
+| `latest_per_name` | Defaults to `true`. `false` (also `0`, `no`) lists every row (every version), as before this default; `true`, `1`, `yes` collapse; anything else is `400`. |
 | `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
+| `include_deleted` | Admins only, as before. A deleted version never wins over a live one; it is the entry only when nothing of the plugin is live. |
 | `name_exact`, `name`, `owner`, `limit`, `offset` | Unchanged. |
 
 The other versions are listed on demand:
@@ -506,8 +511,9 @@ GET /v1/plugins/:id/versions
 }
 ```
 
-Versions come newest first and only those the caller may see; deleted versions
-are left out (an admin may pass `include_deleted=true`). The route answers `404`
+Versions are those of the same owner and name as `:id`, newest first, and only
+those the caller may see; deleted versions are left out (an admin may pass
+`include_deleted=true`). The route answers `404`
 or `403` exactly as `GET /v1/plugins/:id` does for the same id. Every version
 keeps its own id, and every other route (`GET`, `PATCH`, `DELETE`, launches)
 still addresses a plugin by id.
