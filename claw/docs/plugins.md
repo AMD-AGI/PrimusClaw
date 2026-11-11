@@ -547,7 +547,9 @@ permanent).
   (including a session's first message and a message to an Anthropic-compatible
   session) or DAG template naming the plugin is refused: `404 plugin_not_found`,
   the same answer as for a plugin that does not exist or is another user's
-  private one (a DAG template write is `400`, a retry `409 not_retryable`). An A2A request naming it runs as
+  private one (a DAG template write is `400`, a retry `409 not_retryable`; an
+  app run naming another user's private plugin keeps its existing `403
+  plugin_access_denied`). Workbench runs refuse a gone plugin the same way. An A2A request naming it runs as
   if the plugin were deleted (no tools), as A2A already treats a plugin the
   caller cannot see. Work admitted before the expiry keeps running.
 - **The sweep.** Every `PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN` (default 5) minutes

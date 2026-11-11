@@ -551,6 +551,9 @@ async function openA2ARun(
     sandboxSpec: spec.sandboxImage ? "default" : undefined,
     sandboxImage: spec.sandboxImage,
     workspaceId: spec.workspaceId,
+    // On the row, held by openChatRun on this transaction, so the expiry sweep
+    // sees the run as a use of its plugin.
+    pluginId: spec.pluginId,
     // The declared topology goes on the row the ceiling counts, or the GPU
     // demand the ask was charged for is invisible to every later admission.
     spec: spec.topology ? { topology: spec.topology } : undefined,
