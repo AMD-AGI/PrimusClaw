@@ -169,6 +169,10 @@ const OFF_REMOTE: RemoteChat = {
 export interface WorldOptions {
   readonly config?: Partial<RouterConfig>;
   readonly assistant?: Partial<AssistantChat>;
+  /** A whole assistant feature, used as it is (the assistant's real chat: a class's methods do not survive a spread). */
+  readonly assistantChat?: AssistantChat;
+  /** The subscription keeper (default: none, as with notifications off). */
+  readonly subscriptions?: RouterDeps["subscriptions"];
   readonly remote?: Partial<RemoteChat>;
   /** A whole remote-agent feature, used as it is (a class's methods do not survive a spread). */
   readonly remoteChat?: RemoteChat;
@@ -258,7 +262,7 @@ export function world(options: WorldOptions = {}) {
     },
     exchange,
     limits,
-    assistant: { ...OFF_ASSISTANT, ...options.assistant },
+    assistant: options.assistantChat ?? { ...OFF_ASSISTANT, ...options.assistant },
     remote: options.remoteChat ?? { ...OFF_REMOTE, ...options.remote },
     turns,
     stopCards: new StopButtons({ clock, random: new SeededRandom(5), log: silent }),
@@ -266,7 +270,7 @@ export function world(options: WorldOptions = {}) {
     observing: { forward: () => Promise.resolve(), mayTurnOn: () => false, board: () => Promise.resolve() },
     groupHistory: options.groupHistory ?? groupHistoryOf(store, clock),
     github: undefined,
-    subscriptions: undefined,
+    subscriptions: options.subscriptions,
     reviewStop: undefined,
     handoffs: [],
     channelContext: () => ({ context: {}, actions: [], people: [] }),

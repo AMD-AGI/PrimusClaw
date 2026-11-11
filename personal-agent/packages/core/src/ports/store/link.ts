@@ -32,10 +32,14 @@ export interface LinkRepository {
   getKey(userId: string): string | null;
   /** Forget the person's link and everything kept for them that a key is needed for. */
   unlink(userId: string): void;
-  /** The Claw user id of the account the person is linked to. */
+  /**
+   * The Claw user id of the account the person is linked to; for a person with no link, of the account they are bound
+   * to at the identity service (their chats run on exchanged tokens). The assistant reaches either by it.
+   */
   setClawUserId(userId: string, clawUserId: string): void;
   /** Linked before the Claw user id was kept (or the lookup failed at link time). */
   needsClawUserId(userId: string): boolean;
+  /** The link's Claw user id; for a person with no link, the one kept for their binding. */
   clawUserIdOf(userId: string): string | null;
   /** Every linked person, in a stable order. */
   linkedUsers(): string[];

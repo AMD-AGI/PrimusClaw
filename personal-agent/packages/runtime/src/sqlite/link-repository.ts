@@ -27,6 +27,7 @@ interface Judged {
 /** Tables keyed by the person, cleared on unlink. */
 const PERSON_TABLES = [
   "links",
+  "bound_users",
   "sessions",
   "conversation_refs",
   "held_events",
@@ -133,6 +134,7 @@ export class SqliteLinkRepository implements LinkRepository {
       col.bytes(row, "key_enc"),
       now,
     );
+    db.run("DELETE FROM bound_users WHERE aad_id = ?", userId); // (the link's own id is read for its key)
     forgetNotifySub(db, userId);
     forgetRepos(db, userId);
     db.run("DELETE FROM sessions WHERE aad_id = ?", userId);
@@ -166,8 +168,16 @@ export class SqliteLinkRepository implements LinkRepository {
     db.run("UPDATE user_prefs SET brief_trigger_id = NULL WHERE aad_id = ?", userId);
   }
 
+  /** On the link when there is one; else kept for a person bound at the identity service only (`bound_users`). */
   setClawUserId(userId: string, clawUserId: string): void {
-    this.ctx.db.run("UPDATE links SET claw_user_id = ? WHERE aad_id = ?", clawUserId, userId);
+    const { db } = this.ctx;
+    if (db.run("UPDATE links SET claw_user_id = ? WHERE aad_id = ?", clawUserId, userId) > 0) return;
+    db.run(
+      "INSERT OR REPLACE INTO bound_users (aad_id, claw_user_id, updated_at) VALUES (?, ?, ?)",
+      userId,
+      clawUserId,
+      this.ctx.now(),
+    );
   }
 
   needsClawUserId(userId: string): boolean {
@@ -175,8 +185,12 @@ export class SqliteLinkRepository implements LinkRepository {
     return row !== undefined && !col.bool(row, "claw_user_id");
   }
 
+  /** The link's (a linked person's id is never taken from anywhere else), else the bound person's. */
   clawUserIdOf(userId: string): string | null {
-    const row = this.ctx.db.get("SELECT claw_user_id FROM links WHERE aad_id = ?", userId);
+    const { db } = this.ctx;
+    const row =
+      db.get("SELECT claw_user_id FROM links WHERE aad_id = ?", userId) ??
+      db.get("SELECT claw_user_id FROM bound_users WHERE aad_id = ?", userId);
     return row && col.bool(row, "claw_user_id") ? col.str(row, "claw_user_id") : null;
   }
 
@@ -185,13 +199,18 @@ export class SqliteLinkRepository implements LinkRepository {
   }
 
   userForClawUser(clawUserId: string): string | null {
-    const row = this.ctx.db.get("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId);
-    return row ? col.str(row, "aad_id") : null;
+    return this.usersForClawUser(clawUserId)[0] ?? null;
   }
 
   usersForClawUser(clawUserId: string): string[] {
     return this.ctx.db
-      .all("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId)
+      .all(
+        `SELECT aad_id FROM links WHERE claw_user_id = ?
+         UNION ALL
+         SELECT aad_id FROM bound_users WHERE claw_user_id = ? AND aad_id NOT IN (SELECT aad_id FROM links)`,
+        clawUserId,
+        clawUserId,
+      )
       .map((r) => col.str(r, "aad_id"));
   }
 }

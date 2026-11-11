@@ -12,6 +12,7 @@ import type { InboundAction, InboundMessage } from "../ports/surface.js";
 import { pyLower, pySplit } from "../text/py-text.js";
 import { learnLang, type Chat } from "./chat.js";
 import type { CommandSets } from "./command-table.js";
+import { CredentialUnavailable } from "./credentials.js";
 import type { RouterContext } from "./context.js";
 import type { PersonalText } from "./personal-text.js";
 import { ShowHere } from "./show-here.js";
@@ -43,10 +44,38 @@ export class PersonalRouter {
     const userId = chat.sender.id;
     store.references.saveReference(userId, wireOf(event)); // (serviceUrl can change: refreshed every time)
     if (event.type === "action" && event.invoke) store.members.notePersonalClick(userId); // (the app is installed for them)
-    await this.backfill(userId);
-    if (subscriptions !== undefined && store.links.getKey(userId) !== null) await subscriptions.ensure(userId);
+    if (store.links.getKey(userId) !== null) {
+      await this.backfill(userId);
+      if (subscriptions !== undefined) await subscriptions.ensure(userId);
+    } else {
+      await this.reachBound(userId);
+    }
     if (event.type === "message") await this.message(event, chat);
     else await this.click(event, chat);
+  }
+
+  /**
+   * A person with no link whose chats run on an exchanged token (bound at the identity service): their Claw user id is
+   * read with the token and their subscription made with it, as a link's are, so their 1:1 chat reaches the assistant
+   * from this message on (the assistant reaches only a person whose Claw user id and subscription it knows).
+   */
+  private async reachBound(userId: string): Promise<void> {
+    const { credentials, owners } = this.ctx;
+    const { store, subscriptions } = this.ctx.deps;
+    if (!credentials.onExchange) return;
+    let token: string | undefined;
+    try {
+      token = await credentials.background(userId);
+    } catch (error) {
+      if (error instanceof CredentialUnavailable) return; // (the identity service is down: the message says so itself)
+      throw error;
+    }
+    if (token === undefined) return; // (not bound: the message is answered with the card that binds them)
+    if (store.links.clawUserIdOf(userId) === null) {
+      const clawUserId = await owners.userIdOf(token);
+      if (clawUserId !== undefined) store.links.setClawUserId(userId, clawUserId);
+    }
+    if (subscriptions !== undefined) await subscriptions.ensure(userId, token);
   }
 
   /** Linked before the Claw user id was kept: it is read now. */

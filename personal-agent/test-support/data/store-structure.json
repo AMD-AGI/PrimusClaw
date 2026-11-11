@@ -75,6 +75,12 @@
    },
    {
     "type": "table",
+    "name": "bound_users",
+    "tbl_name": "bound_users",
+    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, updated_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "conversation_refs",
     "tbl_name": "conversation_refs",
     "sql": "CREATE TABLE conversation_refs (\n  aad_id TEXT PRIMARY KEY, reference_json TEXT NOT NULL, updated_at REAL NOT NULL)"
@@ -848,6 +854,43 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_auto_replies_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "bound_users": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "aad_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "claw_user_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "updated_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_bound_users_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0
@@ -2982,6 +3025,12 @@
    },
    {
     "type": "table",
+    "name": "bound_users",
+    "tbl_name": "bound_users",
+    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, updated_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "conversation_refs",
     "tbl_name": "conversation_refs",
     "sql": "CREATE TABLE conversation_refs (\n  aad_id TEXT PRIMARY KEY, reference_json TEXT NOT NULL, updated_at REAL NOT NULL)"
@@ -3755,6 +3804,43 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_auto_replies_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "bound_users": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "aad_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "claw_user_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "updated_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_bound_users_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0

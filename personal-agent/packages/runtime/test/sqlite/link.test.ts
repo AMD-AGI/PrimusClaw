@@ -422,3 +422,28 @@ test("a link records its Claw user, found back from either side", () => {
   assert.deepEqual(new Set(links.usersForClawUser("u-1")), new Set(["aad-a", "aad-b"]));
   assert.equal(links.getKey("aad-a"), "ak-a");
 });
+
+test("a person bound with no link keeps a Claw user id of their own; a link's id wins and an unlink forgets both", () => {
+  const { store } = openTestStore();
+  const { links } = store;
+  links.setClawUserId(ALICE, "u-alice"); // (no link: bound at the identity service only)
+  assert.equal(links.getKey(ALICE), null);
+  assert.equal(links.clawUserIdOf(ALICE), "u-alice");
+  assert.equal(links.needsClawUserId(ALICE), false, "(nothing to backfill: there is no link)");
+  assert.deepEqual(links.linkedUsers(), [], "a bound person is not a linked one");
+  assert.deepEqual(links.usersForClawUser("u-alice"), [ALICE]);
+  assert.equal(links.userForClawUser("u-alice"), ALICE);
+
+  links.redeemPending(ALICE, "Alice", links.stashPending("ak-alice"));
+  assert.equal(links.clawUserIdOf(ALICE), null, "a new link's own id is read for its key, never the binding's");
+  assert.equal(links.needsClawUserId(ALICE), true);
+  links.setClawUserId(ALICE, "u-other");
+  assert.equal(links.clawUserIdOf(ALICE), "u-other");
+  assert.deepEqual(links.usersForClawUser("u-alice"), []);
+  assert.deepEqual(links.usersForClawUser("u-other"), [ALICE]);
+
+  links.setClawUserId(BOB, "u-bob");
+  links.unlink(BOB);
+  assert.equal(links.clawUserIdOf(BOB), null, "an unlink forgets a bound person's id");
+  assert.equal(links.userForClawUser("u-bob"), null);
+});

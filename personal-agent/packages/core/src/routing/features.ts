@@ -152,7 +152,8 @@ export interface RemoteChat {
 
 /** The person's notification subscription in Claw (Python `subscriptions.Subscriptions`); undefined when notifications are off. */
 export interface Subscriptions {
-  ensure(userId: string): Promise<void>;
+  /** Made or mended with `credential` when given (a person with no link: their exchanged token), else the linked key. */
+  ensure(userId: string, credential?: string): Promise<void>;
   /** Before the key is revoked: Claw needs it to delete the subscription. */
   remove(userId: string, key: string): Promise<void>;
 }

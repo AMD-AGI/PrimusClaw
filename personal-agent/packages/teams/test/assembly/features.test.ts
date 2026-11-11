@@ -28,6 +28,7 @@ import {
 } from "@primusclaw/personal-agent-runtime";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
+import { FakeExchange } from "../../../../test-support/routing/fixtures.js";
 import { inboundMessage } from "../../../../test-support/inbound.js";
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { SeededRandom } from "../../../../test-support/random.js";
@@ -84,7 +85,12 @@ interface Overrides {
   readonly settings?: Partial<Settings>;
 }
 
-function assembled(env: Record<string, string> = {}, security = new RecordingLogger(), overrides: Overrides = {}) {
+function assembled(
+  env: Record<string, string> = {},
+  security = new RecordingLogger(),
+  overrides: Overrides = {},
+  clawUrl = claw.url,
+) {
   const { store } = openTestStore();
   const surface = new FakeSurface();
   const settings: Settings = { ...readSettingsForTest(), ...overrides.settings };
@@ -94,7 +100,7 @@ function assembled(env: Record<string, string> = {}, security = new RecordingLog
     settings,
     teams: teamsSettingsFromEnv({}, { queues: false }),
     store,
-    claw: createClawClient({ baseUrl: claw.url, clock: systemClock }),
+    claw: createClawClient({ baseUrl: clawUrl, clock: systemClock }),
     surface,
     clock: systemClock,
     random: new SeededRandom(5),
@@ -372,5 +378,69 @@ describe("the deployment's integrations", () => {
       texts(surface).some((t) => t.includes("- Tracker: connected")),
       JSON.stringify(texts(surface)),
     );
+  });
+});
+
+describe("a person bound at the identity service with no link", () => {
+  it("a person bound with no link: their 1:1 message reaches the assistant, with the subscription and id from their token", async () => {
+    const bound = await FakeHttpServer.start([
+      { method: "GET", path: "/v1/notification-subscriptions", handle: () => ({ status: 200, json: { data: [] } }) },
+      {
+        method: "POST",
+        path: "/v1/notification-subscriptions",
+        handle: () => ({ status: 200, json: { data: { subscription_id: "sub-1", secret: "s" } } }),
+      },
+      {
+        method: "POST",
+        path: "/v1/assistant",
+        handle: () => ({ status: 200, json: { data: { session_id: "asst-1" } } }),
+      },
+    ]);
+    try {
+      const exchange = new FakeExchange();
+      exchange.tokens.set(ALICE.id, "tok-alice");
+      const identityLookup = {
+        ownerOfKey: (key: string) =>
+          Promise.resolve(
+            key === "tok-alice" ? { id: "u-alice", name: "Liu, Alice", email: "", accountType: "" } : undefined,
+          ),
+      };
+      const base = readSettingsForTest();
+      const { features, store } = assembled(
+        { PROACTIVE_ENABLED: "1", NOTIFY_WEBHOOK_URL: "http://w/claw-events" },
+        new RecordingLogger(),
+        {
+          plugins: neutralPlugins({ tokenExchange: exchange, identityLookup }),
+          settings: {
+            exchange: { ...base.exchange, enabled: true, forChat: true },
+            assistant: { ...base.assistant, enabled: true, users: new Set() },
+          },
+        },
+        bound.url,
+      );
+      await features.router.handle(
+        inboundMessage({
+          id: "act-b1",
+          sender: ALICE,
+          conversation: {
+            id: "dm-a",
+            kind: "personal",
+            tenantId: "t1",
+            wire: { conversation: { id: "dm-a", conversationType: "personal" }, user: { aadObjectId: ALICE.id } },
+          },
+          text: "connect my dev environment",
+        }),
+      );
+      await features.router.settled();
+      assert.equal(store.links.getKey(ALICE.id), null, "(no link)");
+      assert.equal(store.links.clawUserIdOf(ALICE.id), "u-alice");
+      const asked = (method: string, path: string) =>
+        bound.requests.filter((r) => r.method === method && r.path === path).map((r) => r.headers["authorization"]);
+      assert.deepEqual(asked("POST", "/v1/notification-subscriptions"), ["Bearer tok-alice"]);
+      assert.deepEqual(asked("POST", "/v1/assistant"), ["Bearer tok-alice"], "the assistant's session, on the token");
+      assert.deepEqual(asked("POST", "/v1/sessions"), [], "no plain Claw session");
+    } finally {
+      await bound.close();
+    }
   });
 });
