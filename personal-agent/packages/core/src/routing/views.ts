@@ -29,6 +29,8 @@ export interface BindingCardView {
   /** A first sentence ("" none). */
   readonly lead: string;
   readonly notice: string;
+  /** The language of its title, body and buttons: the person's. */
+  readonly lang: Lang;
 }
 
 /** A group member who has not connected: addressed to them, one button only they can use. */
@@ -157,9 +159,11 @@ export class CommandViews {
     return view({ type: "view", view: { name: "link", model }, fallbackText: `Connect ${this.bot}` });
   }
 
-  binding(confirmUrl: string, lead = ""): OutMessage {
-    const model: BindingCardView = { bot: this.bot, confirmUrl, lead, notice: AI_NOTICE.en };
-    return view({ type: "view", view: { name: "binding", model }, fallbackText: `Connect ${this.bot}` });
+  /** The binding card in the person's language `lang` (its title, body, buttons and notice; `lead` is the caller's). */
+  binding(confirmUrl: string, lead = "", lang: Lang = "en"): OutMessage {
+    const model: BindingCardView = { bot: this.bot, confirmUrl, lead, notice: AI_NOTICE[lang], lang };
+    const fallbackText = lang === "zh" ? `连接 ${this.bot}` : `Connect ${this.bot}`;
+    return view({ type: "view", view: { name: "binding", model }, fallbackText });
   }
 
   onboarding(

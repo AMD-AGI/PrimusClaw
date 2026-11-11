@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import assert from "node:assert/strict";
-import { it } from "node:test";
+import { describe, it } from "node:test";
 
 import { ASSISTANT_RELEASE_MAX, REMOTE_RELEASE_MAX } from "../../src/proactive/release.js";
 import { FakeClock } from "../../../../test-support/clock.js";
@@ -10,6 +10,7 @@ import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openFileTestStore } from "../../../../test-support/store.js";
 import { streamOpener } from "../../src/assistant/tracked-stream.js";
 import { DirectChat } from "../../src/direct-chat/direct-chat.js";
+import { turnAckId, turnAckOf } from "../../src/proactive/events.js";
 import { ALICE, at, event, link, shown, world } from "../../../../test-support/assistant/proactive-world.js";
 
 const APPROVAL = (id = "tu-1", extra: Record<string, unknown> = {}) =>
@@ -284,4 +285,65 @@ it("with direct chat on and the chat attached to a session an amending say is a 
     out.every((line) => line.startsWith("post 💬 **Clawy**")),
     out.join("\n"),
   );
+});
+
+describe('Claw\'s "on it" line for a turn that has begun to answer', () => {
+  // The line's id is Claw's `lookupAckSayId("u-alice", "m1")`: sha256 of "assistant.notice\0u-alice\0lookup_ack:m1" as a uuid.
+  const ACK_ID = "82907c41-ea2c-2ab3-e720-3ad5ca045ba0";
+  const ack = (turn = "m1", id = ACK_ID) => SAY(id, "收到，我看一下。", { user_id: "u-alice", turn_message_id: turn });
+  const REFUSAL = "**❌ 默认模型还没设置成功：这条消息不是从你已登录的聊天发来的，我不能替你改设置。**";
+  const refusal = () => SAY("s-refusal", REFUSAL, { user_id: "u-alice", turn_message_id: "m1", needs_identity: true });
+
+  async function streaming(words: string | undefined) {
+    const w = world();
+    const conversation = w.surface.conversation({ id: `c-${ALICE}`, kind: "personal", tenantId: "", wire: {} });
+    const receipt = await w.receipts.openIn(conversation.ref.id, "zh", streamOpener(conversation, "act-1", w.clock));
+    assert.ok(receipt);
+    receipt.takenAs("m1");
+    if (words !== undefined) receipt.showText(words);
+    return { w, receipt };
+  }
+
+  it("its id is Claw's lookupAckSayId", () => {
+    assert.equal(turnAckId("u-alice", "m1"), ACK_ID);
+    assert.equal(turnAckOf(ack()), "m1");
+    assert.equal(turnAckOf(ack("m2")), "", "the id of another turn's line");
+    assert.equal(turnAckOf({ ...ack(), user_id: "u-bob" }), "", "another person's");
+    assert.equal(turnAckOf(SAY("s1", "收到，我看一下。", { user_id: "u-alice", turn_message_id: "m1" })), "");
+  });
+
+  it("while the reply's words stream into the receipt the line is dropped, and the reply closes the receipt", async () => {
+    const { w, receipt } = await streaming("**❌ 默认模型还没设置成功：这条消息不是从你已登录的聊天发");
+    assert.equal(receipt.answering, true);
+    assert.equal(await w.proactive.handle(ALICE, w.reference, ack()), "dropped");
+    assert.equal(receipt.done, false, "the line left the receipt open");
+    assert.deepEqual(shown(w.surface.outbox), [], "nothing sent, nothing finished");
+    assert.equal(await w.proactive.handle(ALICE, w.reference, refusal()), "delivered");
+    assert.deepEqual(
+      shown(w.surface.outbox),
+      [`stream.finish ${REFUSAL}`],
+      "the refusal ends the stream it was streamed in",
+    );
+  });
+
+  it("after a say of its turn was delivered the line is dropped, not sent as a message of its own", async () => {
+    const { w } = await streaming(undefined);
+    assert.equal(await w.proactive.handle(ALICE, w.reference, refusal()), "delivered");
+    assert.equal(await w.proactive.handle(ALICE, w.reference, ack()), "dropped");
+    assert.deepEqual(shown(w.surface.outbox), [`stream.finish ${REFUSAL}`]);
+  });
+
+  it("before the turn has said or streamed anything the line closes the receipt, as it is there to", async () => {
+    const { w, receipt } = await streaming(undefined);
+    assert.equal(receipt.answering, false);
+    assert.equal(await w.proactive.handle(ALICE, w.reference, ack()), "delivered");
+    assert.deepEqual(shown(w.surface.outbox), ["stream.finish 收到，我看一下。"]);
+    // (another turn's line, after this turn answered, is that turn's business)
+    const other = world();
+    assert.equal(await other.proactive.handle(ALICE, other.reference, refusal()), "delivered");
+    assert.equal(
+      await other.proactive.handle(ALICE, other.reference, ack("m2", turnAckId("u-alice", "m2"))),
+      "delivered",
+    );
+  });
 });
