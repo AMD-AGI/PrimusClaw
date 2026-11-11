@@ -94,4 +94,10 @@ export interface ProactiveDeps {
    * handled (`/resume`, quiet hours off) answer in their client's language; a push or a sweep reads none. Default: none.
    */
   readonly requestScope?: RequestScope;
+  /**
+   * After an assistant message whose turn was refused for want of a confirmed identity (`needs_identity`), in the person's own
+   * chat: the card that confirms it (`Credentials.identityAfterRefusal`), once per turn (`turn`: the message the turn answers,
+   * else the say's own id; a later say of the same turn replaces the first and carries the field too). Default: none.
+   */
+  readonly identityAfterRefusal?: (userId: string, conversation: Conversation, turn: string) => Promise<void>;
 }

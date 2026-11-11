@@ -60,6 +60,30 @@ export class Credentials {
     return undefined;
   }
 
+  /**
+   * After an answer of the assistant that was refused for want of a confirmed identity (`needs_identity`: a person whose chats
+   * run on their key because they never confirmed it asked for something only they may do, such as a review as them): the card
+   * that confirms it, unless the person has confirmed by now. Nothing when chats do not run on the exchange, or it cannot be
+   * asked. Never before that: connecting a machine and the rest of what a key may do are not held behind it.
+   */
+  async identityAfterRefusal(chat: Chat): Promise<boolean> {
+    if (this.chatExchange === undefined) return false;
+    const token = await this.chatExchange.tokenFor(chat.sender.id);
+    if (token.ok || token.error.kind !== "not_bound") return false;
+    return this.sendIdentityCard(chat, linkText.in(chat.lang()).identityRefused);
+  }
+
+  /** The binding card with `lead`; false (nothing sent) when the identity service gives no link: a key's owner is not sent the `/link` steps. */
+  private async sendIdentityCard(chat: Chat, lead: string): Promise<boolean> {
+    const request = await this.deps.exchange.bindingRequest(chat.sender.id, chat.sender.email);
+    if (!request.ok) {
+      this.deps.logger.warn("binding request failed", { kind: request.error.kind });
+      return false;
+    }
+    await chat.send(this.views.binding(request.value.confirmUrl, lead));
+    return true;
+  }
+
   /** A fresh credential per call when chats run on exchanged tokens (they expire); undefined: the key as it is. */
   provider(userId: string, key: string): CredentialProvider {
     return this.chatExchange === undefined ? undefined : () => this.fresh(userId, key);

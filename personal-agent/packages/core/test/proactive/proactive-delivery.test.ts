@@ -97,3 +97,48 @@ it("an approval after the deadline still reaches the phone", async () => {
   assert.deepEqual(approvalCards(w.surface.outbox), ["late-1"]);
   assert.equal(w.store.approvals.getApproval("sess-ak-alice", "late-1")?.state, "pending");
 });
+
+it("an answer refused for want of a confirmed identity (needs_identity) is followed by the identity offer, in the person's own chat", async () => {
+  const offered: [string, string][] = [];
+  const w = world({
+    identityAfterRefusal: (userId, conversation, turn) => {
+      offered.push([userId, turn]);
+      return conversation
+        .send({
+          body: { type: "view", view: { name: "binding", model: {} } as never, fallbackText: "" },
+        })
+        .then(() => undefined);
+    },
+  });
+  const say = (id: string, extra: JsonObject = {}) => ({
+    type: "assistant.say",
+    event_id: id,
+    text: "先确认一次身份。",
+    ...extra,
+  });
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, say("s1", { needs_identity: true, turn_message_id: "m1" })),
+    "delivered",
+  );
+  assert.deepEqual(
+    sentViews(w.surface.outbox).map((v) => v.name),
+    ["binding"],
+  );
+  assert.deepEqual(offered, [[ALICE, "m1"]], "after the words, with the turn it answers");
+  const before = w.surface.outbox.length;
+  // No field, the field not true, or a group binding's chat (`<person>#<group>`): nothing more than the words.
+  await w.proactive.handle(ALICE, w.reference, say("s2"));
+  await w.proactive.handle(ALICE, w.reference, say("s3", { needs_identity: "yes" }));
+  await w.proactive.handle(`${ALICE}#g1`, w.reference, say("s4", { needs_identity: true }));
+  assert.deepEqual(offered, [[ALICE, "m1"]]);
+  assert.equal(sentViews(w.surface.outbox.slice(before)).length, 0);
+  // A say with no turn is offered by its own id; an offer that fails leaves the words delivered.
+  const failing = world({ identityAfterRefusal: () => Promise.reject(new Error("down")) });
+  assert.equal(
+    await failing.proactive.handle(ALICE, failing.reference, say("s5", { needs_identity: true })),
+    "delivered",
+  );
+  assert.ok(failing.surface.outbox.length > 0);
+  await w.proactive.handle(ALICE, w.reference, say("s6", { needs_identity: true }));
+  assert.deepEqual(offered.at(-1), [ALICE, "s6"]);
+});

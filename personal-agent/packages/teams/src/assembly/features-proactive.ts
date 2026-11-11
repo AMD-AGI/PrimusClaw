@@ -13,6 +13,7 @@ import type {
   JsonObject,
   ProactiveHold,
   PublicErrors,
+  Router,
   RunFollowUps,
 } from "@primusclaw/personal-agent";
 import {
@@ -82,6 +83,7 @@ export function proactiveParts(
   style: Style,
   assistant: Pick<AssistantParts, "receipts" | "directChat">,
   errors: PublicErrors,
+  router?: () => Router,
 ): ProactiveParts {
   const { store, claw, surface, settings } = base;
   const deps = {
@@ -114,11 +116,39 @@ export function proactiveParts(
     publicEvent: (event: JsonObject) =>
       publicRunEvent(event, errors, (text) => looksLikeServiceError(text) || looksInternal(text)),
     botName: "Clawy",
+    ...(router === undefined ? {} : { identityAfterRefusal: identityAfterRefusal(base, router) }),
   };
   // (`showsAttached` stays false: the Python worker's /claw-events path runs its own Proactive, on which it is never set)
   const proactive = new Proactive(deps);
   return { proactive, release: new Release(deps, proactive) };
 }
+
+/**
+ * The card that confirms a person's identity after an assistant message refused for want of it (`needs_identity`), in their own
+ * chat, once per turn (kept as a `processed` key, so a later say of the same turn, or the same event delivered again, sends none).
+ */
+function identityAfterRefusal(
+  base: Pick<AssemblyBase, "store" | "logger">,
+  router: () => Router,
+): (userId: string, conversation: Conversation, turn: string) => Promise<void> {
+  return async (userId, conversation, turn) => {
+    const { store } = base;
+    const once = `${IDENTITY_REFUSED_PREFIX}${userId}:${turn}`;
+    if (!turn || store.idempotency.seen(once)) return;
+    const person = {
+      id: userId,
+      channelUserId: store.members.channelIdOf(userId) ?? "",
+      name: store.members.memberName(userId) ?? "",
+      email: "",
+    };
+    const r = router();
+    if (await r.ctx.credentials.identityAfterRefusal(r.chat(person, conversation)))
+      store.idempotency.claimProcessed(once);
+  };
+}
+
+/** The `processed` key prefix of a turn whose identity card was sent (`identityAfterRefusal`). */
+export const IDENTITY_REFUSED_PREFIX = "identity-refused:";
 
 /** What the router reads of quiet hours and /pause (`muted` as a word or null, `release` on /resume). */
 export function proactiveHold(parts: ProactiveParts): ProactiveHold {

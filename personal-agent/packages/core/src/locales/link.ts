@@ -26,6 +26,7 @@ export const linkText = defineCatalog({
       `Too many wrong codes. Wait ${String(p.minutes)} minute${p.minutes !== 1 ? "s" : ""} and try again.`,
     linkingPaused: "Linking is paused for a few minutes because of too many wrong codes. Please try again later.",
     badCode: "That code is not valid or has expired. Get a new one on the console page.",
+    identityRefused: "That needs you in person: confirm your identity once on this card, then ask again.",
   },
   zh: {
     linkSteps: (p) =>
@@ -46,6 +47,7 @@ export const linkText = defineCatalog({
       `Too many wrong codes. Wait ${String(p.minutes)} minute${p.minutes !== 1 ? "s" : ""} and try again.`,
     linkingPaused: "Linking is paused for a few minutes because of too many wrong codes. Please try again later.",
     badCode: "That code is not valid or has expired. Get a new one on the console page.",
+    identityRefused: "这一步需要你本人：在这张卡片上确认一次身份，然后再说一遍就行。",
   },
 });
 

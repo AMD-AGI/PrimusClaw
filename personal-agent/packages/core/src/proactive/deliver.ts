@@ -109,8 +109,34 @@ export class Deliveries {
     return true;
   }
 
-  /** What the assistant said (or a work item that needs the person and was not said). */
+  /**
+   * What the assistant said, then, when its turn was refused something for want of a confirmed identity (`needs_identity`) and
+   * this is the person's own chat (a group binding's key has `#`), the card that confirms it. A card that could not be sent never
+   * makes the message undelivered.
+   */
   private async sendSaid(userId: string, conversation: Conversation, event: JsonObject): Promise<boolean> {
+    const sent = await this.sendSaidWords(userId, conversation, event);
+    const offer = this.deps.identityAfterRefusal;
+    if (
+      sent &&
+      offer !== undefined &&
+      event["type"] === "assistant.say" &&
+      event["needs_identity"] === true &&
+      !userId.includes("#")
+    ) {
+      try {
+        await offer(userId, conversation, str(event["turn_message_id"]) || str(event["event_id"]));
+      } catch (error) {
+        this.deps.logger.warn("the identity card after a refused answer could not be sent", {
+          error: error instanceof Error ? error.name : "unknown",
+        });
+      }
+    }
+    return sent;
+  }
+
+  /** What the assistant said (or a work item that needs the person and was not said). */
+  private async sendSaidWords(userId: string, conversation: Conversation, event: JsonObject): Promise<boolean> {
     const remote = remoteNoticeOf(event);
     if (remote?.kind === "needs_you" && remote.ask !== undefined) {
       const shown = await this.sendRemoteAsk(userId, conversation, event, remote);
