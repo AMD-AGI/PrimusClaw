@@ -32,10 +32,11 @@ name: Personal agent release
 #   publish-image  handles the finished image archive and nothing else, likewise. Its registry and push target are
 #                  derived here, from repository configuration only, never from anything the package job produced.
 #
-# The ingress's npm package. Published only while the repository variable PERSONAL_AGENT_INGRESS_NPM_PUBLISH is exactly
-# "true" (npm's Trusted Publisher entry for a new package name can only be made once the name exists); until then its
-# tarball is checked and attached to the release like the others. The Function package (the zip) is attached either way:
-# it is what a deployment runs.
+# The ingress's npm package. Not published by default, and not meant to be: a deployment runs the Function package (the
+# zip), which every release attaches, and the npm package has no users. The repository variable
+# PERSONAL_AGENT_INGRESS_NPM_PUBLISH stays unset; the branch that publishes it while the variable is exactly "true" is
+# kept (npm's Trusted Publisher entry for a new package name can only be made once the name exists). Its tarball is
+# checked and attached to the release like the others either way.
 #
 # The image. Off until the repository variable PERSONAL_AGENT_IMAGE_PUBLISH is exactly "true": until then a release
 # publishes the npm packages and attaches the tarballs, and the image is built and smoke-tested but pushed nowhere. The

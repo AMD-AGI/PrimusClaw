@@ -7,7 +7,9 @@ SPDX-License-Identifier: MIT
 
 The four packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
 `@primusclaw/personal-agent-teams`, `@primusclaw/personal-agent-teams-ingress`), the Teams ingress's Function package
-(`personal-agent-teams-ingress-X.Y.Z.zip`) and the `personal-agent-teams` image are released together at one version. Each
+(`personal-agent-teams-ingress-X.Y.Z.zip`) and the `personal-agent-teams` image are released together at one version.
+The first three are published to npm; the ingress is deployed from the Function package on the GitHub Release, and its
+npm package is not published (its tarball is attached to the release). Each
 release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub Release's notes (README.md,
 "Releasing"): a version without a section is not released. Which number a release moves, and what its notes must say
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
@@ -19,9 +21,9 @@ A minor release: it adds the Teams ingress as a released part (#739; its deploya
 sends concurrently by #748), and fixes what the 0.3.0 acceptance found (#747). No plugin port (core's `src/plugins/`)
 changed, and the worker needs nothing new from Claw.
 
-The ingress's npm package, `@primusclaw/personal-agent-teams-ingress`, is not on npm yet: its first publish waits for the
-package's Trusted Publisher entry. Its tarball is attached to this release like the others, and the Function package
-(`personal-agent-teams-ingress-0.4.0.zip` with its `.sha256`), which is what a deployment runs, is attached as usual.
+The ingress is deployed from this release's Function package, `personal-agent-teams-ingress-0.4.0.zip` with its
+`.sha256`. Its npm package, `@primusclaw/personal-agent-teams-ingress`, is not published to npm; its tarball is attached
+to the release like the others.
 
 ### Added
 
@@ -43,6 +45,11 @@ package's Trusted Publisher entry. Its tarball is attached to this release like 
   asking for an ingress of one's own (#739, #745).
 - `@primusclaw/personal-agent-teams`: a second entry, `@primusclaw/personal-agent-teams/connector-hosts`, the Bot
   Connector host rule alone, which the ingress imports (#739).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: help's "About answers and your data" can say what a
+  group's recent-messages context keeps (one point per line: what is kept, for how long, that it is never answered or
+  stored on its own, where it goes, and `/context off`), shown only where the deployment keeps those messages and its
+  chat app is granted them: the new setting `TEAMS_GROUP_CONTEXT_GRANTED=1`, off by default, so until a deployment sets
+  it help keeps its previous text (#742).
 
 ### Fixed
 
