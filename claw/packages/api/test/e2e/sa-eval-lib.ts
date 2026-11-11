@@ -1263,7 +1263,7 @@ export function turnsAnswered(says: readonly Say[], messageIds: readonly string[
 
 /**
  * What the server says in its own words when the turn answering the person ended without an answer: that the turn failed, that it was
- * declined, or that it looked things up and put nothing together (`turnLostNotice`, `silentTurnNotice` in
+ * declined, that the person stopped it, or that it looked things up and put nothing together (`turnLostNotice`, `silentTurnNotice` in
  * `src/assistant/router-turn-end.ts`; `test/sa-eval.test.ts` holds them to those). Published as a say like any other and not marked as
  * the system's, so they are known by their words.
  */
@@ -1274,6 +1274,8 @@ export const SYSTEM_TURN_NOTICES: ReadonlySet<string> = new Set([
   "I can't help with that request: it may involve reaching internal addresses, credentials or something else unsafe, so I did not do it. Ask something else or tell me what you want to achieve, and I'll help. Your work items are not affected.",
   "我查了一些资料，但这次没能整理出答复。请再问我一次，或者把问题说得具体一点。",
   "I looked into it but could not put an answer together this time. Please ask me again, or narrow the question down.",
+  "已停止。",
+  "Stopped.",
 ]);
 
 /**

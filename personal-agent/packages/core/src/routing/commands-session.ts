@@ -11,7 +11,7 @@ import type { HistorySession } from "../ports/store/sessions.js";
 import type { InboundAction } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
-import { chatTurnKey, type ActiveTurn } from "./turn-registry.js";
+import { chatTurnKey, type ActiveTurn, type TurnKey } from "./turn-registry.js";
 import type { TurnStarter } from "./turn-start.js";
 import { whenText, zoneOf } from "./time.js";
 import { createPrButton, repoButton } from "./views.js";
@@ -52,7 +52,7 @@ export class SessionCommands {
     const { remote, assistant } = this.ctx.deps;
     if (!scope && (await remote.stop(chat.sender, key, chat.conversation))) return; // (an attached agent is the one to stop)
     if (!scope && assistant.on(chat.sender.id)) {
-      await assistant.stop(chat.sender.id, key, chat.conversation); // (what the assistant does this moment)
+      await assistant.stop(chat.sender.id, key, chat.conversation, undefined, chat.lang()); // (what the assistant does this moment)
       return;
     }
     await this.stopTurn(chat, key, scope);
@@ -61,29 +61,39 @@ export class SessionCommands {
   /**
    * `/stop` of the turn on the chat's own session (not a remote agent's, not the assistant's). `only`: stop only while that
    * turn is the one running (a Stop card's turn), checked with no wait before the interrupt goes; false when it is not, and
-   * nothing was said or stopped.
+   * nothing was said or stopped. `/stop` (no `only`) also gives up the messages queued behind the running turn, and says so.
    */
   async stopTurn(chat: Chat, key: string, scope = "", only?: ActiveTurn): Promise<boolean> {
     const { store } = this.ctx.deps;
-    const turns = this.ctx.turns.of(chatTurnKey(chat.sender.id, scope));
-    const [turn] = turns;
+    const turnKey = chatTurnKey(chat.sender.id, scope);
+    const turn = this.running(turnKey);
     const sessionId = store.sessions.getSession(chat.sender.id, scope);
     if (only !== undefined && (turn !== only || only.over || sessionId === null)) return false;
-    await this.interrupt(chat, key, sessionId, turns);
+    // (before the interrupt: the running turn's end must not hand over to a message being given up)
+    const dropped = only === undefined ? this.ctx.turns.withdrawQueued(turnKey) : 0;
+    const droppedLine = dropped > 0 ? routingText.in(chat.lang()).queueDropped({ n: dropped }) : "";
+    await this.interrupt(chat, key, sessionId, this.running(turnKey), droppedLine);
     return true;
+  }
+
+  /** The chat's turn Claw runs now: the first one not stopped already (one queued behind a stopped turn goes at once). */
+  private running(key: TurnKey): ActiveTurn | undefined {
+    const turns = this.ctx.turns.of(key);
+    return turns.find((turn) => !turn.stopped.isSet) ?? turns[0];
   }
 
   private async interrupt(
     chat: Chat,
     key: string,
     sessionId: string | null,
-    turns: readonly ActiveTurn[],
+    turn: ActiveTurn | undefined,
+    droppedLine: string,
   ): Promise<void> {
     const { claw } = this.ctx.deps;
-    const [turn] = turns;
     const said = routingText.in(chat.lang());
+    const say = (line: string): Promise<void> => chat.say(line + droppedLine); // (what was given up is said with every answer)
     if (sessionId === null) {
-      await chat.say(said.nothingRunning);
+      await say(said.nothingRunning);
       return;
     }
     if (turn !== undefined) turn.stopRequested = true;
@@ -91,19 +101,22 @@ export class SessionCommands {
       // With no turn of mine Claw can still be busy on the session (syncing the workspace after an answer): that is the
       // person's to stop as well.
       if (turn === undefined && !(await claw.sessions.turn(key, sessionId)).running) {
-        await chat.say(said.nothingRunning);
+        await say(said.nothingRunning);
         return;
       }
       await claw.sessions.interrupt(key, sessionId);
-      if (turn !== undefined) turn.stopConfirmed = true;
+      if (turn !== undefined) {
+        turn.stopConfirmed = true;
+        turn.stopped.set();
+      }
     } catch (error) {
       if (!(error instanceof ClawError)) throw error;
       const gone = turn === undefined && error.status === 404; // (the session was deleted in the console)
-      await chat.say(gone ? said.nothingRunning : sessionText.in(chat.lang()).stopFailed({ status: error.status }));
+      await say(gone ? said.nothingRunning : sessionText.in(chat.lang()).stopFailed({ status: error.status }));
       return;
     }
-    if (turn === undefined) await chat.say(sessionText.in(chat.lang()).busyStopped);
-    else await chat.say(said.stopping + (turns.length > 1 ? said.stoppedNextRuns : ""));
+    if (turn === undefined) await say(sessionText.in(chat.lang()).busyStopped);
+    else await say(said.stopping);
   }
 
   /**

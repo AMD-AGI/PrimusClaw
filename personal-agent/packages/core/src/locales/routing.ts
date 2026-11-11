@@ -11,10 +11,18 @@ export const routingText = defineCatalog({
       "Send me a message to see how to connect.",
     onlyChats: "I only work in a one-to-one chat or a group chat. Open a chat with me directly.",
     stillWorking: "I am still working on your previous message. Send /stop to interrupt it.",
-    oneWaiting:
-      "One message is already waiting behind the running task; it runs as soon as that finishes. Send this one after " +
-      "it starts, or /stop to interrupt the running task.",
-    stoppedNextRuns: " The message you sent after it runs next; send /stop again to interrupt that one too.",
+    queuedBehind: (p: { n: number }) =>
+      (p.n === 1
+        ? "Got it. I am still working on your previous message; this one is queued and runs as soon as that is done."
+        : `Got it. This one is queued as number ${String(p.n)}; they run in order once your previous message is done.`) +
+      " /stop stops the running task and drops what is queued.",
+    queueFull: (p: { n: number }) =>
+      `${String(p.n)} messages already wait behind the running task, so this one was not queued. Send it once they have ` +
+      "run, or /stop to stop the running task and drop the queue.",
+    queueDropped: (p: { n: number }) =>
+      p.n === 1
+        ? " The message queued behind it was dropped too."
+        : ` The ${String(p.n)} messages queued behind it were dropped too.`,
     unlinkAsk:
       "`unlink` would disconnect this chat from your PrimusClaw account and delete the API key it uses. If you mean it, " +
       "send `/unlink`; otherwise nothing has changed.",
@@ -35,9 +43,15 @@ export const routingText = defineCatalog({
     notConnected: "这个聊天还没有连上 PrimusClaw 账号（或者我刚才没查到）。给我发一条消息，我告诉你怎么连。",
     onlyChats: "I only work in a one-to-one chat or a group chat. Open a chat with me directly.",
     stillWorking: "我还在处理你上一条消息。发 /stop 可以打断它。",
-    oneWaiting:
-      "已经有一条消息排在正在运行的任务后面，它一结束就运行。等它开始后再发这一条，或者发 /stop 打断正在运行的任务。",
-    stoppedNextRuns: "你之后发的那条消息接着运行；再发一次 /stop 可以把它也打断。",
+    queuedBehind: (p) =>
+      (p.n === 1
+        ? "收到。我还在处理你上一条消息，这条已排在后面，上一条处理完就接着处理它。"
+        : `收到。这条已排队（第 ${String(p.n)} 条），上一条处理完后按顺序处理。`) +
+      "发 /stop 会停下正在运行的任务，并撤回排队的消息。",
+    queueFull: (p) =>
+      `正在运行的任务后面已经排了 ${String(p.n)} 条消息，这条没有排上。等前面的处理完再发，或者发 /stop 停下并清空排队。`,
+    queueDropped: (p) =>
+      p.n === 1 ? "排在后面的那条消息也一起撤回了。" : `排在后面的 ${String(p.n)} 条消息也一起撤回了。`,
     unlinkAsk:
       "`unlink` 会断开这个聊天和你的 PrimusClaw 账号的连接，并删除它用的 API key。确定的话发 `/unlink`；否则什么都没变。",
     nothingRunning: "现在没有在运行的任务。",

@@ -252,6 +252,20 @@ it("stop interrupts what the assistant is doing and says how to stop a task", as
   assert.equal(lines[2], "I could not reach your assistant just now. Please try again in a moment.");
 });
 
+it("stop answers in the chat's language", async () => {
+  const w = world();
+  w.claw.running.add("asst-ak-alice");
+  await w.chat.stop(ALICE, "ak-alice", w.conversation, undefined, "zh");
+  await w.chat.stop(ALICE, "ak-alice", w.conversation, undefined, "zh");
+  w.claw.fail.set("turn", new ClawUnreachable("network", "turn"));
+  await w.chat.stop(ALICE, "ak-alice", w.conversation, undefined, "zh");
+  assert.deepEqual(said(w.surface.outbox), [
+    "已停下刚才在做的事。要停止某个任务，说「停止 #2」（编号见 /board），或者点它卡片下的「停止」。",
+    "我现在没有在忙。要停止某个任务，说「停止 #2」（编号见 /board），或者点它卡片下的「停止」。",
+    "暂时连不上你的助理，请稍后再试。",
+  ]);
+});
+
 it("a person the assistant understands sends with their token and model key and is told when it cannot be reached", async () => {
   const w = world({ understanding: new Set([ALICE]) });
   assert.equal(w.chat.understands(ALICE), true);

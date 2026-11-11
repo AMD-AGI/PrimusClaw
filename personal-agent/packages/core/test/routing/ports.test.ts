@@ -29,7 +29,7 @@ test("every command text and every fixed reply exists in both languages", () => 
     const zh = catalog.in("zh");
     assert.deepEqual(Object.keys(zh), Object.keys(en));
     for (const value of [...Object.values(en), ...Object.values(zh)])
-      assert.ok(typeof value === "string" && value !== "");
+      assert.ok(typeof value === "string" ? value !== "" : typeof value === "function" && value({ n: 2 }) !== "");
   }
   assert.ok(commandText.in("zh").repoUsage.startsWith("用法：") && commandText.in("en").repoUsage.startsWith("Use "));
   assert.ok(AGENT_USAGE.startsWith("Your agents on your own machines") && AGENT_USAGE.includes("/agent pair"));

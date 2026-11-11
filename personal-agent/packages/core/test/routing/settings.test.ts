@@ -195,7 +195,7 @@ test("/stop with no turn of mine interrupts a session that is busy on Claw, and 
   assert.equal(said(w).at(-1), "现在没有在运行的任务。");
 });
 
-test("a message sent while a turn runs waits for it to run and goes behind it; a third is refused", async () => {
+test("messages sent while a turn runs wait behind it, and /stop gives them up", async () => {
   const w = world();
   link(w, ALICE.id, "ak");
   let release = (): void => undefined;
@@ -210,14 +210,10 @@ test("a message sent while a turn runs waits for it to run and goes behind it; a
   await w.router.settled();
   assert.deepEqual(
     w.turns.calls.map((c) => c.at(-1)),
-    ["first", "second"],
+    ["first"],
   );
-  assert.ok(said(w).some((t) => t.startsWith("One message is already waiting behind the running task")));
-  assert.ok(
-    said(w).includes(
-      "Stopping the running task. The message you sent after it runs next; send /stop again to interrupt that one too.",
-    ),
-  );
+  assert.ok(said(w).some((t) => t.startsWith("Got it. This one is queued as number 2")));
+  assert.ok(said(w).includes("Stopping the running task. The 2 messages queued behind it were dropped too."));
 });
 
 test("the task limit refuses one task too many, in the person's language", async () => {

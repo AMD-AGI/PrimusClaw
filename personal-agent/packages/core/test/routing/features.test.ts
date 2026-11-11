@@ -30,8 +30,8 @@ function assistantWorld(understands = false) {
         stopped.push("board");
         return Promise.resolve();
       },
-      stop: () => {
-        stopped.push("stop");
+      stop: (_userId, _credential, _conversation, _only, lang) => {
+        stopped.push(`stop:${lang ?? ""}`);
         return Promise.resolve(true);
       },
       route: (request) => {
@@ -65,8 +65,17 @@ test("with the assistant on, a message goes to it; one it does not take is a tur
     said(w).filter((t) => t.startsWith("en:")),
     ["en: no sessions"],
   );
-  assert.deepEqual(stopped, ["board", "stop"]);
+  assert.deepEqual(stopped, ["board", "stop:en"]);
   assert.equal(routed[0]?.attached, undefined); // (no remote agents here: nothing said of what the chat is attached to)
+});
+
+test("with the assistant on, /stop is answered in the chat's language", async () => {
+  const { w, stopped } = assistantWorld();
+  link(w, ALICE.id, "ak");
+  await w.router.handle(message("帮我看一下今天的新闻有什么"));
+  await w.router.settled();
+  await w.router.handle(message("/stop"));
+  assert.deepEqual(stopped, ["stop:zh"]);
 });
 
 test("with the assistant on, /sessions shows the remote agents' sessions as /agents does; without remote agents it says why there are none", async () => {

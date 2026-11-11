@@ -10,6 +10,7 @@
  *   Q3 say refuses both with what to write instead, stores nothing, and lets the rewritten message through
  *   Q4 work_create tells the user at once that the item started, in their language, once, only for a turn that answers them
  *   Q5 a router turn its model answered with nothing is told to the user as declined, not as "did not go through"
+ *   Q5b a router turn the user stopped (`/stop`) is told as stopped, not as "did not go through, say it again"
  *   Q6 each router turn that answers the user logs how soon it was first heard, last heard, and whether it started an item
  *   Q7 the router's prompt says each of the rules of router-v10 and router-read-v7
  *   Q8 what the router can do is told from the tool catalog: each write of its servers, done by an item that asks first, never "read-only"
@@ -217,6 +218,28 @@ describe("router quality, through the tools", { skip }, () => {
     assert.equal(rows.at(-1)!.text, "刚才这条没有处理成功，请再说一次。进行中的事项不受影响。");
   });
 
+  test("Q5b a turn the user stopped is told as stopped, in their language; one the sweeper closed is still lost", async () => {
+    const stopped = async (prompt: string, fromSweeper = false) => {
+      const turn = await turnFor(prompt);
+      await w.closeRun(turn.task_id, "cancelled", undefined, 0);
+      return w.mod.routerTurnEnd.deliverUnsaidAnswer(
+        {
+          sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: false, interrupted: true, fromSweeper,
+          finalText: "[Request interrupted by user]",
+        } as never, w.sayDeps,
+      );
+    };
+    assert.equal(await stopped("帮我调研一下最近的 GPU 价格"), "said");
+    let rows = await says();
+    assert.equal(rows.at(-1)!.text, "已停止。");
+    assert.equal(await stopped("look into GPU prices for me"), "said");
+    rows = await says();
+    assert.equal(rows.at(-1)!.text, "Stopped.");
+    assert.equal(await stopped("看看节点", true), "said");
+    rows = await says();
+    assert.equal(rows.at(-1)!.text, "刚才这条没有处理成功，请再说一次。进行中的事项不受影响。");
+  });
+
   test("Q6 each router turn answering the user is timed: first and final reply, replies, items started", async () => {
     const turn = await turnFor("帮我修一下构建");
     await w.q("UPDATE claw_tasks SET created_at = NOW() - interval '3 seconds' WHERE task_id = $1", [turn.task_id]);
@@ -238,6 +261,18 @@ describe("router quality, through the tools", { skip }, () => {
 
 describe("router quality, pure", () => {
   // Imported here, not at the top: the modules read the configuration when first loaded, and the world below sets it first.
+  test("Q5c why a silent turn ended: stopped by the user, declined by the model, or failed", async () => {
+    const { lostWhy, turnLostNotice } = await import("../src/assistant/router-turn-end.js");
+    const end = { failed: false, interrupted: true, fromSweeper: false, finalText: "" };
+    assert.equal(lostWhy(end), "stopped");
+    assert.equal(lostWhy({ ...end, fromSweeper: true }), "failed");
+    assert.equal(lostWhy({ ...end, interrupted: false, failed: true }), "failed");
+    assert.equal(lostWhy({ ...end, interrupted: false, failed: true, finalText: "The model ended its turn without any text or tool call" }), "declined");
+    assert.equal(turnLostNotice(["帮我调研一下"], "stopped"), "已停止。");
+    assert.equal(turnLostNotice(["look into it"], "stopped"), "Stopped.");
+    assert.equal(turnLostNotice(["[work_event] a report"], "stopped"), null); // (a report's turn answers nobody)
+  });
+
   test("Q1 an item number without its title is found; one that names the item, or is not an item's, is not", async () => {
     const { bareItemNumbers } = await import("../src/assistant/internal-text.js");
     const bare = (text: string, except?: number) => bareItemNumbers(text, ITEMS, except).map((i) => i.seq);
