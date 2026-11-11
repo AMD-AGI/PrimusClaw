@@ -16,7 +16,8 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 ## 0.4.0
 
 A minor release: it adds the Teams ingress as a released part (#739; its deployable package runs on Node 24 by #745, and
-sends concurrently by #748). No plugin port (core's `src/plugins/`) changed, and the worker needs nothing new from Claw.
+sends concurrently by #748), and fixes what the 0.3.0 acceptance found (#747). No plugin port (core's `src/plugins/`)
+changed, and the worker needs nothing new from Claw.
 
 The ingress's npm package, `@primusclaw/personal-agent-teams-ingress`, is not on npm yet: its first publish waits for the
 package's Trusted Publisher entry. Its tarball is attached to this release like the others, and the Function package
@@ -49,22 +50,22 @@ package's Trusted Publisher entry. Its tarball is attached to this release like 
   person at most once in 24 hours, and never once they confirmed. 0.3.0 sent it after every such answer (one per turn,
   not once as its notes said): a second refused request the same day got the same card again. When it was last sent is
   kept in the store (`github_notices`, kind `identity_card`), so a restart or another replica does not send it sooner;
-  a card that could not be sent does not count. One card per turn at most still holds.
+  a card that could not be sent does not count. One card per turn at most still holds (#747).
 - `@primusclaw/personal-agent`: Claw's "on it" line (收到，我看一下。) that arrives after its turn has begun to answer is
   dropped. It used to take the receipt under the person's message, replace the reply streaming into it, and close it
   as the answer, so the reply came as a message of its own above it (the 0.3.0 acceptance, a refused settings change).
-  The line is known by its id (Claw's `lookupAckSayId`); it still closes a receipt in which nothing has been said yet.
+  The line is known by its id (Claw's `lookupAckSayId`); it still closes a receipt in which nothing has been said yet (#747).
 - `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the identity card's title, body, buttons and AI
   notice are in the person's language; before, a Chinese lead stood over English text and buttons. A lead a caller has
-  only in English keeps the whole card English. Pressing 我已确认 before confirming brings the card back in Chinese too.
+  only in English keeps the whole card English. Pressing 我已确认 before confirming brings the card back in Chinese too (#747).
 - `@primusclaw/personal-agent`: `/whoami` for a person connected only through an identity binding (no linked key) no
   longer tells them to send `/unlink`, which cannot remove a binding: it says the chat is connected through a SaFE
   identity binding and that the account's owner deletes it in SaFE under identity bindings (SaFE's administrator when
-  SaFE does not name the account). `/unlink`'s answer to such a person is now in Chinese for a Chinese speaker.
+  SaFE does not name the account). `/unlink`'s answer to such a person is now in Chinese for a Chinese speaker (#747).
 - `@primusclaw/personal-agent`: a turn the person stopped ends with the stop line in their language (已停止。 in a
   Chinese chat, group or 1:1; it was always the English "Stopped."), and no longer with a "Report a problem" card under
   it: a stop is what the person asked for. A stop Claw did not confirm on a turn that failed still says the failure and
-  keeps the card.
+  keeps the card (#747).
 
 ## 0.3.0
 
