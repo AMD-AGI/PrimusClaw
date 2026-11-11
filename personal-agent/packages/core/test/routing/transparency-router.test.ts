@@ -18,11 +18,9 @@ test("test_help_through_the_worker_in_a_1to1_chat_and_in_a_group", async () => {
   await w.router.handle(message("你能做什么", { id: "h2" }));
   await w.router.handle(message("what can you do", { id: "h3", kind: "group", conversation: "g-1" }));
   const [en = "", zh = "", group = ""] = said(w).slice(-3);
-  const kept = { messages: 30, hours: 4 }; // (the world keeps a group's recent messages, with the default settings)
+  // (the world keeps a group's messages but its app is not granted them, as the default: help says @mentions only)
   assert.ok(
-    en.includes(dataStatement("en", false, kept)) &&
-      zh.includes(dataStatement("zh", false, kept)) &&
-      group.includes(dataStatement("en", false, kept)),
+    en.includes(dataStatement("en")) && zh.includes(dataStatement("zh")) && group.includes(dataStatement("en")),
   );
   assert.ok(group.startsWith("**What Clawy can do for you**") && group.includes("@mention Clawy"));
 });

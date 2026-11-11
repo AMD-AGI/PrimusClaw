@@ -74,26 +74,32 @@ function plural(count: number, one: string): string {
 }
 
 /**
- * Only where the deployment keeps a group's recent messages (#725): what is kept, for how long, where, and how to stop it.
- * The worker's buffer is memory only, but what it holds goes into the asker's session with an @mention (as the turn's
+ * Only where the deployment keeps a group's recent messages (#725) and its app is granted them: what is kept, for how
+ * long, where it goes, and how to stop it; one short line each (help keeps every line short enough for a phone). The
+ * worker's buffer is memory only, but what it holds goes into the asker's session with an @mention (as the turn's
  * quote), and a session is kept as the statement's "how long" says: so "not stored on their own", never "never stored".
  * "May": a group whose mentions go to a remote agent (group-remote.ts) does not send them along.
  */
-export function groupContextLine(lang: Lang, kept: GroupContextKept): string {
+export function groupContextLines(lang: Lang, kept: GroupContextKept): readonly string[] {
+  const messages = String(kept.messages);
+  const hours = String(kept.hours);
   if (lang === "zh") {
-    return (
-      `群里授权我读取聊天消息后，我还会在内存里暂存该群最近 ${String(kept.messages)} 条、${String(kept.hours)} 小时内` +
-      "没 @我 的消息（不单独存库，也不回复）；有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。" +
-      "在群里 @我 /context off 可关闭。"
-    );
+    return [
+      `群里授权我读取聊天消息后，我还会在内存里暂存该群最近 ${messages} 条、${hours} 小时内没 @我 的消息。`,
+      "这些消息我不回复，也不单独存库。",
+      "有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。",
+      "不想让我暂存：在群里 @我 发 /context off。",
+    ];
   }
-  return (
-    "In a group that allows me to read its messages, I also keep its newest " +
-    `${plural(kept.messages, "message")} that ${kept.messages === 1 ? "does" : "do"} not @mention me, for up to ${plural(kept.hours, "hour")}, ` +
-    "in memory (not stored on their own, never answered). When someone @mentions me, they may go with that message, as " +
-    "untrusted background, into that person's session, and are then kept with it. " +
-    "@mention me with /context off in the group to turn it off."
-  );
+  return [
+    "In a group that allows me to read its messages, I also keep, in memory, its newest " +
+      `${plural(kept.messages, "message")} that ${kept.messages === 1 ? "does" : "do"} not @mention me, ` +
+      `for up to ${plural(kept.hours, "hour")}.`,
+    "I never answer them, and never store them on their own.",
+    "When someone @mentions me, they may go with that message, as untrusted background, into that person's session, " +
+      "and are kept with it.",
+    "To turn this off in a group, @mention me there with /context off.",
+  ];
 }
 
 /**
@@ -104,6 +110,6 @@ export function dataStatement(lang: string, remote = false, groupContext?: Group
   const chosen = toLang(lang);
   const lines = [...DATA_LINES[chosen]];
   if (remote) lines.splice(3, 0, REMOTE_LINE[chosen]); // (after "where it goes")
-  if (groupContext !== undefined) lines.splice(1, 1, SEES_LINE[chosen], groupContextLine(chosen, groupContext));
+  if (groupContext !== undefined) lines.splice(1, 1, SEES_LINE[chosen], ...groupContextLines(chosen, groupContext));
   return [`**${DATA_TITLE[chosen]}**`, ...lines.map((line) => `- ${line}`)].join("\n");
 }

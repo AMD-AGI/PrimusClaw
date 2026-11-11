@@ -20,10 +20,10 @@ function gmsg(text: string, options: { user?: typeof ALICE; mentioned?: boolean;
   return { ...m, mentioned: options.mentioned ?? true, targeted: options.targeted ?? false };
 }
 
-function setup(messages = DEFAULT_GROUP_CONTEXT.messages) {
+function setup(messages = DEFAULT_GROUP_CONTEXT.messages, granted = true) {
   const testStore = openTestStore();
   const context = new GroupContext({
-    settings: { ...DEFAULT_GROUP_CONTEXT, messages },
+    settings: { ...DEFAULT_GROUP_CONTEXT, messages, granted },
     clock: testStore.clock,
     mask: (t) => t,
     off: testStore.store.groupContext,
@@ -120,14 +120,20 @@ test("only /context is the command: the bare word is a word, more than one argum
 const OLD_SEES_ZH = "我能看到什么：只有你发给我的消息（群里只有 @我 的消息），以及你引用的消息和附上的文件。";
 const OLD_SEES_EN =
   "What I see: only the messages you send me (in a group, only those that @mention me), with any message you quote and any file you attach.";
-const KEPT_ZH =
-  "- 群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息（不单独存库，也不回复）；" +
-  "有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。在群里 @我 /context off 可关闭。";
-const KEPT_EN =
-  "- In a group that allows me to read its messages, I also keep its newest 30 messages that do not @mention me, " +
-  "for up to 4 hours, in memory (not stored on their own, never answered). When someone @mentions me, they may go " +
-  "with that message, as untrusted background, into that person's session, and are then kept with it. " +
-  "@mention me with /context off in the group to turn it off.";
+const KEPT_ZH = [
+  "- 群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息。",
+  "- 这些消息我不回复，也不单独存库。",
+  "- 有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。",
+  "- 不想让我暂存：在群里 @我 发 /context off。",
+].join("\n");
+const KEPT_EN = [
+  "- In a group that allows me to read its messages, I also keep, in memory, its newest 30 messages that do not " +
+    "@mention me, for up to 4 hours.",
+  "- I never answer them, and never store them on their own.",
+  "- When someone @mentions me, they may go with that message, as untrusted background, into that person's session, " +
+    "and are kept with it.",
+  "- To turn this off in a group, @mention me there with /context off.",
+].join("\n");
 
 test("where a group's recent messages are kept, help in a group and in a 1:1 chat says what, how long, and how to stop", async () => {
   const { w } = setup();
@@ -159,4 +165,13 @@ test("a group that said /context off is told, in its own help, that its @mention
   const [offGroup = "", otherGroup = ""] = said(w).slice(-2);
   assert.ok(offGroup.includes(`- ${OLD_SEES_EN}`) && !offGroup.includes(KEPT_EN), offGroup);
   assert.ok(otherGroup.includes(KEPT_EN) && !otherGroup.includes(OLD_SEES_EN), otherGroup); // (only that group)
+});
+
+test("where the chat app is not granted a group's other messages, help says the @mentions are all I see", async () => {
+  const { w } = setup(DEFAULT_GROUP_CONTEXT.messages, false);
+  await w.router.handle(gmsg("/help"));
+  await w.router.handle(message("你能做什么", { id: "h-zh" }));
+  const [group = "", zh = ""] = said(w).slice(-2);
+  assert.ok(group.includes(`- ${OLD_SEES_EN}`) && !group.includes("/context off"), group);
+  assert.ok(zh.includes(`- ${OLD_SEES_ZH}`) && !zh.includes("/context off"), zh);
 });

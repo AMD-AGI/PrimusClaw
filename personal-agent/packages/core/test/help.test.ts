@@ -64,13 +64,20 @@ test("test_each_line_is_short_enough_for_a_phone", () => {
       [true, false],
       [true, true],
     ] as const) {
-      const text = renderHelp(lang, {
-        parts: PARTS,
-        values: { quiet: "22:00-08:00", github: "未连接" },
-        assistant,
-        understanding,
-      });
-      for (const line of text.split("\n")) assert.ok(cpLength(line) <= limit, line);
+      // A group's recent messages kept (#725), at the default and at the largest settings, or not.
+      for (const groupContext of [undefined, { messages: 30, hours: 4 }, { messages: 200, hours: 24 }]) {
+        for (const group of [false, true]) {
+          const text = renderHelp(lang, {
+            group,
+            parts: PARTS,
+            values: { quiet: "22:00-08:00", github: "未连接" },
+            assistant,
+            understanding,
+            ...(groupContext === undefined ? {} : { groupContext }),
+          });
+          for (const line of text.split("\n")) assert.ok(cpLength(line) <= limit, line);
+        }
+      }
     }
   }
 });

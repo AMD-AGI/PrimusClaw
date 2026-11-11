@@ -177,7 +177,7 @@ export interface GroupHistory {
   record(message: InboundMessage): void;
   /** The chat's kept messages as background for a turn ("" none). */
   background(chatId: string): string;
-  /** How much a chat keeps, for help to say (undefined: the deployment keeps nothing, or `chatId` turned it off). */
+  /** How much a chat keeps, for help to say (undefined: nothing arrives or is kept, or `chatId` turned it off). */
   kept(chatId?: string): GroupContextKept | undefined;
 }
 

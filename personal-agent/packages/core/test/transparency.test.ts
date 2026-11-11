@@ -14,7 +14,7 @@ import {
   DATA_LINES,
   DATA_TITLE,
   dataStatement,
-  groupContextLine,
+  groupContextLines,
   REMOTE_LINE,
   SEES_LINE,
 } from "../src/locales/transparency.js";
@@ -74,27 +74,30 @@ test("test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_t
 
 test("where a group's recent messages are kept, the data statement says what, for how long, where, and how to stop it", () => {
   const kept = { messages: 30, hours: 4 };
-  assert.equal(
-    groupContextLine("zh", kept),
-    "群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息（不单独存库，也不回复）；" +
-      "有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。在群里 @我 /context off 可关闭。",
-  );
-  assert.equal(
-    groupContextLine("en", kept),
-    "In a group that allows me to read its messages, I also keep its newest 30 messages that do not @mention me, " +
-      "for up to 4 hours, in memory (not stored on their own, never answered). When someone @mentions me, they may " +
-      "go with that message, as untrusted background, into that person's session, and are then kept with it. " +
-      "@mention me with /context off in the group to turn it off.",
-  );
-  const one = groupContextLine("en", { messages: 1, hours: 1 });
-  assert.ok(one.includes("newest 1 message that does not @mention me, for up to 1 hour,"), one);
+  assert.deepEqual(groupContextLines("zh", kept), [
+    "群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息。",
+    "这些消息我不回复，也不单独存库。",
+    "有人 @我 时，它们可能作为不可信的背景随那条消息进入 TA 的会话，并和会话一起保留。",
+    "不想让我暂存：在群里 @我 发 /context off。",
+  ]);
+  assert.deepEqual(groupContextLines("en", kept), [
+    "In a group that allows me to read its messages, I also keep, in memory, its newest 30 messages that do not " +
+      "@mention me, for up to 4 hours.",
+    "I never answer them, and never store them on their own.",
+    "When someone @mentions me, they may go with that message, as untrusted background, into that person's session, " +
+      "and are kept with it.",
+    "To turn this off in a group, @mention me there with /context off.",
+  ]);
+  const [one = ""] = groupContextLines("en", { messages: 1, hours: 1 });
+  assert.ok(one.endsWith("its newest 1 message that does not @mention me, for up to 1 hour."), one);
   for (const lang of ["en", "zh"] as const) {
+    const added = groupContextLines(lang, kept).map((line) => `- ${line}`);
     for (const remote of [false, true]) {
       const lines = dataStatement(lang, remote, kept).split("\n");
       const old = dataStatement(lang, remote).split("\n");
-      // The one "what I see" line becomes two, in its place; every other line is as before.
-      assert.deepEqual(lines.slice(2, 4), [`- ${SEES_LINE[lang]}`, `- ${groupContextLine(lang, kept)}`]);
-      assert.deepEqual([...lines.slice(0, 2), ...lines.slice(4)], [...old.slice(0, 2), ...old.slice(3)]);
+      // The one "what I see" line becomes these, in its place; every other line is as before.
+      assert.deepEqual(lines.slice(2, 3 + added.length), [`- ${SEES_LINE[lang]}`, ...added]);
+      assert.deepEqual([...lines.slice(0, 2), ...lines.slice(3 + added.length)], [...old.slice(0, 2), ...old.slice(3)]);
       assert.equal(old[2], `- ${DATA_LINES[lang][1] ?? ""}`);
     }
     // Off (the default): the statement, and help, keep a group's @mentions as all it sees.

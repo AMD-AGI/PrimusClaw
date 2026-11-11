@@ -28,9 +28,20 @@ export interface GroupContextSettings {
   readonly maxAgeSeconds: number;
   /** The longest text kept of one message (code points). */
   readonly messageChars: number;
+  /**
+   * The deployment's chat app asks for the permission that delivers a group's other messages (Teams:
+   * ChatMessage.Read.Chat), so help says what is kept. Without it no such message arrives and help keeps the words
+   * "only the @mentions".
+   */
+  readonly granted: boolean;
 }
 
-export const DEFAULT_GROUP_CONTEXT: GroupContextSettings = { messages: 30, maxAgeSeconds: 4 * 3600, messageChars: 500 };
+export const DEFAULT_GROUP_CONTEXT: GroupContextSettings = {
+  messages: 30,
+  maxAgeSeconds: 4 * 3600,
+  messageChars: 500,
+  granted: false,
+};
 
 /** The most chats kept at once: past it, the chat that heard nothing for longest is dropped. */
 export const MAX_CHATS = 2000;
@@ -87,9 +98,13 @@ export class GroupContext {
     return this.deps.settings.messages > 0;
   }
 
-  /** How much a chat keeps, as help says it (undefined when the deployment keeps nothing, or `chatId` turned it off). */
+  /**
+   * How much a chat keeps, as help says it: undefined when the deployment keeps nothing, its app is not granted the
+   * group's other messages (so none arrives), or `chatId` turned it off.
+   */
   kept(chatId?: string): GroupContextKept | undefined {
-    if (!this.enabled || (chatId !== undefined && this.deps.off.contextOff(chatId))) return undefined;
+    if (!this.enabled || !this.deps.settings.granted) return undefined;
+    if (chatId !== undefined && this.deps.off.contextOff(chatId)) return undefined;
     return { messages: this.deps.settings.messages, hours: this.deps.settings.maxAgeSeconds / 3600 };
   }
 
