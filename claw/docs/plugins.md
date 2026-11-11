@@ -456,7 +456,9 @@ accepts; otherwise the answer is `400 plugin_overrides_invalid` with a
 app run the overrides are applied to a copy of the plugin's manifest, which must
 still validate (a platform-reserved variable such as `LD_PRELOAD` stays
 refused, reported as `issues`); `overrides.image` together with
-`resources.image` is refused (give the image once). The plugin row itself is
+`resources.image` is refused (give the image once), and a plugin that declares
+`image` holds `resources.image` to the same list (a plugin that declares nothing
+keeps accepting any `resources.image`, as before). The plugin row itself is
 never changed by a launch.
 
 ### Audit

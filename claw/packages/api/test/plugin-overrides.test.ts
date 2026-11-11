@@ -26,6 +26,7 @@
  *   A1 an app run with overrides stores the effective manifest and an audit record
  *   A2 an app run's undeclared or reserved override is 400 and writes nothing
  *   A3 the Idempotency-Key hash is unchanged for a request without overrides
+ *   A4 a plugin that declares its image holds resources.image to the same list; one that does not, does not
  *   T1 a single task with overrides gets the model and image, with an audit record
  *   T2 a single task's override without a plugin, or with a DAG, is refused
  */
@@ -373,6 +374,27 @@ describe("plugin overrides against Postgres", { skip }, () => {
     assert.equal(appRunRequestHash(body), appRunRequestHash({ ...body, overrides: null }));
     assert.notEqual(appRunRequestHash(body), appRunRequestHash({ ...body, overrides: { model: "m" } }));
     assert.notEqual(appRunRequestHash({ ...body, overrides: { model: "a" } }), appRunRequestHash({ ...body, overrides: { model: "b" } }));
+  });
+
+  // A4
+  test("a declared image list also holds resources.image; an undeclared plugin's stays free", async () => {
+    const outside = await post("s1", {
+      mode: "app", plugin_id: declared, input: { x: 1 }, resources: { ...GOOD_RES, image: "registry.example.invalid/elsewhere:1" },
+    });
+    assert.equal(outside.statusCode, 400, outside.body);
+    assert.equal(outside.json().error, "plugin_overrides_invalid");
+    assert.match(JSON.stringify(outside.json().problems), /resources\.image/);
+    assert.equal(await count("claw_tasks"), 0);
+
+    const listed = await post("s1", { mode: "app", plugin_id: declared, input: { x: 1 }, resources: { ...GOOD_RES, image: IMAGES[1]!.repo } });
+    assert.equal(listed.statusCode, 200, listed.body);
+    const t = (await q("SELECT sandbox_spec FROM claw_tasks WHERE task_id = $1", [listed.json().task_id])).rows[0] as any;
+    assert.equal(t.sandbox_spec.image, IMAGES[1]!.repo);
+
+    const free = await post("s2", {
+      mode: "app", plugin_id: undeclared, input: { x: 1 }, resources: { ...GOOD_RES, image: "registry.example.invalid/elsewhere:1" },
+    });
+    assert.equal(free.statusCode, 200, free.body);
   });
 
   // T1

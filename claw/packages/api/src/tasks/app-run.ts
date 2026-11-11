@@ -411,6 +411,18 @@ export async function checkAppRunRequest(
   // (an override cannot set a variable the platform reserves, for one).
   const checkedOverrides = checkOverrides(req.body.overrides, row, "app");
   if (!checkedOverrides.ok) return refuse(400, "plugin_overrides_invalid", { problems: checkedOverrides.problems });
+  // A plugin that declares its image overridable has said which images it runs
+  // on, and `resources.image` (which predates declarations and stays free for
+  // a plugin that declares nothing) is held to the same list.
+  const requestedImage = isPlainObject(req.body.resources) ? req.body.resources.image : undefined;
+  if (requestedImage !== undefined && storedOverridable(row.overridable).image !== undefined) {
+    const viaDeclaration = checkOverrides({ image: requestedImage }, row, "app");
+    if (!viaDeclaration.ok) {
+      return refuse(400, "plugin_overrides_invalid", {
+        problems: viaDeclaration.problems.map((p) => ({ ...p, field: p.field.replace(/^overrides\.image/, "resources.image") })),
+      });
+    }
+  }
   let overrides: { values: OverrideValues; audit: Record<string, unknown> } | undefined;
   if (hasOverrides(checkedOverrides.values)) {
     const values = checkedOverrides.values;
