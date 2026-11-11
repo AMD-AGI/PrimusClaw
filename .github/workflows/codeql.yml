@@ -3,8 +3,12 @@
 
 name: CodeQL
 
-# PR/push on all branches: skip when all changes match paths-ignore (doc-only).
-# Weekly schedule still runs on the default branch for full analysis.
+# Pull requests always run, documentation-only ones included: the main
+# ruleset's "Require code scanning results" rule (tool CodeQL) blocks a pull
+# request until CodeQL has reported an analysis for it, and a workflow skipped
+# by a paths filter reports nothing, so a doc-only pull request could never
+# merge. Pushes to main/deploy/** still skip doc-only commits; the weekly
+# schedule runs a full analysis on the default branch.
 on:
   push:
     # main and the deploy/* branches only: every other branch reaches CI as a
@@ -21,14 +25,8 @@ on:
       - "COPYRIGHT"
       - "CODEOWNERS"
       - ".gitattributes"
+  # No paths filter here: see the comment at the top of the file.
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE*"
-      - "COPYRIGHT"
-      - "CODEOWNERS"
-      - ".gitattributes"
   schedule:
     - cron: '0 6 * * 1'
 
