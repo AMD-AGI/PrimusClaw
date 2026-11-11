@@ -249,3 +249,18 @@ test("review round 2: an answer's extra fields are shown, and markup-heavy conte
   assert.ok(Buffer.byteLength(JSON.stringify(slashes)) < 28_000);
   assert.deepEqual(ids(slashes), []);
 });
+
+test("review round 3: many short answers count what each element adds, so the card still fits and is not approvable", () => {
+  const answers = Array.from({ length: 420 }, (_, i) => ({ label: `o${String(i)}`, description: "d" }));
+  const q = card({
+    action_id: "q3",
+    origin: "terminal",
+    kind: "question",
+    tool: "Pick",
+    input: { question: "Pick", options: answers },
+    options: [{ optionId: "a0", name: "o0", kind: "allow_once" }],
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(q)) < 28_000, String(Buffer.byteLength(JSON.stringify(q))));
+  assert.deepEqual(ids(q), []);
+  assert.match(all(q), /approve it at the terminal/);
+});

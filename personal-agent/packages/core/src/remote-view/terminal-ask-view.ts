@@ -197,9 +197,14 @@ function inert(s: TerminalSection, left: number): TerminalSection {
 }
 
 const UTF8 = new TextEncoder();
+/**
+ * What one section costs a card beyond its text: the element it is drawn as (`{"type":"TextBlock","text":...,"wrap":true,...}`,
+ * an answer's bold and dash). Counted so that many short sections (hundreds of answers) cannot outgrow the card either.
+ */
+const SECTION_OVERHEAD = 128;
 /** What a section adds to the card as sent: its rendered text as JSON (escaping counted), in UTF-8 bytes. */
 const renderedBytes = (s: TerminalSection): number =>
-  UTF8.encode(JSON.stringify(s.type === "option" ? [s.label, s.description] : s.text)).length;
+  SECTION_OVERHEAD + UTF8.encode(JSON.stringify(s.type === "option" ? [s.label, s.description] : s.text)).length;
 
 /**
  * The sections as the card shows them, and whether all of them fit whole: at most TERMINAL_CONTENT_MAX characters of the
