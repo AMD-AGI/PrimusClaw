@@ -251,7 +251,7 @@ test("parseMultiNodePromptFlags reads flags wrapped in markdown backticks", () =
 
 test("parseMultiNodePromptFlags closes an escaped-quote server-args value", () => {
   const spec = parseMultiNodePromptFlags(
-    '--nodes 2 --mn-backend atom --server-args \\"--mem-fraction-static 0.8\\" --model /models/Qwen3-14B-FP8',
+    '--nodes 2 --mn-backend atomesh --server-args \\"--mem-fraction-static 0.8\\" --model /models/Qwen3-14B-FP8',
   );
   assert.ok(spec);
   assert.equal(spec.serverArgs, "--mem-fraction-static 0.8");
@@ -302,12 +302,12 @@ test("parseMultiNodePromptFlags accepts sglangrouter and still requires --model"
   assert.throws(() => assertMultiNodeModel(missing), /model is required/);
 });
 
-test("parseMultiNodePromptFlags accepts atom and still requires --model", () => {
+test("parseMultiNodePromptFlags reads atom as atomesh and still requires --model", () => {
   const spec = parseMultiNodePromptFlags(
     "--nodes 2 --mn-backend atom --model /models/Qwen3-14B-FP8 --pd-transfer-backend mooncake --pd-mode disaggregated",
   );
   assert.ok(spec);
-  assert.equal(spec.backend, "atom");
+  assert.equal(spec.backend, "atomesh");
   assert.equal(spec.kvTransferBackend, "mooncake");
   assert.doesNotThrow(() => assertMultiNodeModel(spec));
   const missing = parseMultiNodePromptFlags(
@@ -317,20 +317,20 @@ test("parseMultiNodePromptFlags accepts atom and still requires --model", () => 
   assert.throws(() => assertMultiNodeModel(missing), /model is required/);
 });
 
-test("atom and sglangrouter default to disaggregated mooncake", () => {
-  const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom --model /models/m");
+test("atomesh and sglangrouter default to disaggregated mooncake", () => {
+  const spec = parseMultiNodePromptFlags("--nodes 2 --mn-backend atomesh --model /models/m");
   assert.ok(spec);
   assert.equal(spec.pdMode, "disaggregated");
   assert.equal(spec.kvTransferBackend, "mooncake");
   assert.doesNotThrow(() => assertMultiNodeModel(spec));
-  const declared = specFromTopology({ nodes: 2, backend: "atom", model: "/m" });
+  const declared = specFromTopology({ nodes: 2, backend: "atomesh", model: "/m" });
   assert.equal(declared.pdMode, "disaggregated");
   assert.equal(declared.kvTransferBackend, "mooncake");
 });
 
-test("assertMultiNodeModel rejects an explicit aggregated pd-mode for atom", () => {
+test("assertMultiNodeModel rejects an explicit aggregated pd-mode for atomesh", () => {
   const spec = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
+    "--nodes 2 --mn-backend atomesh --model /models/m --pd-mode aggregated",
   );
   assert.ok(spec);
   assert.equal(spec.pdMode, "aggregated");
@@ -357,27 +357,27 @@ function failureCode(run: () => void): string | undefined {
 test("model and shape refusals carry a code that does not depend on the message", () => {
   const infera = parseMultiNodePromptFlags("--nodes 2 --mn-backend infera");
   assert.equal(failureCode(() => assertMultiNodeModel(infera!)), "infera_model_missing");
-  const atom = parseMultiNodePromptFlags("--nodes 2 --mn-backend atom");
+  const atom = parseMultiNodePromptFlags("--nodes 2 --mn-backend atomesh");
   assert.equal(failureCode(() => assertMultiNodeModel(atom!)), "mn_model_missing");
   const sglang = parseMultiNodePromptFlags("--nodes 2 --mn-backend sglangrouter");
   assert.equal(failureCode(() => assertMultiNodeModel(sglang!)), "mn_model_missing");
   assert.equal(
-    failureCode(() => resolveTopology({ topology: { nodes: 2, backend: "atom" } })),
+    failureCode(() => resolveTopology({ topology: { nodes: 2, backend: "atomesh" } })),
     "mn_model_missing",
   );
   const aggregated = parseMultiNodePromptFlags(
-    "--nodes 2 --mn-backend atom --model /models/m --pd-mode aggregated",
+    "--nodes 2 --mn-backend atomesh --model /models/m --pd-mode aggregated",
   );
   assert.equal(failureCode(() => assertMultiNodeModel(aggregated!)), "mn_config_invalid");
   assert.equal(
     failureCode(() => resolveTopology({
-      topology: { nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 },
+      topology: { nodes: 4, backend: "atomesh", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 },
     })),
     "mn_config_invalid",
   );
   assert.equal(
     failureCode(() => resolveTopology({
-      topology: { nodes: 2, backend: "atom", model: "/m", pd_prefill_tp: 16 },
+      topology: { nodes: 2, backend: "atomesh", model: "/m", pd_prefill_tp: 16 },
     })),
     "mn_config_invalid",
   );

@@ -337,7 +337,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     const displayName = multiNodeWorkloadName(messageId, spec.backend);
     // Derived rather than random, so adopting a redelivered message's workload
     // reproduces the key its pods already trust (see sandbox/multi-node/ssh-key.ts).
-    const keypair = spec.backend === "infera"
+    const keypair = spec.backend !== "rayjob"
       ? deriveSessionKeypair(AUTH_INTERNAL_TOKEN, `${sessionId}:${messageId}`, `primus-claw-${sessionId}`)
       : null;
 
@@ -601,7 +601,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
       });
-    } else if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+    } else if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
       const pd = {
         ...common,
         model: spec.model,
@@ -616,8 +616,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillExtraArgs: spec.pdPrefillExtraArgs,
         pdDecodeExtraArgs: spec.pdDecodeExtraArgs,
         pdIbDevice: spec.pdIbDevice,
+        sshAuthorizedKey: keypair?.authorizedKey,
+        sshPortBase: inferaSshPortBase(displayName),
       };
-      body = spec.backend === "atom" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
+      body = spec.backend === "atomesh" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {
       body = buildRayJobWorkloadBody(common);
     }
@@ -713,9 +715,9 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       isReady: (detail) => {
         if (String(detail.phase ?? "").toLowerCase() !== "running") return false;
         // Atom and SGLangRouter report Running only after router, prefill and
-        // decode are all up, so the phase is the readiness signal. Infera still
-        // needs live pod IPs.
-        if (spec.backend !== "infera") return true;
+        // decode are all up; their pod IPs are still needed for the SSH handoff.
+        // Infera needs live pod IPs as well.
+        if (spec.backend === "rayjob") return true;
         return gpuPodsReady(
           discoverRolePods(detail, spec.pdMode, inferaSshPortBase(displayName)),
           spec.pdMode,
@@ -801,12 +803,20 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       };
     }
 
-    if (spec.backend === "atom" || spec.backend === "sglangrouter") {
+    if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
+      const sshPort = inferaSshPortBase(displayName);
+      const groups = discoverRolePods(detail, "disaggregated", sshPort);
       return {
         ...base,
         serviceUrl: `http://${host}:${ATOM_ROUTER_PORT}`,
         prefillUrl: `http://${workloadId}-prefill.${namespace}.svc.cluster.local:${PD_ENGINE_PREFILL_PORT}`,
         decodeUrl: `http://${workloadId}-decode.${namespace}.svc.cluster.local:${PD_ENGINE_DECODE_PORT}`,
+        sshPrivateKey: keypair?.privateKeyPem,
+        sshKeyPath: SANDBOX_SSH_KEY_PATH,
+        sshPortBase: sshPort,
+        routerIps: groups.frontend.map((p) => p.podIp),
+        prefillIps: groups.prefill.map((p) => p.podIp),
+        decodeIps: groups.decode.map((p) => p.podIp),
       };
     }
 

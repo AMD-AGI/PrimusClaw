@@ -29,7 +29,7 @@ const MAX_NAME_LEN = 63;
 const MULTI_NODE_NAME_SUFFIX: Record<TopologyBackend, string> = {
   rayjob: "-ray",
   infera: "-infera",
-  atom: "-atom",
+  atomesh: "-atom",
   sglangrouter: "-sglangrouter",
 };
 

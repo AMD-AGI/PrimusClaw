@@ -16,14 +16,15 @@
  * never carries them and a restore never overwrites them.
  *
  * Only the block of the active backend is present: `ray` for `rayjob`, `infera`
- * for `infera`. `atom` and `sglangrouter` carry the router service and no
- * control-plane block. Optional fields are omitted when Claw has no value for
- * them rather than written as empty strings.
+ * for `infera`, and an optional `cluster` for `atomesh` and `sglangrouter`, which
+ * carries the SSH control plane of their prefill and decode pods. Optional
+ * fields are omitted when Claw has no value for them rather than written as
+ * empty strings.
  */
 
 export const TOPOLOGY_HANDOFF_SCHEMA = "topology-handoff/v1" as const;
 
-export type TopologyHandoffBackend = "rayjob" | "infera" | "atom" | "sglangrouter";
+export type TopologyHandoffBackend = "rayjob" | "infera" | "atomesh" | "sglangrouter";
 
 export interface TopologyHandoffRay {
   head_ip?: string;
@@ -40,6 +41,19 @@ export interface TopologyHandoffInfera {
   worker_ips: string[];
 }
 
+/** SSH control plane of an `atomesh` or `sglangrouter` cluster. */
+export interface TopologyHandoffCluster {
+  /** File holding the SSH private key (mode 0600). Never the key itself. */
+  ssh_key_file?: string;
+  /** sshd port shared by every router, prefill and decode pod. */
+  ssh_port?: number;
+  /** File ssh may record and read host keys in. */
+  known_hosts_file?: string;
+  router_ips?: string[];
+  prefill_ips?: string[];
+  decode_ips?: string[];
+}
+
 export interface TopologyHandoffV1 {
   schema: typeof TOPOLOGY_HANDOFF_SCHEMA;
   backend: TopologyHandoffBackend;
@@ -48,6 +62,7 @@ export interface TopologyHandoffV1 {
   service_url: string;
   ray?: TopologyHandoffRay;
   infera?: TopologyHandoffInfera;
+  cluster?: TopologyHandoffCluster;
 }
 
 const IP_LIST = { type: "array", items: { type: "string", minLength: 1 } } as const;
@@ -63,14 +78,14 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
   allOf: [
     {
       if: { properties: { backend: { const: "rayjob" } } },
-      then: { required: ["ray"], not: { required: ["infera"] } },
+      then: { required: ["ray"], not: { anyOf: [{ required: ["infera"] }, { required: ["cluster"] }] } },
     },
     {
       if: { properties: { backend: { const: "infera" } } },
-      then: { required: ["infera"], not: { required: ["ray"] } },
+      then: { required: ["infera"], not: { anyOf: [{ required: ["ray"] }, { required: ["cluster"] }] } },
     },
     {
-      if: { properties: { backend: { const: "atom" } } },
+      if: { properties: { backend: { const: "atomesh" } } },
       then: { not: { anyOf: [{ required: ["ray"] }, { required: ["infera"] }] } },
     },
     {
@@ -80,7 +95,7 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
   ],
   properties: {
     schema: { const: TOPOLOGY_HANDOFF_SCHEMA },
-    backend: { enum: ["rayjob", "infera", "atom", "sglangrouter"] },
+    backend: { enum: ["rayjob", "infera", "atomesh", "sglangrouter"] },
     nodes: { type: "integer", minimum: 1 },
     gpus_per_node: { type: "integer", minimum: 1 },
     service_url: { type: "string", minLength: 1 },
@@ -102,6 +117,18 @@ export const TOPOLOGY_HANDOFF_JSON_SCHEMA = {
         prefill_ips: IP_LIST,
         decode_ips: IP_LIST,
         worker_ips: IP_LIST,
+      },
+    },
+    cluster: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ssh_key_file: { type: "string", minLength: 1 },
+        ssh_port: { type: "integer", minimum: 1, maximum: 65535 },
+        known_hosts_file: { type: "string", minLength: 1 },
+        router_ips: IP_LIST,
+        prefill_ips: IP_LIST,
+        decode_ips: IP_LIST,
       },
     },
   },
@@ -152,7 +179,7 @@ export function validateTopologyHandoff(value: unknown): string[] {
         break;
       case "backend":
         if (!S.properties.backend.enum.includes(v as never)) {
-          problems.push("backend: must be rayjob, infera, atom, or sglangrouter");
+          problems.push("backend: must be rayjob, infera, atomesh, or sglangrouter");
         }
         break;
       case "nodes":
@@ -174,6 +201,13 @@ export function validateTopologyHandoff(value: unknown): string[] {
           else str(`infera.${ik}`, iv);
         });
         break;
+      case "cluster":
+        checkObject("cluster.", v, S.properties.cluster, (ck, cv) => {
+          if (ck === "ssh_port") int("cluster.ssh_port", cv, 1, 65535);
+          else if (ck.endsWith("_ips")) list(`cluster.${ck}`, cv);
+          else str(`cluster.${ck}`, cv);
+        });
+        break;
     }
   });
   // Backend/block consistency (the schema's allOf). Only checked once the
@@ -181,9 +215,11 @@ export function validateTopologyHandoff(value: unknown): string[] {
   if (isObj(value) && (value.backend === "rayjob" || value.backend === "infera")) {
     const [want, other] = value.backend === "rayjob" ? (["ray", "infera"] as const) : (["infera", "ray"] as const);
     if (!Object.hasOwn(value, want)) problems.push(`${want}: required when backend is ${value.backend}`);
-    if (Object.hasOwn(value, other)) problems.push(`${other}: not allowed when backend is ${value.backend}`);
+    for (const block of [other, "cluster"] as const) {
+      if (Object.hasOwn(value, block)) problems.push(`${block}: not allowed when backend is ${value.backend}`);
+    }
   }
-  if (isObj(value) && (value.backend === "atom" || value.backend === "sglangrouter")) {
+  if (isObj(value) && (value.backend === "atomesh" || value.backend === "sglangrouter")) {
     for (const block of ["ray", "infera"] as const) {
       if (Object.hasOwn(value, block)) problems.push(`${block}: not allowed when backend is ${value.backend}`);
     }

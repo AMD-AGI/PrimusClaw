@@ -333,7 +333,7 @@ test("buildAtomWorkloadBody creates router, prefill and decode from the prompt s
   assert.equal(body.images.length, 3);
   assert.equal(body.service.port, 8000);
   assert.equal(body.service.targetPort, 8000);
-  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atom");
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atomesh");
   assert.equal(body.env.NCCL_IB_GID_INDEX, "1");
   assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
   assert.equal(body.inferaOptions, undefined);
@@ -462,6 +462,95 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.match(decode, /--disaggregation-mode decode/);
   assert.equal(prefill.includes("atomesh"), false);
   assert.equal(decode.includes("atomesh"), false);
+});
+
+test("PD entrypoints run the server detached and hold the waited pid", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "( setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "( setsid python3 -m sglang_router.launch_router"],
+  ] as const) {
+    for (const sshAuthorizedKey of ["", "ssh-ed25519 AAAATEST primus-claw-sess-1"]) {
+      const body = build({
+        ...COMMON,
+        model: "/models/m",
+        framework: "sglang",
+        kvTransferBackend: "mooncake",
+        pdMode: "disaggregated",
+        sshAuthorizedKey,
+        sshPortBase: 25032,
+      }) as Record<string, any>;
+      const [router, prefill, decode] = body.entryPoints.map(decodeEp);
+      assert.ok(router.includes(routerCommand), router);
+      assert.match(router, /< \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+      for (const ep of [prefill, decode]) {
+        assert.match(ep, /\n\( setsid "\$\{args\[@\]\}" < \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+      }
+      for (const ep of [router, prefill, decode]) {
+        const execs = ep.split("\n").filter((line) => line.startsWith("exec "));
+        assert.deepStrictEqual(execs, ["exec tail -f /dev/null"], ep);
+      }
+    }
+  }
+});
+
+test("PD entrypoints start sshd on the shared port before the server when a key is given", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "setsid python3 -m sglang_router.launch_router"],
+  ] as const) {
+    const body = build({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+      sshAuthorizedKey: "ssh-ed25519 AAAATEST primus-claw-sess-1",
+      sshPortBase: 25032,
+    }) as Record<string, any>;
+    assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, "ssh-ed25519 AAAATEST primus-claw-sess-1");
+    assert.equal(body.env.MN_SSH_PORT, "25032");
+    const router = decodeEp(body.entryPoints[0]);
+    assert.ok(router.startsWith("set -euo pipefail\n"), router);
+    const routerSshd = router.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+    assert.ok(routerSshd >= 0, router);
+    assert.ok(routerSshd < router.indexOf(routerCommand), router);
+    for (const ep of [decodeEp(body.entryPoints[1]), decodeEp(body.entryPoints[2])]) {
+      const sshd = ep.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+      assert.ok(sshd >= 0, ep);
+      assert.ok(sshd < ep.indexOf("sglang.launch_server"));
+      assert.match(ep, /PasswordAuthentication=no/);
+      assert.match(ep, /WARN: sshd/);
+    }
+  }
+});
+
+test("PD entrypoints carry no sshd without a key", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.env.MN_SSH_PORT, undefined);
+  assert.equal(decodeEp(body.entryPoints[0]).includes("sshd"), false);
+  assert.equal(decodeEp(body.entryPoints[1]).includes("sshd"), false);
+});
+
+test("discoverRolePods groups SGLangRouter pods by role name", () => {
+  const workload = {
+    pods: [
+      { podId: "claw-1-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running", resourceId: 0 },
+      { podId: "claw-1-prefill-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
+      { podId: "claw-1-decode-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
+    ],
+  };
+  const groups = discoverRolePods(workload, "disaggregated", 25032);
+  assert.deepStrictEqual(groups.frontend.map((p) => p.podIp), ["172.16.6.11"]);
+  assert.deepStrictEqual(groups.prefill.map((p) => p.podIp), ["10.235.225.141"]);
+  assert.deepStrictEqual(groups.decode.map((p) => p.podIp), ["10.235.225.70"]);
+  assert.equal(gpuPodsReady(groups, "disaggregated"), true);
 });
 
 test("buildAtomWorkloadBody rejects a missing model", () => {

@@ -67,19 +67,23 @@ test("sglangrouter without a model is refused at declaration time", () => {
   ok({ nodes: 2, backend: "sglangrouter", model: "/models/Qwen3-14B", pd_mode: "disaggregated" });
 });
 
-test("atom without a model is refused at declaration time", () => {
-  assert.ok(errs({ nodes: 2, backend: "atom" }).some((m) => m.includes("model")));
-  ok({ nodes: 2, backend: "atom", model: "/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
+test("atom is read as atomesh", () => {
+  assert.equal(ok({ nodes: 2, backend: "atom", model: "/m" }).backend, "atomesh");
 });
 
-test("atom accepts an omitted pd_mode and refuses a shape it cannot provision", () => {
-  ok({ nodes: 2, backend: "atom", model: "/m" });
-  ok({ nodes: 2, backend: "atom", model: "/m", framework: "vllm" });
+test("atomesh without a model is refused at declaration time", () => {
+  assert.ok(errs({ nodes: 2, backend: "atomesh" }).some((m) => m.includes("model")));
+  ok({ nodes: 2, backend: "atomesh", model: "/models/Qwen3-14B-FP8", pd_mode: "disaggregated" });
+});
+
+test("atomesh accepts an omitted pd_mode and refuses a shape it cannot provision", () => {
+  ok({ nodes: 2, backend: "atomesh", model: "/m" });
+  ok({ nodes: 2, backend: "atomesh", model: "/m", framework: "vllm" });
   assert.ok(
-    errs({ nodes: 1, backend: "atom", model: "/m" }).some((m) => m.includes("at least 2")),
+    errs({ nodes: 1, backend: "atomesh", model: "/m" }).some((m) => m.includes("at least 2")),
   );
   assert.ok(
-    errs({ nodes: 4, backend: "atom", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 })
+    errs({ nodes: 4, backend: "atomesh", model: "/m", pd_prefill_nodes: 1, pd_decode_nodes: 1 })
       .some((m) => m.includes("prefill+decode")),
   );
   assert.ok(
@@ -88,9 +92,9 @@ test("atom accepts an omitted pd_mode and refuses a shape it cannot provision", 
   );
 });
 
-test("atom and sglangrouter refuse aggregated pd_mode at declaration time", () => {
+test("atomesh and sglangrouter refuse aggregated pd_mode at declaration time", () => {
   assert.ok(
-    errs({ nodes: 2, backend: "atom", model: "/models/m", pd_mode: "aggregated" })
+    errs({ nodes: 2, backend: "atomesh", model: "/models/m", pd_mode: "aggregated" })
       .some((m) => m.includes("pd_mode")),
   );
   assert.ok(
