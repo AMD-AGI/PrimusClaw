@@ -25,13 +25,13 @@ your own machine without Teams in about five minutes, then a Teams deployment an
 
 `personal-agent/` is its own npm workspace (own `package-lock.json`, Node 26), next to `claw/` and `connector/`.
 
-| Package                                    | Path                     | What it holds                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------ | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@primusclaw/personal-agent`               | `packages/core`          | The channel-neutral domain: routing and commands, turns, the assistant, proactive messages, remote-agent and review state machines, feedback, limits, redaction, view models (no card JSON), locales, and every **port** (`src/ports/`) and **plugin** interface (`src/plugins/`).                                                                                                                                |
-| `@primusclaw/personal-agent-runtime`       | `packages/runtime`       | Node adapters of core's ports: SQLite repositories (`node:sqlite`), Fernet (`node:crypto`), the Claw HTTP client, the token exchange, Prometheus metrics, settings and secrets from the environment, the HTTP server and its generic routes, the system clock and randomness.                                                                                                                                     |
-| `@primusclaw/personal-agent-teams`         | `packages/teams`         | The Teams channel: activity parsing, Adaptive Cards rendered from core's views, rich text, streams, the Bot Connector, the Service Bus queues, Azure Key Vault and workload identity, and the process assembly.                                                                                                                                                                                                   |
-| `@primusclaw/personal-agent-teams-ingress` | `packages/teams-ingress` | The Teams ingress: an Azure Function (its deployable package runs on Node 24 or later) that is the bot's messaging endpoint. It verifies the Bot Framework token, binds it to the activity's serviceUrl (the worker's Bot Connector host rule), puts the activity on the inbound queue, and, as the outbound queue's trigger, posts what the worker queues there. Released also as a deployable Function package. |
-| (shared fakes, not a package)              | `test-support/`          | Fakes for tests: clock, randomness, surface, store, HTTP server, card catalog and snapshots.                                                                                                                                                                                                                                                                                                                      |
+| Package                                    | Path                     | What it holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@primusclaw/personal-agent`               | `packages/core`          | The channel-neutral domain: routing and commands, turns, the assistant, proactive messages, remote-agent and review state machines, feedback, limits, redaction, view models (no card JSON), locales, and every **port** (`src/ports/`) and **plugin** interface (`src/plugins/`).                                                                                                                                                                                                    |
+| `@primusclaw/personal-agent-runtime`       | `packages/runtime`       | Node adapters of core's ports: SQLite repositories (`node:sqlite`), Fernet (`node:crypto`), the Claw HTTP client, the token exchange, Prometheus metrics, settings and secrets from the environment, the HTTP server and its generic routes, the system clock and randomness.                                                                                                                                                                                                         |
+| `@primusclaw/personal-agent-teams`         | `packages/teams`         | The Teams channel: activity parsing, Adaptive Cards rendered from core's views, rich text, streams, the Bot Connector, the Service Bus queues, Azure Key Vault and workload identity, and the process assembly.                                                                                                                                                                                                                                                                       |
+| `@primusclaw/personal-agent-teams-ingress` | `packages/teams-ingress` | The Teams ingress: an Azure Function (its deployable package runs on Node 24 or later) that is the bot's messaging endpoint. It verifies the Bot Framework token, binds it to the activity's serviceUrl (the worker's Bot Connector host rule), puts the activity on the inbound queue, and, as the outbound queue's trigger, posts what the worker queues there. Released as a deployable Function package on the GitHub Release, which is how it is deployed; not published to npm. |
+| (shared fakes, not a package)              | `test-support/`          | Fakes for tests: clock, randomness, surface, store, HTTP server, card catalog and snapshots.                                                                                                                                                                                                                                                                                                                                                                                          |
 
 ### Layering
 
@@ -239,8 +239,10 @@ image. Then, each behind a GitHub environment's required reviewers:
 
 - `publish-npm` (environment `npm-publish`) attests the four tarballs and the Function package, creates the GitHub
   Release with those notes, attaches the tarballs, the zip and its `.sha256`, and publishes the packages to npm with
-  Trusted Publishing (OIDC, `--provenance`, no npm token), core, then runtime, then teams, then teams-ingress (the last
-  only while the repository variable `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` is exactly `true`). These are the tarballs
+  Trusted Publishing (OIDC, `--provenance`, no npm token), core, then runtime, then teams. teams-ingress is not
+  published: the ingress is deployed from the Function package on the release, and its npm package has no users. The
+  repository variable `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` stays unset (the workflow would publish it only while that
+  variable is exactly `true`). These are the tarballs
   `check-pack` checked and the zip the host ran: the job checks out and installs nothing. A
   version already on npm is skipped when it is byte-for-byte the same tarball and fails the run otherwise, so a release
   that failed part-way is finished by dispatching the workflow on its tag with `dry-run` off.
@@ -272,13 +274,12 @@ two environments, whose required reviewers approve each publish, the Trusted Pub
 2. Add a tag ruleset matching `refs/tags/personal-agent-v*` that restricts creation to repository admins.
 3. Publish 0.1.0 of each package once by hand from a clean checkout of the merged `main`: `npm ci && npm run build &&
 npm run check-pack -- --out /tmp/pa`, then `npm publish /tmp/pa/<tarball> --access public` for core, runtime,
-   teams, logged in to npm with 2FA. The ingress's package, which came later, the same way at the first version that
-   has it.
-4. On npmjs.com, for each of the four packages: Settings > Trusted publishing > GitHub Actions: Organization
+   teams, logged in to npm with 2FA. The ingress's package is not published to npm.
+4. On npmjs.com, for each of the three packages: Settings > Trusted publishing > GitHub Actions: Organization
    `AMD-AGI`, Repository `PrimusClaw`, Workflow filename `personal-agent-release.yml`, Environment `npm-publish`. Then
-   Publishing access: require two-factor authentication and disallow tokens. Once the ingress's entry is there, set the
-   repository variable `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` to `true`; until then a release attaches its tarball and
-   its Function package and publishes the other three.
+   Publishing access: require two-factor authentication and disallow tokens. Leave the repository variable
+   `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` unset: a release attaches the ingress's tarball and its Function package and
+   publishes the other three.
 5. When the image is to be published: `DOCKER_USERNAME`/`DOCKER_PASSWORD` must be able to push to the prefix's
    namespace (or set `PERSONAL_AGENT_IMAGE_PREFIX` and, for a registry other than `docker.io`, the
    `PERSONAL_AGENT_REGISTRY_*` pair), then set the repository variable `PERSONAL_AGENT_IMAGE_PUBLISH` to `true`.
