@@ -612,11 +612,11 @@ function atomRouterEntrypoint(framework: string): string {
 }
 
 /**
- * Start sshd for the optimizer's in-place engine relaunch, then fall through.
+ * Start sshd for the optimizer's in-place relaunch, then fall through.
  *
- * The engine images carry sshd but not the SaFE idle scripts, so the key and
- * daemon are set up here from MN_SSH_AUTHORIZED_KEY / MN_SSH_PORT. Key-only
- * root login. A failure only warns: the engine still serves, without SSH control.
+ * The images carry sshd but not the SaFE idle scripts, so the key and daemon
+ * are set up here from MN_SSH_AUTHORIZED_KEY / MN_SSH_PORT. Key-only root
+ * login. A failure only warns: the process still serves, without SSH control.
  */
 const PD_SSHD_BOOTSTRAP = [
   "if ! { mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh \\",
@@ -625,9 +625,16 @@ const PD_SSHD_BOOTSTRAP = [
   "    && { [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A; } \\",
   "    && /usr/sbin/sshd -p \"${MN_SSH_PORT}\" -o PasswordAuthentication=no \\",
   "      -o KbdInteractiveAuthentication=no -o PermitRootLogin=prohibit-password; }; then",
-  "  echo \"WARN: sshd did not start on port ${MN_SSH_PORT}; the engine runs without SSH control\" >&2",
+  "  echo \"WARN: sshd did not start on port ${MN_SSH_PORT}; this pod runs without SSH control\" >&2",
   "fi",
 ];
+
+/** A router entrypoint with the sshd bootstrap after its `set` line when `withSshd`. */
+function routerEntrypointWithSshd(entrypoint: string, withSshd: boolean): string {
+  if (!withSshd) return entrypoint;
+  const [first, ...rest] = entrypoint.split("\n");
+  return [first, ...PD_SSHD_BOOTSTRAP, ...rest].join("\n");
+}
 
 /** Split a prompt arg string into shell words. Quotes are already removed. */
 function shellWords(raw: string): string[] {
@@ -795,7 +802,7 @@ function buildPdClusterWorkloadBody(
     resources: [routerResource, gpuResource(prefillReplica), gpuResource(decodeReplica)],
     images: [p.image, p.image, p.image],
     entryPoints: [
-      b64(opts.routerEntrypoint),
+      b64(routerEntrypointWithSshd(opts.routerEntrypoint, withSshd)),
       b64(atomEngineEntrypoint(
         "prefill", model, prefillTp, p.kvTransferBackend,
         p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "", withSshd,

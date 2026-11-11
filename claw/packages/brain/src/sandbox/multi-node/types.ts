@@ -42,6 +42,8 @@ export interface MultiNodeContext {
   sshKeyPath?: string;
   /** infera: SSH base port, decode pods role-offset; atomesh/sglangrouter: the one port of every pod. */
   sshPortBase?: number;
+  /** atomesh/sglangrouter: router pod IPs. */
+  routerIps?: string[];
   /** PD: prefill pod IPs, rank order. */
   prefillIps?: string[];
   /** PD: decode pod IPs, rank order. */

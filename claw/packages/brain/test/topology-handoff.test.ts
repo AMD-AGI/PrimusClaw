@@ -133,6 +133,7 @@ test("atomesh and sglangrouter with an SSH control plane hand off a cluster bloc
       sshPrivateKey: PEM,
       sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
       sshPortBase: 25032,
+      routerIps: ["172.16.0.9"],
       prefillIps: ["10.0.0.2"],
       decodeIps: ["10.0.0.3"],
     };
@@ -142,6 +143,7 @@ test("atomesh and sglangrouter with an SSH control plane hand off a cluster bloc
     assert.equal(c.ssh_key_file, ctx.sshKeyPath);
     assert.equal(c.ssh_port, 25032);
     assert.equal(c.known_hosts_file, `${TOPOLOGY_HANDOFF_DIR}/known_hosts`);
+    assert.deepEqual(c.router_ips, ["172.16.0.9"]);
     assert.deepEqual(c.prefill_ips, ["10.0.0.2"]);
     assert.deepEqual(c.decode_ips, ["10.0.0.3"]);
     assert.equal(handoff.infera, undefined);
@@ -150,6 +152,7 @@ test("atomesh and sglangrouter with an SSH control plane hand off a cluster bloc
     assert.ok(!byPath.get(DOC)!.content.includes("SECRETKEYBODY"));
     assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, ctx.sshKeyPath);
     assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, "25032");
+    assert.equal(env.HYPERLOOM_MN_EXT_ROUTER_IPS, "172.16.0.9");
     assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, "10.0.0.2");
     assert.equal(env.HYPERLOOM_MN_EXT_DECODE_IPS, "10.0.0.3");
     assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, undefined);

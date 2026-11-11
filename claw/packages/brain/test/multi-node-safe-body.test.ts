@@ -464,8 +464,11 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.equal(decode.includes("atomesh"), false);
 });
 
-test("PD engine entrypoints start sshd on the shared port before the engine when a key is given", () => {
-  for (const build of [buildAtomWorkloadBody, buildSGLangRouterWorkloadBody]) {
+test("PD entrypoints start sshd on the shared port before the server when a key is given", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "exec atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "exec python3 -m sglang_router.launch_router"],
+  ] as const) {
     const body = build({
       ...COMMON,
       model: "/models/m",
@@ -478,7 +481,10 @@ test("PD engine entrypoints start sshd on the shared port before the engine when
     assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, "ssh-ed25519 AAAATEST primus-claw-sess-1");
     assert.equal(body.env.MN_SSH_PORT, "25032");
     const router = decodeEp(body.entryPoints[0]);
-    assert.equal(router.includes("sshd"), false);
+    assert.ok(router.startsWith("set -euo pipefail\n"), router);
+    const routerSshd = router.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+    assert.ok(routerSshd >= 0, router);
+    assert.ok(routerSshd < router.indexOf(routerCommand), router);
     for (const ep of [decodeEp(body.entryPoints[1]), decodeEp(body.entryPoints[2])]) {
       const sshd = ep.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
       assert.ok(sshd >= 0, ep);
@@ -489,7 +495,7 @@ test("PD engine entrypoints start sshd on the shared port before the engine when
   }
 });
 
-test("PD engine entrypoints carry no sshd without a key", () => {
+test("PD entrypoints carry no sshd without a key", () => {
   const body = buildSGLangRouterWorkloadBody({
     ...COMMON,
     model: "/models/m",
@@ -499,6 +505,7 @@ test("PD engine entrypoints carry no sshd without a key", () => {
   }) as Record<string, any>;
   assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
   assert.equal(body.env.MN_SSH_PORT, undefined);
+  assert.equal(decodeEp(body.entryPoints[0]).includes("sshd"), false);
   assert.equal(decodeEp(body.entryPoints[1]).includes("sshd"), false);
 });
 
@@ -511,6 +518,7 @@ test("discoverRolePods groups SGLangRouter pods by role name", () => {
     ],
   };
   const groups = discoverRolePods(workload, "disaggregated", 25032);
+  assert.deepStrictEqual(groups.frontend.map((p) => p.podIp), ["172.16.6.11"]);
   assert.deepStrictEqual(groups.prefill.map((p) => p.podIp), ["10.235.225.141"]);
   assert.deepStrictEqual(groups.decode.map((p) => p.podIp), ["10.235.225.70"]);
   assert.equal(gpuPodsReady(groups, "disaggregated"), true);

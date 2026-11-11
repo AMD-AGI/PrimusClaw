@@ -45,7 +45,7 @@ export interface TopologyHandoffInfera {
 export interface TopologyHandoffCluster {
   /** File holding the SSH private key (mode 0600). Never the key itself. */
   ssh_key_file?: string;
-  /** sshd port shared by every prefill and decode pod. */
+  /** sshd port shared by every router, prefill and decode pod. */
   ssh_port?: number;
   /** File ssh may record and read host keys in. */
   known_hosts_file?: string;

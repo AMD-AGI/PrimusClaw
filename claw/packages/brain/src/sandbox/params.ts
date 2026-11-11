@@ -201,12 +201,13 @@ export function applyMultiNodeExternalEnv(
     return;
   }
 
-  // atomesh and sglangrouter: the optimizer SSHes into prefill and decode to
-  // relaunch the engine in place; every pod shares one sshd port.
+  // atomesh and sglangrouter: the optimizer SSHes into the router, prefill and
+  // decode to relaunch each in place; every pod shares one sshd port.
   if (ctx.backend === "atomesh" || ctx.backend === "sglangrouter") {
     if (!hasSshKeyFile(ctx)) return;
     env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath!;
     if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);
+    if (ctx.routerIps?.length) env.HYPERLOOM_MN_EXT_ROUTER_IPS = ctx.routerIps.join(",");
     if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
     if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
     return;
@@ -291,6 +292,7 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
       prefill_ips: [...(ctx.prefillIps ?? [])],
       decode_ips: [...(ctx.decodeIps ?? [])],
     };
+    if (ctx.routerIps?.length) cluster.router_ips = [...ctx.routerIps];
     if (ctx.sshPortBase) cluster.ssh_port = ctx.sshPortBase;
     cluster.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;
     files.push({ path: cluster.known_hosts_file, content: "", mode: "600" });
