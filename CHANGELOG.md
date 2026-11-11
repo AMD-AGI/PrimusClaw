@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (api, brain and the other server images, with the `claw` chart) | `claw-vX.Y.Z` | none tagged yet; the first will be 0.1.0 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | none tagged yet; the first will be 0.1.0 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` on npm and the `personal-agent-teams` image) | `personal-agent-vX.Y.Z` | 0.3.0 |
 
@@ -58,15 +58,17 @@ behaviour.
 
 ### Claw: build ids and release tags
 
-Every push to `main` that changes Claw builds and pushes its images under
-two tags: `latest`, and the build time in UTC+8 (`YYYYMMDDHHMM`, for example
+A push to `main` that changes the `claw` image's sources (`claw/packages/`,
+`claw/deploy/`, its package, TypeScript and Docker files; a Markdown-only
+change builds nothing) builds that image and pushes it under two tags:
+`latest`, and the build time in UTC+8 (`YYYYMMDDHHMM`, for example
 `202611112010`), which the image also carries as `CLAW_BUILD`. Build ids stay:
 they are how a deployment is pinned and rolled out, and they are internal
 deployment numbers, not release versions.
 
 A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
-build id was built from. It does not rebuild anything: the images to deploy
-for it are that commit's build-id images, named in the release notes. Cut
+build id was built from. It does not rebuild anything: the image to deploy
+for it is that commit's build-id image, named in the release notes. Cut
 one at least whenever what ships carries a new feature or an incompatible
 change.
 
@@ -79,9 +81,10 @@ change.
 3. Create the release on the commit, with that section as its notes:
    `gh release create "claw-vX.Y.Z" --target <commit> --title "Claw X.Y.Z" --notes-file notes.md`.
 
-Do not name a Claw tag `v*`: the Build workflow rebuilds and pushes every
-image under any `v*` tag pushed to the repository. `claw-v*` does not match
-that pattern.
+Do not name a Claw tag `v*`: the image workflows run on any `v*` tag pushed
+to the repository, and the Build workflow then rebuilds its images under the
+tag name and pushes the `claw` image under it. `claw-v*` does not match that
+pattern.
 
 The connector and the personal agent are cut as their own READMEs describe
 ([connector](connector/README.md#releasing-maintainers),
@@ -93,7 +96,8 @@ version chosen by these rules.
 **`latest` is the chart default and is a moving target.** For anything you
 intend to reproduce, set an explicit image tag — `--set image.tag=<build id>`
 — and record it. The `claw` chart's own `version` in `Chart.yaml` versions
-the chart's templates only.
+the chart package (templates, default values and metadata); it is not a Claw
+release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
