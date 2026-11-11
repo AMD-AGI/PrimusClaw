@@ -75,18 +75,26 @@ describe("devenv_pair", { skip }, () => {
     assert.equal((await pairing.claimPairing(m![1], "laptop")).ok, false);
   });
 
-  test("DP2 a turn that answers no message of the user's, an ended turn, a worker, or remote agents off: no code", async () => {
+  test("DP2 a turn that answers no message of the user's, an old message, an ended turn, a worker, or remote agents off: no code; a key's message: a code", async () => {
     const alice = await w.user("alice");
     const report = await w.routerTurn(alice);
     const r1 = await call(report);
     assert.ok(r1.offered && r1.isError);
     assert.match(JSON.stringify(r1), /not_from_user/);
-    // A message that came with a key, not signed in: nobody is attending.
+    // A message that came with the user's key, not signed in, is still their own: it gets a code, as POST
+    // /v1/remote-agents/pairings gives one to any authenticated user (2026-11-11: a key user got the four sign-in commands).
     const key = await userTurn(alice, "pair my laptop");
     await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
     const rk = await call(key);
-    assert.ok(rk.offered && rk.isError);
-    assert.match(JSON.stringify(rk), /not_attended/);
+    assert.ok(rk.offered && !rk.isError, JSON.stringify(rk));
+    assert.match((rk as { body: Record<string, any> }).body.command, /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair [0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4} --server \S+$/);
+    // An old message: refused (attendance_expired), no code.
+    const stale = await userTurn(alice, "pair my laptop");
+    await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - interval '2 hours' WHERE message_id = $1", [stale.mid]);
+    const rs = await call(stale);
+    assert.ok(rs.offered && rs.isError);
+    assert.match(JSON.stringify(rs), /attendance_expired/);
+    await w.q("DELETE FROM claw_remote_pairings");
     const ended = await userTurn(alice, "pair my laptop");
     await w.closeRun(ended.task_id);
     const r2 = await call(ended);
@@ -104,7 +112,7 @@ describe("devenv_pair", { skip }, () => {
     assert.match(section, /No machine: say none is connected\. When connect_a_machine has pairing[^\n]*do not call devenv_pair after it\. Without pairing: devenv_pair/);
     assert.match(section, /exactly as it answered/);
     assert.match(section, /连接我的开发环境 when there is none is devenv_list, whose connect_a_machine then carries the pairing command/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v14");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v15");
     assert.ok((reads.AFTER_READ_TOOLS as readonly string[]).includes("devenv_pair"), "after devenv_list finds no machine, it may still pair");
   });
 

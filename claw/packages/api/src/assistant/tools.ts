@@ -20,7 +20,7 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
-import { markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
+import { identityRefused, markIdentityRefused, markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
 import { earlierFilesOf, handFilesToWorker, workerFilesNote } from "./files.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
@@ -140,6 +140,18 @@ export async function attendedTurn(
   }
   if (message.readUntrusted && !opts.readUntrustedOk) throw new ToolRefused("read_untrusted", readUntrustedRefusal());
   return { userId, message, via: message.attendedVia };
+}
+
+/**
+ * A `not_attended` refusal of this turn, noted on the message it answers (`markIdentityRefused`), so the turn's say tells the channel to
+ * offer the person to confirm their identity. Best effort: a failed note never turns the refusal into a fault.
+ */
+export async function noteIdentityRefused(claims: AssistantTokenClaims): Promise<void> {
+  try {
+    await markIdentityRefused((t, p) => db.query(t, p), claims.sid, claims.mid);
+  } catch (err) {
+    logger.warn({ err, sid: claims.sid }, "assistant.identity_refused_note_failed");
+  }
 }
 
 function requireRole(claims: AssistantTokenClaims, role: "router" | "worker"): void {
@@ -276,6 +288,7 @@ async function sayOnce(
     const out = await recordAssistantSay({
       userId, sessionId: claims.sid, text: args.text, itemId, turnMessageId: claims.mid, holdForTurn, turnBegan: run?.began, amendNotice: true,
       fromEarlierConversationItem: earlierConversationItemOf(run?.prompt),
+      ...(await identityRefusedHere(claims) ? { needsIdentity: true } : {}),
       ...(cited?.sources.length ? { sources: cited.sources } : {}),
       ...(suggested.length ? { suggested } : {}),
       guard: async (q) => {
@@ -293,6 +306,16 @@ async function sayOnce(
       );
     }
     throw err;
+  }
+}
+
+/** Whether this router turn was refused something for want of a confirmed identity; a failed read is said as no. */
+async function identityRefusedHere(claims: AssistantTokenClaims): Promise<boolean> {
+  try {
+    return await identityRefused((t, p) => db.query(t, p), claims.sid, claims.mid);
+  } catch (err) {
+    logger.warn({ err, sid: claims.sid }, "assistant.identity_refused_read_failed");
+    return false;
   }
 }
 

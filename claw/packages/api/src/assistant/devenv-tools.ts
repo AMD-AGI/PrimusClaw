@@ -348,8 +348,8 @@ export function pairingText(command: string, minutes: number, zh: boolean): stri
 }
 
 /**
- * Whether this turn may make the user a pairing itself: when devenv_pair may ({@link pairingTurn}). Where it may not (a report, a
- * message with a key, an old one, not the router) `refused` is devenv_pair's own refusal there. A check that itself failed (the
+ * Whether this turn may make the user a pairing itself: when devenv_pair may ({@link pairingTurn}). Where it may not (a report, an
+ * old message, not the router) `refused` is devenv_pair's own refusal there. A check that itself failed (the
  * database) has no `refused`: it is said as no pairing, never as a failed list or send.
  */
 /** The check {@link mayPairHere} makes, so a test can make it fail as the database would. */
@@ -1243,16 +1243,22 @@ export async function sendConfirmed(userId: string, confirmationId: string, para
 }
 
 /**
- * A turn that may be given a pairing code: one answering a message the user sent signed in, recently (`attendedTurn`). It may have
- * read untrusted text (devenv_list itself marks the turn before it pairs): after a read the turn can only speak to the user
- * (`AFTER_READ_TOOLS`), so the code reaches no one else, and it connects nothing until the user runs it on a machine of theirs.
+ * A turn that may be given a pairing code: one answering the user's own message, recently. Not only one they sent signed in
+ * (`attendedTurn`): a message that came with their key may have one too, as `POST /v1/remote-agents/pairings` gives one to any
+ * authenticated user, the key included (`pairing-routes.ts`). A new user with a key who said "连接我的开发机" got the four sign-in
+ * commands instead (2026-11-11). The code is shown to that user alone, in their own chat, and connects nothing until they run it on a
+ * machine. It may have read untrusted text (devenv_list itself marks the turn before it pairs): after a read the turn can only speak to
+ * the user (`AFTER_READ_TOOLS`), so the code reaches no one else.
  */
 async function pairingTurn(q: Querier, claims: AssistantTokenClaims): Promise<{ userId: string }> {
   const { userId } = await assertLiveRun(q, claims);
-  if (!(await turnMessage(q, claims.sid, claims.mid))) {
+  const message = await turnMessage(q, claims.sid, claims.mid);
+  if (!message) {
     throw new ToolRefused("not_from_user", "only the user's own message can ask for a pairing code: a report cannot");
   }
-  await attendedTurn(q, claims, { readUntrustedOk: true });
+  if (!message.fresh) {
+    throw new ToolRefused("attendance_expired", "the user's message is too old to act on now: ask them to confirm in a new message");
+  }
   return { userId };
 }
 

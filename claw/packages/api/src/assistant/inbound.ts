@@ -282,6 +282,28 @@ export async function turnMessage(q: Querier, sessionId: string, messageId: stri
 }
 
 /**
+ * The turn answering this message was refused something only the person may do because the message came with a key, not with a
+ * confirmed identity (`not_attended`). Only such a message is marked (attended_via NULL), so a say of the turn can tell the channel to
+ * offer the person to confirm their identity once (`needs_identity`).
+ */
+export async function markIdentityRefused(q: Querier, sessionId: string, messageId: string): Promise<void> {
+  await q(
+    `UPDATE claw_assistant_messages SET identity_refused_at = NOW()
+      WHERE session_id = $1 AND message_id = $2 AND attended_via IS NULL AND identity_refused_at IS NULL`,
+    [sessionId, messageId],
+  );
+}
+
+/** Whether the turn answering this message was refused for want of a confirmed identity ({@link markIdentityRefused}). */
+export async function identityRefused(q: Querier, sessionId: string, messageId: string): Promise<boolean> {
+  const row = (await q(
+    "SELECT 1 AS x FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2 AND identity_refused_at IS NOT NULL",
+    [sessionId, messageId],
+  )).rows[0];
+  return row !== undefined;
+}
+
+/**
  * The turn answering this message has read text a worker or a page wrote (`work_recall`). The person's say covers what
  * they wrote, not what the model read afterwards, so the turn stops acting for them (`attendedTurn` refuses).
  */
