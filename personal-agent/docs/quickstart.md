@@ -42,7 +42,7 @@ Bot Connector that prints it. This is how the project's release checks drive the
 
 `/metrics` has a listener of its own (port 9090), which listens on every interface here as everywhere: it answers
 counters and the build's version without asking who is calling. On a machine other people can reach, firewall that
-port, or move it with `METRICS_PORT`.
+port (`METRICS_PORT` changes the port, not the interfaces).
 
 1. Install the worker and fetch the three files of [`examples/local-taste`](../examples/local-taste):
 
