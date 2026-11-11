@@ -46,6 +46,7 @@ import {
 } from "../tasks/dag-expander.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { WorkbenchCtx, WorkbenchDef, RunsListItem } from "./types.js";
+import { holdPluginForAdmission } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "workbench-routes" });
 
@@ -312,6 +313,12 @@ async function submitWorkbenchRun(
   afterCommit: AfterCommit,
 ): Promise<{ commit: boolean; value: unknown }> {
   const { reply } = run;
+  // Held until commit, so the expiry sweep cannot delete it under these tasks;
+  // a plugin that is gone (or past a temporary plugin's expiry) is refused.
+  if (!(await holdPluginForAdmission(client, run.plugin.id))) {
+    await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+    return { commit: false, value: reply };
+  }
   let session: { sessionId: string; created: boolean };
   try {
     session = await ensureSession(run.workbench, run.user, run.body, client, run.req);

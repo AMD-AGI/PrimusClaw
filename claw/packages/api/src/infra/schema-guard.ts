@@ -293,6 +293,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     onlyWhenAssistant: true,
     columns: ["id", "user_id", "scope", "session_id", "run_id", "tool", "args", "created_at"],
   },
+  {
+    // Every plugin write names these columns, so a deployment whose ALTER
+    // failed would answer 500 to every plugin create, upsert and patch.
+    table: "plugins",
+    columns: ["images", "resource", "overridable", "expires_at"],
+  },
 ];
 
 /**

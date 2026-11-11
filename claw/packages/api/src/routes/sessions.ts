@@ -29,6 +29,8 @@ import {
   isAdmin,
   isSystemAdmin,
 } from "../auth/models.js";
+import { pluginLaunchable } from "../marketplace/plugins.js";
+import { PluginGoneError } from "../marketplace/plugin-expiry.js";
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
@@ -1229,6 +1231,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         const n = typeof fmPluginRaw === "number" ? fmPluginRaw : parseInt(String(fmPluginRaw), 10);
         if (Number.isFinite(n)) fmPluginId = n;
       }
+      if (fmPluginId !== undefined && !(await pluginLaunchable(fmPluginId, user?.userId, user ? isAdmin(user) : false))) {
+        return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+      }
       firstMessage = {
         content: fmContent,
         messageType: fmType,
@@ -1758,6 +1763,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       const n = typeof pluginIdRaw === "number" ? pluginIdRaw : parseInt(String(pluginIdRaw), 10);
       if (Number.isFinite(n)) pluginId = n;
     }
+    // A new turn may not name a plugin that is gone, expired or not the caller's to use.
+    if (pluginId !== undefined && !(await pluginLaunchable(pluginId, user?.userId, user ? isAdmin(user) : false))) {
+      return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+    }
     const imageRaw = body.image;
     const requestImage =
       typeof imageRaw === "string" && imageRaw.trim() !== "" ? imageRaw.trim() : undefined;
@@ -1899,7 +1908,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
 
     // Lock, gate, queue or dispatch: all of it is `submitSessionMessage`, which is
     // also what a caller that is not an HTTP request goes through.
-    const submitted = await submitSessionMessage({
+    let submitted: Awaited<ReturnType<typeof submitSessionMessage>>;
+    try {
+    submitted = await submitSessionMessage({
       sessionId, userId, user,
       content, messageType, toolIds, pluginId,
       requestImage, requestResource, requestTimeout, topology, toolsAllowlist,
@@ -1917,6 +1928,11 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         }),
       } : {}),
     });
+    } catch (err) {
+      // The plugin went between the check above and the queue insert's hold.
+      if (err instanceof PluginGoneError) return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+      throw err;
+    }
     // A message to the person's assistant that has had no word CLAW_ASSISTANT_FIRST_ACK_MS from now is told "on it" by the server
     // (`assistant/lookup-ack.ts`), counted from now: a message queued behind a worker's report waits from here, not from its run.
     if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS) {

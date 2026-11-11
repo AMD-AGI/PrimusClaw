@@ -26,7 +26,7 @@ import { db, MarketplaceDb } from "../infra/db.js";
 import { nc, sc } from "../infra/nats.js";
 import { canExecuteTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
-import type { UserInfo } from "../auth/models.js";
+import { isAdmin, type UserInfo } from "../auth/models.js";
 import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { withAdmissionTransaction } from "../tasks/admission.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
@@ -38,11 +38,12 @@ import {
 import { getTask, listTasksByDag } from "../tasks/db.js";
 import { cancelTask, retryTask } from "../tasks/lifecycle.js";
 import { newBatchId } from "../tasks/ids.js";
-import { enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plugins.js";
+import { canViewPlugin, enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plugins.js";
 import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
 import { DELETED_SESSION_TASK_READ_SEC } from "../config.js";
+import { holdPluginForAdmission, PLUGIN_NOT_EXPIRED_SQL } from "../marketplace/plugin-expiry.js";
 import { checkOverrides, hasOverrides, overrideKeys, overridesAudit, type OverrideProblem, type OverrideValues } from "../marketplace/plugin-overrides.js";
 
 /**
@@ -247,8 +248,8 @@ export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown
 
 async function loadPluginRow(pluginId: number) {
   const r = await db.query(
-    `SELECT id, name, version, images, resource, tools, overridable FROM plugins
-     WHERE id = $1 AND deleted_at IS NULL`,
+    `SELECT id, name, version, images, resource, tools, overridable, owner_user_id, is_public FROM plugins
+     WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL}`,
     [pluginId],
   );
   if ((r.rowCount ?? 0) === 0) return null;
@@ -291,14 +292,39 @@ type CreateTarget =
   | { dag: TaskDagDef | null; plugin: Awaited<ReturnType<typeof loadPluginRow>> }
   | { status: number; error: string };
 
+/**
+ * The plugin a request names, or null when it is gone (deleted, or past its
+ * expiry) or the caller may not see it. The two are one answer, so a private
+ * plugin's id is not an existence oracle. A plugin a DAG names goes through
+ * `loadDagPlugin` instead.
+ */
+async function loadRequestedPlugin(pluginId: number, user: UserInfo) {
+  const row = await loadPluginRow(pluginId);
+  return row && canViewPlugin(row, user.userId, isAdmin(user)) ? row : null;
+}
+
+/**
+ * The plugin a DAG names, or null when it is gone or its DAG's owner may not
+ * see it: anyone can name a plugin id when writing a DAG, and running the DAG
+ * must not hand them another owner's private plugin.
+ */
+async function loadDagPlugin(pluginId: number, dagOwner: unknown) {
+  const row = await loadPluginRow(pluginId);
+  return row && canViewPlugin(row, typeof dagOwner === "string" ? dagOwner : undefined, false) ? row : null;
+}
+
 async function resolveCreateTarget(body: CreateTaskBody, user: UserInfo): Promise<CreateTarget> {
   let dag = body.dag_id ? await getTaskDag(body.dag_id) : null;
-  let plugin = body.plugin_id ? await loadPluginRow(body.plugin_id) : null;
+  let plugin = body.plugin_id ? await loadRequestedPlugin(body.plugin_id, user) : null;
   if (!dag && plugin?.resource?.task_dag_id) {
     dag = await getTaskDag(plugin.resource.task_dag_id as string);
   }
-  if (dag && !plugin && dag.plugin_id) plugin = await loadPluginRow(dag.plugin_id);
+  if (dag && !plugin && dag.plugin_id) plugin = await loadDagPlugin(dag.plugin_id, dag.owner_user_id);
   if (body.dag_id && !dag) return { status: 404, error: "dag_not_found" };
+  if (dag && dag.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
+  // A named plugin that is gone (deleted, or a temporary one past its expiry)
+  // or not the caller's to use is refused rather than run without its tools.
+  if (body.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
   if (dag && !canExecuteTaskDag(dag, user)) return { status: 404, error: "dag_not_found" };
   return { dag: (dag as unknown as TaskDagDef | null) ?? null, plugin };
 }
@@ -394,6 +420,11 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
         : withImageOverride(await singleTaskSandboxSpec(target.plugin), target.plugin, overrides.values.image);
 
       return await withAdmissionTransaction<unknown>(async (client) => {
+        // Held until commit, so the expiry sweep cannot delete it under these tasks.
+        if (target.plugin && !(await holdPluginForAdmission(client, target.plugin.id))) {
+          await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+          return { commit: false, value: reply };
+        }
         // Record the caller's own credentials before anything is queued: a task
         // is dispatched long after this request has gone, and the session row is
         // the only thing that carries the submitter that far. Rolled back with
@@ -465,12 +496,17 @@ export async function registerBatchRoute(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ ok: false, error: "dag_not_found" });
     }
     const plugin = body.plugin_id
-      ? await loadPluginRow(body.plugin_id)
-      : (dag.plugin_id ? await loadPluginRow(dag.plugin_id) : null);
+      ? await loadRequestedPlugin(body.plugin_id, user)
+      : (dag.plugin_id ? await loadDagPlugin(dag.plugin_id, dag.owner_user_id) : null);
+    if ((body.plugin_id || dag.plugin_id) && !plugin) return reply.status(404).send({ ok: false, error: "plugin_not_found" });
 
     const batchId = newBatchId();
     try {
       return await withAdmissionTransaction<unknown>(async (client) => {
+        if (plugin && !(await holdPluginForAdmission(client, plugin.id))) {
+          await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+          return { commit: false, value: reply };
+        }
         const outcome = await submitBatch(client, {
           user, sessionId: body.session_id!, dagId: body.dag_id!, dag: dag as unknown as TaskDagDef,
           plugin, inputs: body.inputs!, batchId,

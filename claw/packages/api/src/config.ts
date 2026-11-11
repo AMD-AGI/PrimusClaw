@@ -474,6 +474,12 @@ export const DELIVERY_TTL_DAYS = envInt("DELIVERY_TTL_DAYS", 7, { min: 1 });
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
+// --- Temporary plugins (marketplace/plugin-expiry.ts) ---
+/** The furthest ahead a plugin write may set `expires_at` / `ttl_seconds`. */
+export const PLUGIN_TTL_MAX_DAYS = envInt("PLUGIN_TTL_MAX_DAYS", 30, { min: 1 });
+/** How often expired temporary plugins are soft-deleted. */
+export const PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN = envInt("PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN", 5, { min: 1 });
+
 // --- Session auto-archive ---
 // A session with no activity for this many days, and no run in flight, is
 // archived by the daily maintenance pass. 0 disables it. Archiving only changes

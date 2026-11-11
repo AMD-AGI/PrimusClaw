@@ -26,6 +26,7 @@ import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
+import { holdPluginForAdmission } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "task-lifecycle" });
 
@@ -547,6 +548,13 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
   // The clone copies a persisted value no boundary re-checks, so a row written
   // before the `int4` bound would otherwise re-enter the fleet through retry.
   if (topologyErrors(task.input as Record<string, unknown> | null)) return { ok: false };
+  // The clone references the task's plugin: it must still be there (not
+  // deleted, not past a temporary plugin's expiry), and held against the
+  // expiry sweep until this commits.
+  if (task.plugin_id !== null && task.plugin_id !== undefined) {
+    if (!client) return await withOwnedAdmissionLock((ownedClient) => retryTask(taskId, ownedClient));
+    if (!(await holdPluginForAdmission(client, task.plugin_id))) return { ok: false };
+  }
 
   await acquireAdmissionLock(client);
   const decision = await decideAdmission(askFromRow(task, new Set()), client ?? db);

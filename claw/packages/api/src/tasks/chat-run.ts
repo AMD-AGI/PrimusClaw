@@ -49,6 +49,7 @@ import type { RunOrigin } from "./run-budget.js";
 import type { TaskStatus } from "./types.js";
 import { recordRunUse, releaseRunUse, releaseRunUseStrict } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
+import { holdPluginReference } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "chat-run" });
 
@@ -627,6 +628,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
   const reconcileToken = input.reconcileAction ? randomBytes(16).toString("hex") : undefined;
   const status = input.status ?? "preparing";
   try {
+    // In a caller's transaction the row's plugin reference is written under a
+    // hold, like every other reference, so the expiry sweep cannot race it. The
+    // turn's tools were resolved before this (sessions/dispatch.ts), so a plugin
+    // gone by now changes nothing the turn runs with.
+    if (input.client && input.pluginId !== undefined && input.pluginId !== null) {
+      await holdPluginReference(input.client, input.pluginId);
+    }
     const row = await insertTask({
       task_id: taskId,
       session_id: input.sessionId,

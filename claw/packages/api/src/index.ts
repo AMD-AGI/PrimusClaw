@@ -80,6 +80,7 @@ import { startExternalResolver } from "./tasks/external-resolver.js";
 import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
+import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
@@ -420,6 +421,8 @@ async function main() {
 
   // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
   startUploadSweeper();
+  // Soft-deletes temporary plugins past their expires_at (never a public one).
+  startPluginExpirySweeper(db.pool);
 
   if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).

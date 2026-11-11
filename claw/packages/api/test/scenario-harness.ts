@@ -202,6 +202,22 @@ CREATE TABLE resources (
   deleted_at    TIMESTAMPTZ
 );
 
+-- Locked (FOR SHARE) by a queued message that names a plugin, so the expiry
+-- sweep cannot race the insert (marketplace/plugin-expiry.ts). Only what that
+-- lock and the sweep read.
+CREATE TABLE plugins (
+  id            BIGSERIAL PRIMARY KEY,
+  name          VARCHAR(255) NOT NULL DEFAULT '',
+  version       VARCHAR(255) NOT NULL DEFAULT '',
+  owner_user_id VARCHAR(255),
+  is_public     BOOLEAN NOT NULL DEFAULT true,
+  status        VARCHAR(50) NOT NULL DEFAULT 'active',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at    TIMESTAMPTZ,
+  expires_at    TIMESTAMPTZ
+);
+
 -- Read by injectLiveUserEnv on every claim: the vault is re-read at claim
 -- time rather than carried on the row, so a claim scenario needs it present
 -- even when empty.

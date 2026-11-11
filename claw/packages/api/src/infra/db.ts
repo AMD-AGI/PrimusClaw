@@ -11,6 +11,7 @@ import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
 import { lockBoundedMigrationClient, type MigrationLockPolicy } from "./migration-guard.js";
 import { normalizeOverridable } from "../marketplace/plugin-overrides.js";
+import { isTemporaryPublicViolation, requestedPluginExpiry, temporaryPublicError } from "../marketplace/plugin-expiry.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -2153,7 +2154,11 @@ export async function initDb(): Promise<void> {
         status VARCHAR(50) NOT NULL DEFAULT 'active',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        deleted_at TIMESTAMPTZ
+        deleted_at TIMESTAMPTZ,
+        -- A temporary plugin: soft-deleted by the sweeper after this time
+        -- (marketplace/plugin-expiry.ts). NULL is permanent.
+        expires_at TIMESTAMPTZ,
+        CONSTRAINT plugins_temporary_not_public CHECK (expires_at IS NULL OR is_public = false)
       )
     `);
     await client.query(
@@ -2196,6 +2201,15 @@ export async function initDb(): Promise<void> {
     ).catch(() => {});
     await client.query(
       `ALTER TABLE plugins ADD COLUMN IF NOT EXISTS overridable JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    ).catch(() => {});
+    await client.query(`ALTER TABLE plugins ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`).catch(() => {});
+    // Fails harmlessly (duplicate_object) once the constraint exists.
+    await client.query(
+      `ALTER TABLE plugins ADD CONSTRAINT plugins_temporary_not_public CHECK (expires_at IS NULL OR is_public = false)`,
+    ).catch(() => {});
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_plugins_expires_at ON plugins(expires_at)
+        WHERE expires_at IS NOT NULL AND deleted_at IS NULL`,
     ).catch(() => {});
     // Schema v2 cleanup: drop legacy V1 array column. No rollback path back
     // to V1 — V2 only uses ``resource`` (object).
@@ -3039,13 +3053,26 @@ export const MarketplaceDb = {
     return (r.rows[0] as JsonObject) ?? null;
   },
 
-  async pluginInsert(payload: JsonObject): Promise<JsonObject> {
+  /**
+   * `opts.inheritExpiresAt` is the expiry a new version takes from its source
+   * when the request names none; it is not bounded like a requested one.
+   */
+  async pluginInsert(payload: JsonObject, opts: { inheritExpiresAt?: Date | null } = {}): Promise<JsonObject> {
+    const requested = requestedPluginExpiry(payload);
+    const expiresAt = requested !== undefined ? requested : (opts.inheritExpiresAt ?? null);
+    // A temporary plugin is private unless the request says otherwise, and
+    // saying otherwise is refused (the CHECK constraint is the backstop).
+    let isPublic = payload.is_public ?? true;
+    if (expiresAt) {
+      if (payload.is_public === true) throw temporaryPublicError();
+      isPublic = false;
+    }
     // V2 writes `resource` (object). Legacy `resources` (array) column is
     // intentionally not written here so V1 can keep its data untouched.
     const r = await db.query(
       `INSERT INTO plugins (
-        name, description, version, images, tools, resource, owner_user_id, author, is_public, status, overridable
-      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11::jsonb) RETURNING *`,
+        name, description, version, images, tools, resource, owner_user_id, author, is_public, status, overridable, expires_at
+      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
       [
         payload.name,
         payload.description ?? "",
@@ -3055,11 +3082,14 @@ export const MarketplaceDb = {
         JSON.stringify(payload.resource ?? {}),
         payload.owner_user_id ?? null,
         payload.author ?? null,
-        payload.is_public ?? true,
+        isPublic,
         payload.status ?? "active",
         JSON.stringify(normalizeOverridable(payload.overridable)),
+        expiresAt,
       ],
-    );
+    ).catch((e: unknown) => {
+      throw isTemporaryPublicViolation(e) ? temporaryPublicError() : e;
+    });
     return r.rows[0] as JsonObject;
   },
 
@@ -3078,6 +3108,8 @@ export const MarketplaceDb = {
     if ("tools" in patch) add("tools", JSON.stringify(patch.tools ?? []));
     if ("resource" in patch) add("resource", JSON.stringify(patch.resource ?? {}));
     if ("overridable" in patch) add("overridable", JSON.stringify(normalizeOverridable(patch.overridable)));
+    const expiry = requestedPluginExpiry(patch);
+    if (expiry !== undefined) add("expires_at", expiry);
     if ("owner_user_id" in patch) add("owner_user_id", patch.owner_user_id);
     if ("author" in patch) add("author", patch.author);
     if ("is_public" in patch) add("is_public", patch.is_public);
@@ -3089,7 +3121,9 @@ export const MarketplaceDb = {
     const r = await db.query(
       `UPDATE plugins SET ${sets.join(", ")} WHERE id = $${i} AND deleted_at IS NULL RETURNING *`,
       vals,
-    );
+    ).catch((e: unknown) => {
+      throw isTemporaryPublicViolation(e) ? temporaryPublicError() : e;
+    });
     return (r.rows[0] as JsonObject) ?? null;
   },
 
@@ -3438,7 +3472,7 @@ export const MarketplaceDb = {
       } else conds.push("is_public = true");
     }
     const r = await db.query(
-      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at
+      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at, expires_at
          FROM plugins WHERE ${conds.join(" AND ")} ORDER BY ${PLUGIN_VERSION_ORDER}`,
       args,
     );
