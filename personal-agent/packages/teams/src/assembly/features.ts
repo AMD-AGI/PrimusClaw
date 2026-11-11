@@ -227,7 +227,9 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     reportView: (userId, scope) => w8.reportView(userId, scope),
     note: noteFactory,
     subscriptions:
-      subs === undefined ? undefined : { ensure: (u) => subs.ensure(u), remove: (u, key) => subs.remove(u, key) },
+      subs === undefined
+        ? undefined
+        : { ensure: (u, credential) => subs.ensure(u, credential), remove: (u, key) => subs.remove(u, key) },
     handlers: built.handlers,
     integrations: plugins.integrations,
   };
@@ -356,7 +358,7 @@ export function buildFeatures(given: AssemblyBase): Features {
     hooks,
     reviewHandoff: (userId, event) => lateReview.handoff?.take(userId, event) ?? "dropped",
   });
-  const proactive = proactiveParts(base, teams.style, assistant, errors);
+  const proactive = proactiveParts(base, teams.style, assistant, errors, get);
   const reach = followReach(proactive, base);
   const remote = remoteAgents(base, { switches, guard, reach, errors, directChat: assistant.directChat, hooks });
   const w8 = w8Parts(base, { briefEnabled: switches.brief, assistantOn: (userId) => assistant.chat.on(userId) });

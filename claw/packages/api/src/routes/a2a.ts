@@ -17,6 +17,7 @@ import {
 } from "../tasks/admission.js";
 import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
 import { createA2aV2, type A2aV2, type ContextEntry, type OpenRunInput } from "./a2a-v2.js";
+import { resultMessageState } from "./a2a-task-view.js";
 import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
@@ -1435,8 +1436,7 @@ function mapInternalEventToStream(
       return { responses: [{ artifactUpdate }], terminal: false };
     }
     case "ResultMessage": {
-      const subtype = (event.data as Record<string, unknown>)?.subtype;
-      const state = subtype === "success" ? TaskState.COMPLETED : TaskState.FAILED;
+      const state = resultMessageState(event);
       return { responses: makeTerminalStream(taskId, contextId, state, s), terminal: true };
     }
     case "toolUsed": {

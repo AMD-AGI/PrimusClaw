@@ -484,6 +484,18 @@ export function closingEvents(
   return out;
 }
 
+/**
+ * The task state a turn's `ResultMessage` ends a stream in: completed on success, cancelled when the turn was stopped
+ * (Brain's end of a run the user interrupted, subtype `interrupted`), failed otherwise.
+ */
+export function resultMessageState(event: Record<string, unknown>): TaskState {
+  const data = event.data;
+  const subtype = data && typeof data === "object" ? (data as Record<string, unknown>).subtype : undefined;
+  if (subtype === "success") return TaskState.COMPLETED;
+  if (subtype === "interrupted") return TaskState.CANCELED;
+  return TaskState.FAILED;
+}
+
 /** Whether a live event is the end of the run. */
 export function isRunEnd(event: Record<string, unknown>, messageId: string): boolean {
   if (str(event.type) !== "exec_complete") return false;

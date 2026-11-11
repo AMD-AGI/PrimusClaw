@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * One Claw notification subscription per linked person, made with that person's own key (teams_agent/subscriptions.py).
+ * One Claw notification subscription per linked person, made with that person's own key (teams_agent/subscriptions.py),
+ * and per person bound at the identity service with no link, made with their exchanged token when they write.
  *
  * Claw delivers only a subscription's owner's events and shows its signing secret once, so every person's subscription points at
  * its own URL `<base>/<route>`; the random route token finds the person and their secret. With the assistant on, the subscription
@@ -148,13 +149,17 @@ export class Subscriptions {
     }
   }
 
-  /** Make sure this linked person has a subscription (with the assistant's types when it is on). Never throws. */
-  async ensure(aadId: string): Promise<void> {
+  /**
+   * Make sure this person has a subscription (with the assistant's types when it is on). It is made and mended with
+   * `credential` when one is given (a person with no link, whose chats run on an exchanged token), else with their linked
+   * key. Never throws.
+   */
+  async ensure(aadId: string, credential?: string): Promise<void> {
     try {
+      const key = credential ?? this.store.links.getKey(aadId);
       let found = this.store.notifySubs.getNotifySub(aadId);
-      if (found !== null && this.assistantOnFor(aadId)) found = await this.reconcile(aadId, found.subscriptionId);
+      if (found !== null && this.assistantOnFor(aadId)) found = await this.reconcile(aadId, found.subscriptionId, key);
       if (found !== null) return;
-      const key = this.store.links.getKey(aadId);
       if (key === null || !this.store.notifySubs.claimNotifyAttempt(aadId, RETRY_SECONDS)) return;
       await this.create(aadId, key);
     } catch (error) {
@@ -197,8 +202,11 @@ export class Subscriptions {
    * at, and mended with one PATCH, at most every UPGRADE_RETRY_SECONDS. One Claw no longer has is forgotten (the caller makes a new
    * one); one Claw refuses even the assistant's types (400, 404) takes the person back to sessions (`types_version` 0).
    */
-  private async reconcile(aadId: string, subscriptionId: string): Promise<NotifySubscription | null> {
-    const key = this.store.links.getKey(aadId);
+  private async reconcile(
+    aadId: string,
+    subscriptionId: string,
+    key: string | null,
+  ): Promise<NotifySubscription | null> {
     if (key === null || !this.store.notifySubs.claimNotifyAttempt(aadId, UPGRADE_RETRY_SECONDS)) {
       return this.store.notifySubs.getNotifySub(aadId);
     }

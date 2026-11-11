@@ -1416,6 +1416,13 @@ class TaskRunner {
    */
   private sandboxClaimed = false;
   /**
+   * The main agent has said this run's turn is over (`ResultMessage`). A run the
+   * user stops before that says it itself (`handleUserInterrupt`): the session's
+   * stream forwards no `exec_complete`, so without it a client following the
+   * stream never sees the turn end.
+   */
+  private turnEndAnnounced = false;
+  /**
    * The open started ahead of the first tool call, while it may still be the
    * run's only open: its abort, which gives that open up, and its settlement,
    * which never rejects. See `prestartSandbox` and `retireUnclaimedPrestart`.
@@ -1512,6 +1519,7 @@ class TaskRunner {
       runtimeSecrets(this.request, this.platformKey),
     );
     if (this.messageId) safeEvent.message_id = this.messageId;
+    if (evt.type === "ResultMessage" && !evt.subagent_id) this.turnEndAnnounced = true;
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
     if (opts.stillMine) await this.emitter.emit(this.sessionId, safeEvent, { stillMine: opts.stillMine });
     else await this.emitter.emit(this.sessionId, safeEvent);
@@ -4037,6 +4045,17 @@ class TaskRunner {
       failed: false, interrupted: true,
       turns: turnsCompleted, elapsedMs, tokenUsage, toolStats,
     });
+    // The turn's end on the session's stream. `exec_complete` below is the API's
+    // and is never forwarded to a stream's readers (routes/events.ts SKIP_EVENTS),
+    // and a stopped engine never reached its own `ResultMessage`: without this a
+    // reader -- a chat's "Thinking..." status, an A2A or MCP caller -- waits for
+    // an end that never comes. Stopped while the sandbox was still being prepared
+    // is the common case: the engine had said nothing yet. Not a success, and no
+    // text: what the turn said before the stop is already on the stream.
+    if (!this.turnEndAnnounced) {
+      await this.onEvent({ type: "ResultMessage", data: { subtype: "interrupted" } })
+        .catch((e) => logger.warn({ err: e, sessionId: this.sessionId }, "task.interrupt_result_event_failed"));
+    }
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,

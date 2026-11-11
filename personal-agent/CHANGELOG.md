@@ -33,6 +33,26 @@ release adds; a change to a plugin port (core's `src/plugins/`) is always a mino
 - `@primusclaw/personal-agent-teams`: a second entry, `@primusclaw/personal-agent-teams/connector-hosts`, the Bot
   Connector host rule alone, which the ingress imports.
 
+## 0.3.0
+
+A minor release: it adds a way to run the Teams worker (#736). No plugin port (core's `src/plugins/`) changed.
+
+### Added
+
+- `@primusclaw/personal-agent-teams`: the worker can get its Bot Connector token with an Azure app registration's client
+  secret (`BOT_TOKEN_SOURCE=secret`, `BOT_CLIENT_ID`, `BOT_TENANT_ID`, `BOT_CLIENT_SECRET`), the usual way to run a bot
+  outside Azure, beside the managed identity (`imds`) and workload identity federation. Covered by unit tests; not yet
+  run against a real app registration (#736).
+
+### Fixed
+
+- `@primusclaw/personal-agent`: a person who confirmed an identity binding but never linked a key reaches their
+  assistant in a 1:1 chat: their exchanged token now gets them a notification subscription and a Claw user id, which
+  before came only from a link (#733).
+- `@primusclaw/personal-agent`: a person whose chats run on their linked key because they never confirmed their identity
+  is offered the identity card once, right after an answer Claw refused for want of it (Claw marks such a reply
+  `needs_identity`), instead of nothing telling them how to fix it (#735).
+
 ## 0.2.0
 
 A minor release: it adds behaviour (#713, #720, #725). No plugin port (core's `src/plugins/`) changed.
@@ -63,6 +83,11 @@ A minor release: it adds behaviour (#713, #720, #725). No plugin port (core's `s
   the person stopped says it stopped (#724).
 - `@primusclaw/personal-agent`: asked in a group to introduce itself, the agent also names what a 1:1 chat with it
   adds (connecting your own machine, memory, research, the board, reminders) (#726).
+- `@primusclaw/personal-agent-runtime`, `@primusclaw/personal-agent-teams`: `/whoami` names the account of a person whose
+  chats run on an exchanged identity token: a person's own key (`ak-...`) is still asked of the platform's `/users/self`,
+  any other credential of Claw's `GET /v1/me` (#730).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a feedback report from a 1:1 chat with the assistant
+  on shows the assistant session's turns, the ones the person saw, instead of the plain chat session's (#731).
 
 ### Docs
 
