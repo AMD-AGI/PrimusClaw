@@ -104,6 +104,24 @@ test("a message of a person the assistant understands is logged as the assistant
   noWordsOrIds(lines);
 });
 
+test("a message of a person the assistant understands but cannot reach yet is not logged as started on any route", async () => {
+  const w = world({
+    assistant: {
+      on: () => true,
+      understands: () => true,
+      reachable: () => false,
+      understand: () => Promise.resolve(false),
+    },
+  });
+  const { logger, started } = recording();
+  Object.assign(w.deps, { logger });
+  link(w, ALICE.id, KEY);
+  await w.router.handle(message(`${MARK} connect my dev environment`));
+  await w.router.settled();
+  assert.deepEqual(w.turns.calls, []);
+  assert.deepEqual(started, []);
+});
+
 test("the line names the client platform and the review route, and nothing else", () => {
   const { logger, started } = recording();
   logTurnStarted(logger, "android", false, "review");

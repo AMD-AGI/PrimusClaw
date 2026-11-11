@@ -26,7 +26,11 @@ export function isMobile(clientPlatform: string): boolean {
  */
 export type TurnRoute = "assistant" | "legacy" | "review";
 
-/** The line for a turn started from Teams: where it came from and which path it took, never its words or any id. */
+/**
+ * The line for a turn started from Teams: where it came from and which path it took, never its words or any id. One line
+ * per turn: a message to the assistant or to a plain session is one turn, and a review request for several pull requests
+ * starts one review turn (and one line) for each.
+ */
 export function logTurnStarted(logger: Logger, clientPlatform: string, group: boolean, route: TurnRoute): void {
   logger.info("turn started from Teams client", {
     platform: clientPlatform || "unknown",

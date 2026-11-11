@@ -277,8 +277,9 @@ export class PersonalText {
     });
     const held = assistant.reachable(userId);
     if (held && (await this.ctx.admission.assistantOverLimit(chat, message.id, key))) return;
+    // (one the assistant cannot reach is only told so: no turn starts on any path)
+    if (held) logTurnStarted(logger, message.clientPlatform, false, "assistant");
     // (recorded before it is sent: an action the assistant asks for may arrive before the send returns)
-    logTurnStarted(logger, message.clientPlatform, false, "assistant");
     store.assistantMessages.noteAssistantMessage(
       channelMessageId,
       userId,
