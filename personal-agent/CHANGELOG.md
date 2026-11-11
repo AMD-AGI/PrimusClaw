@@ -17,7 +17,7 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ### Added
 
-- `@primusclaw/personal-agent-teams-ingress`, new: the Teams ingress, the Azure Function (Node 26) between Azure Bot
+- `@primusclaw/personal-agent-teams-ingress`, new: the Teams ingress, the Azure Function (Node 24 or later) between Azure Bot
   Service and the inbound queue, which until now each deployment wrote itself. It verifies the Bot Framework token
   (RS256 only; `exp`, `iss`, `aud` required, no leeway; the audience is `PRIMUSCLAW_BOT_APP_ID`), binds it to the
   activity's `serviceUrl` with the worker's Bot Connector host rule, and queues the activity on its conversation's

@@ -70,7 +70,7 @@ test("the Function package is host.json, a package.json naming the bundle, the b
   ).version;
   assert.deepEqual(
     [manifest["main"], manifest["type"], manifest["version"], manifest["engines"]],
-    ["dist/main.js", "module", version, { node: ">=26" }],
+    ["dist/main.js", "module", version, { node: ">=24" }],
   );
   assert.deepEqual(
     JSON.parse(read("host.json")),
