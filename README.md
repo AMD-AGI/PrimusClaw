@@ -21,7 +21,7 @@ The **connector** is a small client for a developer's own machine that lets
 Claw, and the assistant through it, drive the Claude Code, Codex or Cursor
 sessions on that machine, using outbound HTTPS only.
 
-> **Status: pre-1.0.** Every released version is 0.x. Interfaces, configuration
+> **Status: pre-1.0.** Every published package is 0.x. Interfaces, configuration
 > and wire formats may change between minor releases; pin what you deploy and
 > read the changelogs before upgrading.
 
@@ -125,7 +125,8 @@ storage and LLM gateway, follow [`claw/README.md`](claw/README.md#build-and-run)
 
 The worker reads its whole configuration from the environment.
 [`personal-agent/examples/worker.env.example`](personal-agent/examples/worker.env.example)
-lists every setting and
+lists the settings (all but the release gate's test entry and the settings
+only a deployment's own plugins read), and
 [`personal-agent/docs/configuration.md`](personal-agent/docs/configuration.md)
 describes each one. Keep the filled-in file outside any repository.
 
@@ -232,7 +233,7 @@ root builds and tests Claw and Agent Sandbox, runs the LiteLLM wrapper's Python
 tests, builds the docs, and runs the lint and license checks; `make help` lists
 the per-tree targets. The personal agent (`npm run check` in `personal-agent/`) and the connector (see
 its [Development](connector/README.md#development) section) have their own
-checks, which CI runs in their own workflows.
+checks, which CI runs as separate jobs.
 
 ## Security
 

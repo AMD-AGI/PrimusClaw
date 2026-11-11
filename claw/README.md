@@ -73,7 +73,7 @@ npm run build          # tsc, all workspaces in dependency order
 
 cp .env.example .env   # then fill in the required values
                        # incl. USER_ENV_ENCRYPTION_KEY=$(openssl rand -base64 32);
-                       # on a single-node NATS set the three *_REPLICAS to 1
+                       # on a single-node NATS set NATS_REPLICAS=1
 ./scripts/start-all.sh # hands + brain + api in one terminal
 ```
 
