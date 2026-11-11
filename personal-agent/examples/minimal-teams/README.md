@@ -19,6 +19,6 @@ docker compose up -d
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-The worker alone does not reach Teams: it needs a bot registration, a Service Bus namespace and an ingress in front of
-the inbound queue. Follow the [quick start](../../docs/quickstart.md#deploy-for-microsoft-teams), which sets each of
+The worker alone does not reach Teams: it needs a bot registration, a Service Bus namespace and the ingress in front of
+the inbound queue (a released Azure Function package). Follow the [quick start](../../docs/quickstart.md#deploy-for-microsoft-teams), which sets each of
 them up and explains every line of these two files.

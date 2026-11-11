@@ -13,7 +13,8 @@ are checked only where this page says so (`KEYVAULT_URL`, `SERVICEBUS_NAMESPACE`
 either; see "How switches read" below, and check the spelling of the lenient ones.
 
 [`../examples/worker.env.example`](../examples/worker.env.example) has every setting below with placeholder values,
-except the feedback-plugin settings and the release gate's test entry (the last two sections).
+except the feedback-plugin settings, the release gate's test entry and the Teams ingress's (a Function app's settings,
+not the worker's).
 
 Where each group is read:
 
@@ -24,6 +25,7 @@ Where each group is read:
   style.
 - `packages/runtime/src/github/feedback-worker.ts` (`workerInfoFromEnv`): the image tags a feedback report names.
 - `packages/teams/src/assembly/features-switches.ts`: the feature switches.
+- `packages/teams-ingress/src/settings.ts` and `packages/teams-ingress/src/auth.ts`: the Teams ingress.
 
 ### How switches read
 
@@ -76,7 +78,7 @@ With `keyvault` the vault entries are `clawy-encryption-keys` and `clawy-exchang
 
 | Setting                  | Default      | Meaning                                                                                                                                                                                          |
 | ------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `OUTBOUND_MODE`          | `servicebus` | `servicebus`: replies go to the outbound queue for a relay. `direct`: the worker posts to the Bot Connector itself (streaming, deletes), queue as fallback.                                      |
+| `OUTBOUND_MODE`          | `servicebus` | `servicebus`: replies go to the outbound queue, which the ingress's outbound trigger posts. `direct`: the worker posts to the Bot Connector itself (streaming, deletes), queue as fallback.      |
 | `BOT_TOKEN_SOURCE`       | see below    | The bot's token in direct mode: `imds` (managed identity), `federated` (workload identity federation) or `secret` (an app registration's client secret); `federated` and `secret` need `direct`. |
 | `BOT_MSI_CLIENT_ID`      | —            | Required in direct mode with `imds` or `federated`: the bot's managed identity.                                                                                                                  |
 | `BOT_CLIENT_ID`          | —            | Required with `secret`: the app registration's client id (the Teams manifest's `botId`).                                                                                                         |
@@ -192,6 +194,32 @@ can build one with runtime's `feedbackConfigFromEnv` and `feedbackSink`, which r
 `FEEDBACK_GITHUB_APP_ID`, `FEEDBACK_GITHUB_INSTALLATION_ID`, `FEEDBACK_GITHUB_KEY_FILE` and
 `FEEDBACK_GITHUB_TOKEN_FILE`. The secret loader already reads the App key (`FEEDBACK_GITHUB_KEY_FILE`, or the vault entry
 `clawy-feedback-github-app-key`) when both App ids are set, so leave them unset unless such a plugin uses them.
+
+## The Teams ingress
+
+The ingress ([`packages/teams-ingress`](../packages/teams-ingress), an Azure Function app) reads its own app settings,
+not the worker's. Their names are the ones the Python Function it replaces read, so an app moving to it keeps its
+settings as they are. Service Bus connections follow the Functions convention: `<prefix>__fullyQualifiedNamespace` for
+an identity, the setting itself for a connection string.
+
+| Setting                                                   | Default                                                                                | Meaning                                                                                                                                                                                                        |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PRIMUSCLAW_BOT_APP_ID`                                   | —                                                                                      | The bot's client id, the audience every token must name. Unset, every request is refused (`401`). Also the user-assigned identity the inbound sender and the outbound trigger's Bot Connector token use.       |
+| `PRIMUSCLAW_SERVICEBUS__fullyQualifiedNamespace`          | —                                                                                      | `<name>.servicebus.windows.net` (an `sb://` URL is read too): the inbound queue is reached as an identity, which needs Azure Service Bus Data Sender on it.                                                    |
+| `PRIMUSCLAW_SERVICEBUS__credential`                       | unset                                                                                  | `managedidentity`: the app's system-assigned identity (or `__clientId`'s). Unset: the bot's identity (`PRIMUSCLAW_BOT_APP_ID`) or `__clientId`'s. Anything else is refused.                                    |
+| `PRIMUSCLAW_SERVICEBUS__clientId`                         | —                                                                                      | A user-assigned identity for the inbound queue.                                                                                                                                                                |
+| `PRIMUSCLAW_SERVICEBUS_CONNECTION_STRING`                 | —                                                                                      | Without the namespace setting: a connection string with Send on the inbound queue. Ignored (with a warning) when the namespace is set.                                                                         |
+| `PRIMUSCLAW_SERVICEBUS_QUEUE`                             | `primusclaw-inbound`                                                                   | The inbound queue: the worker's `INBOUND_QUEUE`.                                                                                                                                                               |
+| `PRIMUSCLAW_OUTBOUND_SERVICEBUS__fullyQualifiedNamespace` | —                                                                                      | Registers the outbound trigger, reading the outbound queue as an identity (Azure Service Bus Data Receiver on it; `__credential`/`__clientId` as above, read by the Functions host).                           |
+| `PRIMUSCLAW_OUTBOUND_SERVICEBUS`                          | —                                                                                      | Registers the outbound trigger with a connection string (Listen on the outbound queue) instead. With neither, the trigger is not registered and the app serves `/api/messages` alone.                          |
+| `PRIMUSCLAW_OUTBOUND_QUEUE`                               | `primusclaw-outbound`                                                                  | The outbound queue: the worker's `OUTBOUND_QUEUE`.                                                                                                                                                             |
+| `BOT_TOKEN_ISSUERS`                                       | `https://api.botframework.com`                                                         | The issuers a token may name, `;`-separated.                                                                                                                                                                   |
+| `BOT_OPENID_CONFIG_URL`                                   | `https://login.botframework.com/v1/.well-known/openidconfiguration`                    | Where the signing keys are found (cached for an hour; the key set is refetched for a key id it lacks).                                                                                                         |
+| `BOT_SERVICE_URL_HOSTS`, `BOT_SERVICE_URL_SUFFIXES`       | `smba.trafficmanager.net`; `.botframework.com`, `.teams.microsoft.com` and their `.us` | The Bot Connector hosts an activity's `serviceUrl` (and so the bot's token) may name, `;`- or `,`-separated: the worker's rule. A set value replaces the default; an entry that is not a host name is ignored. |
+
+The outbound trigger posts as the bot, with a token from the app's identity endpoint for `PRIMUSCLAW_BOT_APP_ID`: the
+bot must be a user-assigned managed identity assigned to the Function app. The Functions host's own settings
+(`AzureWebJobsStorage`, `APPLICATIONINSIGHTS_CONNECTION_STRING`, the deployment storage) are Azure's.
 
 ## Release gate only
 

@@ -1,0 +1,44 @@
+{
+  "name": "@primusclaw/personal-agent-teams-ingress",
+  "version": "0.2.0",
+  "description": "The personal agent's Teams ingress: an Azure Function that verifies the Bot Framework token and puts each activity on the inbound Service Bus queue.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AMD-AGI/PrimusClaw.git",
+    "directory": "personal-agent/packages/teams-ingress"
+  },
+  "homepage": "https://github.com/AMD-AGI/PrimusClaw/tree/main/personal-agent#readme",
+  "bugs": {
+    "url": "https://github.com/AMD-AGI/PrimusClaw/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.17.0",
+    "@azure/identity": "^4.14.1",
+    "@azure/service-bus": "^7.10.0",
+    "@primusclaw/personal-agent": "0.2.0",
+    "@primusclaw/personal-agent-teams": "0.2.0",
+    "jose": "^6.2.16"
+  },
+  "devDependencies": {
+    "rhea": "^3.0.5",
+    "ws": "^8.22.2",
+    "@types/ws": "^8.18.2"
+  }
+}

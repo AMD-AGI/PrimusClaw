@@ -21,7 +21,7 @@ import { oddCaseSources, SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnly
  * Each package's floor, in percent. Lowering one is a change to this file that review sees. A package directory under
  * packages/ without a floor here fails the gate (`packagesToCheck`), so a new package cannot go uncounted.
  */
-export const FLOORS: Readonly<Record<string, number>> = { core: 90, runtime: 85, teams: 85 };
+export const FLOORS: Readonly<Record<string, number>> = { core: 90, runtime: 85, teams: 85, "teams-ingress": 85 };
 
 /** Why a package's `src` cannot be judged, if it cannot: it is missing, it is itself a link, or has links inside. */
 function srcLinks(packagesDir: string, pkg: string): string[] {

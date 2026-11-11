@@ -3,12 +3,14 @@
 
 name: Personal agent packaging
 
-# Checks, before a release is ever cut, what a release of the personal agent's three npm packages
-# (@primusclaw/personal-agent, -runtime, -teams) would publish. The workspace itself typechecks and tests the
-# packages' sources (tsconfig.json's `paths`), never what is built from them, so this is where the built packages
-# are checked: `npm run build`, then personal-agent/scripts/check-pack.ts packs the three real tarballs, checks
-# their files and manifests, installs them into an empty directory outside the workspace, imports each package,
-# runs the worker program, and compiles a TypeScript consumer against their declarations.
+# Checks, before a release is ever cut, what a release of the personal agent's four npm packages
+# (@primusclaw/personal-agent, -runtime, -teams, -teams-ingress) and of the Teams ingress's Function package would
+# publish. The workspace itself typechecks and tests the packages' sources (tsconfig.json's `paths`), never what is
+# built from them, so this is where the built packages are checked: `npm run build`, then
+# personal-agent/scripts/check-pack.ts packs the four real tarballs, checks their files and manifests, installs them
+# into an empty directory outside the workspace, imports each package, runs the worker program and the ingress's
+# Function entry, and compiles a TypeScript consumer against their declarations. Then the Function package (the zip a
+# deployment runs, scripts/build-ingress.ts) is built and run in a real Functions host (scripts/ingress-host-smoke.ts).
 #
 # No path filter, like connector-packaging.yml: core compiles the Claw wire contract in from
 # claw/packages/protocol, so a change there can break the packages as surely as one under personal-agent/.
@@ -51,3 +53,28 @@ jobs:
 
       - name: Check the packages
         run: npm run check-pack
+
+      - name: Build the ingress Function package
+        env:
+          OUT: ${{ runner.temp }}/ingress
+        run: |
+          set -euo pipefail
+          npm run build-ingress -- --out "$OUT"
+          (cd "$OUT" && sha256sum -c ./*.zip.sha256)
+
+      # Azure Functions Core Tools, pinned and checked against its sha256: the host the zip runs in.
+      - name: Run the ingress Function package in a Functions host
+        env:
+          OUT: ${{ runner.temp }}/ingress
+          TOOLS: ${{ runner.temp }}/func
+          CORE_TOOLS_VERSION: "4.16.0"
+          CORE_TOOLS_SHA256: c68c7780d94c7583157f7a7d1a05e0ec3e34057c3d55e4c7be71fc4aa0c23667
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLS"
+          curl -fsSL --retry 3 -o "$TOOLS/cli.zip" \
+            "https://github.com/Azure/azure-functions-core-tools/releases/download/$CORE_TOOLS_VERSION/Azure.Functions.Cli.linux-x64.$CORE_TOOLS_VERSION.zip"
+          echo "$CORE_TOOLS_SHA256  $TOOLS/cli.zip" | sha256sum -c -
+          unzip -q "$TOOLS/cli.zip" -d "$TOOLS/cli"
+          chmod +x "$TOOLS/cli/func"
+          node --import tsx scripts/ingress-host-smoke.ts --zip "$(ls "$OUT"/*.zip)" --func "$TOOLS/cli/func"

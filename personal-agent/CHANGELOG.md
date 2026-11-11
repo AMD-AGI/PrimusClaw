@@ -5,11 +5,33 @@ SPDX-License-Identifier: MIT
 
 # Changelog
 
-The three packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
-`@primusclaw/personal-agent-teams`) and the `personal-agent-teams` image are released together at one version. Each
+The four packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
+`@primusclaw/personal-agent-teams`, `@primusclaw/personal-agent-teams-ingress`), the Teams ingress's Function package
+(`personal-agent-teams-ingress-X.Y.Z.zip`) and the `personal-agent-teams` image are released together at one version. Each
 release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub Release's notes (README.md,
 "Releasing"): a version without a section is not released. While the version is 0.x, a patch release fixes and a minor
 release adds; a change to a plugin port (core's `src/plugins/`) is always a minor release and is called out here.
+
+## Unreleased
+
+### Added
+
+- `@primusclaw/personal-agent-teams-ingress`, new: the Teams ingress, the Azure Function (Node 26) between Azure Bot
+  Service and the inbound queue, which until now each deployment wrote itself. It verifies the Bot Framework token
+  (RS256 only; `exp`, `iss`, `aud` required, no leeway; the audience is `PRIMUSCLAW_BOT_APP_ID`), binds it to the
+  activity's `serviceUrl` with the worker's Bot Connector host rule, and queues the activity on its conversation's
+  session; it answers a card button with a placeholder card, the feedback buttons with an empty `200`, other invokes
+  with an empty result, and logs one `token_rejected` security event per refusal. Its outbound queue trigger posts what
+  the worker queues (`OUTBOUND_MODE=servicebus`) as the bot's managed identity, so the default outbound mode now works
+  with published parts only. It answers as the Python Function it replaces did, case for case
+  (`packages/teams-ingress/test/parity.test.ts`), except for a few `serviceUrl`s no Bot Connector sends, which it reads
+  as the worker does. Settings: [configuration.md](docs/configuration.md#the-teams-ingress).
+- The release attaches the ingress as a deployable Function package, `personal-agent-teams-ingress-X.Y.Z.zip` (one
+  reproducible bundle with `host.json`; its sha256 next to it, attested like the tarballs), checked in a real Functions
+  host before it is published. [Quick start](docs/quickstart.md#4-the-ingress), step 4, now deploys it instead of
+  asking for an ingress of one's own.
+- `@primusclaw/personal-agent-teams`: a second entry, `@primusclaw/personal-agent-teams/connector-hosts`, the Bot
+  Connector host rule alone, which the ingress imports.
 
 ## 0.2.0
 
