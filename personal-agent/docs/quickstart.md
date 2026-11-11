@@ -238,7 +238,7 @@ With Docker Compose, from a copy of [`examples/minimal-teams`](../examples/minim
 `assertion-key.pem` for the federated token, which the image reads as uid 65534):
 
 ```bash
-sudo chown 65534 assertion-key.pem && chmod 0400 assertion-key.pem   # federated token only
+sudo chown 65534 assertion-key.pem && sudo chmod 0400 assertion-key.pem   # federated token only
 docker compose up -d
 ```
 
