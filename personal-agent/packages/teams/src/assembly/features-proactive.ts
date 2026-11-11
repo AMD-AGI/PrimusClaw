@@ -125,7 +125,8 @@ export function proactiveParts(
 
 /**
  * The card that confirms a person's identity after an assistant message refused for want of it (`needs_identity`), in their own
- * chat, once per turn (kept as a `processed` key, so a later say of the same turn, or the same event delivered again, sends none).
+ * chat, once per turn (an event claim per person and turn, so a later say of the same turn, the same event delivered again, or
+ * two says of one turn delivered at once, send none).
  */
 function identityAfterRefusal(
   base: Pick<AssemblyBase, "store" | "logger">,
@@ -134,20 +135,29 @@ function identityAfterRefusal(
   return async (userId, conversation, turn) => {
     const { store } = base;
     const once = `${IDENTITY_REFUSED_PREFIX}${userId}:${turn}`;
-    if (!turn || store.idempotency.seen(once)) return;
-    const person = {
-      id: userId,
-      channelUserId: store.members.channelIdOf(userId) ?? "",
-      name: store.members.memberName(userId) ?? "",
-      email: "",
-    };
-    const r = router();
-    if (await r.ctx.credentials.identityAfterRefusal(r.chat(person, conversation)))
-      store.idempotency.claimProcessed(once);
+    if (!turn) return;
+    // (claimed before the card is asked for, so two says of one turn delivered at once send one card; released when none was
+    // sent, so a later say of the turn may still offer it)
+    const claim = store.idempotency.claimEvent(once);
+    if (claim.state !== "claimed") return;
+    let sent = false;
+    try {
+      const person = {
+        id: userId,
+        channelUserId: store.members.channelIdOf(userId) ?? "",
+        name: store.members.memberName(userId) ?? "",
+        email: "",
+      };
+      const r = router();
+      sent = await r.ctx.credentials.identityAfterRefusal(r.chat(person, conversation));
+    } finally {
+      if (sent) store.idempotency.finishEvent(once);
+      else store.idempotency.releaseEvent(once, claim.holder);
+    }
   };
 }
 
-/** The `processed` key prefix of a turn whose identity card was sent (`identityAfterRefusal`). */
+/** The event claim key prefix of a turn whose identity card was sent (`identityAfterRefusal`). */
 export const IDENTITY_REFUSED_PREFIX = "identity-refused:";
 
 /** What the router reads of quiet hours and /pause (`muted` as a word or null, `release` on /resume). */

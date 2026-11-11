@@ -291,10 +291,16 @@ describe("the identity card after a refused answer", () => {
     // A later say of the same turn (it replaces the first) carries the field too: no second card.
     await features.deliverEvent(ALICE.id, reference, say("s2"));
     assert.equal(bindings().length, 1);
+    // Two says of one turn delivered at once: one card.
+    await Promise.all([
+      features.deliverEvent(ALICE.id, reference, { ...say("s4"), turn_message_id: "m3" }),
+      features.deliverEvent(ALICE.id, reference, { ...say("s5"), turn_message_id: "m3" }),
+    ]);
+    assert.equal(bindings().length, 2);
     // Confirmed by now: a refused turn after that offers nothing.
     exchange.tokens.set(ALICE.id, "tok-a");
     await features.deliverEvent(ALICE.id, reference, { ...say("s3"), turn_message_id: "m2" });
-    assert.equal(bindings().length, 1);
+    assert.equal(bindings().length, 2);
   });
 });
 
