@@ -17,6 +17,8 @@
  *       predates the answer, is not told on that report
  *   T8  a told wait is never told again while it still waits, even when a heartbeat in between could not see it (every entry
  *       `unknown`, or this one); a list that knows its conversations and lacks it, or an agent gone from the report, ends it *   T9  an owner with no assistant yet is told once they have one, if it still waits
+ *   T10 a wait whose request the terminal's hook already put to the owner as a card (a terminal-hook session of that machine and
+ *       conversation with a request not yet answered) is not told again; one whose request was answered is told as before
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -286,5 +288,34 @@ describe("conversations open in a terminal that wait for their person", { skip }
     await sweep();
     await sweep();
     assert.equal((await says("carol")).length, 1);
+  });
+
+  test("T10 a wait already put to the owner as a card by the terminal's hook is not told again", async () => {
+    const cid = await machine("alice", "dev-pod");
+    const card = async (ref: string, answered: boolean) => {
+      const sid = randomUUID();
+      await w.q(
+        `INSERT INTO claw_remote_sessions (session_id, owner_user_id, connector_id, agent_id, cwd, origin, ref)
+         VALUES ($1, 'alice', $2, 'claude', '/home/u/repo', 'terminal_hook', $3)`, [sid, cid, ref],
+      );
+      await w.q(
+        `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, 1, 'permissionRequest', NOW(), '{"actionId":"a1"}'::jsonb)`, [sid],
+      );
+      if (answered) {
+        await w.q(
+          `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, 2, 'permission_resolved', NOW(), '{"actionId":"a1","by":"terminal"}'::jsonb)`, [sid],
+        );
+      }
+    };
+    await card("s-1", false);
+    await card("s-2", true);
+    await terminal(cid, "alice", [conv("s-1", "waiting"), conv("s-2", "waiting", { title: "second" })]);
+    await sweep();
+    await waitedFor(cid, "s-1", 2 * MINUTE);
+    await waitedFor(cid, "s-2", 2 * MINUTE);
+    await sweep();
+    assert.deepEqual(await says("alice"), ["dev-pod 上终端里的 Claude Code 在等你（input needed）：second。已经等了一分多钟，回到那个终端处理。"]);
+    await sweep();
+    assert.equal((await says("alice")).length, 1, "the carded one is not told later either");
   });
 });

@@ -163,10 +163,22 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
         RETURNING w.connector_id::text AS connector_id, w.agent_id, w.ref, w.since`,
       [confirmed.map((d) => d.connector_id), confirmed.map((d) => d.agent_id), confirmed.map((d) => d.ref)],
     )).rows as Array<{ connector_id: string; agent_id: string; ref: string; since: Date }> : [];
+    // A conversation whose approval its terminal's hook already put to the owner as a card (a terminal-hook session of that machine
+    // and conversation with a request not yet answered, `store.openTerminalSession`): the card was the news, and this is not said.
+    const carded = due.length ? new Set((await q(
+      `SELECT DISTINCT s.connector_id::text AS connector_id, s.ref FROM claw_remote_sessions s
+        WHERE s.origin = 'terminal_hook' AND s.status = 'active'
+          AND s.connector_id = ANY($1::uuid[]) AND s.ref = ANY($2::text[])
+          AND EXISTS (SELECT 1 FROM claw_remote_events r WHERE r.session_id = s.session_id AND r.type = 'permissionRequest'
+                       AND NOT EXISTS (SELECT 1 FROM claw_remote_events d WHERE d.session_id = s.session_id
+                                         AND d.type = 'permission_resolved' AND d.data->>'actionId' = r.data->>'actionId'))`,
+      [due.map((d) => d.connector_id), due.map((d) => d.ref)],
+    )).rows.map((r) => `${r.connector_id}\u0000${r.ref}`)) : new Set<string>();
     const notices: TerminalWaitNotice[] = [];
     for (const d of due) {
       const r = byKey.get(keyOf(d.connector_id, d.agent_id, d.ref));
       if (!r) continue;
+      if (carded.has(`${d.connector_id}\u0000${d.ref}`)) continue;
       notices.push({
         owner: r.owner_user_id, connectorId: r.connector_id, agentId: r.agent_id, ref: r.ref, machine: r.machine, agent: r.agent,
         title: r.title, cwd: r.cwd, waitingFor: r.waiting_for, since: new Date(d.since),

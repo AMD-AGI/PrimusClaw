@@ -103,11 +103,18 @@ export interface AssistantFile {
  * `agent` are what the connector reported, and `ask`'s words what the agent wrote: untrusted text, shown as text only.
  */
 export interface AssistantRemoteNotice {
-  kind: "done" | "needs_you" | "error";
+  /**
+   * `resolved` (only for a terminal's request, `ask.origin` "terminal"): a request this channel was sent as a card was answered, or stopped
+   * waiting, somewhere else (`resolved`), so a channel that still shows that card marks it so in place; the text says the same in one line
+   * for a channel that does not.
+   */
+  kind: "done" | "needs_you" | "error" | "resolved";
   session_id: string;
   machine: string;
   agent: string;
   ask?: AssistantRemoteAsk;
+  /** With `kind: "resolved"`: which request, and who ended it (`terminal`, or `timeout`, `session_end`, `connector_restart` when nobody did). */
+  resolved?: { action_id: string; by: string };
 }
 
 /** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */
@@ -118,6 +125,22 @@ export interface AssistantRemoteAsk {
   options: Array<{ optionId: string; name: string; kind: string }>;
   /** When the connector stops waiting for an answer (it refuses the request then); absent when it did not say. */
   expires_at?: string;
+  /**
+   * `terminal`: asked in a terminal on the machine (a conversation its person started there), whose own prompt stays open: whichever
+   * answer comes first is taken. Absent for a session opened through Claw.
+   */
+  origin?: "terminal";
+  /** A terminal's request: what kind of prompt it is (`execute`, `edit`, `question`, `switch_mode` for a plan, `mcp`, `other`). */
+  kind?: string;
+  /**
+   * A terminal's request: what it would do, whole, as its connector posted it (the command, the edit, the plan, the question): a channel
+   * shows all of it, or offers only the options that refuse. Absent when it was too large to carry whole; the options are then only
+   * those that refuse.
+   */
+  input?: unknown;
+  /** A terminal's question asked as several cards: which this is (from 0), and how many. */
+  question_index?: number;
+  question_count?: number;
 }
 
 /** Something the assistant chose to say to the user. */

@@ -206,8 +206,14 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
         action_id: r.ask.action_id, tool: redact(r.ask.tool),
         options: r.ask.options.map((o) => ({ optionId: o.optionId, name: redact(o.name), kind: o.kind })),
         ...(r.ask.expires_at ? { expires_at: r.ask.expires_at } : {}),
+        ...(r.ask.origin ? { origin: r.ask.origin } : {}),
+        ...(r.ask.kind ? { kind: r.ask.kind } : {}),
+        ...(r.ask.input !== undefined ? { input: redactPublicJson(r.ask.input) } : {}),
+        ...(r.ask.question_index !== undefined ? { question_index: r.ask.question_index } : {}),
+        ...(r.ask.question_count !== undefined ? { question_count: r.ask.question_count } : {}),
       },
     } : {}),
+    ...(r.resolved ? { resolved: { action_id: r.resolved.action_id, by: r.resolved.by } } : {}),
   };
 }
 

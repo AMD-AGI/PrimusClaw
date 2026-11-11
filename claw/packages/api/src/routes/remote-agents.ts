@@ -26,6 +26,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalSessionOpen,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -87,6 +88,8 @@ export interface RemoteAgentOptions {
   closing?: AbortSignal;
   /** How often this replica ends commands that were never delivered (`store.expireUndelivered`); zero or less runs no sweep. */
   undeliveredSweepMs?: number;
+  /** Terminal-hook sessions one user may open per minute (`TERMINAL_SESSION_LIMITS.opensPerMinute`). */
+  terminalSessionsPerMinute?: number;
 }
 
 /**
@@ -257,6 +260,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   const maxConnectors = opts.maxConnectorsPerUser ?? REMOTE_AGENT_LIMITS.maxConnectorsPerUser;
   const maxActiveSessions = opts.maxActiveSessionsPerUser ?? REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser;
   const maxStreams = opts.maxStreamsPerUser ?? 20;
+  const terminalSessionsPerMinute = opts.terminalSessionsPerMinute ?? TERMINAL_SESSION_LIMITS.opensPerMinute;
   const timing = { pingMs, pollMs, closing: opts.closing };
 
   // Closed sessions and their events would otherwise be kept for ever. Every replica sweeps; the
@@ -471,6 +475,41 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
 
+  // A conversation open in a terminal asked for an approval: the session it is carried on (`store.openTerminalSession`).
+  app.post(CONNECTOR_SIDE_ROUTES.terminalSessions.url, async (req, reply) => {
+    const owner = requireOwner(req, reply, "connector");
+    if (!owner) return;
+    const connector = await ownConnector(req, reply, owner);
+    if (!connector) return;
+    const body = parseTerminalSessionOpen(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    const out = await store.openTerminalSession(owner, String(connector.connector_id), body.value, terminalSessionsPerMinute);
+    if (out.status !== "opened") {
+      if (out.status === "gone") return fail(reply, 401, "revoked");
+      if (out.status === "approvals_off") return fail(reply, 409, "approvals_off");
+      if (out.status === "agent_not_found") return fail(reply, 404, "agent_not_found");
+      return fail(reply, 429, "rate_limited");
+    }
+    return reply.status(out.created ? 201 : 200).send({ ok: true, data: { session_id: out.session_id, created: out.created } });
+  });
+
+  // --- approvals from terminals (user side) ----------------------------------
+
+  app.get("/v1/remote-agents/approvals", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    return reply.send({ ok: true, data: { enabled: await store.approvalsEnabled(owner) } });
+  });
+
+  app.put("/v1/remote-agents/approvals", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const body = parseApprovalsSetting(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    await store.setApprovalsEnabled(owner, body.value.enabled, clientLabel(req));
+    return reply.send({ ok: true, data: { enabled: body.value.enabled } });
+  });
+
   app.get<{ Params: { cid: string }; Querystring: { after?: string } }>(
     CONNECTOR_SIDE_ROUTES.commands.url,
     async (req, reply) => {
@@ -633,6 +672,8 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // A conversation open in a terminal, watched: nothing typed here may reach it (a second writer forks its transcript).
     // Refused before it is queued; the connector refuses it too.
     if (session.read_only === true && READ_ONLY_REFUSED.has(type)) return fail(reply, 409, "session_read_only");
+    // A session that carries a terminal's approvals: only an answer and a close (the terminal's person runs the conversation).
+    if (session.origin === REMOTE_ORIGIN_TERMINAL_HOOK && !TERMINAL_HOOK_COMMANDS.includes(type)) return fail(reply, 409, "terminal_hook_session");
     const connector = await store.findConnector(owner, session.connector_id, onlineWindowMs);
     if (!connector || connector.revoked_at) return notFound(reply);
     const spec = REMOTE_COMMANDS[type as RemoteCommandType];
@@ -683,6 +724,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const out = ordered ? await inRemoteSessionOrder(sessionId, send) : await send();
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "gone") return notFound(reply);
+    if (out.status === "terminal_hook_session") return fail(reply, 409, "terminal_hook_session");
     if (out.status === "duplicate") {
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);

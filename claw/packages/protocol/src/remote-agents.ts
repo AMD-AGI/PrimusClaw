@@ -331,6 +331,63 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
 }
 
 /**
+ * Approvals a terminal asks for, carried to the phone (`POST /v1/remote-agents/connectors/:cid/terminal-sessions`).
+ *
+ * A coding agent its person started in their own terminal asks there before it runs a command, edits a file, leaves plan mode or
+ * puts a multiple-choice question. A connector whose hook sees such a prompt opens (or finds) one session per terminal conversation
+ * (`ref`, the agent's own conversation id) and posts each prompt on it as a `permissionRequest`, with
+ * `data.origin` {@link REMOTE_ORIGIN_TERMINAL_HOOK}; the owner answers it as any other, with a `decision`. The terminal keeps its own
+ * prompt: whichever answer comes first is the one the agent takes, and the connector says which (`permission_resolved.by`).
+ *
+ * Such a session carries nothing else: no prompt, no turn, no mode. It is not one of the sessions a user opens, so it neither counts
+ * against {@link REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser} nor is closed to make room for one.
+ */
+export const REMOTE_ORIGIN_TERMINAL_HOOK = "terminal_hook";
+
+/** The only commands a terminal-hook session takes: an answer, and closing it. */
+export const TERMINAL_HOOK_COMMANDS: readonly RemoteCommandType[] = ["decision", "close"];
+
+export const TERMINAL_SESSION_LIMITS = {
+  /** Terminal-hook sessions one user may open per minute, across their machines (a new terminal conversation opens one). */
+  opensPerMinute: 30,
+  /** Characters of a session's title (the conversation's name, or the start of its first prompt). */
+  maxTitleChars: 80,
+} as const;
+
+/** A conversation ref as a connector names it, and nothing else. */
+const TERMINAL_REF_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export interface RemoteTerminalSessionOpen {
+  agent_id: string;
+  /** The agent's own id of the conversation open in the terminal. */
+  ref: string;
+  cwd: string;
+  /** The conversation's name, or the start of its first prompt; empty when the connector has neither. */
+  title: string;
+}
+
+export function parseTerminalSessionOpen(body: unknown): Parsed<RemoteTerminalSessionOpen> {
+  if (!isObject(body)) return fail("body_required");
+  if (typeof body.agent_id !== "string" || !AGENT_ID_RE.test(body.agent_id)) return fail("invalid_agent_id");
+  if (typeof body.ref !== "string" || !TERMINAL_REF_RE.test(body.ref)) return fail("invalid_ref");
+  if (typeof body.cwd !== "string" || body.cwd.length < 1 || body.cwd.length > 4096 || /[\u0000-\u001f\u007f]/u.test(body.cwd)) {
+    return fail("invalid_cwd");
+  }
+  let title = "";
+  if (body.title !== undefined && body.title !== null) {
+    if (typeof body.title !== "string" || /[\u0000-\u001f\u007f]/u.test(body.title)) return fail("invalid_title");
+    title = Array.from(body.title.trim()).slice(0, TERMINAL_SESSION_LIMITS.maxTitleChars).join("");
+  }
+  return { ok: true, value: { agent_id: body.agent_id, ref: body.ref, cwd: body.cwd, title } };
+}
+
+/** The owner's switch for approvals from terminals (`GET`/`PUT /v1/remote-agents/approvals`). On unless they turned it off. */
+export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean }> {
+  if (!isObject(body) || typeof body.enabled !== "boolean") return fail("enabled_required");
+  return { ok: true, value: { enabled: body.enabled } };
+}
+
+/**
  * Hiding conversations of a machine from its owner's lists (`POST /v1/remote-agents/connectors/:cid/hidden`), and the
  * listing that leaves them out (`GET /v1/remote-agents/connectors`, `?hidden=include` to list them too). Nothing on the
  * machine changes: only which of the conversations it reports (`capabilities.resumable`) the owner's lists show.

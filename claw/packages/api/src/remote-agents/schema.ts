@@ -115,6 +115,30 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_remote_sessions_closed ON claw_remote_sessions(updated_at) WHERE status = 'closed'",
   );
+  // A session a connector opened to carry the approvals a conversation open in a terminal asks for (`origin` 'terminal_hook', `ref`
+  // the conversation): NULL for every session a user opens. Asked first, as for the connector columns above.
+  const noOrigin = (await client.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'claw_remote_sessions' AND column_name = 'origin'`,
+  )).rows.length === 0;
+  if (noOrigin) await client.query(`
+    ALTER TABLE claw_remote_sessions
+      ADD COLUMN IF NOT EXISTS origin TEXT,
+      ADD COLUMN IF NOT EXISTS ref    TEXT
+  `);
+  // One open terminal-hook session per conversation of a connector: two hooks of one conversation opening at once find the same.
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_sessions_terminal_ref ON claw_remote_sessions(connector_id, ref)
+      WHERE origin = 'terminal_hook' AND status = 'active'`,
+  );
+  // Whether an owner wants a terminal's approvals on the phone (`/approvals on|off`). No row: on.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_approval_settings (
+      owner_user_id TEXT PRIMARY KEY,
+      enabled       BOOLEAN NOT NULL,
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_events (
       id          BIGSERIAL PRIMARY KEY,

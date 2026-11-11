@@ -177,7 +177,7 @@ describe("a connector access token over the whole router", { skip }, () => {
     assert.deepEqual([withToken.statusCode, withToken.json()], [without.statusCode, without.json()]);
   });
 
-  test("the five connector-side routes accept it, and nothing else is true of them", async () => {
+  test("the connector-side routes accept it, and nothing else is true of them", async () => {
     const cid = randomUUID();
     const expected: Record<string, number> = {
       [`POST ${connectorSide.register.url}`]: 400, // a bad body, which is after authentication
@@ -186,6 +186,7 @@ describe("a connector access token over the whole router", { skip }, () => {
       [`GET ${connectorSide.commands.url}`]: 404,
       [`POST ${connectorSide.revoke.url}`]: 404, // not this user's connector
       [`POST ${connectorSide.confirm.url}`]: 404, // not this user's connector
+      [`POST ${connectorSide.terminalSessions.url}`]: 404, // not this user's connector
     };
     for (const r of Object.values(connectorSide)) {
       const res = await app.inject({
