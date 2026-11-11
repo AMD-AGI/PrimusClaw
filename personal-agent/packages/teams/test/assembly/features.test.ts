@@ -29,6 +29,7 @@ import {
 } from "@primusclaw/personal-agent-runtime";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
+import { FakeExchange } from "../../../../test-support/routing/fixtures.js";
 import { inboundMessage } from "../../../../test-support/inbound.js";
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { SeededRandom } from "../../../../test-support/random.js";
@@ -261,6 +262,49 @@ function securityRecords(security: RecordingLogger, event: string) {
     .map((line) => JSON.parse(line.message) as Record<string, unknown>)
     .filter((record) => record["event"] === event);
 }
+
+describe("the identity card after a refused answer", () => {
+  it("a say whose turn was refused for want of a confirmed identity is followed by the binding card, once per turn", async () => {
+    const exchange = new FakeExchange();
+    const plugins: Plugins = { ...neutralPlugins(), tokenExchange: exchange };
+    const base = readSettingsForTest();
+    const { features, store, surface } = assembled({}, new RecordingLogger(), {
+      plugins,
+      settings: { exchange: { ...base.exchange, forChat: true } },
+    });
+    store.links.redeemPending(ALICE.id, ALICE.name, store.links.stashPending("ak-alice"));
+    const reference = { serviceUrl: "https://smba.test/", conversation: { id: "dm-a" }, bot: { id: "28:bot" } };
+    const say = (id: string) => ({
+      type: "assistant.say",
+      event_id: id,
+      turn_message_id: "m1",
+      text: "先确认一次身份。",
+      needs_identity: true,
+    });
+    const bindings = () =>
+      surface.outbox.flatMap((r) =>
+        r.op === "send" && r.message.body.type === "view" && r.message.body.view.name === "binding"
+          ? [r.message.body.view.model]
+          : [],
+      );
+    await features.deliverEvent(ALICE.id, reference, say("s1"));
+    assert.equal(bindings().length, 1);
+    assert.equal((bindings()[0] as { confirmUrl: string }).confirmUrl, `https://id.test/confirm?u=${ALICE.id}`);
+    // A later say of the same turn (it replaces the first) carries the field too: no second card.
+    await features.deliverEvent(ALICE.id, reference, say("s2"));
+    assert.equal(bindings().length, 1);
+    // Two says of one turn delivered at once: one card.
+    await Promise.all([
+      features.deliverEvent(ALICE.id, reference, { ...say("s4"), turn_message_id: "m3" }),
+      features.deliverEvent(ALICE.id, reference, { ...say("s5"), turn_message_id: "m3" }),
+    ]);
+    assert.equal(bindings().length, 2);
+    // Confirmed by now: a refused turn after that offers nothing.
+    exchange.tokens.set(ALICE.id, "tok-a");
+    await features.deliverEvent(ALICE.id, reference, { ...say("s3"), turn_message_id: "m2" });
+    assert.equal(bindings().length, 2);
+  });
+});
 
 describe("the request scope", () => {
   it("an audit record written while an inbound press is handled names that activity", async () => {

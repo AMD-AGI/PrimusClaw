@@ -356,7 +356,7 @@ export function buildFeatures(given: AssemblyBase): Features {
     hooks,
     reviewHandoff: (userId, event) => lateReview.handoff?.take(userId, event) ?? "dropped",
   });
-  const proactive = proactiveParts(base, teams.style, assistant, errors);
+  const proactive = proactiveParts(base, teams.style, assistant, errors, get);
   const reach = followReach(proactive, base);
   const remote = remoteAgents(base, { switches, guard, reach, errors, directChat: assistant.directChat, hooks });
   const w8 = w8Parts(base, { briefEnabled: switches.brief, assistantOn: (userId) => assistant.chat.on(userId) });

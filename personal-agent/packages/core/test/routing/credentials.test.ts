@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { AI_NOTICE, type KeyOwner, type Logger, type OutMessage } from "@primusclaw/personal-agent";
 
 import { FakeSurface } from "../../../../test-support/surface.js";
-import { openTestStore } from "../../../../test-support/store.js";
+import { advanceSeconds, openTestStore } from "../../../../test-support/store.js";
 import { Chat } from "../../src/routing/chat.js";
 import { CredentialUnavailable, Credentials } from "../../src/routing/credentials.js";
 import type { RouterConfig } from "../../src/routing/deps.js";
@@ -45,13 +45,27 @@ function config(exchangeForChat: boolean): RouterConfig {
 }
 
 function world(exchangeForChat: boolean, locale = "") {
-  const { store } = openTestStore();
+  const { store, clock } = openTestStore();
   const exchange = new FakeExchange();
   const surface = new FakeSurface();
   const views = new CommandViews("Clawy", PUBLIC, note);
   const credentials = new Credentials({ store, exchange, config: config(exchangeForChat), logger }, views);
   const chat = (who = ALICE) => new Chat(store, who, surface.conversation(personal()), "", locale);
-  return { store, exchange, surface, credentials, chat };
+  return { store, clock, exchange, surface, credentials, chat };
+}
+
+function cards(surface: FakeSurface): { name: string; lead: string; confirmUrl: string }[] {
+  return surface.outbox.flatMap((r) =>
+    r.op === "send" && r.message.body.type === "view"
+      ? [
+          {
+            name: r.message.body.view.name,
+            lead: (r.message.body.view.model as { lead?: string }).lead ?? "",
+            confirmUrl: (r.message.body.view.model as { confirmUrl?: string }).confirmUrl ?? "",
+          },
+        ]
+      : [],
+  );
 }
 
 function said(surface: FakeSurface): string[] {
@@ -181,4 +195,36 @@ test("/whoami says the owner's name as Python strips it: a byte-order mark stays
     saidIn(w).some((t) => t.includes("connected to SaFE user \uFEFFVi")),
     saidIn(w).join(" | "),
   );
+});
+
+test("a key's owner who never confirmed their identity is answered on the key, with no card before it", async () => {
+  // (connecting a machine and the rest of what a key may do are not held behind the identity: the card comes only after an
+  // answer that was refused for want of it, `identityAfterRefusal`)
+  const w = world(true, "zh-CN");
+  link(w.store, ALICE.id, "ak-alice");
+  assert.equal(await w.credentials.credential(w.chat()), "ak-alice");
+  advanceSeconds(w.clock, 86_400);
+  assert.equal(await w.credentials.credential(w.chat()), "ak-alice");
+  assert.deepEqual(said(w.surface), []);
+});
+
+test("after an answer refused for want of a confirmed identity: the card, unless confirmed by now", async () => {
+  const w = world(true, "zh-CN");
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), true);
+  assert.deepEqual(
+    cards(w.surface).map((c) => [c.name, c.lead]),
+    [["binding", "这一步需要你本人：在这张卡片上确认一次身份，然后再说一遍就行。"]],
+  );
+  w.exchange.tokens.set(ALICE.id, "tok-a");
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false);
+  w.exchange.tokens.delete(ALICE.id);
+  w.exchange.down = true;
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false, "the service down: not 'not bound'");
+  w.exchange.down = false;
+  w.exchange.bindingDown = true;
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false);
+  assert.equal(cards(w.surface).length, 1);
+  const keyOnly = world(false);
+  assert.equal(await keyOnly.credentials.identityAfterRefusal(keyOnly.chat()), false);
+  assert.deepEqual(said(keyOnly.surface), []);
 });
