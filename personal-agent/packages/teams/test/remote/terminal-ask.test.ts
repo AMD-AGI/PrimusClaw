@@ -13,6 +13,7 @@ import { remoteDomain, remoteView } from "@primusclaw/personal-agent";
 import { cardOf, textsOf } from "../../../../test-support/adaptive-card.js";
 import { assertValidCard } from "./card-schema.js";
 import { terminalAskCard } from "../../src/views/remote/index.js";
+import { TERMINAL_CARD_SAFE_BYTES } from "../../src/views/remote/permission-cards.js";
 import { remoteAskCard } from "../../src/assembly/features-assistant.js";
 
 type Json = Record<string, unknown>;
@@ -263,4 +264,127 @@ test("review round 3: many short answers count what each element adds, so the ca
   assert.ok(Buffer.byteLength(JSON.stringify(q)) < 28_000, String(Buffer.byteLength(JSON.stringify(q))));
   assert.deepEqual(ids(q), []);
   assert.match(all(q), /approve it at the terminal/);
+});
+
+test("review round 4: the notes of many long 'always' options cannot push an approvable card past what Teams takes", () => {
+  const always = Array.from({ length: 12 }, (_, i) => ({
+    optionId: `al${String(i)}`,
+    name: `Always allow this session: ${"*".repeat(170)}${String(i)}`,
+    kind: "allow_always",
+  }));
+  const c = card({
+    action_id: "n1",
+    origin: "terminal",
+    kind: "execute",
+    tool: "Run",
+    input: { command: `printf '${"*".repeat(6_500)}'` },
+    options: always,
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(c)) < 28_000, String(Buffer.byteLength(JSON.stringify(c))));
+  // Each "always" button there is has its whole name in the body.
+  for (const id of ids(c)) assert.ok(all(c).includes(String(always.findIndex((o) => o.optionId === id))));
+});
+
+/** A small deterministic generator, so a failure names its seed. */
+function rng(seed: number): () => number {
+  let x = seed >>> 0 || 1;
+  return () => {
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    return (x >>> 0) / 2 ** 32;
+  };
+}
+
+test("any input: the card is never heavier than the safe line, and an allow button means the request is on it whole", () => {
+  let approvable = 0;
+  const ALPHABET = 'ab *_`[]()<>\\"\n漢😀|#-';
+  for (let seed = 1; seed <= 300; seed++) {
+    const r = rng(seed);
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(r() * xs.length)] as T;
+    const text = (max: number): string =>
+      Array.from({ length: Math.floor(r() * max) }, () => ALPHABET.charAt(Math.floor(r() * ALPHABET.length))).join("");
+    const kind = pick(["execute", "edit", "switch_mode", "question", "mcp"]);
+    const input: Json =
+      kind === "execute"
+        ? { command: text(20_000), description: text(600) }
+        : kind === "edit"
+          ? { file_path: `/w/${text(500)}`, old_string: text(9_000), new_string: text(9_000) }
+          : kind === "switch_mode"
+            ? { plan: text(20_000) }
+            : kind === "question"
+              ? {
+                  question: text(500),
+                  options: Array.from({ length: Math.floor(r() * 500) }, () => ({
+                    label: text(30),
+                    description: text(60),
+                  })),
+                }
+              : { [text(20)]: text(10_000) };
+    const options = [
+      { optionId: "allow", name: "Yes", kind: "allow_once" },
+      ...Array.from({ length: Math.floor(r() * 12) }, (_, i) => ({
+        optionId: `al${String(i)}`,
+        name: `Always allow this session: ${text(190)}`,
+        kind: "allow_always",
+      })),
+      { optionId: "deny", name: "No", kind: "reject_once" },
+    ];
+    const ask = { action_id: `r${String(seed)}`, origin: "terminal", kind, tool: text(300), input, options };
+    const view = remoteView.terminalAskView(
+      { ask, options: remoteDomain.parseOptions(options), sessionId: "s-1", machine: text(80), agent: "claude" },
+      "en",
+    );
+    const sent = terminalAskCard(view);
+    const bytes = Buffer.byteLength(JSON.stringify(sent));
+    assert.ok(bytes <= TERMINAL_CARD_SAFE_BYTES, `seed ${String(seed)}: ${String(bytes)} bytes`);
+    const c = cardOf(sent);
+    const allows = ((c["actions"] as Json[] | undefined) ?? []).filter(
+      (a) => a["style"] === "positive" || String((a["data"] as Json)["option_id"]).startsWith("al"),
+    );
+    if (allows.length) {
+      assert.ok(view.complete, `seed ${String(seed)}: an allow button on a card that is not whole`);
+      assert.doesNotMatch(all(c), /approve it at the terminal/, `seed ${String(seed)}`);
+      approvable++;
+    }
+  }
+  // (the inputs reach both sides: cards that stay approvable, and cards cut to reject-only)
+  assert.ok(approvable > 10 && approvable < 290, `approvable ${String(approvable)}`);
+});
+
+test("the size backstop: a card heavier than the safe line as built goes out cut short, never with an allow button", () => {
+  const base = remoteView.terminalAskView(
+    {
+      ask: {
+        action_id: "b1",
+        origin: "terminal",
+        kind: "execute",
+        tool: "Run",
+        input: { command: "ls" },
+        options: COMMAND_OPTIONS,
+      },
+      options: remoteDomain.parseOptions(COMMAND_OPTIONS),
+      sessionId: "s-1",
+      machine: "dev-pod",
+      agent: "claude",
+    },
+    "en",
+  );
+  // A view whose content outgrew what it was budgeted for (whatever the reason): the card it would make is too heavy.
+  const heavy = { ...base, sections: [{ type: "code" as const, text: "z".repeat(30_000) }] };
+  const sent = cardOf(terminalAskCard(heavy));
+  assert.ok(Buffer.byteLength(JSON.stringify(sent)) <= TERMINAL_CARD_SAFE_BYTES);
+  assert.deepEqual(ids(sent), ["deny", "deny-stop"]);
+  assert.match(all(sent), /approve it at the terminal/);
+  // Even a fallback that is itself too heavy goes out: title, the notice and the turn-down options.
+  const fallback = base.fallback;
+  assert.ok(fallback !== undefined);
+  const worse = {
+    ...heavy,
+    fallback: { ...fallback, sections: [{ type: "code" as const, text: "z".repeat(30_000) }] },
+  };
+  const last = cardOf(terminalAskCard(worse));
+  assert.ok(Buffer.byteLength(JSON.stringify(last)) <= TERMINAL_CARD_SAFE_BYTES);
+  assert.deepEqual(ids(last), ["deny", "deny-stop"]);
+  assert.match(all(last), /approve it at the terminal/);
 });

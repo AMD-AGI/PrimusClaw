@@ -36,13 +36,28 @@ export function remoteAskCard(view: remoteView.RemoteAskView): CardMessage {
   return message(body, view.buttons.map(decisionAction), OPTIONS_MAX);
 }
 
-/** The card of a question a terminal asks: who asks, what, the content whole (or the notice that it is not), then the options. */
+/** The most a terminal's card may weigh as sent: Teams takes about 28 KB, and this leaves room for the activity around it. */
+export const TERMINAL_CARD_SAFE_BYTES = 24_000;
+
+const cardBytes = (card: CardMessage): number => new TextEncoder().encode(JSON.stringify(card)).length;
+
+/**
+ * The card of a question a terminal asks: who asks, what, the content whole (or the notice that it is not), then the options.
+ * Whatever the request, the card goes out: one heavier than TERMINAL_CARD_SAFE_BYTES is sent cut short instead (only the options
+ * that turn it down), and if even that is too heavy, with its title, the notice to approve at the terminal and those options.
+ */
 export function terminalAskCard(view: remoteView.TerminalAskView): CardMessage {
-  const body: CardElement[] = [
-    header(view.title, { tone: "attention", emoji: "needs_you" }),
-    block(view.who, { isSubtle: true, spacing: "Small" }),
-    block(view.asks, { spacing: "Small" }),
-  ];
+  const full = terminalAskBody(view);
+  if (cardBytes(full) <= TERMINAL_CARD_SAFE_BYTES || view.fallback === undefined) return full;
+  const cut = terminalAskBody(view.fallback);
+  if (cardBytes(cut) <= TERMINAL_CARD_SAFE_BYTES) return cut;
+  return terminalAskBody({ ...view.fallback, who: "", asks: "", sections: [], notes: view.fallback.notes.slice(-2) });
+}
+
+function terminalAskBody(view: remoteView.TerminalAskView): CardMessage {
+  const body: CardElement[] = [header(view.title, { tone: "attention", emoji: "needs_you" })];
+  if (view.who) body.push(block(view.who, { isSubtle: true, spacing: "Small" }));
+  if (view.asks) body.push(block(view.asks, { spacing: "Small" }));
   for (const s of view.sections) {
     if (s.type === "code") body.push(text(s.text, { mono: true, spacing: "Small" }));
     else if (s.type === "words") body.push(block(s.text, { spacing: "Small" }));

@@ -14,7 +14,7 @@ import type { Lang } from "../locales/lang.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 import type { DecisionButton } from "../remote/actions.js";
 import { breakLinks, inertLinks, lit, masked, neutral, plain } from "../remote/inert.js";
-import type { PermissionOption } from "../remote/options.js";
+import { type PermissionOption, shownOptions } from "../remote/options.js";
 import type { Reported } from "../remote/reported.js";
 import { pyStr } from "../text/py-text.js";
 import { optionButtons } from "./permission-view.js";
@@ -26,6 +26,8 @@ import { optionButtons } from "./permission-view.js";
 export const TERMINAL_CONTENT_MAX = 16_000;
 /** The most bytes of rendered content (as the card's JSON carries it) a card holds, leaving room under Teams' ~28 KB for the rest. */
 export const TERMINAL_CARD_BYTES = 20_000;
+/** The content budget of the cut-short card a channel falls back to. */
+export const TERMINAL_FALLBACK_BYTES = 4_000;
 
 /** How long one line of a card may be (a description, a header, a path, an answer's label or meaning) before it is cut. */
 const LINE_MAX = 400;
@@ -52,6 +54,11 @@ export interface TerminalAskView {
   readonly buttons: readonly DecisionButton[];
   /** The whole request is on the card (else only the options that turn it down are). */
   readonly complete: boolean;
+  /**
+   * The same card cut short (content within TERMINAL_FALLBACK_BYTES, only the options that turn it down, no "always" notes): what
+   * a channel sends when the card as built is larger than it can carry. Absent on the fallback itself.
+   */
+  readonly fallback?: TerminalAskView;
 }
 
 export interface TerminalAsk {
@@ -211,10 +218,13 @@ const renderedBytes = (s: TerminalSection): number =>
  * request, and at most TERMINAL_CARD_BYTES of rendered text, so the card always goes out (what is cut is never offered for
  * approval). Escaping can make the rendered text several times longer than the request.
  */
-function shownSections(sections: readonly TerminalSection[]): { shown: TerminalSection[]; whole: boolean } {
+function shownSections(
+  sections: readonly TerminalSection[],
+  budget: number,
+): { shown: TerminalSection[]; whole: boolean } {
   const shown: TerminalSection[] = [];
   let chars = TERMINAL_CONTENT_MAX;
-  let bytes = TERMINAL_CARD_BYTES;
+  let bytes = budget;
   for (const s of sections) {
     if (chars <= 0 || bytes <= 0) return { shown, whole: false };
     const out = inert(s, chars);
@@ -245,7 +255,8 @@ function notesOf(ask: Reported, complete: boolean, options: readonly PermissionO
     notes.push(words.questionOf({ n: index + 1, of: total }));
   if (!complete) notes.push(words.tooLong);
   // (a button shows 40 characters: what an "always" option grants is written out whole here, or the option is not offered)
-  for (const o of options)
+  // (only the options shown as buttons, at most four: their notes stay within what the card's byte budget leaves room for)
+  for (const o of shownOptions(options))
     if (o.kind === "allow_always") notes.push(words.alwaysOption({ name: lit(o.name, OPTION_NAME_MAX) }));
   notes.push(words.firstAnswerWins);
   return notes;
@@ -253,12 +264,18 @@ function notesOf(ask: Reported, complete: boolean, options: readonly PermissionO
 
 /** The card of a question a terminal asks. */
 export function terminalAskView(input: TerminalAsk, lang: Lang = "en"): TerminalAskView {
+  return { ...buildView(input, lang, false), fallback: buildView(input, lang, true) };
+}
+
+/** The card; `cut`: the cut-short one a channel falls back to (never approvable). */
+function buildView(input: TerminalAsk, lang: Lang, cut: boolean): TerminalAskView {
   const words = terminalApprovalText.in(lang);
   const ask = input.ask;
   const raw = record(ask["input"]);
   const content = contentOf(str(ask["kind"]), str(ask["tool"]), raw, words);
-  const rendered = shownSections(content.sections);
+  const rendered = shownSections(content.sections, cut ? TERMINAL_FALLBACK_BYTES : TERMINAL_CARD_BYTES);
   const complete =
+    !cut &&
     raw !== undefined &&
     content.clipped !== true &&
     rendered.whole &&
