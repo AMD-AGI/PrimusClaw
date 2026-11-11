@@ -1319,6 +1319,11 @@ record it.
 - `@primusclaw/connector` 0.1.21: its runtime dependencies are pinned to exact versions (`@agentclientprotocol/sdk` 2.5.0,
   `smol-toml` 1.9.1, `zod` 4.6.7), so an install gets what CI tested instead of the newest version a range allowed (#684, with the
   SDK bump of #652).
+- `@primusclaw/connector` 0.1.22: a terminal session attached to the phone shows only what a person typed there; entries Claude
+  Code writes itself (task notifications, cross-session and sub-agent messages, reminders, compacted-conversation summaries,
+  slash-command lines) are no longer shown as typed in the terminal. A message of several lines, pasted as `[Pasted text #1]`, is
+  confirmed instead of ending as `terminal_input_unconfirmed`; a long message whose input-box row ends two columns short of the
+  rule is submitted instead of refused; the terminal tests stop their tmux servers (#698).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
