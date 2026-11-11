@@ -3,6 +3,7 @@
 
 import { errorName } from "../errors.js";
 import type { Lang } from "../locales/lang.js";
+import type { Logger } from "../ports/logger.js";
 import type { InboundFile } from "../ports/surface.js";
 import { REPO_HOST } from "../commands/repo.js";
 import { routingText } from "../locales/routing.js";
@@ -17,6 +18,21 @@ const MOBILE_PLATFORMS = ["ios", "ipados", "android"];
 /** Teams on a phone or a tablet: its own Stop under a reply is greyed out, and its own thumbs never reach the worker. */
 export function isMobile(clientPlatform: string): boolean {
   return MOBILE_PLATFORMS.includes(clientPlatform.toLowerCase());
+}
+
+/**
+ * The path a message from Teams took: to the person's assistant, to a plain Claw session of their own (the old path, neither
+ * the assistant's nor a work item's), or to a review's turn. Logged so the worker's lines can be counted per path.
+ */
+export type TurnRoute = "assistant" | "legacy" | "review";
+
+/** The line for a turn started from Teams: where it came from and which path it took, never its words or any id. */
+export function logTurnStarted(logger: Logger, clientPlatform: string, group: boolean, route: TurnRoute): void {
+  logger.info("turn started from Teams client", {
+    platform: clientPlatform || "unknown",
+    chat: group ? "group" : "1:1",
+    route,
+  });
 }
 
 /** A review the review service starts as a turn here (its item runs in Claw already; the turn only follows it). */
@@ -217,10 +233,7 @@ export class TurnStarter {
     const { store, config, logger } = this.ctx.deps;
     const session = await this.sessionPart(request);
     const group = chat.scope !== "";
-    logger.info("turn started from Teams client", {
-      platform: request.clientPlatform || "unknown",
-      chat: group ? "group" : "1:1",
-    });
+    logTurnStarted(logger, request.clientPlatform, group, review ? "review" : "legacy");
     return {
       ...session,
       conversation: chat.conversation,

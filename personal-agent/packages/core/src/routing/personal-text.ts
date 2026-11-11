@@ -11,7 +11,7 @@ import type { InboundFile, InboundMessage } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { CommandTable } from "./command-table.js";
 import type { RouterContext } from "./context.js";
-import type { TurnStarter } from "./turn-start.js";
+import { logTurnStarted, type TurnStarter } from "./turn-start.js";
 
 const ELSEWHERE = "Files are not passed on from this chat while it talks to an agent; only your words were sent.";
 
@@ -165,7 +165,10 @@ export class PersonalText {
       files: said.files,
       ...(await this.attached(userId, key)),
     });
-    if (routed) return;
+    if (routed) {
+      logTurnStarted(this.ctx.deps.logger, message.clientPlatform, false, "assistant");
+      return;
+    }
     this.ctx.admission.dropLastHandoff(userId); // (not the assistant's after all: a turn here, counted as one)
     await this.starter.start({
       chat,
@@ -275,6 +278,7 @@ export class PersonalText {
     const held = assistant.reachable(userId);
     if (held && (await this.ctx.admission.assistantOverLimit(chat, message.id, key))) return;
     // (recorded before it is sent: an action the assistant asks for may arrive before the send returns)
+    logTurnStarted(logger, message.clientPlatform, false, "assistant");
     store.assistantMessages.noteAssistantMessage(
       channelMessageId,
       userId,
