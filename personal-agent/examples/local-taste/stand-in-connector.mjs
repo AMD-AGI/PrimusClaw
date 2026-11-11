@@ -9,6 +9,9 @@ import { createServer } from "node:http";
 const port = Number(process.env.CONNECTOR_PORT ?? "3978");
 let sent = 0;
 
+/** What the worker sent, on one line: a line break in it cannot start a line of its own in the output. */
+const oneLine = (text) => String(text).replace(/[\r\n]+/g, " ");
+
 createServer((request, response) => {
   const chunks = [];
   request.on("data", (chunk) => chunks.push(chunk));
@@ -20,9 +23,9 @@ createServer((request, response) => {
       const cards = (activity.attachments ?? []).map((attachment) => attachment.contentType);
       line = JSON.stringify({ type: activity.type, text: activity.text, cards: cards.length ? cards : undefined });
     } catch {
-      // (not JSON: printed as it came)
+      // (not JSON: printed as it came, on one line)
     }
-    console.log(`${request.method} ${request.url} ${line}`);
+    console.log(oneLine(`${request.method ?? ""} ${request.url ?? ""} ${line}`));
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ id: `stand-in-${++sent}` }));
   });

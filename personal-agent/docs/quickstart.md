@@ -40,6 +40,10 @@ About five minutes, no Teams, no Azure, no cluster. The worker runs with the rel
 Bus, its HTTP server on `127.0.0.1` only, a person's message posted to it over HTTP, and every reply sent to a stand-in
 Bot Connector that prints it. This is how the project's release checks drive the worker; it is not a production mode.
 
+`/metrics` has a listener of its own (port 9090), which listens on every interface here as everywhere: it answers
+counters and the build's version without asking who is calling. On a machine other people can reach, firewall that
+port, or move it with `METRICS_PORT`.
+
 1. Install the worker and fetch the three files of [`examples/local-taste`](../examples/local-taste):
 
    ```bash
@@ -256,7 +260,8 @@ TEAMS_DB_PATH=/var/lib/personal-agent/state.db \
 Port 8080 is plain HTTP, and its account-link endpoint receives Claw API keys: reach it only through an HTTPS reverse
 proxy at `PUBLIC_BASE_URL`. The Compose file and the `docker run` above publish it on `127.0.0.1` only, for a proxy on
 the same host; with a proxy elsewhere, publish it on a private address or firewall it, and do the same for the npm
-worker, which listens on every interface. Keep 9090 (`/metrics`) private too. `SIGTERM` finishes the work in hand and
+worker, which listens on every interface. Keep 9090 (`/metrics`) private too: the worker serves it on every
+interface, and the Compose file and `docker run` publish it on `127.0.0.1` only. `SIGTERM` finishes the work in hand and
 exits.
 
 ### 7. Verify
@@ -310,9 +315,10 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
    claw-connector doctor           # one line per check, with the fix for each problem
    ```
 
-   If your Claw deployment runs an identity service with device sign-in, use
-   `claw-connector login --server <claw-api-url> --identity-url <identity-url>` instead of the key: the connector then
-   holds a rotating token rather than the key. See the [connector README](../../connector/README.md#quick-start-about-5-minutes).
+   The connector calls a key sign-in a development key and stores the key as it is (in a file of mode 0600). If your
+   Claw deployment runs an identity service with device sign-in, use
+   `claw-connector login --server <claw-api-url> --identity-url <identity-url>` instead: the connector then holds a
+   rotating token rather than the key. See the [connector README](../../connector/README.md#quick-start-about-5-minutes).
 
 4. In Teams, say `show my agents`: the card lists the machine and its agents, and starts a session on one.
 
