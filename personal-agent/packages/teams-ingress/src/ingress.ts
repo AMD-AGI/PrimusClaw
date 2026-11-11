@@ -89,6 +89,11 @@ const ACK_ONLY_INVOKES: ReadonlySet<string> = new Set(["message/submitAction"]);
 // How long a message waits for the start-up prefetch to finish opening the sender before opening one itself.
 export const PREFETCH_WAIT_SECONDS = 3.0;
 
+// How long a message may take to reach the inbound queue, both attempts and the SDK's retries included, before it is
+// a 500 that Teams retries. Well inside host.json's functionTimeout (30 s), so a stuck send never runs into the host's
+// timeout, which restarts the worker and with it every other request on the instance.
+export const SEND_DEADLINE_SECONDS = 20.0;
+
 /** An HTTP request as the handler sees it. */
 export interface Request {
   headers: { get(name: string): string | null };
@@ -158,6 +163,26 @@ function pathOf(activity: JsonObject): { path: "queued" | "deferred" | "sync"; n
 
 const errorName = (error: unknown): string => (error instanceof Error ? error.name : "Error");
 
+/**
+ * `work`, or the deadline's reason once `deadline` fires, whichever comes first, so a send that ignores its abort
+ * signal still ends at the deadline.
+ */
+function beforeDeadline<T>(work: Promise<T>, deadline: AbortSignal): Promise<T> {
+  const reason = (): Error =>
+    deadline.reason instanceof Error ? deadline.reason : new Error("the inbound send deadline passed");
+  if (deadline.aborted) return Promise.reject(reason());
+  let onAbort = (): void => undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      reject(reason());
+    };
+    deadline.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([work, expired]).finally(() => {
+    deadline.removeEventListener("abort", onAbort);
+  });
+}
+
 export class Ingress {
   readonly settings: Settings;
   readonly auth: Auth;
@@ -171,12 +196,11 @@ export class Ingress {
   private senderClient: QueueClient | null = null;
   /** The inbound-queue sender, opened once per instance and kept. */
   inbound: QueueSender | null = null;
-  /** Serialises sends on the shared sender, as the Python module's lock did. */
-  private busQueue: Promise<unknown> = Promise.resolve();
   prefetch: Promise<void> | null = null;
   private prefetchDone = false;
   private prefetchReport: string | null = null;
   prefetchWaitSeconds = PREFETCH_WAIT_SECONDS;
+  sendDeadlineSeconds = SEND_DEADLINE_SECONDS;
 
   constructor(deps: Deps) {
     this.fetchImpl = deps.fetch;
@@ -269,29 +293,34 @@ export class Ingress {
    * more on a new one, so a kept sender left broken (the service closes idle connections) costs one message a retry
    * instead of every later message an error. The worker dedupes on the activity id, so a message the broker took
    * before the error was seen is not handled twice.
+   *
+   * Sends on one instance run concurrently on the shared sender (the SDK's sender takes concurrent sends), so a send
+   * that hangs holds up only its own request: it fails after `sendDeadlineSeconds`, and the request is a 500. Only the
+   * request whose send failed discards the sender, and only while it is still the instance's sender, so a request
+   * never throws away a sender another one has just opened.
    */
   async sendInbound(message: QueueMessage, log: Logger = this.logs.app): Promise<void> {
+    const deadline = AbortSignal.timeout(this.sendDeadlineSeconds * 1000);
     if (this.inbound === null && this.prefetch !== null && !this.prefetchDone) {
       // A cold instance: the prefetch is already opening the sender, and a second one would only race it.
       await Promise.race([this.prefetch, sleep(this.prefetchWaitSeconds * 1000)]);
     }
-    const run = this.busQueue.then(async () => {
-      for (const attempt of [1, 2]) {
-        this.inbound ??= this.client(log).createSender(this.settings.inboundQueue);
-        const sender = this.inbound;
-        try {
-          await sender.sendMessages(message);
-          return;
-        } catch (error) {
+    for (const attempt of [1, 2]) {
+      this.inbound ??= this.client(log).createSender(this.settings.inboundQueue);
+      const sender = this.inbound;
+      try {
+        await beforeDeadline(sender.sendMessages(message, { abortSignal: deadline }), deadline);
+        return;
+      } catch (error) {
+        if (this.inbound === sender) {
           this.inbound = null;
-          await this.closeQuietly(sender, log);
-          if (attempt === 2) throw error;
-          log.warning("inbound send failed; retrying once on a new sender", error);
+          // Not awaited: closing a sender whose connection hangs must not hold this request past its deadline.
+          void this.closeQuietly(sender, log);
         }
+        if (attempt === 2 || deadline.aborted) throw error;
+        log.warning("inbound send failed; retrying once on a new sender", error);
       }
-    });
-    this.busQueue = run.catch(() => undefined);
-    return run;
+    }
   }
 
   /**

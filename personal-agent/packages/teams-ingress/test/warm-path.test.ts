@@ -26,6 +26,8 @@ class Sender implements QueueSender {
   closed = false;
   /** Replaces the open step (create_message_batch), as the Python tests monkeypatch it. */
   static openHook: ((sender: Sender) => Promise<void>) | null = null;
+  /** Runs before a send; what it returns (or throws) is the send's outcome when it does not return undefined. */
+  static sendHook: ((sender: Sender, id: string) => Promise<void> | undefined) | null = null;
 
   constructor(
     readonly bus: Bus,
@@ -46,6 +48,8 @@ class Sender implements QueueSender {
   }
 
   sendMessages(message: QueueMessage): Promise<void> {
+    const hooked = Sender.sendHook?.(this, (JSON.parse(message.body.toString()) as { id: string }).id);
+    if (hooked !== undefined) return hooked.then(() => void this.bus.sent.push([this, message]));
     if (this.failSends) {
       this.failSends -= 1;
       return Promise.reject(new ConnectionError("link detached"));
@@ -82,6 +86,7 @@ class Bus implements QueueClient {
 
 function make(bus: Bus, overrides: Partial<Deps> = {}): { ingress: Ingress; log: Caplog } {
   Sender.openHook = null;
+  Sender.sendHook = null;
   const { ingress, log } = load(FULL_ENV, overrides);
   ingress.newClient = () => bus;
   ingress.validate = () => Promise.resolve({});
@@ -144,6 +149,63 @@ test("test_the_delivery_ack_uses_the_same_sender", async () => {
   assert.equal(bus.senders.length, 1);
   assert.equal(bus.sent.length, 2);
 });
+
+// --- concurrent sends on one instance ----------------------------------------
+
+test("a send that hangs holds up only its own request, which is a 500 at the deadline", { timeout: 5000 }, async () => {
+  const bus = new Bus();
+  const { ingress } = make(bus);
+  ingress.sendDeadlineSeconds = 0.3;
+  // The hung send ignores its abort signal: the deadline must end the request all the same.
+  Sender.sendHook = (_sender, id) => (id === "stuck" ? new Promise<void>(() => undefined) : undefined);
+  const started = performance.now();
+  const stuck = post(ingress, { ...MESSAGE, id: "stuck" });
+  const others = await Promise.all(["a2", "a3", "a4"].map((id) => post(ingress, { ...MESSAGE, id })));
+  // Answered while the hung send was still in flight, on the same sender: nothing waited behind it.
+  assert.ok(performance.now() - started < 250, "the other requests waited for the hung send");
+  assert.deepEqual(
+    others.map((r) => r.status),
+    [200, 200, 200],
+  );
+  assert.deepEqual(ids(bus), ["a2", "a3", "a4"]);
+  assert.equal(bus.senders.length, 1);
+  assert.equal((await stuck).status, 500);
+  assert.ok(performance.now() - started < 1000);
+  // No second attempt once the deadline has passed, and the sender it used is not kept.
+  assert.equal(bus.senders.length, 1);
+  assert.ok(nth(bus.senders, 0).closed);
+  assert.equal((await post(ingress, { ...MESSAGE, id: "a5" })).status, 200);
+  assert.equal(bus.senders.length, 2);
+});
+
+test(
+  "a failed send discards only the sender it used, never one another request has just opened",
+  { timeout: 5000 },
+  async () => {
+    const bus = new Bus();
+    const { ingress, log } = make(bus);
+    // Both messages are in flight on the first sender when its connection drops; each fails there.
+    const g = gate();
+    Sender.sendHook = (sender) =>
+      sender === bus.senders[0]
+        ? g.wait(5000).then(() => Promise.reject(new ConnectionError("link detached")))
+        : undefined;
+    const replies = [post(ingress, { ...MESSAGE, id: "a1" }), post(ingress, { ...MESSAGE, id: "a2" })];
+    await new Promise((resolve) => setImmediate(resolve));
+    g.set();
+    assert.deepEqual(
+      (await Promise.all(replies)).map((r) => r.status),
+      [200, 200],
+    );
+    // The first failure replaced the sender; the second found it replaced and kept the new one.
+    assert.equal(bus.senders.length, 2);
+    assert.ok(nth(bus.senders, 0).closed && !nth(bus.senders, 1).closed);
+    assert.equal(ingress.inbound, bus.senders[1]);
+    assert.deepEqual(ids(bus).sort(), ["a1", "a2"]);
+    assert.ok(bus.sent.every(([s]) => s === bus.senders[1]));
+    assert.equal(log.text.split("retrying once on a new sender").length - 1, 2);
+  },
+);
 
 // --- the start-up prefetch ---------------------------------------------------
 
