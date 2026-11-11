@@ -64,8 +64,10 @@ test("test_each_line_is_short_enough_for_a_phone", () => {
       [true, false],
       [true, true],
     ] as const) {
-      // A group's recent messages kept (#725), at the default and at the largest settings, or not.
-      for (const groupContext of [undefined, { messages: 30, hours: 4 }, { messages: 200, hours: 24 }]) {
+      // A group's recent messages kept (#725): not, at the default, and at the largest settings (200 messages; any
+      // positive whole number of hours, the longest written being the largest safe integer).
+      const largest = { messages: 200, hours: Number.MAX_SAFE_INTEGER };
+      for (const groupContext of [undefined, { messages: 30, hours: 4 }, { messages: 200, hours: 24 }, largest]) {
         for (const group of [false, true]) {
           const text = renderHelp(lang, {
             group,

@@ -92,10 +92,10 @@ export function groupContextLines(lang: Lang, kept: GroupContextKept): readonly 
     ];
   }
   return [
-    "In a group that allows me to read its messages, I also keep, in memory, its newest " +
+    "In a group that allows me to read its messages, I also keep its newest " +
       `${plural(kept.messages, "message")} that ${kept.messages === 1 ? "does" : "do"} not @mention me, ` +
       `for up to ${plural(kept.hours, "hour")}.`,
-    "I never answer them, and never store them on their own.",
+    "I keep them in memory only: I never answer them, and never store them on their own.",
     "When someone @mentions me, they may go with that message, as untrusted background, into that person's session, " +
       "and are kept with it.",
     "To turn this off in a group, @mention me there with /context off.",

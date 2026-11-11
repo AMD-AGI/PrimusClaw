@@ -81,9 +81,9 @@ test("where a group's recent messages are kept, the data statement says what, fo
     "不想让我暂存：在群里 @我 发 /context off。",
   ]);
   assert.deepEqual(groupContextLines("en", kept), [
-    "In a group that allows me to read its messages, I also keep, in memory, its newest 30 messages that do not " +
+    "In a group that allows me to read its messages, I also keep its newest 30 messages that do not " +
       "@mention me, for up to 4 hours.",
-    "I never answer them, and never store them on their own.",
+    "I keep them in memory only: I never answer them, and never store them on their own.",
     "When someone @mentions me, they may go with that message, as untrusted background, into that person's session, " +
       "and are kept with it.",
     "To turn this off in a group, @mention me there with /context off.",
