@@ -24,7 +24,12 @@ test("a refused command is decoded with its type and reason", () => {
     },
     WORLD_ERRORS,
   );
-  assert.deepEqual(step.rejected, { type: "set_mode", reason: "mode_unavailable" });
+  assert.deepEqual(step.rejected, { type: "set_mode", reason: "mode_unavailable", cmdSeq: null });
+  const named = decode(
+    { name: "command_rejected", id: "2", data: { data: { type: "prompt", cmd_seq: 7, reason: "cancelled" } } },
+    WORLD_ERRORS,
+  );
+  assert.equal(named.rejected?.cmdSeq, 7, "a refusal names its prompt by Claw's number");
   assert.equal(step.finished, false);
   assert.equal(step.closed, null);
 });

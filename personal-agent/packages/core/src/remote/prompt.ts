@@ -4,7 +4,10 @@
 /**
  * A message for the agent, and `/stop`. A message reads its own turn: the read position is moved to the end of the session's events
  * first (what the agent said on its own before it is the follower's, said first and apart). A session that only watches a
- * terminal's conversation takes no message; one whose turn is still running takes none until it has answered.
+ * terminal's conversation takes no message. A message sent while the chat's turn still runs goes to the session at once and waits
+ * there behind that turn, as Claude Code queues what is typed while it works: the person is told it is queued, and its turn is read
+ * right after the one in front (`TurnRunner`). `/stop` stops the running turn and gives up the messages waiting behind it (the
+ * machine drops them too).
  */
 import { ClawError } from "../claw/errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
@@ -12,12 +15,12 @@ import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, textMessage } from "../ports/surface.js";
 import { READ_ONLY_REASONS, readOnlyRefused, sessionTitle, terminalClosedLine } from "./lines.js";
 import type { StatusBoard } from "./board.js";
-import type { RemoteTurn } from "./chats.js";
 import type { RemoteContext } from "./context.js";
 import type { Provider } from "./ended.js";
 import type { FollowControl } from "./follow/control.js";
 import { failureText, idempotencyKey, saidIn } from "./refusals.js";
 import type { SessionStarts } from "./sessions.js";
+import { QUEUED_PROMPTS_MAX, type QueuedPrompt, type RemoteTurn } from "./chats.js";
 import { type ChatState, isTransport } from "./state.js";
 import type { TurnRunner } from "./turns/runner.js";
 import type { Watches } from "./watches.js";
@@ -60,7 +63,7 @@ export class Prompts {
     if (first === null) return;
     const source: SentFrom = p.source || (first.window === "card" && p.quotesWindow ? "quote" : "chat");
     if (this.state.watches(p.chatKey, first)) return this.watched(p, first);
-    if (this.state.chats.turns.has(p.chatKey)) return this.say(p.to, saidIn(lang, "stillWorking"));
+    if (this.state.chats.turns.has(p.chatKey)) return this.queueBehind(p, first, source);
     this.watches.cancel(p.chatKey);
     const followed = await this.follow.stop(p.chatKey); // what the agent said on its own is said first, apart from this turn
     const state = this.state.attached(p.chatKey) ?? first; // (a turn end it read closed an open turn)
@@ -88,7 +91,60 @@ export class Prompts {
       this.board.touchStatus(p.chatKey, p.to, "watching");
       return this.say(p.to, readOnlyRefused(lang, this.state.offersTakeover(p.chatKey)));
     }
-    if (await this.send(p, state)) this.started(p, state, source);
+    const sent = await this.send(p, state);
+    if (sent) this.started(p, state, source, () => sent.cmdSeq);
+  }
+
+  /**
+   * A message while the chat's turn runs: sent to the session now (Claw keeps it in order; the machine runs it once the turn in
+   * front has ended), and its turn is read after that one. It is put in the queue before it is sent: the turn in front may end
+   * while the send is on its way, and its turn must be read from where that one ended, not by the follower. Refused only past what
+   * the machine queues.
+   */
+  private async queueBehind(p: Prompt, state: RemoteState, source: SentFrom): Promise<void> {
+    const text = remoteAgentText.in(this.state.lang(p.chatKey));
+    const waiting = this.state.chats.queuedCount(p.chatKey);
+    if (this.state.chats.queuedMessage(p.chatKey, p.messageId)) return; // (redelivered: it is queued, and was said so)
+    if (waiting >= QUEUED_PROMPTS_MAX) return this.say(p.to, text.queueFull({ n: QUEUED_PROMPTS_MAX }));
+    const sid = state.sessionId;
+    let cmdSeq: number | undefined = undefined; // (Claw's number of it, once the send has answered)
+    let reader: RemoteTurn | undefined;
+    const queued: QueuedPrompt = {
+      messageId: p.messageId,
+      get cmdSeq() {
+        return cmdSeq;
+      },
+      start: () => {
+        const now = this.state.attached(p.chatKey);
+        if (now?.sessionId !== sid) return false; // (the chat left that session meanwhile)
+        this.started(p, now, source, () => cmdSeq);
+        reader = this.state.chats.turns.get(p.chatKey);
+        return true;
+      },
+    };
+    this.state.chats.enqueue(p.chatKey, queued);
+    const sent = await this.send(p, state);
+    if (sent) cmdSeq = sent.cmdSeq;
+    // (refused on the machine before the send answered: the refusal went by while it had no number)
+    const refused = cmdSeq === undefined ? undefined : this.state.chats.takeRefusal(p.chatKey, cmdSeq);
+    // Not sent, a redelivery of a message Claw already has (its turn is read already), or refused: it waits no more, and a reader
+    // started for it meanwhile would wait for a turn that never comes.
+    if (!sent || sent.duplicate || refused !== undefined) {
+      if (
+        !this.state.chats.removeQueued(p.chatKey, queued) &&
+        reader &&
+        this.state.chats.turns.get(p.chatKey) === reader
+      ) {
+        this.closeTurn(p.chatKey, state);
+        this.runner.stopReading(p.chatKey);
+      }
+      if (refused !== undefined) await this.say(p.to, text.queuedRefused({ reason: refused }));
+      return;
+    }
+    if (reader) return; // (the turn in front ended while it was sent: its own turn is read already)
+    if (!this.state.chats.isQueued(p.chatKey, queued)) return; // (a /stop or a detach meanwhile gave it up, and said so)
+    if (source === "card") this.state.view(p.chatKey, state).draft = ""; // (taken: the card's box is empty again)
+    await this.say(p.to, text.queuedBehind({ n: waiting + 1 }));
   }
 
   /** The terminal is using the session: what is typed here is answered, never sent. */
@@ -102,8 +158,14 @@ export class Prompts {
     await this.say(p.to, readOnlyRefused(lang, this.state.offersTakeover(p.chatKey)));
   }
 
-  /** The prompt to Claw; false (and the person told why) when it did not go. */
-  private async send(p: Prompt, state: RemoteState): Promise<boolean> {
+  /**
+   * The prompt to Claw, with Claw's number of it (`duplicate`: Claw had this message already, a redelivery); false (and the person
+   * told why) when it did not go.
+   */
+  private async send(
+    p: Prompt,
+    state: RemoteState,
+  ): Promise<{ readonly cmdSeq: number | undefined; readonly duplicate: boolean } | false> {
     const lang = this.state.lang(p.chatKey);
     const sid = state.sessionId ?? "";
     try {
@@ -111,14 +173,18 @@ export class Prompts {
         sha1Hex: (text: string) => this.ctx.digestHex("sha1", text),
         hexId: () => this.ctx.random.hexId(),
       };
-      await this.ctx.claw.command(
+      const out = await this.ctx.claw.command(
         p.key,
         sid,
         { type: "prompt", text: p.text },
         idempotencyKey(keys, p.chatKey, p.messageId),
       );
       this.ctx.sessionNames.titleRemoteSession(sid, sessionTitle(p.text)); // (a new session is named by its first words)
-      return true;
+      const seq = out["cmd_seq"];
+      return {
+        cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
+        duplicate: out["duplicate"] === true,
+      };
     } catch (error) {
       if (error instanceof ClawError && error.status === 409 && READ_ONLY_REASONS.includes(error.code)) {
         // (a watch this process did not know of: it restarted)
@@ -145,7 +211,7 @@ export class Prompts {
     return failureText(error, this.ctx.errors, this.ctx.clock.epochMs() / 1000, this.state.lang(chatKey));
   }
 
-  private started(p: Prompt, state: RemoteState, source: SentFrom): void {
+  private started(p: Prompt, state: RemoteState, source: SentFrom, cmdSeq?: () => number | undefined): void {
     this.ctx.remoteState.setRemoteTurn(p.chatKey, state.sessionId ?? "", true);
     const view = this.state.view(p.chatKey, state); // (every message that went to the session is what the card says was sent)
     view.sent = p.text;
@@ -159,6 +225,7 @@ export class Prompts {
       to: p.to,
       state,
       replyTo: p.messageId || undefined,
+      cmdSeq,
     });
     this.board.touchStatus(p.chatKey, p.to, "working", undefined, true);
   }
@@ -207,10 +274,11 @@ export class Prompts {
       return true;
     }
     if (turn?.stopRequested === true) {
-      // asked before and the agent has not ended the turn: stop waiting for it
+      // asked before and the agent has not ended the turn: stop waiting for it (and for what waits behind it)
+      const dropped = this.state.chats.dropQueued(chatKey);
       this.runner.cancel(chatKey);
       this.closeTurn(chatKey, state);
-      await this.say(to, saidIn(lang, "stoppedWatching"));
+      await this.say(to, saidIn(lang, "stoppedWatching") + this.droppedLine(chatKey, dropped));
       return true;
     }
     if (turn) turn.stopRequested = true;
@@ -224,6 +292,11 @@ export class Prompts {
     return turn === only && !turn.ended && this.ctx.remoteState.attachedRemote(chatKey) !== null;
   }
 
+  /** What a stop says of the messages it gave up ("" none). */
+  private droppedLine(chatKey: string, dropped: number): string {
+    return dropped > 0 ? remoteAgentText.in(this.state.lang(chatKey)).queueDropped({ n: dropped }) : "";
+  }
+
   private async cancel(chatKey: string, key: string, state: RemoteState, to: Conversation): Promise<void> {
     const lang = this.state.lang(chatKey);
     let out;
@@ -234,12 +307,14 @@ export class Prompts {
       if (isTransport(error)) return this.say(to, saidIn(lang, "unreachable"));
       throw error;
     }
+    // (the machine drops what waits behind the turn it stops: those messages are given up here too, and the person is told)
+    const dropped = this.state.chats.dropQueued(chatKey);
     if (out["connector_online"] === false) {
       this.runner.cancel(chatKey);
       this.closeTurn(chatKey, state);
-      return this.say(to, saidIn(lang, "stopQueuedOffline"));
+      return this.say(to, saidIn(lang, "stopQueuedOffline") + this.droppedLine(chatKey, dropped));
     }
-    await this.say(to, saidIn(lang, "stopping"));
+    await this.say(to, saidIn(lang, "stopping") + this.droppedLine(chatKey, dropped));
   }
 
   /** A turn nobody reads any more is not open: what the agent says from here on is the follower's. */

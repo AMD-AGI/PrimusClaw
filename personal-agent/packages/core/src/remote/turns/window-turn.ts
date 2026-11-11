@@ -6,9 +6,9 @@
  * the card's output (an edit at most every EDIT_SECONDS), the step it runs and a message waiting for the terminal are its state,
  * and the end of the turn refreshes it (posted again at the bottom: a phone may not redraw an edit). Nothing else is posted.
  */
-import type { Conversation } from "../../ports/surface.js";
+import { type Conversation, textMessage } from "../../ports/surface.js";
 import { type RemoteStep } from "../events.js";
-import { pyRstrip, pyStrip } from "../../text/py-text.js";
+import { cpHead, pyRstrip, pyStrip } from "../../text/py-text.js";
 import { redactText } from "../../security/redact.js";
 import type { StatusBoard } from "../board.js";
 import type { ChatState } from "../state.js";
@@ -94,4 +94,15 @@ export class WindowTurn implements TurnDisplay {
     view.ended = true;
     return Promise.resolve();
   }
+
+  /** The turn of a queued message follows at once and takes the card over: this turn's answer is posted to the chat to stay. */
+  async handOver(): Promise<void> {
+    const view = this.view;
+    const words = this.said() || view.note;
+    if (!words) return;
+    await this.to.send(textMessage(cpHead(words, HANDED_OVER_MAX) + (words.length > HANDED_OVER_MAX ? "…" : "")));
+  }
 }
+
+/** A finished answer the next queued turn takes the card from is posted to the chat up to this many characters. */
+export const HANDED_OVER_MAX = 3500;

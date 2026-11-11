@@ -14,6 +14,8 @@ export interface TurnDisplay {
   close(hard?: boolean): void;
   /** The answer: `parts` in order, the suggested `replies` under the last. */
   finish(parts: readonly string[], options: FinishWith): Promise<void>;
+  /** After `finish`, when the turn of a queued message follows at once: what this turn showed must stay readable (optional). */
+  handOver?(): Promise<void>;
 }
 
 export interface FinishWith {

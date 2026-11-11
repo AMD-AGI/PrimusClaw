@@ -43,11 +43,13 @@ export interface RemoteStep {
   readonly started: boolean;
   /** The turn is over. */
   readonly finished: boolean;
+  /** Claw's number of the prompt whose turn ended (a `turn_end` that names it), null when it does not say. */
+  readonly endsSeq: number | null;
   readonly stopReason: string;
   /** The session ended: the reason, "" when none was given. */
   readonly closed: string | null;
-  /** A command the connector refused. */
-  readonly rejected: { readonly type: string; readonly reason: string } | null;
+  /** A command the connector refused (`cmdSeq`: Claw's number of it, null when the connector did not name it). */
+  readonly rejected: { readonly type: string; readonly reason: string; readonly cmdSeq: number | null } | null;
   /** An event of history the agent replayed: never shown as new. */
   readonly replay: boolean;
   /** The session only watches a conversation open in a terminal. */
@@ -79,6 +81,7 @@ export const NOTHING: RemoteStep = Object.freeze({
   note: null,
   started: false,
   finished: false,
+  endsSeq: null,
   stopReason: "",
   closed: null,
   rejected: null,
@@ -107,6 +110,11 @@ function record(value: unknown): Json {
 
 function str(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/** A command's sequence number as Claw gives it (a whole number), null for anything else. */
+function seqOf(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 }
 
 function flag(value: unknown): boolean | null {
@@ -228,6 +236,7 @@ function turnEnd(payload: Json, _kind: string, errors: PublicErrors): RemoteStep
   }
   return remoteStep({
     finished: true,
+    endsSeq: seqOf(payload["cmd_seq"]),
     stopReason: reason,
     note: error ? neutral(errors.publicReason(error, "remote_turn_end"), 300) : null,
   });
@@ -281,6 +290,7 @@ function commandRejected(payload: Json, _kind: string, errors: PublicErrors): Re
     rejected: {
       type: str(payload["type"]),
       reason: neutral(errors.publicReason(reason, "remote_command_rejected"), 300),
+      cmdSeq: seqOf(payload["cmd_seq"]),
     },
   });
 }

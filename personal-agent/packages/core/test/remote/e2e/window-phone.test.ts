@@ -9,9 +9,9 @@ import { test } from "node:test";
 
 import type { WindowView } from "../../../src/remote/window/view.js";
 import { INPUT_ID } from "../../../src/remote/window/view.js";
-import type { PermissionOption } from "../../../../../test-support/remote-fake.js";
+import type { FakeCommand, FakeRemote, PermissionOption } from "../../../../../test-support/remote-fake.js";
 import { ALICE, type RemoteWorld, Script, USER_A, remoteWorld } from "../../../../../test-support/remote-world.js";
-import { AAD, TWO_AGENTS, idleTurn, turnsOf } from "./helpers.js";
+import { AAD, TWO_AGENTS, turnsOf } from "./helpers.js";
 import {
   answering,
   approvalButtons,
@@ -329,15 +329,43 @@ test("a message already typed into the terminal is not withdrawn on detach", () 
     assert.ok(!said.includes("taken back") && said.includes("That turn goes on"), said);
   }, CARD));
 
+test("a message queued from the card: its box empties, and the answer of the turn in front stays in the chat when the next one takes the card", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    const sent: FakeCommand[] = [];
+    script.onPrompt = (_srv: FakeRemote, _sid: string, cmd: FakeCommand) => {
+      sent.push(cmd);
+      return Promise.resolve();
+    };
+    const sid = await windowed(w, script);
+    await sendFromCard(w, sid, "write the report");
+    await w.until(() => sent.length === 1);
+    await w.server.say(sid, "Working on it.");
+    await w.server.tool(sid, "call-1", "Read sources.md");
+    await sendFromCard(w, sid, "and the summary");
+    await w.until(() => sent.length === 2);
+    await w.until(() => viewOf(w)?.draft === "");
+    const seq = (cmd: FakeCommand | undefined) => w.server.commands.indexOf(cmd as FakeCommand) + 1;
+    await w.server.say(sid, "The report is written.");
+    await w.server.emit(sid, "turn_end", { stopReason: "end_turn", cmd_seq: seq(sent[0]) });
+    await w.until(() => sentTexts(w).includes("The report is written."));
+    await w.server.say(sid, "The summary is written.");
+    await w.server.emit(sid, "turn_end", { stopReason: "end_turn", cmd_seq: seq(sent[1]) });
+    await w.idle();
+    assert.ok(JSON.stringify(lastWindow(w)).includes("The summary is written."));
+    assert.deepEqual(prompts(w), ["write the report", "and the summary"]);
+  }, CARD));
+
 test("a send that is refused keeps the words in the box", () =>
   remoteWorld(async (w) => {
     const sid = await windowed(w, answering());
-    turnsOf(w).set(AAD, idleTurn()); // (a turn of the chat's is running: the session takes no message now)
+    const machine = w.server.connector(w.server.session(sid).connector_id);
+    machine.online = false; // (the machine is offline: Claw refuses the message)
     await sendFromCard(w, sid, "please keep these words");
     await sleep(200);
     assert.deepEqual(prompts(w), []);
     assert.equal(viewOf(w)?.draft, "please keep these words");
-    turnsOf(w).delete(AAD);
+    machine.online = true;
     // (any tap: the idle card shows the box with the words in it)
     await w.click({ primusclaw: "remote", op: "full", session_id: sid }, USER_A, statusCardId(w));
     await sleep(200);
