@@ -60,6 +60,13 @@ export class ActiveTurn {
   toolDenied = false;
   /** Claw took this turn's stop (its item's, or the interrupt): its failed end is the stop, not an error. */
   stopConfirmed = false;
+  /**
+   * Set once Claw took the interrupt of this turn (`/stop`): a message queued behind it need not wait for its end, which a turn
+   * stopped before Claw ran it may never report.
+   */
+  readonly stopped = new Latch();
+  /** The turn went to Claw (a queued one once the turns in front of it were over or stopped): `/stop` no longer withdraws it. */
+  launched = false;
   /** Set once Claw runs the turn's message, or the turn is over: a message sent behind it may go then. */
   readonly running = new Latch();
   /** Set once the turn is over (or never started, or was given up while it waited): the turn behind it may go then. */
@@ -126,9 +133,9 @@ export class TurnRegistry {
     return { front, waiting: entry.turns.length - 1 };
   }
 
-  /** Every turn queued behind the chat's running one is given up (`/stop`); how many there were. */
+  /** Every turn queued behind the chat's running one that has not gone to Claw yet is given up (`/stop`); how many there were. */
   withdrawQueued(key: TurnKey): number {
-    const queued = this.of(key).slice(1);
+    const queued = this.of(key).filter((turn, at) => at > 0 && !turn.launched);
     for (const turn of queued) this.drop(key, turn);
     return queued.length;
   }

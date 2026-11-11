@@ -11,7 +11,7 @@ import type { HistorySession } from "../ports/store/sessions.js";
 import type { InboundAction } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
-import { chatTurnKey, type ActiveTurn } from "./turn-registry.js";
+import { chatTurnKey, type ActiveTurn, type TurnKey } from "./turn-registry.js";
 import type { TurnStarter } from "./turn-start.js";
 import { whenText, zoneOf } from "./time.js";
 import { createPrButton, repoButton } from "./views.js";
@@ -66,25 +66,30 @@ export class SessionCommands {
   async stopTurn(chat: Chat, key: string, scope = "", only?: ActiveTurn): Promise<boolean> {
     const { store } = this.ctx.deps;
     const turnKey = chatTurnKey(chat.sender.id, scope);
-    const [turn] = this.ctx.turns.of(turnKey);
+    const turn = this.running(turnKey);
     const sessionId = store.sessions.getSession(chat.sender.id, scope);
     if (only !== undefined && (turn !== only || only.over || sessionId === null)) return false;
     // (before the interrupt: the running turn's end must not hand over to a message being given up)
     const dropped = only === undefined ? this.ctx.turns.withdrawQueued(turnKey) : 0;
     const droppedLine = dropped > 0 ? routingText.in(chat.lang()).queueDropped({ n: dropped }) : "";
-    await this.interrupt(chat, key, sessionId, this.ctx.turns.of(turnKey), droppedLine);
+    await this.interrupt(chat, key, sessionId, this.running(turnKey), droppedLine);
     return true;
+  }
+
+  /** The chat's turn Claw runs now: the first one not stopped already (one queued behind a stopped turn goes at once). */
+  private running(key: TurnKey): ActiveTurn | undefined {
+    const turns = this.ctx.turns.of(key);
+    return turns.find((turn) => !turn.stopped.isSet) ?? turns[0];
   }
 
   private async interrupt(
     chat: Chat,
     key: string,
     sessionId: string | null,
-    turns: readonly ActiveTurn[],
+    turn: ActiveTurn | undefined,
     droppedLine: string,
   ): Promise<void> {
     const { claw } = this.ctx.deps;
-    const [turn] = turns;
     const said = routingText.in(chat.lang());
     const say = (line: string): Promise<void> => chat.say(line + droppedLine); // (what was given up is said with every answer)
     if (sessionId === null) {
@@ -100,7 +105,10 @@ export class SessionCommands {
         return;
       }
       await claw.sessions.interrupt(key, sessionId);
-      if (turn !== undefined) turn.stopConfirmed = true;
+      if (turn !== undefined) {
+        turn.stopConfirmed = true;
+        turn.stopped.set();
+      }
     } catch (error) {
       if (!(error instanceof ClawError)) throw error;
       const gone = turn === undefined && error.status === 404; // (the session was deleted in the console)

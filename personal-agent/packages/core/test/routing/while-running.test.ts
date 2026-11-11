@@ -132,6 +132,36 @@ test("/stop stops the running turn and gives up every message queued behind it",
   assert.deepEqual(w.turns.calls.at(-1), ["send", "ak", "sess-ak", "after"]);
 });
 
+test("a message sent after /stop goes to Claw at once, even while the stopped turn has not ended", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak");
+  const first = gate();
+  w.turns.hold = first.promise; // (a turn stopped before Claw ran it may never report its end)
+  await w.router.handle(message("first"));
+  await w.router.handle(message("/stop"));
+  const second = gate();
+  w.turns.hold = second.promise;
+  await w.router.handle(message("after"));
+  await flush();
+  assert.deepEqual(
+    w.turns.calls.map((c) => c.at(-1)),
+    ["first", "after"],
+  );
+  await w.router.handle(message("/stop")); // (stops the turn that runs now, not the one stopped already)
+  assert.equal(said(w).at(-1), "Stopping the running task.");
+  assert.equal(w.turns.runs.length, 2);
+  await w.router.handle(message("third")); // (both turns in front are stopped: it goes at once too)
+  await flush();
+  assert.deepEqual(
+    w.turns.calls.map((c) => c.at(-1)),
+    ["first", "after", "third"],
+  );
+  first.open();
+  second.open();
+  await w.router.settled();
+  assert.equal(w.router.hasPersonalTurn(ALICE.id), false);
+});
+
 test("one message queued and /stop says it was dropped, in the chat's language", async () => {
   const w = world();
   link(w, ALICE.id, "ak");

@@ -98,6 +98,7 @@ export class TurnStarter {
 
   /** The turn goes to Claw now; its end is `done`. */
   private async launch(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<RunningTurn> {
+    turn.launched = true;
     let run: TurnRun;
     try {
       run = await this.runOf(request);
@@ -109,16 +110,19 @@ export class TurnStarter {
   }
 
   /**
-   * A queued turn: it goes once every turn in front of it is over (the message the person was told is queued is not waited
-   * for by the caller), and not at all when it was given up meanwhile (`/stop`, said there).
+   * A queued turn: it goes once every turn in front of it is over, or stopped (Claw took its interrupt: Claw is free for the next
+   * message, whether or not that turn ever reports its end); the caller does not wait for it. Not at all when it was given up
+   * meanwhile (`/stop`, said there).
    */
   private async afterFront(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<void> {
     for (;;) {
       if (turn.over) return;
-      const head = this.ctx.turns.of(key)[0];
-      if (head === turn) break;
-      if (head === undefined) return;
-      await Promise.race([head.ended.whenSet(), turn.ended.whenSet()]);
+      const turns = this.ctx.turns.of(key);
+      const at = turns.indexOf(turn);
+      if (at < 0) return;
+      const blocking = turns.slice(0, at).find((front) => !front.stopped.isSet);
+      if (blocking === undefined) break;
+      await Promise.race([blocking.ended.whenSet(), blocking.stopped.whenSet(), turn.ended.whenSet()]);
     }
     let started: RunningTurn;
     try {
