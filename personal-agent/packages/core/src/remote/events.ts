@@ -190,8 +190,13 @@ function planLine(payload: Json): string | null {
 }
 
 /** What Claude Code itself writes into a transcript as the user's turn (a slash command's tags, a reminder, an interrupt
- * marker): not words the person typed. */
-const NOT_TYPED = /^(?:<(command-|local-command-|system-reminder|bash-|user-prompt-submit-hook)|\[Request interrupted)/;
+ * marker, a background task's or a sub-agent's notification, a message from another session, a compacted conversation's
+ * summary): not words the person typed. A newer connector leaves these out by what the transcript says of each
+ * entry; this catches them from an older one. Only the start counts: a prompt that mentions such a tag is still the person's. */
+const NOT_TYPED = new RegExp(
+  "^(?:<(?:command-|local-command-|system-reminder|bash-|user-prompt-submit-hook|task-notification|cross-session-message|agent-message)" +
+    "|\\[Request interrupted|Another Claude session sent a message:|This session is being continued from a previous conversation)",
+);
 
 type Reader = (payload: Json, kind: string, errors: PublicErrors) => RemoteStep;
 

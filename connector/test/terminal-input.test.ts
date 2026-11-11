@@ -307,6 +307,25 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(rejected.data.reason, "terminal_session");
   });
 
+  test("a message of several lines, which Claude Code shows as `[Pasted text #1 +k lines]` and records as a <pasted_content> block, is confirmed by its turn, never 'unconfirmed' (2026-11-11)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalEchoMs: 1_500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_PASTE_REF: "1" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const text = "Quoted your earlier reply:\n> the terminal said something\n\nis this expected?";
+    const seq = h.prompt(sid, text);
+    const end = await h.turnEnd(sid, 1);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq, end.data.error], ["end_turn", seq, undefined]);
+    assert.match(typed(t.transcript).at(-1)!, /^\n\n<pasted_content id="[0-9a-f]+">\nQuoted your earlier reply:/, "recorded as Claude Code records a paste");
+    assert.ok(!h.claw.eventsOf(sid, "user_message_chunk").some((e) => !e.data.replay && /Quoted your earlier reply/.test(e.data.update.content.text)), "its own prompt is not news");
+  });
+
   test("withdraw takes back a message waiting for the terminal and leaves the terminal alone: no Escape, nothing typed", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
@@ -837,7 +856,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
   test("Enter's guard reads the one screen: the box there, exactly the text, no question; a long text the box wraps is still exact", () => {
     const box = (held: string[], below = "  ⏸ manual mode on") => `  ready\n${RULE}\n❯ ${held[0]}\n${held.slice(1).map((l) => `  ${l}`).join("\n")}${held.length > 1 ? "\n" : ""}${RULE}\n${below}`;
     assert.equal(enterGuard(box(["hello from the phone"]), "hello from the phone"), null);
-    // (RULE is 40 columns: a row holds 39 at most, its prompt or indent included; a wide character takes two)
+    // (RULE is 40 columns: a row holds 38 at most, its prompt or indent included; a wide character takes two)
     assert.equal(enterGuard(box(["这是一段很长的手机消息，用来测试输入框", "如何显示。"]), "这是一段很长的手机消息，用来测试输入框如何显示。"), null, "wrapped, wide characters");
     assert.equal(enterGuard(box(["这是一段很长的手机消息", "用来测试输入框如何显示。"]), "这是一段很长的手机消息用来测试输入框如何显示。"), "the box does not hold exactly what was typed", "a row ending short is a line break, not a wrap");
     assert.equal(enterGuard(box(["line one", "line two"]), "line one\nline two"), null);
@@ -848,9 +867,17 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(enterGuard(box(["[Pasted text #3]", "more"]), "x".repeat(1500)), "the box does not hold exactly what was typed");
     // Exactly the text: a wrap may drop the space it broke at, nothing else may differ.
     assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccccccc dddddd", "eeeeee"]), "aaaaaaaa bbbbbbbb cccccccc dddddd eeeeee"), null, "wrapped at a space: the next word did not fit");
-    assert.equal(enterGuard(box(["x".repeat(37), "xxx"]), "x".repeat(40)), null, "wrapped inside a word: the row full");
-    assert.equal(enterGuard(box(["x".repeat(36), "x"]), "x".repeat(37)), "the box does not hold exactly what was typed", "one more column was free (codex r3)");
-    assert.equal(enterGuard(box([`${"x".repeat(36)}`, "你好"]), `${"x".repeat(36)}你好`), null, "a wide character does not fit the last free column");
+    assert.equal(enterGuard(box(["x".repeat(36), "xxxx"]), "x".repeat(40)), null, "wrapped inside a word: the row full");
+    assert.equal(enterGuard(box(["x".repeat(35), "x"]), "x".repeat(36)), "the box does not hold exactly what was typed", "one more column was free (codex r3)");
+    assert.equal(enterGuard(box([`${"x".repeat(35)}`, "你好"]), `${"x".repeat(35)}你好`), null, "a wide character does not fit the last free column");
+    // As Claude Code 2.1.285 and 2.1.322 drew them in a 120-column pane (2026-11-11; the words replaced): a row ends two columns
+    // short of the rule. Refused before, so the message stayed in the box unsent ("the box does not hold exactly what was typed").
+    const wide = (held: string[], rule = "─".repeat(120)) => `  ready\n${rule}\n❯ ${held[0]}\n${held.slice(1).map((l) => `  ${l}`).join("\n")}\n${rule}\n  ⏵⏵ bypass permissions on`;
+    const mixed = `Clawy “终端”│${"测".repeat(51)}`;   // (the ambiguous-width “ ” │ take one column each, as Claude Code draws them)
+    assert.equal(enterGuard(wide([mixed, "试，对吗？"]), `${mixed}试，对吗？`), null, "117 columns, and the next character is wide");
+    assert.equal(enterGuard(wide(["x".repeat(116), "x".repeat(14)]), "x".repeat(130)), null, "118 columns of one long word");
+    assert.equal(enterGuard(wide([`${"x".repeat(111)}中中`, "中yyyy"]), `${"x".repeat(111)}中中中yyyy`), null);
+    assert.equal(enterGuard(wide(["x".repeat(115), "x"]), "x".repeat(116)), "the box does not hold exactly what was typed", "one column was still free");
     // (codex r2 on #648) a line break of the box's own is not a wrapped space
     assert.equal(enterGuard(box(["hello", "world"]), "hello world"), "the box does not hold exactly what was typed", "a line break is not a space");
     assert.equal(enterGuard(box(["aaaaaaaa bbbbbbbb cccc", "dd"]), "aaaaaaaa bbbbbbbb cccc dd"), "the box does not hold exactly what was typed", "the next word would have fit");

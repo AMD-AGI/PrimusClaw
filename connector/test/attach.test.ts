@@ -13,7 +13,7 @@ import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
   AttachSupport, MAX_REPORTED, SESSION_REF_RE, blindHolders, classifyAppended, isClaudeArgv, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
-  TranscriptTail, TwinCheckError, transcriptUpdates, type Resumable,
+  TranscriptTail, TwinCheckError, transcriptUpdates, unwrapPasted, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
 import { memoryAudit } from "../src/audit.js";
@@ -629,6 +629,88 @@ roots = ["${os.tmpdir()}"]
     assert.deepEqual(cfg.agents.map((a) => [a.kind, a.askMode, a.attach?.cli ?? null]), [["attach", "default", "claude"], ["attach", "default", "/opt/claude/bin/claude"], ["claude", "default", null]]);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude"\nattach_cli = "claude"\nroots = ["${os.tmpdir()}"]`), ConfigError);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude-attach"\nattach_cli = ""\nroots = ["${os.tmpdir()}"]`), ConfigError);
+  });
+});
+
+describe("which user turns of a terminal's transcript are a person's prompt (what a phone shows as typed in the terminal)", () => {
+  // The shapes Claude Code 2.1.285-2.1.319 writes (measured on real transcripts 2026-11-11; ids, paths and words replaced).
+  const base = { parentUuid: "00000000-0000-4000-8000-000000000001", isSidechain: false, userType: "external", entrypoint: "cli", version: "2.1.312", sessionId: REF, cwd: "/home/dev/repo", timestamp: "2026-11-11T08:00:00.000Z" };
+  const human = { promptId: "11111111-1111-4111-8111-111111111111", origin: { kind: "human" }, promptSource: "typed", turnOrigin: "human", permissionMode: "default" };
+  const line = (o: Record<string, unknown>) => JSON.stringify({ ...base, uuid: "22222222-2222-4222-8222-222222222222", ...o });
+  const user = (content: unknown, o: Record<string, unknown> = {}) => line({ type: "user", message: { role: "user", content }, ...o });
+  const shown = (l: string) => transcriptUpdates(l).map((u) => (u.type === "user_message_chunk" ? (u.update.content as { text: string }).text : u.type));
+  const NOTIFICATION = "<task-notification>\n<task-id>a0b1c2d3e4f5a6b7c</task-id>\n<tool-use-id>toolu_01AAAAAAAAAAAAAAAAAAAAAA</tool-use-id>\n"
+    + "<output-file>/tmp/claude-0/-home-dev-repo/33333333-3333-4333-8333-333333333333/tasks/a0b1c2d3e4f5a6b7c.output</output-file>\n"
+    + "<status>completed</status>\n<summary>Agent \"Fix the parser\" completed</summary>\n<result>done</result>\n</task-notification>";
+  const PEER = "Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/cc-socks/1234.sock\" name=\"other\">\nplease rebase\n</cross-session-message>";
+
+  test("a typed prompt, an accepted suggestion, a queued one and one sent through the SDK are shown", () => {
+    assert.deepEqual(shown(user("fix the failing test in parser.ts", human)), ["fix the failing test in parser.ts"]);
+    assert.deepEqual(shown(user("yes", { ...human, promptSource: "suggestion_accepted" })), ["yes"]);
+    assert.deepEqual(shown(user("and the docs", { ...human, promptSource: "queued" })), ["and the docs"]);
+    assert.deepEqual(shown(user([{ type: "text", text: "from the SDK" }], { ...human, promptSource: "sdk" })), ["from the SDK"]);
+    assert.deepEqual(shown(user([{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }, { type: "text", text: "[Image #1] what is this" }], human)),
+      ["[Image #1] what is this"]);
+  });
+
+  test("a prompt that mentions or even starts with a harness tag is still the person's when the entry says so", () => {
+    const prose = "why does Clawy show <task-notification> blocks as typed in the terminal?";
+    assert.deepEqual(shown(user(prose, human)), [prose]);
+    assert.deepEqual(shown(user(prose)), [prose], "an entry that says nothing: only the start of its text is looked at");
+    assert.deepEqual(shown(user(`${NOTIFICATION}\nwhat does this mean?`, human)), [`${NOTIFICATION}\nwhat does this mean?`], "pasted at the terminal");
+    assert.deepEqual(shown(user("/compact")), ["/compact"], "a slash command as typed, from a Claude Code that does not say where it came from");
+  });
+
+  test("a background task's notification is nothing (the turn Claude Code takes on its own)", () => {
+    const notification = { promptId: "44444444-4444-4444-8444-444444444444", origin: { kind: "task-notification", producer: "session-task", runId: "0abc-def" },
+      promptSource: "system", turnOrigin: "task_notification", queueSkipAttachments: true, permissionMode: "bypassPermissions" };
+    assert.deepEqual(shown(user(NOTIFICATION, notification)), []);
+    assert.deepEqual(shown(user(NOTIFICATION, { origin: { kind: "task-notification" } })), [], "by origin alone");
+    assert.deepEqual(shown(user(NOTIFICATION, { promptSource: "system" })), [], "by promptSource alone");
+    assert.deepEqual(shown(user(NOTIFICATION)), [], "an entry that says nothing: by how it begins");
+    assert.deepEqual(shown(user(`\n${NOTIFICATION}`)), [], "(leading blank lines included)");
+  });
+
+  test("a message from another session or a sub-agent, a scheduled prompt and a reminder are nothing", () => {
+    const peer = { origin: { kind: "peer", from: "uds:/tmp/cc-socks/1234.sock", name: "other", body: "please rebase" }, promptSource: "system", turnOrigin: "peer", isMeta: true };
+    assert.deepEqual(shown(user(PEER, peer)), []);
+    assert.deepEqual(shown(user(PEER, { ...peer, isMeta: false })), [], "by origin, without isMeta");
+    assert.deepEqual(shown(user(PEER)), [], "an entry that says nothing: by how it begins");
+    assert.deepEqual(shown(user("<agent-message from=\"a0123456789abcdef\">\nI am done\n</agent-message>")), []);
+    assert.deepEqual(shown(user("check the deploy and report", { promptSource: "system", turnOrigin: "scheduled", isMeta: true })), [], "a scheduled prompt");
+    assert.deepEqual(shown(user("check the deploy and report", { promptSource: "system", turnOrigin: "scheduled" })), [], "... without isMeta");
+    assert.deepEqual(shown(user("<system-reminder>\nThe date changed.\n</system-reminder>")), []);
+  });
+
+  test("a tool's result is a step's end, never words; a slash command's and a `!` command's lines and a compacted summary are nothing", () => {
+    const result = user([{ tool_use_id: "toolu_01BBBBBBBBBBBBBBBBBBBBBB", type: "tool_result", content: "file contents", is_error: false }],
+      { toolUseResult: { stdout: "file contents", stderr: "", interrupted: false }, sourceToolAssistantUUID: "55555555-5555-4555-8555-555555555555" });
+    assert.deepEqual(transcriptUpdates(result).map((u) => u.type), ["tool_call_update"]);
+    assert.deepEqual(shown(user([{ type: "text", text: "the output of a tool, as text" }], { toolUseResult: "x" })), []);
+    assert.deepEqual(shown(user("<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>")), []);
+    assert.deepEqual(shown(user("<local-command-stdout>Compacted</local-command-stdout>", { turnOrigin: "human" })), []);
+    assert.deepEqual(shown(user("<bash-input>ls /tmp</bash-input>")), []);
+    assert.deepEqual(shown(user("This session is being continued from a previous conversation that ran out of context. The summary below ...",
+      { isCompactSummary: true, isVisibleInTranscriptOnly: true, turnOrigin: "human" })), []);
+  });
+
+  test("a pasted block is the text that was pasted: the phone's message of several lines matches what it typed, and shows as given", () => {
+    // (Claude Code 2.1.285, 2026-11-11: a 4-line message from the phone, pasted, recorded in place of `[Pasted text #1 +3 lines]`)
+    const phone = "Quoted your earlier reply:\n> the terminal said something\n\nis this expected?";
+    const recorded = `\n\n<pasted_content id="1fe5">\n${phone}\n</pasted_content id="1fe5">\n`;
+    assert.deepEqual(shown(user(recorded, human)), [phone]);
+    assert.equal(unwrapPasted(`look at this\n\n<pasted_content id="2a">\nline a\nline b\n</pasted_content id="2a">\n\nand fix it`), "look at this\nline a\nline b\nand fix it");
+    assert.equal(unwrapPasted(`<pasted_content id="1">\nx\n</pasted_content id="2">`), `<pasted_content id="1">\nx\n</pasted_content id="2">`, "ids that do not pair are left");
+    assert.equal(unwrapPasted("a prompt that names <pasted_content id=\"1\"> in prose"), "a prompt that names <pasted_content id=\"1\"> in prose");
+    assert.deepEqual(transcriptUpdates(line({ type: "queue-operation", operation: "enqueue", content: recorded })), [{ type: "queued", update: { text: phone } }]);
+    assert.deepEqual(transcriptUpdates(line({ type: "attachment", attachment: { type: "queued_command", prompt: recorded, commandMode: "prompt", origin: { kind: "human" } } })),
+      [{ type: "queued_taken", update: { text: phone } }]);
+  });
+
+  test("Claude Code's interrupt note is never a prompt: it ends the terminal's turn (turn_interrupted, never sent on)", () => {
+    assert.deepEqual(shown(user([{ type: "text", text: "[Request interrupted by user for tool use]" }])), ["turn_interrupted"]);
+    assert.deepEqual(shown(user("[Request interrupted by user]")), ["turn_interrupted"]);
+    assert.deepEqual(shown(user("[Request interrupted by user] is what it printed", human)), ["[Request interrupted by user] is what it printed"]);
   });
 });
 

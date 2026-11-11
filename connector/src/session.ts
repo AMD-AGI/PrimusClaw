@@ -429,6 +429,10 @@ export class Session {
       if (turn?.seen) this.endTerminalTurn("end_turn");
       return;
     }
+    if (u.type === "turn_interrupted") {
+      if (turn?.seen) this.endTerminalTurn("cancelled");
+      return;
+    }
     // What Claude Code did with a message submitted while a turn ran: queued it (taken: the echo), took it into that turn (its start
     // here), or handed the queue back to the terminal's box (withdrawn there). Never sent on: the phone sees the turn's own lines.
     if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
@@ -447,7 +451,6 @@ export class Session {
       if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
       // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
       if (turn.pasted && !turn.seen && turn.queued && wholeLinesOf(said, turn.text)) { turn.seen = true; return; }
-      if (turn.seen && /^\[Request interrupted by user/.test(said.trim())) { this.endTerminalTurn("cancelled"); }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
     if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
