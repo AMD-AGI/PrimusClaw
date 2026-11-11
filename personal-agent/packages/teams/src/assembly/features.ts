@@ -227,7 +227,9 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     reportView: (userId, scope) => w8.reportView(userId, scope),
     note: noteFactory,
     subscriptions:
-      subs === undefined ? undefined : { ensure: (u) => subs.ensure(u), remove: (u, key) => subs.remove(u, key) },
+      subs === undefined
+        ? undefined
+        : { ensure: (u, credential) => subs.ensure(u, credential), remove: (u, key) => subs.remove(u, key) },
     handlers: built.handlers,
     integrations: plugins.integrations,
   };

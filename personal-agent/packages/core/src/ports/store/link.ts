@@ -36,7 +36,23 @@ export interface LinkRepository {
   setClawUserId(userId: string, clawUserId: string): void;
   /** Linked before the Claw user id was kept (or the lookup failed at link time). */
   needsClawUserId(userId: string): boolean;
+  /**
+   * The link's Claw user id; for a person with no link, the one kept for their binding at the identity service (their
+   * chats run on exchanged tokens). The assistant reaches either by it.
+   */
   clawUserIdOf(userId: string): string | null;
+  /**
+   * A person with no link, bound at the identity service: the Claw user id kept for them, and whether it was read with
+   * `credential` (the token they write with now); null when none is kept.
+   */
+  boundClawUser(userId: string, credential: string): { clawUserId: string; current: boolean } | null;
+  /**
+   * Keep the Claw user id read with `credential` for a bound person with no link. When it names another account than the
+   * one kept, their subscription (made with the earlier account's token) is forgotten, to be made again with this one.
+   */
+  setBoundClawUser(userId: string, clawUserId: string, credential: string): void;
+  /** A person with no link is no longer bound: forget their kept Claw user id and their subscription. */
+  forgetBound(userId: string): void;
   /** Every linked person, in a stable order. */
   linkedUsers(): string[];
   userForClawUser(clawUserId: string): string | null;
