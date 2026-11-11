@@ -21,6 +21,8 @@
  *   X6 the sweep's own statement never touches a public plugin, even without the constraint
  *   X7 admission refuses a plugin past its expiry, and the sweep waits a grace after it
  *   X8 the schema guard requires the plugin columns every write names
+ *   X9 a task cannot name another user's private plugin (temporary plugins are private), and the answer is the not-found one
+ *   X10 an admission in flight holds its plugin against the sweep; a DAG whose plugin is gone is refused
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -135,12 +137,12 @@ describe("temporary plugins against Postgres", { skip }, () => {
     const pub = await addRaw("public", true, null);
     const gone = await addRaw("gone", false, "2020-01-01T00:00:00Z");
     await q("UPDATE plugins SET deleted_at = '2021-01-01' WHERE id = $1", [gone]);
-    const swept = await expiry.sweepExpiredPlugins(h.app.db.db);
+    const swept = await expiry.sweepExpiredPlugins(h.app.db.db.pool);
     assert.deepEqual(swept.map((p) => p.id), [expired]);
     assert.ok((await row(expired)).deleted_at);
     for (const id of [future, permanent, pub]) assert.equal((await row(id)).deleted_at, null);
     assert.equal(new Date((await row(gone)).deleted_at).toISOString(), "2021-01-01T00:00:00.000Z", "a deleted row is not touched again");
-    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db), [], "a second pass finds nothing");
+    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "a second pass finds nothing");
   });
 
   // X5
@@ -151,12 +153,12 @@ describe("temporary plugins against Postgres", { skip }, () => {
     await q("INSERT INTO claw_task_dags (dag_id, name, plugin_id) VALUES ('d1', 'd1', $1)", [byDag]);
     const msg = (await q("INSERT INTO claw_pending_messages (session_id, content, plugin_id) VALUES ('s', 'hi', $1) RETURNING id", [byMsg])).rows[0] as any;
     await q("INSERT INTO claw_tasks (task_id, session_id, name, status, plugin_id) VALUES ('t-x5', 's', 't', 'running', $1)", [byTask]);
-    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db), []);
+    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), []);
     await q("UPDATE claw_task_dags SET deleted_at = NOW() WHERE dag_id = 'd1'");
     await q("DELETE FROM claw_pending_messages WHERE id = $1", [msg.id]);
     await q("UPDATE claw_tasks SET status = 'completed' WHERE task_id = 't-x5'");
     assert.deepEqual(
-      (await expiry.sweepExpiredPlugins(h.app.db.db)).map((p) => p.id).sort((a, b) => a - b),
+      (await expiry.sweepExpiredPlugins(h.app.db.db.pool)).map((p) => p.id).sort((a, b) => a - b),
       [byDag, byMsg, byTask].sort((a, b) => a - b),
     );
     await q("DELETE FROM claw_task_dags");
@@ -169,7 +171,7 @@ describe("temporary plugins against Postgres", { skip }, () => {
     try {
       const pub = await addRaw("public-expired", true, "2020-01-01T00:00:00Z");
       const priv = await addRaw("private-expired", false, "2020-01-01T00:00:00Z");
-      assert.deepEqual((await expiry.sweepExpiredPlugins(h.app.db.db)).map((p) => p.id), [priv]);
+      assert.deepEqual((await expiry.sweepExpiredPlugins(h.app.db.db.pool)).map((p) => p.id), [priv]);
       assert.equal((await row(pub)).deleted_at, null);
       await q("DELETE FROM plugins WHERE id = $1", [pub]);
     } finally {
@@ -194,10 +196,68 @@ describe("temporary plugins against Postgres", { skip }, () => {
     assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_tasks WHERE plugin_id = $1", [past])).rows[0].n, 0);
 
     // A minute past its expiry it is inside the grace: not swept yet.
-    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db), []);
+    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), []);
     await q("UPDATE plugins SET expires_at = NOW() - make_interval(secs => $2) WHERE id = $1", [past, expiry.PLUGIN_EXPIRY_GRACE_SEC + 1]);
-    assert.deepEqual((await expiry.sweepExpiredPlugins(h.app.db.db)).map((p) => p.id), [past]);
+    assert.deepEqual((await expiry.sweepExpiredPlugins(h.app.db.db.pool)).map((p) => p.id), [past]);
     await q("DELETE FROM claw_tasks");
+  });
+
+  // X9
+  test("a task cannot name another user's private plugin", async () => {
+    const theirs = Number(((await q(
+      "INSERT INTO plugins (name, version, owner_user_id, is_public, expires_at) VALUES ('theirs', '1', 'u2', false, '2999-01-01') RETURNING id",
+    )).rows[0] as { id: string }).id);
+    const mine = await addRaw("mine", false, "2999-01-01T00:00:00Z");
+    const post = (payload: unknown) => tasksApp.inject({ method: "POST", url: "/v1/sessions/sx/tasks", payload: payload as object });
+    const refused = await post({ plugin_id: theirs, prompt: "hi" });
+    assert.equal(refused.statusCode, 404, refused.body);
+    assert.equal(refused.json().error, "plugin_not_found", "the same answer as a plugin that does not exist");
+    const missing = await post({ plugin_id: 987654, prompt: "hi" });
+    assert.deepEqual(missing.json(), refused.json());
+    const ok = await post({ plugin_id: mine, prompt: "hi" });
+    assert.equal(ok.statusCode, 200, ok.body);
+    await q("DELETE FROM claw_tasks");
+  });
+
+  // X10
+  test("an admission in flight holds its plugin against the sweep", async () => {
+    const id = await addRaw("held", false, "2020-01-01T00:00:00Z");
+    const live = await addRaw("held-live", false, "2999-01-01T00:00:00Z");
+    const admission = await h.app.db.db.pool.connect();
+    try {
+      await admission.query("BEGIN");
+      // What holdPluginForAdmission takes, on a plugin that expired while the
+      // admission was in flight (the helper itself refuses an expired one).
+      await admission.query("SELECT 1 FROM plugins WHERE id = $1 FOR SHARE", [id]);
+      assert.equal(await expiry.holdPluginForAdmission(admission, live), true);
+      assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "a held plugin is skipped");
+      await admission.query("INSERT INTO claw_tasks (task_id, session_id, name, status, plugin_id) VALUES ('t-x10', 'sx', 't', 'queued', $1)", [id]);
+      await admission.query("COMMIT");
+    } finally {
+      admission.release();
+    }
+    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "its committed task keeps it");
+    await q("UPDATE claw_tasks SET status = 'completed' WHERE task_id = 't-x10'");
+    assert.deepEqual((await expiry.sweepExpiredPlugins(h.app.db.db.pool)).map((p) => p.id), [id]);
+    // Gone, a later admission cannot hold it.
+    const late = await h.app.db.db.pool.connect();
+    try {
+      await late.query("BEGIN");
+      assert.equal(await expiry.holdPluginForAdmission(late, id), false);
+      await late.query("ROLLBACK");
+    } finally {
+      late.release();
+    }
+    await q("DELETE FROM claw_tasks");
+  });
+
+  test("a DAG whose plugin is gone is refused, not run without it", async () => {
+    const past = await addRaw("dag-plugin", false, new Date(Date.now() - 60_000).toISOString());
+    await q("INSERT INTO claw_task_dags (dag_id, name, plugin_id, owner_user_id) VALUES ('d-x10', 'd', $1, 'u1')", [past]);
+    const res = await tasksApp.inject({ method: "POST", url: "/v1/sessions/sx/tasks", payload: { dag_id: "d-x10", input: {} } });
+    assert.equal(res.statusCode, 404, res.body);
+    assert.equal(res.json().error, "plugin_not_found");
+    await q("DELETE FROM claw_task_dags");
   });
 });
 
@@ -221,6 +281,7 @@ test("an expiry request is absent, cleared, a TTL or an instant, and bounded", a
     { expires_at: "tomorrow" },
     { expires_at: 12345 },
     { expires_at: "2026-11-10T00:00:00Z" },
+    { ttl_seconds: Number.MAX_SAFE_INTEGER },
   ]) {
     assert.throws(() => requestedPluginExpiry(bad, NOW, 30), BadRequestError, JSON.stringify(bad));
   }

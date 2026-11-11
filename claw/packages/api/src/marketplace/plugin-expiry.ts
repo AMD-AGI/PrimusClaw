@@ -11,11 +11,17 @@
  * (`plugins_temporary_not_public`), and the sweeper's statement names
  * `is_public = false` as well, so neither rule depends on the other.
  *
- * The sweep is one idempotent UPDATE, so every API replica may run it; the
- * row lock makes each plugin expire once. A plugin something still uses (an
- * unfinished task, a live app run, a queued message, a live DAG template) is
- * left alone and expires on a later pass once that is over.
+ * A plugin something still uses (an unfinished task, a live app run, a queued
+ * message, a live DAG template) is left alone and expires on a later pass once
+ * that is over. "Still uses" includes an admission in flight: every admission
+ * transaction holds the plugin row `FOR SHARE` (`holdPluginForAdmission`) until
+ * it commits, the sweep takes its candidates `FOR UPDATE SKIP LOCKED`, and only
+ * then, in a later statement that sees everything committed before the lock,
+ * checks for references. So an admission either commits its task first (and
+ * the sweep sees it) or waits for the sweep and finds the plugin gone. Every
+ * API replica may run the sweep; the row locks make each plugin expire once.
  */
+import type { PoolClient } from "pg";
 import pino from "pino";
 import { PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN, PLUGIN_TTL_MAX_DAYS } from "../config.js";
 import { BadRequestError } from "../shared/errors.js";
@@ -26,10 +32,9 @@ const logger = pino({ name: "plugin-expiry" });
 export const TEMPORARY_NOT_PUBLIC_CONSTRAINT = "plugins_temporary_not_public";
 
 /**
- * How long after `expires_at` the sweep waits. Admission refuses a plugin past
- * its `expires_at` (routes/tasks.ts, tasks/app-run.ts), so a launch that got in
- * read the plugin before then; the grace outlasts any admission, so by the
- * time the sweep looks, that launch's task row is there and keeps the plugin.
+ * How long after `expires_at` the sweep waits, so an owner who sees a plugin
+ * expire has a moment to extend it. Correctness does not rest on it: the row
+ * locks above do that.
  */
 export const PLUGIN_EXPIRY_GRACE_SEC = 600;
 
@@ -73,7 +78,7 @@ export function requestedPluginExpiry(
     return undefined;
   }
   const delta = at.getTime() - now.getTime();
-  if (delta < PLUGIN_TTL_MIN_SECONDS * 1000 || delta > maxMs) {
+  if (!Number.isFinite(delta) || delta < PLUGIN_TTL_MIN_SECONDS * 1000 || delta > maxMs) {
     throw new BadRequestError(
       `a plugin may expire from ${PLUGIN_TTL_MIN_SECONDS} seconds to ${maxDays} days from now`,
     );
@@ -93,12 +98,34 @@ export function temporaryPublicError(): BadRequestError {
 }
 
 /**
- * Soft-delete every expired temporary plugin nothing uses. Returns what it
- * deleted. Never touches a public plugin.
+ * Hold a plugin for the rest of an admission transaction, or false when it is
+ * gone (deleted, or past its expiry). Every admission that writes a reference
+ * to a plugin (a task, an app run) calls this inside its transaction before
+ * the write; see the module comment for why.
+ */
+export async function holdPluginForAdmission(client: PoolClient, pluginId: number | string): Promise<boolean> {
+  const r = await client.query(
+    `SELECT 1 FROM plugins WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL} FOR SHARE`,
+    [pluginId],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/** The expired private plugins this pass may take, locked; one an admission holds is skipped. */
+export const PLUGIN_EXPIRY_CANDIDATES_SQL = `
+  SELECT id FROM plugins
+   WHERE expires_at IS NOT NULL AND expires_at <= NOW() - INTERVAL '${PLUGIN_EXPIRY_GRACE_SEC} seconds'
+     AND deleted_at IS NULL AND is_public = false
+   ORDER BY id
+   FOR UPDATE SKIP LOCKED`;
+
+/**
+ * Soft-delete the locked candidates nothing uses. Returns what it deleted.
+ * Never touches a public plugin.
  */
 export const PLUGIN_EXPIRY_SWEEP_SQL = `
   UPDATE plugins p SET deleted_at = NOW(), updated_at = NOW()
-   WHERE p.expires_at IS NOT NULL AND p.expires_at <= NOW() - INTERVAL '${PLUGIN_EXPIRY_GRACE_SEC} seconds'
+   WHERE p.id = ANY($1::bigint[])
      AND p.deleted_at IS NULL AND p.is_public = false
      AND NOT EXISTS (SELECT 1 FROM claw_tasks t
                       WHERE t.plugin_id = p.id AND t.status NOT IN ('completed','failed','cancelled'))
@@ -115,10 +142,23 @@ export interface ExpiredPlugin {
   expires_at: Date;
 }
 
-export async function sweepExpiredPlugins(
-  q: { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }> },
-): Promise<ExpiredPlugin[]> {
-  const r = await q.query(PLUGIN_EXPIRY_SWEEP_SQL);
+export async function sweepExpiredPlugins(pool: { connect(): Promise<PoolClient> }): Promise<ExpiredPlugin[]> {
+  const client = await pool.connect();
+  let r: { rows: unknown[] };
+  let broken = false;
+  try {
+    await client.query("BEGIN");
+    const ids = (await client.query(PLUGIN_EXPIRY_CANDIDATES_SQL)).rows.map((x) => String((x as { id: unknown }).id));
+    // A separate statement: under READ COMMITTED it sees every reference
+    // committed before the candidates were locked.
+    r = ids.length ? await client.query(PLUGIN_EXPIRY_SWEEP_SQL, [ids]) : { rows: [] };
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => { broken = true; });
+    throw err;
+  } finally {
+    client.release(broken);
+  }
   const out = (r.rows as Array<Record<string, unknown>>).map((row) => ({
     id: Number(row.id),
     name: String(row.name),
@@ -133,14 +173,12 @@ export async function sweepExpiredPlugins(
 let started = false;
 
 /** Start the periodic sweep (first pass 60 s after start-up). Idempotent. */
-export function startPluginExpirySweeper(
-  q: { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }> },
-): void {
+export function startPluginExpirySweeper(pool: { connect(): Promise<PoolClient> }): void {
   if (started) return;
   started = true;
   const periodMs = PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN * 60 * 1000;
   const pass = () => {
-    sweepExpiredPlugins(q).catch((err) => {
+    sweepExpiredPlugins(pool).catch((err) => {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, "plugin-expiry.sweep_failed");
     });
   };

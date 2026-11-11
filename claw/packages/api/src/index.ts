@@ -422,7 +422,7 @@ async function main() {
   // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
   startUploadSweeper();
   // Soft-deletes temporary plugins past their expires_at (never a public one).
-  startPluginExpirySweeper(db);
+  startPluginExpirySweeper(db.pool);
 
   if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
   // Outbound notification delivery (HMAC-signed webhooks from the outbox).

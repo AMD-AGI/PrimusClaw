@@ -543,15 +543,17 @@ permanent).
   giving a public plugin an expiry is `400`. Clear the expiry first to publish.
 - **New versions** inherit the source version's `expires_at` unless the request
   names its own (or `null`).
-- **Past `expires_at`** a new task or app run on the plugin is refused
-  (`404 plugin_not_found`); work admitted before then keeps running.
+- **Past `expires_at`** a new task, batch or app run on the plugin is refused
+  (`404 plugin_not_found`, the same answer as for a plugin that does not exist
+  or is another user's private one); work admitted before then keeps running.
 - **The sweep.** Every `PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN` (default 5) minutes
   the API soft-deletes (`deleted_at`) every private plugin whose `expires_at` is
   more than 10 minutes past, except one that is still in use: an unfinished
   task, a live app run, a queued message or a live DAG template that names it.
-  That one expires on a later pass, once the use is over. The 10 minutes outlast
-  any admission that read the plugin just before it expired, so its task is
-  there to be seen. The API logs `plugin.expired` for each.
+  That one expires on a later pass, once the use is over. An admission in
+  flight holds the plugin row until it commits, and the sweep skips a held row,
+  so a plugin is never deleted under a run being created. The API logs
+  `plugin.expired` for each.
 
 Eval and probe tooling that registers plugins should set `ttl_seconds`, for
 example a day for a nightly run:
