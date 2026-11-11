@@ -228,7 +228,7 @@ Regenerable content is also left out of the snapshot for size rather than
 ownership, and will simply be rebuilt: `node_modules`, `.task-venv`,
 `.cache`, `.runtime`, `__pycache__`, `torchinductor_*`, `hsa`, `worktree`, and
 object files (`*.o`, `*.co`). The full list is `WORKSPACE_EXCLUDES` in
-[`claw/packages/brain/src/workspace/excludes.ts`](packages/brain/src/workspace/excludes.ts).
+[`packages/brain/src/workspace/excludes.ts`](packages/brain/src/workspace/excludes.ts).
 
 A repository's `.git` is **not** regenerable -- it holds commits that exist nowhere
 else until they are pushed -- so it is carried with the rest of the workspace and a
@@ -258,5 +258,5 @@ See [`.env.example`](.env.example) for the full list.
 | `LITELLM_API_BASE` / `SAFE_DEFAULT_WORKSPACE` | Defaults embedded in GEAK/Hyperloom prompts; MCP callers can pass `api_base` explicitly |
 | `WORKSPACE_PERSIST_BASE` / `CLAW_DEPLOY_ROOT` | Optional shared workspace persistence and Hands distribution; empty values use S3/Brain HTTP fallbacks |
 | `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | Workspace object storage |
-| `A2A_AGENTS` / `A2A_PEER_TOKEN_*` | The only peer agents Brain's `a2a_call` tool may reach, by name (a name list, or a JSON array whose `auth_env` names a variable starting with `A2A_PEER_TOKEN_`). Unset, `a2a_call` has no peers. **Breaking:** `a2a_call` no longer accepts a URL or sends the user's key to a peer; see `CHANGELOG.md` |
+| `A2A_AGENTS` / `A2A_PEER_TOKEN_*` | The only peer agents Brain's `a2a_call` tool may reach, by name (a name list, or a JSON array whose `auth_env` names a variable starting with `A2A_PEER_TOKEN_`). Unset, `a2a_call` has no peers. **Breaking:** `a2a_call` no longer accepts a URL or sends the user's key to a peer; see [`CHANGELOG.md`](../CHANGELOG.md) |
 | `API_PORT` / `EXECUTOR_PORT` / `MCP_PORT` | Service listen ports (api / brain / hands) |
