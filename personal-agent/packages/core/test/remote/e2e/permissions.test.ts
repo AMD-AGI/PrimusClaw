@@ -441,3 +441,38 @@ test("a request whose card cannot be built is forgotten and its resend gets the 
     await w.until(() => w.permissionCards().length > 0);
     assert.equal(w.permissionCards().length, 1);
   }));
+
+/** The request on screen made a terminal's question (a connector's approval hooks): its row keeps the whole ask. */
+function asTerminalQuestion(w: RemoteWorld, sid: string): void {
+  const row = perm(w, sid);
+  assert.ok(row !== null);
+  w.test.store.remotePermissions.forgetRemotePermission(sid, "act-1");
+  w.test.store.remotePermissions.saveRemotePermission({
+    userId: row.userId,
+    sessionId: sid,
+    actionId: "act-1",
+    tool: row.tool,
+    options: row.options,
+    expiresAt: row.expiresAt,
+    ask: { action_id: "act-1", origin: "terminal", kind: "edit", input: { file_path: "README.md" } },
+  });
+}
+
+test("a terminal's question Claw says is answered was answered at the terminal, and a click after that is told so", async () => {
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid);
+    w.server.failOn("POST", "/decisions", 409);
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "This request was answered in the terminal.");
+    assert.equal(perm(w, sid)?.state, "expired");
+  });
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid);
+    w.test.store.remotePermissions.closeRemotePermission(sid, "act-1", "terminal");
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "This request was answered in the terminal.");
+    assert.equal(w.server.commandsOf("decision").length, 0);
+  });
+});

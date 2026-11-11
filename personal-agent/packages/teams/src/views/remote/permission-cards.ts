@@ -36,6 +36,24 @@ export function remoteAskCard(view: remoteView.RemoteAskView): CardMessage {
   return message(body, view.buttons.map(decisionAction), OPTIONS_MAX);
 }
 
+/** The card of a question a terminal asks: who asks, what, the content whole (or the notice that it is not), then the options. */
+export function terminalAskCard(view: remoteView.TerminalAskView): CardMessage {
+  const body: CardElement[] = [
+    header(view.title, { tone: "attention", emoji: "needs_you" }),
+    block(view.who, { isSubtle: true, spacing: "Small" }),
+    block(view.asks, { spacing: "Small" }),
+  ];
+  for (const s of view.sections) {
+    if (s.type === "code") body.push(text(s.text, { mono: true, spacing: "Small" }));
+    else if (s.type === "words") body.push(block(s.text, { spacing: "Small" }));
+    else if (s.type === "option")
+      body.push(block(s.description ? `**${s.label}** — ${s.description}` : `**${s.label}**`, { spacing: "Small" }));
+    else body.push(block(s.text, { isSubtle: true, spacing: "Small" }));
+  }
+  body.push(...view.notes.map((n) => note(n)));
+  return message(body, view.buttons.map(decisionAction), OPTIONS_MAX);
+}
+
 /** What a permission card becomes once answered. */
 export function decidedCard(view: remoteView.DecidedView): CardMessage {
   return message([

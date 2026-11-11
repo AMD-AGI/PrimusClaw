@@ -155,6 +155,8 @@ export const SETTINGS_ENTRIES: readonly Capability[] = [
     covers: [
       "command:agents",
       "command:agent",
+      // (`/approvals`: whether the questions the person's own terminals ask come to the chat; the same remote agents)
+      "command:approvals",
       "agent:new",
       "agent:mode",
       "agent:close",

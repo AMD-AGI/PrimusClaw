@@ -69,6 +69,13 @@ export const ADDED_COLUMNS: readonly (readonly [string, readonly (readonly [stri
   ],
   ["notify_subs", [["types_version", "INTEGER NOT NULL DEFAULT 0"]]],
   [
+    "remote_permissions",
+    [
+      ["message_id", "TEXT NOT NULL DEFAULT ''"], // '' = the channel never said the card's id
+      ["ask_json", "TEXT NOT NULL DEFAULT ''"], // '' = not a question a terminal asks
+    ],
+  ],
+  [
     "turn_answers",
     [
       ["boot_id", "TEXT NOT NULL DEFAULT ''"],

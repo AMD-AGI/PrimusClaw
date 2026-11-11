@@ -11,6 +11,7 @@ import type { DisconnectView, MachineChoiceView, ModeView, TakeoverView } from "
 import type { DecidedView, PermissionView, RemoteAskView } from "./permission-view.js";
 import type { SessionsView } from "./sessions-view.js";
 import type { StatusView } from "./status-view.js";
+import type { TerminalAskView } from "./terminal-ask-view.js";
 import type { HiddenView } from "./hidden-view.js";
 import type { WindowCardView } from "./window-view.js";
 
@@ -22,6 +23,7 @@ export * from "./machine-views.js";
 export * from "./permission-view.js";
 export * from "./sessions-view.js";
 export * from "./status-view.js";
+export * from "./terminal-ask-view.js";
 export * from "./window-view.js";
 export { remoteHealthText, remoteOffText, remoteQueuedText, remoteStopText, remoteText } from "../locales/remote.js";
 export { remoteWindowCardText } from "../locales/remote-window-card.js";
@@ -33,6 +35,7 @@ declare module "../ports/surface.js" {
     remoteStatus: StatusView;
     remotePermission: PermissionView;
     remoteAsk: RemoteAskView;
+    terminalAsk: TerminalAskView;
     remoteDecided: DecidedView;
     remoteDisconnect: DisconnectView;
     remoteTakeover: TakeoverView;

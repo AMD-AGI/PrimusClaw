@@ -24,6 +24,7 @@ import { saidIn } from "./refusals.js";
 import type { StatusBoard } from "./board.js";
 import { type ChatState, isTransport } from "./state.js";
 import { own } from "../own.js";
+import { terminalApprovalText } from "../locales/terminal-approvals.js";
 
 /** How a click ends: the clicked card replaced by `card` (a note when it is text), and the outcome said (W4's `ClickRoute.settle`). */
 export type Settle = (
@@ -147,6 +148,10 @@ export class Permissions {
       await click.settle(saidIn(lang, "approvalInactive"));
       return;
     }
+    if (perm.state === "terminal") {
+      await click.settle(terminalApprovalText.in(lang).answeredInTerminalLine);
+      return;
+    }
     if (perm.state !== "pending") {
       await click.settle(saidIn(lang, "approvalAnswered"));
       return;
@@ -243,7 +248,11 @@ export class Permissions {
         return false;
       }
       this.ctx.permissions.closeRemotePermission(perm.sessionId, perm.actionId, "expired", { onlyIfPending: false });
-      await click.settle(saidIn(lang, "approvalAnswered"));
+      // (a question a terminal asks that Claw says is answered: the terminal answered first)
+      const terminalFirst = perm.ask?.["origin"] === "terminal" && error.status === 409;
+      await click.settle(
+        terminalFirst ? terminalApprovalText.in(lang).answeredInTerminalLine : saidIn(lang, "approvalAnswered"),
+      );
       return false;
     }
   }

@@ -332,3 +332,115 @@ it("a push or a sweep outside any message answers in the language of the text", 
   );
   assert.ok(suggested(w).includes("Back to Clawy"), suggested(w).join(" | "));
 });
+
+/** A question a terminal asks (a connector's approval hooks), as Claw relays it (`remote.ask` with `origin: "terminal"`). */
+function aTerminalAsk(actionId = "act-t1"): JsonObject {
+  return {
+    action_id: actionId,
+    tool: "Run: npm test",
+    origin: "terminal",
+    kind: "execute",
+    input: { command: "npm test", description: "Run the tests" },
+    options: [
+      { optionId: "allow", name: "Yes", kind: "allow_once" },
+      { optionId: "deny", name: "No", kind: "reject_once" },
+    ],
+    expires_at: "2026-10-27T05:00:00Z",
+  };
+}
+
+function resolvedSay(sessionId: string, actionId: string, by: string, eventId: string): JsonObject {
+  return {
+    type: "assistant.say",
+    event_id: eventId,
+    text: by === "terminal" ? "（这个请求已在终端里回答）" : "（这个请求不再等待回答）",
+    fallback: true,
+    remote: {
+      kind: "resolved",
+      session_id: sessionId,
+      machine: "dev-pod",
+      agent: "claude",
+      resolved: { action_id: actionId, by },
+    },
+  };
+}
+
+it("a terminal's question is posted as a card whose id is kept, with its whole ask", async () => {
+  const w = world();
+  const push = remoteSay("rs-t", "needs_you", "say-t", { text: "x", ask: aTerminalAsk() });
+  assert.equal(await w.proactive.handle(ALICE, w.reference, push), "delivered");
+  const posted = w.surface.outbox.filter((r) => r.op === "post");
+  assert.equal(posted.length, 1);
+  const saved = w.store.remotePermissions.getRemotePermission("rs-t", "act-t1");
+  assert.ok(saved !== null);
+  assert.equal(saved.messageId, (posted[0] as { id: string }).id);
+  assert.deepEqual(saved.ask, aTerminalAsk());
+  // One an agent Claw started asks keeps going out as before, with no ask kept.
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, remoteSay("rs-1", "needs_you", "say-a", { text: "x", ask: anAsk() })),
+    "delivered",
+  );
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-1", "act-1")?.ask, null);
+});
+
+it("answered at the terminal first: the card is edited in place to say so, without buttons, and nothing new is sent", async () => {
+  const w = world();
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", { text: "x", ask: aTerminalAsk() }),
+  );
+  const before = w.surface.outbox.length;
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "terminal", "say-r")),
+    "delivered",
+  );
+  const after = w.surface.outbox.slice(before);
+  assert.deepEqual(
+    after.map((r) => r.op),
+    ["update"],
+  );
+  const edit = after[0] as {
+    id: string;
+    message: {
+      body: { type: string; view: { name: string; model: { title?: string; text: string; buttons?: unknown[] } } };
+    };
+  };
+  assert.equal(edit.id, w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.messageId);
+  assert.equal(edit.message.body.view.name, "note");
+  assert.match(edit.message.body.view.model.text, /terminal|终端/);
+  assert.equal(edit.message.body.view.model.buttons, undefined);
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.state, "terminal");
+});
+
+it("given up (timeout): the card says it no longer waits; answered here first: the notice changes nothing", async () => {
+  const w = world();
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", { text: "x", ask: aTerminalAsk() }),
+  );
+  await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "timeout", "say-r"));
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.state, "expired");
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t2", { text: "x", ask: aTerminalAsk("act-t2") }),
+  );
+  w.store.remotePermissions.closeRemotePermission("rs-t", "act-t2", "decided");
+  const before = w.surface.outbox.length;
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t2", "terminal", "say-r2")),
+    "delivered",
+  );
+  assert.deepEqual(w.surface.outbox.slice(before), []);
+});
+
+it("a resolved notice for a card this chat never showed is said as its one line", async () => {
+  const w = world();
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-x", "act-x", "terminal", "say-r")),
+    "delivered",
+  );
+  assert.ok(shown(w.surface.outbox).some((line) => line.includes("已在终端里回答")));
+});
