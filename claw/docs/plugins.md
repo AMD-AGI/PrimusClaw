@@ -490,6 +490,7 @@ says otherwise.
 | `latest_per_name` | Defaults to `true`. `false` (also `0`, `no`) lists every row (every version), as before this default; `true`, `1`, `yes` collapse; anything else is `400`. |
 | `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
 | `include_deleted` | Admins only, as before. A deleted version never wins over a live one; it is the entry only when nothing of the plugin is live. |
+| `scope` | Which plugins: `visible` (default) is the public ones plus the caller's own, for admins too; `mine` only the caller's own; `public` only public ones; `all` every plugin, admins only (`403` otherwise). Anything else is `400`. |
 | `name_exact`, `name`, `owner`, `limit`, `offset` | Unchanged. |
 
 The other versions are listed on demand:
