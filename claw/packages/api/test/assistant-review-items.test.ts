@@ -1749,7 +1749,7 @@ describe("assistant review items", { skip }, () => {
     try {
       await ri.followReviewItems();
       await reviewResultsSettled();
-      assert.equal(seen.length, 2);
+      assert.deepEqual(seen.map((f) => f.sessionId), [moved.session_id], "a wait past its day ends without asking GitHub, so a look that keeps failing cannot hold it open");
       for (const [it, why] of [[moved, /new commits/], [old, /still not green after 24 hours/]] as const) {
         const item = await w.item(it.item_id);
         assert.deepEqual([item.board_state, item.outcome], ["done", "accepted"]);

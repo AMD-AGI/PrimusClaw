@@ -1494,9 +1494,9 @@ export class GithubReview {
       truncated: Number(runs.json?.total_count ?? 0) > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
     };
     const verdict = evaluateChecks(input);
-    if (!verdict.summary.advisoryFailed.length || required === null) return verdict;
-    // A failure the rulesets do not require is advisory only if the classic branch protection does not require it either: read once, and
-    // only here, where it decides something. Unreadable, nothing is advisory.
+    if (required === null || verdict.summary.failedNames.every((name) => required.includes(name))) return verdict;
+    // A failure the rulesets do not require is advisory only if the classic branch protection does not require it either, and either may be
+    // the one that requires something: read once, and only here, where it decides something. Unreadable, nothing is advisory.
     const classic = requiredContextsFromBranch(await this.baseBranch(ctx, ref, pr));
     if (classic === null) return evaluateChecks({ ...input, advisory: false });
     return evaluateChecks({ ...input, required: [...required, ...classic.filter((c) => !required.includes(c))] });

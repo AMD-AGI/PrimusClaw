@@ -1480,6 +1480,11 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
     try {
       const sessionId = String(taken.worker_session_id);
       const wait = ciWaitOf(await readFacts(db, { user_id: String(taken.user_id), worker_session_id: sessionId, params }));
+      // A wait past its day ends whatever GitHub answers now: a look that keeps failing (an expired authorization) never keeps it open.
+      if (wait && now - wait.since > CI_WAIT_MS) {
+        await endCiWait(item_id, "timeout", wait.headSha, now);
+        continue;
+      }
       const out = await follow({
         sessionId, ref: params.pr, actingUserId: params.acting_as,
         requesterUserId: requestedBy ?? String(taken.user_id), requesterLabel: params.requester_label ?? undefined,
@@ -1501,6 +1506,17 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
   return ended;
 }
 
+/** End a review's wait for CI, once (`ci_wait_ended`), and bring the item to it: the sync tells the owner why (`review-result.ts`). */
+async function endCiWait(itemId: string, reason: CiWaitEnd, head: string, now: number): Promise<void> {
+  await db.query(
+    `UPDATE claw_work_items SET params = params || jsonb_build_object('ci_wait_ended', $2::jsonb), updated_at = NOW()
+      WHERE item_id = $1 AND board_state <> 'done' AND NOT (params ? 'ci_wait_ended')`,
+    [itemId, JSON.stringify({ reason, at: new Date(now).toISOString(), head_sha: head })],
+  );
+  logger.info({ itemId, reason, head }, "assistant.review_ci_wait_ended");
+  await syncReviewItem(itemId);
+}
+
 /**
  * One look at a review waiting for CI (`ciWaitOf`), from what `followPullRequest` read of the pull request with its checks: a new head ends
  * the wait (the commits it waited on are not the pull request any more), a green head runs the review once more in its session (the same
@@ -1513,15 +1529,7 @@ async function followCiWait(
 ): Promise<void> {
   const head = String(body.head_sha ?? "").toLowerCase();
   const ci = body.ci as { green?: unknown } | undefined;
-  const end = async (reason: CiWaitEnd): Promise<void> => {
-    await db.query(
-      `UPDATE claw_work_items SET params = params || jsonb_build_object('ci_wait_ended', $2::jsonb), updated_at = NOW()
-        WHERE item_id = $1 AND board_state <> 'done' AND NOT (params ? 'ci_wait_ended')`,
-      [itemId, JSON.stringify({ reason, at: new Date(now).toISOString(), head_sha: head || wait.headSha })],
-    );
-    logger.info({ itemId, reason, head: head || wait.headSha }, "assistant.review_ci_wait_ended");
-    await syncReviewItem(itemId);
-  };
+  const end = (reason: CiWaitEnd): Promise<void> => endCiWait(itemId, reason, head || wait.headSha, now);
   if (head && head !== wait.headSha) return end("head_moved");
   if (ci?.green === true) {
     const queued = await inTransaction(async (query) => {

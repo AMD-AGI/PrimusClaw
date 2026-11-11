@@ -565,6 +565,13 @@ describe("M the merge gates", () => {
     const o = await merge();
     assert.equal(reason(o), "merged", JSON.stringify(o.body));
     assert.equal(puts().length, 1);
+    // Where only the classic branch protection requires something (the rulesets nothing), a failure it does not require is advisory too.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.rules = [];
+    e.gh.branch = { protected: true, protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["test"], checks: [] } } };
+    e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    assert.equal(reason(await merge()), "merged");
     // A check only the classic branch protection requires is not advisory (the rulesets read does not see it), nor is any failure when
     // that protection cannot be read.
     for (const arrange of [
