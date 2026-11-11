@@ -14,7 +14,7 @@
 import type { Lang } from "../locales/lang.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 import type { DecisionButton } from "../remote/actions.js";
-import { breakLinks, inertLinks, lit, masked, neutral, plain } from "../remote/inert.js";
+import { breakLinks, lit, masked, neutral, plain } from "../remote/inert.js";
 import { type PermissionOption, shownOptions } from "../remote/options.js";
 import type { Reported } from "../remote/reported.js";
 import { redactText } from "../security/redact.js";
@@ -82,17 +82,22 @@ const record = (v: unknown): Reported | undefined =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Reported) : undefined;
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 
+/**
+ * `<` and `>` escaped as markdown, shown as themselves: a card must show a command's `>` as `>`, not as a look-alike (no tag
+ * can be built in a card either way). `](` gets a zero-width space inside, so no link can be built.
+ */
+const angles = (v: string): string => v.replace(/[<>]/g, "\\$&");
 /** Text shown as it is, in a fixed-width font: credentials masked, no link or markup can be built from it. */
-const codeText = (v: string): string => plain(breakLinks(inertLinks(masked(v))));
-/** Text whose markdown (lists, bold) is kept, but no link or tag can be built from it. */
-const wordsText = (v: string): string => breakLinks(inertLinks(masked(v)));
+const codeText = (v: string): string => plain(breakLinks(masked(v))).replace(/>/g, "\\>");
+/** Text whose markdown (lists, bold) is kept, but no link can be built from it. */
+const wordsText = (v: string): string => breakLinks(angles(masked(v)).replaceAll("](", "]\u200b("));
 
 /**
- * A character a card does not show as itself: a control character (but a line break or a tab), an invisible format character (a
- * bidi override that reorders what is shown, a zero-width space, a soft hyphen), or a look-alike the card draws `<`/`>` as.
+ * A character a card does not show as itself: a control character (but a line break or a tab), or an invisible format character
+ * (a bidi override that reorders what is shown, a zero-width space, a soft hyphen).
  */
 // eslint-disable-next-line no-control-regex -- control characters are exactly what is looked for
-const UNSHOWN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\u2039\u203a]/u;
+const UNSHOWN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}]/u;
 /**
  * Whether `text` is shown as it is: no credential masked in it (the private-key mask runs to the end of a key that is never
  * closed, hiding whatever follows it) and no character the card does not show as itself.

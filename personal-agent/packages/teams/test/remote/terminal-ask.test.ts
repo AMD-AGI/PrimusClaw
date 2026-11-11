@@ -457,14 +457,14 @@ test("review round 6: a request the card cannot show as it is (a credential mask
   assert.deepEqual(ids(card(ask({ command: `GH_TOKEN=${token} gh pr list` }))), ["deny", "deny-stop"]);
   assert.deepEqual(ids(card(ask({ command: "ls", description: `uses ${token}` }))), ["deny", "deny-stop"]);
   assert.deepEqual(ids(card(ask({ command: "ls", env: { GH_TOKEN: token } }))), ["deny", "deny-stop"]);
-  // A character the card does not show as itself: a bidi override, a zero-width space, a control character, a look-alike.
-  for (const command of ["ls ‮; rm -rf ~", "rm -rf /tmp/a​ /", "echo a\u001b[2Kb", "echo a › b"])
+  // A character the card does not show as itself: a bidi override, a zero-width space, a control character.
+  for (const command of ["ls \u202e; rm -rf ~", "rm -rf /tmp/a\u200b /", "echo a\u001b[2Kb"])
     assert.deepEqual(ids(card(ask({ command }))), ["deny", "deny-stop"], JSON.stringify(command));
   // A path written other than as it is: the edit is not approvable.
   const edit = (file_path: string): string[] =>
     ids(card({ ...ask({ file_path, content: "x" }), kind: "edit", tool: "Edit" }));
   assert.deepEqual(edit("/w/a[1].ts"), ["deny", "deny-stop"]);
-  assert.deepEqual(edit("/w/a‮.ts"), ["deny", "deny-stop"]);
+  assert.deepEqual(edit("/w/a\u202e.ts"), ["deny", "deny-stop"]);
   assert.deepEqual(edit("/w/a.ts"), ["allow", "allow-session", "deny", "deny-stop"]);
   // An "always" rule written other than as it is is not offered; the rest are.
   const rule = card({
@@ -476,6 +476,11 @@ test("review round 6: a request the card cannot show as it is (a credential mask
     ],
   });
   assert.deepEqual(ids(rule), ["allow", "deny"]);
+  // A redirect is shown as itself (escaped as markdown), never as a look-alike.
+  const redirect = card(ask({ command: "cat /tmp/config.json > /tmp/out.json < /dev/null" }));
+  const mono = (redirect["body"] as Json[]).find((b) => b["fontType"] === "Monospace");
+  assert.equal(mono?.["text"], "cat /tmp/config.json \\> /tmp/out.json \\< /dev/null");
+  assert.deepEqual(ids(redirect), ["allow", "allow-session", "deny", "deny-stop"]);
   // Line breaks, tabs and markup are shown as they are: still approvable.
   assert.deepEqual(ids(card(ask({ command: 'for f in *.ts; do\n\techo "$f" > out_$f; done' }))), [
     "allow",
