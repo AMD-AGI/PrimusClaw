@@ -6,3 +6,4 @@ package-lock.json
 ported-tests/
 test-names.jsonl
 test-support/data/
+packages/teams-ingress/test/parity/python-answers.json

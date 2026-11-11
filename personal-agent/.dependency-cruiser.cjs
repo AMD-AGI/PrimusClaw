@@ -8,6 +8,9 @@
  *                                                   src/protocol.ts alone -- the Claw wire contract.
  *   runtime  (@primusclaw/personal-agent-runtime)  Node adapters of core's ports: depends on core only.
  *   teams    (@primusclaw/personal-agent-teams)    the Teams channel and the process: depends on core and runtime.
+ *   teams-ingress (@primusclaw/personal-agent-teams-ingress)  the Teams ingress Function: depends on core and on the
+ *                                                   worker's Bot Connector host rule (teams' src/connector-hosts.ts
+ *                                                   entry), never on the worker or the runtime.
  *   test-support                                    fakes for tests; never imported by a package's src.
  *
  * The wire contract's own files (claw/packages/protocol/src) are compiled in but are not core's: what they import is
@@ -66,11 +69,25 @@ module.exports = {
       to: { path: "^packages/teams-ingress/" },
     },
     {
+      name: "teams-ingress-depends-on-core-and-the-host-rule",
+      severity: "error",
+      comment:
+        "The ingress Function loads core and the worker's Bot Connector host rule and nothing else of the workspace: " +
+        "its deployable bundle must not take in the worker or the runtime.",
+      from: { path: "^packages/teams-ingress/src/" },
+      to: { path: "^packages/(runtime|teams)/", pathNot: "^packages/teams/src/connector-hosts\\.ts$" },
+    },
+    {
       name: "packages-through-their-entry",
       severity: "error",
-      comment: "Another package is used through its public entry (src/index.ts), never by a deep path into its files.",
+      comment:
+        "Another package is used through its public entries (src/index.ts, and teams' src/connector-hosts.ts), never " +
+        "by a deep path into its files.",
       from: { path: "^packages/([^/]+)/" },
-      to: { path: "^packages/[^/]+/", pathNot: ["^packages/$1/", "^packages/[^/]+/src/index\\.ts$"] },
+      to: {
+        path: "^packages/[^/]+/",
+        pathNot: ["^packages/$1/", "^packages/[^/]+/src/index\\.ts$", "^packages/teams/src/connector-hosts\\.ts$"],
+      },
     },
     {
       name: "src-not-to-tests",

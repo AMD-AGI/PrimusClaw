@@ -34,7 +34,15 @@ test("a file under src/ read by import.meta.url ships at the same place under di
   assert.equal(placeMetaUrl(pkg, w8, "../../README.md", new Map()), undefined);
 });
 
-const TEAMS = ["package.json", "dist/LICENSE", "dist/index.js", "dist/main.js", "dist/types/index.d.ts"];
+const TEAMS = [
+  "package.json",
+  "dist/LICENSE",
+  "dist/index.js",
+  "dist/main.js",
+  "dist/types/index.d.ts",
+  "dist/connector-hosts.js",
+  "dist/types/connector-hosts.d.ts",
+];
 
 test("a tarball carries its bundles, declarations, licence and run-time files, and nothing else", () => {
   const read = (): string => "";
@@ -47,6 +55,13 @@ test("a tarball carries its bundles, declarations, licence and run-time files, a
   assert.deepEqual(fileProblems(spec("teams"), TEAMS.slice(0, 3), read), [
     "missing from the package: dist/types/index.d.ts (run npm run build first)",
     "missing from the package: dist/main.js (run npm run build first)",
+    "missing from the package: dist/connector-hosts.js (run npm run build first)",
+    "missing from the package: dist/types/connector-hosts.d.ts (run npm run build first)",
+  ]);
+  const ingress = ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/main.js"];
+  assert.deepEqual(fileProblems(spec("teams-ingress"), ingress, read), []);
+  assert.deepEqual(fileProblems(spec("teams-ingress"), [...ingress, "host.json"], read), [
+    "unexpected file in the package: host.json",
   ]);
   const core = ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts"];
   assert.deepEqual(fileProblems(spec("core"), core, read), [
@@ -79,7 +94,10 @@ const manifest = (over: Record<string, unknown> = {}): Record<string, unknown> =
     url: "git+https://github.com/AMD-AGI/PrimusClaw.git",
     directory: "personal-agent/packages/teams",
   },
-  exports: { ".": { types: "./dist/types/index.d.ts", default: "./dist/index.js" } },
+  exports: {
+    ".": { types: "./dist/types/index.d.ts", default: "./dist/index.js" },
+    "./connector-hosts": { types: "./dist/types/connector-hosts.d.ts", default: "./dist/connector-hosts.js" },
+  },
   dependencies: { "@primusclaw/personal-agent": "0.1.0", zod: "^4" },
   ...over,
 });
@@ -94,7 +112,7 @@ test("the manifest is publishable, names its siblings by its own exact version, 
   ]);
   assert.deepEqual(
     manifestProblems(spec("teams"), manifest({ dependencies: { "@primusclaw/personal-agent": "^0.1.0" } }), TGZ, {}),
-    ['depends on @primusclaw/personal-agent@"^0.1.0"; the three name each other by their one version 0.1.0'],
+    ['depends on @primusclaw/personal-agent@"^0.1.0"; the packages name each other by their one version 0.1.0'],
   );
   assert.deepEqual(
     manifestProblems(spec("teams"), manifest(), TGZ, { version: "0.2.0", repository: "https://github.com/o/r" }),
@@ -104,11 +122,12 @@ test("the manifest is publishable, names its siblings by its own exact version, 
     ],
   );
   assert.deepEqual(manifestProblems(spec("teams"), manifest({ exports: { ".": "./src/index.ts" } }), TGZ, {}), [
-    'exports is {".":"./src/index.ts"}, expected {".":{"types":"./dist/types/index.d.ts","default":"./dist/index.js"}}',
+    'exports is {".":"./src/index.ts"}, expected {".":{"types":"./dist/types/index.d.ts","default":"./dist/index.js"},' +
+      '"./connector-hosts":{"types":"./dist/types/connector-hosts.d.ts","default":"./dist/connector-hosts.js"}}',
   ]);
   assert.deepEqual(manifestProblems(spec("teams"), manifest({ version: "0.1.0-rc.1" }), TGZ, {}), [
     'version "0.1.0-rc.1" is not MAJOR.MINOR.PATCH',
     "the tarball is named primusclaw-personal-agent-teams-0.1.0.tgz, expected primusclaw-personal-agent-teams-0.1.0-rc.1.tgz",
-    'depends on @primusclaw/personal-agent@"0.1.0"; the three name each other by their one version 0.1.0-rc.1',
+    'depends on @primusclaw/personal-agent@"0.1.0"; the packages name each other by their one version 0.1.0-rc.1',
   ]);
 });
