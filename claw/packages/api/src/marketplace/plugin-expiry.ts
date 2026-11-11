@@ -42,6 +42,8 @@ export const PLUGIN_EXPIRY_GRACE_SEC = 600;
 /** The condition an admission adds to its plugin read: not past its expiry. */
 export const PLUGIN_NOT_EXPIRED_SQL = "(expires_at IS NULL OR expires_at > NOW())";
 
+const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+
 /** Shortest TTL a write may ask for: shorter is a mistake, not a plugin. */
 export const PLUGIN_TTL_MIN_SECONDS = 60;
 
@@ -72,7 +74,9 @@ export function requestedPluginExpiry(
   } else if (hasAt) {
     if (payload.expires_at === null) return null;
     const raw = payload.expires_at;
-    const ms = typeof raw === "string" ? Date.parse(raw) : NaN;
+    // ISO 8601 with a time and an offset only: Date.parse also takes forms
+    // whose meaning depends on the server's locale and time zone.
+    const ms = typeof raw === "string" && ISO_INSTANT_RE.test(raw) ? Date.parse(raw) : NaN;
     if (!Number.isFinite(ms)) throw new BadRequestError("expires_at must be an ISO 8601 timestamp");
     at = new Date(ms);
   } else {

@@ -10,7 +10,7 @@ import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { getViewablePlugin, resolveTaskPlugin } from "../marketplace/plugins.js";
+import { getViewablePlugin, pluginLaunchable, resolveTaskPlugin } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
@@ -422,9 +422,11 @@ async function resolveA2ARunSpec(
     // `metadata.plugin_id` is the caller's to name, so the plugin is read as the
     // caller sees it, exactly as a chat message does: a plugin they may not view
     // resolves to null here, never to its tools, skills and rules.
-    const plugin = await resolveTaskPlugin(
-      pluginId, auth.userId, isAdmin({ ...auth, userName: auth.userId }),
-    );
+    // A temporary plugin past its expiry reads as gone, exactly like a deleted one.
+    const admin = isAdmin({ ...auth, userName: auth.userId });
+    const plugin = await pluginLaunchable(pluginId, auth.userId, admin)
+      ? await resolveTaskPlugin(pluginId, auth.userId, admin)
+      : { tools: null, image: undefined, resource: undefined };
     pluginTools = plugin.tools;
     pluginImage = plugin.image;
     pluginResource = plugin.resource;

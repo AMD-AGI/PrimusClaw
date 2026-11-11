@@ -1237,14 +1237,16 @@ async function gateUserMessageTurn(
       await client.query("ROLLBACK");
       return { kind: "missing" };
     }
+    // A turn under a plugin that is gone (deleted, or a temporary one past its
+    // expiry) is refused, queued or not; a queued row also keeps the hold so
+    // the expiry sweep cannot race its insert.
+    if (!(await holdPluginReference(client, config.pluginId ?? null))) {
+      await client.query("ROLLBACK");
+      return { kind: "plugin_gone" };
+    }
     // None for a session that acts as a user (see `loadUserEnvForSession`).
     const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
     if (locked.rows[0].agent_status === "running") {
-      // The queued row references the plugin: hold it against the expiry sweep, and refuse one that is gone.
-      if (!(await holdPluginReference(client, config.pluginId ?? null))) {
-        await client.query("ROLLBACK");
-        return { kind: "plugin_gone" };
-      }
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",

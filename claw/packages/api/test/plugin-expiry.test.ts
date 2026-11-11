@@ -339,6 +339,7 @@ test("an expiry request is absent, cleared, a TTL or an instant, and bounded", a
   assert.equal(requestedPluginExpiry({ ttl_seconds: null }, NOW), null);
   assert.deepEqual(requestedPluginExpiry({ ttl_seconds: 3600 }, NOW), new Date("2026-11-11T01:00:00Z"));
   assert.deepEqual(requestedPluginExpiry({ expires_at: "2026-11-12T00:00:00Z" }, NOW), new Date("2026-11-12T00:00:00Z"));
+  assert.deepEqual(requestedPluginExpiry({ expires_at: "2026-11-12T08:00:00.5+08:00" }, NOW), new Date("2026-11-12T00:00:00.5Z"));
   for (const bad of [
     { ttl_seconds: 3600, expires_at: "2026-11-12T00:00:00Z" },
     { ttl_seconds: "3600" },
@@ -350,6 +351,9 @@ test("an expiry request is absent, cleared, a TTL or an instant, and bounded", a
     { expires_at: 12345 },
     { expires_at: "2026-11-10T00:00:00Z" },
     { ttl_seconds: Number.MAX_SAFE_INTEGER },
+    { expires_at: "Nov 12 2026" },
+    { expires_at: "2026-11-12" },
+    { expires_at: "2026-11-12T00:00:00" },
   ]) {
     assert.throws(() => requestedPluginExpiry(bad, NOW, 30), BadRequestError, JSON.stringify(bad));
   }

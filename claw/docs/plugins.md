@@ -544,10 +544,12 @@ permanent).
 - **New versions** inherit the source version's `expires_at` unless the request
   names its own (or `null`).
 - **Past `expires_at`** a new task, batch, app run, retry, session message
-  (including a session's first message) or DAG template naming the plugin is
-  refused (`404 plugin_not_found`, the same answer as for a plugin that does not
-  exist or is another user's private one; a DAG template write is `400`); work
-  admitted before then keeps running.
+  (including a session's first message and a message to an Anthropic-compatible
+  session) or DAG template naming the plugin is refused: `404 plugin_not_found`,
+  the same answer as for a plugin that does not exist or is another user's
+  private one (a DAG template write is `400`). An A2A request naming it runs as
+  if the plugin were deleted (no tools), as A2A already treats a plugin the
+  caller cannot see. Work admitted before the expiry keeps running.
 - **The sweep.** Every `PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN` (default 5) minutes
   the API soft-deletes (`deleted_at`) every private plugin whose `expires_at` is
   more than 10 minutes past, except one that is still in use: an unfinished
