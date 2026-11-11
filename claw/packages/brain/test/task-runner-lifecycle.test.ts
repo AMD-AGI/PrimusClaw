@@ -184,7 +184,9 @@ function captureAgentDone() {
  * resolves, which is the only input that selects a terminal state.
  */
 async function runScenario(opts: {
-  engineBehavior: (signal?: AbortSignal, extras?: ExecuteExtras) => Promise<ExecuteResult>;
+  engineBehavior: (
+    signal?: AbortSignal, extras?: ExecuteExtras, onEvent?: (evt: Record<string, unknown>) => Promise<void>,
+  ) => Promise<ExecuteResult>;
   deliveryCount?: number;
   sideEffects?: Partial<TaskRunnerSideEffects>;
   onStart?: (abortCtrl: AbortController) => void;
@@ -257,10 +259,10 @@ async function runScenario(opts: {
   // for the assertions about what must be announced before any slow work.
   let typesAtEngineStart: string[] = [];
   const engine: Engine = {
-    async execute(_req, _onEvent, signal, _hands, extras) {
+    async execute(_req, onEvent, signal, _hands, extras) {
       calls.push("engine.execute");
       typesAtEngineStart = events.map((e) => String(e.type));
-      return opts.engineBehavior(signal, extras);
+      return opts.engineBehavior(signal, extras, onEvent);
     },
   };
 
@@ -523,6 +525,62 @@ test("user interrupt vs fatal is decided by the abort signal, not the error", as
     String(r.completion?.final_text).includes("Interrupted by user"),
     "final_text must be non-empty so the assistant turn is persisted for future context",
   );
+});
+
+test("a turn stopped before the engine said anything ends on the session's stream with an interrupted ResultMessage", async () => {
+  // A /stop while the sandbox is still being prepared: the engine has emitted
+  // nothing of its own. `exec_complete` never reaches a stream's readers, so the
+  // ResultMessage is the only end a chat's status (or an A2A caller) can see.
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async () => {
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  assert.equal(r.completion?.interrupted, true);
+  const ends = r.events.filter((e) => e.type === "ResultMessage");
+  assert.equal(ends.length, 1, "exactly one end of the turn");
+  assert.deepEqual(ends[0]?.data, { subtype: "interrupted" });
+  assert.equal(ends[0]?.message_id, MESSAGE, "the end names the stopped turn's message");
+  assert.equal(ends[0]?.subagent_id, undefined, "a main-agent end, not a sub-agent's");
+  const types = r.types.filter((t) => t === "ResultMessage" || t === "exec_complete");
+  assert.deepEqual(types, ["ResultMessage", "exec_complete"], "the stream's end comes before the API's completion");
+});
+
+test("a turn stopped after the engine ended it does not end it twice", async () => {
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async (_signal, _extras, onEvent) => {
+      // A sub-agent's end is not the turn's: it must not stand in for it.
+      await onEvent!({ type: "ResultMessage", subagent_id: "sub-1", data: { subtype: "success" } });
+      await onEvent!({ type: "ResultMessage", data: { subtype: "success" } });
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  assert.equal(r.completion?.interrupted, true);
+  const mainEnds = r.events.filter((e) => e.type === "ResultMessage" && !e.subagent_id);
+  assert.deepEqual(mainEnds.map((e) => e.data), [{ subtype: "success" }], "the engine's own end stands alone");
+});
+
+test("a sub-agent's end does not stand in for the stopped turn's", async () => {
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async (_signal, _extras, onEvent) => {
+      await onEvent!({ type: "ResultMessage", subagent_id: "sub-1", data: { subtype: "success" } });
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  const mainEnds = r.events.filter((e) => e.type === "ResultMessage" && !e.subagent_id);
+  assert.deepEqual(mainEnds.map((e) => e.data), [{ subtype: "interrupted" }]);
 });
 
 test("DAG cancellation posts a cancelled terminal callback on clean engine return", async () => {
