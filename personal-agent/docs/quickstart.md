@@ -76,7 +76,7 @@ Bot Connector that prints it. This is how the project's release checks drive the
    ```bash
    curl -fsS http://127.0.0.1:8080/healthz; echo                      # ok
    curl -fsS http://127.0.0.1:9090/metrics | grep build_info           # personal_agent_build_info{version="0.1.1",...} 1
-   say() { sed "s|__ID__|$(date +%s%N)|; s|__TEXT__|$1|" message.json |
+   say() { n=$((n + 1)); sed "s|__ID__|$(date +%s)-$n|; s|__TEXT__|$1|" message.json |
      curl -fsS -H 'content-type: application/json' --data @- http://127.0.0.1:8080/gate/v1/activity; echo; }
    say hello                                                           # {"status":"handled"}
    ```
@@ -90,7 +90,7 @@ it again, and link the made-up person to your Claw API key the way a real person
 
 ```bash
 read -rs CLAW_KEY                                                      # paste your Claw API key; it is not echoed
-code=$(curl -fsS -H 'content-type: application/json' -d "{\"key\":\"$CLAW_KEY\"}" \
+code=$(printf '{"key":"%s"}' "$CLAW_KEY" | curl -fsS -H 'content-type: application/json' --data @- \
   http://127.0.0.1:8080/primus-claw-agent/link | sed 's/.*"code":"\([^"]*\)".*/\1/')
 say "/link $code"                                                      # Connected ...
 say "write a haiku about message queues"                                # a turn in a Claw session
@@ -98,7 +98,8 @@ say "/help"
 ```
 
 `/primus-claw-agent/link` answers `{"code":"...","expires_in":600}` for a key Claw accepts and `422 key_rejected`
-otherwise. The answer to a message arrives in the stand-in connector's terminal once Claw has finished the turn.
+otherwise. The answer to a message arrives in the stand-in connector's terminal once Claw has finished the turn. The key goes to
+`curl` on its standard input, so it never appears in a command line or the shell's history.
 
 **From the image instead of npm** (Linux only: the test entry listens on the host's loopback, so the container shares
 the host's network; the stand-in connector runs on the host as above):
@@ -237,7 +238,7 @@ docker compose up -d
 With plain Docker:
 
 ```bash
-docker run -d --name personal-agent --env-file .env -p 8080:8080 -p 127.0.0.1:9090:9090 \
+docker run -d --name personal-agent --env-file .env -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
   -v personal-agent-data:/data -v "$PWD/assertion-key.pem:/run/secrets/assertion-key.pem:ro" \
   docker.io/primussafe/personal-agent-teams:0.1.1
 ```
@@ -250,8 +251,13 @@ TEAMS_DB_PATH=/var/lib/personal-agent/state.db \
   node --env-file=.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
 ```
 
-(set `BOT_ASSERTION_KEY_FILE` to the key's real path when you run it this way). Put an HTTPS reverse proxy in front of
-port 8080 at `PUBLIC_BASE_URL`. Keep 9090 (`/metrics`) private. `SIGTERM` finishes the work in hand and exits.
+(set `BOT_ASSERTION_KEY_FILE` to the key's real path when you run it this way).
+
+Port 8080 is plain HTTP, and its account-link endpoint receives Claw API keys: reach it only through an HTTPS reverse
+proxy at `PUBLIC_BASE_URL`. The Compose file and the `docker run` above publish it on `127.0.0.1` only, for a proxy on
+the same host; with a proxy elsewhere, publish it on a private address or firewall it, and do the same for the npm
+worker, which listens on every interface. Keep 9090 (`/metrics`) private too. `SIGTERM` finishes the work in hand and
+exits.
 
 ### 7. Verify
 
@@ -268,8 +274,8 @@ Then the first message. In Teams, open a chat with the app and say `hello`: the 
 your account first. Link your Claw API key through the worker's public origin and send the code:
 
 ```bash
-read -rs CLAW_KEY    # your Claw API key
-curl -fsS -H 'content-type: application/json' -d "{\"key\":\"$CLAW_KEY\"}" \
+read -rs CLAW_KEY    # your Claw API key, not echoed
+printf '{"key":"%s"}' "$CLAW_KEY" | curl -fsS -H 'content-type: application/json' --data @- \
   https://agent.example.com/primus-claw-agent/link    # {"code":"7KQ3M9XP","expires_in":600}
 ```
 
@@ -285,17 +291,21 @@ above.
 With remote agents switched on, a person drives Claude Code, Codex or Cursor on their own machine from the chat. The
 machine runs claw-connector, which only makes outbound HTTPS requests to Claw; the worker never talks to the machine.
 
-1. On the worker, add `REMOTE_AGENTS_ENABLED=1`. To hear a remote agent between turns, also switch on Claw's
-   notifications: `PROACTIVE_ENABLED=1` and `NOTIFY_WEBHOOK_URL=<PUBLIC_BASE_URL>/claw-events`. Claw sends only to
-   public https addresses, or to hosts its operator lists in Claw's `NOTIFY_WEBHOOK_ALLOWED_HOSTS`. Restart the worker.
-   Both switches are on for exactly `1` only.
-2. On the developer machine (Node.js 22 or newer):
+1. On Claw's API, set `CLAW_REMOTE_AGENTS_ENABLED=true` (with the Helm chart, through `api.extraEnv`): without it the
+   remote-agent routes do not exist and no connector can register. To hear a remote agent between turns, also set
+   `CLAW_NOTIFICATIONS_ENABLED=true`. See [remote-agents.md](../../claw/docs/remote-agents.md).
+2. On the worker, add `REMOTE_AGENTS_ENABLED=1`, and for those notifications `PROACTIVE_ENABLED=1` and
+   `NOTIFY_WEBHOOK_URL=<PUBLIC_BASE_URL>/claw-events`. Both switches are on for exactly `1` only. Claw sends
+   notifications only to public https addresses, or to hosts its operator lists in Claw's
+   `NOTIFY_WEBHOOK_ALLOWED_HOSTS`. Restart the worker.
+3. On the developer machine (Node.js 22 or newer):
 
    ```bash
    npm install -g @primusclaw/connector@0.1.22
    claw-connector --version        # 0.1.22
    claw-connector init             # writes agents.toml and prints its path; set `roots`, the directories an agent may use
-   CLAW_CONNECTOR_KEY='<the same person's Claw API key>' claw-connector login --server https://claw.example.com/claw-api
+   read -rs CLAW_CONNECTOR_KEY && export CLAW_CONNECTOR_KEY   # the same person's Claw API key, not echoed
+   claw-connector login --server https://claw.example.com/claw-api && unset CLAW_CONNECTOR_KEY
    claw-connector service install  # keeps it running (systemd --user on Linux, launchd on macOS)
    claw-connector doctor           # one line per check, with the fix for each problem
    ```
@@ -304,7 +314,7 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
    `claw-connector login --server <claw-api-url> --identity-url <identity-url>` instead of the key: the connector then
    holds a rotating token rather than the key. See the [connector README](../../connector/README.md#quick-start-about-5-minutes).
 
-3. In Teams, say `show my agents`: the card lists the machine and its agents, and starts a session on one.
+4. In Teams, say `show my agents`: the card lists the machine and its agents, and starts a session on one.
 
 ## Troubleshooting
 
@@ -313,7 +323,7 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
 | The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error. |
 | `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                |
 | The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check `BOT_MSI_CLIENT_ID`, and for `federated` the issuer, subject, tenant and the published key set. With no relay, a reply that went to the queue never reaches Teams.                                                                          |
-| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `curl -H "Authorization: Bearer $CLAW_KEY" <CLAW_API_URL>/v1/sessions?limit=1`.                                                                                                                                                       |
+| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                            |
 | A switch seems to do nothing                                                                     | Some switches read anything but their own words as off: `PROACTIVE_ENABLED` and `REMOTE_AGENTS_ENABLED` are on for exactly `1` (`true` is off). See [How switches read](configuration.md#how-switches-read).                                                                                                              |
 
 A store the worker cannot write stops the start with `CRITICAL the worker does not start: unable to open database file`.
