@@ -68,9 +68,10 @@ deployment numbers, not release versions.
 
 A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
 build id was built from. It does not rebuild anything: the image to deploy
-for it is that commit's build-id image, named in the release notes. Cut
-one at least whenever what ships carries a new feature or an incompatible
-change.
+for it is that commit's build-id image, named in the release notes. Every
+production rollout of a new build id is a release and gets a tag: PATCH when
+it only fixes bugs, MINOR when it adds a feature or makes an incompatible
+change, so a user can name the version that carries a fix.
 
 1. Find the commit of the build you are releasing (the Build workflow run
    that pushed it logs `CLAW_BUILD in image: '<build id>'`; its `headSha` is
