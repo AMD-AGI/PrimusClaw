@@ -109,7 +109,7 @@ release version, and its `appVersion` stays `latest`.
   (`CLAW_GITHUB_REVIEW_FINDING_CHECK`, on by default; it fails open). Non-blocking notes are passed to `gh_review_submit` as
   `non_blocking` and listed under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the
   review, a skipped one is named and stops an approval), and the instructions carry short checks for the languages the
-  change touches.
+  change touches (#750).
 
 ## [0.1.1] - 2026-11-11
 
