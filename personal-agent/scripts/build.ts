@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Builds the three packages into what npm publishes (from personal-agent/: `npm run build`):
+ * Builds the four packages into what npm publishes (from personal-agent/: `npm run build`):
  *
- *   packages/<pkg>/dist/index.js        one ES module per package, bundled by esbuild (teams also dist/main.js: the program)
+ *   packages/<pkg>/dist/index.js        one ES module per package, bundled by esbuild (teams also dist/main.js, the
+ *                                       program, and dist/connector-hosts.js; teams-ingress also dist/main.js, the
+ *                                       Function app's entry)
  *   packages/<pkg>/dist/types/**.d.ts   the declarations, by tsc
  *   packages/<pkg>/dist/LICENSE         the repository's licence
  *
- * Every bare import stays external (the dependencies, and the other two packages, installed from the registry), so each
+ * Every bare import stays external (the dependencies, and the other packages, installed from the registry), so each
  * package carries only its own code. Core is the exception the wire contract makes: it reaches claw/packages/protocol by a
  * relative path (src/protocol.ts), and that source is compiled into core's bundle and its declarations, never published
  * as a package of its own. A bundle that takes in a file outside its package's src (and, for core, the protocol's) fails
@@ -21,7 +23,9 @@
  *
  * The workspace itself never loads dist/: tsconfig.json's `paths` name each package's src for typecheck, tests and lint.
  *
- *   node --import tsx scripts/build.ts [core|runtime|teams ...]
+ * The Teams ingress's deployable Function package (one bundle with its dependencies) is scripts/build-ingress.ts.
+ *
+ *   node --import tsx scripts/build.ts [core|runtime|teams|teams-ingress ...]
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -35,7 +39,7 @@ const protocolSrc = path.resolve(root, "..", "claw", "packages", "protocol", "sr
 
 export interface PackageSpec {
   /** The directory under packages/. */
-  readonly dir: "core" | "runtime" | "teams";
+  readonly dir: "core" | "runtime" | "teams" | "teams-ingress";
   readonly name: string;
   /** The entries under src/, each bundled into dist/<entry>.js. */
   readonly entries: readonly string[];
@@ -45,7 +49,8 @@ export interface PackageSpec {
 export const PACKAGES: readonly PackageSpec[] = [
   { dir: "core", name: "@primusclaw/personal-agent", entries: ["index"] },
   { dir: "runtime", name: "@primusclaw/personal-agent-runtime", entries: ["index"] },
-  { dir: "teams", name: "@primusclaw/personal-agent-teams", entries: ["index", "main"] },
+  { dir: "teams", name: "@primusclaw/personal-agent-teams", entries: ["index", "main", "connector-hosts"] },
+  { dir: "teams-ingress", name: "@primusclaw/personal-agent-teams-ingress", entries: ["index", "main"] },
 ];
 
 const inside = (dir: string, file: string): boolean => file === dir || file.startsWith(dir + path.sep);

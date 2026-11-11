@@ -2,18 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Fails unless the three npm tarballs are what is meant to be published, and work once installed. Run after
+ * Fails unless the four npm tarballs are what is meant to be published, and work once installed. Run after
  * `npm run build`, from personal-agent/:
  *
  *   node --import tsx scripts/check-pack.ts [--version X.Y.Z] [--repository https://github.com/OWNER/REPO] [--out DIR]
  *
  * It packs each package with `npm pack` and reads the real tarball, never the `files` field. The file list: the bundles,
  * the declarations, the licence, the files a bundle reads at run time, and nothing else (no TypeScript source, test or
- * fixture). The manifest: name, one version for all three, the exact version they name each other by, not private, the
- * licence, the repository directory, the engine, the entries. Then it installs the three tarballs into an empty
+ * fixture). The manifest: name, one version for all four, the exact version they name each other by, not private, the
+ * licence, the repository directory, the engine, the entries. Then it installs the four tarballs into an empty
  * directory outside the workspace and checks what a user gets there: each package imports, the wire contract is compiled
- * into core, the store's schema loads, the worker program runs and refuses an empty environment, and a TypeScript file
- * naming the three packages compiles against their declarations.
+ * into core, the store's schema loads, the worker program runs and refuses an empty environment, the ingress's Function
+ * entry loads and registers its messaging endpoint, and a TypeScript file naming the four packages compiles against
+ * their declarations. The ingress's deployable zip is scripts/build-ingress.ts's.
  *
  * --version pins the version (a release passes its tag's), --repository the repository that publishes (npm refuses a
  * provenance statement whose repository differs from `repository.url`), and --out keeps the checked tarballs in DIR, so
@@ -47,7 +48,28 @@ const SHIPPED: Readonly<Record<PackageSpec["dir"], readonly string[]>> = {
     "dist/types/protocol/remote-agents.d.ts",
   ],
   runtime: ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/sqlite/schema.sql"],
-  teams: ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/main.js"],
+  teams: [
+    "package.json",
+    "dist/LICENSE",
+    "dist/index.js",
+    "dist/types/index.d.ts",
+    "dist/main.js",
+    "dist/connector-hosts.js",
+    "dist/types/connector-hosts.d.ts",
+  ],
+  "teams-ingress": ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/main.js"],
+};
+
+const ENTRY = { types: "./dist/types/index.d.ts", default: "./dist/index.js" };
+/** Each package's `exports`: its entry, and for teams the Bot Connector host rule the ingress imports on its own. */
+const EXPORTS: Readonly<Record<PackageSpec["dir"], unknown>> = {
+  core: { ".": ENTRY },
+  runtime: { ".": ENTRY },
+  teams: {
+    ".": ENTRY,
+    "./connector-hosts": { types: "./dist/types/connector-hosts.d.ts", default: "./dist/connector-hosts.js" },
+  },
+  "teams-ingress": { ".": ENTRY },
 };
 
 const errText = (e: unknown): string => {
@@ -111,7 +133,7 @@ function fixedFieldProblems(pkg: PackageSpec, m: Record<string, unknown>): strin
   want("type", m["type"], "module");
   want("engines", m["engines"], { node: ">=26" });
   want("repository.directory", repository.directory, `personal-agent/packages/${pkg.dir}`);
-  want("exports", m["exports"], { ".": { types: "./dist/types/index.d.ts", default: "./dist/index.js" } });
+  want("exports", m["exports"], EXPORTS[pkg.dir]);
   if (m["private"] === true) problems.push('"private": true would make npm refuse to publish');
   for (const field of ["main", "module", "bin", "scripts"]) {
     if (Object.hasOwn(m, field)) problems.push(`the manifest has "${field}", which the package does not use`);
@@ -145,7 +167,7 @@ export function manifestProblems(
   for (const [dep, range] of Object.entries((m["dependencies"] ?? {}) as Record<string, unknown>)) {
     if (NAMES.includes(dep) && range !== version) {
       problems.push(
-        `depends on ${dep}@${JSON.stringify(range)}; the three name each other by their one version ${version}`,
+        `depends on ${dep}@${JSON.stringify(range)}; the packages name each other by their one version ${version}`,
       );
     }
   }
@@ -156,11 +178,15 @@ const PROBE = `
   const core = await import("@primusclaw/personal-agent");
   const runtime = await import("@primusclaw/personal-agent-runtime");
   const teams = await import("@primusclaw/personal-agent-teams");
+  const hosts = await import("@primusclaw/personal-agent-teams/connector-hosts");
+  const ingress = await import("@primusclaw/personal-agent-teams-ingress");
   const problems = [];
   if (core.CONNECTOR_PACKAGE !== "@primusclaw/connector") problems.push("core does not carry the wire contract (CONNECTOR_PACKAGE)");
   if (typeof core.neutralPlugins !== "function" || typeof core.integrationRegistry !== "function") problems.push("core lacks its plugin entry points");
   if (typeof runtime.openWorkerStore !== "function") problems.push("runtime lacks openWorkerStore");
   if (typeof teams.buildWorker !== "function" || typeof teams.main !== "function") problems.push("teams lacks buildWorker or main");
+  if (hosts.DEFAULT_HOSTS?.[0] !== "smba.trafficmanager.net") problems.push("teams/connector-hosts lacks the Bot Connector host rule");
+  if (typeof ingress.createIngress !== "function" || typeof ingress.register !== "function") problems.push("teams-ingress lacks createIngress or register");
   console.log(JSON.stringify(problems));
 `;
 
@@ -172,6 +198,8 @@ const CONSUMER = [
   'import { neutralPlugins, integrationRegistry, CONNECTOR_PACKAGE, type Plugins, type IntegrationRegistry } from "@primusclaw/personal-agent";',
   'import { openWorkerStore } from "@primusclaw/personal-agent-runtime";',
   'import { buildWorker, main, type WorkerOptions, type Worker } from "@primusclaw/personal-agent-teams";',
+  'import { ConnectorHosts } from "@primusclaw/personal-agent-teams/connector-hosts";',
+  'import { consoleSink, createIngress, register, SERVICE_BUS, type Ingress } from "@primusclaw/personal-agent-teams-ingress";',
   "const plugins: Plugins = neutralPlugins();",
   "const registry: IntegrationRegistry = integrationRegistry();",
   'registry.addMcpServer("x", "X");',
@@ -179,11 +207,16 @@ const CONSUMER = [
   "const options: WorkerOptions = {};",
   "const built: Promise<Worker> = buildWorker({}, plugins, options);",
   "const exit: Promise<number> = main({});",
+  'const hosts: string = new ConnectorHosts().host("https://smba.trafficmanager.net/teams/");',
+  "const ingress: Ingress = createIngress({ env: {}, fetch, log: consoleSink, serviceBus: SERVICE_BUS });",
+  "register({ http: () => undefined, serviceBusQueue: () => undefined }, ingress);",
+  "// @ts-expect-error createIngress takes its dependencies",
+  "createIngress({});",
   "// @ts-expect-error neutralPlugins takes a partial Plugins, not a number",
   "neutralPlugins(1);",
   "// @ts-expect-error openWorkerStore takes settings",
   "openWorkerStore();",
-  "export { built, exit, pkg };",
+  "export { built, exit, hosts, pkg };",
   "",
 ].join("\n");
 
@@ -217,6 +250,20 @@ function installedProblems(user: string, tarballs: readonly string[]): string[] 
       `dist/main.js with an empty environment exited ${String(ran.status)}, expected 2 with a CRITICAL secrets line: ${ran.stderr}`,
     );
   }
+  // The ingress's Function entry, outside a Functions host: @azure/functions runs in its test mode and says it skips the
+  // registration of the messaging endpoint, which shows the entry ran to its register call.
+  const entry = path.join(user, "node_modules", "@primusclaw", "personal-agent-teams-ingress", "dist", "main.js");
+  const loaded = spawnSync(process.execPath, [entry], {
+    cwd: user,
+    env: { PATH: process.env["PATH"] ?? "" },
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (loaded.status !== 0 || !/register function "messages"/.test(loaded.stdout + loaded.stderr)) {
+    problems.push(
+      `the ingress's dist/main.js exited ${String(loaded.status)} without registering "messages": ${loaded.stdout}${loaded.stderr}`,
+    );
+  }
   // Twice: as a typical project compiles (skipLibCheck), and with every declaration file checked as well, under the
   // settings the packages are written with, so a declaration naming a module or type the package lacks fails here.
   fs.writeFileSync(path.join(user, "consumer.ts"), CONSUMER);
@@ -244,7 +291,7 @@ function installedProblems(user: string, tarballs: readonly string[]): string[] 
   return problems.map((p) => `installed: ${p}`);
 }
 
-/** Pack, inspect and install the three packages; every problem found. */
+/** Pack, inspect and install the packages; every problem found. */
 export function checkPack(expect: Expect, out: string | undefined): string[] {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "personal-agent-pack-"));
   try {
@@ -269,7 +316,7 @@ export function checkPack(expect: Expect, out: string | undefined): string[] {
       problems.push(...found.map((p) => `${pkg.name}: ${p}`));
     }
     if (versions.size !== 1)
-      problems.push(`the three packages are released in lockstep, but name ${String(versions.size)} versions`);
+      problems.push(`the packages are released in lockstep, but name ${String(versions.size)} versions`);
     if (problems.length > 0) return problems;
     const user = path.join(scratch, "user");
     fs.mkdirSync(user);

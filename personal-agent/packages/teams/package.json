@@ -17,6 +17,10 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./connector-hosts": {
+      "types": "./dist/types/connector-hosts.d.ts",
+      "default": "./dist/connector-hosts.js"
     }
   },
   "files": [

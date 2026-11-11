@@ -12,6 +12,7 @@ Teams bot that people talk to, and finally with a developer machine connected th
 | --------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The Teams worker, as npm packages             | 0.3.0   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
 | The Teams worker, as an image                 | 0.3.0   | [`docker.io/primussafe/personal-agent-teams:0.3.0`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
+| The Teams ingress, as an Azure Function       | next    | `personal-agent-teams-ingress-<version>.zip` on the GitHub Release `personal-agent-v<version>`, from the first release after 0.3.0 ([step 4](#4-the-ingress))                                                                                                               |
 | claw-connector, for a developer's own machine | 0.1.22  | [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector)                                                                                                                                                                                              |
 
 The worker holds no model and no sandbox: every answer comes from a [Claw](../../claw/README.md) deployment, which runs
@@ -23,7 +24,7 @@ the agent loop against your LLM gateway. What you bring, and what this page sets
 | Claw and its LLM gateway                            | yes, separately | a running deployment ([`deploy/`](../../deploy/README.md)) and its SaFE endpoint, a Claw API key per person |
 | Teams bot registration and app package              | no              | an Azure Bot, an app registration with a client secret (or a managed identity), a Teams app manifest        |
 | Service Bus queues                                  | no              | an Azure Service Bus namespace with two queues                                                              |
-| The ingress between the bot and the inbound queue   | **not yet**     | a small HTTPS service you write; [its contract](#4-the-ingress) is below                                    |
+| The ingress between the bot and the inbound queue   | yes             | an Azure Function app (Flex Consumption, Node 26) to deploy it to ([step 4](#4-the-ingress))                |
 
 ## Prerequisites
 
@@ -120,7 +121,7 @@ the repository and run `make demo` ([root README](../../README.md#evaluate-local
 How a message travels, and which parts are yours:
 
 ```text
-Teams --> Azure Bot Service --> your ingress (HTTPS) --> Service Bus inbound queue (one session per conversation)
+Teams --> Azure Bot Service --> the ingress (Azure Function) --> Service Bus inbound queue (one session per conversation)
       --> worker --> Claw API ...  worker --> Bot Connector (OUTBOUND_MODE=direct) --> Teams
 ```
 
@@ -249,19 +250,82 @@ and the `WORKER_IDENTITY_*` settings in the [configuration reference](configurat
 
 ### 4. The ingress
 
-The component between Azure Bot Service and the inbound queue is not published yet, so this is the one piece you write
-(an Azure Function or any small HTTPS service). Its contract with the worker:
+The ingress is the bot's messaging endpoint: an Azure Function that checks the Bot Framework token of every request
+Azure Bot Service sends, binds it to the activity's `serviceUrl` (the same Bot Connector host rule the worker applies),
+and puts the activity on the inbound queue, its content unchanged, with the conversation as its session. It answers at once: `200`
+for a message, a placeholder card for a card button (`adaptiveCard/action`), an empty `200` for the feedback buttons
+(`message/submitAction`), an empty result for any other invoke, `401` without a valid token, and `500` when the queue
+cannot take the activity (Teams then retries; the worker drops a repeated activity id). It is
+[`packages/teams-ingress`](../packages/teams-ingress); each release attaches it ready to deploy as
+`personal-agent-teams-ingress-<version>.zip` (with its `.sha256`), a Function app package that installs and builds
+nothing on the app.
 
-- It is the bot's messaging endpoint. It checks the `Authorization` header of every request as Bot Framework requires
-  ([authenticate requests from the Bot Connector service](https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication))
-  and refuses anything else.
-- It sends the activity's JSON, unchanged, as one message to the inbound queue (`INBOUND_QUEUE`, default
-  `primusclaw-inbound`), with the message's session id set to the activity's `conversation.id`.
-- It answers Bot Service at once: `200` for a message. For an `invoke` named `adaptiveCard/action` (someone pressed a
-  button on a card) it answers with an Adaptive Card invoke response carrying a placeholder card. When the worker
-  handles the press it replaces that card through the Bot Connector (it updates the message the invoke's `replyToId`
-  names), with a note if nothing else settled it. The worker reads only `message` and `invoke` activities and ignores
-  the rest.
+Create a Function app on the Flex Consumption plan with Node.js 26 and a system-assigned identity, and give that
+identity the right to send to the inbound queue:
+
+```bash
+az storage account create -g <group> -n <ingress-storage> --sku Standard_LRS
+az functionapp create -g <group> -n <ingress-app> --storage-account <ingress-storage> \
+  --flexconsumption-location <region> --runtime node --runtime-version 26 --assign-identity '[system]'
+principal=$(az functionapp identity show -g <group> -n <ingress-app> --query principalId -o tsv)
+az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal \
+  --role "Azure Service Bus Data Sender" \
+  --scope "$(az servicebus queue show -g <group> --namespace-name <namespace> -n primusclaw-inbound --query id -o tsv)"
+az functionapp config appsettings set -g <group> -n <ingress-app> --settings \
+  PRIMUSCLAW_BOT_APP_ID=<bot-client-id> \
+  PRIMUSCLAW_SERVICEBUS__fullyQualifiedNamespace=<namespace>.servicebus.windows.net \
+  PRIMUSCLAW_SERVICEBUS__credential=managedidentity
+```
+
+`<bot-client-id>` is `BOT_CLIENT_ID` (step 2a) or `BOT_MSI_CLIENT_ID` (step 2b): the token's audience. Instead of the
+identity, `PRIMUSCLAW_SERVICEBUS_CONNECTION_STRING` can hold a connection string with the right to send (step 3's
+`worker-send`). [configuration.md](configuration.md#the-teams-ingress) lists every setting.
+
+Deploy the release's zip, after checking it is the one the release names. A Flex Consumption app takes a package
+through One Deploy as `application/zip`:
+
+```bash
+v=<version>
+gh release download "personal-agent-v$v" -R AMD-AGI/PrimusClaw -p "personal-agent-teams-ingress-$v.zip*"
+sha256sum -c "personal-agent-teams-ingress-$v.zip.sha256"
+gh attestation verify "personal-agent-teams-ingress-$v.zip" --repo AMD-AGI/PrimusClaw
+host=$(az functionapp show -g <group> -n <ingress-app> --query "properties.defaultHostName || defaultHostName" -o tsv)
+scm=$(az functionapp show -g <group> -n <ingress-app> \
+  --query "(properties.hostNameSslStates || hostNameSslStates)[?hostType=='Repository'].name | [0]" -o tsv)
+# The management token goes to curl in a file only you can read, never onto a command line.
+(umask 077; printf 'header = "Authorization: Bearer %s"\n' \
+  "$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)" > curl-auth)
+curl -fsS -K curl-auth -X POST "https://$scm/api/publish?type=zip&RemoteBuild=false" \
+  -H "Content-Type: application/zip" --data-binary @"personal-agent-teams-ingress-$v.zip"
+rm curl-auth
+```
+
+The deployment takes a minute; then a request without a token is refused, and the function's log shows one
+`token_rejected` event for it:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "https://$host/api/messages" -d '{}'    # 401
+```
+
+Set the bot's messaging endpoint (the `--endpoint` of step 2) to `https://<host>/api/messages`:
+`az bot update -g <group> -n <bot-name> --endpoint "https://$host/api/messages"`.
+
+**The outbound queue.** With the worker's default `OUTBOUND_MODE=servicebus`, the same Function app posts what the
+worker puts on the outbound queue. That needs a bot that is a user-assigned managed identity (step 2b), assigned to the
+Function app, and the app's identity allowed to receive from the outbound queue:
+
+```bash
+az functionapp identity assign -g <group> -n <ingress-app> --identities <identity-resource-id>
+az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal \
+  --role "Azure Service Bus Data Receiver" \
+  --scope "$(az servicebus queue show -g <group> --namespace-name <namespace> -n primusclaw-outbound --query id -o tsv)"
+az functionapp config appsettings set -g <group> -n <ingress-app> --settings \
+  PRIMUSCLAW_OUTBOUND_SERVICEBUS__fullyQualifiedNamespace=<namespace>.servicebus.windows.net \
+  PRIMUSCLAW_OUTBOUND_SERVICEBUS__credential=managedidentity
+```
+
+Without those settings the outbound trigger is not registered and the app serves the messaging endpoint alone; the
+worker then needs `OUTBOUND_MODE=direct`.
 
 ### 5. Configure the worker
 
@@ -279,8 +343,8 @@ filled-in file out of any repository; it holds the encryption key, the bot's cli
 | `BOT_MSI_CLIENT_ID`, `BOT_TOKEN_SOURCE=federated` and the four after it    | step 2b instead of 2a; on an Azure host delete the five federated lines (`imds`)    |
 
 Everything else has a default; [configuration.md](configuration.md) describes every setting. The default
-`OUTBOUND_MODE=servicebus` needs a relay that posts the outbound queue to Teams, which is not published either, so use
-`direct`.
+`OUTBOUND_MODE=servicebus` posts through the ingress's outbound trigger ([step 4](#4-the-ingress), a managed-identity
+bot only); `direct` needs nothing more than the bot's identity in the worker's settings.
 
 ### 6. Run it
 
@@ -385,13 +449,13 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
 
 ## Troubleshooting
 
-| What you see                                                                                     | What it means, and the fix                                                                                                                                                                                                                                                                                                                         |
-| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error.                          |
-| `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                                         |
-| The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check the client id and tenant (and for `secret` the secret's expiry; the `AADSTS` code in `Entra ID answered ...` names the cause), and for `federated` the issuer, subject and the published key set. With no relay, a reply that went to the queue never reaches Teams. |
-| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                                                     |
-| A switch seems to do nothing                                                                     | Some switches read anything but their own words as off: `PROACTIVE_ENABLED` and `REMOTE_AGENTS_ENABLED` are on for exactly `1` (`true` is off). See [How switches read](configuration.md#how-switches-read).                                                                                                                                       |
+| What you see                                                                                     | What it means, and the fix                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error.                                                            |
+| `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                                                                           |
+| The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check the client id and tenant (and for `secret` the secret's expiry; the `AADSTS` code in `Entra ID answered ...` names the cause), and for `federated` the issuer, subject and the published key set. Without the ingress's outbound trigger (step 4), a reply that went to the queue never reaches Teams. |
+| `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                                                                                       |
+| A switch seems to do nothing                                                                     | Some switches read anything but their own words as off: `PROACTIVE_ENABLED` and `REMOTE_AGENTS_ENABLED` are on for exactly `1` (`true` is off). See [How switches read](configuration.md#how-switches-read).                                                                                                                                                                         |
 
 A store the worker cannot write stops the start with `CRITICAL the worker does not start: unable to open database file`.
 The image runs as uid 65534, so a bind-mounted host directory must be writable by that user.

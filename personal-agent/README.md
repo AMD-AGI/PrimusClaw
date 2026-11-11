@@ -17,19 +17,21 @@ package rather than a rewrite.
 To run your own from the published packages or image, start with the [quick start](docs/quickstart.md): the worker on
 your own machine without Teams in about five minutes, then a Teams deployment and a connected developer machine.
 
-> **Status.** Released as 0.x: the three npm packages and the `docker.io/primussafe/personal-agent-teams` image (see
+> **Status.** Released as 0.x: the npm packages, the Teams ingress's Function package and the
+> `docker.io/primussafe/personal-agent-teams` image (see
 > [CHANGELOG.md](CHANGELOG.md)). Configuration and plugin interfaces may still change between minor releases.
 
 ## Packages
 
 `personal-agent/` is its own npm workspace (own `package-lock.json`, Node 26), next to `claw/` and `connector/`.
 
-| Package                              | Path               | What it holds                                                                                                                                                                                                                                                                      |
-| ------------------------------------ | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@primusclaw/personal-agent`         | `packages/core`    | The channel-neutral domain: routing and commands, turns, the assistant, proactive messages, remote-agent and review state machines, feedback, limits, redaction, view models (no card JSON), locales, and every **port** (`src/ports/`) and **plugin** interface (`src/plugins/`). |
-| `@primusclaw/personal-agent-runtime` | `packages/runtime` | Node adapters of core's ports: SQLite repositories (`node:sqlite`), Fernet (`node:crypto`), the Claw HTTP client, the token exchange, Prometheus metrics, settings and secrets from the environment, the HTTP server and its generic routes, the system clock and randomness.      |
-| `@primusclaw/personal-agent-teams`   | `packages/teams`   | The Teams channel: activity parsing, Adaptive Cards rendered from core's views, rich text, streams, the Bot Connector, the Service Bus queues, Azure Key Vault and workload identity, and the process assembly.                                                                    |
-| (shared fakes, not a package)        | `test-support/`    | Fakes for tests: clock, randomness, surface, store, HTTP server, card catalog and snapshots.                                                                                                                                                                                       |
+| Package                                    | Path                     | What it holds                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@primusclaw/personal-agent`               | `packages/core`          | The channel-neutral domain: routing and commands, turns, the assistant, proactive messages, remote-agent and review state machines, feedback, limits, redaction, view models (no card JSON), locales, and every **port** (`src/ports/`) and **plugin** interface (`src/plugins/`).                                                                                        |
+| `@primusclaw/personal-agent-runtime`       | `packages/runtime`       | Node adapters of core's ports: SQLite repositories (`node:sqlite`), Fernet (`node:crypto`), the Claw HTTP client, the token exchange, Prometheus metrics, settings and secrets from the environment, the HTTP server and its generic routes, the system clock and randomness.                                                                                             |
+| `@primusclaw/personal-agent-teams`         | `packages/teams`         | The Teams channel: activity parsing, Adaptive Cards rendered from core's views, rich text, streams, the Bot Connector, the Service Bus queues, Azure Key Vault and workload identity, and the process assembly.                                                                                                                                                           |
+| `@primusclaw/personal-agent-teams-ingress` | `packages/teams-ingress` | The Teams ingress: an Azure Function (Node 26) that is the bot's messaging endpoint. It verifies the Bot Framework token, binds it to the activity's serviceUrl (the worker's Bot Connector host rule), puts the activity on the inbound queue, and, as the outbound queue's trigger, posts what the worker queues there. Released also as a deployable Function package. |
+| (shared fakes, not a package)              | `test-support/`          | Fakes for tests: clock, randomness, surface, store, HTTP server, card catalog and snapshots.                                                                                                                                                                                                                                                                              |
 
 ### Layering
 
@@ -41,8 +43,10 @@ error:
   plugin brings those in.
 - **The Claw wire contract enters through one file.** `packages/core/src/protocol.ts` is the only file that imports
   `claw/packages/protocol/src`; the contract is compiled in, so a field Claw renames fails this workspace's typecheck.
-- **runtime depends on core only**; **teams depends on core and runtime**.
-- **Packages meet through their entry** (`src/index.ts`), never by a deep path.
+- **runtime depends on core only**; **teams depends on core and runtime**; **teams-ingress depends on core and on teams'
+  Bot Connector host rule** (`@primusclaw/personal-agent-teams/connector-hosts`), never on the worker or the runtime,
+  so its Function package carries none of them.
+- **Packages meet through their entries** (`src/index.ts`, and teams' `src/connector-hosts.ts`), never by a deep path.
 - **A domain never imports its view** (`src/<area>/` must not import `src/<area>-view/`).
 - **No cycles**, type-only imports included; production code never imports `test-support/`, a test or a development
   dependency; every import resolves and is declared.
@@ -57,7 +61,7 @@ public build runs with the neutral defaults (`neutralPlugins()`); nothing is loa
 ```mermaid
 flowchart LR
   user([Person in Teams]) --> bf[Bot Framework]
-  bf --> ingress["Ingress (verifies the Bot Framework token)"]
+  bf --> ingress["teams-ingress (Azure Function: verifies the Bot Framework token)"]
   ingress --> inq[("Service Bus inbound queue")]
   inq --> teams
   subgraph worker [Worker process]
@@ -67,7 +71,7 @@ flowchart LR
   runtime -->|HTTPS| claw[Claw API]
   claw -->|"signed events to /claw-events/:route"| runtime
   teams -->|"OUTBOUND_MODE=servicebus"| outq[("Service Bus outbound queue")]
-  outq --> relay[Relay] --> bc[Bot Connector]
+  outq --> relay["teams-ingress: outbound trigger"] --> bc[Bot Connector]
   teams -->|"OUTBOUND_MODE=direct"| bc
   bc --> user
   connector["claw-connector on a person's machine"] -->|outbound HTTPS| claw
@@ -75,8 +79,10 @@ flowchart LR
 
 - **Inbound.** Teams activities reach the worker through a Service Bus queue with one session per conversation, so a
   conversation's messages are handled in order and one poison message never blocks it. The ingress in front of the
-  queue verifies the Bot Framework token; it is a separate component and not part of this workspace yet.
-- **Outbound.** By default the worker hands replies to the outbound queue for a relay to post. With
+  queue (`packages/teams-ingress`, an Azure Function) verifies the Bot Framework token, binds it to the activity's
+  serviceUrl and queues the activity unchanged; it holds no state and no business logic.
+- **Outbound.** By default the worker hands replies to the outbound queue, which the ingress's outbound trigger posts
+  (signing in as the bot's user-assigned managed identity). With
   `OUTBOUND_MODE=direct` it posts to the Bot Connector itself, which is what Teams' streaming and message deletion need;
   the queue stays as the fallback. The bot's token is only ever sent to Bot Connector hosts on an allow-list
   (`packages/teams/src/connector/hosts.ts`).
@@ -118,28 +124,33 @@ npm test        # the test suite alone
 | `npm run lint`         | ESLint with typescript-eslint strict (type-checked): no import cycles, complexity ≤ 15, functions ≤ 80 lines, files ≤ 600 lines, no `any`, no floating promises, no unexplained `eslint-disable`. |
 | `npm run format:check` | Prettier.                                                                                                                                                                                         |
 | `npm run depcruise`    | The layering rules above.                                                                                                                                                                         |
-| `npm run coverage`     | The whole suite once under c8, each package against its floor on lines, statements, functions and branches: core 90 %, runtime 85 %, teams 85 % (`scripts/coverage.ts`).                          |
+| `npm run coverage`     | The whole suite once under c8, each package against its floor on lines, statements, functions and branches: core 90 %, runtime 85 %, teams 85 %, teams-ingress 85 % (`scripts/coverage.ts`).      |
 | `npm run ported-tests` | The ported-tests ledgers against the tests that actually ran in that coverage run.                                                                                                                |
 
 Tests use `node:test` with `tsx`: `node --import tsx --test packages/core/test/<file>.test.ts` runs one file.
 
 ### Building the packages
 
-The three packages are published to npm in lockstep (one version for all three, naming each other by it exactly).
+The four packages are published to npm in lockstep (one version for all four, naming each other by it exactly).
 Inside the workspace nothing is built: `tsconfig.json`'s `paths` point each package name at its `src/`, so typecheck,
 lint, the layers and the tests all read the sources. What npm gets is built from them:
 
 ```bash
 npm run build        # scripts/build.ts: packages/*/dist (esbuild bundles, tsc declarations, the licence)
 npm run check-pack   # scripts/check-pack.ts: pack, inspect, install in an empty directory, import, type-check
+npm run build-ingress   # scripts/build-ingress.ts: the ingress's Function package, a reproducible zip and its sha256
 ```
 
-Each package is one ES module bundle, its dependencies (and the other two packages) left to npm. Core's bundle and
+Each package is one ES module bundle, its dependencies (and the other packages) left to npm. Core's bundle and
 declarations carry the Claw wire contract from `claw/packages/protocol`, which is not published on its own. A file a
 module reads at run time (the store's `schema.sql`) ships next to the bundle. `check-pack` fails on a file in a tarball
 that should not be there (sources, tests, fixtures) or one missing from it, on a manifest that cannot be published, and
 on packages that do not install, import, run the worker program or compile against their declarations in a clean
-directory. CI runs both on every change (`.github/workflows/personal-agent-packaging.yml`).
+directory. The ingress's Function package is different: one bundle of `packages/teams-ingress/src/main.ts` with
+everything it imports (the parts of core and of teams it uses, and its npm dependencies), plus `host.json`, a
+`package.json` naming the bundle, and the licences, so a Function app installs and builds nothing; the same commit
+gives the same zip. CI runs all three on every change, and runs the zip in Azure Functions Core Tools' host
+(`scripts/ingress-host-smoke.ts`) (`.github/workflows/personal-agent-packaging.yml`).
 
 ### The ported-tests ledgers
 
@@ -169,8 +180,8 @@ cp examples/worker.env.example /path/outside/the/repo/worker.env   # fill it in
 node --env-file=/path/outside/the/repo/worker.env --import tsx packages/teams/src/main.ts
 ```
 
-As an image (`personal-agent/Dockerfile`, built from the repository root: it builds and checks the three packages
-as a release would, installs them from their tarballs, and runs `dist/main.js` as uid 65534):
+As an image (`personal-agent/Dockerfile`, built from the repository root: it builds and checks the packages as a
+release would, installs the worker's three from their tarballs, and runs `dist/main.js` as uid 65534):
 
 ```bash
 docker build -f personal-agent/Dockerfile -t personal-agent-teams .
@@ -194,8 +205,9 @@ reference says which.
 `SIGTERM` or `SIGINT` stops taking new work, finishes what is in hand and exits.
 
 To answer real people it needs, besides Claw: a Teams bot registration and app package, the ingress in front of the
-inbound queue, a Service Bus namespace with the two queues (sessions enabled on the inbound one), and, for the default
-outbound mode, a relay that posts the outbound queue to the Bot Connector.
+inbound queue (the released Function package: [quick start](docs/quickstart.md#4-the-ingress)), and a Service Bus
+namespace with the two queues (sessions enabled on the inbound one). For the default outbound mode the same ingress
+posts the outbound queue to the Bot Connector, which needs a bot that is a user-assigned managed identity.
 
 ## Configuration
 
@@ -215,18 +227,21 @@ In short:
 
 ## Releasing (maintainers)
 
-A release is the tag `personal-agent-vX.Y.Z` on a commit of `main` whose three `package.json` files name `X.Y.Z`.
+A release is the tag `personal-agent-vX.Y.Z` on a commit of `main` whose four `package.json` files name `X.Y.Z`.
 `X.Y.Z` is chosen by the repository's versioning rules ([CHANGELOG.md](../CHANGELOG.md#versioning)), which Claw and the
 connector follow too.
 Pushing it starts
 [personal-agent-release.yml](../.github/workflows/personal-agent-release.yml). Its `package` job (no credential, no
-OIDC) runs `npm run check`, builds the packages, packs and checks them with `check-pack --version X.Y.Z`, takes the
-release notes from this version's section of [CHANGELOG.md](CHANGELOG.md), and builds and smoke-tests the image. Then,
-each behind a GitHub environment's required reviewers:
+OIDC) runs `npm run check`, builds the packages, packs and checks them with `check-pack --version X.Y.Z`, builds the
+ingress's Function package (`personal-agent-teams-ingress-X.Y.Z.zip` and its `.sha256`) and runs it in a Functions host,
+takes the release notes from this version's section of [CHANGELOG.md](CHANGELOG.md), and builds and smoke-tests the
+image. Then, each behind a GitHub environment's required reviewers:
 
-- `publish-npm` (environment `npm-publish`) attests the three tarballs, creates the GitHub Release with those notes,
-  attaches the tarballs, and publishes them to npm with Trusted Publishing (OIDC, `--provenance`, no npm token), core,
-  then runtime, then teams. These are the tarballs `check-pack` checked: the job checks out and installs nothing. A
+- `publish-npm` (environment `npm-publish`) attests the four tarballs and the Function package, creates the GitHub
+  Release with those notes, attaches the tarballs, the zip and its `.sha256`, and publishes the packages to npm with
+  Trusted Publishing (OIDC, `--provenance`, no npm token), core, then runtime, then teams, then teams-ingress (the last
+  only while the repository variable `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` is exactly `true`). These are the tarballs
+  `check-pack` checked and the zip the host ran: the job checks out and installs nothing. A
   version already on npm is skipped when it is byte-for-byte the same tarball and fails the run otherwise, so a release
   that failed part-way is finished by dispatching the workflow on its tag with `dry-run` off.
 - `publish-image` (environment `image-publish`) runs only while the repository variable
@@ -257,24 +272,28 @@ two environments, whose required reviewers approve each publish, the Trusted Pub
 2. Add a tag ruleset matching `refs/tags/personal-agent-v*` that restricts creation to repository admins.
 3. Publish 0.1.0 of each package once by hand from a clean checkout of the merged `main`: `npm ci && npm run build &&
 npm run check-pack -- --out /tmp/pa`, then `npm publish /tmp/pa/<tarball> --access public` for core, runtime,
-   teams, logged in to npm with 2FA.
-4. On npmjs.com, for each of the three packages: Settings > Trusted publishing > GitHub Actions: Organization
+   teams, logged in to npm with 2FA. The ingress's package, which came later, the same way at the first version that
+   has it.
+4. On npmjs.com, for each of the four packages: Settings > Trusted publishing > GitHub Actions: Organization
    `AMD-AGI`, Repository `PrimusClaw`, Workflow filename `personal-agent-release.yml`, Environment `npm-publish`. Then
-   Publishing access: require two-factor authentication and disallow tokens.
+   Publishing access: require two-factor authentication and disallow tokens. Once the ingress's entry is there, set the
+   repository variable `PERSONAL_AGENT_INGRESS_NPM_PUBLISH` to `true`; until then a release attaches its tarball and
+   its Function package and publishes the other three.
 5. When the image is to be published: `DOCKER_USERNAME`/`DOCKER_PASSWORD` must be able to push to the prefix's
    namespace (or set `PERSONAL_AGENT_IMAGE_PREFIX` and, for a registry other than `docker.io`, the
    `PERSONAL_AGENT_REGISTRY_*` pair), then set the repository variable `PERSONAL_AGENT_IMAGE_PUBLISH` to `true`.
 
 **Cutting a release.**
 
-1. Set the version in the three `package.json` files (and the exact version teams names core and runtime by), add its
+1. Set the version in the four `package.json` files (and the exact versions teams and teams-ingress name the others by), add its
    section to [CHANGELOG.md](CHANGELOG.md), and merge that to `main`.
 2. Tag the merged commit and push the tag: `git tag personal-agent-vX.Y.Z <sha-on-main> && git push origin
 personal-agent-vX.Y.Z`.
 3. The `package` job's summary lists the commit, whether the workflow at that commit equals `main`'s, and each
-   tarball's sha256. A reviewer checks them and approves `publish-npm` (and `publish-image`).
+   tarball's and the Function package's sha256. A reviewer checks them and approves `publish-npm` (and
+   `publish-image`).
 4. Check it: `npm view @primusclaw/personal-agent-teams version`; `gh attestation verify <tarball> --repo
-AMD-AGI/PrimusClaw` on each tarball attached to the release; with the image,
+AMD-AGI/PrimusClaw` on each tarball and on the Function package attached to the release; with the image,
    `gh attestation verify oci://<repository>:X.Y.Z --repo AMD-AGI/PrimusClaw`.
 
 ## Security

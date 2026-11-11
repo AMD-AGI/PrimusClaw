@@ -4,7 +4,7 @@
 
 # release-workflow-check.sh [workflow.yml]
 #
-# .github/workflows/personal-agent-release.yml publishes three npm packages with an OIDC identity and, once switched on,
+# .github/workflows/personal-agent-release.yml publishes four npm packages with an OIDC identity and, once switched on,
 # pushes an image with a registry credential. A tag push runs the file as it exists at the tag, so what keeps a publish
 # behind the environments, and the credential on the right registry, is the file's shape. This asserts it:
 #   [trigger]      only a personal-agent-v* tag push, a workflow_dispatch with a dry-run input on by default, and a pull
@@ -23,7 +23,7 @@
 #   [permissions]  only the publish jobs hold a write scope (the OIDC one included)
 #   [environment]  publish-npm runs in npm-publish, publish-image in image-publish, each after the package job
 #   [no-code]      the publish jobs check out nothing, install no dependency and run no repository script
-#   [publish-last] `npm publish` is only in publish-npm's last step, core, then runtime, then teams
+#   [publish-last] `npm publish` is only in publish-npm's last step, core, then runtime, then teams, then teams-ingress
 #   [injection]    no run script interpolates ${{ }}
 #   [pinned]       every action is pinned to a commit
 # Then it mutates a copy of the file once per rule and requires that rule, and not just any rule, to report it: a check
@@ -576,8 +576,10 @@ def check_publish_last(doc):
                 p.append(f"npm publish in {j} step {s.get('name')!r}; it belongs only in publish-npm's last step")
     last = (doc["jobs"]["publish-npm"].get("steps") or [{}])[-1]
     order = re.findall(r"^\s*publish (@primusclaw/[a-z-]+) ", str(last.get("run", "")), re.M)
-    if order != ["@primusclaw/personal-agent", "@primusclaw/personal-agent-runtime", "@primusclaw/personal-agent-teams"]:
-        p.append(f"publish-npm publishes {order}, expected core, runtime, teams in that order")
+    expected = ["@primusclaw/personal-agent", "@primusclaw/personal-agent-runtime", "@primusclaw/personal-agent-teams",
+                "@primusclaw/personal-agent-teams-ingress"]
+    if order != expected:
+        p.append(f"publish-npm publishes {order}, expected core, runtime, teams, teams-ingress in that order")
     return p
 
 
