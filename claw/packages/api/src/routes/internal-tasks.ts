@@ -1500,7 +1500,9 @@ function registerLeaseRoute(app: FastifyInstance): void {
         try {
           saving = await workspaceSaveHoldsRun(
             taskId, body.brain_id,
-            token.ok ? { attemptId: token.attemptId, claimCount: token.claimCount } : null,
+            // The generation the renewal itself is fenced on: a fat run quotes it in
+            // `run_claim`, its token's own count being zero (`quotedGeneration`).
+            token.ok ? { attemptId: token.attemptId, claimCount: quotedGeneration(body, token) } : null,
           );
         } catch (err) {
           logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_save_hold_unreadable");
