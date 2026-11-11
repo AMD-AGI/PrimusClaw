@@ -11,7 +11,7 @@ import type { WindowView } from "../../../src/remote/window/view.js";
 import { INPUT_ID } from "../../../src/remote/window/view.js";
 import type { PermissionOption } from "../../../../../test-support/remote-fake.js";
 import { ALICE, type RemoteWorld, Script, USER_A, remoteWorld } from "../../../../../test-support/remote-world.js";
-import { AAD, TWO_AGENTS, idleTurn, turnsOf } from "./helpers.js";
+import { AAD, TWO_AGENTS, turnsOf } from "./helpers.js";
 import {
   answering,
   approvalButtons,
@@ -332,12 +332,13 @@ test("a message already typed into the terminal is not withdrawn on detach", () 
 test("a send that is refused keeps the words in the box", () =>
   remoteWorld(async (w) => {
     const sid = await windowed(w, answering());
-    turnsOf(w).set(AAD, idleTurn()); // (a turn of the chat's is running: the session takes no message now)
+    const machine = w.server.connector(w.server.session(sid).connector_id);
+    machine.online = false; // (the machine is offline: Claw refuses the message)
     await sendFromCard(w, sid, "please keep these words");
     await sleep(200);
     assert.deepEqual(prompts(w), []);
     assert.equal(viewOf(w)?.draft, "please keep these words");
-    turnsOf(w).delete(AAD);
+    machine.online = true;
     // (any tap: the idle card shows the box with the words in it)
     await w.click({ primusclaw: "remote", op: "full", session_id: sid }, USER_A, statusCardId(w));
     await sleep(200);

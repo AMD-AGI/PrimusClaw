@@ -15,8 +15,18 @@ export const remoteAgentText = defineCatalog({
       "That machine is offline, so nothing was sent. On that machine, run `claw-connector status` to see why, then `claw-connector service install` to start it again. Then send the message again.",
     outdated:
       "That machine's connector is too old for a new session, so nothing was started. On that machine, run `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install` to upgrade it and restart it. Then try again.",
-    stillWorking:
-      "The agent is still working on your previous message, so this one was not sent. Send it again once it has answered.",
+    queuedBehind: (p: { n: number }) =>
+      (p.n === 1
+        ? "Got it. The agent is still on your previous message; this one is queued and goes to it as soon as that is answered."
+        : `Got it. This one is queued as number ${String(p.n)}; the agent takes them in order once it has answered your previous message.`) +
+      " /stop stops the running one and drops what is queued.",
+    queueFull: (p: { n: number }) =>
+      `${String(p.n)} messages already wait behind the running one, so this one was not sent. Send it once the agent has answered, or /stop to stop it and drop the queue.`,
+    queueDropped: (p: { n: number }) =>
+      p.n === 1
+        ? " The message queued behind it was dropped too."
+        : ` The ${String(p.n)} messages queued behind it were dropped too.`,
+    queuedRefused: (p: { reason: string }) => `A message you queued was not run on the machine: ${p.reason}`,
     stopFirst: "A task is still running. Send /stop first.",
     notAttached:
       "You are not attached to a remote session. Start one with `/agent new AGENT PATH`, or `/agent attach N`.",
@@ -164,7 +174,16 @@ export const remoteAgentText = defineCatalog({
       "那台机器离线了，什么都没有发出去。在那台机器上运行 `claw-connector status` 看原因，再运行 `claw-connector service install` 重新启动它。然后再发一次。",
     outdated:
       "那台机器的连接器太旧，开不了新会话，什么都没有启动。在那台机器上运行 `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install` 升级并重启它。然后再试一次。",
-    stillWorking: "agent 还在处理你上一条消息，这条没有发给它。等它回答完再发。",
+    queuedBehind: (p) =>
+      (p.n === 1
+        ? "收到。agent 还在处理你上一条消息，这条已排在后面，上一条回答完就接着处理它。"
+        : `收到。这条已排队（第 ${String(p.n)} 条），agent 回答完上一条后按顺序处理。`) +
+      "发 /stop 会停下正在运行的这条，并撤回排队的消息。",
+    queueFull: (p) =>
+      `正在运行的这条后面已经排了 ${String(p.n)} 条消息，这条没有发出去。等 agent 回答后再发，或者发 /stop 停下并清空排队。`,
+    queueDropped: (p) =>
+      p.n === 1 ? "排在后面的那条消息也一起撤回了。" : `排在后面的 ${String(p.n)} 条消息也一起撤回了。`,
+    queuedRefused: (p) => `你排队的一条消息没有在机器上运行：${p.reason}`,
     stopFirst: "还有任务在运行。先发 /stop。",
     notAttached: "你还没有接入远程会话。用 `/agent new AGENT PATH` 开一个，或者发 `/agent attach N`。",
     approvalInactive: "这个审批请求已经失效了。",

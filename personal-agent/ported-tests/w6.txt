@@ -28,7 +28,7 @@ tests/test_remote_agents.py::test_a_session_closed_under_a_running_turn_is_not_s
 tests/test_remote_agents.py::test_a_session_that_cannot_open_says_why_and_the_chat_goes_back_to_claw -> packages/core/test/remote/e2e/agents.test.ts::a session that cannot open says why and the chat goes back to claw
 tests/test_remote_agents.py::test_an_agent_that_does_not_report_in_does_not_leave_the_user_waiting_in_silence -> packages/core/test/remote/e2e/agents-machines.test.ts::an agent that does not report in does not leave the user waiting in silence
 tests/test_remote_agents.py::test_a_turn_shows_the_work_as_it_happens_then_the_answer_and_nothing_stays_open -> packages/core/test/remote/e2e/agents.test.ts::a turn shows the work as it happens then the answer and nothing stays open
-tests/test_remote_agents.py::test_a_message_while_the_agent_is_working_is_not_sent_on -> packages/core/test/remote/e2e/agents.test.ts::a message while the agent is working is not sent on
+tests/test_remote_agents.py::test_a_message_while_the_agent_is_working_is_not_sent_on -> DROPPED: superseded: a message sent while the turn runs is now sent and queued behind it, not refused (packages/core/test/remote/e2e/queued.test.ts)
 tests/test_remote_agents.py::test_a_prompt_to_an_offline_machine_says_so_and_starts_no_turn -> packages/core/test/remote/e2e/agents.test.ts::a prompt to an offline machine says so and starts no turn
 tests/test_remote_agents.py::test_a_prompt_to_a_session_that_has_ended_says_so -> packages/core/test/remote/e2e/agents.test.ts::a prompt to a session that has ended says so
 tests/test_remote_agents.py::test_one_message_makes_one_idempotency_key_that_claw_accepts -> packages/core/test/remote/refusals.test.ts::one message makes one idempotency key that claw accepts

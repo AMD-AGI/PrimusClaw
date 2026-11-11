@@ -55,6 +55,8 @@ export interface TurnRequest {
   readonly state: RemoteState;
   /** The person's message the turn answers (a stream answers it); undefined: shown by a progress message. */
   readonly replyTo: string | undefined;
+  /** Claw's number of the prompt the turn answers (undefined: not known, any turn end ends it). */
+  readonly cmdSeq?: number | undefined;
 }
 
 export class TurnRunner {
@@ -80,7 +82,9 @@ export class TurnRunner {
     turn.task = new Task((signal) => this.guarded(request, turn, signal), this.ctx.logger, "a remote turn");
   }
 
+  /** Stop reading the chat's turn; the messages waiting behind it are given up too (nothing will read their turns). */
   cancel(chatKey: string): void {
+    this.state.chats.dropQueued(chatKey);
     this.state.chats.turns.get(chatKey)?.task?.cancel();
   }
 
@@ -95,9 +99,22 @@ export class TurnRunner {
       await request.to.send(textMessage(words.watchFailed({ ref })));
     } finally {
       if (this.state.chats.turns.get(request.chatKey) === turn) this.state.chats.turns.delete(request.chatKey);
-      this.follow.ensure(request.chatKey); // the turn is over: what the agent says next is followed from where it ended
-      this.board.touchStatus(request.chatKey, request.to);
+      this.over(request, signal);
     }
+  }
+
+  /**
+   * The turn is over: the turn of the oldest message sent behind it is read next (it runs on the machine now), or, with none
+   * waiting, what the agent says next is followed from where the turn ended.
+   */
+  private over(request: TurnRequest, signal: AbortSignal): void {
+    const { chatKey } = request;
+    if (signal.aborted) this.state.chats.dropQueued(chatKey);
+    for (let next = this.state.chats.takeQueued(chatKey); next; next = this.state.chats.takeQueued(chatKey)) {
+      if (next.start()) return;
+    }
+    this.follow.ensure(chatKey);
+    this.board.touchStatus(chatKey, request.to);
   }
 
   private display(request: TurnRequest): { display: TurnDisplay; signer: Signer | null } {
@@ -109,7 +126,7 @@ export class TurnRunner {
     const { chatKey, to, state } = request;
     const { display, signer } = this.display(request);
     display.begin();
-    const fold = new RemoteTurnState(this.ctx.errors);
+    const fold = new RemoteTurnState(this.ctx.errors, request.cmdSeq);
     const cursor = this.ctx.remoteState.getRemote(chatKey)?.cursor ?? ""; // (read again: a catch-up starts where the chat left off)
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(REMOTE_TURN_DEADLINE_SECONDS * 1000)]);
     try {
@@ -238,6 +255,9 @@ export class TurnRunner {
     const { chatKey, to } = request;
     const sid = request.state.sessionId ?? "";
     noteWaiting(this.state.chats.turns.get(chatKey), step);
+    if (step.rejected?.type === "prompt" && step.rejected.cmdSeq !== null) {
+      await this.queuedRefused(chatKey, to, step.rejected.cmdSeq, step.rejected.reason);
+    }
     // (said in the chat's language, as a line of the turn's live view)
     const shown = step.queued !== null ? { ...step, note: queuedLine(step.queued, this.state.lang(chatKey)) } : step;
     display.progress(shown);
@@ -248,6 +268,16 @@ export class TurnRunner {
     if (step.recovered !== null && (step.recovered.continuing || !step.recovered.interrupted)) {
       // (a turn the restart ended says so as its own end, which comes next)
       await this.sayRecovered(chatKey, to, step.recovered.interrupted, step.recovered.continuing);
+    }
+  }
+
+  /** A message waiting behind this turn was refused on the machine before it ran: it waits no more, and the person is told. */
+  private async queuedRefused(chatKey: string, to: Conversation, cmdSeq: number, reason: string): Promise<void> {
+    if (this.state.chats.takeQueuedSeq(chatKey, cmdSeq) === undefined) return;
+    try {
+      await to.send(textMessage(remoteAgentText.in(this.state.lang(chatKey)).queuedRefused({ reason })));
+    } catch (error) {
+      this.ctx.logger.warn("that a queued message was refused could not be told", { error: errorName(error) });
     }
   }
 

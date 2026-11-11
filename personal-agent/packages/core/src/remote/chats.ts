@@ -26,6 +26,21 @@ export interface RemoteTurn {
   readonly ended: boolean;
 }
 
+/**
+ * A message sent to the attached session while a turn of the chat still ran. Claw keeps it in order and the machine runs it once the
+ * turn in front has ended (the connector queues it, as Claude Code queues what is typed while it works); its own turn is read right
+ * after the one in front (`TurnRunner`).
+ */
+export interface QueuedPrompt {
+  /** Claw's sequence number of the prompt (a refusal of it names it); undefined when Claw did not give one. */
+  readonly cmdSeq: number | undefined;
+  /** Start reading its turn: false when it cannot be (the chat is no longer attached to that session). */
+  start(): boolean;
+}
+
+/** At most this many messages wait behind a running turn (the connector refuses more: `too_many_queued_prompts`). */
+export const QUEUED_PROMPTS_MAX = 5;
+
 /** A turn about to be watched (its task is set right after). */
 export function newTurn(): RemoteTurn {
   return {
@@ -54,6 +69,8 @@ export class ChatRegistry {
   /** Chats `forget` was called for: nothing follows them until they attach again. */
   readonly unlinked = new Set<string>();
   readonly turns = new Map<string, RemoteTurn>();
+  /** The messages sent while the chat's turn ran, oldest first: each one's turn is read after the one in front. */
+  private readonly queuedPrompts = new Map<string, QueuedPrompt[]>();
   /** A short watch (`/agent new` waiting for the agent, `/agent mode` for its answer). */
   readonly watchers = new Map<string, Task>();
   /** Whether the agent of the attached session starts in a mode that does not ask (its connector's report). */
@@ -65,6 +82,42 @@ export class ChatRegistry {
   private readonly readOnlyKnown = new Map<string, string>();
   private readonly terminalInput = new Map<string, string>();
   private readonly tickets = new Map<string, TakeoverTicket>();
+
+  /** How many messages wait behind the chat's running turn. */
+  queuedCount(chatKey: string): number {
+    return this.queuedPrompts.get(chatKey)?.length ?? 0;
+  }
+
+  enqueue(chatKey: string, prompt: QueuedPrompt): void {
+    const queue = this.queuedPrompts.get(chatKey) ?? [];
+    queue.push(prompt);
+    this.queuedPrompts.set(chatKey, queue);
+  }
+
+  /** The oldest message waiting, taken off the queue. */
+  takeQueued(chatKey: string): QueuedPrompt | undefined {
+    const queue = this.queuedPrompts.get(chatKey);
+    const next = queue?.shift();
+    if (queue?.length === 0) this.queuedPrompts.delete(chatKey);
+    return next;
+  }
+
+  /** The waiting message Claw numbered `cmdSeq` (refused before it ran), taken off the queue. */
+  takeQueuedSeq(chatKey: string, cmdSeq: number): QueuedPrompt | undefined {
+    const queue = this.queuedPrompts.get(chatKey);
+    const at = queue?.findIndex((q) => q.cmdSeq === cmdSeq) ?? -1;
+    if (queue === undefined || at < 0) return undefined;
+    const [taken] = queue.splice(at, 1);
+    if (queue.length === 0) this.queuedPrompts.delete(chatKey);
+    return taken;
+  }
+
+  /** Every waiting message is given up (a stop drops them on the machine too); how many there were. */
+  dropQueued(chatKey: string): number {
+    const count = this.queuedCount(chatKey);
+    this.queuedPrompts.delete(chatKey);
+    return count;
+  }
 
   watching(chatKey: string): boolean {
     return this.watchers.get(chatKey)?.running ?? false;
@@ -145,5 +198,6 @@ export class ChatRegistry {
     this.agentUnattended.delete(chatKey);
     this.readOnly.delete(chatKey);
     this.readOnlyKnown.delete(chatKey);
+    this.queuedPrompts.delete(chatKey);
   }
 }

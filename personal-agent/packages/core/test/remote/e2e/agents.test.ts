@@ -12,12 +12,11 @@ import { failureText, idempotencyKey } from "../../../src/remote/refusals.js";
 import { RECONNECT_RETRY_SECONDS } from "../../../src/remote/sessions.js";
 import { type FakeCommand, type FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE, Script, remoteWorld } from "../../../../../test-support/remote-world.js";
-import { AAD, BOB, TWO_AGENTS, attached, en, oneTurn, seen } from "./helpers.js";
+import { AAD, BOB, TWO_AGENTS, attached, en, seen } from "./helpers.js";
 
 const OFFLINE = en.offline;
 const OUTDATED = en.outdated;
 const NOT_ENABLED = en.notEnabled;
-const STILL_WORKING = en.stillWorking;
 
 const errors = {
   looksInternal: () => false,
@@ -421,31 +420,6 @@ test("a turn shows the work as it happens then the answer and nothing stays open
     assert.ok(state && !state.turnOpen);
     assert.equal(state.cursor, String(w.server.events.get(sid)?.at(-1)?.id));
     assert.equal(w.remote.busyChats().length, 0);
-  }));
-
-test("a message while the agent is working is not sent on", () =>
-  remoteWorld(async (w) => {
-    const script = new Script();
-    script.onPrompt = async (srv, sid) => {
-      await srv.say(sid, "working..."); // no turn end: the turn stays open
-    };
-    const { sid } = await attached(w, script);
-    await w.send("first");
-    await w.until(() => w.progressTexts().some((t) => t.includes("working...")));
-    await w.send("second");
-    assert.equal(w.last(), STILL_WORKING);
-    assert.deepEqual(
-      w.server.commandsOf("prompt").map((c) => c.body["text"]),
-      ["first"],
-    );
-    await w.server.end(sid);
-    await w.idle();
-    script.onPrompt = oneTurn;
-    await w.say("third");
-    assert.deepEqual(
-      w.server.commandsOf("prompt").map((c) => c.body["text"]),
-      ["first", "third"],
-    );
   }));
 
 test("a prompt to an offline machine says so and starts no turn", () =>

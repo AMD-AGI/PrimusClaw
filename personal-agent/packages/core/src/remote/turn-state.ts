@@ -23,25 +23,45 @@ export class RemoteTurnState {
   note: string | null = null;
   private toolSinceText = true;
 
-  constructor(private readonly errors: PublicErrors) {}
+  constructor(
+    private readonly errors: PublicErrors,
+    /** Claw's number of the prompt this turn answers: the connector's refusal of it ends the turn (no `turn_end` follows one). */
+    private readonly cmdSeq?: number,
+  ) {}
 
   feed(event: SseEvent): RemoteStep {
     if (event.id && this.seen.has(event.id)) return NOTHING;
     if (event.id) this.remember(event.id);
     const step = decode(event, this.errors);
     if (step.replay) return step;
+    // (the end of another prompt's turn, one queued in front of this one: not this turn's, and nothing to show)
+    if (this.othersEnd(step)) return NOTHING;
     if (step.chunk?.kind === "message") {
       this.addText(step.chunk.text);
     } else if (step.tool) {
       this.toolSinceText = true;
     }
-    if (step.finished) {
-      this.ended = true;
-      this.stopReason = step.stopReason;
-      this.note = step.note;
-    }
+    if (step.finished) this.end(step.stopReason, step.note);
     if (step.closed !== null) this.closed = step.closed;
+    // (the connector refused this turn's own prompt: no turn_end follows that)
+    if (this.refusedOwn(step)) this.end("error", step.rejected?.reason ?? null);
     return step;
+  }
+
+  /** A turn end that names another prompt than this turn's. */
+  private othersEnd(step: RemoteStep): boolean {
+    return step.finished && this.cmdSeq !== undefined && step.endsSeq !== null && step.endsSeq !== this.cmdSeq;
+  }
+
+  /** The connector refused the prompt this turn answers. */
+  private refusedOwn(step: RemoteStep): boolean {
+    return step.rejected?.type === "prompt" && this.cmdSeq !== undefined && step.rejected.cmdSeq === this.cmdSeq;
+  }
+
+  private end(stopReason: string, note: string | null): void {
+    this.ended = true;
+    this.stopReason = stopReason;
+    this.note = note;
   }
 
   /** The agent's last piece of text, stripped. */
