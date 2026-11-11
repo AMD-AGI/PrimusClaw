@@ -102,6 +102,21 @@ export class ChatRegistry {
     return next;
   }
 
+  /** Whether `prompt` still waits in the chat's queue. */
+  isQueued(chatKey: string, prompt: QueuedPrompt): boolean {
+    return this.queuedPrompts.get(chatKey)?.includes(prompt) ?? false;
+  }
+
+  /** Take `prompt` off the queue (its send failed); false when it is not there (its turn was started meanwhile). */
+  removeQueued(chatKey: string, prompt: QueuedPrompt): boolean {
+    const queue = this.queuedPrompts.get(chatKey);
+    const at = queue?.indexOf(prompt) ?? -1;
+    if (queue === undefined || at < 0) return false;
+    queue.splice(at, 1);
+    if (queue.length === 0) this.queuedPrompts.delete(chatKey);
+    return true;
+  }
+
   /** The waiting message Claw numbered `cmdSeq` (refused before it ran), taken off the queue. */
   takeQueuedSeq(chatKey: string, cmdSeq: number): QueuedPrompt | undefined {
     const queue = this.queuedPrompts.get(chatKey);

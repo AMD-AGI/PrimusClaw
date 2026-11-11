@@ -90,6 +90,28 @@ test("a correction sent during the turn reaches the agent as the next message, i
     assert.equal(w.answer(), "好的，只写了摘要。");
   }));
 
+test("the turn in front ends while the queued message is still being sent: its turn is read as its own, not by the follower", () =>
+  remoteWorld(async (w) => {
+    const { sid, prompts, script } = await manual(w);
+    await firstRunning(w, sid, prompts);
+    script.onPrompt = async (srv: FakeRemote, s: string, cmd: FakeCommand) => {
+      prompts.push(cmd);
+      // (Claw has the message but has not answered the send yet: the turn in front ends, and the machine runs this one at once)
+      await srv.say(s, "The report is written.");
+      await endOf(w, s, prompts[0]);
+      await w.until(() => w.said().includes("The report is written."));
+      await srv.say(s, "It is 9:00.");
+      await endOf(w, s, cmd);
+    };
+    await w.send("also, what time is it there?");
+    await w.until(() => prompts.length === 2);
+    await w.idle();
+    assert.equal(w.answer(), "It is 9:00.");
+    assert.ok(!w.said().includes(en.queuedBehind({ n: 1 })), "its turn already ran: not told it waits");
+    const state = w.test.store.remoteState.attachedRemote(AAD);
+    assert.ok(state && !state.turnOpen);
+  }));
+
 test("several messages queue in order and each is answered in turn", () =>
   remoteWorld(async (w) => {
     const { sid, prompts } = await manual(w);
