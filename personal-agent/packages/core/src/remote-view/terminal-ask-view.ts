@@ -25,6 +25,12 @@ import { optionButtons } from "./permission-view.js";
  */
 export const TERMINAL_CONTENT_MAX = 16_000;
 
+/** How long one line of a card may be (a description, a header, a path, an answer's label or meaning) before it is cut. */
+const LINE_MAX = 400;
+const LABEL_MAX = 200;
+/** The longest option name a card writes out whole (the connector names an "always" option with the rule it adds). */
+const OPTION_NAME_MAX = 200;
+
 /** One piece of a terminal request's content. `code`: shown as it is, in a fixed-width font; `words`: markdown kept, links not. */
 export type TerminalSection =
   | { readonly type: "line"; readonly text: string }
@@ -86,10 +92,12 @@ function optionTitle(option: PermissionOption, lang: Lang): string | undefined {
 interface Content {
   readonly asks: string;
   readonly sections: TerminalSection[];
+  /** The input's fields it shows (every other one is shown as JSON after them). */
+  readonly fields: readonly string[];
+  /** A line it shows was too long to show whole (the path in its first line). */
+  readonly clipped?: boolean;
 }
 type Words = ReturnType<typeof terminalApprovalText.in>;
-
-const EDIT_FIELDS = ["file_path", "notebook_path", "content", "old_string", "new_string", "new_source"];
 
 function commandContent(input: Reported, words: Words): Content | undefined {
   const command = input["command"];
@@ -97,7 +105,7 @@ function commandContent(input: Reported, words: Words): Content | undefined {
   const description = str(input["description"]);
   const sections: TerminalSection[] = [{ type: "code", text: command }];
   if (description) sections.push({ type: "line", text: description });
-  return { asks: words.asksRun, sections };
+  return { asks: words.asksRun, sections, fields: ["command", "description"] };
 }
 
 function editContent(input: Reported, words: Words): Content | undefined {
@@ -110,15 +118,19 @@ function editContent(input: Reported, words: Words): Content | undefined {
     sections.push({ type: "line", text: words.newText }, { type: "code", text: str(input["new_string"]) });
   }
   if (typeof input["new_source"] === "string") sections.push({ type: "code", text: input["new_source"] });
-  // (whatever else the edit carries is shown too: the card shows the request whole)
-  const rest = Object.fromEntries(Object.entries(input).filter(([k]) => !EDIT_FIELDS.includes(k)));
-  if (Object.keys(rest).length) sections.push({ type: "code", text: JSON.stringify(rest, null, 2) });
-  return { asks: words.asksEdit({ path: neutral(path, 200) }), sections };
+  return {
+    asks: words.asksEdit({ path: neutral(path, LINE_MAX) }),
+    sections,
+    fields: ["file_path", "notebook_path", "content", "old_string", "new_string", "new_source"],
+    clipped: path.length > LINE_MAX,
+  };
 }
 
 function planContent(input: Reported, words: Words): Content | undefined {
   const plan = input["plan"];
-  return typeof plan === "string" ? { asks: words.asksPlan, sections: [{ type: "words", text: plan }] } : undefined;
+  return typeof plan === "string"
+    ? { asks: words.asksPlan, sections: [{ type: "words", text: plan }], fields: ["plan"] }
+    : undefined;
 }
 
 function questionContent(input: Reported, words: Words): Content | undefined {
@@ -132,7 +144,7 @@ function questionContent(input: Reported, words: Words): Content | undefined {
     const r = record(o) ?? {};
     sections.push({ type: "option", label: str(r["label"]), description: str(r["description"]) });
   }
-  return { asks: words.asksQuestion, sections };
+  return { asks: words.asksQuestion, sections, fields: ["question", "header", "options"] };
 }
 
 const CONTENT = new Map<string, (input: Reported, words: Words) => Content | undefined>([
@@ -142,24 +154,37 @@ const CONTENT = new Map<string, (input: Reported, words: Words) => Content | und
   ["question", questionContent],
 ]);
 
-/** What a request shows, by its kind; any other (or one whose fields are not what its kind has) as its JSON. */
+/**
+ * What a request shows, by its kind; any other (or one whose fields are not what its kind has) as its JSON. Whatever fields its
+ * kind does not show are shown after it as JSON: the card shows the request whole.
+ */
 function contentOf(kind: string, tool: string, input: Reported | undefined, words: Words): Content {
-  const generic = { asks: words.asksTool({ tool: neutral(tool, 120) }), sections: [] as TerminalSection[] };
+  const generic: Content = { asks: words.asksTool({ tool: neutral(tool, 120) }), sections: [], fields: [] };
   if (input === undefined) return generic;
   const shown = CONTENT.get(kind)?.(input, words);
-  return shown ?? { ...generic, sections: [{ type: "code", text: JSON.stringify(input, null, 2) }] };
+  if (shown === undefined) return { ...generic, sections: [{ type: "code", text: JSON.stringify(input, null, 2) }] };
+  const rest = Object.fromEntries(Object.entries(input).filter(([k]) => !shown.fields.includes(k)));
+  if (Object.keys(rest).length === 0) return shown;
+  return { ...shown, sections: [...shown.sections, { type: "code", text: JSON.stringify(rest, null, 2) }] };
 }
 
 const sectionChars = (s: TerminalSection): number =>
   s.type === "option" ? s.label.length + s.description.length : s.text.length;
 
+/** Whether a section is longer than the card shows one of its kind (a line, a label): then the request is not shown whole. */
+const sectionClipped = (s: TerminalSection): boolean =>
+  s.type === "option"
+    ? s.label.length > LABEL_MAX || s.description.length > LINE_MAX
+    : s.type === "line" && s.text.length > LINE_MAX;
+
 /** One section made inert for a card, cut to `left` characters. */
 function inert(s: TerminalSection, left: number): TerminalSection {
-  if (s.type === "option") return { type: "option", label: lit(s.label, 200), description: lit(s.description, 300) };
+  if (s.type === "option")
+    return { type: "option", label: lit(s.label, LABEL_MAX), description: lit(s.description, LINE_MAX) };
   const piece = s.text.length > left ? `${s.text.slice(0, left)}…` : s.text;
   if (s.type === "code") return { type: "code", text: codeText(piece) };
   if (s.type === "words") return { type: "words", text: wordsText(piece) };
-  return { type: "line", text: lit(piece, 400) };
+  return { type: "line", text: lit(piece, LINE_MAX) };
 }
 
 /** The sections as the card shows them: at most TERMINAL_CONTENT_MAX characters (what is cut is never offered for approval). */
@@ -181,9 +206,9 @@ function notesOf(ask: Reported, complete: boolean, options: readonly PermissionO
   if (Number.isInteger(total) && total > 1 && Number.isInteger(index))
     notes.push(words.questionOf({ n: index + 1, of: total }));
   if (!complete) notes.push(words.tooLong);
-  const rule = record(ask["input"])?.["always_allows"];
-  if (complete && typeof rule === "string" && options.some((o) => o.kind === "allow_always"))
-    notes.push(words.alwaysAllows({ rule: lit(rule, 200) }));
+  // (a button shows 40 characters: what an "always" option grants is written out whole here, or the option is not offered)
+  for (const o of options)
+    if (o.kind === "allow_always") notes.push(words.alwaysOption({ name: lit(o.name, OPTION_NAME_MAX) }));
   notes.push(words.firstAnswerWins);
   return notes;
 }
@@ -195,9 +220,15 @@ export function terminalAskView(input: TerminalAsk, lang: Lang = "en"): Terminal
   const raw = record(ask["input"]);
   const content = contentOf(str(ask["kind"]), str(ask["tool"]), raw, words);
   const complete =
-    raw !== undefined && content.sections.reduce((n, s) => n + sectionChars(s), 0) <= TERMINAL_CONTENT_MAX;
-  // Cut, never shown in part with a way to approve it: what was cut is what would run.
-  const options = complete ? input.options : input.options.filter((o) => o.kind.startsWith("reject"));
+    raw !== undefined &&
+    content.clipped !== true &&
+    !content.sections.some(sectionClipped) &&
+    content.sections.reduce((n, s) => n + sectionChars(s), 0) <= TERMINAL_CONTENT_MAX;
+  // Cut, never shown in part with a way to approve it: what was cut is what would run. An "always" option whose name (the
+  // rule it adds) cannot be written out whole is not offered either.
+  const options = (complete ? input.options : input.options.filter((o) => o.kind.startsWith("reject"))).filter(
+    (o) => o.kind !== "allow_always" || (o.name.trim() !== "" && o.name.length <= OPTION_NAME_MAX),
+  );
   const buttons = optionButtons(options, input.sessionId, pyStr(ask["action_id"]), lang).map((b) => {
     const option = options.find((o) => o.optionId === b.optionId);
     const title = option ? optionTitle(option, lang) : undefined;

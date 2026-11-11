@@ -16,8 +16,7 @@ export const terminalApprovalText = defineCatalog({
     asksTool: (p: { tool: string }) => `wants to use ${p.tool}:`,
     oldText: "Replaces:",
     newText: "With:",
-    alwaysAllows: (p: { rule: string }) =>
-      `"Always allow" lets ${p.rule} run without asking for the rest of this terminal session.`,
+    alwaysOption: (p: { name: string }) => `"Always allow (this session)" means: ${p.name}`,
     firstAnswerWins: "The terminal is asking too: the first answer, here or there, counts.",
     tooLong: "Too long to show in full here: it can only be turned down from the phone; approve it at the terminal.",
     questionOf: (p: { n: number; of: number }) => `Question ${String(p.n)} of ${String(p.of)}`,
@@ -49,7 +48,7 @@ export const terminalApprovalText = defineCatalog({
     asksTool: (p) => `想使用 ${p.tool}：`,
     oldText: "原内容：",
     newText: "改为：",
-    alwaysAllows: (p) => `选“本会话始终允许”后，这个终端会话里 ${p.rule} 不再询问。`,
+    alwaysOption: (p) => `“本会话始终允许”即：${p.name}`,
     firstAnswerWins: "终端里也在等你回答，先答的算数。",
     tooLong: "内容过长，这里显示不全：手机上只能拒绝，请到终端批准。",
     questionOf: (p) => `第 ${String(p.n)} 题，共 ${String(p.of)} 题`,

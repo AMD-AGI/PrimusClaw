@@ -141,7 +141,9 @@ export class Proactive {
    */
   private shownInChat(userId: string, event: JsonObject, now: number): boolean {
     const remote = remoteNoticeOf(event);
-    if (remote === undefined || remote.kind === "needs_you" || !this.showsAttached) return false;
+    // (a request waiting, or the end of a terminal's question, is never "already shown": its card is this chat's to draw or end)
+    if (remote === undefined || remote.kind === "needs_you" || remote.kind === "resolved" || !this.showsAttached)
+      return false;
     const state = this.deps.store.remoteState.attachedRemote(userId);
     return (
       state !== null &&

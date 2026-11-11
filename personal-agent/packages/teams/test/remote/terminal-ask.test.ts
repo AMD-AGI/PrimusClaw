@@ -18,7 +18,7 @@ import { remoteAskCard } from "../../src/assembly/features-assistant.js";
 type Json = Record<string, unknown>;
 const COMMAND_OPTIONS = [
   { optionId: "allow", name: "Yes", kind: "allow_once" },
-  { optionId: "allow-session", name: "Always allow (this session only)", kind: "allow_always" },
+  { optionId: "allow-session", name: "Always allow this session: Bash(npm test)", kind: "allow_always" },
   { optionId: "deny", name: "No", kind: "reject_once" },
   { optionId: "deny-stop", name: "No, and stop", kind: "reject_once" },
 ];
@@ -43,7 +43,7 @@ test("a command: shown whole in a fixed-width block, with every option as a butt
     origin: "terminal",
     kind: "execute",
     tool: "Run: npm test",
-    input: { command: "npm test -- --grep 'a_b'", description: "Run the tests", always_allows: "Bash(npm test)" },
+    input: { command: "npm test -- --grep 'a_b'", description: "Run the tests" },
     options: COMMAND_OPTIONS,
   };
   const c = card(ask);
@@ -52,7 +52,8 @@ test("a command: shown whole in a fixed-width block, with every option as a butt
   const mono = (c["body"] as Json[]).find((b) => b["fontType"] === "Monospace");
   assert.equal(mono?.["text"], "npm test -- --grep 'a\\_b'");
   assert.match(all(c), /Run the tests/);
-  assert.match(all(c), /Bash\\\(npm test\\\)|Bash\(npm test\)/);
+  // What the "always" option grants is written out whole (a button shows 40 characters).
+  assert.match(all(c), /means: Always allow this session: Bash\(npm test\)/);
   assert.match(all(c), /first answer/);
   assert.deepEqual(titles(card(ask, "zh")), ["允许", "本会话始终允许", "拒绝", "拒绝并停止"]);
   assert.match(all(card(ask, "zh")), /先答的算数/);
@@ -109,6 +110,49 @@ test("a plan as words (lists kept, no link can be made), a question with each an
   assert.match(all(edit), /a\.ts/);
   assert.match(all(edit), /let a = 1/);
   assert.match(all(edit), /const a = 1/);
+});
+
+test("nothing is approved unseen: a field the kind does not show is shown as JSON, a line too long to show whole keeps only the turn-down options", () => {
+  const extra = card({
+    action_id: "f1",
+    origin: "terminal",
+    kind: "execute",
+    tool: "Run",
+    input: { command: "ls", run_in_background: true, timeout: 5 },
+    options: COMMAND_OPTIONS,
+  });
+  assert.match(all(extra), /run\\_in\\_background|run_in_background/);
+  assert.deepEqual(ids(extra), ["allow", "allow-session", "deny", "deny-stop"]);
+  const longDescription = card({
+    action_id: "f2",
+    origin: "terminal",
+    kind: "execute",
+    tool: "Run",
+    input: { command: "ls", description: "d".repeat(401) },
+    options: COMMAND_OPTIONS,
+  });
+  assert.deepEqual(ids(longDescription), ["deny", "deny-stop"]);
+  const longPath = card({
+    action_id: "f3",
+    origin: "terminal",
+    kind: "edit",
+    tool: "Edit",
+    input: { file_path: `/w/${"p".repeat(500)}.ts`, content: "x" },
+    options: COMMAND_OPTIONS,
+  });
+  assert.deepEqual(ids(longPath), ["deny", "deny-stop"]);
+  const longRule = card({
+    action_id: "f4",
+    origin: "terminal",
+    kind: "execute",
+    tool: "Run",
+    input: { command: "ls" },
+    options: [
+      { optionId: "allow-session", kind: "allow_always", name: `Always allow this session: ${"r".repeat(300)}` },
+      { optionId: "allow", name: "Yes", kind: "allow_once" },
+    ],
+  });
+  assert.deepEqual(ids(longRule), ["allow"]);
 });
 
 test("nothing is approved unseen: content that did not come, or is longer than a card shows, keeps only the options that turn it down", () => {

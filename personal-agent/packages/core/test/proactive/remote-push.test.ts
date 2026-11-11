@@ -444,3 +444,24 @@ it("a resolved notice for a card this chat never showed is said as its one line"
   );
   assert.ok(shown(w.surface.outbox).some((line) => line.includes("已在终端里回答")));
 });
+
+it("the end of a terminal's question edits its card even in a chat attached to that session", async () => {
+  const w = world();
+  w.proactive.showsAttached = true;
+  attach(w, "rs-t");
+  advanceSeconds(w.clock, 60);
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", { text: "x", ask: aTerminalAsk() }),
+  );
+  const before = w.surface.outbox.length;
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "terminal", "say-r")),
+    "delivered",
+  );
+  assert.deepEqual(
+    w.surface.outbox.slice(before).map((r) => r.op),
+    ["update"],
+  );
+});
