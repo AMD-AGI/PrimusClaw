@@ -12,6 +12,7 @@ import type { RemotePermission, RemoteState } from "../ports/store/remote.js";
 import { isGroupKey, personOf } from "./chat-key.js";
 import type { ChatRegistry } from "./chats.js";
 import type { RemoteContext } from "./context.js";
+import { isTerminalPermission } from "./terminal-asks.js";
 import { WindowView } from "./window/view.js";
 
 /** Events read back to learn whether a session only watches a terminal's conversation. */
@@ -133,10 +134,15 @@ export class ChatState {
     this.views.delete(chatKey);
   }
 
-  /** The approvals the chat's session waits for, as the window shows them (none in a group: those go to the binder's 1:1). */
+  /**
+   * The approvals the chat's session waits for, as the window shows them (none in a group: those go to the binder's 1:1). A
+   * question a terminal asks is never among them: the window shows a tool and buttons, not the request, and it has its own card.
+   */
   approvalsOf(chatKey: string, state: RemoteState): RemotePermission[] {
     if (isGroupKey(chatKey) || !state.sessionId) return [];
-    return this.ctx.permissions.pendingRemotePermissions(chatKey, state.sessionId);
+    return this.ctx.permissions
+      .pendingRemotePermissions(chatKey, state.sessionId)
+      .filter((p) => !isTerminalPermission(p));
   }
 
   /** The person's time zone (IANA), the default when theirs is not one. */

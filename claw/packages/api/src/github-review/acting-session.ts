@@ -127,6 +127,36 @@ export async function proofForFirstMessageAgain(
 }
 
 /**
+ * The proof for running a review once more when CI turned green (`assistant/review-items.ts`, `followReviewItems`): the person asked for this
+ * review of their own account, its one turn ended with a comment-only review because CI was not green on the head (its approval was refused
+ * `ci_not_green`), and that head is green now. It is the same words in the same session, given once more, as a person who said "review and
+ * merge it" means "once CI lets it". Made only when the database shows exactly that: the session acts as a user, has had one turn and no
+ * other, that turn completed and its words are `content`, nothing is queued, its approval was refused `ci_not_green`, and it is the session of
+ * an open review item of the owner's own (nobody else asked for it) whose wait for CI has not ended. Null otherwise: never twice, since the
+ * turn it lets through is the session's second.
+ */
+export async function proofForReviewAfterGreenCi(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat') AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
+            (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
+            EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool = 'gh_review_submit'
+                     AND a.result = 'refused' AND a.detail = 'ci_not_green') AS ci_refused,
+            EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state <> 'done'
+                     AND NOT (w.params ? 'requested_by') AND NOT (w.params ? 'ci_wait_ended')) AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; ci_refused: boolean; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
+  if (row.status !== "completed" || row.words !== content || !row.ci_refused || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}
+
+/**
  * The proof for the first message of a review that waited for a slot (`params.queued`, `assistant/review-items.ts`): the request that made
  * it was checked as `checkSessionCreate` checks any, and its item and session were made then, with the person's say, but its first message
  * was held back so that nothing of it could run before a slot was free. Made only when the database shows exactly that: the session acts

@@ -542,7 +542,11 @@ describe("M the merge gates", () => {
       ["required check never reported", () => { e.gh.checkRuns = [{ name: "lint", status: "completed", conclusion: "success" }]; }],
       ["no check at all", () => { e.gh.checkRuns = []; e.gh.statuses = []; e.gh.rules = []; }],
       ["rules unreadable", () => { e.gh.rulesStatus = 404; }],
-      ["a failing status next to a green check", () => { e.gh.statuses = [{ context: "ci/other", state: "failure" }]; }],
+      ["a failing status next to a green check, where the rules require nothing", () => { e.gh.statuses = [{ context: "ci/other", state: "failure" }]; e.gh.rules = []; }],
+      ["a failing required check next to a failing one that is not required", () => {
+        e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }]; e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      }],
+      ["a check not required that has not finished", () => { e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }, { name: "e2e", status: "queued", conclusion: null }]; }],
     ];
     for (const [name, arrange] of cases) {
       e = await reviewEnv(); allowed();
@@ -552,6 +556,40 @@ describe("M the merge gates", () => {
       assert.equal(reason(o), "ci_not_green", name);
       assert.equal(e.gh.writes.length, 0, name);
     }
+  });
+
+  test("M3b a failed check the base branch does not require is advisory: GitHub's UNSTABLE for it merges, as GitHub would (Primus-SaFE#873, codecov/patch)", async () => {
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    const o = await merge();
+    assert.equal(reason(o), "merged", JSON.stringify(o.body));
+    assert.equal(puts().length, 1);
+    // Where only the classic branch protection requires something (the rulesets nothing), a failure it does not require is advisory too.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.rules = [];
+    e.gh.branch = { protected: true, protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["test"], checks: [] } } };
+    e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    assert.equal(reason(await merge()), "merged");
+    // A check only the classic branch protection requires is not advisory (the rulesets read does not see it), nor is any failure when
+    // that protection cannot be read.
+    for (const arrange of [
+      () => { e.gh.branch = { protected: true, protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["codecov/patch"], checks: [] } } }; },
+      () => { e.gh.branchStatus = 404; },
+    ]) {
+      e = await reviewEnv({}, { approved: true }); allowed();
+      e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      e.gh.graphql.mergeStateStatus = "UNSTABLE";
+      arrange();
+      assert.equal(reason(await merge()), "ci_not_green");
+      assert.equal(puts().length, 0);
+    }
+    // UNSTABLE with nothing advisory to explain it is still not a merge state this reads as open.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    assert.equal(reason(await merge()), "merge_state_not_clean");
+    assert.equal(puts().length, 0);
   });
 
   test("M4 unresolved review threads stop the merge, and so do more threads than could be read", async () => {

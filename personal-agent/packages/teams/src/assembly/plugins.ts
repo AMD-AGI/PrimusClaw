@@ -4,7 +4,7 @@
 /**
  * The platform services the Python worker always talks to, in place of the neutral plugins a deployment did not replace:
  * whose key it is from SaFE's `/users/self` (the Python `safe.user_id_of` / `safe.whoami`, used by the subscriptions,
- * `/whoami` and a report), a key deleted at SaFE when it is given up (`safe.revoke_own_key`: /unlink, and pending keys
+ * `/whoami` and a report), and whose exchanged identity token it is from Claw's `/v1/me` (SaFE refuses such a token), a key deleted at SaFE when it is given up (`safe.revoke_own_key`: /unlink, and pending keys
  * nobody redeemed), and the GitHub issues a report is filed as (`FeedbackService`'s GitHub sink, when FEEDBACK_REPO
  * and a credential are set). A plugin a deployment did replace is kept.
  */
@@ -41,7 +41,10 @@ export function platformPlugins(plugins: Plugins, deps: PlatformDeps): Plugins {
   const { env, settings, secrets, logger } = deps;
   const identityLookup =
     plugins.identityLookup === noIdentityLookup
-      ? new HttpIdentityLookup(settings.safeApiUrl, (url, init) => deps.fetch(url, init))
+      ? new HttpIdentityLookup(settings.safeApiUrl, (url, init) => deps.fetch(url, init), undefined, {
+          clawApiUrl: settings.clawApiUrl,
+          logger,
+        })
       : plugins.identityLookup;
   const keyRevoker =
     plugins.keyRevoker === noKeyRevoker

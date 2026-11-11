@@ -586,18 +586,19 @@ describe("development environment items and devenv_send", { skip }, () => {
       assert.ok(claimed.ok && claimed.owner === "alice", JSON.stringify(claimed));
       assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 0);
 
-      // A message that came with a key: nobody is attending, so no code, and the model is not sent to devenv_pair for one.
+      // A message that came with the user's key is still their own: a code too (the send itself stays a card).
       const key = await refused(await userTurn(alice, "让开发机上的 claude 跑 ls", false), "ls");
-      assert.equal(key.connect.pairing, undefined);
-      assert.equal(key.connect.commands.length, 4);
-      assert.match(key.message, /no pairing command can be made in this turn \(not_attended\), so do not call devenv_pair/);
+      assert.deepEqual(key.connect.pairing, { expires_in_minutes: 10, single_use: true });
+      assert.equal(key.connect.commands.length, 1);
+      assert.ok(key.connect.text_zh.includes("```\n" + key.connect.commands[0] + "\n```"), key.connect.text_zh);
+      assert.equal(await codes(), 1, "the key's code (the claimed one is gone)");
       // A report answers no message of the user's: refused before any of this.
       await assert.rejects(tools.devenvSend(await w.routerTurn(alice), { text: "ls" }), (e: Recorded) => e.code === "not_from_user");
       assert.equal(await codes(), 1);
 
       // Too many codes this minute: the setup commands, and still not devenv_pair.
-      // (the one made above counts toward the limit too)
-      for (let i = 1; i < pairing.CODES_PER_MINUTE; i++) await pairing.createPairing("alice", "test");
+      // (the two made above count toward the limit too)
+      for (let i = 2; i < pairing.CODES_PER_MINUTE; i++) await pairing.createPairing("alice", "test");
       const limited = await refused(await userTurn(alice, "让开发机上的 claude 跑 ls"), "ls");
       assert.equal(limited.connect.pairing, undefined);
       assert.match(limited.connect.text_zh, /claw-connector init/);
@@ -1865,7 +1866,10 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v14");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v15");
+    // "连接我的开发机" and its kin (a typo too) connect a machine.
+    for (const said of ["连接我的开发机", "连接开发机", "连我的机器", "连接我得开发机"]) assert.ok(section.includes(said), said);
+    assert.doesNotMatch(section, /needs_identity/);
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

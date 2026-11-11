@@ -2892,6 +2892,10 @@ const versionPart = (n: number) =>
 export const PLUGIN_VERSION_ORDER =
   `${versionPart(1)} DESC, ${versionPart(2)} DESC, ${versionPart(3)} DESC, updated_at DESC, id DESC`;
 
+/** What a plugin listing covers; see `listPluginsRepo`. */
+export type PluginListScope = "visible" | "mine" | "public" | "all";
+export const PLUGIN_LIST_SCOPES: readonly PluginListScope[] = ["visible", "mine", "public", "all"];
+
 /** Row shapes from tools/plugins/resources (JSONB columns parsed). */
 export type JsonObject = Record<string, unknown>;
 
@@ -3380,6 +3384,14 @@ export const MarketplaceDb = {
     owner?: string;
     viewerUserId?: string;
     isAdmin: boolean;
+    /**
+     * Which plugins a listing covers (routes/plugins.ts `scope`): `visible` is
+     * public plus the viewer's own, `mine` the viewer's own, `public` the public
+     * ones, `all` every plugin (admins only; the route refuses anyone else).
+     * Absent keeps the older rule: an admin sees everything, anyone else
+     * `visible`.
+     */
+    scope?: PluginListScope;
     includeDeleted: boolean;
     nameExact?: string;
     nameContains?: string;
@@ -3405,8 +3417,18 @@ export const MarketplaceDb = {
       conds.push(`owner_user_id = ${p()}`);
       args.push(params.owner);
     }
-    if (!params.isAdmin) {
-      const uid = params.viewerUserId || "";
+    const uid = params.viewerUserId || "";
+    const scope: PluginListScope = params.scope ?? (params.isAdmin ? "all" : "visible");
+    if (scope === "all" && !params.isAdmin) throw new Error("scope=all is for admins");
+    if (scope === "mine") {
+      // No viewer means nothing is theirs.
+      if (uid) {
+        conds.push(`owner_user_id = ${p()}`);
+        args.push(uid);
+      } else conds.push("false");
+    } else if (scope === "public") {
+      conds.push("is_public = true");
+    } else if (scope === "visible") {
       if (uid) {
         conds.push(`(is_public = true OR owner_user_id = ${p()})`);
         args.push(uid);

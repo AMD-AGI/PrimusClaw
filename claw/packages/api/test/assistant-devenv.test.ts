@@ -594,7 +594,7 @@ describe("devenv_list", { skip }, () => {
     assert.match(b.connect_a_machine.text, /^Your machine box is offline: run `claw-connector service install` on it to bring it back\.\nTo connect a new machine instead: /);
   });
 
-  test("D8c no machine and no pairing for this turn (a report, a key, an old message, no public address, the limit): the setup commands", async () => {
+  test("D8c no machine and no pairing for this turn (a report, an old message, no public address, the limit): the setup commands; a key's message: the pairing", async () => {
     const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
     process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
     process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
@@ -618,11 +618,23 @@ describe("devenv_list", { skip }, () => {
           return { isError: r.isError === true, text: r.content[0].text };
         } finally { await client.close(); }
       };
-      const key = await userTurn(alice, "连接我的开发环境");
+      const key = await userTurn(alice, "连接我的开发机");
       await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
-      unpaired((await call(key)).body, "key", /\(not_attended\)/);
+      // A message that came with the user's key is still their own: the one-line pairing command, as a signed-in one gets
+      // (2026-11-11: a new key user's "连接我得开发机" got the four sign-in commands).
+      const keyBody = (await call(key)).body;
+      assert.deepEqual(keyBody.connect_a_machine.pairing, { expires_in_minutes: 10, single_use: true });
+      assert.equal(keyBody.connect_a_machine.commands.length, 1);
+      assert.match(keyBody.connect_a_machine.commands[0], /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair [0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4} --server https:\/\/claw\.example\.com\/claw-api$/);
+      assert.ok(keyBody.connect_a_machine.text.startsWith("在要连接的机器上打开终端"), keyBody.connect_a_machine.text);
+      assert.ok(keyBody.connect_a_machine.text.includes("```\n" + keyBody.connect_a_machine.commands[0] + "\n```"));
+      assert.equal(keyBody.note.includes("no pairing command can be made"), false);
       const keyPair = await pairTool(key);
-      assert.ok(keyPair.isError && /not_attended/.test(keyPair.text), keyPair.text);
+      assert.ok(!keyPair.isError && /claw-connector pair /.test(keyPair.text), keyPair.text);
+      assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 2);
+      // (out of the way of what follows: no live code, and none counted toward this minute's limit)
+      await w.q("DELETE FROM claw_remote_pairings");
+      await w.q("DELETE FROM claw_remote_audit WHERE owner_user_id = 'alice' AND action = 'pairing.created'");
       const stale = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - interval '2 hours' WHERE message_id = $1", [stale.mid]);
       unpaired((await call(stale)).body, "stale", /\(attendance_expired\)/);
