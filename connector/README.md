@@ -563,7 +563,7 @@ directory only you can enter).
   A plan: *Approve (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep planning*. A
   question (`AskUserQuestion`): its own answers, one card per question. No card switches a session into a mode that stops
   asking (auto, accept edits, bypass).
-- **Nothing is approved unseen.** A card carries the request whole (credentials masked). One too long for that (over 24 KB
+- **Nothing is approved unseen.** A card carries the request whole (credentials masked). One too long for that (over 12 KB
   as JSON) is shown cut and offers only the options that turn it down; it is approved at the terminal.
 - **Which conversations.** Only sessions in a terminal (`CLAUDE_CODE_ENTRYPOINT=cli`); one this connector runs already asks
   through its own cards. The folder must be inside the roots of the agent that reads that Claude config directory (a

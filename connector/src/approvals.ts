@@ -78,7 +78,7 @@ export const MAX_QUESTION_OPTIONS = 4;
  * when the card shows all of it: one that is longer is shown cut, with only the options that turn it down, and has to be
  * approved at the terminal, so nothing can be approved that the owner was not shown. Well inside one event's limit.
  */
-export const CARD_INPUT_MAX = 24 * 1024;
+export const CARD_INPUT_MAX = 12 * 1024;
 export const TOO_LONG_NOTE = "Too long to show in full here: it can only be turned down from the phone; approve it at the terminal.";
 /** What Claude reads when the owner turns a request down from the phone. */
 export const DENIED_MESSAGE = "The user declined this from their phone (Claw).";

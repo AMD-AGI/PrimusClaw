@@ -112,14 +112,14 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     assert.equal(cmd.decide(["allow"]), null);
     assert.equal(cmd.decide(["allow-session"]), null);
     assert.equal(cmd.decide(["deny"])!.behavior, "deny");
-    assert.ok(Buffer.byteLength(JSON.stringify(cmd.cards[0]!.input)) < 32 * 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(cmd.cards[0]!.input)) < 16 * 1024);
 
     const plan = mapRequest(ev(req("ExitPlanMode", { plan: `## Big\n${long}` })))!;
     assert.deepEqual(plan.cards[0]!.options.map((o) => o.optionId), ["plan-keep"]);
     assert.equal(plan.decide(["plan-approve"]), null);
 
     // A plan or command that fits is carried whole, its last line included.
-    const fits = mapRequest(ev(req("ExitPlanMode", { plan: `## Ok\n${"y".repeat(10_000)}\nLAST STEP` })))!;
+    const fits = mapRequest(ev(req("ExitPlanMode", { plan: `## Ok\n${"y".repeat(8_000)}\nLAST STEP` })))!;
     assert.match(JSON.stringify(fits.cards[0]!.input), /LAST STEP/);
     assert.deepEqual(fits.cards[0]!.options.map((o) => o.optionId), ["plan-approve", "plan-keep"]);
   });
