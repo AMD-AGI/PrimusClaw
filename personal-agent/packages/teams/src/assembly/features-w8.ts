@@ -111,6 +111,8 @@ export function w8Parts(
   const reporting = new FeedbackReporting({
     service,
     sessions: store.sessions,
+    assistant: claw.assistant,
+    assistantOn: options.assistantOn,
     credential,
     identity: plugins.identityLookup,
     clock,

@@ -80,6 +80,27 @@ test("in a chat that talks to the assistant the vote is on the assistants sessio
   assert.deepEqual(world.claw.votes, [["ak-alice", "sess-assistant", "teams:say-1", "up", undefined]]);
 });
 
+test("in a chat that talks to the assistant a thumbs down reports the assistants session, not the plain chat session", async () => {
+  const world = linkedWorld({ assistantOn: true });
+  vote(world, "dislike", "it failed every time", "", "say-1");
+  await world.thumbs.settled();
+  assert.deepEqual(world.claw.votes, [["ak-alice", "sess-assistant", "teams:say-1", "down", "it failed every time"]]);
+  const body = world.issues.issues[0]?.body ?? "";
+  assert.ok(body.includes("sess-assistant"), body);
+  assert.ok(!body.includes("sess-1"), "not the plain chat session's turns");
+});
+
+test("when the assistants session cannot be read the report goes without another sessions turns", async () => {
+  const world = linkedWorld({ assistantOn: true });
+  world.claw.assistant.session = () => Promise.reject(new Error("claw is down"));
+  vote(world, "dislike", "bad", "", "say-1");
+  await world.thumbs.settled();
+  const body = world.issues.issues[0]?.body ?? "";
+  assert.equal(world.issues.issues.length, 1, "still filed");
+  assert.ok(!body.includes("sess-1"), body);
+  assert.ok(world.log.lines.some((l) => l.message === "feedback: the assistant's session could not be read"));
+});
+
 test("clawys own thumbs on mobile vote and the comment replaces the vote", async () => {
   const world = linkedWorld();
   await tap(world, "dislike");

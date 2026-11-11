@@ -271,6 +271,18 @@ describe("router quality, pure", () => {
     assert.equal(turnLostNotice(["帮我调研一下"], "stopped"), "已停止。");
     assert.equal(turnLostNotice(["look into it"], "stopped"), "Stopped.");
     assert.equal(turnLostNotice(["[work_event] a report"], "stopped"), null); // (a report's turn answers nobody)
+    // The gateway refused the user's key (and the turn was not run again on the fallback): what to fix, not "say it again".
+    const invalid = "401 {\"error\":{\"message\":\"{ \\\"statusCode\\\": 401, \\\"message\\\": \\\"Access denied due to invalid subscription key. Make sure to provide a valid key for an active subscription.\\\" }\"}}";
+    assert.equal(lostWhy({ ...end, interrupted: false, failed: true, finalText: invalid }), "key_invalid");
+    assert.equal(lostWhy({ ...end, interrupted: false, failed: true, finalText: "403 {\"error\":\"No APIM Key binding found. Please upload your APIM Key\"}" }), "key_missing");
+    assert.equal(lostWhy({ ...end, interrupted: false, failed: true, finalText: `The gateway said: ${invalid}` }), "failed");
+    assert.equal(lostWhy({ ...end, interrupted: true, fromSweeper: true, finalText: invalid }), "failed");
+    const zh = turnLostNotice(["为什么没有回答我？"], "key_invalid")!;
+    assert.match(zh, /^你绑定的 APIM Key 无效或已过期/);
+    assert.doesNotMatch(zh, /请再说一次/);
+    assert.match(turnLostNotice(["why no answer?"], "key_invalid")!, /^The APIM key bound to your key is invalid or expired/);
+    assert.match(turnLostNotice(["帮我看看"], "key_missing")!, /^你的 key 还没有绑定 APIM Key/);
+    assert.equal(turnLostNotice(["[work_event] a report"], "key_invalid"), null);
   });
 
   test("Q1 an item number without its title is found; one that names the item, or is not an item's, is not", async () => {
