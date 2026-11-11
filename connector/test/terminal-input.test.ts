@@ -10,14 +10,14 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import test, { after, describe } from "node:test";
+import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
 import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { wholeLinesOf } from "../src/session.js";
-import { Harness, tmpdir } from "./support/harness.js";
+import { Harness, onCleanup, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const FAKE_TERMINAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "support", "fake-terminal.mjs");
@@ -146,8 +146,10 @@ const needTmux = process.env.CI === "true";
 
 const servers: string[] = [];
 const hs: Harness[] = [];
-after(async () => {
-  for (const h of hs) await h.close();
+// Before the temporary directories go (onCleanup runs ahead of their removal): a server whose socket was removed first can no longer
+// be told to stop, and its pane's stand-in outlived the run.
+onCleanup(async () => {
+  for (const h of hs) { try { await h.close(); } catch { /* the servers below still go */ } }
   // Only the servers this file started, by their own sockets.
   for (const s of servers) { try { execFileSync("tmux", ["-S", s, "kill-server"], { stdio: "ignore" }); } catch { /* gone */ } }
 });
