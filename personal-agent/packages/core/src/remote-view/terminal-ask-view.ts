@@ -14,7 +14,7 @@
 import type { Lang } from "../locales/lang.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 import type { DecisionButton } from "../remote/actions.js";
-import { breakLinks, lit, masked, neutral, plain } from "../remote/inert.js";
+import { breakLinks, lit, masked, neutral } from "../remote/inert.js";
 import { type PermissionOption, shownOptions } from "../remote/options.js";
 import type { Reported } from "../remote/reported.js";
 import { redactText } from "../security/redact.js";
@@ -82,14 +82,19 @@ const record = (v: unknown): Reported | undefined =>
   v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Reported) : undefined;
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 
+/** The characters a fixed-width block escapes: markdown's (`plain`'s) and `>`, the backslash among them. */
+const CODE_MARKUP = /[\\`*_[\]<>]/g;
 /**
- * `<` and `>` escaped as markdown, shown as themselves: a card must show a command's `>` as `>`, not as a look-alike (no tag
- * can be built in a card either way). `](` gets a zero-width space inside, so no link can be built.
+ * `<` and `>` in words escaped as markdown, with every backslash in the run right before one (so `\<` is still shown as
+ * written): shown as themselves, not as look-alikes (a card must show a `>` as `>`; no tag can be built in a card either way).
+ * A run of backslashes is matched whole, so the scan stays linear.
  */
-const angles = (v: string): string => v.replace(/[<>]/g, "\\$&");
+const ANGLES = /\\+[<>]?|[<>]/g;
+const angles = (v: string): string =>
+  v.replace(ANGLES, (run) => (/[<>]$/.test(run) ? run.replace(/[\\<>]/g, "\\$&") : run));
 /** Text shown as it is, in a fixed-width font: credentials masked, no link or markup can be built from it. */
-const codeText = (v: string): string => plain(breakLinks(masked(v))).replace(/>/g, "\\>");
-/** Text whose markdown (lists, bold) is kept, but no link can be built from it. */
+const codeText = (v: string): string => breakLinks(masked(v)).replace(CODE_MARKUP, "\\$&");
+/** Text whose markdown (lists, bold) is kept, but no link can be built from it (`](` gets a zero-width space inside). */
 const wordsText = (v: string): string => breakLinks(angles(masked(v)).replaceAll("](", "]\u200b("));
 
 /**

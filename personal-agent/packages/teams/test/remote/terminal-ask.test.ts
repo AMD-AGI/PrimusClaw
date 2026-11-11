@@ -481,6 +481,21 @@ test("review round 6: a request the card cannot show as it is (a credential mask
   const mono = (redirect["body"] as Json[]).find((b) => b["fontType"] === "Monospace");
   assert.equal(mono?.["text"], "cat /tmp/config.json \\> /tmp/out.json \\< /dev/null");
   assert.deepEqual(ids(redirect), ["allow", "allow-session", "deny", "deny-stop"]);
+  // In words (a plan), the same, with the backslashes right before an angle escaped too: shown as written.
+  const plan = remoteView.terminalAskView(
+    {
+      ask: { ...ask({ plan: "use a\\<b and x > y, then \\*keep\\* this" }), kind: "switch_mode", tool: "Plan" },
+      options: remoteDomain.parseOptions(COMMAND_OPTIONS),
+      sessionId: "s-1",
+      machine: "dev-pod",
+      agent: "claude",
+    },
+    "en",
+  );
+  assert.deepEqual(
+    plan.sections.map((x) => (x.type === "words" ? x.text : "")),
+    ["use a\\\\\\<b and x \\> y, then \\*keep\\* this"],
+  );
   // Line breaks, tabs and markup are shown as they are: still approvable.
   assert.deepEqual(ids(card(ask({ command: 'for f in *.ts; do\n\techo "$f" > out_$f; done' }))), [
     "allow",
