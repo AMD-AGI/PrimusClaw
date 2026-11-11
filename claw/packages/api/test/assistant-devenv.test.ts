@@ -620,12 +620,38 @@ describe("devenv_list", { skip }, () => {
       };
       const key = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
-      unpaired((await call(key)).body, "key", /\(not_attended\)/);
+      const keyBody = (await call(key)).body;
+      unpaired(keyBody, "key", /\(not_attended\)/);
+      // A key, not a confirmed identity: the answer first says to confirm it once and ask again for the one line, then the sign-in
+      // way (2026-11-11: a new user with a key was given only the four setup commands for "连接我的开发机").
+      const { IDENTITY_FIRST } = await import("../src/assistant/devenv-tools.js");
+      assert.equal(keyBody.connect_a_machine.needs_identity, true);
+      assert.ok(keyBody.connect_a_machine.text.startsWith(
+        "先确认一次身份（点聊天里的身份确认卡片，打开链接确认一次），确认后再说“连接我的开发机”，我就给你一行命令，在机器上运行就能连上。\n"
+        + "不想现在确认的话，也可以用登录方式连接：\n在要使用的机器上",
+      ), keyBody.connect_a_machine.text);
+      for (const c of keyBody.connect_a_machine.commands) assert.ok(keyBody.connect_a_machine.text.includes(c), c);
+      assert.match(keyBody.note, /\(not_attended\)[^]*confirm their identity once on the card[^]*never say you cannot connect it for them/);
+      assert.ok(IDENTITY_FIRST.en.startsWith("First confirm your identity once"));
       const keyPair = await pairTool(key);
       assert.ok(keyPair.isError && /not_attended/.test(keyPair.text), keyPair.text);
+      const enKey = await userTurn(alice, "connect my dev machine");
+      await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [enKey.mid]);
+      const enKeyBody = (await call(enKey)).body;
+      assert.equal(enKeyBody.connect_a_machine.text, IDENTITY_FIRST.en + enKeyBody.connect_a_machine.text.slice(IDENTITY_FIRST.en.length));
+      assert.match(enKeyBody.connect_a_machine.text.slice(IDENTITY_FIRST.en.length), /^On the machine you want to use/);
+      // The refusal is noted on the message, so the turn's say tells the channel to offer the identity card.
+      const marked = async (mid: string) => (await w.q(
+        "SELECT identity_refused_at IS NOT NULL AS m FROM claw_assistant_messages WHERE message_id = $1", [mid]))[0].m;
+      assert.equal(await marked(key.mid), true);
       const stale = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - interval '2 hours' WHERE message_id = $1", [stale.mid]);
-      unpaired((await call(stale)).body, "stale", /\(attendance_expired\)/);
+      const staleBody = (await call(stale)).body;
+      unpaired(staleBody, "stale", /\(attendance_expired\)/);
+      // Any other refusal is as it was: the setup commands alone, nothing about the identity, and nothing noted.
+      assert.equal(staleBody.connect_a_machine.needs_identity, undefined);
+      assert.match(staleBody.connect_a_machine.text, /^在要使用的机器上/);
+      assert.equal(await marked(stale.mid), false);
       const stalePair = await pairTool(stale);
       assert.ok(stalePair.isError && /attendance_expired/.test(stalePair.text), stalePair.text);
       assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 0);

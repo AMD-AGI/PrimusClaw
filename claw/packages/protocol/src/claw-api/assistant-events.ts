@@ -177,6 +177,11 @@ export interface AssistantSayPayload extends AssistantEventBase {
   replaces?: string;
   /** The message id of the turn a system notice answers or a router say belongs to (what an `amends` or a `replaces` is matched by). */
   turn_message_id?: string;
+  /**
+   * Present when the turn was refused something only the person may do because their message came with a key, not with a confirmed
+   * identity (`not_attended`): a channel that can bind the person's identity offers it with this message; one that cannot ignores it.
+   */
+  needs_identity?: true;
 }
 
 /** The system's own message, sent when an item has needed the user for a while and nobody has said so. */

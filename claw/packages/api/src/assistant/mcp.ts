@@ -39,7 +39,7 @@ import {
 import { deliverText, TEXT_DELIVERY_MAX_BYTES } from "./text-delivery.js";
 import { type AssistantTokenClaims, verifyAssistantToken } from "./token.js";
 import {
-  modelDefaultSet, report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
+  modelDefaultSet, noteIdentityRefused, report, say, ToolRefused, workCreate, workRecall, workSend, workStop, type RecallDetail,
 } from "./tools.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
@@ -79,6 +79,7 @@ async function answer(
   } catch (err) {
     if (err instanceof ToolRefused) {
       logger.info({ sid: claims.sid, tool: name, code: err.code }, "assistant.tool_refused");
+      if (err.code === "not_attended") await noteIdentityRefused(claims);
       return result({ ok: false, error: err.code, message: err.message, ...(err.data ? { data: err.data } : {}) }, true);
     }
     logger.error({ err, sid: claims.sid, tool: name }, "assistant.tool_failed");

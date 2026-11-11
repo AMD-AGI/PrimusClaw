@@ -1865,7 +1865,10 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v14");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v15");
+    // "连接我的开发机" and its kin (a typo too) connect a machine; a message with a key is told to confirm its identity first.
+    for (const said of ["连接我的开发机", "连接开发机", "连我的机器", "连接我得开发机"]) assert.ok(section.includes(said), said);
+    assert.match(section, /connect_a_machine with needs_identity[^\n]*confirm their identity once on the card[^\n]*never say you cannot connect it for them/);
     // The plain-words control: a new session, a session named by when it was used, back to the assistant with nothing to run.
     assert.match(section, /new_session: true when they ask for a new session/);
     assert.match(section, /昨天那个会话/);

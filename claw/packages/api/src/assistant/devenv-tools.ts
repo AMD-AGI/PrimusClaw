@@ -36,7 +36,7 @@ import { connectorSetup, outdatedMessage, versionVerdict, type ConnectorVersionV
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import { assertLiveRun, attendedTurn, noteIdentityRefused, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
 
 const logger = pino({ name: "assistant-devenv" });
@@ -327,6 +327,8 @@ export interface DevenvList {
    */
   connect_a_machine?: {
     commands: string[]; text: string; pairing?: { expires_in_minutes: number; single_use: true };
+    /** No pairing because the message came with a key: `text` first says to confirm their identity once, then the setup commands. */
+    needs_identity?: true;
     /** Every machine of the user's is offline: `text` first says how to bring them back, then how to connect a new one. */
     all_offline?: true;
   };
@@ -362,7 +364,10 @@ async function mayPairHere(claims: AssistantTokenClaims): Promise<PairGate> {
     await devenvToolPorts.pairingTurn((text, params) => db.query(text, params), claims);
     return { may: true };
   } catch (err) {
-    if (err instanceof ToolRefused) return { may: false, refused: err.code };
+    if (err instanceof ToolRefused) {
+      if (err.code === "not_attended") await noteIdentityRefused(claims);
+      return { may: false, refused: err.code };
+    }
     logger.warn({ err, sid: claims.sid }, "assistant.devenv_pairing_check_failed");
     return { may: false };
   }
@@ -378,13 +383,31 @@ export interface ConnectNew {
   text: { zh: string; en: string };
   pairing?: { expires_in_minutes: number; single_use: true };
   refused?: string;
+  /** No pairing because the user's message came with a key: confirming their identity once gets them one (`IDENTITY_FIRST`). */
+  needs_identity?: true;
 }
+
+/**
+ * What a user whose message came with a key (no identity confirmed, `not_attended`) is told first: confirming their identity once is
+ * what gets them the one-line command; the setup commands follow as the other way. A new user with a key who said "连接我的开发机"
+ * was given only the four setup commands, and nothing said why there was no one-line command or how to get one (2026-11-11 10:24Z).
+ */
+export const IDENTITY_FIRST = {
+  zh: "先确认一次身份（点聊天里的身份确认卡片，打开链接确认一次），确认后再说“连接我的开发机”，我就给你一行命令，在机器上运行就能连上。"
+    + "\n不想现在确认的话，也可以用登录方式连接：\n",
+  en: "First confirm your identity once (open the identity confirmation card in this chat and confirm), then say \"connect my dev machine\" "
+    + "again and I will give you one command line that connects it.\nOr, without confirming now, connect it with the sign-in way:\n",
+} as const;
 
 async function connectNew(claims: AssistantTokenClaims, gate: PairGate): Promise<ConnectNew> {
   const setup = (): ConnectNew => {
     const s = connectorSetup();
     return { commands: s.steps.map((x) => x.command), text: { zh: s.text.zh, en: s.text.en } };
   };
+  if (!gate.may && gate.refused === "not_attended") {
+    const s = setup();
+    return { ...s, text: { zh: IDENTITY_FIRST.zh + s.text.zh, en: IDENTITY_FIRST.en + s.text.en }, refused: gate.refused, needs_identity: true };
+  }
   if (!gate.may) return gate.refused ? { ...setup(), refused: gate.refused } : setup();
   try {
     const p = await devenvPair(claims) as { command: string; expires_in_minutes: number };
@@ -411,6 +434,10 @@ export const PAIRED_NOTE = " The user has no machine connected: connect_a_machin
 const unpairedNote = (code: string): string => " The user has no machine connected, and no pairing command can be made for them in this "
   + `turn (${code}): give them connect_a_machine.text as it is (the commands are exact; do not change or shorten them). Do not call `
   + "devenv_pair: it is refused here too."
+  + (code === "not_attended"
+    ? " Its first sentence tells them to confirm their identity once on the card in this chat and then ask again for a one-line "
+      + "command: keep that sentence first; never say you cannot connect it for them."
+    : "")
   + (code === "rate_limited" ? " They can also ask again in a minute for a one-line pairing command instead." : "");
 const noteFor = (c: ConnectNew): string => (c.pairing ? PAIRED_NOTE : c.refused ? unpairedNote(c.refused) : SETUP_NOTE);
 
@@ -545,6 +572,7 @@ export async function devenvList(
           commands: allOffline ? [RESTART_COMMAND, ...made.commands] : made.commands,
           text: allOffline ? allOfflineText(all.map((m) => m.machine ?? "?"), zh ? made.text.zh : made.text.en, zh) : zh ? made.text.zh : made.text.en,
           ...(made.pairing ? { pairing: made.pairing } : {}),
+          ...(made.needs_identity ? { needs_identity: true as const } : {}),
           ...(allOffline ? { all_offline: true as const } : {}),
         },
       }
@@ -1146,6 +1174,7 @@ export async function devenvSend(claims: AssistantTokenClaims, args: DevenvSendA
       throw new ToolRefused("no_machine", `${planned.message}: nothing was sent. ${sendConnectMessage(made)}${NO_MACHINE_NOTE}`, {
         connect_a_machine: {
           commands: made.commands, text_en: made.text.en, text_zh: made.text.zh, ...(made.pairing ? { pairing: made.pairing } : {}),
+          ...(made.needs_identity ? { needs_identity: true } : {}),
         },
       });
     }

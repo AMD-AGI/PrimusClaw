@@ -100,6 +100,8 @@ export interface SayInput {
   amendNotice?: boolean;
   /** The replies it suggests, already checked (`suggested.ts`): carried by its event as `suggested_replies`. */
   suggested?: string[];
+  /** The turn was refused something for want of a confirmed identity (`markIdentityRefused`): carried by its event as `needs_identity`. */
+  needsIdentity?: boolean;
   /**
    * The item the report that woke this turn is about, when that report said the item came from a session the user deleted
    * (`earlierConversationItemOf`): a message about that item starts with where it came from (`MOVED_PREFIX_ZH`/`_EN`), as the system's
@@ -176,6 +178,7 @@ type ToStore =
     turnMessageId?: string;
     /** A development environment session's own message (`remote-items.ts`). */
     remote?: AssistantRemoteNotice;
+    needsIdentity?: boolean;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow; heldWrite?: AssistantHeldWrite });
 
@@ -194,6 +197,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...(m.replaces ? { replaces: m.replaces } : {}),
       ...((m.noticeOfTurn ?? m.turnMessageId) ? { turn_message_id: m.noticeOfTurn ?? m.turnMessageId } : {}),
       ...(m.remote ? { remote: redactedRemote(m.remote) } : {}),
+      ...(m.needsIdentity ? { needs_identity: true as const } : {}),
     };
 }
 
@@ -326,6 +330,7 @@ async function sendSayEvent(
     ...(payload.type === "assistant.say" && payload.amends ? { amends: payload.amends } : {}),
     ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
     ...(payload.type === "assistant.say" && payload.remote ? { remote: payload.remote } : {}),
+    ...(payload.type === "assistant.say" && payload.needs_identity ? { needs_identity: true } : {}),
     // A write the item's worker holds for the person: the card a channel draws from its `approval.requested`, for a reader of the session.
     ...(payload.type === "work_item.needs_you" && payload.held_write ? { held_write: payload.held_write } : {}),
     fallback: payload.type === "work_item.needs_you",
@@ -652,6 +657,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       return storeOne({
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text: said, item, sources: input.sources, suggested: input.suggested,
         ...(input.turnMessageId ? { turnMessageId: input.turnMessageId } : {}),
+        ...(input.needsIdentity ? { needsIdentity: true } : {}),
         // After the turn's start notice a say adds to that notice (`amends`); otherwise a later say takes the place of the turn's first one.
         ...(notice ? { amends: notice } : replaces ? { replaces } : {}),
         ...(input.holdForTurn ? { hold: { status: heldStatus(input.holdForTurn), seconds: HOLD_SECONDS } } : {}),
