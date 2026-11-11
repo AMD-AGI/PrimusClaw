@@ -1451,21 +1451,74 @@ export function fitResumable(base: Record<string, unknown>, items: Resumable[], 
 export interface TranscriptUpdate {
   /**
    * `turn_done`: the terminal finished a turn (Claude Code's `turn_duration` line); never sent on, it ends a typed prompt's turn.
+   * `turn_interrupted`: Claude Code's own `[Request interrupted by user]` note; never sent on, it ends that turn as cancelled.
    * A prompt submitted while a turn runs is queued by Claude Code, and these say what became of it (never sent on either):
    * `queued` (`queue-operation` enqueue, `update.text` the prompt: it was taken, and waits), `queued_taken` (a `queued_command`
    * attachment, `update.text` the prompt: the running turn took it in), `queue_withdrawn` (`popAll`: the queue went back into the
    * terminal's box, to be edited there).
    */
-  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done" | "queued" | "queued_taken" | "queue_withdrawn";
+  type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done" | "turn_interrupted" | "queued" | "queued_taken" | "queue_withdrawn";
   update: Record<string, unknown>;
 }
 
 const MAX_TOOL_TITLE = 200;
 
+/** `promptSource` of a prompt a person gave (measured on Claude Code 2.1.285-2.1.319): typed at the terminal, a queued one
+ * that came out of the queue, an accepted suggestion, or sent through the SDK. Claude Code's own say `system`. */
+const PERSON_SOURCES: ReadonlySet<string> = new Set(["typed", "queued", "suggestion_accepted", "sdk"]);
+
+/**
+ * How the turns Claude Code writes for itself begin, for an entry that says nothing about where it came from (a Claude Code
+ * older than `promptSource`/`origin`, or one of its lines that never carries them: a slash command's tags and output, a `!`
+ * command's input and output, a compacted conversation's summary). Only the start of the text is looked at: a person's prompt
+ * that mentions `<task-notification>` in a sentence is still theirs.
+ */
+const HARNESS_TEXT = new RegExp(
+  "^(?:<(?:task-notification|cross-session-message|agent-message|system-reminder|local-command-|command-(?:name|message|args)>"
+  + "|bash-(?:input|stdout|stderr)>|user-prompt-submit-hook)"
+  + "|Another Claude session sent a message:|This session is being continued from a previous conversation"
+  + "|\\[Request interrupted by user)",
+);
+
+/**
+ * Whether the words of a `user` entry are a person's prompt, rather than a turn Claude Code wrote itself: a background task's
+ * or a sub-agent's notification, a message from another session, a scheduled prompt, a reminder, a hook's or a command's
+ * output, a compacted conversation's summary, a tool's result. What the entry says of itself decides (`isMeta`,
+ * `isCompactSummary`, `toolUseResult`, `origin.kind`, `promptSource`); only an entry that says nothing is judged by how its
+ * text begins ({@link HARNESS_TEXT}).
+ */
+export function isPersonPrompt(doc: Record<string, unknown>, text: string): boolean {
+  if (doc.isMeta === true || doc.isCompactSummary === true || doc.isVisibleInTranscriptOnly === true || "toolUseResult" in doc) return false;
+  const kind = isObject(doc.origin) && typeof doc.origin.kind === "string" ? doc.origin.kind : null;
+  if (kind !== null) return kind === "human";
+  if (typeof doc.promptSource === "string") return PERSON_SOURCES.has(doc.promptSource);
+  return !HARNESS_TEXT.test(text.trimStart());
+}
+
+/**
+ * A pasted block as Claude Code records it in a prompt (measured on 2.1.285-2.1.319): a paste of several lines shows in the box as
+ * `[Pasted text #n +k lines]`, and the prompt, the queue and the transcript have that placeholder replaced by
+ * `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n`.
+ */
+const PASTED_RE = /\n*<pasted_content id="([^"\s<>]{1,64})">\n([\s\S]*?)\n<\/pasted_content id="\1">\n*/g;
+
+/**
+ * `text` with each pasted block as the text that was pasted, on lines of its own: what the person (or the phone, whose message is
+ * typed as one paste) gave, as it was given.
+ */
+export function unwrapPasted(text: string): string {
+  if (!text.includes("<pasted_content ")) return text;
+  return text.replace(PASTED_RE, (_m, _id: string, inner: string, at: number, whole: string) => {
+    const end = at + _m.length;
+    return `${at > 0 ? "\n" : ""}${inner}${end < whole.length ? "\n" : ""}`;
+  });
+}
+
 /**
  * What one line of a Claude Code transcript shows a phone: the user's words, the agent's words, the steps it starts and how
- * they end. Thinking, sub-agent lines (`isSidechain`), lines Claude Code adds for itself (`isMeta`, summaries, snapshots) and
- * anything that does not parse are nothing. Read-only: the line is never written back, and nothing here runs.
+ * they end. Thinking, sub-agent lines (`isSidechain`), lines Claude Code adds for itself (`isMeta`, summaries, snapshots),
+ * user turns that are not a person's prompt ({@link isPersonPrompt}) and anything that does not parse are nothing. Read-only:
+ * the line is never written back, and nothing here runs.
  */
 export function transcriptUpdates(line: string): TranscriptUpdate[] {
   let doc: unknown;
@@ -1473,20 +1526,27 @@ export function transcriptUpdates(line: string): TranscriptUpdate[] {
   if (!isObject(doc) || doc.isSidechain === true || doc.isMeta === true) return [];
   if (doc.type === "system" && doc.subtype === "turn_duration") return [{ type: "turn_done", update: {} }];
   if (doc.type === "queue-operation") {
-    if (doc.operation === "enqueue" && typeof doc.content === "string") return [{ type: "queued", update: { text: doc.content } }];
+    if (doc.operation === "enqueue" && typeof doc.content === "string") return [{ type: "queued", update: { text: unwrapPasted(doc.content) } }];
     if (doc.operation === "popAll") return [{ type: "queue_withdrawn", update: {} }];
     return [];
   }
   if (doc.type === "attachment") {
     const a = isObject(doc.attachment) ? doc.attachment : null;
-    if (a?.type === "queued_command" && typeof a.prompt === "string") return [{ type: "queued_taken", update: { text: a.prompt } }];
+    if (a?.type === "queued_command" && typeof a.prompt === "string") return [{ type: "queued_taken", update: { text: unwrapPasted(a.prompt) } }];
     return [];
   }
   if (doc.type !== "user" && doc.type !== "assistant") return [];
   const msg = isObject(doc.message) ? doc.message : null;
   if (!msg) return [];
-  const text = (type: "user_message_chunk" | "agent_message_chunk", t: string): TranscriptUpdate[] =>
-    t.trim() ? [{ type, update: { sessionUpdate: type, content: { type: "text", text: t } } }] : [];
+  const user = doc;
+  const text = (type: "user_message_chunk" | "agent_message_chunk", t: string): TranscriptUpdate[] => {
+    if (!t.trim()) return [];
+    if (type === "user_message_chunk") {
+      if (!isPersonPrompt(user, t)) return t.trimStart().startsWith(INTERRUPTED) ? [{ type: "turn_interrupted", update: {} }] : [];
+      t = unwrapPasted(t);
+    }
+    return [{ type, update: { sessionUpdate: type, content: { type: "text", text: t } } }];
+  };
   if (typeof msg.content === "string") return text(doc.type === "user" ? "user_message_chunk" : "agent_message_chunk", msg.content);
   if (!Array.isArray(msg.content)) return [];
   const out: TranscriptUpdate[] = [];

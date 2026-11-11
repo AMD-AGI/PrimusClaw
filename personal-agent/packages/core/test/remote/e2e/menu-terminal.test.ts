@@ -236,6 +236,16 @@ test("what is typed at the shared terminal shows on the phone before its reply a
     // (history replayed on attach, and what Claude Code writes as the user's turn itself, are not words typed now)
     await w.server.emit(sid, "user_message_chunk", chunk("user_message_chunk", "an old prompt", { replay: true }));
     await w.server.emit(sid, "user_message_chunk", chunk("user_message_chunk", "<command-name>/clear</command-name>"));
+    // (from a connector that passes on the turns Claude Code takes on its own: a background task's notification, a message from
+    // another session or a sub-agent, a compacted conversation's summary)
+    for (const own of [
+      "<task-notification>\n<task-id>a0b1c2d3e4f5a6b7c</task-id>\n<output-file>/tmp/claude-0/x/tasks/a0b1.output</output-file>\n</task-notification>",
+      'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/cc-socks/1.sock">\nplease rebase\n</cross-session-message>',
+      '<agent-message from="a0123456789abcdef">\ndone\n</agent-message>',
+      "This session is being continued from a previous conversation that ran out of context.",
+    ]) {
+      await w.server.emit(sid, "user_message_chunk", chunk("user_message_chunk", own));
+    }
     await w.server.emit(sid, "user_message_chunk", chunk("user_message_chunk", "run the linter\nthen tell me"));
     await w.server.emit(sid, "agent_message_chunk", chunk("agent_message_chunk", "Lint is clean."));
     await w.until(() => w.said().some((t) => t.includes("Lint is clean.")));
@@ -249,6 +259,10 @@ test("what is typed at the shared terminal shows on the phone before its reply a
     const reply = said.findIndex((t) => t.includes("Lint is clean."));
     assert.ok((typed[0] ?? Infinity) < reply, "the prompt comes before its reply");
     assert.ok(!said.some((t) => t.includes("an old prompt") || t.includes("/clear")));
+    assert.ok(
+      !said.some((t) => /task-id|tasks\/a0b1|please rebase|agent-message|previous conversation/.test(t)),
+      said.join(" | "),
+    );
     // leaving the conversation sends the connector nothing: the terminal keeps it, untouched
     await w.say("/agent detach");
     await w.idle();

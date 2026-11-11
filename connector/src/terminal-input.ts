@@ -332,14 +332,15 @@ function displayWidth(x: string): number {
  * more or less. A text line goes on to the next box line only where the box wrapped it, which the widths tell (`widths`: each box
  * row's columns, prompt or indent included; `boxWidth`: the rule's): at a space, when the next word would not have fit on the row
  * (the space is not drawn); inside a word, when the next character would not have fit. A row that ends short of that is a line break of the text, never
- * a wrap. Runs of whitespace count as one space (the box draws them so). Measured on Claude Code 2.1.285, a 200-column pane: rows
- * filled to at most 199 columns.
+ * a wrap. Runs of whitespace count as one space (the box draws them so). Measured on Claude Code 2.1.285 and 2.1.322, 2026-11-11, in
+ * panes 80, 120, 151 and 200 columns wide (the rule as wide as the pane): rows filled to at most two columns short of the rule (118 of
+ * 120), its prompt or indent included; a wide character that would take the last of those columns goes to the next row.
  */
 function heldExactly(lines: string[], widths: number[], boxWidth: number, text: string): boolean {
   const norm = (x: string) => x.replace(/\s+/g, " ").trim();
   const want = text.split("\n").map(norm);
   const got = lines.map(norm);
-  const limit = boxWidth - 1;
+  const limit = boxWidth - 2;
   let g = 0;
   for (const line of want) {
     // (an empty line of the text is an empty line of the box)

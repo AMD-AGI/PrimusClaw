@@ -34,6 +34,8 @@
  * FAKE_DIALOG_ON_KEY=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the screen read and the keys. The question shows
  * as the first input arrives, before it is read; while it shows, a typed digit answers it ("approved", as Claude Code 2.1.285 takes a
  * lone `1`) and a paste is dropped (as Claude Code drops one, measured 2026-11-10).
+ * FAKE_PASTE_REF=1: a paste of several lines shows in the box as `[Pasted text #n +k lines]`, and the prompt (and the queue) records
+ * it as Claude Code 2.1.285-2.1.319 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
  */
 import fs from "node:fs";
 
@@ -47,6 +49,15 @@ let buffer = "";
 let pasting = false;
 let working = false;
 let pending = "";
+let pasted = "";
+const pastes = new Map();
+/** `text` with each `[Pasted text #n +k lines]` it holds as the prompt records it (FAKE_PASTE_REF=1). */
+const expand = (text) => text.replace(/\[Pasted text #(\d+) \+\d+ lines\]/g, (m, n) => {
+  const p = pastes.get(Number(n));
+  if (p === undefined) return m;
+  const id = (0x1000 + Number(n)).toString(16);
+  return `\n\n<pasted_content id="${id}">\n${p}\n</pasted_content id="${id}">\n`;
+});
 const modeFile = process.env.FAKE_MODE_FILE;
 // Claude Code's own table (indicator per mode id), as the connector reads it back.
 const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "accept edits", bypassPermissions: "bypass permissions", dontAsk: "don't ask", auto: "auto mode" };
@@ -115,7 +126,7 @@ function submit() {
   const text = buffer;
   buffer = "";
   if (!text.trim()) return draw();
-  line({ type: "user", message: { role: "user", content: text }, promptSource: "typed", origin: { kind: "human" } });
+  line({ type: "user", message: { role: "user", content: expand(text) }, promptSource: "typed", origin: { kind: "human" } });
   runTurn(text, workMs);
 }
 
@@ -128,10 +139,15 @@ process.stdin.on("data", (chunk) => {
   if (process.env.FAKE_DIALOG_AT_ENTER === "1" && !dialogShown && !pasting && chunk.includes("\r")) showDialog();
   pending += chunk;
   while (pending) {
-    if (pending.startsWith("\x1b[200~")) { pasting = true; pending = pending.slice(6); continue; }
+    if (pending.startsWith("\x1b[200~")) { pasting = true; pasted = ""; pending = pending.slice(6); continue; }
     if (pending.startsWith("\x1b[201~")) {
       pasting = false;
       pending = pending.slice(6);
+      if (process.env.FAKE_PASTE_REF === "1" && pasted.includes("\n")) {
+        const n = pastes.size + 1;
+        pastes.set(n, pasted);
+        buffer = buffer.slice(0, buffer.length - pasted.length) + `[Pasted text #${n} +${pasted.split("\n").length - 1} lines]`;
+      }
       if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown && buffer) showDialog();
       continue;
     }
@@ -158,7 +174,10 @@ process.stdin.on("data", (chunk) => {
     }
     const ch = pending[0];
     pending = pending.slice(1);
-    if (pasting) { if (!(dialog && process.env.FAKE_DIALOG_ON_KEY === "1")) buffer += ch === "\r" ? "\n" : ch; continue; }
+    if (pasting) {
+      if (!(dialog && process.env.FAKE_DIALOG_ON_KEY === "1")) { const c = ch === "\r" ? "\n" : ch; buffer += c; pasted += c; }
+      continue;
+    }
     if (dialog && process.env.FAKE_DIALOG_ON_KEY === "1" && /[0-9]/.test(ch)) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
     if (ch === "\r") {
       if (dialog) {
@@ -171,7 +190,7 @@ process.stdin.on("data", (chunk) => {
       else if (buffer.trim()) {
         // (Claude Code queues it: taken at the running turn's next step, or once it ends)
         queue.push(buffer);
-        line({ type: "queue-operation", operation: "enqueue", content: buffer });
+        line({ type: "queue-operation", operation: "enqueue", content: expand(buffer) });
         buffer = "";
       }
       continue;
