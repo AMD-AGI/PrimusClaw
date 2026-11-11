@@ -4,7 +4,7 @@
 /** How Teams shows the remote-agent views. */
 import type { Renderers } from "../registry.js";
 import { agentsCard } from "./agents-card.js";
-import { decidedCard, permissionCard, remoteAskCard } from "./permission-cards.js";
+import { decidedCard, permissionCard, remoteAskCard, terminalAskCard } from "./permission-cards.js";
 import { sessionsCard } from "./sessions-card.js";
 import { disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 import { hiddenCard } from "./hidden-card.js";
@@ -12,7 +12,7 @@ import { statusCard } from "./status-card.js";
 import { windowCard } from "./window-card.js";
 
 export { agentsCard, conversationBlocks } from "./agents-card.js";
-export { decidedCard, permissionCard, remoteAskCard } from "./permission-cards.js";
+export { decidedCard, permissionCard, remoteAskCard, terminalAskCard } from "./permission-cards.js";
 export { connectBlocks, sessionsCard } from "./sessions-card.js";
 export { disconnectButtons, disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 export { hiddenCard } from "./hidden-card.js";
@@ -26,6 +26,7 @@ type RemoteRenderers = Pick<
   | "remoteStatus"
   | "remotePermission"
   | "remoteAsk"
+  | "terminalAsk"
   | "remoteDecided"
   | "remoteDisconnect"
   | "remoteTakeover"
@@ -42,6 +43,7 @@ export const REMOTE_RENDERERS: RemoteRenderers = {
   remoteStatus: statusCard,
   remotePermission: permissionCard,
   remoteAsk: remoteAskCard,
+  terminalAsk: terminalAskCard,
   remoteDecided: decidedCard,
   remoteDisconnect: disconnectCard,
   remoteTakeover: takeoverCard,

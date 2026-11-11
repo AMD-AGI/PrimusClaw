@@ -123,22 +123,36 @@ export function suggestedRepliesOf(event: Event, text: string, styleOn: boolean,
 }
 
 export interface RemoteNotice {
-  readonly kind: "done" | "needs_you" | "error";
+  /** `resolved`: a question a terminal asked no longer waits here (answered there, or given up); `resolved` says which. */
+  readonly kind: "done" | "needs_you" | "error" | "resolved";
   readonly sessionId: string;
   readonly ask: Event | undefined;
   readonly machine: string;
   readonly agent: string;
+  readonly resolved?: { readonly actionId: string; readonly by: string };
+}
+
+const REMOTE_KINDS = new Set(["done", "needs_you", "error", "resolved"]);
+
+/** A `resolved` notice's request and who ended it; undefined when it names no request. */
+function resolvedOf(remote: Event): RemoteNotice["resolved"] {
+  const resolved = record(remote["resolved"]);
+  const actionId = resolved?.["action_id"];
+  return resolved && typeof actionId === "string" && actionId ? { actionId, by: field(resolved["by"]) } : undefined;
 }
 
 /** What an `assistant.say` says of an agent session on the person's machine, or undefined for any other message. */
 export function remoteNoticeOf(event: Event): RemoteNotice | undefined {
   const remote = event["type"] === "assistant.say" ? record(event["remote"]) : undefined;
   const kind = remote?.["kind"];
-  if (remote === undefined || (kind !== "done" && kind !== "needs_you" && kind !== "error")) return undefined;
+  if (remote === undefined || typeof kind !== "string" || !REMOTE_KINDS.has(kind)) return undefined;
   const sessionId = remote["session_id"];
   if (typeof sessionId !== "string" || !sessionId) return undefined;
+  const resolved = kind === "resolved" ? resolvedOf(remote) : undefined;
+  if (kind === "resolved" && resolved === undefined) return undefined;
   return {
-    kind,
+    ...(resolved ? { resolved } : {}),
+    kind: kind as RemoteNotice["kind"],
     sessionId,
     ask: record(remote["ask"]),
     machine: field(remote["machine"]),

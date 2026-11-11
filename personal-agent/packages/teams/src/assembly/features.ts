@@ -33,6 +33,7 @@ import {
   pendingOf,
   UPGRADE_RETRY_SECONDS,
   noModelRefusalPolicy,
+  TerminalApprovalsCommand,
 } from "@primusclaw/personal-agent";
 
 import type { GateSubscriptions } from "../gate/routes.js";
@@ -372,7 +373,11 @@ export function buildFeatures(given: AssemblyBase): Features {
     // (1:1: the review's typed answers, mode words and requests come before the feedback answer, as in Python)
     personalInterceptors: [...(reviewHandlers?.personalInterceptors ?? []), w8.flow.interceptor],
     groupInterceptors,
-    commands: [w8.brief, ...(reviewHandlers?.commands ?? [])],
+    commands: [
+      w8.brief,
+      ...(switches.remoteAgents ? [new TerminalApprovalsCommand(base.claw.remoteAgents)] : []),
+      ...(reviewHandlers?.commands ?? []),
+    ],
     clicks: [
       ...(reviewHandlers?.clicks ?? []),
       ...assistant.clicks,

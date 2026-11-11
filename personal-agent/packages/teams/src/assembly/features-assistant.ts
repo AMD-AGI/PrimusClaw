@@ -67,6 +67,19 @@ function keeper(base: AssemblyBase, notifyUrl: string): SubscriptionKeeper | und
 /** The approval card of a request an agent on the person's machine waits on (W6b's view). */
 export function remoteAskCard(request: Parameters<ConstructorParameters<typeof Board>[0]["remoteAsk"]>[0]) {
   const lang: Lang = request.lang === "zh" ? "zh" : "en";
+  if (remoteView.isTerminalAsk(request.ask)) {
+    const terminal = remoteView.terminalAskView(
+      { ...request, options: remoteDomain.parseOptions(request.options) },
+      lang,
+    );
+    return {
+      body: {
+        type: "view" as const,
+        view: { name: "terminalAsk" as const, model: terminal },
+        fallbackText: terminal.title,
+      },
+    };
+  }
   const model = remoteView.remoteAskView({ ...request, options: remoteDomain.parseOptions(request.options) }, lang);
   return { body: { type: "view" as const, view: { name: "remoteAsk" as const, model }, fallbackText: model.title } };
 }

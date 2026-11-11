@@ -15,6 +15,7 @@ import { workEventText } from "../assistant/work-items.js";
 import { QUESTION_TOOL } from "../approvals/questions.js";
 import type { JsonObject } from "../json.js";
 import { answerLang, pickLang } from "../language/detect.js";
+import type { Lang } from "../locales/lang.js";
 import { proactiveLines } from "../locales/proactive-lines.js";
 import type { Conversation, OutMessage, View } from "../ports/surface.js";
 import { ITEM_SOURCE, ASSISTANT_SAID_TYPES } from "../subscriptions/event-types.js";
@@ -25,12 +26,51 @@ import { replyParts } from "../turn/answer-parts.js";
 import type { ProactiveDeps } from "./deps.js";
 import { EXPIRES_KEY, REMOTE_SAID, finishedAt, type AnsweredInChat } from "./events.js";
 import { remoteAskExpiry, zoneOf } from "./quiet.js";
+import { noteCard } from "../remote/views.js";
+import { parseOptions } from "../remote/options.js";
+import { SHOWN_WHOLE } from "../remote/terminal-asks.js";
+import { terminalAskView } from "../remote-view/terminal-ask-view.js";
+import { terminalApprovalText } from "../locales/terminal-approvals.js";
 
 /** What the person asked, as the name of a run in its card and in the line before a lost turn's answer. */
 export const PROMPT_TITLE_MAX = 60;
 
 function view(v: View): OutMessage {
   return { body: { type: "view", view: v, fallbackText: "" } };
+}
+
+/**
+ * What a terminal's question card offers (`terminalAskView`): the options it shows as buttons, as the connector gave them, and the
+ * ask marked with whether the card shows the request whole (`SHOWN_WHOLE`), which a click is checked against.
+ */
+function terminalOffer(
+  ask: Readonly<Record<string, unknown>>,
+  offered: readonly unknown[],
+  remote: RemoteNotice,
+  lang: Lang,
+): { options: unknown[]; ask: Readonly<Record<string, unknown>> } {
+  // (judged on the card as drawn, in the person's language: what is stored is what the buttons offer)
+  const view = terminalAskView(
+    { ask, options: parseOptions(offered), sessionId: remote.sessionId, machine: remote.machine, agent: remote.agent },
+    lang,
+  );
+  const ids = new Set(view.buttons.map((b) => b.optionId));
+  const options = offered.filter((o) => {
+    const id = o !== null && typeof o === "object" ? (o as Record<string, unknown>)["optionId"] : undefined;
+    return typeof id === "string" && ids.has(id);
+  });
+  return { options, ask: { ...ask, [SHOWN_WHOLE]: view.complete } };
+}
+
+/** A terminal's question names its request by an id the connector made, a uuid: anything else is said as words, no card. */
+function cardableIds(ask: Readonly<Record<string, unknown>>, actionId: string, sessionId: string): boolean {
+  return ask["origin"] !== "terminal" || (plainId(actionId) && plainId(sessionId));
+}
+
+/** An id a card's button may carry: at most 128 characters, no control characters. */
+function plainId(id: string): boolean {
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused
+  return id.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(id);
 }
 
 function str(value: unknown): string {
@@ -109,13 +149,28 @@ export class Deliveries {
     return true;
   }
 
+  /**
+   * A development environment session's own card: a request that waits on the person (its card), or the end of a terminal's
+   * question (its card edited). Undefined when the message goes on as words.
+   */
+  private async remoteCard(
+    userId: string,
+    conversation: Conversation,
+    event: JsonObject,
+  ): Promise<boolean | undefined> {
+    const remote = remoteNoticeOf(event);
+    if (remote?.resolved !== undefined) {
+      return (await this.endTerminalAsk(userId, conversation, remote.sessionId, remote.resolved)) ? true : undefined;
+    }
+    if (remote?.kind === "needs_you" && remote.ask !== undefined)
+      return this.sendRemoteAsk(userId, conversation, event, remote);
+    return undefined;
+  }
+
   /** What the assistant said (or a work item that needs the person and was not said). */
   private async sendSaid(userId: string, conversation: Conversation, event: JsonObject): Promise<boolean> {
-    const remote = remoteNoticeOf(event);
-    if (remote?.kind === "needs_you" && remote.ask !== undefined) {
-      const shown = await this.sendRemoteAsk(userId, conversation, event, remote);
-      if (shown !== undefined) return shown;
-    }
+    const card = await this.remoteCard(userId, conversation, event);
+    if (card !== undefined) return card;
     let words = workEventText(parseWorkItem(event["item"]) ?? null, event["text"]);
     if (!words && assistantDeliveries(event).length === 0) return false;
     const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, this.clientLocale(), words);
@@ -283,12 +338,20 @@ export class Deliveries {
     const { store } = this.deps;
     const ask = remote.ask ?? {};
     const actionId = str(ask["action_id"]);
-    const options = this.deps.remote.options(ask["options"]);
-    if (!actionId || options.length === 0) return undefined;
+    const offered = this.deps.remote.options(ask["options"]);
+    if (!actionId || offered.length === 0) return undefined;
+    if (!cardableIds(ask, actionId, remote.sessionId)) return undefined;
     const now = store.now();
     const expiresAt = remoteAskExpiry(ask, now);
     if (expiresAt <= now) return false;
     const tool = str(ask["tool"]) || "an action";
+    // A question a terminal asks keeps its whole ask: the board draws its card again with the content, never buttons alone. Only
+    // the options its card offers are kept (what was not shown whole offers only those that turn it down), and whether it was.
+    const terminal = ask["origin"] === "terminal";
+    const prefs = store.prefs.getPrefs(userId);
+    const lang = answerLang(prefs.lang, this.clientLocale(), event["text"]);
+    const shown = terminal ? terminalOffer(ask, offered, remote, lang) : { options: offered, ask };
+    const options = shown.options;
     if (
       !store.remotePermissions.saveRemotePermission({
         userId,
@@ -297,12 +360,12 @@ export class Deliveries {
         tool,
         options,
         expiresAt,
+        ...(terminal ? { ask: shown.ask } : {}),
       })
     ) {
       return false; // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it)
     }
     const item = parseWorkItem(event["item"]);
-    const prefs = store.prefs.getPrefs(userId);
     const card = this.deps.remote.askCard({
       ask,
       options,
@@ -312,15 +375,57 @@ export class Deliveries {
       about: item ? `#${String(item.seq)} ${item.title}` : "",
       expiresAt,
       zone: zoneOf(prefs),
-      lang: answerLang(prefs.lang, this.clientLocale(), event["text"]),
+      lang,
     });
     try {
-      await conversation.send(card);
+      if (terminal) {
+        // (its id is kept: when the terminal answers first, this card is edited to say so)
+        const messageId = await conversation.post(card);
+        if (messageId) store.remotePermissions.setRemotePermissionMessage(remote.sessionId, actionId, messageId);
+      } else {
+        await conversation.send(card);
+      }
     } catch (error) {
       store.remotePermissions.forgetRemotePermission(remote.sessionId, actionId); // (nobody saw it: Claw's retry must show it)
       throw error;
     }
     return true;
+  }
+
+  /**
+   * A question a terminal asked no longer waits here (`resolved`): answered at the terminal, or given up. Its card is edited in
+   * place to say so, without its buttons, and a click on it is told the same. True when that is done (or there is nothing to
+   * do: answered here already); false when the card cannot be found or edited, and the notice's own line is said instead.
+   */
+  private async endTerminalAsk(
+    userId: string,
+    conversation: Conversation,
+    sessionId: string,
+    resolved: { readonly actionId: string; readonly by: string },
+  ): Promise<boolean> {
+    const { store } = this.deps;
+    const perm = store.remotePermissions.getRemotePermission(sessionId, resolved.actionId);
+    if (perm === null || perm.userId !== userId) return false;
+    const state = resolved.by === "terminal" ? "terminal" : "expired";
+    if (!store.remotePermissions.closeRemotePermission(sessionId, resolved.actionId, state)) {
+      // A click is on its way: the end is kept, so that if the click fails its card says so instead of coming back. If it goes
+      // through it answers the card itself. (answered here first: nothing to do)
+      store.remotePermissions.closeRemotePermission(sessionId, resolved.actionId, state, { onlyIfState: "sending" });
+      return true;
+    }
+    if (!perm.messageId) return false;
+    const lang = answerLang(store.prefs.getPrefs(userId).lang, this.clientLocale(), str(perm.ask?.["tool"]));
+    const words = terminalApprovalText.in(lang);
+    const ended =
+      resolved.by === "terminal"
+        ? { title: words.answeredInTerminal, line: words.answeredInTerminalLine }
+        : { title: words.noLongerWaiting, line: words.noLongerWaitingLine };
+    try {
+      await conversation.update(perm.messageId, noteCard(ended.line, ended.title));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** A run started by a chat turn is named by what the person asked there (Claw names it by its session's first message). */

@@ -72,6 +72,7 @@ export * as remoteDomain from "./remote/index.js";
 export * as remoteView from "./remote-view/index.js";
 // The remote agents, as the worker's assembly builds them (W6; the view it gives them is remoteView.createRemoteViews).
 export { RemoteAgents } from "./remote/remote-agents.js";
+export { TerminalApprovalsCommand } from "./remote/approvals-command.js";
 export type { RemoteContext, RemoteErrors, RemoteGuard, RemoteSettings } from "./remote/context.js";
 export { ConnectorSetup, setupFrom } from "./remote/connector/setup.js";
 export { CredentialUnavailable as FollowCredentialUnavailable } from "./remote/follow/follower.js";

@@ -103,6 +103,10 @@ export interface RemotePermission {
   readonly options: readonly unknown[];
   readonly expiresAt: number;
   readonly state: RemotePermissionState;
+  /** The message the card went out as, when the channel said its id ("" none): a card a terminal's answer ends is edited there. */
+  readonly messageId: string;
+  /** For a question a terminal asks: the whole `remote.ask`, so the card can be drawn again with its content (null otherwise). */
+  readonly ask: Readonly<Record<string, unknown>> | null;
 }
 
 export interface NewRemotePermission {
@@ -112,6 +116,8 @@ export interface NewRemotePermission {
   readonly tool: string;
   readonly options: readonly unknown[];
   readonly expiresAt: number;
+  /** For a question a terminal asks: the whole `remote.ask` (see {@link RemotePermission.ask}). */
+  readonly ask?: Readonly<Record<string, unknown>>;
 }
 
 export interface RemotePermissionRepository {
@@ -122,10 +128,13 @@ export interface RemotePermissionRepository {
   pendingRemotePermissions(userId: string, sessionId: string): RemotePermission[];
   waitingRemoteSessions(userId: string): Set<string>;
   forgetRemotePermission(sessionId: string, actionId: string): void;
+  /** Record the message the card went out as. */
+  setRemotePermissionMessage(sessionId: string, actionId: string, messageId: string): void;
   closeRemotePermission(
     sessionId: string,
     actionId: string,
     state: RemotePermissionState,
-    options?: { readonly onlyIfPending?: boolean },
+    /** `onlyIfState`: only from that state (instead of only from pending). */
+    options?: { readonly onlyIfPending?: boolean; readonly onlyIfState?: RemotePermissionState },
   ): boolean;
 }
