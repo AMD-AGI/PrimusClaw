@@ -41,6 +41,7 @@ import {
   normalizeOverridable,
   overridableDeclarationProblems,
   overrideKeys,
+  patternCompiles,
   runPatternJobs,
 } from "../src/marketplace/plugin-overrides.js";
 import { BadRequestError } from "../src/shared/errors.js";
@@ -88,6 +89,13 @@ test("a declaration is checked, and every problem is named", () => {
   ]);
   assert.throws(() => normalizeOverridable({ secrets: {} }), (e: unknown) => e instanceof BadRequestError && /overridable\.secrets/.test(e.message));
   assert.throws(() => normalizeOverridable([]), BadRequestError);
+  // `__proto__` is a valid variable name and a special property of every object.
+  assert.deepEqual(
+    overridableDeclarationProblems(JSON.parse('{"env":{"__proto__":{}},"model":{"env":["__proto__"]}}')).map((p) => p.field).sort(),
+    ["overridable.env.__proto__", "overridable.model.env"],
+  );
+  assert.equal(patternCompiles("^[a-f0-9]{40}$"), true);
+  assert.equal(patternCompiles("("), false);
 });
 
 // V2
@@ -143,6 +151,7 @@ test("each value is held to its rule", () => {
   assert.equal(checkOverrides({ args: ["--a", "--b", "--c", "--d"] }, PLUGIN, "app").ok, false);
   assert.equal(checkOverrides({ env: { constructor: "x" } }, PLUGIN, "app").ok, false);
   assert.equal(checkOverrides({ env: { toString: "x" } }, PLUGIN, "app").ok, false);
+  assert.equal(checkOverrides(JSON.parse('{"env":{"__proto__":"x"}}'), PLUGIN, "app").ok, false);
 });
 
 // V4

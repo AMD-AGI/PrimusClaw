@@ -82,6 +82,8 @@ export const OVERRIDE_LIMITS = {
 
 /** The variable names an app manifest accepts; the manifest validator has the last word on reserved names. */
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A name that is a valid variable name and also a special property of every object; refused outright. */
+const isEnvName = (n: unknown): n is string => typeof n === "string" && ENV_NAME_RE.test(n) && n !== "__proto__";
 const TOP_KEYS = new Set(["image", "model", "args", "env"]);
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -122,9 +124,8 @@ function checkStringRule(v: unknown, at: string, out: OverrideProblem[], extraKe
     if (typeof v.pattern !== "string" || v.pattern === "" || v.pattern.length > OVERRIDE_LIMITS.maxPatternLength) {
       out.push({ field: `${at}.pattern`, reason: `must be a non-empty string of at most ${OVERRIDE_LIMITS.maxPatternLength} characters` });
     } else {
-      try {
-        new RegExp(v.pattern, "u");
-      } catch {
+      // Compiled where it is tested: in the pattern context, under its timeout.
+      if (patternCompiles(v.pattern) !== true) {
         out.push({ field: `${at}.pattern`, reason: "is not a valid regular expression" });
       }
     }
@@ -159,7 +160,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
     checkStringRule(v.model, "overridable.model", out, ["env"]);
     const env = isPlainObject(v.model) ? v.model.env : undefined;
     if (env !== undefined && (!Array.isArray(env) || env.length > OVERRIDE_LIMITS.maxEnvEntries
-      || !env.every((n) => typeof n === "string" && ENV_NAME_RE.test(n)))) {
+      || !env.every(isEnvName))) {
       out.push({ field: "overridable.model.env", reason: "must be a list of environment variable names" });
     }
   }
@@ -184,7 +185,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
         out.push({ field: "overridable.env", reason: `at most ${OVERRIDE_LIMITS.maxEnvEntries} variables` });
       }
       for (const name of names) {
-        if (!ENV_NAME_RE.test(name)) out.push({ field: `overridable.env.${name}`, reason: "is not an environment variable name" });
+        if (!isEnvName(name)) out.push({ field: `overridable.env.${name}`, reason: "is not an environment variable name" });
         else checkStringRule(v.env[name], `overridable.env.${name}`, out);
       }
     }
@@ -220,28 +221,42 @@ interface PatternJob {
 
 let patternContext: ReturnType<typeof createContext> | undefined;
 
+/** Run `script` over `data` (a JSON string, as `__jobs`) in the pattern context; its JSON answer, or null when it did not finish. */
+function inPatternContext(script: string, data: string, budgetMs: number): unknown {
+  patternContext ??= createContext(Object.create(null));
+  patternContext.__jobs = data;
+  try {
+    return JSON.parse(String(runInContext(script, patternContext, { timeout: budgetMs, displayErrors: false })));
+  } catch {
+    return null;
+  } finally {
+    patternContext.__jobs = undefined;
+  }
+}
+
+/** Whether `pattern` compiles as a `u`-flag regular expression; null when the check did not finish. */
+export function patternCompiles(pattern: string): boolean | null {
+  const out = inPatternContext(
+    "JSON.stringify((() => { try { new RegExp(JSON.parse(__jobs), 'u'); return true; } catch { return false; } })())",
+    JSON.stringify(pattern),
+    OVERRIDE_LIMITS.patternBudgetMs,
+  );
+  return typeof out === "boolean" ? out : null;
+}
+
 /**
  * Which of `jobs` match, as one interruptible run; `null` when the run did not
  * finish within `budgetMs` (or failed), which the caller treats as no match.
  */
 export function runPatternJobs(jobs: Array<{ pattern: string; value: string }>, budgetMs: number = OVERRIDE_LIMITS.patternBudgetMs): boolean[] | null {
   if (jobs.length === 0) return [];
-  patternContext ??= createContext(Object.create(null));
   // Only a string crosses into the context, and only a string comes back.
-  patternContext.__jobs = JSON.stringify(jobs.map((j) => [j.pattern, j.value]));
-  try {
-    const out = runInContext(
-      "JSON.stringify(JSON.parse(__jobs).map(([p, v]) => new RegExp(p, 'u').test(v)))",
-      patternContext,
-      { timeout: budgetMs, displayErrors: false },
-    );
-    const parsed = JSON.parse(String(out)) as unknown;
-    return Array.isArray(parsed) && parsed.length === jobs.length ? parsed.map((x) => x === true) : null;
-  } catch {
-    return null;
-  } finally {
-    patternContext.__jobs = undefined;
-  }
+  const parsed = inPatternContext(
+    "JSON.stringify(JSON.parse(__jobs).map(([p, v]) => new RegExp(p, 'u').test(v)))",
+    JSON.stringify(jobs.map((j) => [j.pattern, j.value])),
+    budgetMs,
+  );
+  return Array.isArray(parsed) && parsed.length === jobs.length ? parsed.map((x) => x === true) : null;
 }
 
 function checkStringValue(
@@ -353,17 +368,17 @@ export function checkOverrides(
         out.push({ field: at, reason: "must be an object of variable name to value" });
         continue;
       }
-      const env: Record<string, string> = {};
+      const entries: Array<[string, string]> = [];
       for (const [name, v] of Object.entries(value)) {
-        const rule = Object.hasOwn(decl.env!, name) ? decl.env![name] : undefined;
+        const rule = isEnvName(name) && Object.hasOwn(decl.env!, name) ? decl.env![name] : undefined;
         if (!rule) {
           out.push({ field: `${at}.${name}`, reason: "the plugin does not declare this variable overridable" });
           continue;
         }
         const s = checkStringValue(v, rule, `${at}.${name}`, out, patterns);
-        if (s !== undefined) env[name] = s;
+        if (s !== undefined) entries.push([name, s]);
       }
-      values.env = env;
+      values.env = Object.fromEntries(entries);
     }
   }
   const matched = runPatternJobs(patterns);
@@ -392,9 +407,13 @@ export function applyAppOverrides<M extends { command: string[]; env?: Record<st
   decl: OverridableDeclaration,
 ): M {
   if (!hasOverrides(values)) return manifest;
-  const env: Record<string, string> = { ...(manifest.env ?? {}) };
-  if (values.model !== undefined) for (const name of decl.model?.env ?? []) env[name] = values.model;
-  if (values.env) Object.assign(env, values.env);
+  // Built from entries (later ones win), never by assigning to a caller-named key.
+  const model = values.model;
+  const env: Record<string, string> = Object.fromEntries([
+    ...Object.entries(manifest.env ?? {}),
+    ...(model !== undefined ? (decl.model?.env ?? []).filter(isEnvName).map((name): [string, string] => [name, model]) : []),
+    ...Object.entries(values.env ?? {}).filter(([name]) => isEnvName(name)),
+  ]);
   const out: M = {
     ...manifest,
     command: values.args ? [...manifest.command, ...values.args] : [...manifest.command],
