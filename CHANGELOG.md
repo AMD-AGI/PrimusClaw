@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.0 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` and `-teams-ingress` on npm, the Teams ingress's Function package and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.3.0 |
 
@@ -101,6 +101,10 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+## [0.1.1] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611112033` (commit 8566ebd5). Connector requirements unchanged from 0.1.0.
 
 ### Fixed
 - A turn stopped with `/stop` while Brain was still setting it up now ends on the session's event stream: Brain emits a
