@@ -365,6 +365,14 @@ function heldExactly(lines: string[], widths: number[], boxWidth: number, text: 
   return g === got.length;
 }
 
+/**
+ * How long the box is watched for the pasted text, from the paste. A Claude Code that is busy (a large conversation, several background
+ * agents, a queued notification being taken in) can draw a paste late: the text is in its input but not yet on the screen. Read every
+ * 100 ms up to ECHO_SLOW_MS, then every 250 ms; the person on the phone is told at ECHO_SLOW_MS that the message waits.
+ */
+export const ECHO_WAIT_MS = 20_000;
+export const ECHO_SLOW_MS = 3_000;
+
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
 export const ENTER_SETTLE_MS = 250;
 
@@ -380,6 +388,8 @@ export interface TypeOptions {
   submitted?: () => boolean;
   /** Called right before the text first enters the pane (the paste itself): from then on what the transcript shows of it can be this message. */
   onPaste?: () => void;
+  /** Called once when the box has not shown the pasted text ECHO_SLOW_MS after the paste (a busy terminal draws late): it is waited for. */
+  onSlow?: () => void;
 }
 
 /**
@@ -399,6 +409,16 @@ const CLEAR_WAIT_MS = 10 * 60_000;
 /** How many times a message whose text a question took out of the box is typed again, once the question is gone. */
 const MAX_TYPINGS = 3;
 
+/**
+ * The pasted text never showed in the box within the echo wait (ECHO_WAIT_MS): nothing was submitted. `box` is what the box showed
+ * instead at the end (`empty`: the terminal did not take the paste in, or has not drawn it; `unknown`: no box on the screen).
+ */
+export class TerminalInputUnseen extends Error {
+  constructor(readonly box: BoxState, readonly waitedMs: number) {
+    super(`the terminal did not show the typed text in ${Math.round(waitedMs / 1000)} s (the box: ${box})`);
+  }
+}
+
 /** What was typed is in the box but was not submitted: the screen did not pass {@link enterGuard}. */
 export class TerminalNotSubmitted extends Error {
   constructor(readonly why: string) {
@@ -408,7 +428,7 @@ export class TerminalNotSubmitted extends Error {
 
 /** One tmux pane that holds a conversation open, and the typing into it. */
 export class TerminalInput {
-  constructor(readonly ref: PaneRef, private readonly tmux: TmuxRunner, private readonly echoWaitMs = 3_000, private readonly settleMs = ENTER_SETTLE_MS) {}
+  constructor(readonly ref: PaneRef, private readonly tmux: TmuxRunner, private readonly echoWaitMs = ECHO_WAIT_MS, private readonly settleMs = ENTER_SETTLE_MS) {}
 
   /** Whether the process proven at the start is still the one there, and still runs in this pane. */
   private stillThere(panePid: number): boolean {
@@ -515,15 +535,20 @@ export class TerminalInput {
       await stillWanted();
       await this.put(text, typings === 1 ? opts.onPaste : undefined);
       pasted = true;
-      const by = Date.now() + this.echoWaitMs;
+      const at = Date.now();
+      let slow = false;
       let dialog = false;
       for (;;) {
         await stillWanted();
         const screen = await this.screen();
         if (dialogOnScreen(screen)) { dialog = true; break; }
-        if (inputBox(screen) === "typed") break;
-        if (Date.now() >= by) throw new Error("the terminal did not show the typed text");
-        await sleep(100);
+        // (shown: the box holds text now, or holds exactly this text however it is drawn)
+        const box = inputBox(screen);
+        if (box === "typed" || enterGuard(screen, text) === null) break;
+        const waited = Date.now() - at;
+        if (waited >= this.echoWaitMs) throw new TerminalInputUnseen(box, waited);
+        if (!slow && waited >= Math.min(ECHO_SLOW_MS, this.echoWaitMs)) { slow = true; opts.onSlow?.(); }
+        await sleep(waited < ECHO_SLOW_MS ? 100 : 250);
       }
       for (;;) {
         if (dialog) {

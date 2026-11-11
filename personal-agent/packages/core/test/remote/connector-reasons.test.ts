@@ -73,6 +73,7 @@ const CONNECTOR_CODES = [
   "terminal_gone",
   "terminal_switched",
   "terminal_input_failed",
+  "terminal_input_unseen",
   "terminal_input_unconfirmed",
   "terminal_input_unavailable",
   "terminal_session",
@@ -231,6 +232,7 @@ const TERMINAL_TURN_ERRORS = [
   "terminal_busy",
   "terminal_input_withdrawn",
   "terminal_input_failed",
+  "terminal_input_unseen",
   "terminal_switched",
   "terminal_gone",
   "terminal_screen_unknown",
@@ -245,6 +247,12 @@ for (const code of TERMINAL_TURN_ERRORS) {
     assert.ok(!zh.includes("不认识") && !en.includes("do not know"), `${zh} | ${en}`);
   });
 }
+
+test("a message the terminal never showed says it was not sent, why, and to send it again", () => {
+  const [zh, en] = explain("terminal_input_unseen");
+  assert.ok(zh.includes("没有发出去") && zh.includes("正忙") && zh.includes("再发"), zh);
+  assert.ok(en.includes("nothing was sent") && en.includes("busy") && en.includes("again"), en);
+});
 
 test("terminal busy no longer blames a running turn", () => {
   // (0.1.19 types a message in while a turn runs, Claude Code queues it: only typing or a scrolled-back screen holds it)

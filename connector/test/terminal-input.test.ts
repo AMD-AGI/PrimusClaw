@@ -561,6 +561,47 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
   });
 
+  test("a busy terminal that draws the paste 5 s late: the paste is waited for (the phone told it waits), then submitted and queued by Claude Code", async () => {
+    // (2026-11-11, a terminal busy with seven background agents and queued notifications: "the terminal did not show the typed
+    // text" after 3 s, twice, for a message it took at once a minute later)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "15000", FAKE_DRAW_LAG_MS: "5000" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "from the phone");
+    const told = await h.claw.until("the notice that it waits", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === one), 8_000);
+    assert.equal(told.data.reason, "terminal_working");
+    await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 15_000);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 30_000);
+    assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
+    assert.ok(!h.audit().some((a) => a.kind === "terminal_input_refused"), "never refused");
+  });
+
+  test("a paste the terminal never shows within terminalShowMs is refused by a reason of its own (terminal_input_unseen), and nothing is submitted", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalShowMs: 1_500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "15000", FAKE_DRAW_LAG_MS: "6000" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
+    await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "from the phone");
+    const end = await h.claw.until("the refusal", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
+    assert.equal(end.data.error, "terminal_input_unseen");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === one)?.data.reason, "terminal_input_unseen");
+    assert.match(String(h.audit().find((a) => a.kind === "terminal_input_refused")?.detail), /did not show the typed text in 2 s \(the box: empty\)/);
+    assert.deepEqual(queuedIn(t.transcript), [], "nothing was submitted");
+  });
+
   test("a terminal whose registry row is torn: proven by the task folder its process holds, listed live, typed into once its screen is free", { skip: process.platform !== "linux" }, async () => {
     // (Claude Code never writes a torn row again: autopilot-devpod 2026-11-09, every conversation of the folder was "unknown" and
     // the one in use had no Connect)

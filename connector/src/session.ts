@@ -21,7 +21,7 @@
 import path from "node:path";
 import { TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
-import { TerminalInput, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
+import { ECHO_WAIT_MS, TerminalInput, TerminalInputUnseen, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
 import { AdapterProcess, AuthenticateFailed, isAuthRequiredError, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
@@ -73,11 +73,17 @@ export interface SessionTiming {
    * instead of waiting `terminalWaitMs`. A Claude Code that says it is working or waiting, or whose word cannot be read, keeps that wait.
    */
   terminalScreenWaitMs: number;
+  /**
+   * How long a message pasted into a terminal's box may take to show there before it is given up (`terminal_input_unseen`): a busy
+   * Claude Code draws a paste late. The phone is told it waits after ECHO_SLOW_MS (terminal-input.ts).
+   */
+  terminalShowMs: number;
 }
 
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
   rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalScreenWaitMs: 30_000,
+  terminalShowMs: ECHO_WAIT_MS,
 };
 
 /**
@@ -345,7 +351,7 @@ export class Session {
    */
   private async spectate(support: AttachSupport, title: string, detail: string, pane: { ok: true; pane: PaneRef } | { ok: false; why: string }): Promise<void> {
     this.readOnly = true;
-    if (pane.ok) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket));
+    if (pane.ok) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket), this.env.timing.terminalShowMs);
     // The terminal's permission mode now, as its footer names it (null when the screen does not say): the chat tells the person
     // when a message from the phone will run without asking (`MODES_THAT_DO_NOT_ASK`).
     let terminalMode: string | null = null;
@@ -384,7 +390,7 @@ export class Session {
     // One that typed into its terminal does again, once the pane is proven again; until then (or if it cannot be) a message is refused.
     if (typed && this.acpId) {
       this.terminalRestoring = support.terminalPane(this.acpId).then((pane) => {
-        if (pane.ok && !this.closed) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket));
+        if (pane.ok && !this.closed) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket), this.env.timing.terminalShowMs);
         else if (!pane.ok) this.audit("terminal_input_lost", { why: pane.why.slice(0, 300) });
       }).finally(() => { this.terminalRestoring = null; });
     }
@@ -614,6 +620,8 @@ export class Session {
             stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
             submitted: () => turn.seen || turn.queued === true,
             onPaste: () => { turn.pasted = true; },
+            // (a busy terminal draws the paste late: the phone is told the message waits there)
+            onSlow: () => this.emit("terminal_input_queued", { reason: "terminal_working", cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1 }),
           });
           turn.typing = false;
           turn.sentAt = Date.now();
@@ -622,10 +630,12 @@ export class Session {
           if (this.terminalTurn !== turn) continue;
           this.terminalTurn = null;
           this.env.store.endTurn(this.id);
-          // (`TerminalNotSubmitted`: typed, but the screen did not let Enter go; no key was sent after the text, which stays in the box)
-          this.audit("terminal_input_refused", { reason: "terminal_input_failed", detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
-          this.rejectCommand("prompt", next.cmdId, "terminal_input_failed", next.cmdSeq);
-          this.emit("turn_end", { stopReason: "error", error: "terminal_input_failed", cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+          // (`TerminalNotSubmitted`: typed, but the screen did not let Enter go; no key was sent after the text, which stays in the box.
+          // `TerminalInputUnseen`: the box never showed the paste, however long it was waited for; said by a reason of its own)
+          const reason = e instanceof TerminalInputUnseen ? "terminal_input_unseen" : "terminal_input_failed";
+          this.audit("terminal_input_refused", { reason, detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
           continue;
         }
         // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
