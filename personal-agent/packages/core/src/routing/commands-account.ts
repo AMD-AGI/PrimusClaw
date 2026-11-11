@@ -36,7 +36,8 @@ export class AccountCommands {
     if (who !== undefined) lead.push(accountText.in(lang).connectedTo({ name: who[0], email: who[1] }));
     const attached = this.attachedLead(chat, lang);
     if (attached !== undefined) lead.push(attached);
-    const { assistant, config } = this.ctx.deps;
+    const { assistant, config, groupHistory } = this.ctx.deps;
+    const groupContext = groupHistory.kept();
     await chat.say(
       renderHelp(lang, {
         assistant: assistant.on(chat.sender.id),
@@ -45,6 +46,7 @@ export class AccountCommands {
         lead: lead.join("\n\n"),
         bot: config.botName,
         understanding: assistant.understands(chat.sender.id),
+        ...(groupContext === undefined ? {} : { groupContext }),
       }),
     );
   }

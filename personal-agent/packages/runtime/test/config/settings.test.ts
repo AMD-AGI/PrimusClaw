@@ -156,13 +156,20 @@ describe("the per-person limits", () => {
   }
 
   it("a group chat's recent messages: 30 for 4 hours, 500 characters each, unless set; 0 messages is off", () => {
-    assert.deepEqual(settings().groupContext, { messages: 30, maxAgeSeconds: 14_400, messageChars: 500 });
+    assert.deepEqual(settings().groupContext, {
+      messages: 30,
+      maxAgeSeconds: 14_400,
+      messageChars: 500,
+      granted: false,
+    });
     const s = settings({
       TEAMS_GROUP_CONTEXT_MESSAGES: "10",
       TEAMS_GROUP_CONTEXT_HOURS: "2",
       TEAMS_GROUP_CONTEXT_CHARS: "200",
     });
-    assert.deepEqual(s.groupContext, { messages: 10, maxAgeSeconds: 7200, messageChars: 200 });
+    assert.deepEqual(s.groupContext, { messages: 10, maxAgeSeconds: 7200, messageChars: 200, granted: false });
+    assert.equal(settings({ TEAMS_GROUP_CONTEXT_GRANTED: "1" }).groupContext.granted, true);
+    assert.equal(settings({ TEAMS_GROUP_CONTEXT_GRANTED: "true" }).groupContext.granted, false); // (exactly 1)
     assert.equal(settings({ TEAMS_GROUP_CONTEXT_MESSAGES: "0" }).groupContext.messages, 0);
   });
 
