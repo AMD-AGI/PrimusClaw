@@ -15,8 +15,8 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ## 0.4.0
 
-A minor release: it adds the Teams ingress as a released part (#739, run on Node 24 by #745). No plugin port (core's
-`src/plugins/`) changed, and the worker needs nothing new from Claw.
+A minor release: it adds the Teams ingress as a released part (#739; its deployable package runs on Node 24 by #745, and
+sends concurrently by #748). No plugin port (core's `src/plugins/`) changed, and the worker needs nothing new from Claw.
 
 The ingress's npm package, `@primusclaw/personal-agent-teams-ingress`, is not on npm yet: its first publish waits for the
 package's Trusted Publisher entry. Its tarball is attached to this release like the others, and the Function package
@@ -33,7 +33,9 @@ package's Trusted Publisher entry. Its tarball is attached to this release like 
   the worker queues (`OUTBOUND_MODE=servicebus`) as the bot's managed identity, so the default outbound mode now works
   with published parts only. It answers as the Python Function it replaces did, case for case
   (`packages/teams-ingress/test/parity.test.ts`), except for a few `serviceUrl`s no Bot Connector sends, which it reads
-  as the worker does. Settings: [configuration.md](docs/configuration.md#the-teams-ingress) (#739, #745).
+  as the worker does. Sends to the inbound queue run concurrently on an instance's shared sender, each with a 20 s
+  deadline, so one send stuck in retries holds up only its own request (a `500` at the deadline), not every request on
+  that instance (#748). Settings: [configuration.md](docs/configuration.md#the-teams-ingress) (#739, #745).
 - The release attaches the ingress as a deployable Function package, `personal-agent-teams-ingress-X.Y.Z.zip` (one
   reproducible bundle with `host.json`; its sha256 next to it, attested like the tarballs), checked in a real Functions
   host before it is published. [Quick start](docs/quickstart.md#4-the-ingress), step 4, now deploys it instead of
