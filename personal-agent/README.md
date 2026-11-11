@@ -14,10 +14,8 @@ name defaults to "Clawy".
 The entry point today is **Microsoft Teams**. The domain logic is channel-neutral, so another channel is a new adapter
 package rather than a rewrite.
 
-> **Status.** The TypeScript worker is being assembled. The packages below are on `main`; the process entry
-> (`packages/teams/src/main.ts`) and its assembly (`packages/teams/src/assembly/**`) arrive with pull request
-> [#615](https://github.com/AMD-AGI/PrimusClaw/pull/615). Until then the packages are libraries with their tests, and
-> there is no runnable worker on `main`.
+> **Status.** Released as 0.x: the three npm packages and the `docker.io/primussafe/personal-agent-teams` image (see
+> [CHANGELOG.md](CHANGELOG.md)). Configuration and plugin interfaces may still change between minor releases.
 
 ## Packages
 
@@ -159,8 +157,6 @@ together with its ledger line.
 
 ## Running the worker
 
-> Needs [#615](https://github.com/AMD-AGI/PrimusClaw/pull/615): `packages/teams/src/main.ts` is not on `main` yet.
-
 ```bash
 cd personal-agent
 npm ci
@@ -199,7 +195,7 @@ outbound mode, a relay that posts the outbound queue to the Bot Connector.
 ## Configuration
 
 [`examples/worker.env.example`](examples/worker.env.example) lists every setting the worker reads, with placeholder
-values (all but the release gate's test entry); [`docs/configuration.md`](docs/configuration.md) describes each one and marks the ones that arrive with #615.
+values (all but the release gate's test entry); [`docs/configuration.md`](docs/configuration.md) describes each one.
 In short:
 
 - **Required:** `CLAW_API_URL`, `SAFE_API_URL`, `PUBLIC_BASE_URL`, `TEAMS_ENCRYPTION_KEYS`, and either
