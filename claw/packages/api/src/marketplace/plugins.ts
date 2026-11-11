@@ -332,6 +332,8 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     created_at: formatTs(r.created_at),
     updated_at: formatTs(r.updated_at),
     deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    // A temporary plugin's expiry (marketplace/plugin-expiry.ts); null is permanent.
+    expires_at: r.expires_at ? formatTs(r.expires_at) : null,
     // Only on a collapsed listing row: how many versions of this name the caller can see.
     ...(r.version_count !== undefined && r.version_count !== null ? { version_count: Number(r.version_count) } : {}),
   };
@@ -675,14 +677,14 @@ export async function upsertPlugin(
 
 function pluginInplaceUpdates(payload: JsonObject): JsonObject {
   const out: JsonObject = {};
-  for (const k of ["name", "description", "version", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status"]) {
+  for (const k of ["name", "description", "version", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status", "expires_at", "ttl_seconds"]) {
     if (k in payload) out[k] = payload[k];
   }
   return out;
 }
 
 function pluginNewVersionOverrides(payload: JsonObject): JsonObject | null {
-  const keys = ["description", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status"];
+  const keys = ["description", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status", "expires_at", "ttl_seconds"];
   const out: JsonObject = {};
   for (const k of keys) {
     if (k in payload) out[k] = payload[k];
@@ -713,9 +715,12 @@ export async function createPluginNewVersion(
     status: src.status ?? "active",
   };
   if (overrides) Object.assign(payload, overrides);
+  // A new version of a temporary plugin is temporary until the same instant,
+  // unless the request names its own expiry (or null for none).
+  const inheritExpiresAt = src.expires_at ? new Date(src.expires_at as string | Date) : null;
   for (let attempt = 0; attempt < UPSERT_CONCURRENCY_RETRIES; attempt++) {
     try {
-      return await MarketplaceDb.pluginInsert(payload);
+      return await MarketplaceDb.pluginInsert(payload, { inheritExpiresAt });
     } catch (e) {
       if (!isPgUniqueViolation(e)) throw e;
       const existing = await MarketplaceDb.pluginActiveByNameAndVersion(

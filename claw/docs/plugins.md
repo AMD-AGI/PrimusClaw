@@ -517,3 +517,44 @@ those the caller may see; deleted versions are left out (an admin may pass
 or `403` exactly as `GET /v1/plugins/:id` does for the same id. Every version
 keeps its own id, and every other route (`GET`, `PATCH`, `DELETE`, launches)
 still addresses a plugin by id.
+
+---
+
+## 6. Temporary Plugins
+
+A plugin registered for one run (an eval, a probe, a smoke test) can expire on
+its own instead of staying in every listing until someone deletes it.
+
+Plugin writes (`POST /v1/plugins`, `POST /v1/plugins/upsert`,
+`PUT`/`PATCH /v1/plugins/:id`, `POST /v1/plugins/:id/new-version`) accept one of:
+
+| Field | Meaning |
+| ----- | ------- |
+| `ttl_seconds` | Expire this many seconds from now. |
+| `expires_at` | Expire at this ISO 8601 instant. |
+
+Either must land from 60 seconds to `PLUGIN_TTL_MAX_DAYS` (default 30) days
+from now; giving both is refused. `null` for either clears the expiry and makes
+the plugin permanent. Every plugin read returns `expires_at` (`null` when
+permanent).
+
+- **Never public.** A temporary plugin is private by default; asking for
+  `is_public: true` together with an expiry, making a temporary plugin public, or
+  giving a public plugin an expiry is `400`. Clear the expiry first to publish.
+- **New versions** inherit the source version's `expires_at` unless the request
+  names its own (or `null`).
+- **The sweep.** Every `PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN` (default 5) minutes
+  the API soft-deletes (`deleted_at`) every private plugin whose `expires_at` has
+  passed, except one that is still in use: an unfinished task, a live app run, a
+  queued message or a live DAG template that names it. That one expires on a
+  later pass, once the use is over. The API logs `plugin.expired` for each.
+  Until the sweep runs, an expired plugin still works.
+
+Eval and probe tooling that registers plugins should set `ttl_seconds`, for
+example a day for a nightly run:
+
+```bash
+curl -X POST "$CLAW/v1/plugins/upsert" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name":"probe-2026-11-11","version":"0.1.0","ttl_seconds":86400}'
+```
