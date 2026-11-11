@@ -146,7 +146,8 @@ export async function functionFiles(): Promise<ZipEntry[]> {
     outfile: "main.js",
     format: "esm",
     platform: "node",
-    target: "node26",
+    // Node 24, the oldest Node a Flex Consumption app runs as generally available: the zip runs on 24 and later.
+    target: "node24",
     external: HOST_PROVIDED,
     banner: { js: BANNER },
     // The workspace's tsconfig.json: its `paths` name core's and the worker package's sources at this commit.
@@ -167,12 +168,12 @@ export async function functionFiles(): Promise<ZipEntry[]> {
   const functionManifest = {
     name: NAME,
     version: manifest.version,
-    description: "The personal agent's Teams ingress, as an Azure Functions app (Node.js 26).",
+    description: "The personal agent's Teams ingress, as an Azure Functions app (Node.js 24 or later).",
     license: "MIT",
     private: true,
     type: "module",
     main: "dist/main.js",
-    engines: { node: ">=26" },
+    engines: { node: ">=24" },
   };
   return [
     { name: "host.json", data: fs.readFileSync(path.join(pkgDir, "host.json")) },
