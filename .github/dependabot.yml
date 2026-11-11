@@ -43,6 +43,11 @@ updates:
       npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # typescript-eslint 8 declares a peer of typescript <6.1.0, so a TypeScript 7
+    # bump fails `npm ci` with ERESOLVE. Lift this once typescript-eslint accepts 7.
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "pip"
     directories:
