@@ -112,13 +112,14 @@ export interface ReviewParams {
   record?: ReviewRecord | null;
   /**
    * Why the wait for CI to turn green ended without the review being run again (`followReviewItems`): the head moved, the wait ran out, or
-   * the review could not be queued again. Absent while it waits, and on a review that never waited.
+   * the review could not be queued again, or CI turned green with a review thread still open. Absent while it waits, and on a review that
+   * never waited.
    */
   ci_wait_ended?: { reason: CiWaitEnd; at: string; head_sha: string };
 }
 
 /** Why a review stopped waiting for CI to turn green (`ReviewParams.ci_wait_ended`). */
-export type CiWaitEnd = "head_moved" | "timeout" | "not_queued";
+export type CiWaitEnd = "head_moved" | "timeout" | "not_queued" | "threads_open";
 
 /** One finding of a review: where, the thread GitHub opened for it (null when unknown), its first words, and whether its thread is resolved. */
 export interface RecordedFinding { path: string; line: number; thread_id: string | null; note: string; resolved: boolean }
@@ -1529,9 +1530,12 @@ async function followCiWait(
   itemId: string, sessionId: string, ownerId: string, wait: NonNullable<ReturnType<typeof ciWaitOf>>, body: Record<string, unknown>, now: number,
 ): Promise<void> {
   const head = String(body.head_sha ?? "").toLowerCase();
-  const ci = body.ci as { green?: unknown } | undefined;
+  const ci = body.ci as { green?: unknown; unresolved_threads?: unknown } | undefined;
   const end = (reason: CiWaitEnd): Promise<void> => endCiWait(itemId, reason, head || wait.headSha, now);
   if (head && head !== wait.headSha) return end("head_moved");
+  // CI green, but a review thread is open (or the threads could not all be read): run again, the approval would be refused for it, so the
+  // wait ends here and the owner is told what is left.
+  if (ci?.green === true && ci.unresolved_threads !== 0) return end("threads_open");
   if (ci?.green === true) {
     const queued = await inTransaction(async (query) => {
       const q = { query };

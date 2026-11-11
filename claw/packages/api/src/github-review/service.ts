@@ -74,8 +74,9 @@ export interface FollowRequest {
   /** R asked X for a review that merges (not a review only): R's account merges once X's approval is on GitHub. */
   mergeByRequester: boolean;
   /**
-   * Read CI on the head too, when the pull request is open and nothing is merged for R: the answer's `ci` (green, and the names of the
-   * failed, advisory and unfinished checks). For a review that waits for CI to turn green before it is run again (`review-items.ts`).
+   * Read CI on the head too, when the pull request is open and nothing is merged for R: the answer's `ci` (green, the names of the failed,
+   * advisory and unfinished checks, and the open review threads, null when they could not all be read). For a review that waits for CI to
+   * turn green before it is run again (`review-items.ts`).
    */
   withChecks?: boolean;
 }
@@ -867,10 +868,14 @@ export class GithubReview {
         return ok({ status, url: pr.url, head_sha: pr.headSha }, redact);
       }
       if (!asRequester) {
-        const ci = f.withChecks ? await this.readChecks(ctx, ref, pr) : null;
+        const st = f.withChecks ? await this.readState(ctx, ref, pr, repo) : null;
         return ok({
           status: "open", url: pr.url, head_sha: pr.headSha,
-          ...(ci ? { ci: { green: ci.green, failed: ci.summary.failedNames, advisory: ci.summary.advisoryFailed, pending: ci.summary.pendingNames } } : {}),
+          ...(st ? { ci: {
+            green: st.checks.green, failed: st.checks.summary.failedNames, advisory: st.checks.summary.advisoryFailed, pending: st.checks.summary.pendingNames,
+            // (what else would stop an approval once CI is green: a review run again for CI alone would be refused for it)
+            unresolved_threads: st.threadsComplete ? st.unresolvedThreads : null,
+          } } : {}),
         }, redact);
       }
       return ok(await this.mergeForRequester(ctx, ref, repo, pr, f), redact);

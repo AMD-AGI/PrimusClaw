@@ -43,6 +43,7 @@
  *   RS2 held back only by CI: the sweep reads CI with the pull request, runs the review once more in its session when the head is green,
  *       and its approval goes to the merge card; never twice; a waiting review holds no slot
  *   RS3 a wait for CI ends on a new head or after a day, and says so; a restart does not carry the end over
+ *   RS4 CI green with a review thread open ends the wait instead of running the review again, and says what is left
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1715,7 +1716,7 @@ describe("assistant review items", { skip }, () => {
       assert.equal((await w.item(it.item_id)).board_state, "in_progress");
       assert.equal((await w.item(it.item_id)).params.ci_waiting, true, "a review waiting for CI holds no slot");
 
-      ci = { green: true, failed: [], advisory: [], pending: [] };
+      ci = { green: true, failed: [], advisory: [], pending: [], unresolved_threads: 0 };
       now += 100_000;
       w.drains.length = 0;
       await ri.followReviewItems(now);
@@ -1747,6 +1748,30 @@ describe("assistant review items", { skip }, () => {
     } finally {
       ri.reviewItemPorts.followPullRequest = null;
     }
+  });
+
+  test("RS4 CI turns green with a review thread still open: not run again (its approval would be refused for the thread), and the owner is told what is left", async () => {
+    await w.user("alice");
+    const it = await one("alice", { review_only: false });
+    await firstTurnWords(it.session_id);
+    await postedReview(it.session_id, { event: "COMMENT", ci: ["ci_failed: test"] });
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    for (const threads of [1, null]) {
+      await followed(async () => ({ status: "open", head_sha: "a".repeat(40), ci: { green: true, failed: [], advisory: [], pending: [], unresolved_threads: threads } } as never));
+      try {
+        await ri.followReviewItems(Date.now() + (threads === null ? 200_000 : 0));
+        await reviewResultsSettled();
+      } finally {
+        ri.reviewItemPorts.followPullRequest = null;
+      }
+    }
+    assert.equal(await count("claw_pending_messages", `session_id = '${it.session_id}'`), 0, "not run again");
+    const item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.params.ci_wait_ended.reason], ["done", "threads_open"]);
+    const told = await toldTo("alice");
+    assert.equal(told.length, 2, "the wait, then why it ended");
+    assert.match(told[1]!, /not approved: review threads are still open[\s\S]*CI is green now[\s\S]*`review again #1`/);
   });
 
   test("RS3 a wait for CI ends on a new head or after a day, and the owner is told why and what to say", async () => {

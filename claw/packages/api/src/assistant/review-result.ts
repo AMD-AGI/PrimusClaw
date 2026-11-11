@@ -64,12 +64,12 @@ function ciLine(ci: { failed: string[]; pending: string[] }, sha: string, zh: bo
   return zh ? `head \`${sha}\` 上 CI 没全绿${which}` : `CI is not green on head \`${sha}\`${which}`;
 }
 
-const ENDED_ZH: Record<CiWaitEnd, string> = {
+const ENDED_ZH: Record<Exclude<CiWaitEnd, "threads_open">, string> & Partial<Record<CiWaitEnd, string>> = {
   head_moved: "PR 有了新提交，原来那个 head 的 CI 不再等了",
   timeout: `等了 ${WAIT_HOURS} 小时 CI 还没全绿，不再等了`,
   not_queued: "没能自动再审（这次评审的会话已经不能再排队）",
 };
-const ENDED_EN: Record<CiWaitEnd, string> = {
+const ENDED_EN: Record<Exclude<CiWaitEnd, "threads_open">, string> & Partial<Record<CiWaitEnd, string>> = {
   head_moved: "the pull request got new commits, so I stopped waiting for CI on the old head",
   timeout: `CI was still not green after ${WAIT_HOURS} hours, so I stopped waiting`,
   not_queued: "the review could not be run again by itself (its session could not take another turn)",
@@ -105,6 +105,11 @@ export function resultText(kind: ReviewResult, f: ResultFacts, zh: boolean): str
     return zh
       ? [`**${f.pr} 审完了，没批准：有 ${f.findings.length} 个阻塞问题**`, "", ...shown, ...more, `- 接下来：作者改完推送后，回复 ${again} 再审一遍。`, link].join("\n")
       : [`**${f.pr} is reviewed and not approved: ${f.findings.length} blocking finding(s)**`, "", ...shown, ...more, `- Next: once the author pushes a fix, reply ${again}.`, link].join("\n");
+  }
+  if (f.ended === "threads_open") {
+    return zh
+      ? [`**${f.pr} 审完了，没批准：PR 上还有没解决的评审讨论**`, "", "- 代码里没发现阻塞问题；CI 已经全绿，但还有没解决的评审讨论，所以没有自动再审。", `- 接下来：讨论都解决后回复 ${again}。`, link].join("\n")
+      : [`**${f.pr} is reviewed and not approved: review threads are still open**`, "", "- The review found nothing blocking; CI is green now, but review threads are still open, so it was not run again.", `- Next: once every thread is resolved, reply ${again}.`, link].join("\n");
   }
   if (f.ci) {
     const why = f.ended ? (zh ? ENDED_ZH[f.ended] : ENDED_EN[f.ended])
@@ -196,8 +201,11 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
           AND lower(head_sha) = $2 ORDER BY at DESC, id DESC`,
       [item.worker_session_id, head],
     )).rows as Array<{ detail: string; risk_reasons: unknown }>;
-    const ciRow = refusals.find((r) => r.detail === "ci_not_green");
-    const other = refusals.find((r) => r.detail === "threads_unresolved" || r.detail === "cannot_approve_own_pull_request");
+    // The latest refusal of the head says what held the review last: a CI refusal from before CI turned green says nothing of a thread
+    // the run after it was refused for.
+    const latest = refusals.find((r) => ["ci_not_green", "threads_unresolved", "cannot_approve_own_pull_request"].includes(r.detail));
+    const ciRow = latest?.detail === "ci_not_green" ? latest : undefined;
+    const other = latest && latest.detail !== "ci_not_green" ? latest : undefined;
     const turns = Number((await q(
       "SELECT COUNT(*)::int AS n FROM claw_tasks WHERE session_id = $1 AND origin = 'chat'", [item.worker_session_id],
     )).rows[0]?.n ?? 0);
@@ -211,7 +219,7 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
       headSha: head, event: String(last.event), reviewId: typeof last.posted?.review_id === "number" ? last.posted.review_id : null,
       findings, ci: ciRow ? ciNamesOf(ciRow.risk_reasons) : null, refused: other ? other.detail : null,
       reviewOnly: String(item.params.review_only ?? "true") !== "false", turns,
-      ended: ended === "head_moved" || ended === "timeout" || ended === "not_queued" ? ended : null,
+      ended: ended === "head_moved" || ended === "timeout" || ended === "not_queued" || ended === "threads_open" ? ended : null,
     };
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;
     if (!sessionId) return skipped("owner_has_no_assistant");

@@ -33,6 +33,7 @@ test("every way a review ends without an approval says why and what is next, in 
     [{ ended: "timeout" }, /等了 24 小时/, /after 24 hours/],
     [{ turns: 2 }, /已经在 CI 转绿后自动再审过一次/, /already run again once/],
     [{ ci: null, refused: "threads_unresolved" }, /还有没解决的评审讨论/, /review threads are still open/],
+    [{ ended: "threads_open" }, /CI 已经全绿，但还有没解决的评审讨论[\s\S]*讨论都解决后回复 `再审 #195`/, /CI is green now, but review threads are still open/],
     [{ ci: null, refused: "cannot_approve_own_pull_request" }, /PR 是你自己写的/, /you wrote it/],
     [{ ci: null }, /结论：只留了评论[\s\S]*`再审 #195`/, /Verdict: a comment only/],
   ];
