@@ -108,6 +108,8 @@ export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "f
   const own = prompts.filter((p) => !p.startsWith(WORK_EVENT_PREFIX));
   if (!own.length) return null;
   const chinese = detectLanguage(own.join("\n")) === "Chinese";
+  // The person stopped it (`/stop`): what they asked for happened, and asking them to say it again would be wrong.
+  if (why === "stopped") return chinese ? "已停止。" : "Stopped.";
   if (why === "declined") {
     return chinese
       ? "这个请求我不能处理：它可能涉及访问内部地址、凭据或其他不安全的操作，所以我没有执行。换个问题或说明你想达到的目的，我可以继续帮你。进行中的事项不受影响。"
@@ -118,8 +120,8 @@ export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "f
     : "That message did not go through; please say it again. Your work items are not affected.";
 }
 
-/** Why a turn that answers the user ended without a word: it failed, or the model declined to answer at all. */
-export type TurnLostWhy = "failed" | "declined";
+/** Why a turn that answers the user ended without a word: it failed, the model declined to answer at all, or it was stopped. */
+export type TurnLostWhy = "failed" | "declined" | "stopped";
 
 /**
  * What Brain ends a run with when its model answered nothing twice in a row (or on its last turn): no text and no tool call
@@ -129,8 +131,13 @@ export type TurnLostWhy = "failed" | "declined";
  */
 export const EMPTY_TURN_TEXT_RE = /\bended (?:its|its last allowed) turn without any text or tool call\b/i;
 
-/** Why the turn ended silent, from how it ended. Pure, for the tests. */
+/**
+ * Why the turn ended silent, from how it ended. Pure, for the tests. An interrupted turn that answers the person was stopped by
+ * them (`/stop` reaches Claw as the session's interrupt; the turns the system itself stops are a worker's report's, which answer
+ * nobody), unless the sweeper closed it: then it was lost, not stopped.
+ */
 export function lostWhy(end: Pick<RouterTurnEnd, "failed" | "interrupted" | "fromSweeper" | "finalText">): TurnLostWhy {
+  if (end.interrupted && !end.fromSweeper) return "stopped";
   return end.failed && !end.interrupted && !end.fromSweeper && EMPTY_TURN_TEXT_RE.test(end.finalText ?? "") ? "declined" : "failed";
 }
 
@@ -345,7 +352,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   const prompts = runs.map((r) => r.prompt);
   const why = lostWhy(end);
   let text = lost ? turnLostNotice(prompts, why) : answerToDeliver(end.finalText, prompts);
-  if (lost) await takeBack(why === "declined" ? "declined" : "turn_lost");
+  if (lost) await takeBack(why === "failed" ? "turn_lost" : why);
   if (!text) {
     if (lost) return "skipped";
     await takeBack("no_text");

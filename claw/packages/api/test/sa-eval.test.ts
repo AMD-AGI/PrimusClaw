@@ -1023,6 +1023,7 @@ test("S31 said: the turn answered with a message of its own, the router's say or
   const notices = [
     turnLostNotice(["中文消息"]), turnLostNotice(["an English message"]), turnLostNotice(["中文消息"], "declined"),
     turnLostNotice(["an English message"], "declined"), silentTurnNotice(["中文消息"]), silentTurnNotice(["an English message"]),
+    turnLostNotice(["中文消息"], "stopped"), turnLostNotice(["an English message"], "stopped"),
   ];
   assert.deepEqual([...SYSTEM_TURN_NOTICES].sort(), notices.map((n) => n!).sort());
   for (const n of notices) assert.equal(check(observed([ack, say(5000, m, n!)]))?.pass, false, `the system's notice: ${n}`);

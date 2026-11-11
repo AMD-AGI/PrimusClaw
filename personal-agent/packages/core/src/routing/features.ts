@@ -61,9 +61,15 @@ export interface AssistantChat {
   board(userId: string, credential: string, conversation: Conversation): Promise<void>;
   /**
    * What the assistant is doing this moment is stopped. `onlyMessage`: only while Claw's running turn answers that
-   * message; false, with nothing said or stopped, when it does not.
+   * message; false, with nothing said or stopped, when it does not. What is said is in `lang` (the chat's).
    */
-  stop(userId: string, credential: string, conversation: Conversation, onlyMessage?: string): Promise<boolean>;
+  stop(
+    userId: string,
+    credential: string,
+    conversation: Conversation,
+    onlyMessage?: string,
+    lang?: Lang,
+  ): Promise<boolean>;
   /** Forget what is kept for the person (they unlinked). */
   forget(userId: string): void;
   /** True when the assistant took the message. */

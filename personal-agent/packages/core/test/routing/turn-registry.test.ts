@@ -5,27 +5,42 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { FakeClock } from "../../../../test-support/clock.js";
-import { ActiveTurn, chatTurnKey, Latch, reviewTurnKey, TurnRegistry } from "../../src/routing/turn-registry.js";
+import {
+  ActiveTurn,
+  chatTurnKey,
+  Latch,
+  QUEUED_TURNS_MAX,
+  reviewTurnKey,
+  TurnRegistry,
+} from "../../src/routing/turn-registry.js";
 
-test("a chat has its running turn and at most one queued behind it; a review queues behind nothing", () => {
+test("a chat has its running turn and up to five queued behind it; a review queues behind nothing", () => {
   const turns = new TurnRegistry();
   const chat = chatTurnKey("u1");
   const first = new ActiveTurn();
   assert.ok(turns.claim(chat, first));
   assert.equal(turns.claim(chat, new ActiveTurn()), false);
   const second = new ActiveTurn();
-  assert.deepEqual(turns.enqueue(chat, second), { front: first });
-  assert.equal(turns.enqueue(chat, new ActiveTurn()), "one_waiting");
+  assert.deepEqual(turns.enqueue(chat, second), { front: first, waiting: 1 });
+  for (let n = 2; n <= QUEUED_TURNS_MAX; n += 1) {
+    assert.deepEqual(turns.enqueue(chat, new ActiveTurn()), { front: first, waiting: n });
+  }
+  assert.equal(turns.enqueue(chat, new ActiveTurn()), "queue_full");
   assert.equal(turns.enqueue(chat, new ActiveTurn(true)), "still_working");
-  assert.deepEqual(turns.of(chat), [first, second]);
+  assert.equal(turns.of(chat).length, 1 + QUEUED_TURNS_MAX);
+  assert.equal(turns.withdrawQueued(chat), QUEUED_TURNS_MAX);
+  assert.ok(second.over && second.ended.isSet);
+  assert.deepEqual(turns.of(chat), [first]);
+  assert.deepEqual(turns.enqueue(chat, second), { front: first, waiting: 1 });
   turns.drop(chat, first);
-  assert.ok(first.running.isSet);
+  assert.ok(first.running.isSet && first.ended.isSet);
   assert.deepEqual(turns.of(chat), [second]);
+  assert.equal(turns.withdrawQueued(chat), 0); // (the running turn is not given up)
   turns.drop(chat, second);
   assert.equal(turns.has(chat), false);
   turns.drop(chat, second); // (a turn dropped twice is a no-op)
   const fresh = new ActiveTurn();
-  assert.deepEqual(turns.enqueue(chat, fresh), { front: fresh }); // (a chat with no turn: it is the first)
+  assert.deepEqual(turns.enqueue(chat, fresh), { front: fresh, waiting: 0 }); // (a chat with no turn: it is the first)
 });
 
 test("a review is kept per item (or per pull request) beside the chat turn, and counted with it", () => {
@@ -57,4 +72,9 @@ test("a message queued behind a turn waits for it to run, at most as long as it 
   const timedOut = late.wait(15_000, clock);
   await clock.advance(15_000);
   assert.equal(await timedOut, false);
+  const ended = new Latch();
+  const whenSet = ended.whenSet();
+  ended.set();
+  await whenSet;
+  await ended.whenSet(); // (already set)
 });

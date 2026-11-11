@@ -443,10 +443,16 @@ export class AssistantChat {
   /**
    * `/stop`: interrupts what the assistant is doing this moment; a task is stopped by name. `onlyMessage`: interrupt only while
    * Claw's running turn answers that message (a Stop card's turn, read just before the interrupt goes); false, with nothing said
-   * or interrupted, when it does not.
+   * or interrupted, when it does not. Said in `lang`, the chat's.
    */
-  async stop(_userId: string, credential: string, conversation: Conversation, onlyMessage?: string): Promise<boolean> {
-    const t = assistantChatText.in("en");
+  async stop(
+    _userId: string,
+    credential: string,
+    conversation: Conversation,
+    onlyMessage?: string,
+    lang: Lang = "en",
+  ): Promise<boolean> {
+    const t = assistantChatText.in(lang);
     let running: boolean;
     try {
       const { sessionId } = await this.o.claw.assistant.session(credential);

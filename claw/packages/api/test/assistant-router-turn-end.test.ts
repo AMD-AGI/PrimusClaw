@@ -109,9 +109,11 @@ describe("assistant router turn end", { skip }, () => {
     const turn = await endedTurn("How is the build going?");
     for (const extra of [{ finalText: "" }, { finalText: "   \n " }, {}]) assert.equal(await end(turn, extra), "skipped", JSON.stringify(extra));
     assert.equal((await says()).length, 0);
-    for (const extra of [
-      { failed: true, finalText: "partial" }, { interrupted: true, finalText: "partial" }, { fromSweeper: true, finalText: "[Task timed out]" },
-    ]) {
+    for (const [extra, said] of [
+      [{ failed: true, finalText: "partial" }, /did not go through/],
+      [{ interrupted: true, finalText: "partial" }, /^Stopped\.$/],   // (the person stopped it: not asked to say it again)
+      [{ fromSweeper: true, finalText: "[Task timed out]" }, /did not go through/],
+    ] as const) {
       await w.q("TRUNCATE claw_assistant_says");
       const lost = await endedTurn("How is the build going?");
       assert.equal(await end(lost, extra), "said", JSON.stringify(extra));
@@ -119,7 +121,7 @@ describe("assistant router turn end", { skip }, () => {
       const [notice, ...more] = await says();
       assert.equal(more.length, 0);
       assert.equal(notice.fallback, true, "the system's words, not the model's");
-      assert.match(notice.text, /did not go through/);
+      assert.match(notice.text, said);
     }
   });
 

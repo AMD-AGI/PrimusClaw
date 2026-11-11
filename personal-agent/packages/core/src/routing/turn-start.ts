@@ -9,11 +9,9 @@ import { routingText } from "../locales/routing.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
-import { ActiveTurn, chatTurnKey, reviewTurnKey, type TurnKey } from "./turn-registry.js";
+import { ActiveTurn, chatTurnKey, QUEUED_TURNS_MAX, reviewTurnKey, type TurnKey } from "./turn-registry.js";
 import type { ReviewRunFields, TurnHooks, TurnOutcome, TurnRun } from "./turn-runner.js";
 
-/** What a waiting message gives the turn in front to start running in Claw (`_queue_behind`). */
-export const SUBMIT_WAIT_SECONDS = 15;
 const MOBILE_PLATFORMS = ["ios", "ipados", "android"];
 
 /** Teams on a phone or a tablet: its own Stop under a reply is greyed out, and its own thumbs never reach the worker. */
@@ -62,7 +60,8 @@ export interface StartTurn {
 /**
  * Starting and following a turn (the Python `Agent._start_turn`, `_queue_behind`, `_guarded`, `_record_session`,
  * `_record_turn`): a new task is admitted under the person's task limit; a message sent while the chat's turn runs is
- * queued in Claw behind it (one at most); a review has a session of its own and is neither queued nor queued behind.
+ * queued behind it (up to `QUEUED_TURNS_MAX`, in order, each told its place) and goes to Claw once every turn in front of it
+ * is over, so `/stop` can still give it up; a review has a session of its own and is neither queued nor queued behind.
  */
 export class TurnStarter {
   private readonly running = new Set<Promise<void>>();
@@ -83,7 +82,22 @@ export class TurnStarter {
     const turn = new ActiveTurn(review !== undefined, review?.itemId ?? "");
     const admitted = review === undefined && (await this.admit(request, key, turn));
     if (admitted === undefined) return undefined;
-    if (!admitted && !(await this.queueBehind(key, turn, chat))) return undefined;
+    if (!admitted) {
+      const queued = await this.queueBehind(key, turn, chat);
+      if (queued === "refused") return undefined;
+      if (queued === "waiting") return this.track(this.afterFront(request, key, turn));
+    }
+    return this.launch(request, key, turn);
+  }
+
+  private track(task: Promise<void>): RunningTurn {
+    this.running.add(task);
+    void task.finally(() => this.running.delete(task));
+    return { done: task };
+  }
+
+  /** The turn goes to Claw now; its end is `done`. */
+  private async launch(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<RunningTurn> {
     let run: TurnRun;
     try {
       run = await this.runOf(request);
@@ -91,10 +105,31 @@ export class TurnStarter {
       this.ctx.turns.drop(key, turn); // (a turn that never started must not hold the chat)
       throw error;
     }
-    const task = this.guarded(request, run, key, turn);
-    this.running.add(task);
-    void task.finally(() => this.running.delete(task));
-    return { done: task };
+    return this.track(this.guarded(request, run, key, turn));
+  }
+
+  /**
+   * A queued turn: it goes once every turn in front of it is over (the message the person was told is queued is not waited
+   * for by the caller), and not at all when it was given up meanwhile (`/stop`, said there).
+   */
+  private async afterFront(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<void> {
+    for (;;) {
+      if (turn.over) return;
+      const head = this.ctx.turns.of(key)[0];
+      if (head === turn) break;
+      if (head === undefined) return;
+      await Promise.race([head.ended.whenSet(), turn.ended.whenSet()]);
+    }
+    let started: RunningTurn;
+    try {
+      started = await this.launch(request, key, turn);
+    } catch (error) {
+      const ref = this.ctx.deps.random.hexId().slice(0, 8);
+      this.ctx.deps.logger.error("a queued turn could not start", { ref, error: errorName(error) });
+      await this.tell(request, `Something went wrong on my side (ref ${ref}). Please try again.`);
+      return;
+    }
+    await started.done;
   }
 
   /** True when admitted as the chat's first turn; false when the chat has one (queue behind it); undefined: refused. */
@@ -111,21 +146,24 @@ export class TurnStarter {
   }
 
   /**
-   * Registers `turn` behind the chat's running one; false (the person is told why) when it may not go. It is sent only
-   * once Claw runs the turn in front: then Claw names that turn as the one it waits behind.
+   * Registers `turn` behind the chat's running one: "front" when the chat has none after all (it runs now), "waiting" when it
+   * is queued (the person is told its place), "refused" (and told why) when it may not wait.
    */
-  private async queueBehind(key: TurnKey, turn: ActiveTurn, chat: Chat): Promise<boolean> {
+  private async queueBehind(key: TurnKey, turn: ActiveTurn, chat: Chat): Promise<"front" | "waiting" | "refused"> {
     const queued = this.ctx.turns.enqueue(key, turn);
     const said = routingText.in(chat.lang());
-    if (queued === "still_working" || queued === "one_waiting") {
-      await chat.say(queued === "still_working" ? said.stillWorking : said.oneWaiting);
-      return false;
+    if (queued === "still_working" || queued === "queue_full") {
+      await chat.say(queued === "still_working" ? said.stillWorking : said.queueFull({ n: QUEUED_TURNS_MAX }));
+      return "refused";
     }
-    if (queued.front === turn) return true;
-    if (await queued.front.running.wait(SUBMIT_WAIT_SECONDS * 1000, this.ctx.deps.clock)) return true;
-    this.ctx.turns.drop(key, turn);
-    await chat.say(routingText.in(chat.lang()).stillWorking);
-    return false;
+    if (queued.front === turn) return "front";
+    try {
+      await chat.say(said.queuedBehind({ n: queued.waiting }));
+    } catch (error) {
+      this.ctx.turns.drop(key, turn); // (not told it is queued: it does not run unannounced)
+      throw error;
+    }
+    return "waiting";
   }
 
   private async sessionOf(request: StartTurn): Promise<string | null> {
