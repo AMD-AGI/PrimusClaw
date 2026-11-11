@@ -134,6 +134,7 @@ export interface RemotePermissionRepository {
     sessionId: string,
     actionId: string,
     state: RemotePermissionState,
-    options?: { readonly onlyIfPending?: boolean },
+    /** `onlyIfState`: only from that state (instead of only from pending). */
+    options?: { readonly onlyIfPending?: boolean; readonly onlyIfState?: RemotePermissionState },
   ): boolean;
 }

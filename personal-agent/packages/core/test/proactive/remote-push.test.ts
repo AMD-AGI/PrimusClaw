@@ -374,7 +374,7 @@ it("a terminal's question is posted as a card whose id is kept, with its whole a
   const saved = w.store.remotePermissions.getRemotePermission("rs-t", "act-t1");
   assert.ok(saved !== null);
   assert.equal(saved.messageId, (posted[0] as { id: string }).id);
-  assert.deepEqual(saved.ask, aTerminalAsk());
+  assert.deepEqual(saved.ask, { ...aTerminalAsk(), clawy_shown_whole: true });
   // One an agent Claw started asks keeps going out as before, with no ask kept.
   assert.equal(
     await w.proactive.handle(ALICE, w.reference, remoteSay("rs-1", "needs_you", "say-a", { text: "x", ask: anAsk() })),
@@ -480,4 +480,46 @@ it("a terminal's question whose ids are not plain ids gets no card: its words ar
   assert.ok(!shown(w.surface.outbox).some((line) => line.includes("ask rs-t")));
   assert.ok(shown(w.surface.outbox).some((line) => line.includes("终端在等你")));
   assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "x".repeat(129)), null);
+});
+
+it("a terminal's request keeps only the options its card offers, and is marked as shown whole or not", async () => {
+  const w = world();
+  const cut = { ...aTerminalAsk("act-c"), input: { command: "x".repeat(20_000) } };
+  await w.proactive.handle(ALICE, w.reference, remoteSay("rs-t", "needs_you", "say-c", { text: "x", ask: cut }));
+  const row = w.store.remotePermissions.getRemotePermission("rs-t", "act-c");
+  assert.ok(row !== null);
+  assert.deepEqual(
+    row.options.map((o) => (o as { optionId: string }).optionId),
+    ["deny"],
+  );
+  assert.equal(row.ask?.["clawy_shown_whole"], false);
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-w", { text: "x", ask: aTerminalAsk("act-w") }),
+  );
+  const whole = w.store.remotePermissions.getRemotePermission("rs-t", "act-w");
+  assert.ok(whole !== null);
+  assert.deepEqual(
+    whole.options.map((o) => (o as { optionId: string }).optionId),
+    ["allow", "deny"],
+  );
+  assert.equal(whole.ask?.["clawy_shown_whole"], true);
+});
+
+it("the terminal answers while a click is on its way: the end is kept, and the click's own outcome edits the card", async () => {
+  const w = world();
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", { text: "x", ask: aTerminalAsk() }),
+  );
+  w.store.remotePermissions.closeRemotePermission("rs-t", "act-t1", "sending");
+  const before = w.surface.outbox.length;
+  assert.equal(
+    await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "terminal", "say-r")),
+    "delivered",
+  );
+  assert.deepEqual(w.surface.outbox.slice(before), []);
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.state, "terminal");
 });

@@ -25,6 +25,7 @@ import type { StatusBoard } from "./board.js";
 import { type ChatState, isTransport } from "./state.js";
 import { own } from "../own.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
+import { isTerminalPermission, mayChoose } from "./terminal-asks.js";
 
 /** How a click ends: the clicked card replaced by `card` (a note when it is text), and the outcome said (W4's `ClickRoute.settle`). */
 export type Settle = (
@@ -77,6 +78,9 @@ export class Permissions {
     const state = this.state.attached(chatKey);
     const lang = this.state.lang(chatKey);
     const actionId = textOf(request["actionId"]);
+    // A question a terminal asks reaches the owner as its own card (Claw's push, which shows its content): a chat attached to the
+    // session that carries it draws nothing, so the request is never shown here with every option and none of the content.
+    if (request["origin"] === "terminal_hook") return;
     const options = parseOptions(request["options"]);
     if (!actionId || options.length === 0) {
       await to.send(textMessage(saidIn(lang, "noAnswerableOption")));
@@ -123,11 +127,11 @@ export class Permissions {
   /** The card again with its buttons and `text` on it: the decision did not go through. */
   private reopened(perm: RemotePermission, text: string, lang: Lang): OutMessage {
     const title = remoteText.in(lang).approvalNeeded({ tool: neutral(perm.tool, 100) });
-    return reopenedCard(
-      this.ctx.views.optionButtons(parseOptions(perm.options), perm.sessionId, perm.actionId, lang),
-      title,
-      text,
+    // (a terminal's question comes back without its content: only the options that turn it down, never an approval unseen)
+    const options = parseOptions(perm.options).filter(
+      (o) => !isTerminalPermission(perm) || o.kind.startsWith("reject"),
     );
+    return reopenedCard(this.ctx.views.optionButtons(options, perm.sessionId, perm.actionId, lang), title, text);
   }
 
   /** A click on an option of a permission card (see the module). */
@@ -144,7 +148,8 @@ export class Permissions {
     const owner =
       perm !== null &&
       (perm.userId === click.person || (isGroupKey(perm.userId) && personOf(perm.userId) === click.person));
-    if (perm === null || !owner || option === undefined) {
+    // (a terminal's question its card did not show whole is never approved from here, whatever the button says)
+    if (perm === null || !owner || option === undefined || !mayChoose(perm, option)) {
       await click.settle(saidIn(lang, "approvalInactive"));
       return;
     }
@@ -222,8 +227,21 @@ export class Permissions {
     how: { readonly audited: Readonly<Record<string, string | null>>; readonly giveBack: () => void },
   ): Promise<boolean> {
     const again = async (text: string): Promise<void> => {
-      // the decision did not go through: the card comes back with its buttons
-      this.ctx.permissions.closeRemotePermission(perm.sessionId, perm.actionId, "pending", { onlyIfPending: false });
+      // the decision did not go through: the card comes back with its buttons, unless the request was ended meanwhile (the
+      // terminal answered it while this click was on its way): then it says so instead
+      if (
+        !this.ctx.permissions.closeRemotePermission(perm.sessionId, perm.actionId, "pending", {
+          onlyIfState: "sending",
+        })
+      ) {
+        const now = this.ctx.permissions.getRemotePermission(perm.sessionId, perm.actionId);
+        await click.settle(
+          now?.state === "terminal"
+            ? terminalApprovalText.in(lang).answeredInTerminalLine
+            : saidIn(lang, "approvalAnswered"),
+        );
+        return;
+      }
       await click.settle(this.reopened(perm, text, lang), { fallback: text });
     };
     try {

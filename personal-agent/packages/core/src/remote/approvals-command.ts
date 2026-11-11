@@ -6,7 +6,7 @@
  * command, change a file, start on a plan or have a question answered, and the connector's approval hooks put it here) come to
  * this chat. The setting is Claw's (`/v1/remote-agents/approvals`), on unless turned off; with no word it is only read.
  */
-import { ClawError } from "../claw/errors.js";
+import { ClawAnswerInvalid, ClawError } from "../claw/errors.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 import type { ClawRemoteAgentsPort } from "../ports/claw/remote-agents.js";
 import type { CommandHandler, CommandRoute } from "../ports/routing.js";
@@ -33,7 +33,7 @@ export class TerminalApprovalsCommand implements CommandHandler {
         await say(enabled ? words.approvalsTurnedOn : words.approvalsTurnedOff);
       }
     } catch (error) {
-      if (!(error instanceof ClawError) && !isTransport(error)) throw error;
+      if (!(error instanceof ClawError) && !(error instanceof ClawAnswerInvalid) && !isTransport(error)) throw error;
       await say(words.approvalsUnavailable);
     }
     return true;

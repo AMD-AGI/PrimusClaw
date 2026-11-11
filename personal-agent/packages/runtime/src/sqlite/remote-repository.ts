@@ -157,16 +157,12 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
     sessionId: string,
     actionId: string,
     state: RemotePermissionState,
-    options: { readonly onlyIfPending?: boolean } = {},
+    options: { readonly onlyIfPending?: boolean; readonly onlyIfState?: RemotePermissionState } = {},
   ): boolean {
-    const onlyIfPending = options.onlyIfPending ?? true;
-    return (
-      this.ctx.db.run(
-        `UPDATE remote_permissions SET state = ? WHERE session_id = ? AND action_id = ?${onlyIfPending ? " AND state = 'pending'" : ""}`,
-        state,
-        sessionId,
-        actionId,
-      ) === 1
-    );
+    const from = options.onlyIfState ?? ((options.onlyIfPending ?? true) ? "pending" : null);
+    const sql = "UPDATE remote_permissions SET state = ? WHERE session_id = ? AND action_id = ?";
+    return from === null
+      ? this.ctx.db.run(sql, state, sessionId, actionId) === 1
+      : this.ctx.db.run(`${sql} AND state = ?`, state, sessionId, actionId, from) === 1;
   }
 }

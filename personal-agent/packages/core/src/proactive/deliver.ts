@@ -26,6 +26,9 @@ import type { ProactiveDeps } from "./deps.js";
 import { EXPIRES_KEY, REMOTE_SAID, finishedAt, type AnsweredInChat } from "./events.js";
 import { remoteAskExpiry, zoneOf } from "./quiet.js";
 import { noteCard } from "../remote/views.js";
+import { parseOptions } from "../remote/options.js";
+import { SHOWN_WHOLE } from "../remote/terminal-asks.js";
+import { terminalAskView } from "../remote-view/terminal-ask-view.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 
 /** What the person asked, as the name of a run in its card and in the line before a lost turn's answer. */
@@ -33,6 +36,32 @@ export const PROMPT_TITLE_MAX = 60;
 
 function view(v: View): OutMessage {
   return { body: { type: "view", view: v, fallbackText: "" } };
+}
+
+/**
+ * What a terminal's question card offers (`terminalAskView`): the options it shows as buttons, as the connector gave them, and the
+ * ask marked with whether the card shows the request whole (`SHOWN_WHOLE`), which a click is checked against.
+ */
+function terminalOffer(
+  ask: Readonly<Record<string, unknown>>,
+  offered: readonly unknown[],
+  remote: RemoteNotice,
+): { options: unknown[]; ask: Readonly<Record<string, unknown>> } {
+  const view = terminalAskView(
+    { ask, options: parseOptions(offered), sessionId: remote.sessionId, machine: remote.machine, agent: remote.agent },
+    "en",
+  );
+  const ids = new Set(view.buttons.map((b) => b.optionId));
+  const options = offered.filter((o) => {
+    const id = o !== null && typeof o === "object" ? (o as Record<string, unknown>)["optionId"] : undefined;
+    return typeof id === "string" && ids.has(id);
+  });
+  return { options, ask: { ...ask, [SHOWN_WHOLE]: view.complete } };
+}
+
+/** A terminal's question names its request by an id the connector made, a uuid: anything else is said as words, no card. */
+function cardableIds(ask: Readonly<Record<string, unknown>>, actionId: string, sessionId: string): boolean {
+  return ask["origin"] !== "terminal" || (plainId(actionId) && plainId(sessionId));
 }
 
 /** An id a card's button may carry: at most 128 characters, no control characters. */
@@ -306,16 +335,18 @@ export class Deliveries {
     const { store } = this.deps;
     const ask = remote.ask ?? {};
     const actionId = str(ask["action_id"]);
-    const options = this.deps.remote.options(ask["options"]);
-    if (!actionId || options.length === 0) return undefined;
-    // (a terminal's question names its request by an id the connector made, a uuid: anything else is said as words, no card)
-    if (ask["origin"] === "terminal" && !(plainId(actionId) && plainId(remote.sessionId))) return undefined;
+    const offered = this.deps.remote.options(ask["options"]);
+    if (!actionId || offered.length === 0) return undefined;
+    if (!cardableIds(ask, actionId, remote.sessionId)) return undefined;
     const now = store.now();
     const expiresAt = remoteAskExpiry(ask, now);
     if (expiresAt <= now) return false;
     const tool = str(ask["tool"]) || "an action";
-    // A question a terminal asks keeps its whole ask: the board draws its card again with the content, never buttons alone.
+    // A question a terminal asks keeps its whole ask: the board draws its card again with the content, never buttons alone. Only
+    // the options its card offers are kept (what was not shown whole offers only those that turn it down), and whether it was.
     const terminal = ask["origin"] === "terminal";
+    const shown = terminal ? terminalOffer(ask, offered, remote) : { options: offered, ask };
+    const options = shown.options;
     if (
       !store.remotePermissions.saveRemotePermission({
         userId,
@@ -324,7 +355,7 @@ export class Deliveries {
         tool,
         options,
         expiresAt,
-        ...(terminal ? { ask } : {}),
+        ...(terminal ? { ask: shown.ask } : {}),
       })
     ) {
       return false; // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it)
@@ -372,8 +403,12 @@ export class Deliveries {
     const perm = store.remotePermissions.getRemotePermission(sessionId, resolved.actionId);
     if (perm === null || perm.userId !== userId) return false;
     const state = resolved.by === "terminal" ? "terminal" : "expired";
-    // (answered here first, or a click is on its way: the click's own outcome stands)
-    if (!store.remotePermissions.closeRemotePermission(sessionId, resolved.actionId, state)) return true;
+    if (!store.remotePermissions.closeRemotePermission(sessionId, resolved.actionId, state)) {
+      // A click is on its way: the end is kept, so that if the click fails its card says so instead of coming back. If it goes
+      // through it answers the card itself. (answered here first: nothing to do)
+      store.remotePermissions.closeRemotePermission(sessionId, resolved.actionId, state, { onlyIfState: "sending" });
+      return true;
+    }
     if (!perm.messageId) return false;
     const lang = answerLang(store.prefs.getPrefs(userId).lang, this.clientLocale(), str(perm.ask?.["tool"]));
     const words = terminalApprovalText.in(lang);
