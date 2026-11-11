@@ -441,3 +441,132 @@ test("a request whose card cannot be built is forgotten and its resend gets the 
     await w.until(() => w.permissionCards().length > 0);
     assert.equal(w.permissionCards().length, 1);
   }));
+
+/** The request on screen made a terminal's question (a connector's approval hooks): its row keeps the whole ask. */
+function asTerminalQuestion(w: RemoteWorld, sid: string, whole = true): void {
+  const row = perm(w, sid);
+  assert.ok(row !== null);
+  w.test.store.remotePermissions.forgetRemotePermission(sid, "act-1");
+  w.test.store.remotePermissions.saveRemotePermission({
+    userId: row.userId,
+    sessionId: sid,
+    actionId: "act-1",
+    tool: row.tool,
+    options: row.options,
+    expiresAt: row.expiresAt,
+    ask: {
+      action_id: "act-1",
+      origin: "terminal",
+      kind: "edit",
+      input: { file_path: "README.md" },
+      ...(whole ? { clawy_shown_whole: true } : {}),
+    },
+  });
+}
+
+test("a terminal's question Claw says is answered was answered at the terminal, and a click after that is told so", async () => {
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid);
+    w.server.failOn("POST", "/decisions", 409);
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "This request was answered in the terminal.");
+    assert.equal(perm(w, sid)?.state, "expired");
+  });
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid);
+    w.test.store.remotePermissions.closeRemotePermission(sid, "act-1", "terminal");
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "This request was answered in the terminal.");
+    assert.equal(w.server.commandsOf("decision").length, 0);
+  });
+});
+
+test("a terminal's question its card did not show whole is never approved here, and a failed click brings back only the turn-down options", () =>
+  remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CLAUDE_OPTIONS, "claude");
+    asTerminalQuestion(w, sid, false);
+    // An allow button (an older card, or one built by hand) is refused here, and nothing reaches Claw.
+    await w.click(button(card, "allow-once"));
+    assert.equal(w.last(), APPROVAL_INACTIVE);
+    assert.equal(w.server.calls.filter(([, p]) => p.includes("decisions")).length, 0);
+    // A turn-down that does not go through comes back with turn-down options only.
+    w.server.failOn("POST", "/decisions", 500);
+    await w.click(button(card, "reject"));
+    const restored = w.cards().at(-1) ?? {};
+    assert.deepEqual(
+      actionsOf(restored).map((a) => dataOf(a)["option_id"]),
+      ["reject"],
+    );
+    assert.equal(perm(w, sid)?.state, "pending");
+  }));
+
+test("a terminal's question shown whole still loses its allow options when a failed click brings the card back without its content", () =>
+  remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CLAUDE_OPTIONS, "claude");
+    asTerminalQuestion(w, sid);
+    w.server.failOn("POST", "/decisions", 500);
+    await w.click(button(card, "allow-once"));
+    const restored = w.cards().at(-1) ?? {};
+    assert.deepEqual(
+      actionsOf(restored).map((a) => dataOf(a)["option_id"]),
+      ["reject"],
+    );
+  }));
+
+test("the terminal answers while a click is on its way and the click fails: the card says so instead of coming back", () =>
+  remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CLAUDE_OPTIONS, "claude");
+    asTerminalQuestion(w, sid);
+    const perms = w.test.store.remotePermissions;
+    const close = perms.closeRemotePermission.bind(perms);
+    // (the resolved notice lands just after the click took the request: as the proactive side records it)
+    perms.closeRemotePermission = (s, a, state, options) => {
+      const done = close(s, a, state, options);
+      if (done && state === "sending") close(s, a, "terminal", { onlyIfState: "sending" });
+      return done;
+    };
+    w.server.failOn("POST", "/decisions", 500);
+    const before = w.permissionCards().length;
+    await w.click(button(card, "allow-once"));
+    assert.equal(w.last(), "This request was answered in the terminal.");
+    assert.equal(w.permissionCards().length, before);
+    assert.equal(perm(w, sid)?.state, "terminal");
+  }));
+
+test("a chat attached to the session that carries a terminal's questions draws no card for them", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await asked(w, CLAUDE_OPTIONS, "claude");
+    const cards = w.permissionCards().length;
+    await w.server.emit(sid, "permissionRequest", {
+      actionId: "act-term",
+      tool: "Run: ls",
+      kind: "execute",
+      input: { command: "ls" },
+      options: CLAUDE_OPTIONS,
+      origin: "terminal_hook",
+    });
+    // (as Claw's push names the same origin: not drawn either)
+    await w.server.emit(sid, "permissionRequest", {
+      actionId: "act-term2",
+      tool: "Run: ls",
+      kind: "execute",
+      input: { command: "ls" },
+      options: CLAUDE_OPTIONS,
+      origin: "terminal",
+    });
+    // (a second request of the same session is shown: the one before it has been read)
+    await w.server.emit(sid, "permissionRequest", {
+      actionId: "act-after",
+      tool: "Edit b.md",
+      kind: "edit",
+      input: { path: "b.md" },
+      options: CLAUDE_OPTIONS,
+    });
+    await w.until(() => w.permissionCards().length === cards + 1);
+    assert.ok(!JSON.stringify(w.permissionCards()).includes("act-term"));
+    assert.equal(w.test.store.remotePermissions.getRemotePermission(sid, "act-term"), null);
+    assert.ok(!JSON.stringify(w.permissionCards()).includes("act-term2"));
+    assert.equal(w.test.store.remotePermissions.getRemotePermission(sid, "act-term2"), null);
+  }));

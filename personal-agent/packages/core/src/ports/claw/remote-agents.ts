@@ -42,6 +42,10 @@ export interface ClawRemoteAgentsPort {
   /** A one-time pairing code inside the command line that uses it. */
   pair(key: ClawCredential): Promise<RemotePairing>;
   revoke(key: ClawCredential, connectorId: string): Promise<void>;
+  /** Whether the questions the caller's terminals ask come to them (`GET /approvals`; on unless they turned it off). */
+  approvals(key: ClawCredential): Promise<boolean>;
+  /** Turn them on or off (`PUT /approvals`); answers the setting as Claw stored it. */
+  setApprovals(key: ClawCredential, enabled: boolean): Promise<boolean>;
   createSession(key: ClawCredential, session: NewRemoteSession): Promise<RemoteSession>;
   sessions(key: ClawCredential): Promise<RemoteSession[]>;
   session(key: ClawCredential, sessionId: string): Promise<RemoteSession>;

@@ -189,6 +189,36 @@ test("an approval waits on the card and is answered there", () =>
     assert.ok(words.includes("APPROVED-OK") && !words.includes("Needs your approval"), words);
   }, CARD));
 
+test("a terminal's question is never drawn in the window: it shows a tool and buttons, not the request", () =>
+  remoteWorld(async (w) => {
+    const script = new Script();
+    script.onPrompt = async (srv, sid) => {
+      await srv.say(sid, "REDRAWN-OK");
+    };
+    const sid = await windowed(w, script);
+    // (stored as a terminal's question shown whole: its options keep Allow)
+    w.test.store.remotePermissions.saveRemotePermission({
+      userId: AAD,
+      sessionId: sid,
+      actionId: "act-term",
+      tool: "Run: TERMINAL-TOOL",
+      options: CODEX_OPTIONS,
+      expiresAt: Date.now() / 1000 + 600,
+      ask: {
+        action_id: "act-term",
+        origin: "terminal",
+        kind: "execute",
+        input: { command: "ls" },
+        clawy_shown_whole: true,
+      },
+    });
+    await sendFromCard(w, sid, "go");
+    await w.until(() => cardWords(lastWindow(w)).includes("REDRAWN-OK"));
+    const card = lastWindow(w);
+    assert.ok(!cardWords(card).includes("TERMINAL-TOOL"), cardWords(card));
+    assert.deepEqual(approvalButtons(card), []);
+  }, CARD));
+
 test("stop and back to the assistant from the card", () =>
   remoteWorld(async (w) => {
     const script = new Script();

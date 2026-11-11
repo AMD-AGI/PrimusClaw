@@ -154,7 +154,8 @@ export class Board {
       if (perm === null || perm.userId !== userId || perm.state !== "pending" || perm.expiresAt <= now) continue;
       const prefs = store.prefs.getPrefs(userId);
       return this.deps.remoteAsk({
-        ask: { action_id: perm.actionId, tool: perm.tool },
+        // (a question a terminal asks is drawn again whole, with its content: never its buttons alone)
+        ask: perm.ask ?? { action_id: perm.actionId, tool: perm.tool },
         options: perm.options,
         sessionId,
         machine: typeof item.params["machine"] === "string" ? item.params["machine"] : "",
