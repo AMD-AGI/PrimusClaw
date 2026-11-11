@@ -209,8 +209,10 @@ The component between Azure Bot Service and the inbound queue is not published y
 - It sends the activity's JSON, unchanged, as one message to the inbound queue (`INBOUND_QUEUE`, default
   `primusclaw-inbound`), with the message's session id set to the activity's `conversation.id`.
 - It answers Bot Service at once: `200` for a message. For an `invoke` named `adaptiveCard/action` (someone pressed a
-  button on a card) it answers with an Adaptive Card invoke response carrying a placeholder card, which the worker
-  replaces when it handles the press. The worker reads only `message` and `invoke` activities and ignores the rest.
+  button on a card) it answers with an Adaptive Card invoke response carrying a placeholder card. When the worker
+  handles the press it replaces that card through the Bot Connector (it updates the message the invoke's `replyToId`
+  names), with a note if nothing else settled it. The worker reads only `message` and `invoke` activities and ignores
+  the rest.
 
 ### 5. Configure the worker
 
@@ -247,11 +249,13 @@ docker run -d --name personal-agent --env-file .env -p 127.0.0.1:8080:8080 -p 12
   docker.io/primussafe/personal-agent-teams:0.1.1
 ```
 
-From npm (Node 26), with the store somewhere the user running it can write:
+From npm (Node 26), with the store in a directory the user running it can write (SQLite creates the file, not the
+directory):
 
 ```bash
 npm install @primusclaw/personal-agent-teams@0.1.1
-TEAMS_DB_PATH=/var/lib/personal-agent/state.db \
+mkdir -p "$HOME/personal-agent"
+TEAMS_DB_PATH="$HOME/personal-agent/state.db" \
   node --env-file=.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
 ```
 
