@@ -51,6 +51,9 @@ export class FakeGithub {
   statuses: Array<{ context: string; state: string }> = [];
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
+  /** `GET /branches/{branch}`: the classic branch protection, here requiring no check (as both public repositories this serves have it). */
+  branch: unknown = { protected: true, protection: { enabled: true, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } };
+  branchStatus = 200;
   graphql: Record<string, any> = {
     id: "PR_kwDOdemo7", mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD, isMergeQueueEnabled: false,
     isInMergeQueue: false, mergeQueueEntry: null,
@@ -164,6 +167,7 @@ export class FakeGithub {
     }
     if (/\/commits\/[0-9a-f]{40}\/check-runs$/.test(p)) return json(200, { total_count: this.checkRuns.length, check_runs: this.checkRuns });
     if (/\/commits\/[0-9a-f]{40}\/status$/.test(p)) return json(200, { total_count: this.statuses.length, state: "success", statuses: this.statuses });
+    if (/^\/repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(p)) return this.branchStatus === 200 ? json(200, this.branch) : json(this.branchStatus, { message: "nope" });
     if (/\/rules\/branches\//.test(p)) return this.rulesStatus === 200 ? json(200, this.rules) : json(this.rulesStatus, { message: "nope" });
     if (/\/issues\/\d+\/comments$/.test(p)) return json(200, this.issueComments);
     if (/\/pulls\/\d+\/comments$/.test(p)) return json(200, this.reviewComments);

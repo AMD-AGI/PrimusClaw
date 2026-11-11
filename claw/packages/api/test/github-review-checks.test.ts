@@ -4,7 +4,7 @@
 /** Whether the head commit is green: what counts, and what must never be read as green. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateChecks, requiredContextsFromRules } from "../src/github-review/checks.js";
+import { evaluateChecks, requiredContextsFromBranch, requiredContextsFromRules } from "../src/github-review/checks.js";
 
 const run = (name: string, status = "completed", conclusion: string | null = "success") => ({ name, status, conclusion });
 const base = { statuses: [], required: [], truncated: false };
@@ -115,4 +115,17 @@ test("a run with a conclusion is finished whatever its status says (PrimusClaw#7
   // The same shape with a failing conclusion is a failure, and a run with no conclusion yet still waits.
   assert.deepEqual(evaluateChecks({ ...base, checkRuns: [run("a", "in_progress", "failure")] }).summary.failedNames, ["a"]);
   assert.deepEqual(evaluateChecks({ ...base, checkRuns: [run("a", "in_progress", null)] }).summary.pendingNames, ["a"]);
+});
+
+test("the classic protection's required checks come from the branch read; enforcement off or no protection requires none; an unknown shape is unreadable", () => {
+  assert.deepEqual(requiredContextsFromBranch({ protected: true, protection: { required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } }), []);
+  assert.deepEqual(requiredContextsFromBranch({ protected: false }), []);
+  assert.deepEqual(requiredContextsFromBranch({ protected: true, protection: { required_status_checks: {
+    enforcement_level: "everyone", contexts: ["ci/a"], checks: [{ context: "ci/a" }, { context: "build" }] } } }), ["ci/a", "build"]);
+  assert.equal(requiredContextsFromBranch(null), null);
+  assert.equal(requiredContextsFromBranch({ protected: true }), null);
+  assert.equal(requiredContextsFromBranch({ protected: true, protection: { required_status_checks: { enforcement_level: "everyone" } } }), null);
+  // Unreadable: no failure is advisory.
+  const v = evaluateChecks({ ...base, checkRuns: [run("test")], statuses: [{ context: "codecov/patch", state: "failure" }], required: ["test"], advisory: false });
+  assert.deepEqual([v.green, v.summary.advisoryFailed], [false, []]);
 });

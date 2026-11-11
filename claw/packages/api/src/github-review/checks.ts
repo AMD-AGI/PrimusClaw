@@ -41,6 +41,11 @@ export function evaluateChecks(input: {
   required: string[] | null;
   /** More checks exist than were read. */
   truncated: boolean;
+  /**
+   * Whether a failed check outside `required` may be advisory: false when the classic branch protection's required checks could not be read
+   * (`required` then lists only the rulesets'), so a check only it requires is never taken for one that is not required. Default true.
+   */
+  advisory?: boolean;
 }): ChecksVerdict {
   const reasons: string[] = [];
   const state = new Map<string, "pass" | "fail" | "pending">();
@@ -73,7 +78,7 @@ export function evaluateChecks(input: {
   const pending = pendingNames.length;
   const required = input.required ?? [];
   const requiredMissing = required.filter((name) => !state.has(name));
-  const advisoryFailed = required.length > 0 ? failedNames.filter((name) => !required.includes(name)) : [];
+  const advisoryFailed = required.length > 0 && input.advisory !== false ? failedNames.filter((name) => !required.includes(name)) : [];
   const blockingFailed = failedNames.filter((name) => !advisoryFailed.includes(name));
 
   if (input.required === null) reasons.push("the required checks of the base branch could not be read");
@@ -111,6 +116,28 @@ export function requiredContextsFromRules(rules: unknown): string[] | null {
       if (!out.includes(context)) out.push(context);
     }
   }
+  return out;
+}
+
+/**
+ * The status-check contexts the base branch's classic branch protection requires, from `GET /repos/{o}/{r}/branches/{branch}` (readable by
+ * anyone who can read the repository, unlike the protection endpoint): `[]` when it requires none (enforcement off, or no protection), null
+ * when the answer does not say. The rulesets read (`requiredContextsFromRules`) does not see these.
+ */
+export function requiredContextsFromBranch(branch: unknown): string[] | null {
+  const b = branch as { protected?: unknown; protection?: { required_status_checks?: { enforcement_level?: unknown; contexts?: unknown; checks?: unknown } } } | null;
+  if (!b || typeof b !== "object") return null;
+  if (b.protected === false) return [];
+  const rsc = b.protection?.required_status_checks;
+  if (!rsc || typeof rsc !== "object") return null;
+  if (rsc.enforcement_level === "off") return [];
+  const out: string[] = [];
+  for (const c of Array.isArray(rsc.contexts) ? rsc.contexts : []) if (typeof c === "string" && c && !out.includes(c)) out.push(c);
+  for (const c of Array.isArray(rsc.checks) ? rsc.checks : []) {
+    const context = (c as { context?: unknown } | null)?.context;
+    if (typeof context === "string" && context && !out.includes(context)) out.push(context);
+  }
+  if (!Array.isArray(rsc.contexts) && !Array.isArray(rsc.checks)) return null;
   return out;
 }
 

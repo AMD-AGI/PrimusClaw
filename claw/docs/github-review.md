@@ -401,7 +401,9 @@ A review asked of someone else meets the assistant in three places:
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
   failure is a failure; nothing is re-run; a failed check the base branch's rules do not require is
-  advisory, named and not blocking, when those rules require at least one check), no review thread is unresolved, GitHub's own merge
+  advisory, named and not blocking, when those rules require at least one check and the classic
+  branch protection, read from `GET /branches/{branch}`, does not require it either; when that read
+  does not say, no failure is advisory), no review thread is unresolved, GitHub's own merge
   state is `CLEAN` (or `UNSTABLE` when the only checks not passing are advisory failures) after the approval (GitHub works the state out asynchronously, so an `UNKNOWN`,
   and a `BLOCKED` right after this call's own approval, is looked at again for about seven seconds, one
   request a look, with CI read once more before a merge that had to wait, before the merge is refused as `merge_state_not_clean`), and the repository's own

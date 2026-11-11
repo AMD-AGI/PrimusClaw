@@ -23,7 +23,7 @@
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
-import { evaluateChecks, hasMergeQueueRule, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
+import { evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { commentableLines } from "./diff.js";
 import { GithubClient, GithubError, GithubGraphqlError, parsePrRef, repoPath, type GithubAnswer, type PrRef } from "./github.js";
 import { LEGACY_REPO_CONFIG_STEM, LEGACY_RUN_MARKER_PREFIX } from "./legacy-names.js";
@@ -158,6 +158,8 @@ interface Ctx {
   skipBudget?: boolean;
   /** The base branch's rules as GitHub gave them, read once per call (see `baseRules`); null when they could not be read. */
   rules?: unknown;
+  /** The base branch as GitHub answers `GET /branches/{branch}`, read once per call (`baseBranch`); null when it would not say. */
+  branch?: unknown;
 }
 
 interface RepoInfo {
@@ -1487,10 +1489,30 @@ export class GithubReview {
     const required = requiredContextsFromRules(await this.baseRules(ctx, ref, pr));
     const checkRuns = (runs.json?.check_runs ?? []).map((c) => ({ name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null }));
     const statuses = (status.json?.statuses ?? []).map((s) => ({ context: String(s.context ?? ""), state: String(s.state ?? "") }));
-    return evaluateChecks({
+    const input = {
       checkRuns, statuses, required,
       truncated: Number(runs.json?.total_count ?? 0) > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
-    });
+    };
+    const verdict = evaluateChecks(input);
+    if (!verdict.summary.advisoryFailed.length || required === null) return verdict;
+    // A failure the rulesets do not require is advisory only if the classic branch protection does not require it either: read once, and
+    // only here, where it decides something. Unreadable, nothing is advisory.
+    const classic = requiredContextsFromBranch(await this.baseBranch(ctx, ref, pr));
+    if (classic === null) return evaluateChecks({ ...input, advisory: false });
+    return evaluateChecks({ ...input, required: [...required, ...classic.filter((c) => !required.includes(c))] });
+  }
+
+  /** The base branch as `GET /branches/{branch}` answers (its classic protection's required checks), read once per call; null when GitHub would not say. */
+  private async baseBranch(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<unknown> {
+    if (ctx.branch === undefined) {
+      try {
+        ctx.branch = (await ctx.client.get<unknown>(repoPath(ref, `/branches/${encodeURIComponent(pr.baseRef)}`))).json;
+      } catch (err) {
+        if (err instanceof GithubError && err.rateLimited) throw err;
+        ctx.branch = null;
+      }
+    }
+    return ctx.branch;
   }
 
   /** What GitHub says of the pull request itself, in one request: its merge state and review decision, its head and its review threads. */
