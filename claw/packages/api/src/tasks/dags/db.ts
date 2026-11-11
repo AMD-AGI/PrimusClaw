@@ -7,7 +7,8 @@
  * Thin SQL wrappers; no business logic. Admission lives in `./admission.ts`
  * and route plumbing in `../../routes/task-dags.ts`.
  */
-import { db } from "../../infra/db.js";
+import { db, inTransaction } from "../../infra/db.js";
+import { holdPluginReference } from "../../marketplace/plugin-expiry.js";
 import type { TaskDagDef, DagDerived } from "./types.js";
 
 export interface TaskDagRow {
@@ -44,7 +45,11 @@ export async function insertTaskDag(
   fullAdmin: boolean,
 ): Promise<TaskDagRow | null> {
   const metadata = { ...(def.metadata ?? {}), derived };
-  const r = await db.query(
+  // In one transaction with a hold on the plugin it names, so the expiry sweep
+  // cannot delete that plugin between its reference check and this write.
+  const r = await inTransaction(async (query) => {
+    await holdPluginReference({ query }, def.plugin_id ?? null);
+    return query(
     `INSERT INTO claw_task_dags
        (dag_id, name, version, description, plugin_id, trust_level,
         input_schema, nodes, batch_aggregator, metadata, owner_user_id,
@@ -81,6 +86,7 @@ export async function insertTaskDag(
       fullAdmin,
     ],
   );
+  });
   return (r.rowCount ?? 0) > 0 ? (r.rows[0] as TaskDagRow) : null;
 }
 

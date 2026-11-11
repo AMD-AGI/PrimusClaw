@@ -23,6 +23,8 @@
  *   X8 the schema guard requires the plugin columns every write names
  *   X9 a task cannot name another user's private plugin (temporary plugins are private), and the answer is the not-found one
  *   X10 an admission in flight holds its plugin against the sweep; a DAG whose plugin is gone is refused
+ *   X11 a DAG cannot hand its runner a private plugin its own owner may not see
+ *   X12 a queued message and a DAG template hold the plugin they name while they are written
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -257,6 +259,40 @@ describe("temporary plugins against Postgres", { skip }, () => {
     const res = await tasksApp.inject({ method: "POST", url: "/v1/sessions/sx/tasks", payload: { dag_id: "d-x10", input: {} } });
     assert.equal(res.statusCode, 404, res.body);
     assert.equal(res.json().error, "plugin_not_found");
+    await q("DELETE FROM claw_task_dags");
+  });
+  // X11
+  test("a DAG cannot hand its runner a private plugin its owner may not see", async () => {
+    const theirs = Number(((await q(
+      "INSERT INTO plugins (name, version, owner_user_id, is_public) VALUES ('dag-theirs', '1', 'u2', false) RETURNING id",
+    )).rows[0] as { id: string }).id);
+    await q("INSERT INTO claw_task_dags (dag_id, name, plugin_id, owner_user_id) VALUES ('d-x11', 'd', $1, 'u1')", [theirs]);
+    const res = await tasksApp.inject({ method: "POST", url: "/v1/sessions/sx/tasks", payload: { dag_id: "d-x11", input: {} } });
+    assert.equal(res.statusCode, 404, res.body);
+    assert.equal(res.json().error, "plugin_not_found");
+    await q("DELETE FROM claw_task_dags");
+  });
+
+  // X12
+  test("a DAG template write holds the plugin it names", async () => {
+    const id = await addRaw("dag-held", false, "2020-01-01T00:00:00Z");
+    const { holdPluginReference } = expiry;
+    const writer = await h.app.db.db.pool.connect();
+    try {
+      await writer.query("BEGIN");
+      await holdPluginReference(writer, id);
+      assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "held while the write is in flight");
+      await writer.query("INSERT INTO claw_task_dags (dag_id, name, plugin_id) VALUES ('d-x12', 'd', $1)", [id]);
+      await writer.query("COMMIT");
+    } finally {
+      writer.release();
+    }
+    assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "and kept by the template once written");
+    await holdPluginReference({ query: (t: string, p?: unknown[]) => q(t, p) }, null);
+    await q("DELETE FROM claw_task_dags");
+    const { insertTaskDag } = await import("../src/tasks/dags/db.js");
+    const row = await insertTaskDag({ dag_id: "d-x12b", name: "d", plugin_id: id, nodes: [] } as any, {} as any, "u1", false);
+    assert.equal(Number(row!.plugin_id), id, "insertTaskDag still writes through its transaction");
     await q("DELETE FROM claw_task_dags");
   });
 });

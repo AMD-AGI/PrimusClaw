@@ -39,6 +39,7 @@ import type { EnvironmentTopology } from "@claw/protocol";
 import { db, type StatementRunner } from "../infra/db.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { holdPluginReference } from "../marketplace/plugin-expiry.js";
 import { canAccessSession, isSystemAdmin, type UserInfo } from "../auth/models.js";
 import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
@@ -328,6 +329,8 @@ export async function submitSessionMessage(
         userEnv: userEnvSnapshot,
         doorbell: RUN_DOORBELL_DISPATCH,
       });
+      // The queued row references the plugin: hold it so the expiry sweep cannot race the insert.
+      await holdPluginReference(client, pluginId);
       const inserted = await insertPendingMessage(client, {
         sessionId,
         content,

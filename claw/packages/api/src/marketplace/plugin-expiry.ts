@@ -13,9 +13,10 @@
  *
  * A plugin something still uses (an unfinished task, a live app run, a queued
  * message, a live DAG template) is left alone and expires on a later pass once
- * that is over. "Still uses" includes an admission in flight: every admission
- * transaction holds the plugin row `FOR SHARE` (`holdPluginForAdmission`) until
- * it commits, the sweep takes its candidates `FOR UPDATE SKIP LOCKED`, and only
+ * that is over. "Still uses" includes a write in flight: every transaction that
+ * writes such a reference holds the plugin row `FOR SHARE` until it commits
+ * (`holdPluginForAdmission` for runs, `holdPluginReference` for queued messages
+ * and DAG templates), the sweep takes its candidates `FOR UPDATE SKIP LOCKED`, and only
  * then, in a later statement that sees everything committed before the lock,
  * checks for references. So an admission either commits its task first (and
  * the sweep sees it) or waits for the sweep and finds the plugin gone. Every
@@ -109,6 +110,20 @@ export async function holdPluginForAdmission(client: PoolClient, pluginId: numbe
     [pluginId],
   );
   return (r.rowCount ?? 0) > 0;
+}
+
+/**
+ * Hold a plugin row for the rest of a transaction that writes a reference to
+ * it without admitting a run (a queued message, a DAG template), whatever
+ * state the plugin is in: the write is not refused, only kept from racing the
+ * sweep. A no-op for a null id.
+ */
+export async function holdPluginReference(
+  q: { query: (text: string, params?: unknown[]) => Promise<unknown> },
+  pluginId: number | string | null | undefined,
+): Promise<void> {
+  if (pluginId === null || pluginId === undefined) return;
+  await q.query("SELECT 1 FROM plugins WHERE id = $1 FOR SHARE", [pluginId]);
 }
 
 /** The expired private plugins this pass may take, locked; one an admission holds is skipped. */

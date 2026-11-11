@@ -295,12 +295,22 @@ type CreateTarget =
 /**
  * The plugin a request names, or null when it is gone (deleted, or past its
  * expiry) or the caller may not see it. The two are one answer, so a private
- * plugin's id is not an existence oracle; a plugin a DAG names is the DAG's
- * business and is read with `loadPluginRow` directly.
+ * plugin's id is not an existence oracle. A plugin a DAG names goes through
+ * `loadDagPlugin` instead.
  */
 async function loadRequestedPlugin(pluginId: number, user: UserInfo) {
   const row = await loadPluginRow(pluginId);
   return row && canViewPlugin(row, user.userId, isAdmin(user)) ? row : null;
+}
+
+/**
+ * The plugin a DAG names, or null when it is gone or its DAG's owner may not
+ * see it: anyone can name a plugin id when writing a DAG, and running the DAG
+ * must not hand them another owner's private plugin.
+ */
+async function loadDagPlugin(pluginId: number, dagOwner: unknown) {
+  const row = await loadPluginRow(pluginId);
+  return row && canViewPlugin(row, typeof dagOwner === "string" ? dagOwner : undefined, false) ? row : null;
 }
 
 async function resolveCreateTarget(body: CreateTaskBody, user: UserInfo): Promise<CreateTarget> {
@@ -309,7 +319,7 @@ async function resolveCreateTarget(body: CreateTaskBody, user: UserInfo): Promis
   if (!dag && plugin?.resource?.task_dag_id) {
     dag = await getTaskDag(plugin.resource.task_dag_id as string);
   }
-  if (dag && !plugin && dag.plugin_id) plugin = await loadPluginRow(dag.plugin_id);
+  if (dag && !plugin && dag.plugin_id) plugin = await loadDagPlugin(dag.plugin_id, dag.owner_user_id);
   if (body.dag_id && !dag) return { status: 404, error: "dag_not_found" };
   if (dag && dag.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
   // A named plugin that is gone (deleted, or a temporary one past its expiry)
@@ -487,7 +497,7 @@ export async function registerBatchRoute(app: FastifyInstance): Promise<void> {
     }
     const plugin = body.plugin_id
       ? await loadRequestedPlugin(body.plugin_id, user)
-      : (dag.plugin_id ? await loadPluginRow(dag.plugin_id) : null);
+      : (dag.plugin_id ? await loadDagPlugin(dag.plugin_id, dag.owner_user_id) : null);
     if ((body.plugin_id || dag.plugin_id) && !plugin) return reply.status(404).send({ ok: false, error: "plugin_not_found" });
 
     const batchId = newBatchId();
