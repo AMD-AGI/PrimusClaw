@@ -20,6 +20,7 @@
  * acting routes only from a row that was dispatched with a `callback_url`. See
  * `internalTaskAuth`.
  */
+import { workspaceSaveHoldsRun } from "../sessions/save-hold.js";
 import { createHash } from "node:crypto";
 import { constantTimeEquals, PG_INT4_MAX } from "@claw/utils";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
@@ -1486,6 +1487,26 @@ function registerLeaseRoute(app: FastifyInstance): void {
         return grant.claimCount === undefined
           ? { ok: true, status: grant.status }
           : { ok: true, status: grant.status, claim_count: grant.claimCount };
+      }
+      // A run whose turn has ended and whose workspace save is still running: its
+      // completion closed the row, but its worker is still uploading from the
+      // sandbox. Refused as terminal, that worker is told to let go, and the
+      // sandbox's reclaimers read the closed row the same way. So its own
+      // renewal is answered as granted while the save holds the session, and
+      // refused as before once it is over (sessions/save-hold.ts). Not for an
+      // acceptance: a redelivery of an ended turn must still read the row as gone.
+      if (!declaredAccept) {
+        let saving = false;
+        try {
+          saving = await workspaceSaveHoldsRun(taskId, body.brain_id);
+        } catch (err) {
+          logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_save_hold_unreadable");
+          return reply.status(503).send({ ok: false, status: "unknown" });
+        }
+        if (saving) {
+          logger.info({ taskId, caller: body.brain_id }, "run.lease_renew_kept_for_workspace_save");
+          return { ok: true, status: "completed" };
+        }
       }
       // Told which of the three refusals it was, because "two workers on one
       // run" and "this run was cancelled" ask the refused worker for opposite

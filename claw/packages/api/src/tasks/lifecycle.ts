@@ -10,6 +10,7 @@
  * `last_user` sandbox destruction. Per-DAG aggregation and cascade failure
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
+import { workspaceSaveHoldsSession } from "../sessions/save-hold.js";
 import { db, inTransaction } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import type { PoolClient } from "pg";
@@ -268,6 +269,12 @@ async function maybeStopHandlesForLastUser(
       { dagRootTaskId, dagNodeId, sessionId, hold: termHold.state, handles: owned.map(([h]) => h) },
       "sandbox.last_user_stop_deferred_terminal_hold",
     );
+    return;
+  }
+  // Nor while the session's last turn is still saving its workspace from this
+  // sandbox: the orphan sweep reaps it once the save is over (sessions/save-hold.ts).
+  if (await workspaceSaveHoldsSession(sessionId)) {
+    logger.info({ dagRootTaskId, dagNodeId, sessionId }, "sandbox.last_user_stop_deferred_workspace_save");
     return;
   }
 

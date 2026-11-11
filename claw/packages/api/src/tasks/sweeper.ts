@@ -42,7 +42,7 @@ import { isNoMessageFound } from "./sandbox-stopper.js";
 import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
-import { releaseFinishedWorkspaceSaves, workspaceSaveHeldSql } from "../sessions/save-hold.js";
+import { releaseFinishedWorkspaceSaves, workspaceSaveHeldSql, workspaceSaveHoldsSession } from "../sessions/save-hold.js";
 // `handleRegistry` is this branch's replacement for the bare `handleMap()`
 // accessor main imported here: same KV bucket, but every read goes through the
 // registry so a lookup can be re-read consistently before a destroy. The only
@@ -3068,6 +3068,14 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
       // A terminal the owner has open holds the sandbox, and so does one that is
       // unreadable. The claim lapses on its own, so this defers rather than
       // keeps: the next tick after the expiry reaps it like any other orphan.
+      // A run whose turn ended is still uploading its workspace from this sandbox
+      // until its save is over: its row is closed, but stopping the sandbox now
+      // loses every file not yet uploaded (sessions/save-hold.ts).
+      if (sessionId && await workspaceSaveHoldsSession(sessionId)) {
+        logger.info({ dagRoot, sessionId }, "sweeper.orphan_handles_workspace_save");
+        deferred++;
+        continue;
+      }
       if (sessionId) {
         const termHold = await handleRegistry.terminalHold(sessionId);
         if (termHold.state !== "none") {

@@ -139,6 +139,8 @@ test("S1 a message sent during the save waits in the queue, however long, and go
   const s = await session();
   assert.equal(s.agent_status, "idle", "the session reads idle as soon as the turn ends");
   assert.equal(s.workspace_save_id, "save-1");
+  const [kept] = await sql("SELECT workspace_save_task_id FROM claw_sessions WHERE session_id = 's1'");
+  assert.equal(kept.workspace_save_task_id, turn.task_id, "the run doing the save keeps its sandbox and lease");
 
   const second = await send("follow-up");
   assert.equal(second.queued, true, "queued, not dispatched");
@@ -158,6 +160,8 @@ test("S1 a message sent during the save waits in the queue, however long, and go
   assert.equal(await queued(), 0);
   const after = await session();
   assert.equal(after.workspace_save_id, null);
+  const [released] = await sql("SELECT workspace_save_task_id FROM claw_sessions WHERE session_id = 's1'");
+  assert.equal(released.workspace_save_task_id, null, "and gives them back once the save is over");
   assert.equal(after.agent_status, "running", "the follow-up is the session's turn now");
 });
 

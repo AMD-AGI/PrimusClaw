@@ -60,6 +60,7 @@ CREATE TABLE claw_sessions (
   pending_drain_until TIMESTAMPTZ,
   workspace_save_id TEXT,
   workspace_save_until TIMESTAMPTZ,
+  workspace_save_task_id TEXT,
   status         TEXT DEFAULT 'active',
   -- The create route's INSERT names every one of these, so a scenario that
   -- drives it against a narrower table fails on the column rather than on the

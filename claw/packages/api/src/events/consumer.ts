@@ -797,7 +797,7 @@ export async function releaseSessionGateIfLastRun(
         SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW(),
             -- In the statement that sets the session idle, so no message is admitted between the two
             -- (sessions/save-hold.ts).
-            ${workspaceSaveHoldSet("$2", "$6")}
+            ${workspaceSaveHoldSet("$2", "$6", "$5")}
       WHERE session_id = $2
         AND deleted_at IS NULL
         AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
