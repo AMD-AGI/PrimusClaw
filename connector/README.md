@@ -471,7 +471,8 @@ box holds someone's half-typed text, a question or a menu is on the screen (an E
 question it would approve a tool call), or the pane is scrolled back. It is pasted as one bracketed paste (`load-buffer` and
 `paste-buffer -p -d`), one line or several: nothing in it is read as a key name, and a question that shows at that moment does not
 take it as its choice (a typed `1` would approve a permission question), and it is
-submitted with Enter once the box shows it, and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
+submitted with Enter once the box shows it (a busy Claude Code may draw a paste late: it is waited for up to 20 seconds, the phone
+told after 3 that the message waits; one never shown is refused, `terminal_input_unseen`, and nothing is submitted), and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
 text and no question or menu, with End and Enter sent together (one write): in the box they submit it; on a question that came
 up in the moment after that read, End picks its last option ("No") and Enter chooses that, so a phone's message never approves
 anything (if a question took them, the Enter is tried again once it is gone). A question that shows after the text went in holds the Enter: no key at all is sent while it shows,

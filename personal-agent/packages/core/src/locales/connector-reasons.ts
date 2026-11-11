@@ -88,6 +88,9 @@ export const connectorReasonText = defineCatalog({
     terminal_switched:
       "That terminal has moved to another conversation (a /resume or /clear there), so the message was not typed in.",
     terminal_input_failed: "Typing the message into the terminal failed; it was not sent.",
+    // (a connector after 0.1.22: the paste never showed in the box in the 20 seconds it waited)
+    terminal_input_unseen:
+      "The message was typed into the terminal, but the terminal did not show it for 20 seconds (Claude Code there is busy or not taking input), so nothing was sent. Send it again in a moment.",
     terminal_input_unconfirmed:
       "The message was typed into the terminal, but its transcript does not show it; it may not have gone in. Check the terminal.",
     terminal_input_unavailable:
@@ -184,6 +187,8 @@ export const connectorReasonText = defineCatalog({
     terminal_gone: "终端那边的 tmux 窗格已经没了，这条消息没有发进去。",
     terminal_switched: "那个终端已经换到另一段对话了（在终端里 /resume 或 /clear 过），这条消息没有发进去。",
     terminal_input_failed: "往终端里输入这条消息失败了，没有发进去。",
+    terminal_input_unseen:
+      "这条消息输进终端后，等了 20 秒终端都没有显示它（那边的 Claude Code 正忙或没在接收输入），所以没有发出去。稍后再发一次。",
     terminal_input_unconfirmed: "消息已经输入终端，但终端的记录里没看到它，可能没发出去。去终端里看一眼。",
     terminal_input_unavailable: "连接器重启后没能再确认那个终端，这条消息没有发进去。重新 attach 一次。",
     empty_prompt: "这条消息去掉控制字符后是空的，没有发进终端。",

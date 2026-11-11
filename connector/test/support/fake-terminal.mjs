@@ -34,6 +34,8 @@
  * FAKE_DIALOG_ON_KEY=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the screen read and the keys. The question shows
  * as the first input arrives, before it is read; while it shows, a typed digit answers it ("approved", as Claude Code 2.1.285 takes a
  * lone `1`) and a paste is dropped (as Claude Code drops one, measured 2026-11-10).
+ * FAKE_DRAW_LAG_MS: while a turn runs, what comes in (a paste, a key) is drawn this much later (a busy Claude Code drawing late); what
+ * the transcript records is written at once.
  * FAKE_PASTE_REF=1: a paste of several lines shows in the box as `[Pasted text #n +k lines]`, and the prompt (and the queue) records
  * it as Claude Code 2.1.285-2.1.319 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
  */
@@ -201,7 +203,9 @@ process.stdin.on("data", (chunk) => {
     buffer += ch;
     if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown) showDialog();
   }
-  draw();
+  const lag = Number(process.env.FAKE_DRAW_LAG_MS || "0");
+  if (lag > 0 && working) setTimeout(draw, lag);
+  else draw();
 });
 if (Number(process.env.FAKE_BUSY_MS) > 0) {
   line({ type: "user", message: { role: "user", content: "a long task of its own" }, origin: { kind: "human" } });
