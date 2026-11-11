@@ -129,13 +129,26 @@ export async function workspaceSaveHoldsSession(sessionId: string): Promise<bool
  * Whether `taskId` is the run whose save holds its session, and `brainId` the worker holding it: such a run is still
  * saving, so a renewal of its lease is answered as granted rather than refused as terminal.
  */
-export async function workspaceSaveHoldsRun(taskId: string, brainId: string | undefined): Promise<boolean> {
+export async function workspaceSaveHoldsRun(
+  taskId: string,
+  brainId: string | undefined,
+  attempt: { attemptId: string; claimCount: number } | null,
+): Promise<boolean> {
   if (!brainId) return false;
+  // The attempt is fenced as the renewal it stands in for fences it: a pod name
+  // is reused across process incarnations, so the holder is the attempt the row
+  // last recorded, of the row's current generation, and not one it has settled.
+  // A legacy renewal carries no attempt and is fenced on the owner alone, as the
+  // legacy renewal is.
   const r = await db.query(
     `SELECT 1 FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
       WHERE t.task_id = $1 AND t.lease_owner = $2
-        AND s.workspace_save_task_id = t.task_id AND ${workspaceSaveHeldSql("s")}`,
-    [taskId, brainId],
+        AND s.workspace_save_task_id = t.task_id AND ${workspaceSaveHeldSql("s")}
+        AND ($3::text IS NULL OR (
+              t.attempt_id = $3
+          AND COALESCE(t.claim_count, 0) = $4::int
+          AND t.settled_attempt_id IS DISTINCT FROM $3))`,
+    [taskId, brainId, attempt?.attemptId ?? null, attempt?.claimCount ?? 0],
   );
   return r.rows.length > 0;
 }

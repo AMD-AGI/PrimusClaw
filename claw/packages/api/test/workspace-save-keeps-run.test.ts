@@ -10,6 +10,9 @@
  *
  *   K1 the saving worker's renewal of its closed row is granted while the hold names that run
  *   K2 another worker's, an acceptance's, and any renewal once the save is over or the hold has run out, are refused as before
+ *   K3 an attempt-token renewal is kept only for the attempt the row holds: a stale or settled attempt of the same pod is
+ *      refused
+ *   K4 a session settled by another path (a lost or exhausted run) is not parked while the save holds it, and is after
  */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -19,6 +22,7 @@ import type { Harness } from "./scenario-harness.js";
 
 const { startHarness, seedSession } = await import("./scenario-harness.js");
 const { registerInternalTaskRoutes } = await import("../src/routes/internal-tasks.js");
+const { parkHandsOfSettledSessions, parkSettledHandsPorts } = await import("../src/tasks/park-settled-hands.js");
 
 const TOKEN = "run-lease-token";
 let app: FastifyInstance;
@@ -94,4 +98,40 @@ test("K2 everyone else, and the same worker once the save is over or the hold ra
   );
   const otherRun = await renew("worker-1");
   assert.equal(otherRun.statusCode, 409, "a hold for another run's save keeps nothing of this one");
+});
+
+test("K3 an attempt-token renewal is kept only for the attempt the row holds", async () => {
+  await h.sql("UPDATE claw_tasks SET attempt_id = 'attempt-2', claim_count = 2 WHERE task_id = 'run-1'");
+  const token = (attempt: string, claim: number) => ({ attempt_id: attempt, claim_count: claim, delivery_seq: 0, delivery_count: 1 });
+
+  const current = await renew("worker-1", token("attempt-2", 2));
+  assert.equal(current.statusCode, 200, current.body);
+  assert.deepEqual(current.json(), { ok: true, status: "completed" });
+
+  const stale = await renew("worker-1", token("attempt-1", 2));
+  assert.equal(stale.statusCode, 409, "the same pod name, an earlier attempt");
+  const oldGeneration = await renew("worker-1", token("attempt-2", 1));
+  assert.equal(oldGeneration.statusCode, 409, "the same attempt id, an earlier generation");
+
+  await h.sql("UPDATE claw_tasks SET settled_attempt_id = 'attempt-2' WHERE task_id = 'run-1'");
+  const settled = await renew("worker-1", token("attempt-2", 2));
+  assert.equal(settled.statusCode, 409, "an attempt the row has settled holds nothing");
+});
+
+test("K4 a session settled by another path is not parked while the save holds it, and is after", async () => {
+  const parked: string[] = [];
+  const original = parkSettledHandsPorts.parkHandsAfterRun;
+  parkSettledHandsPorts.parkHandsAfterRun = async (sessionId: string) => {
+    parked.push(sessionId);
+    return { outcome: "parked" } as Awaited<ReturnType<typeof original>>;
+  };
+  try {
+    await parkHandsOfSettledSessions(["session-1"]);
+    assert.deepEqual(parked, [], "the saving run is still using the sandbox");
+    await h.sql("UPDATE claw_sessions SET workspace_save_id = NULL, workspace_save_until = NULL, workspace_save_task_id = NULL");
+    await parkHandsOfSettledSessions(["session-1"]);
+    assert.deepEqual(parked, ["session-1"]);
+  } finally {
+    parkSettledHandsPorts.parkHandsAfterRun = original;
+  }
 });

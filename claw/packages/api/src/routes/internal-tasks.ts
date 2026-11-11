@@ -1498,7 +1498,10 @@ function registerLeaseRoute(app: FastifyInstance): void {
       if (!declaredAccept) {
         let saving = false;
         try {
-          saving = await workspaceSaveHoldsRun(taskId, body.brain_id);
+          saving = await workspaceSaveHoldsRun(
+            taskId, body.brain_id,
+            token.ok ? { attemptId: token.attemptId, claimCount: token.claimCount } : null,
+          );
         } catch (err) {
           logger.warn({ taskId, err: (err as Error)?.message }, "run.lease_save_hold_unreadable");
           return reply.status(503).send({ ok: false, status: "unknown" });
