@@ -11,7 +11,10 @@ import { personOf, isGroupKey } from "../chat-key.js";
 import type { RemoteContext } from "../context.js";
 import type { StatusBoard } from "../board.js";
 import type { ChatState } from "../state.js";
+import { errorName } from "../../errors.js";
 import { Follower } from "./follower.js";
+import { RETRY_MS, STOP_WAIT_MS, type FollowTimings } from "./timings.js";
+import type { RemoteState } from "../../ports/store/remote.js";
 
 /** How the follower says a session's end and shows a permission request (the domain's own sentences and cards). */
 export interface FollowHooks {
@@ -54,14 +57,10 @@ export class FollowControl {
     const current = chats.followers.get(chatKey);
     if (current?.alive === true && current.sessionId === attached.sessionId) return;
     this.drop(chatKey);
-    // A conversation open in a terminal, watched or typed into: what is typed there is answered there, with no turn of the phone's to
-    // end it, so its reply is told after a few quiet seconds, as a watch's is. With the half-minute of a session of the phone's own it
-    // came after the person had left (2026-11-11 guide re-check: nothing within 20 s, although the card says replies show up here).
-    const watched = this.state.watches(chatKey, attached) || this.state.typesIntoTerminal(chatKey, attached);
     const follower = new Follower(chatKey, attached.sessionId ?? "", {
       clock: this.ctx.clock,
       logger: this.ctx.logger,
-      timings: watched ? this.ctx.settings.watchTimings : this.ctx.settings.timings,
+      timings: this.timingsOf(chatKey, attached),
       reach: this.ctx.reach,
       remoteState: this.ctx.remoteState,
       references: this.ctx.references,
@@ -98,6 +97,43 @@ export class FollowControl {
     return true;
   }
 
+  /**
+   * A conversation open in a terminal, watched or typed into: what is typed there is answered there, with no turn of the phone's to
+   * end it, so its reply is told after a few quiet seconds, as a watch's is. With the half-minute of a session of the phone's own it
+   * came after the person had left (2026-11-11 guide re-check: nothing within 20 s, although the card says replies show up here).
+   * Read each time they are used: a worker that restarted learns only after its reader started whether the session is a terminal's
+   * (`resume`).
+   */
+  private timingsOf(chatKey: string, attached: RemoteState): FollowTimings {
+    const pick = (): FollowTimings =>
+      this.state.watches(chatKey, attached) || this.state.typesIntoTerminal(chatKey, attached)
+        ? this.ctx.settings.watchTimings
+        : this.ctx.settings.timings;
+    return {
+      get quietMs() {
+        return pick().quietMs;
+      },
+      get toolQuietMs() {
+        return pick().toolQuietMs;
+      },
+      get gapMs() {
+        return pick().gapMs;
+      },
+      get maxAgeMs() {
+        return pick().maxAgeMs;
+      },
+      get reconnectMs() {
+        return pick().reconnectMs;
+      },
+      get retryMs() {
+        return pick().retryMs ?? RETRY_MS;
+      },
+      get stopWaitMs() {
+        return pick().stopWaitMs ?? STOP_WAIT_MS;
+      },
+    };
+  }
+
   /** The chat leaves its session. */
   detach(chatKey: string): void {
     this.drop(chatKey);
@@ -109,6 +145,18 @@ export class FollowControl {
     for (const chatKey of this.ctx.remoteState.remoteAttachedUsers()) {
       if (this.state.directOn(chatKey)) this.chatIsWindow(chatKey);
       this.ensure(chatKey);
+      void this.learn(chatKey);
+    }
+  }
+
+  /** What this process forgot in a restart: whether the chat's session only watches or types into a terminal (its timings). */
+  private async learn(chatKey: string): Promise<void> {
+    const attached = this.state.attached(chatKey);
+    try {
+      const key = attached === null ? null : await this.ctx.credentialFor(personOf(chatKey));
+      if (attached !== null && key) await this.state.knownWatch(chatKey, key, attached);
+    } catch (error) {
+      this.ctx.logger.info("whether a resumed session is a terminal's could not be read", { error: errorName(error) });
     }
   }
 

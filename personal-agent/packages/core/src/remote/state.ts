@@ -77,7 +77,11 @@ export class ChatState {
         throw error;
       }
       const said = rows.filter((r) => r.type === "session_started" || r.type === "session_resumed").at(-1);
-      if (said) this.chats.markReadOnly(chatKey, sid, said.data?.["read_only"] === true);
+      if (said) {
+        this.chats.markReadOnly(chatKey, sid, said.data?.["read_only"] === true);
+        // (and whether what is sent is typed into a terminal: the follower's timings, `follow/control.ts`)
+        this.chats.markTerminal(chatKey, sid, said.data?.["input"] === "terminal");
+      }
       this.chats.learnedWatch(chatKey, sid);
     }
     return this.watches(chatKey, state);

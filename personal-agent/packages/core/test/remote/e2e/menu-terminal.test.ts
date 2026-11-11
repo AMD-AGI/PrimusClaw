@@ -285,6 +285,17 @@ test("the reply to a prompt typed at a terminal the chat types into is told afte
       await says("agent_message_chunk", "TERMINAL");
       // (the session's own timings here are a minute of quiet: only the watch's, TEST_TIMINGS, get it out in time)
       await w.until(() => w.said().some((t) => t.includes("TERMINAL") && !t.includes("Typed in the terminal")), 5_000);
+      // A worker that restarted reads back that the session types into a terminal: its reader is just as quick.
+      w.remote.shutdown();
+      const chats = w.remote as unknown as {
+        chats: { terminalInput: Map<string, string>; readOnlyKnown: Map<string, string> };
+      };
+      chats.chats.terminalInput.clear(); // (a new worker process: nothing of this in memory)
+      chats.chats.readOnlyKnown.clear();
+      w.remote.resume();
+      await says("user_message_chunk", "Reply with AGAIN only");
+      await says("agent_message_chunk", "AGAIN");
+      await w.until(() => w.said().some((t) => t.includes("AGAIN") && !t.includes("Typed in the terminal")), 5_000);
     },
     { timings: { quietMs: 60_000, toolQuietMs: 60_000, gapMs: 0, maxAgeMs: 120_000, reconnectMs: 50 } },
   ));
