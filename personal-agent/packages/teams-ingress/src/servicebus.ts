@@ -23,7 +23,7 @@ function wrap(client: ServiceBusClient): QueueClient {
     createSender(queue: string): QueueSender {
       const sender = client.createSender(queue);
       return {
-        sendMessages: (message: QueueMessage) => sender.sendMessages({ ...message }),
+        sendMessages: (message: QueueMessage, options) => sender.sendMessages({ ...message }, options),
         createMessageBatch: () => sender.createMessageBatch(),
         close: () => sender.close(),
       };
