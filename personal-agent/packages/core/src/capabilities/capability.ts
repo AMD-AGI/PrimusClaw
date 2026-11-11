@@ -36,6 +36,12 @@ export interface Capability {
   /** What it is, in a few words. */
   readonly zh: string;
   readonly en: string;
+  /**
+   * What it is in a handful of words, for the line of a group's help that says what else a 1:1 chat with the bot does ("" : not
+   * named there). Only a capability a group does not show has one.
+   */
+  readonly dmZh: string;
+  readonly dmEn: string;
   /** One sentence a person would type for it ("" : it is done with buttons). */
   readonly sayZh: string;
   readonly sayEn: string;
@@ -64,6 +70,8 @@ type Fields = Pick<Capability, "key" | "category" | "zh" | "en"> & Partial<Capab
 
 export function capability(fields: Fields): Capability {
   return {
+    dmZh: "",
+    dmEn: "",
     sayZh: "",
     sayEn: "",
     reaches: "",

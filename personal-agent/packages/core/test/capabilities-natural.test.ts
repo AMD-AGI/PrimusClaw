@@ -91,3 +91,19 @@ test("test_without_the_brief_a_brief_sentence_is_words_for_claw (natural_command
   assert.equal(naturalCommand("回来吧", false, new Set(["agent detach"])), "回来吧");
   assert.equal(naturalCommand("我的 agent 会话", false, new Set(["agent detach"])), "/agent sessions");
 });
+
+test("asking to introduce itself is help in a group and stays words in a 1:1 chat", () => {
+  for (const text of [
+    "介绍一下你自己",
+    "介绍一下你自己！",
+    "你是谁？",
+    "自我介绍一下",
+    "Introduce yourself.",
+    "who are you",
+  ]) {
+    assert.equal(naturalCommand(text, true), "/help", text);
+    assert.equal(naturalCommand(text), text, text);
+  }
+  // only the whole message: a request that starts the same way is still a request
+  assert.equal(naturalCommand("介绍一下你自己是怎么审 PR 的", true), "介绍一下你自己是怎么审 PR 的");
+});

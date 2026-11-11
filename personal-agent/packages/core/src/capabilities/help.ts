@@ -109,6 +109,31 @@ function categoryBlocks(lang: Lang, chat: ChatShape, values: Readonly<Record<str
   return blocks;
 }
 
+/**
+ * In a group: what a 1:1 chat with the bot does that the group cannot, in a few words each (a capability's `dmZh`/`dmEn`), as the 1:1
+ * chat of the person who asked shows it (`assistant`, `parts`), and how to open one. Words only: nothing of anyone's settings, and
+ * nothing to tap, since what it names is done in the 1:1 chat. A machine of one's own leads: a group cannot show it at all.
+ */
+function oneToOneBlock(lang: Lang, chat: ChatShape, bot: string): string | undefined {
+  const zh = lang === "zh";
+  const oneToOne: ChatShape = { ...chat, group: false, understanding: false };
+  const names: string[] = [];
+  const items = CAPABILITIES.filter((c) => c.where === "dm" && (zh ? c.dmZh : c.dmEn) !== "" && shown(c, oneToOne));
+  for (const c of [...items.filter((c) => c.category === "remote"), ...items.filter((c) => c.category !== "remote")]) {
+    const name = zh ? c.dmZh : c.dmEn;
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length === 0) return undefined;
+  const lines = [zh ? "**私聊我还可以**" : "**More in a 1:1 chat with me**"];
+  for (const name of names) lines.push(`- ${name}`);
+  lines.push(
+    zh
+      ? `这些在和我的 1:1 聊天里用：点 ${bot} 的名字，发起私聊就行。`
+      : `These are in a 1:1 chat with me: select ${bot}'s name and start a chat.`,
+  );
+  return lines.join("\n");
+}
+
 function chatOf(options: HelpOptions): ChatShape {
   return {
     group: options.group ?? false,
@@ -134,6 +159,8 @@ export function renderHelp(language: string, options: HelpOptions = {}): string 
   if (options.lead) out.push(options.lead);
   if (chat.group) out.push(groupLead(zh, bot));
   out.push(...categoryBlocks(lang, chat, options.values ?? {}));
+  const oneToOne = chat.group ? oneToOneBlock(lang, chat, bot) : undefined;
+  if (oneToOne !== undefined) out.push(oneToOne);
   out.push(authorityText(zh, chat.parts));
   if (chat.group) out.push(zh ? "设置只能在和我的 1:1 聊天里改。" : "Settings are changed in a 1:1 chat with me.");
   out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"))); // (every help: 1:1, group and the assistant's)
