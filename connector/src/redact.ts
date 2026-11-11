@@ -47,9 +47,9 @@ export function redactDeep<T>(value: T): T {
   if (typeof value === "string") return redactText(value).text as T;
   if (Array.isArray(value)) return value.map((v) => redactDeep(v)) as T;
   if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = redactDeep(v);
-    return out as T;
+    // Built with fromEntries, which defines each key as a field of the copy's own: what a hook or an agent sent is parsed JSON,
+    // where `__proto__` is an ordinary key, and an assignment under that name would set the copy's prototype instead.
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactDeep(v)])) as T;
   }
   return value;
 }

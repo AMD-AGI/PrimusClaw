@@ -454,3 +454,12 @@ describe("through a running connector and Claw", () => {
     assert.ok(h.audit().some((r) => r.kind === "approval_not_sent" && r.reason === "approvals_off"));
   });
 });
+
+test("a `__proto__` key in what a hook sent stays a plain field of the card's input, never the copy's prototype", () => {
+  const raw = JSON.parse('{"command":"ls","__proto__":{"polluted":"yes"}}') as Record<string, unknown>;
+  const m = mapRequest(ev(req("Bash", raw)))!;
+  const input = m.cards[0]!.input as Record<string, unknown>;
+  assert.equal((input as { polluted?: unknown }).polluted, undefined);
+  assert.equal(Object.getPrototypeOf(input), Object.prototype);
+  assert.deepEqual(Object.keys(input).sort(), ["__proto__", "command"]);
+});
