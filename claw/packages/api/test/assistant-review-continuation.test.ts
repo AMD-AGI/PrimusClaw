@@ -124,7 +124,8 @@ describe("assistant review continuation", { skip }, () => {
     assert.equal(await ri.syncReviewItemOfSession(sessionId), true);
   }
   const post = (sessionId: string, head: string, comments: Array<{ path: string; line: number; body: string }>, user = "alice") =>
-    service.submitReview(actor(sessionId, user), { pr: PR_REF, head_sha: head, event: comments.length ? "REQUEST_CHANGES" : "COMMENT", body: "Review.", risk_judgement: LOW, comments });
+    service.submitReview(actor(sessionId, user), { pr: PR_REF, head_sha: head, event: comments.length ? "REQUEST_CHANGES" : "COMMENT", body: "Review.", risk_judgement: LOW, comments,
+      coverage: gh.files.map((f) => ({ path: f.filename, status: "reviewed" })) });
 
   test("A1 replay: reviewed twice with a fix between, the old findings are checked, only the change since is read, and a new issue is caught", async () => {
     // ---- round one, on HEAD: two findings.

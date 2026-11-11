@@ -241,13 +241,20 @@ const DEEP_REVIEW_STEPS = `## Steps
    resource left open), security (injection, missing authentication or authorisation check,
    secrets in code or logs, unsafe input, path traversal), and compatibility (changed public
    behaviour, callers that the change breaks, migrations, config, wire formats). Then look at
-   whether the tests cover what changed.
+   whether the tests cover what changed. When these instructions end with checks for the languages
+   the change touches, look for those too, in the same passes.
+   Go file by file: every file in \`coverage.required\` of the overview gets a conclusion, \`reviewed\`
+   (you read all of its diff and judged it) or \`skipped\` with the reason, and \`gh_review_submit\` takes
+   the list as \`coverage\`. A file with no conclusion refuses the review; a skipped file is named in the
+   review and stops an approval.
 6. Keep only findings that are all of these:
    - introduced by this change (check the base: a problem that was already there is not yours);
    - actionable: the author knows what to change;
    - verified: you can point to a path and line in the diff and say what goes wrong and when.
      Mark each one \`[verified]\` or \`[inferred]\`; post only \`[verified]\` ones.
-   Drop style preferences, naming, formatting and anything a linter owns. A problem that breaks
+   Drop style preferences, naming, formatting and anything a linter owns. A typo in a name or a
+   user-visible string the change adds, and code it adds that can never run or is never read, are
+   worth a non-blocking note. A problem that breaks
    the main path (every turn, every request, every user, or an unattended run) as soon as a shipped
    flag or documented setting is turned on is blocking, even when that flag is off by default:
    off by default lowers the urgency, not the severity.
@@ -282,9 +289,17 @@ const DEEP_REVIEW_STEPS = `## Steps
    - Inline comments are for verified blocking findings only: one per finding, on its path and a
      line inside the diff, saying what goes wrong, when, and what to change.
    - The body says what you read (files, functions and their callers), what you ran (each command
-     and its result, or why a test could not run), what the second pass added, and then, as plain
-     sentences and not inline: non-blocking suggestions and open questions for the author, each
-     with its path. Leave out what you have nothing to say about.
+     and its result, or why a test could not run) and what the second pass added. Leave out what you
+     have nothing to say about.
+   - Non-blocking suggestions and open questions for the author go in \`non_blocking\` of
+     \`gh_review_submit\`, one entry each with its path, its line (or null) and the note, and not in the
+     body: the review lists the ones that hold up under the body.
+   - Before anything is posted, the service has every finding, inline and non-blocking, checked by an
+     independent reviewer that reads the change. It withdraws the ones it can disprove, that were
+     already there before the change, that name no wrong outcome or that repeat another, posts a
+     blocking one it judges secondary as a note, and says what it did in \`finding_check\` of the result.
+     Do not post a withdrawn finding again in another form; say in your answer how many were withdrawn.
+     A \`REQUEST_CHANGES\` review whose inline findings were all withdrawn or made notes is posted as \`COMMENT\`.
    - Blocking findings: \`gh_review_submit\` with \`REQUEST_CHANGES\`, the inline comments and the body.
    - No blocking findings: \`gh_review_submit\` with \`APPROVE\` and the body. Then call
      \`gh_pr_merge\`; it re-reads everything and merges only if all gates pass.
@@ -332,6 +347,7 @@ const DEEP_REVIEW_STEPS = `## Steps
    - If \`gh_pr_merge\` answers \`acting_login_unknown\`, the account's GitHub login is not known, so it cannot be told whether the person wrote the pull request:
      nothing was approved or merged. Say so; a comment-only review is still open.
    - \`head_not_read\`, \`second_pass_required\` or \`review_not_submitted\`: a step was skipped; do what it says.
+   - \`coverage_missing\`: some files of \`coverage.required\` have no conclusion: conclude on them and submit again.
    - If a tool answers \`review_target_mismatch\`, this session is bound to one pull request: do not try
      another one.
    Never state that something was merged or approved unless a tool result says so.

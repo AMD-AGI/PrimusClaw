@@ -1569,7 +1569,8 @@ describe("assistant review items", { skip }, () => {
     });
     // bob's review: it approves the head (judged low), then its merge is judged high and held for bob, as his setting says.
     await reviewedHead({ sql: (text: string, params?: unknown[]) => w.q(text, params as never), actor }, { pr: DEMO });
-    const approved = await service.submitReview(actor, { pr: DEMO, head_sha: HEAD, event: "APPROVE", body: "No blocking findings.", risk_judgement: { level: "low", reason: "an ordinary change" } });
+    const approved = await service.submitReview(actor, { pr: DEMO, head_sha: HEAD, event: "APPROVE", body: "No blocking findings.", risk_judgement: { level: "low", reason: "an ordinary change" },
+      coverage: gh.files.map((f) => ({ path: f.filename, status: "reviewed" })) });
     assert.equal(approved.body.status, "submitted", approved.text);
     const held = await service.mergePr(actor, { pr: DEMO, head_sha: HEAD, risk_judgement: { level: "high", reason: "a person should look" } });
     assert.equal(held.body.status, "confirmation_required", held.text);
