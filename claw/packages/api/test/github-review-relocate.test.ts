@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import test, { after, afterEach, describe } from "node:test";
-import { headLines, locateCode, placeComment, repeatsOpenFinding } from "../src/github-review/relocate.js";
+import { headLines, locateCode, placeComment, repeatsOpenFinding, saysTheSame } from "../src/github-review/relocate.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, closeShared, reviewEnv, type ReviewEnv } from "./support/review-env.js";
 
@@ -57,17 +57,21 @@ describe("P placing by the code", () => {
     assert.deepEqual(placeComment(PATCH, 20, undefined), { line: 20, movedFrom: null });
   });
 
-  test("P4 a finding repeats an open thread of the last review on the same file within a few lines; a resolved one or one without a thread does not count", () => {
+  test("P4 a finding repeats an open thread of the last review on the same file within a few lines when it says much the same; a resolved one, one without a thread or another problem does not count", () => {
     const open = [
-      { path: "src/app.ts", line: 10, thread_id: "T1", resolved: false },
-      { path: "src/app.ts", line: 30, thread_id: "T2", resolved: true },
-      { path: "src/app.ts", line: 50, thread_id: null, resolved: false },
+      { path: "src/app.ts", line: 10, thread_id: "T1", resolved: false, note: "token is logged in plain text when the call fails" },
+      { path: "src/app.ts", line: 30, thread_id: "T2", resolved: true, note: "x is never checked" },
+      { path: "src/app.ts", line: 50, thread_id: null, resolved: false, note: "y is never checked" },
     ];
-    assert.equal(repeatsOpenFinding(open, "src/app.ts", 12)?.thread_id, "T1");
-    assert.equal(repeatsOpenFinding(open, "src/app.ts", 14), null);
-    assert.equal(repeatsOpenFinding(open, "src/other.ts", 10), null);
-    assert.equal(repeatsOpenFinding(open, "src/app.ts", 30), null);
-    assert.equal(repeatsOpenFinding(open, "src/app.ts", 50), null);
+    assert.equal(repeatsOpenFinding(open, "src/app.ts", 12, "The token is still logged in plain text when the call fails.")?.thread_id, "T1");
+    assert.equal(repeatsOpenFinding(open, "src/app.ts", 11, "The retry loop never ends when the server answers 503."), null, "another problem near an old one");
+    assert.equal(repeatsOpenFinding(open, "src/app.ts", 14, "token is logged in plain text when the call fails"), null);
+    assert.equal(repeatsOpenFinding(open, "src/other.ts", 10, "token is logged in plain text when the call fails"), null);
+    assert.equal(repeatsOpenFinding(open, "src/app.ts", 30, "x is never checked"), null);
+    assert.equal(repeatsOpenFinding(open, "src/app.ts", 50, "y is never checked"), null);
+    assert.equal(saysTheSame("d_bad is wrong", "d_bad is still wrong"), true);
+    assert.equal(saysTheSame("d_bad is wrong", "e_new_bug breaks it"), false);
+    assert.equal(saysTheSame("", "anything"), false);
   });
 });
 
@@ -99,7 +103,7 @@ describe("S through gh_review_submit", () => {
   });
 
   test("S2 a re-review does not open a second thread where the last review's is still open: the finding goes in the body, and the result says so", async () => {
-    e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c", resolved: false }] }) } });
+    e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c is never checked", resolved: false }] }) } });
     e.gh.files[0]!.patch = "@@ -1,4 +1,8 @@\n a\n-b\n+b2\n+c\n+d\n+e2\n+e3\n e\n f";
     const o = await submit({ comments: [
       { path: "src/app.ts", line: 4, body: "c is still never checked" },
@@ -112,7 +116,7 @@ describe("S through gh_review_submit", () => {
   });
 
   test("S3 a re-review whose only inline finding repeats an open thread still requests changes, with the finding in the body", async () => {
-    e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c", resolved: false }] }) } });
+    e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c is never checked", resolved: false }] }) } });
     const o = await submit({ comments: [{ path: "src/app.ts", line: 3, body: "c is still never checked" }] });
     assert.equal(o.isError, false, o.text);
     assert.equal(posted()[0]?.body.event, "REQUEST_CHANGES");

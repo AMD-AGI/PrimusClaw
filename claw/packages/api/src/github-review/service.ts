@@ -766,8 +766,8 @@ export class GithubReview {
       // A re-review does not open a second thread where one of the last review's is still open: the finding is said in the body.
       const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
       if (continuation?.findings.length) {
-        const stillOpen = comments.filter((c) => c.side === "RIGHT" && repeatsOpenFinding(continuation.findings, c.path, c.line));
-        repeated = stillOpen.map((c) => ({ path: c.path, line: c.line, thread_id: repeatsOpenFinding(continuation.findings, c.path, c.line)?.thread_id ?? null }));
+        const stillOpen = comments.filter((c) => c.side === "RIGHT" && repeatsOpenFinding(continuation.findings, c.path, c.line, c.body));
+        repeated = stillOpen.map((c) => ({ path: c.path, line: c.line, thread_id: repeatsOpenFinding(continuation.findings, c.path, c.line, c.body)?.thread_id ?? null }));
         comments = comments.filter((c) => !stillOpen.includes(c));
         if (stillOpen.length) text = `${text.trimEnd()}\n\n**Still open from the last review**\n${stillOpen.map((c) => `- \`${c.path}:${c.line}\`: ${c.body.replace(/\s*\n\s*/g, " ").trim()}`).join("\n")}`;
       }

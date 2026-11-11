@@ -754,8 +754,10 @@ These parts of the deep review are mechanisms rather than instructions, borrowed
   `+`/`-` mark ignored) and posts the comment there; the result's `moved_comments` names each move.
   Code that is not in the diff moves nothing, and a line outside the diff is refused as before.
 - **No second thread on a re-review.** A re-review's inline finding within three lines of a finding
-  of the last review whose thread is still open, on the same file, is said in the body under "Still
-  open from the last review" instead of opening another thread (`said_in_body_as_still_open`).
+  of the last review whose thread is still open, on the same file, and that says much the same (most
+  words of the shorter text are in the other), is said in the body under "Still open from the last
+  review" instead of opening another thread (`said_in_body_as_still_open`). A new problem near an old
+  one says other things and gets its own thread.
 
 `CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review has no model or
 reasoning effort of its own: the session runs on the `model` and `effort` its creator sent with

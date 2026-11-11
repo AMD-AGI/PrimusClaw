@@ -11,7 +11,8 @@
  * `diff/relocation.go`); the matching here is plain text, with no model call.
  *
  * A re-review that says again what an open thread of the last review says would open a second thread on the same code: an inline
- * finding within a few lines of a finding of the last review whose thread is still open is said in the body instead.
+ * finding within a few lines of a finding of the last review whose thread is still open, and that says much the same (most of its
+ * words are the recorded note's), is said in the body instead. A new problem near an old one says other things and keeps its thread.
  */
 import { HUNK_RE } from "./diff.js";
 
@@ -88,13 +89,31 @@ export function placeComment(patch: string | undefined | null, line: number, cod
   return { line: at, movedFrom: line };
 }
 
-/** A finding of the last review, as a re-review is given it. */
-export interface OpenFinding { path: string; line: number | null; thread_id: string | null; resolved: boolean }
+/** A finding of the last review, as a re-review is given it (`note`: the start of what it said). */
+export interface OpenFinding { path: string; line: number | null; thread_id: string | null; resolved: boolean; note?: string }
 
 /** Within this many lines of an open finding of the last review on the same file, a new inline finding is the same place. */
 export const SAME_PLACE_LINES = 3;
 
-/** The open finding of the last review that an inline comment at `path:line` would repeat, or null. */
-export function repeatsOpenFinding(open: readonly OpenFinding[], path: string, line: number): OpenFinding | null {
-  return open.find((f) => !f.resolved && f.thread_id !== null && f.path === path && f.line !== null && Math.abs(f.line - line) <= SAME_PLACE_LINES) ?? null;
+/** At least this share of the words of the shorter of two texts must be in the other for them to say much the same. */
+export const SAME_WORDS_SHARE = 0.6;
+
+const segmenter = new Intl.Segmenter("en", { granularity: "word" });
+const words = (t: string): Set<string> => new Set([...segmenter.segment(t.toLowerCase())].filter((s) => s.isWordLike && s.segment.length > 1).map((s) => s.segment));
+
+/** Whether two findings say much the same: most words of the shorter (the recorded note is cut) are in the other. */
+export function saysTheSame(a: string, b: string): boolean {
+  const x = words(a);
+  const y = words(b);
+  const [small, big] = x.size <= y.size ? [x, y] : [y, x];
+  if (small.size === 0) return false;
+  let shared = 0;
+  for (const w of small) if (big.has(w)) shared++;
+  return shared / small.size >= SAME_WORDS_SHARE;
+}
+
+/** The open finding of the last review that an inline comment at `path:line` saying `body` would repeat, or null. */
+export function repeatsOpenFinding(open: readonly OpenFinding[], path: string, line: number, body: string): OpenFinding | null {
+  return open.find((f) => !f.resolved && f.thread_id !== null && f.path === path && f.line !== null && Math.abs(f.line - line) <= SAME_PLACE_LINES
+    && typeof f.note === "string" && saysTheSame(f.note, body.slice(0, 400))) ?? null;
 }
