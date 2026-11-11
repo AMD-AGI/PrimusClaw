@@ -121,11 +121,12 @@ const OLD_SEES_ZH = "我能看到什么：只有你发给我的消息（群里�
 const OLD_SEES_EN =
   "What I see: only the messages you send me (in a group, only those that @mention me), with any message you quote and any file you attach.";
 const KEPT_ZH =
-  "- 群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息，不存数据库、不回复，" +
-  "有人 @我 时作为不可信的背景一起带上。在群里 @我 /context off 可关闭。";
+  "- 群里授权我读取聊天消息后，我还会在内存里暂存该群最近 30 条、4 小时内没 @我 的消息（不单独存库，也不回复）；" +
+  "有人 @我 时，它们作为不可信的背景随那条消息进入 TA 的会话，和会话一起保留。在群里 @我 /context off 可关闭。";
 const KEPT_EN =
   "- In a group that allows me to read its messages, I also keep its newest 30 messages that do not @mention me, " +
-  "for up to 4 hours, in memory only (never stored, never answered), as untrusted background for the next @mention. " +
+  "for up to 4 hours, in memory (not stored on their own, never answered). When someone @mentions me, they go with " +
+  "that message, as untrusted background, into that person's session and are kept with it. " +
   "@mention me with /context off in the group to turn it off.";
 
 test("where a group's recent messages are kept, help in a group and in a 1:1 chat says what, how long, and how to stop", async () => {

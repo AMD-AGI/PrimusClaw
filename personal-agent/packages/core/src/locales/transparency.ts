@@ -73,18 +73,24 @@ function plural(count: number, one: string): string {
   return `${String(count)} ${one}${count === 1 ? "" : "s"}`;
 }
 
-/** Only where the deployment keeps a group's recent messages (#725): what is kept, for how long, where, and how to stop it. */
+/**
+ * Only where the deployment keeps a group's recent messages (#725): what is kept, for how long, where, and how to stop it.
+ * The worker's buffer is memory only, but what it holds goes into the asker's session with an @mention (as the turn's
+ * quote), and a session is kept as the statement's "how long" says: so "not stored on their own", never "never stored".
+ */
 export function groupContextLine(lang: Lang, kept: GroupContextKept): string {
   if (lang === "zh") {
     return (
       `群里授权我读取聊天消息后，我还会在内存里暂存该群最近 ${String(kept.messages)} 条、${String(kept.hours)} 小时内` +
-      "没 @我 的消息，不存数据库、不回复，有人 @我 时作为不可信的背景一起带上。在群里 @我 /context off 可关闭。"
+      "没 @我 的消息（不单独存库，也不回复）；有人 @我 时，它们作为不可信的背景随那条消息进入 TA 的会话，和会话一起保留。" +
+      "在群里 @我 /context off 可关闭。"
     );
   }
   return (
     "In a group that allows me to read its messages, I also keep its newest " +
     `${plural(kept.messages, "message")} that ${kept.messages === 1 ? "does" : "do"} not @mention me, for up to ${plural(kept.hours, "hour")}, ` +
-    "in memory only (never stored, never answered), as untrusted background for the next @mention. " +
+    "in memory (not stored on their own, never answered). When someone @mentions me, they go with that message, as " +
+    "untrusted background, into that person's session and are kept with it. " +
     "@mention me with /context off in the group to turn it off."
   );
 }
