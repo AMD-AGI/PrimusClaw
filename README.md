@@ -192,7 +192,7 @@ and from `v*` tags:
 
 | Component | Tag | Published to | Release notes |
 |---|---|---|---|
-| Personal agent (three packages and the image, one version) | `personal-agent-vX.Y.Z` | npm; the image to Docker Hub while image publishing is switched on | [`personal-agent/CHANGELOG.md`](personal-agent/CHANGELOG.md) |
+| Personal agent (three packages and the image, one version) | `personal-agent-vX.Y.Z` | npm; the image to the configured registry (Docker Hub by default) while image publishing is switched on | [`personal-agent/CHANGELOG.md`](personal-agent/CHANGELOG.md) |
 | Connector | `connector-vX.Y.Z` | npm | the [GitHub Release](https://github.com/AMD-AGI/PrimusClaw/releases) of the tag |
 | Claw, Agent Sandbox | images built from `main` (`latest` plus a timestamp tag) and from `v*` tags | Docker Hub | [`CHANGELOG.md`](CHANGELOG.md) |
 
