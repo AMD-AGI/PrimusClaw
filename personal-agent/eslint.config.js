@@ -39,7 +39,9 @@ export default tseslint.config(
   importX.flatConfigs.typescript,
   {
     languageOptions: {
-      parserOptions: { projectService: { allowDefaultProject: ["*.js", "*.cjs", "eslint-rules/*.js"] } },
+      parserOptions: {
+        projectService: { allowDefaultProject: ["*.js", "*.cjs", "eslint-rules/*.js", "examples/*/*.mjs"] },
+      },
     },
     settings: {
       "import-x/resolver-next": [createTypeScriptImportResolver({ project: "./tsconfig.json" })],
@@ -83,9 +85,17 @@ export default tseslint.config(
     rules: { "layers/async-context-in-runtime-context": "error" },
   },
   {
-    // Config files, the local lint rules and scripts are plain JavaScript run by Node.
-    files: ["*.js", "*.cjs", "eslint-rules/*.js"],
+    // Config files, the local lint rules, scripts and the examples' helpers are plain JavaScript run by Node.
+    files: ["*.js", "*.cjs", "eslint-rules/*.js", "examples/*/*.mjs"],
     extends: [tseslint.configs.disableTypeChecked],
-    languageOptions: { globals: { process: "readonly", console: "readonly", module: "writable", require: "readonly" } },
+    languageOptions: {
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        module: "writable",
+        require: "readonly",
+        Buffer: "readonly",
+      },
+    },
   },
 );

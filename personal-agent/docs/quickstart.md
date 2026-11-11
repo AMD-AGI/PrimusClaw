@@ -93,7 +93,7 @@ read -rs CLAW_KEY                                                      # paste y
 code=$(curl -fsS -H 'content-type: application/json' -d "{\"key\":\"$CLAW_KEY\"}" \
   http://127.0.0.1:8080/primus-claw-agent/link | sed 's/.*"code":"\([^"]*\)".*/\1/')
 say "/link $code"                                                      # Connected ...
-say "what can you do"                                                  # a Claw session answers
+say "write a haiku about message queues"                                # a turn in a Claw session
 say "/help"
 ```
 
