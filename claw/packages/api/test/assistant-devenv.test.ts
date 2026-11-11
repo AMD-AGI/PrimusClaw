@@ -594,7 +594,7 @@ describe("devenv_list", { skip }, () => {
     assert.match(b.connect_a_machine.text, /^Your machine box is offline: run `claw-connector service install` on it to bring it back\.\nTo connect a new machine instead: /);
   });
 
-  test("D8c no machine and no pairing for this turn (a report, a key, an old message, no public address, the limit): the setup commands", async () => {
+  test("D8c no machine and no pairing for this turn (a report, an old message, no public address, the limit): the setup commands; a key's message: the pairing", async () => {
     const keep = { pub: process.env.CLAW_PUBLIC_URL, iss: process.env.IDENTITY_ISSUER_URL };
     process.env.CLAW_PUBLIC_URL = "https://claw.example.com/claw-api";
     process.env.IDENTITY_ISSUER_URL = "https://id.example.com";
@@ -618,40 +618,26 @@ describe("devenv_list", { skip }, () => {
           return { isError: r.isError === true, text: r.content[0].text };
         } finally { await client.close(); }
       };
-      const key = await userTurn(alice, "连接我的开发环境");
+      const key = await userTurn(alice, "连接我的开发机");
       await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [key.mid]);
+      // A message that came with the user's key is still their own: the one-line pairing command, as a signed-in one gets
+      // (2026-11-11: a new key user's "连接我得开发机" got the four sign-in commands).
       const keyBody = (await call(key)).body;
-      unpaired(keyBody, "key", /\(not_attended\)/);
-      // A key, not a confirmed identity: the answer first says to confirm it once and ask again for the one line, then the sign-in
-      // way (2026-11-11: a new user with a key was given only the four setup commands for "连接我的开发机").
-      const { IDENTITY_FIRST } = await import("../src/assistant/devenv-tools.js");
-      assert.equal(keyBody.connect_a_machine.needs_identity, true);
-      assert.ok(keyBody.connect_a_machine.text.startsWith(
-        "先确认一次身份（点聊天里的身份确认卡片，打开链接确认一次），确认后再说“连接我的开发机”，我就给你一行命令，在机器上运行就能连上。\n"
-        + "不想现在确认的话，也可以用登录方式连接：\n在要使用的机器上",
-      ), keyBody.connect_a_machine.text);
-      for (const c of keyBody.connect_a_machine.commands) assert.ok(keyBody.connect_a_machine.text.includes(c), c);
-      assert.match(keyBody.note, /\(not_attended\)[^]*confirm their identity once on the card[^]*never say you cannot connect it for them/);
-      assert.ok(IDENTITY_FIRST.en.startsWith("First confirm your identity once"));
+      assert.deepEqual(keyBody.connect_a_machine.pairing, { expires_in_minutes: 10, single_use: true });
+      assert.equal(keyBody.connect_a_machine.commands.length, 1);
+      assert.match(keyBody.connect_a_machine.commands[0], /^npm install -g --no-update-notifier @primusclaw\/connector@latest && claw-connector pair [0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4} --server https:\/\/claw\.example\.com\/claw-api$/);
+      assert.ok(keyBody.connect_a_machine.text.startsWith("在要连接的机器上打开终端"), keyBody.connect_a_machine.text);
+      assert.ok(keyBody.connect_a_machine.text.includes("```\n" + keyBody.connect_a_machine.commands[0] + "\n```"));
+      assert.equal(keyBody.note.includes("no pairing command can be made"), false);
       const keyPair = await pairTool(key);
-      assert.ok(keyPair.isError && /not_attended/.test(keyPair.text), keyPair.text);
-      const enKey = await userTurn(alice, "connect my dev machine");
-      await w.q("UPDATE claw_assistant_messages SET attended_via = NULL WHERE message_id = $1", [enKey.mid]);
-      const enKeyBody = (await call(enKey)).body;
-      assert.equal(enKeyBody.connect_a_machine.text, IDENTITY_FIRST.en + enKeyBody.connect_a_machine.text.slice(IDENTITY_FIRST.en.length));
-      assert.match(enKeyBody.connect_a_machine.text.slice(IDENTITY_FIRST.en.length), /^On the machine you want to use/);
-      // The refusal is noted on the message, so the turn's say tells the channel to offer the identity card.
-      const marked = async (mid: string) => (await w.q(
-        "SELECT identity_refused_at IS NOT NULL AS m FROM claw_assistant_messages WHERE message_id = $1", [mid]))[0].m;
-      assert.equal(await marked(key.mid), true);
+      assert.ok(!keyPair.isError && /claw-connector pair /.test(keyPair.text), keyPair.text);
+      assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 2);
+      // (out of the way of what follows: no live code, and none counted toward this minute's limit)
+      await w.q("DELETE FROM claw_remote_pairings");
+      await w.q("DELETE FROM claw_remote_audit WHERE owner_user_id = 'alice' AND action = 'pairing.created'");
       const stale = await userTurn(alice, "连接我的开发环境");
       await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - interval '2 hours' WHERE message_id = $1", [stale.mid]);
-      const staleBody = (await call(stale)).body;
-      unpaired(staleBody, "stale", /\(attendance_expired\)/);
-      // Any other refusal is as it was: the setup commands alone, nothing about the identity, and nothing noted.
-      assert.equal(staleBody.connect_a_machine.needs_identity, undefined);
-      assert.match(staleBody.connect_a_machine.text, /^在要使用的机器上/);
-      assert.equal(await marked(stale.mid), false);
+      unpaired((await call(stale)).body, "stale", /\(attendance_expired\)/);
       const stalePair = await pairTool(stale);
       assert.ok(stalePair.isError && /attendance_expired/.test(stalePair.text), stalePair.text);
       assert.equal(Number((await w.q("SELECT COUNT(*) AS n FROM claw_remote_pairings WHERE owner_user_id = 'alice'"))[0].n), 0);

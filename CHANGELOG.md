@@ -232,13 +232,14 @@ record it.
   their machine was revoked no longer name it, the results of `devenv_list` and `devenv_send` with no machine at all tell the router
   to name none, and the router's prompt takes a machine's name from this turn's `devenv_list` or `devenv_send` alone.
   Router prompt router-devenv-v14.
-- A person whose messages reach the assistant with a key, not a confirmed identity, is told how to get the one-line pairing command
-  instead of only the four sign-in commands. `devenv_list` (and `devenv_send` with no machine) refused a pairing there (`not_attended`)
-  and answered "连接我的开发机" with the setup commands alone; its `connect_a_machine` now carries `needs_identity` and its text says
-  first to confirm their identity once on the card in the chat and ask again, then gives the sign-in way. A turn refused anything for
-  that reason is noted on its message (`claw_assistant_messages.identity_refused_at`, added at start-up), and its `assistant.say`
-  carries `needs_identity`, so a channel can put the identity card beside the answer. The router's prompt names 连接我的开发机,
-  连接开发机 and 连我的机器 as connecting a machine. Router prompt router-devenv-v15.
+- "连接我的开发机" gets the one-line pairing command whether the person's message reached the assistant signed in or with their key.
+  `devenv_pair`, and the pairing `devenv_list` and `devenv_send` make for a user with no machine, required a message sent signed in
+  (`attendedTurn`) and answered a key user with the four sign-in commands; they now require only that the turn answers the user's
+  own, recent message (not a report), as `POST /v1/remote-agents/pairings` already gives a code to any authenticated user. A turn
+  refused anything else for want of a confirmed identity (`not_attended`, such as a review as them) is noted on its message
+  (`claw_assistant_messages.identity_refused_at`, added at start-up), and its `assistant.say` carries `needs_identity`, so a channel
+  can put the identity card beside the answer. The router's prompt names 连接我的开发机, 连接开发机 and 连我的机器 as connecting a
+  machine. Router prompt router-devenv-v15.
 - The assistant tells a person the commands they can type back in the language it answers them in: approve #ref and deny #ref for a
   card, undo #N after something is remembered, and 批准 / 拒绝 / 撤销 only in a Chinese conversation. The tool results (a memory save,
   a scheduled task, a GitHub comment or a devenv_send instruction card put to the person), what waits for them in the router's state
