@@ -23,7 +23,7 @@ import { actingUserOf, parseActingAs } from "../github-review/acting-as.js";
 import { REVIEW_SANDBOX_PROFILE, requestedByOf, usesReviewProfile } from "../github-review/requested-by.js";
 import { reviewAgentSettings, reviewTurnsLeft } from "../github-review/review-profile.js";
 import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js";
-import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, type AttendedProof } from "../github-review/acting-session.js";
+import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, proofForReviewAfterGreenCi, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { StartedReview, StartedReviewForRequester } from "@claw/protocol";
 import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
@@ -37,6 +37,7 @@ import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from
 import { queueRouterWake, tellUnwoken } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
 import { checkConflictLater } from "./review-conflict.js";
+import { ciNamesOf, tellReviewResultLater } from "./review-result.js";
 import { REVIEW_QUESTIONS as RQ } from "./review-questions.js";
 import { clipOneLine, getWorkItem, insertWorkItem, itemView, MAX_QUEUED_ITEMS, RUNNING, WAITING, type Outcome, type WorkItemView } from "./work-items.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
@@ -109,7 +110,16 @@ export interface ReviewParams {
   continues?: ReviewContinues | null;
   /** What this review has posted so far, from the same facts (`reviewRecord`); written when the item's state is brought up to date. */
   record?: ReviewRecord | null;
+  /**
+   * Why the wait for CI to turn green ended without the review being run again (`followReviewItems`): the head moved, the wait ran out, or
+   * the review could not be queued again, or CI turned green with a review thread still open. Absent while it waits, and on a review that
+   * never waited.
+   */
+  ci_wait_ended?: { reason: CiWaitEnd; at: string; head_sha: string };
 }
+
+/** Why a review stopped waiting for CI to turn green (`ReviewParams.ci_wait_ended`). */
+export type CiWaitEnd = "head_moved" | "timeout" | "not_queued" | "threads_open";
 
 /** One finding of a review: where, the thread GitHub opened for it (null when unknown), its first words, and whether its thread is resolved. */
 export interface RecordedFinding { path: string; line: number; thread_id: string | null; note: string; resolved: boolean }
@@ -449,6 +459,8 @@ async function refuseOverLimit(q: StatementRunner, actingAs: string, wanted: num
        UNION
        SELECT worker_session_id FROM claw_work_items
         WHERE kind = 'review' AND board_state <> 'done' AND ($1::text IS NULL OR params->>'acting_as' = $1) AND item_id IS DISTINCT FROM $3
+          -- (a review waiting for CI is not about to write: when it runs again, what it writes is counted then)
+          AND NOT (params ? 'ci_waiting')
      ) s`,
     [actor, HOUR_MS, except],
   )).rows[0] as { n: number }).n);
@@ -741,6 +753,7 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
     ...(p.halted && typeof p.halted === "object" ? { halted: p.halted } : {}),
     ...(p.queued && typeof p.queued === "object" ? { queued: p.queued } : {}),
     ...(typeof p.request_batch === "string" && p.request_batch ? { request_batch: p.request_batch } : {}),
+    ...(p.ci_wait_ended && typeof p.ci_wait_ended === "object" && typeof p.ci_wait_ended.reason === "string" ? { ci_wait_ended: p.ci_wait_ended } : {}),
     continues: readContinues(p.continues),
   };
 }
@@ -898,7 +911,9 @@ export async function restartReview(
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
   // (a restart is made as any start is: neither why the old one was halted nor that it waited for a slot carries over)
   // Nor which message started it: a resend of that message answers the review it started, never one a restart made (`startedFor`).
-  const { halted: _halted, queued: _queued, request_batch: _batch, request_message: _message, ...kept } = was;
+  // (nor that the old one stopped waiting for CI: the new one is a review of its own)
+  const { halted: _halted, queued: _queued, request_batch: _batch, request_message: _message, ci_wait_ended: _ciWaitEnded, ...kept } = was;
+  delete (kept as Record<string, unknown>).ci_waiting;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
@@ -1089,16 +1104,50 @@ export interface ReviewFacts {
   halted?: { reason: string; message: string } | null;
   /** The review waits for a slot (`ReviewParams.queued`): nothing of it has run. */
   queued?: boolean;
+  /** Nobody else asked for it: the owner's own review, started by their assistant (no `requested_by`). */
+  ownReview?: boolean;
+  /** How many turns the review's session has had. */
+  turns?: number;
+  /** The last review the session posted: its head, its event (the verdict), how many inline findings it had, and when. */
+  lastPosted?: { headSha: string; event: string; findings: number; at: number } | null;
+  /** The last approval the review tools refused because CI was not green (`ci_not_green`): on which head, and the checks it named. */
+  ciRefusal?: { headSha: string; failed: string[]; pending: string[] } | null;
+  /** Why the wait for CI ended (`ReviewParams.ci_wait_ended`), or null while it may wait. */
+  ciWaitEnded?: CiWaitEnd | null;
+}
+
+/** How long a review waits for CI on its head to turn green before it stops waiting and says so. */
+export const CI_WAIT_MS = 24 * HOUR_MS;
+
+/**
+ * The wait for CI a review is in, or null: the owner's own review (one someone else asked for is followed by the chat that started it), whose
+ * one turn posted a review that does not approve, with no inline finding, after the review tools refused its approval of that same head
+ * because CI was not green. Then the review found nothing to block it but CI, and it is run once more, in the same session, when CI on that
+ * head is green (`followReviewItems`): the person asked for a review that approves and merges, and only CI stood in the way. Never after a
+ * second turn (it is run again at most once), and never once the wait ended (`ciWaitEnded`).
+ */
+export function ciWaitOf(f: ReviewFacts): { headSha: string; failed: string[]; pending: string[]; since: number } | null {
+  const p = f.lastPosted;
+  const c = f.ciRefusal;
+  if (!f.ownReview || f.turns !== 1 || f.ciWaitEnded || !p || !c) return null;
+  if (p.event === "APPROVE" || p.findings > 0 || c.headSha !== p.headSha) return null;
+  return { headSha: p.headSha, failed: c.failed, pending: c.pending, since: p.at };
 }
 
 /** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
 export const FOLLOW_TOOL = "gh_pr_follow";
 const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_merged", "closed"]);
 
+/**
+ * What the owner of their own review is told of its end by the server (`review-result.ts`): it waits for CI to turn green before it is run
+ * again (`ci_wait`), or it posted a review that does not approve (`not_approved`). An approval goes on to the merge's confirmation card.
+ */
+export type ReviewResult = "ci_wait" | "not_approved";
+
 export type ReviewState =
-  | { boardState: "in_progress"; summary: string; question: string | null }
+  | { boardState: "in_progress"; summary: string; question: string | null; result?: ReviewResult }
   | { boardState: "needs_you"; reportKind: "blocked" | "failed"; summary: string; question: string }
-  | { boardState: "done"; outcome: Extract<Outcome, "accepted" | "stopped">; summary: string };
+  | { boardState: "done"; outcome: Extract<Outcome, "accepted" | "stopped">; summary: string; result?: ReviewResult };
 
 /**
  * Where a review item stands, from the facts alone. Every status of a confirmation lands somewhere (`merged`, `queued`, `submitted`,
@@ -1160,7 +1209,17 @@ export function reviewState(f: ReviewFacts): ReviewState {
   if (!f.reviewOnly && mergeRefused && (!submitted || mergeRefused.at >= submitted.at)) {
     return { boardState: "needs_you", reportKind: "blocked", summary: `the merge of ${pr} was refused: ${mergeRefused.detail}`, question: RQ.lookAt.en(pr) };
   }
-  if (submitted) return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted` };
+  if (submitted) {
+    const wait = ciWaitOf(f);
+    if (wait) {
+      return { boardState: "in_progress", summary: `waiting for CI on ${wait.headSha.slice(0, 7)} to pass, then reviewing ${pr} again`, question: null, result: "ci_wait" };
+    }
+    const event = f.lastPosted?.event ?? "";
+    if (f.ownReview && f.lastPosted && event !== "APPROVE") {
+      return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted without an approval (${event || "no verdict"})`, result: "not_approved" };
+    }
+    return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted` };
+  }
   if (f.turn === "failed") return { boardState: "needs_you", reportKind: "failed", summary: `the review of ${pr} failed`, question: RQ.restartReview.en(pr) };
   if (f.writes.some((w) => w.result === "ok" && w.detail === "dry_run")) {
     return { boardState: "needs_you", reportKind: "blocked", summary: `writes are off on this deployment: nothing was posted to ${pr}`, question: RQ.lookAt.en(pr) };
@@ -1185,9 +1244,23 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   const turn = (await q.query(
     `SELECT (EXISTS (SELECT 1 FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' AND status = ANY($2::text[]))
              OR EXISTS (SELECT 1 FROM claw_pending_messages WHERE session_id = $1)) AS busy,
-            (SELECT status FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' ORDER BY created_at DESC LIMIT 1) AS last`,
+            (SELECT status FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' ORDER BY created_at DESC LIMIT 1) AS last,
+            (SELECT COUNT(*)::int FROM claw_tasks WHERE session_id = $1 AND origin = 'chat') AS turns`,
     [sessionId, SWEEPABLE_RUN_STATUSES],
-  )).rows[0] as { busy: boolean; last: string | null };
+  )).rows[0] as { busy: boolean; last: string | null; turns: number };
+  const posted = (await q.query(
+    `SELECT head_sha, COALESCE(posted->>'event', arguments->>'event', '') AS event,
+            CASE WHEN jsonb_typeof(posted->'findings') = 'array' THEN jsonb_array_length(posted->'findings') ELSE 0 END AS findings, at
+       FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok'
+        -- (the row of the write that posted it: a retry answered already_submitted keeps no findings, and would read as none)
+        AND detail IN ('submitted', 'already_submitted') AND posted IS NOT NULL ORDER BY at DESC, id DESC LIMIT 1`,
+    [sessionId],
+  )).rows[0] as { head_sha: string; event: string; findings: number; at: unknown } | undefined;
+  const ci = (await q.query(
+    `SELECT head_sha, risk_reasons FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'refused'
+        AND detail = 'ci_not_green' ORDER BY at DESC, id DESC LIMIT 1`,
+    [sessionId],
+  )).rows[0] as { head_sha: string; risk_reasons: unknown } | undefined;
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
@@ -1196,8 +1269,14 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     turn: turn.busy ? "running" : turn.last === null ? "none" : turn.last === "failed" || turn.last === "cancelled" ? "failed" : "finished",
     halted: row.params.halted ?? null,
     queued: row.params.queued !== undefined,
+    ownReview: row.params.requested_by === undefined,
+    turns: Number(turn.turns ?? 0),
+    lastPosted: posted ? { headSha: String(posted.head_sha).toLowerCase(), event: String(posted.event), findings: Number(posted.findings), at: ms(posted.at) } : null,
+    ciRefusal: ci ? { headSha: String(ci.head_sha).toLowerCase(), ...ciNamesOf(ci.risk_reasons) } : null,
+    ciWaitEnded: row.params.ci_wait_ended?.reason ?? null,
   };
 }
+
 
 /**
  * Bring one open review item to what its facts say, under the item's row lock. Writes only a change; entering "needs you", or a new reason
@@ -1207,8 +1286,10 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   // Whether the item needs its owner after this sync, written or not: a review someone else asked for that is blocked on a conflict is
   // told to the one who asked too (`review-conflict.ts`, once per head commit), and a new head that still conflicts reads as the same state.
   let needsYou = false;
+  let told: ReviewResult | null = null;
   const woke = await inTransaction(async (query) => {
     needsYou = false;
+    told = null;
     const q = { query };
     const row = (await query(
       `SELECT item_id, user_id, worker_session_id, params, kind, board_state, last_report_kind, summary, pending_question, generation, attention_seq
@@ -1226,10 +1307,21 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
     const record = await reviewRecord(q, row.worker_session_id as string, params);
     const recordChanged = JSON.stringify(record) !== JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null);
     if (recordChanged) await query("UPDATE claw_work_items SET params = params || jsonb_build_object('record', $2::jsonb) WHERE item_id = $1", [itemId, JSON.stringify(record)]);
+    // A review that waits for CI holds no slot (`RUNNING`): it may wait a day, and the owner's other work is not held back by it. The mark
+    // goes as soon as it stops waiting, so the turn run when CI turned green counts again.
+    const ciWaiting = state.boardState === "in_progress" && state.result === "ci_wait";
+    if (ciWaiting !== ((row.params as Record<string, unknown> | null)?.ci_waiting === true)) {
+      await query(
+        ciWaiting ? "UPDATE claw_work_items SET params = params || '{\"ci_waiting\": true}'::jsonb WHERE item_id = $1"
+          : "UPDATE claw_work_items SET params = params - 'ci_waiting' WHERE item_id = $1",
+        [itemId],
+      );
+    }
     if (row.board_state === state.boardState && (row.last_report_kind ?? null) === reportKind
       && (row.pending_question ?? null) === question && row.summary === summary) return null;
     const attention = state.boardState === "needs_you" ? 1 : 0;
     const outcome = state.boardState === "done" ? state.outcome : null;
+    told = state.boardState === "needs_you" ? null : state.result ?? null;
     await query(
       `UPDATE claw_work_items
           SET board_state = $2, last_report_kind = COALESCE($3, last_report_kind), summary = $4, pending_question = $5, outcome = $6,
@@ -1255,6 +1347,9 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   // Where a review's "blocked" is written: its session reports nothing itself (no worker report reaches `ingestReport`), so the check
   // there never ran for one (2026-11-08, N5: four reviews refused on DIRTY, none told). Not waited for, as there.
   if (needsYou) checkConflictLater(itemId);
+  // A review that ended without an approval, or waits for CI before it is run again, is told to its owner by the server, in their language
+  // (2026-11-11: #195 posted a comment-only review because codecov/patch was red, the item closed as done, and nobody was told anything).
+  if (told) tellReviewResultLater(itemId, told);
   const after = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown> | undefined;
   return after ? itemView(after) : null;
 }
@@ -1385,22 +1480,87 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
     if (!taken || !params) continue;
     const requestedBy = params.requested_by ?? null;
     try {
+      const sessionId = String(taken.worker_session_id);
+      const wait = ciWaitOf(await readFacts(db, { user_id: String(taken.user_id), worker_session_id: sessionId, params }));
+      // A wait past its day ends whatever GitHub answers now: a look that keeps failing (an expired authorization) never keeps it open.
+      if (wait && now - wait.since > CI_WAIT_MS) {
+        await endCiWait(item_id, "timeout", wait.headSha, now);
+        continue;
+      }
       const out = await follow({
-        sessionId: String(taken.worker_session_id), ref: params.pr, actingUserId: params.acting_as,
+        sessionId, ref: params.pr, actingUserId: params.acting_as,
         requesterUserId: requestedBy ?? String(taken.user_id), requesterLabel: params.requester_label ?? undefined,
         mergeByRequester: requestedBy !== null && requestedBy !== params.acting_as && params.review_only === false,
+        ...(wait ? { withChecks: true } : {}),
       });
       const status = String(out.body.status ?? "");
       logger.info({ itemId: item_id, status, reason: out.body.reason ?? null }, "assistant.review_followed");
       if (!out.isError && FOLLOW_ENDS.has(status)) {
         await syncReviewItem(item_id);
         ended += 1;
+      } else if (!out.isError && status === "open" && wait) {
+        await followCiWait(item_id, sessionId, String(taken.user_id), wait, out.body, now);
       }
     } catch (err) {
       logger.warn({ err, itemId: item_id }, "assistant.review_follow_failed");
     }
   }
   return ended;
+}
+
+/** End a review's wait for CI, once (`ci_wait_ended`), and bring the item to it: the sync tells the owner why (`review-result.ts`). */
+async function endCiWait(itemId: string, reason: CiWaitEnd, head: string, now: number): Promise<void> {
+  await db.query(
+    `UPDATE claw_work_items SET params = params || jsonb_build_object('ci_wait_ended', $2::jsonb), updated_at = NOW()
+      WHERE item_id = $1 AND board_state <> 'done' AND NOT (params ? 'ci_wait_ended')`,
+    [itemId, JSON.stringify({ reason, at: new Date(now).toISOString(), head_sha: head })],
+  );
+  logger.info({ itemId, reason, head }, "assistant.review_ci_wait_ended");
+  await syncReviewItem(itemId);
+}
+
+/**
+ * One look at a review waiting for CI (`ciWaitOf`), from what `followPullRequest` read of the pull request with its checks: a new head ends
+ * the wait (the commits it waited on are not the pull request any more), a green head runs the review once more in its session (the same
+ * words, `proofForReviewAfterGreenCi`; what it then posts goes the usual way: an approval to the merge's confirmation card), and a wait past
+ * `CI_WAIT_MS` ends. Anything else waits for the next look. Each end is written once (`ci_wait_ended`) and brought to the item by the sync,
+ * which tells the owner (`review-result.ts`).
+ */
+async function followCiWait(
+  itemId: string, sessionId: string, ownerId: string, wait: NonNullable<ReturnType<typeof ciWaitOf>>, body: Record<string, unknown>, now: number,
+): Promise<void> {
+  const head = String(body.head_sha ?? "").toLowerCase();
+  const ci = body.ci as { green?: unknown; unresolved_threads?: unknown } | undefined;
+  const end = (reason: CiWaitEnd): Promise<void> => endCiWait(itemId, reason, head || wait.headSha, now);
+  if (head && head !== wait.headSha) return end("head_moved");
+  // CI green, but a review thread is open (or the threads could not all be read): run again, the approval would be refused for it, so the
+  // wait ends here and the owner is told what is left.
+  if (ci?.green === true && ci.unresolved_threads !== 0) return end("threads_open");
+  if (ci?.green === true) {
+    const queued = await inTransaction(async (query) => {
+      const q = { query };
+      // Under the item's row lock, as the sync takes it: a stop or a restart of the item meanwhile is seen here.
+      const open = (await query("SELECT 1 FROM claw_work_items WHERE item_id = $1 AND board_state <> 'done' FOR UPDATE", [itemId])).rows.length > 0;
+      if (!open) return null;
+      const words = (await query(
+        `SELECT COALESCE(prompt, input->>'prompt', '') AS words FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' ORDER BY created_at, task_id LIMIT 1`,
+        [sessionId],
+      )).rows[0] as { words: string } | undefined;
+      const proof = words ? await proofForReviewAfterGreenCi(q, sessionId, words.words) : null;
+      if (!words || !proof) return { ok: false as const, error: "no_proof" };
+      return queueServerMessage(q, { sessionId, userId: ownerId, content: words.words, dedupeKey: `review-ci-green:${itemId}:${wait.headSha}`, attended: proof });
+    });
+    if (queued === null) return;
+    if (!queued.ok) {
+      logger.warn({ itemId, error: queued.error }, "assistant.review_ci_green_not_queued");
+      return end("not_queued");
+    }
+    logger.info({ itemId, head: wait.headSha }, "assistant.review_ci_green_rerun");
+    await drainSessionIfIdle(sessionId, ownerId);
+    await syncReviewItem(itemId);
+    return;
+  }
+  if (now - wait.since > CI_WAIT_MS) return end("timeout");
 }
 
 // ------------------------------------------------------------------------------------------------ the queue

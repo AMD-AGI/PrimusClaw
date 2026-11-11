@@ -377,7 +377,8 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
   // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
   // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
-  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 3, "three places make a proof: the create's check, the first message's re-run, and a queued review's first message");
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 4,
+    "four places make a proof: the create's check, the first message's re-run, a queued review's first message, and a review run again once CI is green");
   assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
     "the re-run's proof only for a session whose one turn failed with the same words");
   const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
@@ -388,6 +389,13 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "the queued review's proof only for a session with no turn and no message whose item still waits");
   const queuedProof = [...found.keys()].filter((f) => /\bproofForQueuedFirstMessage\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(queuedProof, ["assistant/review-items.ts"], "only the review items ask for a queued review's proof");
+  // A review of the owner's own account whose one turn posted a comment because CI was not green: its same words once more, once CI is
+  // green. Made only for a session that acts as a user, had one completed turn with those words and nothing queued, whose approval was
+  // refused ci_not_green, and whose item is the owner's own, open and still waiting.
+  assert.match(actingSession, /Number\(row\.turns\) !== 1 \|\| Number\(row\.queued\) !== 0\) return null;\s*if \(row\.status !== "completed" \|\| row\.words !== content \|\| !row\.ci_refused \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the green-CI re-run's proof only for one completed turn with the same words, a ci_not_green refusal and a waiting own review");
+  const greenProof = [...found.keys()].filter((f) => /\bproofForReviewAfterGreenCi\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(greenProof, ["assistant/review-items.ts"], "only the review items ask for the green-CI re-run's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
   assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
   const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));
