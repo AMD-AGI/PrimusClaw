@@ -148,7 +148,11 @@ test("a bound person who rebinds to another account is followed to it: id, subsc
   w.owners.set("tok-other", { id: "u-other", name: "Other", email: "", accountType: "" });
   await w.router.handle(message("after"));
 
-  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-other", "the id the webhook checks events against is the new owner");
+  assert.equal(
+    w.store.links.clawUserIdOf(ALICE.id),
+    "u-other",
+    "the id the webhook checks events against is the new owner",
+  );
   assert.deepEqual(
     aw.subsClaw.calls.filter((c) => c.startsWith("create ")),
     [`create ${TOKEN}`, "create tok-other"],

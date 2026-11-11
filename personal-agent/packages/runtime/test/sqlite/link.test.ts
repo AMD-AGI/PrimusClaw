@@ -430,7 +430,11 @@ test("a person bound with no link keeps a Claw user id of their own, never found
   assert.equal(links.getKey(ALICE), null);
   assert.equal(links.clawUserIdOf(ALICE), "u-alice");
   assert.deepEqual(links.boundClawUser(ALICE, "tok-1"), { clawUserId: "u-alice", current: true });
-  assert.deepEqual(links.boundClawUser(ALICE, "tok-2"), { clawUserId: "u-alice", current: false }, "read with another token");
+  assert.deepEqual(
+    links.boundClawUser(ALICE, "tok-2"),
+    { clawUserId: "u-alice", current: false },
+    "read with another token",
+  );
   assert.equal(links.needsClawUserId(ALICE), false, "(nothing to backfill: there is no link)");
   assert.deepEqual(links.linkedUsers(), [], "a bound person is not a linked one");
   assert.deepEqual(links.usersForClawUser("u-alice"), [], "a Claw user is found back from links only");
