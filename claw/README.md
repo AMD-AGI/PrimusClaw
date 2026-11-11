@@ -49,7 +49,7 @@ argument (`api` / `brain` / `hands`) — see
 | Package | Role |
 |---|---|
 | [`packages/utils`](packages/utils) | Domain-free helpers safe for every role, including the in-sandbox one: KV abstraction, secret redaction, constant-time compare, env settings |
-| [`packages/protocol`](packages/protocol) | The api↔brain contract: shared types, NATS subject builders, sandbox env composition, run leases, task consumer |
+| [`packages/protocol`](packages/protocol) | The api↔brain contract: shared types, NATS subject builders, sandbox env composition, and the coordination protocols (run leases, task consumer, sandbox handle map, Hands parking) |
 | [`packages/hands`](packages/hands) | The MCP tool server that runs *inside* the sandbox (fs / shell / s3 tools) |
 | [`packages/brain`](packages/brain) | The agent loop: LLM calls, tool routing, sub-agents, sandbox lifecycle, workspace↔S3 sync. Pulls tasks from one durable JetStream consumer, `brain-workers`, which the API provisions and every replica shares; whichever replica has capacity takes the next task |
 | [`packages/api`](packages/api) | The public Fastify server: sessions, events, memory, skills, plugins, MCP, admin, A2A, task DAGs |
@@ -246,4 +246,3 @@ See [`.env.example`](.env.example) for the full list.
 | `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | Workspace object storage |
 | `A2A_AGENTS` / `A2A_PEER_TOKEN_*` | The only peer agents Brain's `a2a_call` tool may reach, by name (a name list, or a JSON array whose `auth_env` names a variable starting with `A2A_PEER_TOKEN_`). Unset, `a2a_call` has no peers. **Breaking:** `a2a_call` no longer accepts a URL or sends the user's key to a peer; see `CHANGELOG.md` |
 | `API_PORT` / `EXECUTOR_PORT` / `MCP_PORT` | Service listen ports (api / brain / hands) |
-

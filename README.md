@@ -101,8 +101,8 @@ You do not need SaFE to evaluate the project:
 | Install the full stack on a cluster | Kubernetes, `kubectl`, `helm`, a storage class, and a SaFE endpoint |
 | Install on an **isolated** cluster with no SaFE | `deploy/deploy.sh --insecure-sandbox`, which turns sandbox authentication **off entirely**: never on a shared or reachable cluster |
 
-Claw and the personal agent require **Node 26**, a Current release rather than
-an LTS (pinned in [`claw/.nvmrc`](claw/.nvmrc)).
+Claw and the personal agent require **Node 26** (pinned in
+[`claw/.nvmrc`](claw/.nvmrc)); the connector runs on Node.js 22 or newer.
 
 ## Quick start
 
@@ -228,9 +228,9 @@ Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setup,
 the checks a pull request must pass, coverage floors, and the
 [Developer Certificate of Origin](https://developercertificate.org/) sign-off
 (`git commit -s`) required on every commit. `make verify` from the repository
-root builds and tests Claw, Agent Sandbox, the Python packages and the docs,
-plus the lint and license checks; `make help` lists the per-tree targets. The
-personal agent (`npm run check` in `personal-agent/`) and the connector (see
+root builds and tests Claw and Agent Sandbox, runs the LiteLLM wrapper's Python
+tests, builds the docs, and runs the lint and license checks; `make help` lists
+the per-tree targets. The personal agent (`npm run check` in `personal-agent/`) and the connector (see
 its [Development](connector/README.md#development) section) have their own
 checks, which CI runs in their own workflows.
 
