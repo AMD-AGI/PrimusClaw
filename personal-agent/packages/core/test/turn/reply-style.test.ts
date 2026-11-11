@@ -225,6 +225,25 @@ it("test_a_group_turn_streams_in_reply_to_the_message_and_its_status_carries_non
   assert.ok(textOf(final).includes("Summary: on track.") && final.suggestions === undefined); // (none in a group)
 });
 
+it("a group turn stopped while its sandbox is prepared ends its floating status with the stop, as the stream's final", async () => {
+  // What Claw sends for a turn /stop reached before the engine said anything (Brain's `handleUserInterrupt`): its setup
+  // steps, then a ResultMessage that is not a success and carries no text. The floating "Thinking…" must be closed by it:
+  // the stream's final message says the turn stopped, and nothing is informed after it.
+  const run = await turn(
+    [
+      [0.1, tool("download_skill", "success")],
+      [0.2, ev("sandboxStatus", "m1", { status: "deferred" })],
+      [6.0, ev("ResultMessage", "m1", { data: { subtype: "interrupted" } })],
+    ],
+    { request: { group: true }, controls: { stopRequested: () => true, stopConfirmed: () => true } },
+  );
+  assert.deepEqual([run.ops[0]?.op, run.ops[0]?.text], ["open", turnText.in("en").thinking]);
+  const closing = finals(run);
+  assert.equal(closing.length, 1, "the floating status is closed once");
+  assert.equal(closing[0]?.text, "Stopped.");
+  assert.equal(run.ops.at(-1), closing[0], "nothing is shown in the stream after it is closed");
+});
+
 it("test_the_informative_text_is_cut_to_teams_limits_keeping_the_newest", () => {
   const lines = ["old ".repeat(200), "x".repeat(500), "最新的一步：读取文件"];
   const text = statusText(lines);
