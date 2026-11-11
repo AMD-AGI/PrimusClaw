@@ -71,9 +71,9 @@ flowchart LR
   [`claw/README.md`](claw/README.md#architecture) and the design notes in
   [`claw/docs/`](claw/docs/README.md).
 - **The personal agent** holds no model or sandbox of its own: it is a client
-  of the Claw API, and each person acts with their own Claw identity. Claw
-  sends it each person's notifications (assistant replies, approvals, finished
-  runs, remote-agent events). See
+  of the Claw API, and each person acts with their own Claw identity. With
+  proactive messages switched on, Claw sends it each person's notifications
+  (assistant replies, approvals, finished runs, remote-agent events). See
   [`personal-agent/README.md`](personal-agent/README.md#architecture).
 - **The connector** opens no port and needs no public address. Claw relays the
   conversation and keeps an audit trail; the agent, the files, the checkout and
@@ -170,7 +170,7 @@ service. See the [connector quick start](connector/README.md#quick-start-about-5
 ### Deploy the full stack
 
 ```bash
-# Preview: prints the plan, mutates nothing.
+# Preview: prints the plan; child installers preview where they support it.
 SAFE_API_URL=https://safe.example.com bash deploy/deploy.sh --dry-run
 
 # Install Agent Sandbox, Claw and LiteLLM (--skip-litellm to omit the gateway).
@@ -192,9 +192,9 @@ and from `v*` tags:
 
 | Component | Tag | Published to | Release notes |
 |---|---|---|---|
-| Personal agent (three packages and the image, one version) | `personal-agent-vX.Y.Z` | npm and Docker Hub | [`personal-agent/CHANGELOG.md`](personal-agent/CHANGELOG.md) |
+| Personal agent (three packages and the image, one version) | `personal-agent-vX.Y.Z` | npm; the image to Docker Hub while image publishing is switched on | [`personal-agent/CHANGELOG.md`](personal-agent/CHANGELOG.md) |
 | Connector | `connector-vX.Y.Z` | npm | the [GitHub Release](https://github.com/AMD-AGI/PrimusClaw/releases) of the tag |
-| Claw, Agent Sandbox | images from every `main` build (`latest` plus a timestamp tag) and from `v*` tags | Docker Hub | [`CHANGELOG.md`](CHANGELOG.md) |
+| Claw, Agent Sandbox | images built from `main` (`latest` plus a timestamp tag) and from `v*` tags | Docker Hub | [`CHANGELOG.md`](CHANGELOG.md) |
 
 After each package's first version, which a maintainer published by hand so
 that it could be given a Trusted Publisher, npm releases are published from

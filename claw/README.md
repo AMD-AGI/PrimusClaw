@@ -114,18 +114,32 @@ are not part of `npm test`.
 
 ```
 claw/
-├── packages/          # the five workspaces above
-│   ├── utils/         #   domain-free helpers (kv/, security/, env settings)
-│   ├── protocol/      #   shared types, NATS subjects, sandbox/ coordination
-│   ├── hands/         #   in-sandbox MCP tool server; src/tools/ holds fs/, shell/, s3/
-│   ├── brain/         #   agent loop; src/ holds agent/, tasks/, delivery/, clients/, workspace/, sandbox/
-│   └── api/           #   public API; src/ holds routes/, sessions/, marketplace/, infra/
-├── deploy/            # Helm chart, deploy/upgrade/build scripts, entrypoint
-├── docs/              # design docs — see docs/README.md for the index
-├── examples/          # runnable examples
-├── scripts/           # start/stop scripts and the CI lint invariants
-├── tests/             # SDK-level scripts against a deployed stack
-├── Dockerfile         # one image; entrypoint dispatches on api / brain / hands
+├── packages/               # the five workspaces above
+│   ├── utils/              # domain-free helpers (kv/, security/, env settings)
+│   ├── protocol/           # shared types, NATS subjects, sandbox/ coordination
+│   ├── hands/              # in-sandbox MCP tool server
+│   │   └── src/tools/      # fs/, shell/, s3/ tool implementations
+│   ├── brain/              # agent-loop engine
+│   │   ├── src/agent/      # agent loop, engine adapters, prompt, hooks, HITL
+│   │   ├── src/tasks/      # task runner, dispatch, locks, gates
+│   │   ├── src/delivery/   # doorbell intake, claim-next, delivery dispatch
+│   │   ├── src/clients/    # hands, MCP, A2A, run-claim clients
+│   │   ├── src/workspace/  # snapshot sync, reaper, S3 upload
+│   │   └── src/sandbox/    # SaFE sandbox client
+│   └── api/                # public API server
+│       ├── src/routes/     # sessions, events, memory, skills, plugins, mcp, admin, a2a, tasks
+│       ├── src/sessions/   # dispatch, teardown, context, sweepers
+│       ├── src/marketplace/  # plugins, skills, evolution
+│       └── src/infra/      # db, nats, metrics, leader lock, schema guard
+├── deploy/                 # deploy guide (README.md), Helm chart (charts/claw/, the single source
+│                           # for all K8s manifests), deploy.sh / upgrade.sh / build.sh (Kaniko or
+│                           # local Docker), entrypoint
+├── docs/                   # design docs — see docs/README.md for the index
+├── examples/               # runnable examples
+├── scripts/                # start-all.sh / start-{api,brain,hands}.sh / stop-all.sh, plugin
+│                           # migration scripts, and the CI lint invariants
+├── tests/                  # SDK-level scripts against a deployed stack
+├── Dockerfile              # one image; entrypoint dispatches on api / brain / hands
 └── .env.example
 ```
 
