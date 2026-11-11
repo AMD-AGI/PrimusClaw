@@ -127,9 +127,11 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       risk_judgement: JUDGEMENT,
       comments: z.array(z.object({
         path: z.string(), line: z.number().int(), side: z.enum(["RIGHT", "LEFT"]).optional(), body: z.string(),
+        existing_code: z.string().optional().describe("The line or few lines of the head the comment is about, copied exactly: they place it when the line number is off"),
       })).max(30).optional().describe("Inline comments; each must be on a line the diff shows"),
       non_blocking: z.array(z.object({
         path: z.string(), line: z.number().int().nullable().optional(), body: z.string(),
+        existing_code: z.string().optional().describe("The code of the head the note is about, copied exactly"),
       })).max(30).optional().describe("Non-blocking suggestions and open questions, one each: they are listed under the review body, not posted inline"),
       coverage: z.array(z.object({
         path: z.string(), status: z.enum(["reviewed", "skipped"]), note: z.string().optional(),

@@ -34,6 +34,7 @@ import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, files
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { languageChecksText } from "./review-rules.js";
+import { placeComment, repeatsOpenFinding, locateCode } from "./relocate.js";
 import { clipPrSummary } from "./pr-summary.js";
 import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
@@ -751,7 +752,9 @@ export class GithubReview {
     const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
     // The deep review's coverage and finding check need the changed files only (the rest of a change is read where it is needed).
     const files = change ? change.files : deep ? await this.readChangedFiles(ctx, ref, pr) : null;
-    const comments = this.checkComments(o.rawComments, change);
+    const moved: Array<{ path: string; from: number; to: number }> = [];
+    let comments = this.checkComments(o.rawComments, change, moved);
+    let repeated: Array<{ path: string; line: number; thread_id: string | null }> = [];
     const event = o.event;
     let text = o.text;
     let checked: FindingCheckOutcome | null = null;
@@ -760,7 +763,15 @@ export class GithubReview {
       coverage = await this.requireCoverage(ctx, ref, repo, pr, change, files, o.coverage, event);
       // The check withdraws notes only: every inline finding is posted as the reviewer wrote it (finding-check.ts).
       checked = await this.checkFindings(ctx, pr, files, comments, o.notes ?? []);
-      text = this.composeBody(text, checked.nonBlocking, coverage, files);
+      // A re-review does not open a second thread where one of the last review's is still open: the finding is said in the body.
+      const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
+      if (continuation?.findings.length) {
+        const stillOpen = comments.filter((c) => c.side === "RIGHT" && repeatsOpenFinding(continuation.findings, c.path, c.line));
+        repeated = stillOpen.map((c) => ({ path: c.path, line: c.line, thread_id: repeatsOpenFinding(continuation.findings, c.path, c.line)?.thread_id ?? null }));
+        comments = comments.filter((c) => !stillOpen.includes(c));
+        if (stillOpen.length) text = `${text.trimEnd()}\n\n**Still open from the last review**\n${stillOpen.map((c) => `- \`${c.path}:${c.line}\`: ${c.body.replace(/\s*\n\s*/g, " ").trim()}`).join("\n")}`;
+      }
+      text = this.composeBody(text, this.placeNotes(checked.nonBlocking, files), coverage, files);
     } else if (o.notes?.length) {
       text = this.composeBody(text, o.notes, null, null);
     }
@@ -778,7 +789,10 @@ export class GithubReview {
       }
     }
     const result = await this.writeReview(ctx, ref, pr, event, text, comments);
-    return { status: result.status, head_sha: headSha, ...result.detail, ...this.checkSummary(checked, coverage) };
+    return {
+      status: result.status, head_sha: headSha, ...result.detail, ...this.checkSummary(checked, coverage),
+      ...(moved.length ? { moved_comments: moved } : {}), ...(repeated.length ? { said_in_body_as_still_open: repeated } : {}),
+    };
   }
 
   /** `gh_pr_merge`: merge what this session approved, if every gate is open; a merge a person confirmed approves first when needed. */
@@ -1649,19 +1663,25 @@ export class GithubReview {
     return mergesByItself(state) ? this.confirmedMergesOnly(ctx, risk) : risk;
   }
 
-  private checkComments(raw: unknown, change: Change | null): ReviewComment[] {
+  private checkComments(raw: unknown, change: Change | null, moved: Array<{ path: string; from: number; to: number }> = []): ReviewComment[] {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Refusal("invalid_comments", "comments must be a list");
     if (raw.length > MAX_REVIEW_COMMENTS) throw new Refusal("too_many_comments", `at most ${MAX_REVIEW_COMMENTS} inline comments`);
     const problems: string[] = [];
     const out: ReviewComment[] = [];
     const lines = new Map<string, ReturnType<typeof commentableLines>>();
-    for (const f of change?.files ?? []) lines.set(f.path, commentableLines(f.patch));
+    const patches = new Map<string, string | undefined>();
+    for (const f of change?.files ?? []) { lines.set(f.path, commentableLines(f.patch)); patches.set(f.path, f.patch); }
     raw.forEach((c, i) => {
       const item = (c ?? {}) as Record<string, unknown>;
       const path = typeof item.path === "string" ? item.path : "";
-      const line = Number(item.line);
       const side = item.side === "LEFT" ? "LEFT" : "RIGHT";
+      // The code the comment is about places it on the head side when its line number is off (relocate.ts).
+      const given = Number(item.line);
+      const placed = side === "RIGHT" && Number.isInteger(given) && given >= 1 && typeof item.existing_code === "string"
+        ? placeComment(patches.get(path), given, item.existing_code) : null;
+      const line = placed ? placed.line : given;
+      if (placed?.movedFrom != null) moved.push({ path, from: placed.movedFrom, to: placed.line });
       const body = typeof item.body === "string" ? item.body.trim() : "";
       if (!path || !Number.isInteger(line) || line < 1 || !body) { problems.push(`comment ${i}: path, line and body are required`); return; }
       if (body.length > MAX_COMMENT_CHARS) { problems.push(`comment ${i}: longer than ${MAX_COMMENT_CHARS} characters`); return; }
@@ -1682,7 +1702,8 @@ export class GithubReview {
       const path = typeof item.path === "string" ? item.path.trim() : "";
       const body = typeof item.body === "string" ? item.body.trim().slice(0, MAX_COMMENT_CHARS) : "";
       const line = Number.isInteger(item.line) && (item.line as number) > 0 ? item.line as number : null;
-      return path && body ? [{ path, line, body, blocking: false }] : [];
+      const code = typeof item.existing_code === "string" && item.existing_code.trim() ? item.existing_code.slice(0, 2000) : undefined;
+      return path && body ? [{ path, line, body, blocking: false, ...(code ? { code } : {}) }] : [];
     });
   }
 
@@ -1733,6 +1754,16 @@ export class GithubReview {
       withdrawn: outcome.withdrawn.length, doubted: outcome.doubted.length,
     }, "github_review.finding_check");
     return outcome;
+  }
+
+  /** The notes with their line taken from the code they quote, where the diff shows it (relocate.ts); the rest as given. */
+  private placeNotes(notes: Finding[], files: RiskFile[]): Finding[] {
+    const patches = new Map(files.map((f) => [f.path, f.patch] as const));
+    return notes.map((n) => {
+      if (!n.code) return n;
+      const at = locateCode(patches.get(n.path), n.code, n.line ?? 0);
+      return at !== null && at !== n.line && !(n.line !== null && n.line > at && n.line < at + n.code.split("\n").filter((l) => l.trim()).length) ? { ...n, line: at } : n;
+    });
   }
 
   /** The body that is posted: the reviewer's text, the notes that hold up and what was not reviewed, within the body limit. */

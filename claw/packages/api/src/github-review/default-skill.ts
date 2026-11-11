@@ -287,7 +287,11 @@ const DEEP_REVIEW_STEPS = `## Steps
    rerun it. A real test failure that the change caused is a finding.
 11. Write one review.
    - Inline comments are for verified blocking findings only: one per finding, on its path and a
-     line inside the diff, saying what goes wrong, when, and what to change.
+     line inside the diff, saying what goes wrong, when, and what to change. Give each one, and each
+     non-blocking note, \`existing_code\`: the line or the few lines of the head it is about, copied
+     exactly from the diff. The service puts the comment on that code when the line number is off.
+   - On a re-review, a finding of the last review that is not fixed is said again in the body, not as a
+     new inline comment: an inline one within a few lines of its open thread is moved to the body.
    - The body says what you read (files, functions and their callers), what you ran (each command
      and its result, or why a test could not run) and what the second pass added. Leave out what you
      have nothing to say about.

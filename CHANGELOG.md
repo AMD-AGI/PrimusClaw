@@ -110,6 +110,9 @@ release version, and its `appVersion` stays `latest`.
   the check doubts are reported back to the reviewer. Notes are passed to `gh_review_submit` as `non_blocking` and listed
   under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the review, a skipped one is
   named and stops an approval), and the instructions carry short checks for the languages the change touches (#750).
+- The deep GitHub review places each finding by the code it quotes (`existing_code`): a comment whose line number is off is
+  posted on the line the diff shows that code on, and the result names each move. A re-review no longer opens a second
+  thread where a thread of the last review is still open: that finding is said in the body (#753).
 
 ## [0.1.2] - 2026-11-11
 
