@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "../../..",
+    "paths": {
+      "@primusclaw/personal-agent": ["../core/dist/types/index.d.ts"],
+      "@primusclaw/personal-agent-teams/connector-hosts": ["../teams/dist/types/connector-hosts.d.ts"]
+    }
+  },
+  "include": ["src"]
+}

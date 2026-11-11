@@ -3,11 +3,13 @@
 
 name: Personal agent release
 
-# Releases the personal agent (personal-agent/README.md, "Releasing"): its three npm packages, @primusclaw/personal-agent,
-# -runtime and -teams, in lockstep at one version, and, once switched on, its worker image. A maintainer pushes the tag
-# personal-agent-vX.Y.Z on a commit of main whose three package.json files name X.Y.Z; this workflow builds, tests and
-# checks the packages and the image, then (each behind a GitHub environment's reviewers) attests the tarballs, puts them
-# on the GitHub Release of that tag and publishes them to npm, and pushes the image and attests it.
+# Releases the personal agent (personal-agent/README.md, "Releasing"): its four npm packages, @primusclaw/personal-agent,
+# -runtime, -teams and -teams-ingress, in lockstep at one version, the Teams ingress's deployable Function package
+# (personal-agent-teams-ingress-X.Y.Z.zip, the bytes a Function app runs), and, once switched on, its worker image. A
+# maintainer pushes the tag personal-agent-vX.Y.Z on a commit of main whose four package.json files name X.Y.Z; this
+# workflow builds, tests and checks the packages, the Function package (in a real Functions host) and the image, then
+# (each behind a GitHub environment's reviewers) attests the tarballs and the zip, puts them and the zip's sha256 on the
+# GitHub Release of that tag and publishes the packages to npm, and pushes the image and attests it.
 #
 # What runs on which event:
 #   tag push personal-agent-v*            package, then publish-npm; publish-image too when the switch below is on
@@ -29,6 +31,11 @@ name: Personal agent release
 #   publish-npm    handles the finished tarballs and nothing else: no checkout, no install, no repository script.
 #   publish-image  handles the finished image archive and nothing else, likewise. Its registry and push target are
 #                  derived here, from repository configuration only, never from anything the package job produced.
+#
+# The ingress's npm package. Published only while the repository variable PERSONAL_AGENT_INGRESS_NPM_PUBLISH is exactly
+# "true" (npm's Trusted Publisher entry for a new package name can only be made once the name exists); until then its
+# tarball is checked and attached to the release like the others. The Function package (the zip) is attached either way:
+# it is what a deployment runs.
 #
 # The image. Off until the repository variable PERSONAL_AGENT_IMAGE_PUBLISH is exactly "true": until then a release
 # publishes the npm packages and attaches the tarballs, and the image is built and smoke-tested but pushed nowhere. The
@@ -191,9 +198,9 @@ jobs:
         working-directory: personal-agent
         run: npm run build
 
-      # The three tarballs uploaded below, attested and published are the ones checked here (scripts/check-pack.ts): the
-      # files each ships, one version for all three equal to the tag's, repository.url naming the repository npm's
-      # provenance will name, and the three installed into an empty directory, imported, run and type-checked.
+      # The four tarballs uploaded below, attested and published are the ones checked here (scripts/check-pack.ts): the
+      # files each ships, one version for all four equal to the tag's, repository.url naming the repository npm's
+      # provenance will name, and the four installed into an empty directory, imported, run and type-checked.
       - name: Pack and check the tarballs
         working-directory: personal-agent
         env:
@@ -202,11 +209,46 @@ jobs:
         run: |
           set -euo pipefail
           npm run check-pack -- --version "$VERSION" --repository https://github.com/AMD-AGI/PrimusClaw --out "$OUT"
-          for name in personal-agent personal-agent-runtime personal-agent-teams; do
+          for name in personal-agent personal-agent-runtime personal-agent-teams personal-agent-teams-ingress; do
             [ -f "$OUT/primusclaw-$name-$VERSION.tgz" ] || { echo "::error::check-pack kept no primusclaw-$name-$VERSION.tgz"; exit 1; }
           done
           count=$(find "$OUT" -maxdepth 1 -name '*.tgz' | wc -l)
-          [ "$count" -eq 3 ] || { echo "::error::expected exactly three tarballs, found $count"; exit 1; }
+          [ "$count" -eq 4 ] || { echo "::error::expected exactly four tarballs, found $count"; exit 1; }
+
+      # The Teams ingress's deployable Function package, next to the tarballs: one reproducible zip (scripts/build-ingress.ts)
+      # and its sha256, which a deployment pins.
+      - name: Build the ingress Function package
+        working-directory: personal-agent
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          OUT: ${{ runner.temp }}/personal-agent-packages
+        run: |
+          set -euo pipefail
+          npm run build-ingress -- --out "$OUT"
+          zip="$OUT/personal-agent-teams-ingress-$VERSION.zip"
+          [ -f "$zip" ] && [ -f "$zip.sha256" ] || { echo "::error::build-ingress kept no personal-agent-teams-ingress-$VERSION.zip"; exit 1; }
+          (cd "$OUT" && sha256sum -c "$(basename "$zip").sha256")
+
+      # The zip as a Function app runs it: in Azure Functions Core Tools' host (pinned, checked against its sha256),
+      # answering 401, 200, 400 and 500 to the requests scripts/ingress-host-smoke.ts sends.
+      - name: Run the ingress Function package in a Functions host
+        working-directory: personal-agent
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          OUT: ${{ runner.temp }}/personal-agent-packages
+          TOOLS: ${{ runner.temp }}/func
+          CORE_TOOLS_VERSION: "4.16.0"
+          CORE_TOOLS_SHA256: c68c7780d94c7583157f7a7d1a05e0ec3e34057c3d55e4c7be71fc4aa0c23667
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLS"
+          curl -fsSL --retry 3 -o "$TOOLS/cli.zip" \
+            "https://github.com/Azure/azure-functions-core-tools/releases/download/$CORE_TOOLS_VERSION/Azure.Functions.Cli.linux-x64.$CORE_TOOLS_VERSION.zip"
+          echo "$CORE_TOOLS_SHA256  $TOOLS/cli.zip" | sha256sum -c -
+          unzip -q "$TOOLS/cli.zip" -d "$TOOLS/cli"
+          chmod +x "$TOOLS/cli/func"
+          node --import tsx scripts/ingress-host-smoke.ts --zip "$OUT/personal-agent-teams-ingress-$VERSION.zip" --func "$TOOLS/cli/func"
+          rm -rf "$TOOLS"
 
       # The release notes are the version's section of personal-agent/CHANGELOG.md; a version without one is not released.
       - name: Release notes from the changelog
@@ -306,7 +348,7 @@ jobs:
             echo
             echo "- commit \`$GITHUB_SHA\`"
             echo "- release workflow at this commit: $same"
-            for f in "$OUT"/*.tgz; do
+            for f in "$OUT"/*.tgz "$OUT"/*.zip; do
               echo "- \`$(basename "$f")\`, sha256 \`$(sha256sum "$f" | cut -d' ' -f1)\`"
             done
             echo "- image archive sha256 \`$ARCHIVE_SHA256\`: $image"
@@ -392,18 +434,23 @@ jobs:
           [[ "$REF_NAME" =~ ^personal-agent-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::the ref is not a personal-agent-vX.Y.Z tag"; exit 1; }
           version="${REF_NAME#personal-agent-v}"
           count=$(find "$DIR" -maxdepth 1 -name '*.tgz' | wc -l)
-          [ "$count" -eq 3 ] || { echo "::error::expected exactly three tarballs, found $count"; exit 1; }
+          [ "$count" -eq 4 ] || { echo "::error::expected exactly four tarballs, found $count"; exit 1; }
           {
             echo "version=$version"
             echo "core=$DIR/primusclaw-personal-agent-$version.tgz"
             echo "runtime=$DIR/primusclaw-personal-agent-runtime-$version.tgz"
             echo "teams=$DIR/primusclaw-personal-agent-teams-$version.tgz"
+            echo "ingress=$DIR/primusclaw-personal-agent-teams-ingress-$version.tgz"
+            echo "function=$DIR/personal-agent-teams-ingress-$version.zip"
           } >> "$GITHUB_OUTPUT"
-          for name in personal-agent personal-agent-runtime personal-agent-teams; do
+          for name in personal-agent personal-agent-runtime personal-agent-teams personal-agent-teams-ingress; do
             [ -f "$DIR/primusclaw-$name-$version.tgz" ] || { echo "::error::primusclaw-$name-$version.tgz is missing"; exit 1; }
           done
+          zip="$DIR/personal-agent-teams-ingress-$version.zip"
+          [ -f "$zip" ] && [ -f "$zip.sha256" ] || { echo "::error::personal-agent-teams-ingress-$version.zip is missing"; exit 1; }
+          (cd "$DIR" && sha256sum -c "$(basename "$zip").sha256")
 
-      # `gh attestation verify <tarball> --repo AMD-AGI/PrimusClaw` checks each.
+      # `gh attestation verify <tarball or zip> --repo AMD-AGI/PrimusClaw` checks each.
       - name: Attest the tarballs' provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -411,6 +458,8 @@ jobs:
             ${{ steps.tarballs.outputs.core }}
             ${{ steps.tarballs.outputs.runtime }}
             ${{ steps.tarballs.outputs.teams }}
+            ${{ steps.tarballs.outputs.ingress }}
+            ${{ steps.tarballs.outputs.function }}
 
       # Before the publish: this is repeatable (an existing release is kept, --clobber), the registry is not.
       - name: Attach the tarballs to the release
@@ -422,24 +471,30 @@ jobs:
           CORE: ${{ steps.tarballs.outputs.core }}
           RUNTIME: ${{ steps.tarballs.outputs.runtime }}
           TEAMS: ${{ steps.tarballs.outputs.teams }}
+          INGRESS: ${{ steps.tarballs.outputs.ingress }}
+          FUNCTION: ${{ steps.tarballs.outputs.function }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "personal-agent $VERSION" --notes-file "$DIR/release-notes.md"
           fi
-          gh release upload "$TAG" "$CORE" "$RUNTIME" "$TEAMS" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" "$CORE" "$RUNTIME" "$TEAMS" "$INGRESS" "$FUNCTION" "$FUNCTION.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
 
       # The OIDC credential is exchanged here, nowhere earlier, and the packages go out in dependency order under the
-      # default `latest` dist-tag; publishing a tarball runs no lifecycle script. A version already on the registry is
+      # default `latest` dist-tag; publishing a tarball runs no lifecycle script. The ingress's package goes last, and only
+      # while PERSONAL_AGENT_INGRESS_NPM_PUBLISH is exactly "true". A version already on the registry is
       # skipped when it is byte-for-byte this tarball (the re-run of a release that failed part-way) and fails the run
       # otherwise. Nothing may follow this step: a run that fails anywhere before it publishes nothing.
-      - name: Publish core, runtime, teams
+      - name: Publish core, runtime, teams, teams-ingress
         env:
           VERSION: ${{ steps.tarballs.outputs.version }}
           CORE: ${{ steps.tarballs.outputs.core }}
           RUNTIME: ${{ steps.tarballs.outputs.runtime }}
           TEAMS: ${{ steps.tarballs.outputs.teams }}
+          INGRESS: ${{ steps.tarballs.outputs.ingress }}
+          INGRESS_SWITCH: ${{ vars.PERSONAL_AGENT_INGRESS_NPM_PUBLISH }}
         run: |
           set -euo pipefail
           publish() {
@@ -462,6 +517,11 @@ jobs:
           publish @primusclaw/personal-agent "$CORE"
           publish @primusclaw/personal-agent-runtime "$RUNTIME"
           publish @primusclaw/personal-agent-teams "$TEAMS"
+          if [ "$INGRESS_SWITCH" = true ]; then
+            publish @primusclaw/personal-agent-teams-ingress "$INGRESS"
+          else
+            echo "@primusclaw/personal-agent-teams-ingress is not published: PERSONAL_AGENT_INGRESS_NPM_PUBLISH is not \"true\""
+          fi
 
   publish-image:
     name: Push and attest the image
