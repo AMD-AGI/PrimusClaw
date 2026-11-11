@@ -290,6 +290,38 @@ interface EndedTurn {
 }
 
 /**
+ * A delivery refused because its row is already terminal: if it is a run whose
+ * turn ended before its workspace save finished (the Brain saving was lost),
+ * report that save over, so the API lets the session's next message out of its
+ * queue now rather than when the hold runs out. Nothing is run or published
+ * besides; the row's ending was decided by whoever closed it.
+ */
+export async function settleEndedTurnOfGoneRow(request: ExecuteRequest): Promise<void> {
+  const sessionId = request.session_id;
+  const messageId = request.message_id || "";
+  if (!sessionId || !messageId) return;
+  const { kvCkpt, emitter } = getDeps();
+  const key = endedTurnKey(sessionId, messageId);
+  const entry = await kvCkpt.get(key);
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return;
+  let ended: EndedTurn | null = null;
+  try {
+    ended = JSON.parse(sc.decode(entry.value)) as EndedTurn;
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_unreadable");
+  }
+  if (ended?.save_id) {
+    const finished: WorkspaceSaveFinishedEvent = {
+      type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: "failed",
+      reason: "run_stopped_during_save", save_id: ended.save_id, message_id: messageId,
+    };
+    await emitter.emit(sessionId, { ...finished });
+  }
+  await kvCkpt.delete(key).catch(() => {});
+  logger.warn({ sessionId, messageId, saveId: ended?.save_id }, "task.ended_turn_settled_on_gone_row");
+}
+
+/**
  * Finish a turn whose completion an earlier delivery already published, without
  * running it again: publish the completion again (the API skips a second one),
  * report its save over, hand the result to Backend, ack.
