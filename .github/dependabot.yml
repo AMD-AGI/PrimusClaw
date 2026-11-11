@@ -1,73 +1,101 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
+# Version updates for every ecosystem and directory below land in ONE pull
+# request a week: the `weekly-dependencies` multi-ecosystem group. Schedule,
+# commit message and open-PR limit live on the group, not on the entries.
+#
+# Major versions are ignored for npm, pip, gomod and docker: they break builds
+# (TypeScript 7 broke main on 2026-11-11) and are upgraded deliberately by a
+# person. GitHub Actions majors stay in the weekly PR; they are tag bumps.
+#
+# Security updates cannot join a multi-ecosystem group (it is version-updates
+# only), so each entry also groups its security updates into one PR per
+# ecosystem. `ignore` update-types do not apply to security updates, so a fix
+# that needs a major version still arrives.
 version: 2
+
+multi-ecosystem-groups:
+  weekly-dependencies:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(deps)"
+
 updates:
-  # GitHub Actions workflows
+  # GitHub Actions workflows (majors included).
   - package-ecosystem: "github-actions"
     directory: "/"
-    schedule:
-      interval: "monthly"
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
     groups:
-      github-actions:
+      github-actions-security:
+        applies-to: security-updates
         patterns: ["*"]
 
   # Node / TypeScript
   - package-ecosystem: "npm"
-    directory: "/claw"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 10
+    directories:
+      - "/claw"
+      - "/connector"
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
-      npm-minor-patch:
+      npm-security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
 
-  # Python packages
-  - package-ecosystem: "npm"
-    directory: "/connector"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 10
-    groups:
-      npm-minor-patch:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
-
+  # A separate entry so the typescript bound below stays on /personal-agent;
+  # /connector already builds with TypeScript 7.
   - package-ecosystem: "npm"
     directory: "/personal-agent"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 10
-    groups:
-      npm-minor-patch:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
-    # typescript-eslint 8.72 declares a peer of typescript >=4.8.4 <6.1.0, so any
-    # bump past 6.0.x (7.0.2 was one) fails `npm ci` with ERESOLVE. Raise this
-    # bound together with typescript-eslint once its peer range allows more.
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
     ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # typescript-eslint 8.72 declares a peer of typescript >=4.8.4 <6.1.0, so any
+      # bump past 6.0.x (7.0.2 was one) fails `npm ci` with ERESOLVE. Raise this
+      # bound together with typescript-eslint once its peer range allows more.
       - dependency-name: "typescript"
         versions: [">=6.1.0"]
+    groups:
+      personal-agent-npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
 
+  # Python packages
   - package-ecosystem: "pip"
     directories:
       - "/sandbox/sdk-python"
-    schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 10
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
-      pip-minor-patch:
+      pip-security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # Go module (Sandbox)
   - package-ecosystem: "gomod"
     directory: "/sandbox"
-    schedule:
-      interval: "monthly"
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
-      gomod:
+      gomod-security:
+        applies-to: security-updates
         patterns: ["*"]
 
   # Docker base images. Every directory containing a Dockerfile must be listed;
@@ -78,10 +106,12 @@ updates:
       - "/deploy/litellm"
       - "/personal-agent"
       - "/sandbox/docker"
-    schedule:
-      interval: "monthly"
+    multi-ecosystem-group: "weekly-dependencies"
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
-      docker:
+      docker-security:
+        applies-to: security-updates
         patterns: ["*"]
-        # One PR per base image across all listed Dockerfiles.
-        group-by: dependency-name
