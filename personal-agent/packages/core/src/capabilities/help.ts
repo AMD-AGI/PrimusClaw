@@ -9,7 +9,7 @@
 import { BOT_NAME } from "../branding.js";
 import { own } from "../own.js";
 import { toLang, type Lang } from "../locales/lang.js";
-import { dataStatement } from "../locales/transparency.js";
+import { dataStatement, type GroupContextKept } from "../locales/transparency.js";
 import { CAPABILITIES, CATEGORIES, type Capability, type Part } from "./registry.js";
 import { shown, type ChatShape } from "./visibility.js";
 
@@ -83,6 +83,8 @@ export interface HelpOptions {
   readonly lead?: string;
   readonly bot?: string;
   readonly understanding?: boolean;
+  /** The deployment keeps a group's recent messages as background (what the data statement then says it sees). */
+  readonly groupContext?: GroupContextKept;
 }
 
 function capabilityLine(c: Capability, lang: Lang, current: string | undefined): string {
@@ -163,7 +165,8 @@ export function renderHelp(language: string, options: HelpOptions = {}): string 
   if (oneToOne !== undefined) out.push(oneToOne);
   out.push(authorityText(zh, chat.parts));
   if (chat.group) out.push(zh ? "设置只能在和我的 1:1 聊天里改。" : "Settings are changed in a 1:1 chat with me.");
-  out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"))); // (every help: 1:1, group and the assistant's)
+  // (every help: 1:1, group and the assistant's)
+  out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"), options.groupContext));
   out.push(
     zh
       ? "随时问我「你能做什么」看这份说明。底部菜单里也有常用的按钮。"

@@ -113,14 +113,17 @@ async function runScenario(opts: {
   overrides?: Partial<TaskRunnerSideEffects>;
   /** Run as a claimed doorbell holding this generation. */
   claimCount?: number;
+  /** Called with each event's type just before it is published. */
+  onEmit?: (type: string) => void;
 }) {
   const renewals: LeaseRenewal[] = [];
   const emitted: string[] = [];
   const completions: Array<Record<string, unknown>> = [];
-  const { msg } = fakeMsg();
+  const { msg, verdicts } = fakeMsg();
   const { kv } = fakeKv();
   const { kv: kvCkpt } = fakeKv();
   const emitter = { async emit(_s: string, evt: Record<string, unknown>, o?: { stillMine?: () => boolean }) {
+    opts.onEmit?.(String(evt.type));
     if (o?.stillMine && !o.stillMine()) throw new EmitStoodDownError(String(evt.type));
     emitted.push(String(evt.type));
     if (evt.type === "exec_complete") completions.push(evt);
@@ -195,7 +198,7 @@ async function runScenario(opts: {
     msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl,
     opts.claimCount === undefined ? null : { claimCount: opts.claimCount },
   );
-  return { renewals, abortCtrl, emitted, completions };
+  return { renewals, abortCtrl, emitted, completions, verdicts };
 }
 
 test("a run with a lease claims it before it starts working", async () => {
@@ -549,23 +552,56 @@ test("a run past its lock's self-fence stops on the local check, without waiting
   assert.equal(abortReason, LEASE_LOST_ABORT_REASON);
 });
 
-test("a run that passes its self-fence while saving its work does not publish a success", async (t) => {
-  // The turn ended, but the fence went up while the workspace and transcript
-  // were being saved. Another brain may hold the run from now on, and a
-  // completion from here would close its row.
+test("a run that passes its self-fence before its turn ends does not publish a success", async (t) => {
+  // The fence goes up between the engine's answer and the turn's end. Another
+  // brain may hold the run from now on, and a completion from here would close
+  // its row.
   t.mock.timers.enable({ apis: ["setInterval"] });
   let fenced = false;
+  let saves = 0;
   const { emitted } = await runScenario({
+    lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
+    onEmit: (type) => {
+      if (type !== "executionStats") return;
+      fenced = true;
+      t.mock.timers.tick(SELF_FENCE_CHECK_MS);
+    },
+    overrides: {
+      lockPastSelfFence: (() => fenced) as never,
+      syncWorkspaceToS3: (async () => {
+        saves++;
+        return { uploaded: 0, totalFiles: 0, failedCount: 0, exhausted: false, empty: true };
+      }) as never,
+    },
+  });
+  assert.ok(emitted.includes("executionStats"), `published: ${emitted.join(", ")}`);
+  assert.ok(!emitted.includes("exec_complete"), `published: ${emitted.join(", ")}`);
+});
+
+test("a run that passes its self-fence while saving its work ended its turn but does not report the task done", async (t) => {
+  // The turn's end goes out before the workspace is saved, while the run is
+  // still this brain's: that is what hands the session back instead of leaving
+  // it `running` for as long as the upload takes. The fence then goes up during
+  // the save. The task is another brain's from there, so it is not reported
+  // done to Backend and the delivery is not acked.
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let fenced = false;
+  const agentDone: unknown[] = [];
+  const { emitted, completions, verdicts } = await runScenario({
     lease: { url: "http://api.test/v1/internal/tasks/t-1/lease", token: "tok" },
     overrides: {
       lockPastSelfFence: (() => fenced) as never,
+      postAgentDone: (async (...a: unknown[]) => { agentDone.push(a); }) as never,
       flushTranscript: (async () => {
         fenced = true;
         t.mock.timers.tick(SELF_FENCE_CHECK_MS);
       }) as never,
     },
   });
-  assert.ok(!emitted.includes("exec_complete"), `published: ${emitted.join(", ")}`);
+  assert.equal(completions.length, 1, `published: ${emitted.join(", ")}`);
+  assert.equal(completions[0].failed, false);
+  assert.deepEqual(agentDone, [], "a stood-down run does not report the task done");
+  assert.ok(!verdicts.includes("ack"), `verdicts: ${verdicts.join(", ")}`);
 });
 
 test("a claimed doorbell's completion names the claim it holds", async () => {

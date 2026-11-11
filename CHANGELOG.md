@@ -15,9 +15,9 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.1 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.2 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` and `-teams-ingress` on npm, the Teams ingress's Function package and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.3.0 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` and `-teams-ingress` on npm, the Teams ingress's Function package and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.4.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -110,6 +110,23 @@ release version, and its `appVersion` stays `latest`.
   the check doubts are reported back to the reviewer. Notes are passed to `gh_review_submit` as `non_blocking` and listed
   under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the review, a skipped one is
   named and stops an approval), and the instructions carry short checks for the languages the change touches (#750).
+
+## [0.1.2] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611120220` (commit 56304d8d). #752 fixes a regression #744 introduced; deploy both
+together, never #744 alone. `claw_sessions` gains `workspace_save_id`, `workspace_save_until` (#744) and
+`workspace_save_task_id` (#752), added by the API's `initDb` at startup; roll the API before Brain. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- Brain ends a turn on the session before saving the workspace: the session is idle as soon as the answer is out and the
+  save runs in the background. A message sent during the save waits in the API's queue and runs once the save ends; an
+  error after `exec_complete` no longer re-runs the turn; `/files` reports `saving` meanwhile (#744).
+- A run whose workspace save is still in progress keeps its sandbox and its lease until the save ends: the API answers
+  the saving run's lease renewals instead of refusing them as terminal, and the orphan sweep, the agent-done stop and the
+  settled-session park wait for the save. Without it, #744 lost any save that took longer than a few seconds (the sandbox
+  was destroyed mid-upload) (#752).
 
 ## [0.1.1] - 2026-11-11
 

@@ -13,6 +13,10 @@ import { buildMessages } from "../sessions/context-builder.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
+import { releaseWorkspaceSaveHold, workspaceSaveHoldSet } from "../sessions/save-hold.js";
+import {
+  WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD,
+} from "@claw/protocol";
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
 import { scanMemoryContent } from "../memory/gates.js";
@@ -590,6 +594,20 @@ export async function consumeEventDelivery(msg: {
         msg.nak(10_000);
         return;
       }
+    } else if (event.type === WORKSPACE_SAVE_EVENT && event.phase === "finished" && typeof event.save_id === "string") {
+      // The save the session's queue was held for is over, however it went: release and drain now.
+      try {
+        const released = await releaseWorkspaceSaveHold(sessionId, event.save_id);
+        if (released) {
+          logger.info({ sessionId, saveId: event.save_id, outcome: event.outcome }, "workspace_save.hold_released");
+          await drainOldestPendingMessage(sessionId, released.userId);
+        }
+      } catch (e) {
+        // Retried: until it lands, the queue waits for the sweeper's backstop or the hold's time bound.
+        logger.error({ err: e, sessionId }, "workspace_save.hold_release_failed");
+        msg.nak(10_000);
+        return;
+      }
     } else if (event.type === "taskInterrupted" || event.type === "taskResumed") {
       // INV-8 (checkpoint-architecture-redesign §5.3): brain emits these
       // events whenever a task is SIGTERM'd or a redelivery picks one back
@@ -751,6 +769,7 @@ export async function releaseSessionGateIfLastRun(
   messageId: string | null,
   failed: boolean,
   taskId: string | null = null,
+  workspaceSaveId: string | null = null,
 ): Promise<boolean> {
   // Compared with `IS NOT DISTINCT FROM` rather than `=`, which is the sibling
   // idiom in `runCleanupAction` and in `applySessionGateTransition`, and the
@@ -775,7 +794,10 @@ export async function releaseSessionGateIfLastRun(
   // a live run. Occupancy cannot stand in for ownership across that window.
   const r = await db.query(
     `UPDATE claw_sessions
-        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
+        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW(),
+            -- In the statement that sets the session idle, so no message is admitted between the two
+            -- (sessions/save-hold.ts).
+            ${workspaceSaveHoldSet("$2", "$6", "$5")}
       WHERE session_id = $2
         AND deleted_at IS NULL
         AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
@@ -803,7 +825,7 @@ export async function releaseSessionGateIfLastRun(
                    ELSE t.metadata->>'message_id' IS DISTINCT FROM $3
                  END
         )`,
-    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced(), taskId],
+    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced(), taskId, workspaceSaveId],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -1104,9 +1126,15 @@ async function handleComplete(
   // run.completed / run.failed notification. Everything below that is such a
   // side effect is gated on this one answer, or follows the early return.
   const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
+  // A save that follows this turn holds the session's queue until it is over (sessions/save-hold.ts).
+  const workspaceSaveId = (event as Record<string, unknown>)[WORKSPACE_SAVE_PENDING_FIELD] === WORKSPACE_SAVE_PENDING
+    && typeof (event as Record<string, unknown>)[WORKSPACE_SAVE_ID_FIELD] === "string"
+    ? String((event as Record<string, unknown>)[WORKSPACE_SAVE_ID_FIELD])
+    : null;
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
+    workspaceSaveId,
   );
 
   // 3. Save conversation turns.
@@ -1201,7 +1229,13 @@ async function handleComplete(
   if (!gateOpened) {
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
-  if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
+  //    Nor while this turn's workspace save is still running: the next turn would
+  //    wait for the save on Brain's workspace lock, where its wait is bounded, and
+  //    the save's `finished` drains it instead (sessions/save-hold.ts). The drain's
+  //    claim refuses a held session too; this only says why in the log.
+  if (gateOpened && workspaceSaveId) {
+    logger.info({ sessionId, messageId, workspaceSaveId }, "chat.pending_drain_deferred_workspace_save");
+  } else if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
 
   if (sandboxOnly) {
     logger.info({ sessionId, messageId, failed }, "exec_complete.handled_sandbox_only");

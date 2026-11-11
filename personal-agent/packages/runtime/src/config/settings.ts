@@ -106,6 +106,7 @@ function groupContextSettings(read: EnvReader): GroupContextSettings {
     messages,
     maxAgeSeconds: read.positiveInt("TEAMS_GROUP_CONTEXT_HOURS", DEFAULT_GROUP_CONTEXT.maxAgeSeconds / 3600) * 3600,
     messageChars: read.positiveInt("TEAMS_GROUP_CONTEXT_CHARS", DEFAULT_GROUP_CONTEXT.messageChars),
+    granted: read.raw("TEAMS_GROUP_CONTEXT_GRANTED") === "1",
   };
 }
 

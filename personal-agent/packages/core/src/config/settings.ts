@@ -39,7 +39,7 @@ export interface Settings {
   /** TEAMS_OBSERVE_USERS (lower-cased): who may turn on observing a group chat. */
   readonly observeUsers: ReadonlySet<string>;
   /**
-   * TEAMS_GROUP_CONTEXT_MESSAGES (30; 0 off), TEAMS_GROUP_CONTEXT_HOURS (4), TEAMS_GROUP_CONTEXT_CHARS (500): the recent
+   * TEAMS_GROUP_CONTEXT_MESSAGES (30; 0 off), TEAMS_GROUP_CONTEXT_HOURS (4), TEAMS_GROUP_CONTEXT_CHARS (500), TEAMS_GROUP_CONTEXT_GRANTED (off): the recent
    * messages of a group chat kept in memory as background for an @mention.
    */
   readonly groupContext: GroupContextSettings;

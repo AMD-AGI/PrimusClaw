@@ -331,7 +331,7 @@ jobs:
       # test/terminal-input.test.ts types into a real tmux pane (a server of
       # its own, on its own socket); in CI a missing tmux fails it, not skips it.
       - name: tmux for the terminal-input tests
-        run: command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q tmux; }
+        run: command -v tmux >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -q && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -q tmux; }
 
       # Real child processes and sockets: a stand-in Claw and a stand-in ACP
       # adapter, no database and no network beyond the loopback. TMPDIR is a
@@ -505,7 +505,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - run: python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+      - run: python3 -c 'import yaml' || sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3-yaml
 
       - run: bash scripts/release-tests/sandbox-router-ingress.sh
 

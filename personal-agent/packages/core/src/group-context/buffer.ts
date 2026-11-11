@@ -13,6 +13,7 @@
  * @mentions the bot, `background` gives what is kept, marked as untrusted history, for the turn to send before what they
  * wrote.
  */
+import type { GroupContextKept } from "../locales/transparency.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { GroupContextRepository } from "../ports/store/group-context.js";
@@ -27,9 +28,20 @@ export interface GroupContextSettings {
   readonly maxAgeSeconds: number;
   /** The longest text kept of one message (code points). */
   readonly messageChars: number;
+  /**
+   * The deployment's chat app asks for the permission that delivers a group's other messages (Teams:
+   * ChatMessage.Read.Chat), so help says what is kept. Without it no such message arrives and help keeps the words
+   * "only the @mentions".
+   */
+  readonly granted: boolean;
 }
 
-export const DEFAULT_GROUP_CONTEXT: GroupContextSettings = { messages: 30, maxAgeSeconds: 4 * 3600, messageChars: 500 };
+export const DEFAULT_GROUP_CONTEXT: GroupContextSettings = {
+  messages: 30,
+  maxAgeSeconds: 4 * 3600,
+  messageChars: 500,
+  granted: false,
+};
 
 /** The most chats kept at once: past it, the chat that heard nothing for longest is dropped. */
 export const MAX_CHATS = 2000;
@@ -84,6 +96,16 @@ export class GroupContext {
 
   get enabled(): boolean {
     return this.deps.settings.messages > 0;
+  }
+
+  /**
+   * How much a chat keeps, as help says it: undefined when the deployment keeps nothing, its app is not granted the
+   * group's other messages (so none arrives), or `chatId` turned it off.
+   */
+  kept(chatId?: string): GroupContextKept | undefined {
+    if (!this.enabled || !this.deps.settings.granted) return undefined;
+    if (chatId !== undefined && this.deps.off.contextOff(chatId)) return undefined;
+    return { messages: this.deps.settings.messages, hours: this.deps.settings.maxAgeSeconds / 3600 };
   }
 
   /** A group message not addressed to the bot: kept, never answered. */

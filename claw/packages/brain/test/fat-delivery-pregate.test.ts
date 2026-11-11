@@ -18,6 +18,8 @@
  *   F3  an acceptance with no generation is still an acceptance
  *   F4  every inconclusive answer refuses the delivery without running it
  *   F5  gone acks, superseded naks, neither handles
+ *   F5b a gone row whose turn ended before its workspace save finished reports that save over before the ack, and naks
+ *       to say it again when it could not
  *   F6  the pre-gate heartbeat renews under the generation while the gate blocks
  *   F7  the heartbeat stops only once the handler has taken renewal over
  *   F8  a refusal mid-wait stops the delivery before the handler
@@ -44,7 +46,7 @@ import type { LeaseAnswer, LeaseRenewal } from "../src/tasks/callback.js";
 import type { NatsEmitter } from "../src/events/emitter.js";
 import type { Engine } from "../src/agent/index.js";
 import {
-  bindTaskRunnerDeps, runHandleTask, type TaskRunnerSideEffects,
+  bindTaskRunnerDeps, endedTurnKey, runHandleTask, settleEndedTurnOfGoneRow, type TaskRunnerSideEffects,
 } from "../src/tasks/runner.js";
 import { bindTaskDispatchKv, handleTask } from "../src/tasks/dispatch.js";
 import { bindTaskLockKv } from "../src/tasks/lock.js";
@@ -281,6 +283,43 @@ describe("the pre-gate lease refusing a delivery", () => {
     await runDelivery(takenMsg, taken.deps);
     assert.deepEqual(verdictsOf(takenMsg), ["nak:1000"]);
     assert.deepEqual(taken.handled, []);
+  });
+
+  it("F5b a gone row of a turn that ended mid-save reports the save over, then acks without running it", async () => {
+    // The Brain that ended this turn was lost during its save. The API closed the row on the completion and holds the
+    // session's next message until the save's finish, which only this redelivery can still send.
+    const kvCkpt = fakeKv();
+    const emitted: Array<Record<string, unknown>> = [];
+    bindTaskRunnerDeps({
+      kv: fakeKv(), kvCkpt, engine: {} as Engine,
+      emitter: { async emit(_s: string, evt: Record<string, unknown>) { emitted.push(evt); } } as unknown as NatsEmitter,
+    });
+    const key = endedTurnKey(SESSION, "m-1");
+    await kvCkpt.put(key, JSON.stringify({ result: {}, save_id: "save-9" }));
+
+    const gone = harness({ answers: () => ({ kind: "refused", refusal: "gone" }) });
+    gone.deps.onRowGone = settleEndedTurnOfGoneRow;
+    const msg = msgFor(fatRequest());
+    await runDelivery(msg, gone.deps);
+    assert.deepEqual(emitted.map((e) => [e.type, e.phase, e.outcome, e.save_id]), [["workspaceSave", "finished", "failed", "save-9"]]);
+    assert.deepEqual(verdictsOf(msg), ["ack"]);
+    assert.deepEqual(gone.handled, [], "the ended turn is not run again");
+    assert.equal(await kvCkpt.get(key), null);
+
+    // A row gone for any other reason: nothing to say.
+    emitted.length = 0;
+    const plain = msgFor(fatRequest({ message_id: "m-2" }));
+    await runDelivery(plain, gone.deps);
+    assert.deepEqual(emitted, []);
+    assert.deepEqual(verdictsOf(plain), ["ack"]);
+
+    // Saying it failed: naked, so it is said again rather than left to the hold's time bound.
+    const failing = harness({ answers: () => ({ kind: "refused", refusal: "gone" }) });
+    failing.deps.onRowGone = async () => { throw new Error("nats down"); };
+    const retried = msgFor(fatRequest());
+    await runDelivery(retried, failing.deps);
+    assert.deepEqual(verdictsOf(retried), ["nak:5000"]);
+    assert.deepEqual(failing.handled, []);
   });
 });
 
@@ -869,6 +908,12 @@ describe("the pre-gate as the pod wires it", () => {
       /fatPreGate:\s*createFatPreGate\(/,
       "the delivery loop is started without a pre-gate, so a queued fat chat turn "
       + "holds no lease, a Stop has no row to reach, and the turn runs anyway",
+    );
+    assert.match(
+      source,
+      /onRowGone:\s*\(request\)\s*=>\s*settleEndedTurnOfGoneRow\(request\)/,
+      "a turn whose Brain was lost mid-save never reports the save over, and the session's next message waits "
+      + "for the hold's time bound",
     );
   });
 });

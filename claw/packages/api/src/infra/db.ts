@@ -1574,6 +1574,13 @@ export async function initDb(): Promise<void> {
     await addCol("effort", "TEXT");
     // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
     await addCol("pending_drain_until", "TIMESTAMPTZ");
+    // The workspace save the session's last turn left running, and until when its next turn waits for it in the queue
+    // rather than on Brain's workspace lock (`sessions/save-hold.ts`). NULL: none.
+    await addCol("workspace_save_id", "TEXT");
+    await addCol("workspace_save_until", "TIMESTAMPTZ");
+    // The run whose save that is: its sandbox is not reclaimed and its lease renewal is not refused as terminal while the
+    // save runs, though its row is already closed (`sessions/save-hold.ts`). NULL: none.
+    await addCol("workspace_save_task_id", "TEXT");
     // When the session was last archived, which is what SESSION_RETENTION_DAYS
     // counts from (sessions/retention.ts). NULL for one archived before this
     // column existed, which retention reads as its updated_at instead.

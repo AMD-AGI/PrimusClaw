@@ -92,7 +92,7 @@ jobs:
       - name: The release workflow keeps its shape
         run: |
           set -euo pipefail
-          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update && sudo apt-get install -y python3-yaml; }
+          python3 -c 'import yaml' 2>/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3-yaml; }
           bash personal-agent/scripts/release-workflow-check.sh
 
       # The ref and the tag are attacker-shaped text, so they reach the shell through the environment, never through
@@ -277,11 +277,17 @@ jobs:
             exit 1
           fi
 
+      # The runner image ships Buildah; apt runs only where it is missing, bounded, so a mirror that hangs fails the
+      # step in minutes instead of holding the job to its timeout (personal-agent-v0.4.0's first run hung here 25 min).
       - name: Install Buildah
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y buildah
+          if ! command -v buildah >/dev/null; then
+            apt=(sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+            "${apt[@]}" update
+            "${apt[@]}" install -y buildah
+          fi
+          buildah --version
 
       - name: Build the image
         env:
@@ -297,7 +303,7 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version }}
         run: |
           set -euo pipefail
-          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          command -v podman >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y podman; }
           USER_ID=$(podman run --rm "$IMAGE" id -u)
           [[ "$USER_ID" == "65534" ]] || { echo "::error::the image runs as uid $USER_ID, expected 65534"; exit 1; }
           GOT=$(podman run --rm -w /app "$IMAGE" node -p 'const v=(n)=>require("./node_modules/@primusclaw/"+n+"/package.json").version; [v("personal-agent"),v("personal-agent-runtime"),v("personal-agent-teams")].join(" ")')
@@ -600,7 +606,7 @@ jobs:
           path: ${{ runner.temp }}/personal-agent-image
 
       - name: Install skopeo
-        run: command -v skopeo >/dev/null || { sudo apt-get update && sudo apt-get install -y skopeo; }
+        run: command -v skopeo >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y skopeo; }
 
       # Docker Hub's credentials go to docker.io and nowhere else; a registry of another host needs its own pair.
       # Missing credentials fail the job: it never pushes anywhere but the target resolved above.
