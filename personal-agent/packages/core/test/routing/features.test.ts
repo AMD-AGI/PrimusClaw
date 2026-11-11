@@ -69,6 +69,58 @@ test("with the assistant on, a message goes to it; one it does not take is a tur
   assert.equal(routed[0]?.attached, undefined); // (no remote agents here: nothing said of what the chat is attached to)
 });
 
+test("with the assistant on, /sessions shows the remote agents' sessions as /agents does; without remote agents it says why there are none", async () => {
+  const listed: string[] = [];
+  const on = (enabled: boolean, understands = false) =>
+    world({
+      assistant: {
+        on: () => true,
+        understands: () => understands,
+        reachable: () => true,
+        hiddenCommand: (text, lang) =>
+          ["/new", "/sessions"].includes(text.trim()) ? `${lang}: no sessions` : undefined,
+        board: () => Promise.resolve(),
+        stop: () => Promise.resolve(true),
+        route: () => Promise.resolve(true),
+        understand: () => Promise.resolve(true),
+      },
+      remote: {
+        enabled,
+        attached: () => false,
+        prompt: () => Promise.resolve(),
+        agent: () => Promise.resolve(),
+        agents: (chat) => (listed.push(chat.id), Promise.resolve()),
+        stop: () => Promise.resolve(false),
+        attachment: () => ({ label: "", host: "", cwd: "", cardWindowLine: "" }),
+      },
+    });
+  const w = on(true);
+  link(w, ALICE.id, "ak");
+  await w.router.handle(message("/sessions"));
+  await w.router.handle(message("sessions")); // (the menu's word)
+  await w.router.handle(message("/new"));
+  assert.deepEqual(listed, [ALICE.id, ALICE.id], "the agents' list, as /agents shows it");
+  assert.deepEqual(
+    said(w).filter((t) => t.startsWith("en:")),
+    ["en: no sessions"],
+    "only /new is still answered that there is one conversation",
+  );
+  // (a person the assistant understands: an exact command, the menu's word included, is still read here)
+  const understood = on(true, true);
+  link(understood, ALICE.id, "ak");
+  await understood.router.handle(message("sessions"));
+  await understood.router.handle(message("/sessions"));
+  assert.deepEqual(listed, [ALICE.id, ALICE.id, ALICE.id, ALICE.id], "the same for a person the assistant understands");
+  const off = on(false);
+  link(off, ALICE.id, "ak");
+  await off.router.handle(message("/sessions"));
+  assert.deepEqual(listed.length, 4, "no remote agents: nothing listed");
+  assert.deepEqual(
+    said(off).filter((t) => t.startsWith("en:")),
+    ["en: no sessions"],
+  );
+});
+
 test("a person the assistant understands is sent as themselves with the chat's context; an exact command is read here", async () => {
   const { w, understood } = assistantWorld(true);
   link(w, ALICE.id, "ak-alice");
