@@ -46,7 +46,13 @@ const MIN_FIRST_LINE_CHARS = 4;
 export function locateCode(patch: string | undefined | null, code: string, line: number): number | null {
   const want = code.split("\n").map(norm).filter(Boolean).slice(0, MAX_SNIPPET_LINES);
   if (!want.length || (want[0] as string).length < MIN_FIRST_LINE_CHARS) return null;
-  const shown = [...headLines(patch).entries()].filter(([, t]) => norm(t) !== "");
+  const all = headLines(patch);
+  const shown = [...all.entries()].filter(([, t]) => norm(t) !== "");
+  // Two shown lines follow one another in the file when every line between them is shown and blank (not in another hunk).
+  const adjacent = (a: number, b: number): boolean => {
+    for (let n = a + 1; n < b; n++) if (norm(all.get(n) ?? "x") !== "") return false;
+    return true;
+  };
   // A line copied from the diff with its `+` or `-` mark is the same line without it.
   const same = (shownText: string, w: string): boolean => {
     const t = norm(shownText);
@@ -54,7 +60,11 @@ export function locateCode(patch: string | undefined | null, code: string, line:
   };
   let best: number | null = null;
   for (let i = 0; i < shown.length; i++) {
-    if (!want.every((w, k) => shown[i + k] !== undefined && same((shown[i + k] as [number, string])[1], w))) continue;
+    if (!want.every((w, k) => {
+      const here = shown[i + k];
+      if (here === undefined || !same(here[1], w)) return false;
+      return k === 0 || adjacent((shown[i + k - 1] as [number, string])[0], here[0]);
+    })) continue;
     const at = (shown[i] as [number, string])[0];
     if (best === null || Math.abs(at - line) < Math.abs(best - line)) best = at;
   }

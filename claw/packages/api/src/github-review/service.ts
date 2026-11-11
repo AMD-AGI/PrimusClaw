@@ -34,7 +34,7 @@ import { PAGE_MAX_CHARS, SECTIONS, conversationText, diffRanges, diffText, files
 import { isReviewInstructionPath, selectReviewInstructions } from "./repo-skill.js";
 import { chooseReviewPath, reviewPathAdvice } from "./review-path.js";
 import { languageChecksText } from "./review-rules.js";
-import { placeComment, repeatsOpenFinding, locateCode } from "./relocate.js";
+import { placeComment, repeatsOpenFinding } from "./relocate.js";
 import { clipPrSummary } from "./pr-summary.js";
 import { isReviewTarget, reviewOnlyOf } from "./review-target.js";
 import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
@@ -1761,8 +1761,8 @@ export class GithubReview {
     const patches = new Map(files.map((f) => [f.path, f.patch] as const));
     return notes.map((n) => {
       if (!n.code) return n;
-      const at = locateCode(patches.get(n.path), n.code, n.line ?? 0);
-      return at !== null && at !== n.line && !(n.line !== null && n.line > at && n.line < at + n.code.split("\n").filter((l) => l.trim()).length) ? { ...n, line: at } : n;
+      const placed = placeComment(patches.get(n.path), n.line ?? 0, n.code);
+      return placed.movedFrom !== null ? { ...n, line: placed.line } : n;
     });
   }
 

@@ -45,6 +45,8 @@ describe("P placing by the code", () => {
     assert.equal(locateCode(PATCH, "if (a) go(a);", 11), null, "a removed line is not on the head side");
     assert.equal(locateCode(PATCH, "}", 13), null, "too short to place anything");
     assert.equal(locateCode(PATCH, "return done(a);\nreturn b;", 15), null, "lines that do not follow one another");
+    assert.equal(locateCode(PATCH, "return done(a);\nconst b = read();", 15), null, "the last line of one hunk and the first of the next are not adjacent in the file");
+    assert.equal(locateCode(PATCH, "    go(a);\n  }\n\n  return done(a);", 1), 12, "a blank line between is skipped");
   });
 
   test("P3 a comment stays where its line shows the code, or anywhere inside the code's lines; else it moves, and code not in the diff moves nothing", () => {
@@ -88,6 +90,14 @@ describe("S through gh_review_submit", () => {
     assert.deepEqual(moved.body.moved_comments, [{ path: "src/app.ts", from: 40, to: 3 }]);
   });
 
+  test("S1b a note is listed with the line of the code it quotes", async () => {
+    e = await reviewEnv();
+    e.gh.files[0]!.patch = "@@ -1,3 +1,4 @@\n const a = 1;\n-const b = 2;\n+const b = read();\n+const c = b + 1;\n return a;";
+    const o = await submit({ event: "COMMENT", non_blocking: [{ path: "src/app.ts", line: null, body: "read() can throw", existing_code: "const b = read();" }] });
+    assert.equal(o.isError, false, o.text);
+    assert.match(posted()[0]?.body.body, /- `src\/app\.ts:2`: read\(\) can throw/);
+  });
+
   test("S2 a re-review does not open a second thread where the last review's is still open: the finding goes in the body, and the result says so", async () => {
     e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c", resolved: false }] }) } });
     e.gh.files[0]!.patch = "@@ -1,4 +1,8 @@\n a\n-b\n+b2\n+c\n+d\n+e2\n+e3\n e\n f";
@@ -99,5 +109,14 @@ describe("S through gh_review_submit", () => {
     assert.deepEqual(posted()[0]?.body.comments, [{ path: "src/app.ts", line: 7, side: "RIGHT", body: "e3 is new and wrong" }]);
     assert.match(posted()[0]?.body.body, /\*\*Still open from the last review\*\*\n- `src\/app\.ts:4`: c is still never checked/);
     assert.deepEqual(o.body.said_in_body_as_still_open, [{ path: "src/app.ts", line: 4, thread_id: "PRRT_kwDO1" }]);
+  });
+
+  test("S3 a re-review whose only inline finding repeats an open thread still requests changes, with the finding in the body", async () => {
+    e = await reviewEnv({}, { deps: { continuationOf: async () => ({ sinceHeadSha: HEAD, findings: [{ path: "src/app.ts", line: 3, thread_id: "PRRT_kwDO1", note: "c", resolved: false }] }) } });
+    const o = await submit({ comments: [{ path: "src/app.ts", line: 3, body: "c is still never checked" }] });
+    assert.equal(o.isError, false, o.text);
+    assert.equal(posted()[0]?.body.event, "REQUEST_CHANGES");
+    assert.equal(posted()[0]?.body.comments, undefined);
+    assert.match(posted()[0]?.body.body, /\*\*Still open from the last review\*\*\n- `src\/app\.ts:3`: c is still never checked/);
   });
 });
