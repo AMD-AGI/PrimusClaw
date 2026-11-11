@@ -35,6 +35,12 @@ function view(v: View): OutMessage {
   return { body: { type: "view", view: v, fallbackText: "" } };
 }
 
+/** An id a card's button may carry: at most 128 characters, no control characters. */
+function plainId(id: string): boolean {
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused
+  return id.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(id);
+}
+
 function str(value: unknown): string {
   return typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
 }
@@ -302,6 +308,8 @@ export class Deliveries {
     const actionId = str(ask["action_id"]);
     const options = this.deps.remote.options(ask["options"]);
     if (!actionId || options.length === 0) return undefined;
+    // (a terminal's question names its request by an id the connector made, a uuid: anything else is said as words, no card)
+    if (ask["origin"] === "terminal" && !(plainId(actionId) && plainId(remote.sessionId))) return undefined;
     const now = store.now();
     const expiresAt = remoteAskExpiry(ask, now);
     if (expiresAt <= now) return false;

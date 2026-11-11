@@ -388,3 +388,49 @@ test("the size backstop: a card heavier than the safe line as built goes out cut
   assert.deepEqual(ids(last), ["deny", "deny-stop"]);
   assert.match(all(last), /approve it at the terminal/);
 });
+
+test("review round 5: answers of another shape are shown as JSON, and huge ids still leave a card that goes out", () => {
+  const odd = card({
+    action_id: "o1",
+    origin: "terminal",
+    kind: "question",
+    tool: "Pick",
+    input: { question: "Pick", options: { action: "hidden-thing" } },
+    options: [{ optionId: "a0", name: "A", kind: "allow_once" }],
+  });
+  assert.match(all(odd), /hidden-thing/);
+  assert.deepEqual(ids(odd), []);
+  const notObjects = card({
+    action_id: "o2",
+    origin: "terminal",
+    kind: "question",
+    tool: "Pick",
+    input: { question: "Pick", options: [{ label: "A" }, "rm -rf ~"] },
+    options: [
+      { optionId: "a0", name: "A", kind: "allow_once" },
+      { optionId: "skip", name: "Skip", kind: "reject_once" },
+    ],
+  });
+  assert.match(all(notObjects), /rm -rf/);
+  assert.deepEqual(ids(notObjects), ["skip"]);
+  const view = remoteView.terminalAskView(
+    {
+      ask: {
+        action_id: "x".repeat(30_000),
+        origin: "terminal",
+        kind: "execute",
+        tool: "Run",
+        input: { command: "ls" },
+      },
+      options: remoteDomain.parseOptions(COMMAND_OPTIONS),
+      sessionId: "s-1",
+      machine: "dev-pod",
+      agent: "claude",
+    },
+    "en",
+  );
+  const sent = cardOf(terminalAskCard(view));
+  assert.ok(Buffer.byteLength(JSON.stringify(sent)) <= TERMINAL_CARD_SAFE_BYTES);
+  assert.deepEqual(ids(sent), []);
+  assert.match(all(sent), /approve it at the terminal/);
+});

@@ -160,7 +160,15 @@ function questionContent(input: Reported, words: Words): Content | undefined {
     if (Object.keys(rest).length) extras.push(rest);
   }
   if (extras.length) sections.push({ type: "code", text: JSON.stringify(extras, null, 2) });
-  return { asks: words.asksQuestion, sections, fields: ["question", "header", "options"] };
+  // (a header or answers of another shape are not rendered here: they go after it as JSON with every other field)
+  // (answers that are not a list of objects are not what a question carries: shown, but never answerable from here)
+  const malformed = !Array.isArray(input["options"]) || options.some((o) => record(o) === undefined);
+  const fields = [
+    "question",
+    ...(typeof input["header"] === "string" ? ["header"] : []),
+    ...(Array.isArray(input["options"]) ? ["options"] : []),
+  ];
+  return { asks: words.asksQuestion, sections, fields, clipped: malformed };
 }
 
 const CONTENT = new Map<string, (input: Reported, words: Words) => Content | undefined>([

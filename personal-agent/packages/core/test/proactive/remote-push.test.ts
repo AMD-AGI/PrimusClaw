@@ -465,3 +465,19 @@ it("the end of a terminal's question edits its card even in a chat attached to t
     ["update"],
   );
 });
+
+it("a terminal's question whose ids are not plain ids gets no card: its words are said instead", async () => {
+  const w = world();
+  const ask = { ...aTerminalAsk(), action_id: "x".repeat(129) };
+  assert.equal(
+    await w.proactive.handle(
+      ALICE,
+      w.reference,
+      remoteSay("rs-t", "needs_you", "say-bad", { text: "终端在等你", ask }),
+    ),
+    "delivered",
+  );
+  assert.ok(!shown(w.surface.outbox).some((line) => line.includes("ask rs-t")));
+  assert.ok(shown(w.surface.outbox).some((line) => line.includes("终端在等你")));
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "x".repeat(129)), null);
+});

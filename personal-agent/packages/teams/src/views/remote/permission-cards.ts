@@ -51,7 +51,10 @@ export function terminalAskCard(view: remoteView.TerminalAskView): CardMessage {
   if (cardBytes(full) <= TERMINAL_CARD_SAFE_BYTES || view.fallback === undefined) return full;
   const cut = terminalAskBody(view.fallback);
   if (cardBytes(cut) <= TERMINAL_CARD_SAFE_BYTES) return cut;
-  return terminalAskBody({ ...view.fallback, who: "", asks: "", sections: [], notes: view.fallback.notes.slice(-2) });
+  const bare = { ...view.fallback, who: "", asks: "", sections: [], notes: view.fallback.notes.slice(-2) };
+  const minimal = terminalAskBody(bare);
+  // (buttons whose own data is too heavy, a malformed request's ids: the card still goes out, to be answered at the terminal)
+  return cardBytes(minimal) <= TERMINAL_CARD_SAFE_BYTES ? minimal : terminalAskBody({ ...bare, buttons: [] });
 }
 
 function terminalAskBody(view: remoteView.TerminalAskView): CardMessage {
