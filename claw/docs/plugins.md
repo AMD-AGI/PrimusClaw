@@ -489,9 +489,10 @@ says otherwise.
 | --------------- | ------ |
 | `latest_per_name` | Defaults to `true`. `false` (also `0`, `no`) lists every row (every version), as before this default; `true`, `1`, `yes` collapse; anything else is `400`. |
 | `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
-| `include_deleted` | Admins only, as before. A deleted version never wins over a live one; it is the entry only when nothing of the plugin is live. |
-| `scope` | Which plugins: `visible` (default) is the public ones plus the caller's own, for admins too; `mine` only the caller's own; `public` only public ones; `all` every plugin, admins only (`403` otherwise). Anything else is `400`. |
-| `name_exact`, `name`, `owner`, `limit`, `offset` | Unchanged. |
+| `include_deleted` | Admins only. Adds deleted rows within the `scope`: with the default `visible` that is deleted public plugins and the admin's own; another user's deleted private plugins need `scope=all` as well. A deleted version never wins over a live one; it is the entry only when nothing of the plugin is live. |
+| `scope` | Which plugins: `visible` (default) is the public ones plus the caller's own, for admins too; `mine` only the caller's own; `public` only public ones; `all` every plugin, admins only (`403` otherwise). An absent or empty `scope` is `visible`; any other value is `400`. |
+| `owner` | Narrows the listing to one owner's plugins (`me` is the caller), inside the `scope`. For an admin this changed with `scope`: `owner=<another user>` alone returns only that user's public plugins; add `scope=all` to include their private ones (as `owner` alone did before `scope` existed). |
+| `name_exact`, `name`, `limit`, `offset` | Unchanged. |
 
 The other versions are listed on demand:
 
