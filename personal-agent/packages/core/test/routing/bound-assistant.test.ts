@@ -198,3 +198,34 @@ test("a linked person who is also bound keeps the link's id: a bound token never
   assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice-key");
   assert.equal(w.store.links.boundClawUser(ALICE.id, TOKEN), null, "nothing is kept beside a link");
 });
+
+test("two messages around a rebind: a slow lookup of the earlier token never overwrites the later account", async () => {
+  const { aw, w } = boundWorld();
+  w.owners.set("tok-other", { id: "u-other", name: "Other", email: "", accountType: "" });
+  let answer = (): void => undefined;
+  const slow = new Promise<void>((resolve) => {
+    answer = resolve;
+  });
+  const identity = w.deps.identity;
+  const lookup = identity.ownerOfKey.bind(identity);
+  identity.ownerOfKey = async (key: string) => {
+    if (key === TOKEN) await slow; // (the earlier token's owner answers late)
+    return lookup(key);
+  };
+
+  const first = w.router.handle(message("on the earlier account"));
+  await new Promise((resolve) => setImmediate(resolve)); // (the first message has its token and is looking it up)
+  w.exchange.tokens.set(ALICE.id, "tok-other");
+  const second = w.router.handle(message("on the later account"));
+  await new Promise((resolve) => setImmediate(resolve));
+  answer();
+  await Promise.all([first, second]);
+
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-other", "the later account's id is the one kept");
+  assert.equal(
+    aw.subsClaw.calls.filter((c) => c.startsWith("create ")).at(-1),
+    "create tok-other",
+    "the subscription kept is the later account's",
+  );
+  assert.deepEqual(w.store.links.boundClawUser(ALICE.id, "tok-other"), { clawUserId: "u-other", current: true });
+});

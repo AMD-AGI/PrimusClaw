@@ -13,6 +13,7 @@ import { pyLower, pySplit } from "../text/py-text.js";
 import { learnLang, type Chat } from "./chat.js";
 import type { CommandSets } from "./command-table.js";
 import { CredentialUnavailable } from "./credentials.js";
+import { KeyedLock } from "./lock.js";
 import type { RouterContext } from "./context.js";
 import type { PersonalText } from "./personal-text.js";
 import { ShowHere } from "./show-here.js";
@@ -29,6 +30,8 @@ const OWN_VERBS = ["bind", "repo", "create_pr", "show", "turn_stop"] as const;
 export class PersonalRouter {
   private readonly stopPress: StopPress;
   private readonly showHere: ShowHere;
+  /** A person's bound id is read and kept one message at a time, so a late lookup of an earlier token never wins. */
+  private readonly boundLock = new KeyedLock();
 
   constructor(
     private readonly ctx: RouterContext,
@@ -48,7 +51,7 @@ export class PersonalRouter {
       await this.backfill(userId);
       if (subscriptions !== undefined) await subscriptions.ensure(userId);
     } else {
-      await this.reachBound(userId);
+      await this.boundLock.run(userId, () => this.reachBound(userId));
     }
     if (event.type === "message") await this.message(event, chat);
     else await this.click(event, chat);
