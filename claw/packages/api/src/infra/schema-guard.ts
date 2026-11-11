@@ -69,6 +69,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "effort",
       // Absent, every message to a session and every drain of its queue fails.
       "pending_drain_until",
+      // Absent, every completion fails to set the session idle, and every message and drain fails with it.
+      "workspace_save_id", "workspace_save_until",
     ],
   },
   {

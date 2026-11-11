@@ -265,6 +265,103 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
 }
 
 /**
+ * The record that a run's turn has already ended on the session.
+ *
+ * `exec_complete` goes out before the workspace is saved (see `finalizeSuccess`),
+ * and the API admits the session's next turn once it has the completion and the
+ * save's finish. A run that stops after its completion and before its ack -- a
+ * SIGTERM that outlasts the save, a pod lost, a lease lost -- is redelivered, and
+ * running that turn again would answer it twice and race the turn after it. So
+ * the completion is recorded first, with what the Backend handoff needs, and a
+ * redelivery that finds the record finishes the turn instead of running it
+ * (`finishEndedTurn`).
+ */
+export function endedTurnKey(sessionId: string, messageId: string): string {
+  return `turn-ended.${sessionId}.${messageId}`;
+}
+
+interface EndedTurn {
+  /** The completion as published (redacted), published again by a redelivery. */
+  completion?: Record<string, unknown>;
+  result: ExecuteResult;
+  run_time?: RunTimeReport;
+  /** The save announced on the completion, which the redelivery reports over. */
+  save_id?: string;
+}
+
+/**
+ * Finish a turn whose completion an earlier delivery already published, without
+ * running it again: publish the completion again (the API skips a second one),
+ * report its save over, hand the result to Backend, ack.
+ *
+ * The save is not retried. It is reported `failed`, so the API stops holding the
+ * session's next message for it, and the files are where they were -- in the
+ * sandbox, for the next turn's save to upload.
+ */
+async function finishEndedTurn(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  messageId: string,
+  lockKey: string,
+  run?: AbortController,
+): Promise<boolean> {
+  if (!messageId) return false;
+  const { kvCkpt, emitter } = getDeps();
+  const key = endedTurnKey(sessionId, messageId);
+  let entry;
+  try {
+    entry = await kvCkpt.get(key);
+  } catch (err) {
+    // Not knowing whether the turn already ended is not a reason to run it again.
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_lookup_failed");
+    msg.nak(5_000);
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
+    return true;
+  }
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
+  let ended: EndedTurn;
+  try {
+    ended = JSON.parse(sc.decode(entry.value)) as EndedTurn;
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_unreadable");
+    await kvCkpt.delete(key).catch(() => {});
+    return false;
+  }
+  try {
+    // Again, in case the earlier delivery stopped between the record and the
+    // publish: the API handles one completion per turn and skips the rest.
+    if (ended.completion) await emitter.emit(sessionId, ended.completion);
+    if (ended.save_id) {
+      const finished: WorkspaceSaveFinishedEvent = {
+        type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: "failed",
+        reason: "run_stopped_during_save", save_id: ended.save_id, message_id: messageId,
+      };
+      await emitter.emit(sessionId, { ...finished }).catch((err: unknown) => {
+        logger.warn({ err, sessionId, messageId }, "task.ended_turn_save_event_failed");
+      });
+    }
+    await deliverAgentDone(kvCkpt, request, ended.result, ended.run_time);
+    await ackAndClearCallback(msg, kvCkpt, request);
+    await kvCkpt.delete(key).catch((err) => {
+      logger.warn({ err, sessionId, messageId }, "task.ended_turn_cleanup_failed");
+    });
+    logger.warn(
+      { sessionId, messageId, deliveryCount: msg.info.deliveryCount, saveId: ended.save_id },
+      "task.ended_turn_not_rerun",
+    );
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_finish_failed");
+    msg.nak(5_000);
+  } finally {
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
+  }
+  return true;
+}
+
+/**
  * Which row and which generation a completion is reporting for.
  *
  * The generation belongs to the delivery rather than to any one phase of it,
@@ -3504,17 +3601,21 @@ class TaskRunner {
     // The turn's end, published before the workspace is saved rather than after.
     //
     // The answer is final the moment the engine returns, and `exec_complete` is
-    // what hands the session back (`agent_status` idle, the next queued message
-    // dispatched). Saving /workspace below is bounded by nothing but the number of
-    // files in it: a review that cloned a large repository uploaded 79,353 files
-    // in 62 minutes, and for all of that time the session read `running` with the
-    // answer already on screen. Nothing the API does with `exec_complete` reads
-    // what the save writes -- deliveries are stored when `deliver_file` answers,
-    // skill files travel in the event -- and the next run on this workspace still
-    // waits for the save: it takes the same workspace lock, which this run holds
-    // until it has settled below. What still follows the save is the handoff to
-    // Backend (`deliverAgentDone`), so a task whose successors read its files is
-    // not reported done before they are there.
+    // what sets the session idle. Saving /workspace below is bounded by nothing
+    // but the number of files in it: a review that cloned a large repository
+    // uploaded 79,353 files in 62 minutes, and for all of that time the session
+    // read `running` with the answer already on screen. Nothing the API does with
+    // `exec_complete` reads what the save writes -- deliveries are stored when
+    // `deliver_file` answers, skill files travel in the event.
+    //
+    // The session's next message still waits for the save, but in the API's
+    // queue: the completion names the save (`workspace_save_id`), the API holds
+    // the queue until that save's `workspaceSave` `finished`, and only then
+    // dispatches (api sessions/save-hold.ts). Dispatched at once, it would wait on
+    // this run's workspace lock, where its redelivery budget runs out in about an
+    // hour. What also still follows the save is the handoff to Backend
+    // (`deliverAgentDone`), so a task whose successors read its files is not
+    // reported done before they are there.
     //
     // The run may already have stood down: a lost lease, or the lock's
     // self-fence, after which another brain may hold this run. A success
@@ -3530,7 +3631,7 @@ class TaskRunner {
     // Named per save, not per turn: a redelivered turn keeps its message id, and
     // the finish of an earlier attempt's save must not end this one's.
     const saveId = !!hands && this.request.workspace_throwaway !== true ? randomUUID() : undefined;
-    await this.onEvent({
+    const completion: Record<string, unknown> = {
       type: "exec_complete",
       session_id: this.sessionId,
       message_id: this.messageId,
@@ -3550,130 +3651,167 @@ class TaskRunner {
       delivery_count: this.msg.info.deliveryCount,
       ...(saveId ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING, [WORKSPACE_SAVE_ID_FIELD]: saveId } : {}),
       ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
-    }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
-      if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
+    };
+    const secrets = runtimeSecrets(this.request, this.platformKey);
+    const handoff = redactEgressPayload<ExecuteResult>(
+      this.withPlatformFacts(result),
+      secrets,
+    );
+    // Recorded before it is published, with the completion itself: a delivery of
+    // this run that comes back once the completion may be out finishes the turn
+    // (`finishEndedTurn`, which publishes the completion again -- the API takes
+    // one per turn) and does not run it again.
+    const endedKey = this.messageId ? endedTurnKey(this.sessionId, this.messageId) : null;
+    if (endedKey) {
+      const runTime = this.coverageReport()?.runTime;
+      const ended: EndedTurn = {
+        completion: redactEgressPayload<Record<string, unknown>>({ ...completion, message_id: this.messageId }, secrets),
+        result: handoff,
+        ...(runTime ? { run_time: runTime } : {}),
+        ...(saveId ? { save_id: saveId } : {}),
+      };
+      await this.kvCkpt.put(endedKey, sc.encode(JSON.stringify(ended)));
+    }
+    await this.onEvent(completion, { stillMine: () => !this.leaseLost }).catch(async (err: unknown) => {
+      if (err instanceof EmitStoodDownError) {
+        // Refused before it was published: the turn did not end, and the brain
+        // that holds the run now must run it, not skip it on this record.
+        if (endedKey) await this.kvCkpt.delete(endedKey).catch(() => {});
+        throw LEASE_LOST_ABORT_REASON;
+      }
       throw err;
     });
-    // Ahead of the upload below, for the runs that reap at all: a process still
-    // writing while /workspace is read gets captured half-written, and anything
-    // it would have written after the read is lost when it is killed anyway.
-    // Stopping it first makes the snapshot the last complete state instead.
-    await this.reapBackgroundShells();
+    // Nothing from here to the handoff may end the run as a failure: the turn has
+    // ended on the session, and a failure is naked and redelivered. A step that
+    // throws is logged and the run goes on to its handoff and ack.
+    try {
+      // Ahead of the upload below, for the runs that reap at all: a process still
+      // writing while /workspace is read gets captured half-written, and anything
+      // it would have written after the read is lost when it is killed anyway.
+      // Stopping it first makes the snapshot the last complete state instead.
+      await this.reapBackgroundShells();
 
-    // 5. S3 upload: always sync /workspace so artifacts survive sandbox GC
-    //    and syncWorkspaceFromS3 has something to rehydrate on the next
-    //    sandbox. Failure is logged AND surfaced as a `sandboxStatus` event
-    //    (status=workspace_sync_*) so the user / monitoring can see it —
-    //    previously silent `logger.warn` was the root cause of 13% of long
-    //    sessions losing their /workspace artifacts despite a successful
-    //    `exec_complete`. Task completion still doesn't depend on object-
-    //    storage availability (event is informational, not fatal).
-    //    The optional per-message immutable archive (claw-<messageId>/) is
-    //    gated behind BRAIN_WORKSPACE_SNAPSHOT_ENABLED.
-    //    SIGTERM-checkpoint path below uses its own sync into the
-    //    checkpoint prefix and is independent of this block.
-    //    A run that never attached a sandbox has nothing here to do: no
-    //    /workspace to upload and no sandbox GC to outlive. Logged rather than
-    //    passed over silently, because "nothing was uploaded" otherwise reads
-    //    exactly like an upload that failed.
-    let syncOk = false;
-    if (!hands) {
-      logger.info(
-        { sessionId: this.sessionId, messageId: this.messageId },
-        "s3.sync_skipped_no_sandbox",
-      );
-    } else if (this.request.workspace_throwaway === true) {
-      // The task declared its workspace throwaway -- it has already delivered
-      // its output somewhere of its own -- so this run publishes nothing. The
-      // prune is skipped with the upload, on purpose: pruning against a tree we
-      // never uploaded would delete the last durable copy of whatever an
-      // earlier, non-throwaway run of this session left in S3.
-      logger.info(
-        { sessionId: this.sessionId, messageId: this.messageId },
-        "s3.sync_skipped_workspace_throwaway",
-      );
-    } else {
-      // The turn has already ended on the session (above), saying a save follows,
-      // so its files in the object store trail it until this is over. `finished`
-      // goes out however the save ends, so the file listing stops saying "saving"
-      // (WORKSPACE_SAVE_EVENT).
-      let saveOutcome: WorkspaceSaveOutcome = "failed";
-      try {
-        logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
-        let syncedGit: GitReport | undefined;
+      // 5. S3 upload: always sync /workspace so artifacts survive sandbox GC
+      //    and syncWorkspaceFromS3 has something to rehydrate on the next
+      //    sandbox. Failure is logged AND surfaced as a `sandboxStatus` event
+      //    (status=workspace_sync_*) so the user / monitoring can see it —
+      //    previously silent `logger.warn` was the root cause of 13% of long
+      //    sessions losing their /workspace artifacts despite a successful
+      //    `exec_complete`. Task completion still doesn't depend on object-
+      //    storage availability (event is informational, not fatal).
+      //    The optional per-message immutable archive (claw-<messageId>/) is
+      //    gated behind BRAIN_WORKSPACE_SNAPSHOT_ENABLED.
+      //    SIGTERM-checkpoint path below uses its own sync into the
+      //    checkpoint prefix and is independent of this block.
+      //    A run that never attached a sandbox has nothing here to do: no
+      //    /workspace to upload and no sandbox GC to outlive. Logged rather than
+      //    passed over silently, because "nothing was uploaded" otherwise reads
+      //    exactly like an upload that failed.
+      let syncOk = false;
+      if (!hands) {
+        logger.info(
+          { sessionId: this.sessionId, messageId: this.messageId },
+          "s3.sync_skipped_no_sandbox",
+        );
+      } else if (this.request.workspace_throwaway === true) {
+        // The task declared its workspace throwaway -- it has already delivered
+        // its output somewhere of its own -- so this run publishes nothing. The
+        // prune is skipped with the upload, on purpose: pruning against a tree we
+        // never uploaded would delete the last durable copy of whatever an
+        // earlier, non-throwaway run of this session left in S3.
+        logger.info(
+          { sessionId: this.sessionId, messageId: this.messageId },
+          "s3.sync_skipped_workspace_throwaway",
+        );
+      } else {
+        // The turn has already ended on the session (above), saying a save follows,
+        // so its files in the object store trail it until this is over. `finished`
+        // goes out however the save ends, so the file listing stops saying "saving"
+        // (WORKSPACE_SAVE_EVENT).
+        let saveOutcome: WorkspaceSaveOutcome = "failed";
         try {
-          const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
-          syncOk = !r.exhausted && !r.empty;
-          saveOutcome = r.empty ? "empty" : r.exhausted ? "partial" : "synced";
-          syncedGit = r.git;
-          if (r.empty) {
+          logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
+          let syncedGit: GitReport | undefined;
+          try {
+            const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
+            syncOk = !r.exhausted && !r.empty;
+            saveOutcome = r.empty ? "empty" : r.exhausted ? "partial" : "synced";
+            syncedGit = r.git;
+            if (r.empty) {
+              await this.onEvent({
+                type: "sandboxStatus",
+                status: "workspace_sync_empty",
+                reason: "empty_workspace",
+                message: "no files under /workspace at sync time",
+                message_id: this.messageId,
+              });
+            } else if (r.exhausted) {
+              await this.onEvent({
+                type: "sandboxStatus",
+                status: "workspace_sync_partial",
+                reason: "upload_exhausted",
+                // Out of what this sync tried to upload: files the last sync that
+                // landed already put in S3 are not attempts.
+                message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
+                message_id: this.messageId,
+              });
+            }
+          } catch (e: unknown) {
+            const errMsg = (e as { message?: string })?.message
+              ? String((e as { message: string }).message).slice(0, 500)
+              : String(e);
+            const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
+            const reason = isHandsNetworkError(e)
+              ? "sandbox_unreachable"
+              : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
+                ? "payload_too_large"
+                : errType;
+            logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
             await this.onEvent({
               type: "sandboxStatus",
-              status: "workspace_sync_empty",
-              reason: "empty_workspace",
-              message: "no files under /workspace at sync time",
+              status: "workspace_sync_failed",
+              reason,
+              message: errMsg,
               message_id: this.messageId,
             });
-          } else if (r.exhausted) {
-            await this.onEvent({
-              type: "sandboxStatus",
-              status: "workspace_sync_partial",
-              reason: "upload_exhausted",
-              // Out of what this sync tried to upload: files the last sync that
-              // landed already put in S3 are not attempts.
-              message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
-              message_id: this.messageId,
-            });
+            // Recovery: if a periodic in-flight checkpoint had been written, copy
+            // it server-side back to the session prefix. This is the safety net
+            // for long sessions whose sandbox dies right at sync time — we still
+            // surface the artifacts captured at the last checkpoint window.
+            await this.recoverInflightCheckpoint("from_inflight_checkpoint");
           }
-        } catch (e: unknown) {
-          const errMsg = (e as { message?: string })?.message
-            ? String((e as { message: string }).message).slice(0, 500)
-            : String(e);
-          const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
-          const reason = isHandsNetworkError(e)
-            ? "sandbox_unreachable"
-            : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
-              ? "payload_too_large"
-              : errType;
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
-          await this.onEvent({
-            type: "sandboxStatus",
-            status: "workspace_sync_failed",
-            reason,
-            message: errMsg,
-            message_id: this.messageId,
+          // Independent of the above: a sync can land and still have left a repository
+          // behind. Outside the try on purpose: the upload succeeded, and an event the
+          // stream refused must not turn it into the failure above, whose recovery
+          // copies an older in-flight checkpoint over the files just uploaded.
+          await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
+            logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
           });
-          // Recovery: if a periodic in-flight checkpoint had been written, copy
-          // it server-side back to the session prefix. This is the safety net
-          // for long sessions whose sandbox dies right at sync time — we still
-          // surface the artifacts captured at the last checkpoint window.
-          await this.recoverInflightCheckpoint("from_inflight_checkpoint");
-        }
-        // Independent of the above: a sync can land and still have left a repository
-        // behind. Outside the try on purpose: the upload succeeded, and an event the
-        // stream refused must not turn it into the failure above, whose recovery
-        // copies an older in-flight checkpoint over the files just uploaded.
-        await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
-        });
-        if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
-          try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
-            logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
+          if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
+            try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
+              logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
+            }
           }
+          logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
+        } finally {
+          await this.announceWorkspaceSave({
+            type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, save_id: saveId, message_id: this.messageId,
+          });
         }
-        logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
-      } finally {
-        await this.announceWorkspaceSave({
-          type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, save_id: saveId, message_id: this.messageId,
-        });
       }
-    }
 
-    // 5b. Write execution transcript as JSONL to S3
-    await fx().flushTranscript(this.sessionId, this.request.user_id || "default", this.messageId, this.transcriptStartedAt, this.transcriptLog, {
-      turns: result.turns, elapsedMs: result.elapsedMs,
-      tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
-    });
+      // 5b. Write execution transcript as JSONL to S3
+      await fx().flushTranscript(this.sessionId, this.request.user_id || "default", this.messageId, this.transcriptStartedAt, this.transcriptLog, {
+        turns: result.turns, elapsedMs: result.elapsedMs,
+        tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
+      });
+    } catch (e) {
+      if (e === LEASE_LOST_ABORT_REASON) throw e;
+      logger.error(
+        { err: e, sessionId: this.sessionId, messageId: this.messageId },
+        "task.after_turn_end_failed",
+      );
+    }
 
     // The save is the one long stretch of this method, and the run can stand
     // down during it. The turn's end is already published, and was this run's to
@@ -3683,21 +3821,18 @@ class TaskRunner {
     // The user-visible completion event is persisted before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
     // task execution without losing the session's terminal event.
-    await deliverAgentDone(
-      this.kvCkpt,
-      this.request,
-      redactEgressPayload<ExecuteResult>(
-        this.withPlatformFacts(result),
-        runtimeSecrets(this.request, this.platformKey),
-      ),
-      this.coverageReport()?.runTime,
-    );
+    await deliverAgentDone(this.kvCkpt, this.request, handoff, this.coverageReport()?.runTime);
     // Ack BEFORE logging task.completed: if the process is killed by a hot-
     // reload between the log line and msg.ack(), NATS redelivers the task after
     // ack_wait and the entire execution repeats from scratch. Since exec_complete
     // is already persisted in JetStream, the event-consumer can handle post-
     // completion logic (pending messages, summaries) even if Brain dies here.
     await this.ackTerminal();
+    if (endedKey) {
+      await this.kvCkpt.delete(endedKey).catch((e: unknown) => {
+        logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "task.ended_turn_cleanup_failed");
+      });
+    }
     logger.info({
       sessionId: this.sessionId, messageId: this.messageId, turns: result.turns, elapsedMs: result.elapsedMs,
       // A completed run always has both -- the loop that produced this result
@@ -5274,6 +5409,7 @@ export async function runHandleTask(
   // profile, and the prompt that holds the requester's words is not read as configuration (`agent/review-profile.ts`).
   applyReviewProfileBackstop(request);
   if (await replayPendingCallback(msg, request, lockKey, abortCtrl)) return;
+  if (await finishEndedTurn(msg, request, sessionId, messageId, lockKey, abortCtrl)) return;
   if (await refuseUnsupportedMode(msg, request, sessionId, lockKey, abortCtrl)) return;
   if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey, abortCtrl)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;

@@ -59,8 +59,7 @@ function fakeMsg(deliveryCount = 1) {
 }
 
 /** In-memory stand-in for the three KV methods task-runner actually calls. */
-function fakeKv() {
-  const store = new Map<string, Uint8Array>();
+function fakeKv(store = new Map<string, Uint8Array>()) {
   const enc = new TextEncoder();
   const kv = {
     async get(key: string) {
@@ -208,12 +207,17 @@ async function runScenario(opts: {
    */
   seedClearedCallback?: boolean;
   /** Arrays the scenario's events and calls are mirrored into as they happen, for a stub to read mid-run. */
-  observe?: { events: Array<Record<string, unknown>>; calls: string[] };
+  observe?: { events: Array<Record<string, unknown>>; calls: string[]; ckpt?: Map<string, Uint8Array> };
+  /** An earlier delivery of this run already published its completion (`turn-ended.<sid>.<mid>`). */
+  seedEndedTurn?: Record<string, unknown>;
 }) {
   const sessionId = opts.sessionId ?? SESSION;
   const { msg, verdicts } = fakeMsg(opts.deliveryCount ?? 1);
   const { kv } = fakeKv();
-  const { kv: kvCkpt, store: ckptStore } = fakeKv();
+  const { kv: kvCkpt, store: ckptStore } = fakeKv(opts.observe?.ckpt);
+  if (opts.seedEndedTurn) {
+    ckptStore.set(`turn-ended.${sessionId}.${MESSAGE}`, new TextEncoder().encode(JSON.stringify(opts.seedEndedTurn)));
+  }
   if (opts.seedCallback) {
     assert.ok(opts.taskId, "a persisted callback belongs to a task");
     ckptStore.set(`task-result.${opts.taskId}`, opts.seedCallback);
@@ -458,6 +462,86 @@ test("a run with no sandbox has no save to announce", async () => {
   assert.equal(r.completion.workspace_save, undefined, "no save follows it");
   assert.equal(r.completion.workspace_save_id, undefined);
   assert.deepEqual(r.events.filter((e) => e.type === "workspaceSave"), []);
+});
+
+test("the turn's end is recorded before it is published, and the record goes with the ack", async () => {
+  const ckpt = new Map<string, Uint8Array>();
+  let recordAtCompletion: Record<string, unknown> | undefined;
+  const events: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    observe: { events, calls, ckpt },
+    sideEffects: {
+      syncWorkspaceToS3: (async () => {
+        const raw = ckpt.get(`turn-ended.${SESSION}.${MESSAGE}`);
+        recordAtCompletion = raw ? JSON.parse(new TextDecoder().decode(raw)) : undefined;
+        return SYNCED;
+      }) as never,
+    },
+  });
+  assert.ok(recordAtCompletion, "a delivery that came back during the save would find the turn ended");
+  assert.equal((recordAtCompletion.completion as Record<string, unknown>).type, "exec_complete");
+  assert.equal(recordAtCompletion.save_id, r.completion?.workspace_save_id);
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(ckpt.has(`turn-ended.${SESSION}.${MESSAGE}`), false, "nothing to finish once acked");
+});
+
+for (const [label, over] of [
+  ["the save throws", { syncWorkspaceToS3: (async () => { throw new Error("hands gone"); }) }],
+  ["the transcript throws", { flushTranscript: (async () => { throw new Error("s3 down"); }) }],
+  ["reaping the shells throws", {
+    makeHandsClient: (() => ({
+      close: async () => {},
+      reapShells: async () => { throw new Error("reap failed"); },
+    })),
+  }],
+] as const) {
+  test(`after the turn has ended, ${label}: the run is still acked, not naked for a rerun`, async () => {
+    let agentDone = 0;
+    const r = await runScenario({
+      taskId: `task-after-end-${label.length}`,
+      engineBehavior: withSandbox,
+      sideEffects: {
+        ...(over as unknown as Partial<TaskRunnerSideEffects>),
+        postAgentDone: (async () => { agentDone++; }) as never,
+      },
+    });
+    assert.deepEqual(r.verdicts, ["ack"], "a nak would run the ended turn again beside the next one");
+    assert.equal(r.types.filter((t) => t === "exec_complete").length, 1);
+    assert.equal(r.completion?.failed, false);
+    assert.equal(agentDone, 1, "the task is handed to Backend as done");
+    assert.equal(r.ckptStore.has(`turn-ended.${SESSION}.${MESSAGE}`), false);
+  });
+}
+
+test("a delivery of a turn that already ended finishes it without running it again", async () => {
+  // The earlier delivery published the completion and was stopped during its
+  // save (SIGTERM, pod lost) before its ack, so JetStream delivered it again.
+  const stored = result({ finalText: "already answered" });
+  const completion = { type: "exec_complete", message_id: MESSAGE, failed: false, final_text: "already answered",
+    workspace_save: "pending", workspace_save_id: "save-1" };
+  const handed: ExecuteResult[] = [];
+  const r = await runScenario({
+    taskId: "task-ended",
+    deliveryCount: 2,
+    seedEndedTurn: { completion, result: stored, save_id: "save-1" },
+    engineBehavior: async () => { throw new Error("the ended turn must not run again"); },
+    sideEffects: {
+      postAgentDone: (async (_req: unknown, res: ExecuteResult) => { handed.push(res); }) as never,
+    },
+  });
+  assert.ok(!r.calls.includes("engine.execute"), "the turn is not executed again");
+  assert.ok(!r.calls.includes("ensureHands"), "nor is a sandbox opened for it");
+  assert.deepEqual(r.events.map((e) => [e.type, e.phase, e.outcome, e.save_id]), [
+    ["exec_complete", undefined, undefined, undefined],
+    ["workspaceSave", "finished", "failed", "save-1"],
+  ], "the completion again (the API takes one per turn), then the save reported over so the next message is let through");
+  assert.equal(r.events[0].final_text, "already answered");
+  assert.deepEqual(handed, [stored]);
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.ckptStore.has(`turn-ended.${SESSION}.${MESSAGE}`), false);
+  assert.ok(r.calls.includes("releaseTaskLock"));
 });
 
 // ── fatal ────────────────────────────────────────────────────────────────

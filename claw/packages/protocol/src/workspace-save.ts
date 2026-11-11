@@ -37,6 +37,8 @@ export interface WorkspaceSaveFinishedEvent {
   outcome: WorkspaceSaveOutcome;
   /** The completion's `workspace_save_id`. */
   save_id?: string;
+  /** Why a save ended the way it did, where its outcome alone does not say. */
+  reason?: string;
   message_id?: string;
 }
 

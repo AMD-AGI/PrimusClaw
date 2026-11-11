@@ -21,6 +21,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import crypto from "node:crypto";
+import { workspaceSaveHeldSql } from "../sessions/save-hold.js";
 import { db, MarketplaceDb } from "../infra/db.js";
 import { canViewPlugin, ownerOrAdmin, formatPluginRow, pluginLaunchable } from "../marketplace/plugins.js";
 import { holdPluginReference } from "../marketplace/plugin-expiry.js";
@@ -1230,7 +1231,7 @@ async function gateUserMessageTurn(
   try {
     await client.query("BEGIN");
     const locked = await client.query(
-      "SELECT agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+      `SELECT agent_status, ${workspaceSaveHeldSql()} AS save_held FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE`,
       [sessionId],
     );
     if (!locked.rows.length) {
@@ -1246,7 +1247,8 @@ async function gateUserMessageTurn(
     }
     // None for a session that acts as a user (see `loadUserEnvForSession`).
     const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
-    if (locked.rows[0].agent_status === "running") {
+    // Queued behind the last turn's workspace save as behind a running turn (sessions/save-hold.ts).
+    if (locked.rows[0].agent_status === "running" || locked.rows[0].save_held === true) {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",
