@@ -104,6 +104,16 @@ export class ClawClient {
   }
 
   /**
+   * Open (or find, by conversation id) the session that carries the approvals of one conversation open in a terminal
+   * (approvals.ts). Throws {@link HttpError}: 409 `approvals_off` when the owner turned them off, 404 from a Claw without the route.
+   */
+  async openTerminalSession(cid: string, p: { agent_id: string; ref: string; cwd: string; title: string }): Promise<string> {
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/terminal-sessions`, p);
+    if (typeof d.session_id !== "string") throw new HttpError(500, "no_session_id", "/terminal-sessions");
+    return d.session_id;
+  }
+
+  /**
    * Whether command `cmdId`, received late (after a stall, held in the network, or past the live TTL), may still be carried out:
    * Claw's answer, `live` or why not (`session_closed`, `cancelled`, `expired`, `gone`). `received_late`: it was already older than
    * the live TTL when it came (only then may Claw call it `expired`). Throws {@link RevokedError} when this connector was revoked,

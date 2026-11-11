@@ -13,8 +13,8 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 mkdirSync(join(root, "dist"), { recursive: true });
 await build({
-  // The hook is its own, small bundle: SessionStart waits for it, so it must not load the connector's dependencies.
-  entryPoints: [join(root, "src/cli.ts"), join(root, "src/terminal-hook.ts")],
+  // The hooks are their own, small bundles: Claude Code waits for them, so they must not load the connector's dependencies.
+  entryPoints: [join(root, "src/cli.ts"), join(root, "src/terminal-hook.ts"), join(root, "src/approval-hook.ts")],
   outdir: join(root, "dist"),
   bundle: true,
   platform: "node",
@@ -26,3 +26,4 @@ await build({
 });
 chmodSync(join(root, "dist/cli.js"), 0o755);
 chmodSync(join(root, "dist/terminal-hook.js"), 0o755);
+chmodSync(join(root, "dist/approval-hook.js"), 0o755);

@@ -57,6 +57,10 @@ export class FakeClaw {
   limitRefusals = 0;
   /** Whether the connector-side `POST .../connectors/:cid/revoke` exists; false is a Claw from before it. */
   revokeRoute = true;
+  /** `POST .../terminal-sessions` (approvals asked in a terminal): what was asked, the session each ref got, and the owner's switch. */
+  readonly terminalOpens: any[] = [];
+  readonly terminalSessions = new Map<string, string>();
+  approvalsOff = false;
   /** Every revocation asked of this Claw, by either route, and what was asked with. */
   readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
@@ -245,6 +249,18 @@ export class FakeClaw {
       };
       if (this.holdConfirms) { this.heldConfirms.push(answer); return; }
       return answer();
+    }
+    const ts = /^\/v1\/remote-agents\/connectors\/([^/]+)\/terminal-sessions$/.exec(path);
+    if (ts && req.method === "POST") {
+      if (ts[1] !== this.connectorId) return this.json(res, 404, { ok: false, error: "not_found" });
+      const body = await this.readBody(req) as any;
+      this.terminalOpens.push(body);
+      this.wake();
+      if (this.approvalsOff) return this.json(res, 409, { ok: false, error: "approvals_off" });
+      const known = this.terminalSessions.get(String(body?.ref));
+      const sid = known ?? randomUUID();
+      this.terminalSessions.set(String(body?.ref), sid);
+      return this.json(res, 200, { ok: true, data: { session_id: sid, created: !known } });
     }
     const m = /^\/v1\/remote-agents\/connectors(?:\/([^/]+)\/(heartbeat|events|commands))?$/.exec(path);
     if (!m) return this.json(res, 404, { ok: false, error: "not_found" });

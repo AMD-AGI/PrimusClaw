@@ -42,6 +42,9 @@ export class SessionManager {
   /** The sessions {@link killAll} stopped: {@link idle} also waits for the prompts they were still counting. */
   private stopped: Session[] = [];
 
+  /** The sessions that carry a terminal's approvals (approvals.ts): their commands go there, never to an agent. */
+  approvals: { owns(sid: string): boolean; decide(actionId: string, optionId: string, by: string | null): boolean; close(sid: string): void } | null = null;
+
   constructor(private readonly env: SessionEnv) {}
 
   private agent(id: unknown): AgentConfig | undefined {
@@ -118,6 +121,18 @@ export class SessionManager {
     if (type === "session.new") { await this.sessionNew(cmd); return false; }
     if (!isRemoteCommandType(type)) {
       this.env.audit.record("command_dropped", { type: String(type).slice(0, 64), session_id: sid, cmd_id: cmdId, reason: "not_a_known_command", known: [...REMOTE_COMMAND_TYPES, "session.new"] });
+      return false;
+    }
+    if (this.approvals?.owns(sid)) {
+      if (type === "decision" && typeof cmd.action_id === "string" && typeof cmd.option_id === "string") {
+        this.approvals.decide(cmd.action_id, cmd.option_id, typeof cmd.by === "string" ? cmd.by : null);
+      } else if (type === "close") {
+        this.approvals.close(sid);
+      } else {
+        const seq = cmdSeqOf(cmd);
+        this.env.audit.record("command_rejected", { type, cmd_id: cmdId, reason: "terminal_hook_session" });
+        this.env.emit(sid, "command_rejected", { type, cmd_id: cmdId, reason: "terminal_hook_session", ...(seq !== null ? { cmd_seq: seq } : {}) });
+      }
       return false;
     }
     const s = await this.lookup(sid);
