@@ -244,6 +244,41 @@ it("a group turn stopped while its sandbox is prepared ends its floating status 
   assert.equal(run.ops.at(-1), closing[0], "nothing is shown in the stream after it is closed");
 });
 
+it("a Chinese group's turn the person stopped ends with 已停止。 and no Report a problem card under it", async () => {
+  // (2026-11-11 Claw #737 acceptance: the stop line came in English, "Stopped.", and every /stop got a feedback card)
+  const REPORT: OutMessage = { body: { type: "text", text: "REPORT" } };
+  const stoppedTurn = (lang: "zh" | "en", confirmed: boolean, subtype = "interrupted") =>
+    turn(
+      [
+        [0.1, tool("download_skill", "success")],
+        [0.2, ev("sandboxStatus", "m1", { status: "deferred" })],
+        [6.0, ev("ResultMessage", "m1", { data: { subtype } })],
+      ],
+      {
+        request: { group: true, lang, text: "请在沙箱里用 Python 运行 print(2**100)" },
+        hooks: { reportMessage: () => REPORT },
+        controls: { stopRequested: () => true, stopConfirmed: () => confirmed },
+      },
+    );
+  const reports = (run: StreamRun) => run.bus.sent.filter((s) => textOf(s.message) === "REPORT").length;
+  const zh = await stoppedTurn("zh", true);
+  assert.deepEqual(
+    finals(zh).map((f) => f.text),
+    ["已停止。"],
+  );
+  assert.equal(reports(zh), 0, "no Report a problem card under a turn the person stopped");
+  const en = await stoppedTurn("en", true);
+  assert.deepEqual(
+    finals(en).map((f) => f.text),
+    ["Stopped."],
+  );
+  assert.equal(reports(en), 0);
+  // A stop Claw did not confirm on a turn that failed is said as a failure, and the card stays under it.
+  const failed = await stoppedTurn("zh", false, "error");
+  assert.ok(finals(failed)[0]?.text.startsWith("已停止。\n\n任务出错了，没有完成。"), finals(failed)[0]?.text ?? "");
+  assert.equal(reports(failed), 1);
+});
+
 it("test_the_informative_text_is_cut_to_teams_limits_keeping_the_newest", () => {
   const lines = ["old ".repeat(200), "x".repeat(500), "最新的一步：读取文件"];
   const text = statusText(lines);

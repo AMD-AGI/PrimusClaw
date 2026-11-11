@@ -52,6 +52,10 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   longer tells them to send `/unlink`, which cannot remove a binding: it says the chat is connected through a SaFE
   identity binding and that the account's owner deletes it in SaFE under identity bindings (SaFE's administrator when
   SaFE does not name the account). `/unlink`'s answer to such a person is now in Chinese for a Chinese speaker.
+- `@primusclaw/personal-agent`: a turn the person stopped ends with the stop line in their language (已停止。 in a
+  Chinese chat, group or 1:1; it was always the English "Stopped."), and no longer with a "Report a problem" card under
+  it: a stop is what the person asked for. A stop Claw did not confirm on a turn that failed still says the failure and
+  keeps the card.
 
 ## 0.3.0
 

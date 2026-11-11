@@ -178,7 +178,7 @@ export class Credentials {
  * The group @mention's lead is said in Chinese to a person who reads Chinese.
  */
 function bindingLang(chat: Chat, lead: string): { readonly lang: Lang; readonly lead: string } {
-  if (!chat.zh()) return { lang: "en", lead };
+  if (chat.lang() !== "zh") return { lang: "en", lead };
   if (lead === routingText.in("en").dmLead) return { lang: "zh", lead: routingText.in("zh").dmLead };
   return lead === "" || /[\u4e00-\u9fff]/u.test(lead) ? { lang: "zh", lead } : { lang: "en", lead };
 }

@@ -143,7 +143,9 @@ it("a person who is not connected is shown the way to connect in their own chat 
   w.exchange.bound.delete("aad-a");
   await press(w, { chat: "group" });
   const connectCards = () =>
-    w.surface.outbox.filter((r) => "message" in r && JSON.stringify(rendered(r.message)).includes("I confirmed"));
+    w.surface.outbox.filter(
+      (r) => "message" in r && JSON.stringify(rendered(r.message)).includes('"primusclaw":"bind"'),
+    );
   assert.deepEqual(connectCards(), []);
   await press(w, { chat: "1:1", id: "a2" });
   const cards = connectCards();
