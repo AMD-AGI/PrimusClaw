@@ -4,8 +4,8 @@
 /**
  * One Teams conversation's outbound side (core's `Conversation`, the Python worker's `Messenger`): posting, editing and
  * deleting messages through the outbox, waiting for the id of a queued message, and opening a stream. Every operation
- * leaves one log line (what, how long, whether an ack is awaited; never the text): after a turn it is the only trace of
- * what the worker handed to Teams. In a group chat everything posted is masked first.
+ * leaves one log line (what, to which conversation, how long, whether an ack is awaited; never the text): after a turn
+ * it is the only trace of what the worker handed to Teams. In a group chat everything posted is masked first.
  */
 import type {
   Clock,
@@ -34,6 +34,7 @@ import {
   type PublishOptions,
   type TeamsEnvelope,
 } from "../outbound/outbox.js";
+import { outboundLogFields } from "../outbound/log-fields.js";
 import { openStream, type StreamContext } from "../stream/live-stream.js";
 import type { AckRegistry } from "./acks.js";
 import type { Masker } from "./masker.js";
@@ -93,6 +94,7 @@ export class TeamsConversation implements Conversation {
   private async publish(body: TeamsEnvelope, options?: PublishOptions): Promise<Delivered | undefined> {
     const activity = body.activity;
     const attachments = activity["attachments"];
+    const { conversation, content } = outboundLogFields(body);
     this.logger.info("outbound", {
       operation: body.operation,
       type: kindOf(activity),
@@ -100,13 +102,20 @@ export class TeamsConversation implements Conversation {
       attachments: Array.isArray(attachments) ? attachments.length : 0,
       ack: Boolean(body.ack),
       activityId: body.activity_id ?? "-",
+      conversation,
+      content,
     });
     const started = this.parts.clock.monotonicMs();
     const result = await this.parts.outbox.publish(body, options);
     const took = this.parts.clock.monotonicMs() - started;
     if (result === undefined && took >= SLOW_PUBLISH_MS) {
       // (a direct send logs its own latency)
-      this.logger.warn("outbound took long to hand to the queue", { operation: body.operation, tookMs: took });
+      this.logger.warn("outbound took long to hand to the queue", {
+        operation: body.operation,
+        tookMs: took,
+        conversation,
+        content,
+      });
     }
     return result;
   }
@@ -191,7 +200,11 @@ export class TeamsConversation implements Conversation {
       status,
       post: async (activity, signal) => {
         const body = envelope("send", reference(this.ref), this.prepare(activity));
-        this.logger.info("outbound stream", { type: kindOf(body.activity), chars: streamChars(body.activity) });
+        this.logger.info("outbound stream", {
+          type: kindOf(body.activity),
+          chars: streamChars(body.activity),
+          ...outboundLogFields(body),
+        });
         return (await outbox.publishStream(body, { signal })).activityId;
       },
       render: (message) => activityOf(message, this.parts.render),

@@ -10,7 +10,7 @@ import test from "node:test";
 import { UnaddressableError } from "../../src/connector/errors.js";
 import { DEFAULT_LIMITS } from "../../src/connector/limits.js";
 import { buildRequest } from "../../src/connector/request.js";
-import { DeleteUnsupportedError } from "../../src/outbound/outbox.js";
+import { DeleteUnsupportedError, type TeamsEnvelope } from "../../src/outbound/outbox.js";
 import { FakeClock } from "../../../../test-support/clock.js";
 import {
   build,
@@ -183,6 +183,58 @@ test("every direct send logs one line with its latency and never the text or the
   assert.ok(b.logger.records.some((r) => r.message === "direct send not delivered, handing it to the queue"));
   const text = b.logger.text();
   assert.ok(!text.includes(SECRET_TEXT) && !text.includes("token-1") && !text.includes("Bearer"));
+});
+
+test("every direct line names the target conversation and whether it is a card, a message or typing", async () => {
+  const t = teams();
+  t.answers = [json(201, { id: "teams-1" }), json(201, { id: "teams-2" }), json(201, {}), json(201, { id: "s-1" })];
+  const b = build({ teams: t });
+  const target = reference("a:1target-conversation");
+  const card: TeamsEnvelope = {
+    operation: "send",
+    reference: target,
+    activity: {
+      type: "message",
+      attachments: [
+        { contentType: "application/vnd.microsoft.card.adaptive", content: { body: [{ text: SECRET_TEXT }] } },
+      ],
+    },
+  };
+  await settle(b.clock, b.outbox.publish(card));
+  await settle(b.clock, b.outbox.publish(envelope(SECRET_TEXT, { ref: target })));
+  await settle(b.clock, b.outbox.publish({ operation: "send", reference: target, activity: { type: "typing" } }));
+  await settle(b.clock, b.outbox.publishStream(envelope(SECRET_TEXT, { ref: reference("19:group@thread.v2") })));
+  const lines = b.logger.records.filter((r) => r.message.startsWith("direct "));
+  assert.deepEqual(
+    lines.map((r) => [r.message, r.fields["kind"], r.fields["content"], r.fields["conversation"]]),
+    [
+      ["direct send delivered", "message", "card", "a:1target-conversation"],
+      ["direct send delivered", "message", "message", "a:1target-conversation"],
+      ["direct send delivered", "typing", "typing", "a:1target-conversation"],
+      ["direct stream delivered", "message", "message", "19:group@thread.v2"],
+    ],
+  );
+  // the value is the conversation the request went to
+  assert.ok(t.calls[0]?.url.includes("/v3/conversations/a:1target-conversation/activities"));
+  const text = b.logger.text();
+  assert.ok(!text.includes(SECRET_TEXT) && !text.includes("29:user") && !text.includes("aad-1")); // no text, no person
+});
+
+test("a send handed to the queue names its conversation, and one without a conversation says -", async () => {
+  const t = teams();
+  t.answers = [empty(503)];
+  const b = build({ teams: t });
+  await settle(b.clock, b.outbox.publish(envelope(SECRET_TEXT, { ref: reference("19:busy@thread.v2") })));
+  await settle(b.clock, b.outbox.publish(envelope(SECRET_TEXT, { ref: reference("19:busy@thread.v2") })));
+  await settle(b.clock, b.outbox.publish(envelope(SECRET_TEXT, { ref: { serviceUrl: SERVICE_URL } })));
+  const named = (message: string) => b.logger.records.find((r) => r.message.startsWith(message))?.fields;
+  assert.equal(named("direct send not delivered")?.["conversation"], "19:busy@thread.v2");
+  assert.equal(named("direct send not delivered")?.["content"], "message");
+  assert.equal(named("direct send skipped")?.["conversation"], "19:busy@thread.v2");
+  const unaddressable = b.logger.records.filter((r) => r.message.startsWith("direct send not delivered")).at(-1);
+  assert.equal(unaddressable?.fields["conversation"], "-");
+  assert.equal(b.queue.sent.length, 3);
+  assert.ok(!b.logger.text().includes(SECRET_TEXT));
 });
 
 // --- deleting a message ---
