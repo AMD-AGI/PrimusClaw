@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | none tagged yet; the first will be 0.1.0 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` and `-teams-ingress` on npm, the Teams ingress's Function package and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.3.0 |
 
@@ -68,9 +68,10 @@ deployment numbers, not release versions.
 
 A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
 build id was built from. It does not rebuild anything: the image to deploy
-for it is that commit's build-id image, named in the release notes. Cut
-one at least whenever what ships carries a new feature or an incompatible
-change.
+for it is that commit's build-id image, named in the release notes. Every
+production rollout of a new build id is a release and gets a tag: PATCH when
+it only fixes bugs, MINOR when it adds a feature or makes an incompatible
+change, so a user can name the version that carries a fix.
 
 1. Find the commit of the build you are releasing (the Build workflow run
    that pushed it logs `CLAW_BUILD in image: '<build id>'`; its `headSha` is
@@ -100,6 +101,21 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+## [0.1.1] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611112033` (commit 8566ebd5). Connector requirements unchanged from 0.1.0.
+
+### Fixed
+- A turn stopped with `/stop` while Brain was still setting it up now ends on the session's event stream: Brain emits a
+  main-agent `ResultMessage` with `subtype: "interrupted"` before `exec_complete` (the A2A stream reports it `CANCELED`), so a
+  group chat's "Thinking…" no longer stays up until the worker's turn deadline (#737).
+
+## [0.1.0] - 2026-11-11
+
+The first tagged Claw release, a baseline for what was deployed on that day; every entry below is in it. Image
+`docker.io/primussafe/claw:202611112010` (commit 21ffe4ef). Serves connectors from 0.1.3 on and recommends 0.1.4 or later
+(`CONNECTOR_VERSIONS`); answering a terminal's Claude Code questions from Teams (#706) needs connector 0.1.23 or later.
 
 ### Added
 - `SANDBOX_ALLOWED_NAMESPACES` (comma or space separated; unset or empty allows every workspace, as before): the SaFE
