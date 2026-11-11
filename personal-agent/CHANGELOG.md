@@ -8,8 +8,9 @@ SPDX-License-Identifier: MIT
 The three packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
 `@primusclaw/personal-agent-teams`) and the `personal-agent-teams` image are released together at one version. Each
 release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub Release's notes (README.md,
-"Releasing"): a version without a section is not released. While the version is 0.x, a patch release fixes and a minor
-release adds; a change to a plugin port (core's `src/plugins/`) is always a minor release and is called out here.
+"Releasing"): a version without a section is not released. Which number a release moves, and what its notes must say
+(each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
+feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
 ## 0.3.0
 

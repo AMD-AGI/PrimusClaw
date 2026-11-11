@@ -216,6 +216,8 @@ In short:
 ## Releasing (maintainers)
 
 A release is the tag `personal-agent-vX.Y.Z` on a commit of `main` whose three `package.json` files name `X.Y.Z`.
+`X.Y.Z` is chosen by the repository's versioning rules ([CHANGELOG.md](../CHANGELOG.md#versioning)), which Claw and the
+connector follow too.
 Pushing it starts
 [personal-agent-release.yml](../.github/workflows/personal-agent-release.yml). Its `package` job (no credential, no
 OIDC) runs `npm run check`, builds the packages, packs and checks them with `check-pack --version X.Y.Z`, takes the
