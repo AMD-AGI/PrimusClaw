@@ -1251,7 +1251,8 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     `SELECT head_sha, COALESCE(posted->>'event', arguments->>'event', '') AS event,
             CASE WHEN jsonb_typeof(posted->'findings') = 'array' THEN jsonb_array_length(posted->'findings') ELSE 0 END AS findings, at
        FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok'
-        AND detail IN ('submitted', 'already_submitted') ORDER BY at DESC, id DESC LIMIT 1`,
+        -- (the row of the write that posted it: a retry answered already_submitted keeps no findings, and would read as none)
+        AND detail IN ('submitted', 'already_submitted') AND posted IS NOT NULL ORDER BY at DESC, id DESC LIMIT 1`,
     [sessionId],
   )).rows[0] as { head_sha: string; event: string; findings: number; at: unknown } | undefined;
   const ci = (await q.query(

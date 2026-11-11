@@ -185,7 +185,7 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
     const last = (await q(
       `SELECT head_sha, COALESCE(posted->>'event', arguments->>'event', '') AS event, posted FROM claw_github_audit
         WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok' AND detail IN ('submitted', 'already_submitted')
-        ORDER BY at DESC, id DESC LIMIT 1`,
+          AND posted IS NOT NULL ORDER BY at DESC, id DESC LIMIT 1`,
       [item.worker_session_id],
     )).rows[0] as { head_sha: string; event: string; posted: { review_id?: unknown } | null } | undefined;
     if (!last) return skipped("nothing_posted");

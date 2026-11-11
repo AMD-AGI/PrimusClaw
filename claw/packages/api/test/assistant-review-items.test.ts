@@ -1671,6 +1671,21 @@ describe("assistant review items", { skip }, () => {
     assert.match(told[1]!, /`src\/a\.ts:12` the lock is never released/);
     assert.match(told[1]!, new RegExp(`review again #${findings.seq}`));
 
+    // A retry of a review with findings answers already_submitted and keeps no findings: the review is still the one with findings, and
+    // does not wait for CI.
+    const retried = await one("alice", { prs: [PR(265)], review_only: false });
+    await firstTurnWords(retried.session_id);
+    await postedReview(retried.session_id, { event: "COMMENT", ci: ["ci_failed: test"], findings: [{ path: "b.ts", line: 4, thread_id: "T2", note: "races" }] });
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, at)
+       VALUES ('alice', 'alice', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_review_submit', '{"event":"COMMENT"}', 'ok', 'already_submitted', NOW() + INTERVAL '1 second')`,
+      [retried.session_id, "a".repeat(40)],
+    );
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    assert.equal((await w.item(retried.item_id)).board_state, "done", "not a CI wait");
+    assert.match((await toldTo("alice")).at(-1)!, /1 blocking finding[\s\S]*`b\.ts:4` races/);
+
     // A review someone asked of another person is told by the chat that started it, not here.
     const asked = await start("alice", { prs: [PR(270)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
     const askedItem = await w.item(asked.body.data.items[0].item_id);
@@ -1680,7 +1695,7 @@ describe("assistant review items", { skip }, () => {
     await ri.sweepReviewItems();
     await reviewResultsSettled();
     assert.equal((await w.item(askedItem.item_id)).board_state, "done", "it does not wait for CI either");
-    assert.deepEqual([(await toldTo("alice")).length, (await toldTo("bob")).length], [2, 0]);
+    assert.deepEqual([(await toldTo("alice")).length, (await toldTo("bob")).length], [3, 0]);
   });
 
   test("RS2 a review held back only by CI is run once more when CI on its head is green, and its approval goes to the merge card", async () => {
