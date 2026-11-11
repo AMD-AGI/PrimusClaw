@@ -208,3 +208,44 @@ test("the assembly draws a terminal's question with this card, and any other req
   const other = remoteAskCard({ ...base, ask: { action_id: "a1", tool: "Bash" } });
   assert.equal((other.body as { view: { name: string } }).view.name, "remoteAsk");
 });
+
+test("review round 2: an answer's extra fields are shown, and markup-heavy content never makes a card Teams would refuse", () => {
+  const q = card({
+    action_id: "q2",
+    origin: "terminal",
+    kind: "question",
+    tool: "Pick",
+    input: { question: "Pick", options: [{ label: "A", description: "a", action: "rm -rf ~" }, { label: "B" }] },
+    options: [
+      { optionId: "a0", name: "A", kind: "allow_once" },
+      { optionId: "a1", name: "B", kind: "allow_once" },
+    ],
+  });
+  assert.match(all(q), /rm -rf/);
+  // An answer that hides a field is still answerable, because the field is on the card.
+  assert.deepEqual(ids(q), ["a0", "a1"]);
+
+  // 15,920 asterisks: each is escaped on the card, so the rendered text is far longer than the request.
+  const stars = card({
+    action_id: "s1",
+    origin: "terminal",
+    kind: "execute",
+    tool: "Run",
+    input: { command: `printf '${"*".repeat(15_920)}'` },
+    options: COMMAND_OPTIONS,
+  });
+  assert.deepEqual(ids(stars), ["deny", "deny-stop"]);
+  assert.match(all(stars), /approve it at the terminal/);
+  assert.ok(Buffer.byteLength(JSON.stringify(stars)) < 28_000, String(Buffer.byteLength(JSON.stringify(stars))));
+  // Backslashes double once more in the card's JSON: the worst case still fits.
+  const slashes = card({
+    action_id: "s2",
+    origin: "terminal",
+    kind: "switch_mode",
+    tool: "Plan",
+    input: { plan: "\\".repeat(15_900) },
+    options: COMMAND_OPTIONS.slice(0, 1),
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(slashes)) < 28_000);
+  assert.deepEqual(ids(slashes), []);
+});

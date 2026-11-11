@@ -24,6 +24,8 @@ import { optionButtons } from "./permission-view.js";
  * most 16 KiB of JSON, and what is shown of it (unescaped, without the JSON's quoting) is no longer.
  */
 export const TERMINAL_CONTENT_MAX = 16_000;
+/** The most bytes of rendered content (as the card's JSON carries it) a card holds, leaving room under Teams' ~28 KB for the rest. */
+export const TERMINAL_CARD_BYTES = 20_000;
 
 /** How long one line of a card may be (a description, a header, a path, an answer's label or meaning) before it is cut. */
 const LINE_MAX = 400;
@@ -140,10 +142,17 @@ function questionContent(input: Reported, words: Words): Content | undefined {
   const options = Array.isArray(input["options"]) ? input["options"] : [];
   const sections: TerminalSection[] = header ? [{ type: "line", text: header }] : [];
   sections.push({ type: "words", text: question });
-  for (const o of options) {
-    const r = record(o) ?? {};
-    sections.push({ type: "option", label: str(r["label"]), description: str(r["description"]) });
+  const extras: Reported[] = [];
+  for (const o of options as unknown[]) {
+    const r = record(o);
+    sections.push({ type: "option", label: str(r?.["label"]), description: str(r?.["description"]) });
+    // (an answer that is not an object, or carries fields beyond its label and meaning, is shown whole after the answers)
+    const rest = r
+      ? Object.fromEntries(Object.entries(r).filter(([k]) => k !== "label" && k !== "description"))
+      : { value: o };
+    if (Object.keys(rest).length) extras.push(rest);
   }
+  if (extras.length) sections.push({ type: "code", text: JSON.stringify(extras, null, 2) });
   return { asks: words.asksQuestion, sections, fields: ["question", "header", "options"] };
 }
 
@@ -187,16 +196,40 @@ function inert(s: TerminalSection, left: number): TerminalSection {
   return { type: "line", text: lit(piece, LINE_MAX) };
 }
 
-/** The sections as the card shows them: at most TERMINAL_CONTENT_MAX characters (what is cut is never offered for approval). */
-function shownSections(sections: readonly TerminalSection[]): TerminalSection[] {
-  const out: TerminalSection[] = [];
-  let left = TERMINAL_CONTENT_MAX;
+const UTF8 = new TextEncoder();
+/** What a section adds to the card as sent: its rendered text as JSON (escaping counted), in UTF-8 bytes. */
+const renderedBytes = (s: TerminalSection): number =>
+  UTF8.encode(JSON.stringify(s.type === "option" ? [s.label, s.description] : s.text)).length;
+
+/**
+ * The sections as the card shows them, and whether all of them fit whole: at most TERMINAL_CONTENT_MAX characters of the
+ * request, and at most TERMINAL_CARD_BYTES of rendered text, so the card always goes out (what is cut is never offered for
+ * approval). Escaping can make the rendered text several times longer than the request.
+ */
+function shownSections(sections: readonly TerminalSection[]): { shown: TerminalSection[]; whole: boolean } {
+  const shown: TerminalSection[] = [];
+  let chars = TERMINAL_CONTENT_MAX;
+  let bytes = TERMINAL_CARD_BYTES;
   for (const s of sections) {
-    if (left <= 0) break;
-    out.push(inert(s, left));
-    left -= sectionChars(s);
+    if (chars <= 0 || bytes <= 0) return { shown, whole: false };
+    const out = inert(s, chars);
+    if (renderedBytes(out) > bytes) {
+      // the longest prefix whose rendered text fits what is left
+      let lo = 0;
+      let hi = s.type === "option" ? 0 : Math.min(s.text.length, chars);
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (renderedBytes(inert(s, mid)) <= bytes) lo = mid;
+        else hi = mid - 1;
+      }
+      if (s.type !== "option" && lo > 0) shown.push(inert(s, lo));
+      return { shown, whole: false };
+    }
+    shown.push(out);
+    chars -= sectionChars(s);
+    bytes -= renderedBytes(out);
   }
-  return out;
+  return { shown, whole: chars >= 0 };
 }
 
 function notesOf(ask: Reported, complete: boolean, options: readonly PermissionOption[], words: Words): string[] {
@@ -219,9 +252,11 @@ export function terminalAskView(input: TerminalAsk, lang: Lang = "en"): Terminal
   const ask = input.ask;
   const raw = record(ask["input"]);
   const content = contentOf(str(ask["kind"]), str(ask["tool"]), raw, words);
+  const rendered = shownSections(content.sections);
   const complete =
     raw !== undefined &&
     content.clipped !== true &&
+    rendered.whole &&
     !content.sections.some(sectionClipped) &&
     content.sections.reduce((n, s) => n + sectionChars(s), 0) <= TERMINAL_CONTENT_MAX;
   // Cut, never shown in part with a way to approve it: what was cut is what would run. An "always" option whose name (the
@@ -243,7 +278,7 @@ export function terminalAskView(input: TerminalAsk, lang: Lang = "en"): Terminal
       project: lit(projectOf(ask), 80),
     }),
     asks: content.asks,
-    sections: shownSections(content.sections),
+    sections: rendered.shown,
     notes: notesOf(ask, complete, options, words),
     buttons,
     complete,
