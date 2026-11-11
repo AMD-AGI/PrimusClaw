@@ -186,7 +186,9 @@ authentication at all.
 
 ## Releases and versioning
 
-Each published component is released on its own tag and versioned on its own:
+The personal agent and the connector are released on tags of their own and
+versioned independently; the Claw and Agent Sandbox images are built from `main`
+and from `v*` tags:
 
 | Component | Tag | Published to | Release notes |
 |---|---|---|---|
@@ -194,12 +196,13 @@ Each published component is released on its own tag and versioned on its own:
 | Connector | `connector-vX.Y.Z` | npm | the [GitHub Release](https://github.com/AMD-AGI/PrimusClaw/releases) of the tag |
 | Claw, Agent Sandbox | images from every `main` build (`latest` plus a timestamp tag) and from `v*` tags | Docker Hub | [`CHANGELOG.md`](CHANGELOG.md) |
 
-npm packages are published from GitHub Actions with
-[Trusted Publishing](https://docs.npmjs.com/trusted-publishers) (OIDC, no
-stored npm token) and npm provenance, and each release carries a build
-provenance attestation you can check with
-`gh attestation verify <file> --repo AMD-AGI/PrimusClaw`. Every publish waits
-for a required reviewer's approval. The release procedures are in the
+After each package's first version, which a maintainer published by hand so
+that it could be given a Trusted Publisher, npm releases are published from
+GitHub Actions with [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
+(OIDC, no stored npm token) and npm provenance. Each such release carries a
+build provenance attestation you can check with
+`gh attestation verify <file> --repo AMD-AGI/PrimusClaw`, and its publish job
+waits for a required reviewer's approval. The release procedures are in the
 connector's and the personal agent's READMEs.
 
 ## Documentation
@@ -225,8 +228,11 @@ Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setup,
 the checks a pull request must pass, coverage floors, and the
 [Developer Certificate of Origin](https://developercertificate.org/) sign-off
 (`git commit -s`) required on every commit. `make verify` from the repository
-root builds and tests every tree, plus the lint and license checks, mirroring
-CI; `make help` lists the per-tree targets.
+root builds and tests Claw, Agent Sandbox, the Python packages and the docs,
+plus the lint and license checks; `make help` lists the per-tree targets. The
+personal agent (`npm run check` in `personal-agent/`) and the connector (see
+its [Development](connector/README.md#development) section) have their own
+checks, which CI runs in their own workflows.
 
 ## Security
 
