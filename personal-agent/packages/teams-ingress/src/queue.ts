@@ -18,7 +18,8 @@ export interface QueueMessage {
 
 /** The part of a ServiceBusSender the ingress uses. */
 export interface QueueSender {
-  sendMessages(message: QueueMessage): Promise<void>;
+  /** `abortSignal` ends the send, and the SDK's retries of it, when it fires. */
+  sendMessages(message: QueueMessage, options?: { abortSignal?: AbortSignal }): Promise<void>;
   /** Opens the connection and the link (and so takes the token) without sending. */
   createMessageBatch(): Promise<unknown>;
   close(): Promise<void>;
