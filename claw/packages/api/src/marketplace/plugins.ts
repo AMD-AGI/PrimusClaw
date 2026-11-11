@@ -168,26 +168,27 @@ function rowMatchingVersion(rows: JsonObject[], ver: string): JsonObject | null 
   return null;
 }
 
+/** A row's `updated_at` (else `created_at`) as epoch ms; 0 when absent or unparseable. */
+function rowTimeMs(x: JsonObject): number {
+  const v = x.updated_at ?? x.created_at;
+  const ms = v instanceof Date ? v.getTime() : typeof v === "string" || typeof v === "number" ? new Date(v).getTime() : NaN;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 /**
- * Row with max (semver tuple, ``updated_at``/``created_at`` string, ``id``) — Python ``_latest_row_by_version``.
+ * Row with max (semver tuple, ``updated_at``/``created_at`` time, ``id``) — Python ``_latest_row_by_version``.
+ * The time is compared as a time: pg returns a Date, whose string form sorts by weekday name.
  */
-function latestRowByVersion(rows: JsonObject[]): JsonObject {
+export function latestRowByVersion(rows: JsonObject[]): JsonObject {
   if (!rows.length) throw new BadRequestError("rows must not be empty");
   let top = rows[0]!;
-  const key = (x: JsonObject): [number, number, number, string, number] => [
-    ...versionSortTuple(x.version),
-    String(x.updated_at ?? x.created_at ?? ""),
-    Number(x.id ?? 0),
-  ];
   const cmp = (a: JsonObject, b: JsonObject): number => {
-    const ka = key(a);
-    const kb = key(b);
     const byVer = compareVersion(a.version, b.version);
     if (byVer !== 0) return byVer;
-    const ta = ka[3];
-    const tb = kb[3];
-    if (ta !== tb) return ta < tb ? -1 : ta > tb ? 1 : 0;
-    return ka[4] - kb[4];
+    const ta = rowTimeMs(a);
+    const tb = rowTimeMs(b);
+    if (ta !== tb) return ta - tb;
+    return Number(a.id ?? 0) - Number(b.id ?? 0);
   };
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i]!;
@@ -328,6 +329,24 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     author: r.author,
     is_public: r.is_public ?? true,
     status: r.status ?? "active",
+    created_at: formatTs(r.created_at),
+    updated_at: formatTs(r.updated_at),
+    deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    // Only on a collapsed listing row: how many versions of this name the caller can see.
+    ...(r.version_count !== undefined && r.version_count !== null ? { version_count: Number(r.version_count) } : {}),
+  };
+}
+
+/** One entry of `GET /v1/plugins/:id/versions`: enough to pick a version, then address it by id. */
+export function formatPluginVersionRow(r: JsonObject): JsonObject {
+  return {
+    id: Number(r.id),
+    name: r.name,
+    version: r.version,
+    status: r.status ?? "active",
+    is_public: r.is_public ?? true,
+    owner_user_id: r.owner_user_id,
+    author: r.author,
     created_at: formatTs(r.created_at),
     updated_at: formatTs(r.updated_at),
     deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,

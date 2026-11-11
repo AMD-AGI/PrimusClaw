@@ -469,3 +469,51 @@ also stores the manifest it actually ran with. The API logs
 `plugin_overrides.applied` with the task, plugin, user and the overridden keys,
 never the values. For an app run, `overrides` is part of what an
 `Idempotency-Key` is bound to; a request without it hashes as before.
+
+---
+
+## 5. Listing Plugins and Their Versions
+
+`GET /v1/plugins` lists **one entry per plugin**, where a plugin is an owner's
+name: the latest active version of that (owner, name) the caller may see.
+Names are not owned, so two users' plugins called `alpha` are two entries, and
+one user's versions never replace or count towards another's. "Latest" is the
+version order an upsert uses (the first three dot-separated parts compared by
+their leading digits, so `1.10.0` is newer than `1.9.0`; ties go to the most
+recently updated row, then the highest id), not the row touched last. A
+collapsed entry carries `version_count`: the number of versions of that
+(owner, name) the listing covers, which is the active ones unless `status`
+says otherwise.
+
+| Query parameter | Effect |
+| --------------- | ------ |
+| `latest_per_name` | Defaults to `true`. `false` (also `0`, `no`) lists every row (every version), as before this default; `true`, `1`, `yes` collapse; anything else is `400`. |
+| `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
+| `include_deleted` | Admins only, as before. A deleted version never wins over a live one; it is the entry only when nothing of the plugin is live. |
+| `name_exact`, `name`, `owner`, `limit`, `offset` | Unchanged. |
+
+The other versions are listed on demand:
+
+```
+GET /v1/plugins/:id/versions
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "name": "my-plugin",
+    "versions": [
+      { "id": 12, "name": "my-plugin", "version": "1.10.0", "status": "active", "is_public": true,
+        "owner_user_id": "...", "author": "...", "created_at": "...", "updated_at": "...", "deleted_at": null }
+    ]
+  }
+}
+```
+
+Versions are those of the same owner and name as `:id`, newest first, and only
+those the caller may see; deleted versions are left out (an admin may pass
+`include_deleted=true`). The route answers `404`
+or `403` exactly as `GET /v1/plugins/:id` does for the same id. Every version
+keeps its own id, and every other route (`GET`, `PATCH`, `DELETE`, launches)
+still addresses a plugin by id.

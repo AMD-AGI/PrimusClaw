@@ -2866,6 +2866,18 @@ async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
     // covers every row the old index did.
 }
 
+/**
+ * "Newest version first", in SQL: the first three dot-separated parts compared
+ * by their leading digits (a missing or non-numeric part is 0), then the most
+ * recently updated, then the highest id. The order `latestRowByVersion`
+ * (marketplace/plugins.ts) uses to pick the version an upsert extends, for
+ * version parts that fit a JavaScript number.
+ */
+const versionPart = (n: number) =>
+  `COALESCE(NULLIF(substring(split_part(version, '.', ${n}) from '^[0-9]+'), '')::numeric, 0)`;
+export const PLUGIN_VERSION_ORDER =
+  `${versionPart(1)} DESC, ${versionPart(2)} DESC, ${versionPart(3)} DESC, updated_at DESC, id DESC`;
+
 /** Row shapes from tools/plugins/resources (JSONB columns parsed). */
 export type JsonObject = Record<string, unknown>;
 
@@ -3373,11 +3385,24 @@ export const MarketplaceDb = {
       conds.push(`name ILIKE ${p()}`);
       args.push(`%${params.nameContains.trim()}%`);
     }
+    // Collapsed, a plugin is one entry: the latest active version of an
+    // (owner, name). Names are not owned -- two users may each publish "alpha"
+    // -- so a name alone would let one user's higher version replace another's
+    // plugin. Without an explicit status filter only active rows compete, so a
+    // disabled newer version never hides the one that runs.
+    if (params.latestPerName && !params.status) conds.push("status = 'active'");
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
     const sortCol = params.sortField === "updated_at" ? "updated_at" : "created_at";
     const ord = params.sortOrder === "asc" ? "ASC" : "DESC";
+    // `version_count` is counted over the same rows (window functions run
+    // before DISTINCT ON): the versions of that (owner, name) this listing
+    // covers. A deleted row (admins, include_deleted) sorts after every live
+    // one, so it is the entry only when nothing of the plugin is live.
     const baseFrom = params.latestPerName
-      ? `(SELECT DISTINCT ON (name) * FROM plugins ${where} ORDER BY name, ${sortCol} DESC, id DESC) t`
+      ? `(SELECT DISTINCT ON (owner_user_id, name) *,
+                 COUNT(*) OVER (PARTITION BY owner_user_id, name)::int AS version_count
+           FROM plugins ${where}
+          ORDER BY owner_user_id, name, (deleted_at IS NOT NULL), ${PLUGIN_VERSION_ORDER}) t`
       : `(SELECT * FROM plugins ${where}) t`;
     const cnt = await db.query(`SELECT COUNT(*)::int AS c FROM ${baseFrom}`, args);
     const total = (cnt.rows[0] as { c: number }).c;
@@ -3389,6 +3414,35 @@ export const MarketplaceDb = {
       args,
     );
     return { rows: data.rows as JsonObject[], total };
+  },
+
+  /**
+   * Every version of one plugin -- one (owner, name), since names are not
+   * owned -- that the viewer may see, newest first by the version order
+   * `upsertPlugin` uses. Deleted rows are left out unless asked for.
+   */
+  async listPluginVersions(params: {
+    name: string;
+    ownerUserId: string | null;
+    viewerUserId?: string;
+    isAdmin: boolean;
+    includeDeleted: boolean;
+  }): Promise<JsonObject[]> {
+    const conds = ["name = $1", "owner_user_id IS NOT DISTINCT FROM $2"];
+    const args: unknown[] = [params.name, params.ownerUserId];
+    if (!params.includeDeleted) conds.push("deleted_at IS NULL");
+    if (!params.isAdmin) {
+      if (params.viewerUserId) {
+        conds.push("(is_public = true OR owner_user_id = $3)");
+        args.push(params.viewerUserId);
+      } else conds.push("is_public = true");
+    }
+    const r = await db.query(
+      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at
+         FROM plugins WHERE ${conds.join(" AND ")} ORDER BY ${PLUGIN_VERSION_ORDER}`,
+      args,
+    );
+    return r.rows as JsonObject[];
   },
 
   async listResourcesRepo(params: {
