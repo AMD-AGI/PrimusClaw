@@ -52,6 +52,7 @@ import { newMcpToken, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { db } from "../infra/db.js";
 import { canViewPlugin } from "../marketplace/plugins.js";
+import { PLUGIN_NOT_EXPIRED_SQL } from "../marketplace/plugin-expiry.js";
 import {
   applyAppOverrides,
   checkOverrides,
@@ -390,7 +391,7 @@ export async function checkAppRunRequest(
   // 1. The plugin, the caller's right to it, and its manifest.
   const row = (await db.query(
     `SELECT id, version, resource, images, overridable, owner_user_id, is_public FROM plugins
-      WHERE id = $1 AND deleted_at IS NULL`,
+      WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL}`,
     [pluginId],
   )).rows[0] as {
     id: string | number; version: string | null; resource: unknown; images: unknown; overridable: unknown;

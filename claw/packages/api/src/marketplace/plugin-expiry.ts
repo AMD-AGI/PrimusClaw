@@ -25,6 +25,17 @@ const logger = pino({ name: "plugin-expiry" });
 /** The CHECK constraint that keeps a public plugin permanent. */
 export const TEMPORARY_NOT_PUBLIC_CONSTRAINT = "plugins_temporary_not_public";
 
+/**
+ * How long after `expires_at` the sweep waits. Admission refuses a plugin past
+ * its `expires_at` (routes/tasks.ts, tasks/app-run.ts), so a launch that got in
+ * read the plugin before then; the grace outlasts any admission, so by the
+ * time the sweep looks, that launch's task row is there and keeps the plugin.
+ */
+export const PLUGIN_EXPIRY_GRACE_SEC = 600;
+
+/** The condition an admission adds to its plugin read: not past its expiry. */
+export const PLUGIN_NOT_EXPIRED_SQL = "(expires_at IS NULL OR expires_at > NOW())";
+
 /** Shortest TTL a write may ask for: shorter is a mistake, not a plugin. */
 export const PLUGIN_TTL_MIN_SECONDS = 60;
 
@@ -87,7 +98,7 @@ export function temporaryPublicError(): BadRequestError {
  */
 export const PLUGIN_EXPIRY_SWEEP_SQL = `
   UPDATE plugins p SET deleted_at = NOW(), updated_at = NOW()
-   WHERE p.expires_at IS NOT NULL AND p.expires_at <= NOW()
+   WHERE p.expires_at IS NOT NULL AND p.expires_at <= NOW() - INTERVAL '${PLUGIN_EXPIRY_GRACE_SEC} seconds'
      AND p.deleted_at IS NULL AND p.is_public = false
      AND NOT EXISTS (SELECT 1 FROM claw_tasks t
                       WHERE t.plugin_id = p.id AND t.status NOT IN ('completed','failed','cancelled'))

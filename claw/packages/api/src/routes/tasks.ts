@@ -43,6 +43,7 @@ import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
 import { DELETED_SESSION_TASK_READ_SEC } from "../config.js";
+import { PLUGIN_NOT_EXPIRED_SQL } from "../marketplace/plugin-expiry.js";
 import { checkOverrides, hasOverrides, overrideKeys, overridesAudit, type OverrideProblem, type OverrideValues } from "../marketplace/plugin-overrides.js";
 
 /**
@@ -248,7 +249,7 @@ export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown
 async function loadPluginRow(pluginId: number) {
   const r = await db.query(
     `SELECT id, name, version, images, resource, tools, overridable FROM plugins
-     WHERE id = $1 AND deleted_at IS NULL`,
+     WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL}`,
     [pluginId],
   );
   if ((r.rowCount ?? 0) === 0) return null;
@@ -299,6 +300,9 @@ async function resolveCreateTarget(body: CreateTaskBody, user: UserInfo): Promis
   }
   if (dag && !plugin && dag.plugin_id) plugin = await loadPluginRow(dag.plugin_id);
   if (body.dag_id && !dag) return { status: 404, error: "dag_not_found" };
+  // A named plugin that is gone (deleted, or a temporary one past its expiry)
+  // is refused rather than run without its tools.
+  if (body.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
   if (dag && !canExecuteTaskDag(dag, user)) return { status: 404, error: "dag_not_found" };
   return { dag: (dag as unknown as TaskDagDef | null) ?? null, plugin };
 }
