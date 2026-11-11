@@ -58,6 +58,9 @@ export function decidedLine(option: PermissionOption, tool: string, lang: Lang):
   return lang === "zh" ? `${verdict}：${shown}` : `${verdict}: ${shown}.`;
 }
 
+/** The origins of a question a terminal asks: as the connector marks it, and as Claw's push names it. */
+const TERMINAL_ORIGINS: ReadonlySet<string> = new Set(["terminal_hook", "terminal"]);
+
 export class Permissions {
   constructor(
     private readonly ctx: RemoteContext,
@@ -80,7 +83,8 @@ export class Permissions {
     const actionId = textOf(request["actionId"]);
     // A question a terminal asks reaches the owner as its own card (Claw's push, which shows its content): a chat attached to the
     // session that carries it draws nothing, so the request is never shown here with every option and none of the content.
-    if (request["origin"] === "terminal_hook") return;
+    // (the connector marks it `terminal_hook`; `terminal` is how Claw's push names the same origin: either is never drawn here)
+    if (TERMINAL_ORIGINS.has(textOf(request["origin"]))) return;
     const options = parseOptions(request["options"]);
     if (!actionId || options.length === 0) {
       await to.send(textMessage(saidIn(lang, "noAnswerableOption")));

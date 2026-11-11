@@ -8,7 +8,8 @@
  *
  * Nothing is approved unseen. The card shows the request whole (the connector and Claw carry it whole, credentials masked); a
  * request whose content did not come (Claw leaves it out past its size), or that is longer than a card shows, keeps only the
- * options that turn it down, and says to approve it at the terminal.
+ * options that turn it down, and says to approve it at the terminal. So does one the card cannot show as it is: a credential
+ * masked in it (a mask can hide more than the credential), or a character the card does not show as itself.
  */
 import type { Lang } from "../locales/lang.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
@@ -16,6 +17,8 @@ import type { DecisionButton } from "../remote/actions.js";
 import { breakLinks, inertLinks, lit, masked, neutral, plain } from "../remote/inert.js";
 import { type PermissionOption, shownOptions } from "../remote/options.js";
 import type { Reported } from "../remote/reported.js";
+import { redactText } from "../security/redact.js";
+import { neutral as neutralLine } from "../text/neutral.js";
 import { pyStr } from "../text/py-text.js";
 import { optionButtons } from "./permission-view.js";
 
@@ -84,6 +87,23 @@ const codeText = (v: string): string => plain(breakLinks(inertLinks(masked(v))))
 /** Text whose markdown (lists, bold) is kept, but no link or tag can be built from it. */
 const wordsText = (v: string): string => breakLinks(inertLinks(masked(v)));
 
+/**
+ * A character a card does not show as itself: a control character (but a line break or a tab), an invisible format character (a
+ * bidi override that reorders what is shown, a zero-width space, a soft hyphen), or a look-alike the card draws `<`/`>` as.
+ */
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is looked for
+const UNSHOWN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\u2039\u203a]/u;
+/**
+ * Whether `text` is shown as it is: no credential masked in it (the private-key mask runs to the end of a key that is never
+ * closed, hiding whatever follows it) and no character the card does not show as itself.
+ */
+const shownAsIs = (text: string): boolean => !UNSHOWN.test(text) && !redactText(text).masked;
+/** Whether a one-line text (a path, a tool, an "always" rule) is shown exactly: `neutral` changes nothing in it. */
+const lineAsIs = (text: string): boolean => shownAsIs(text) && neutralLine(text, Infinity) === text;
+/** Whether a section is shown as it is (see `shownAsIs`). */
+const sectionAsIs = (s: TerminalSection): boolean =>
+  s.type === "option" ? shownAsIs(s.label) && shownAsIs(s.description) : shownAsIs(s.text);
+
 /** The localized title of an option the connector names by a known id; a question's answers keep their own labels. */
 function optionTitle(option: PermissionOption, lang: Lang): string | undefined {
   const words = terminalApprovalText.in(lang);
@@ -131,7 +151,7 @@ function editContent(input: Reported, words: Words): Content | undefined {
     asks: words.asksEdit({ path: neutral(path, LINE_MAX) }),
     sections,
     fields: ["file_path", "notebook_path", "content", "old_string", "new_string", "new_source"],
-    clipped: path.length > LINE_MAX,
+    clipped: path.length > LINE_MAX || !lineAsIs(path),
   };
 }
 
@@ -183,7 +203,12 @@ const CONTENT = new Map<string, (input: Reported, words: Words) => Content | und
  * kind does not show are shown after it as JSON: the card shows the request whole.
  */
 function contentOf(kind: string, tool: string, input: Reported | undefined, words: Words): Content {
-  const generic: Content = { asks: words.asksTool({ tool: neutral(tool, 120) }), sections: [], fields: [] };
+  const generic: Content = {
+    asks: words.asksTool({ tool: neutral(tool, 120) }),
+    sections: [],
+    fields: [],
+    clipped: tool.length > 120 || !lineAsIs(tool),
+  };
   if (input === undefined) return generic;
   const shown = CONTENT.get(kind)?.(input, words);
   if (shown === undefined) return { ...generic, sections: [{ type: "code", text: JSON.stringify(input, null, 2) }] };
@@ -288,11 +313,12 @@ function buildView(input: TerminalAsk, lang: Lang, cut: boolean): TerminalAskVie
     content.clipped !== true &&
     rendered.whole &&
     !content.sections.some(sectionClipped) &&
+    content.sections.every(sectionAsIs) &&
     content.sections.reduce((n, s) => n + sectionChars(s), 0) <= TERMINAL_CONTENT_MAX;
   // Cut, never shown in part with a way to approve it: what was cut is what would run. An "always" option whose name (the
   // rule it adds) cannot be written out whole is not offered either.
   const options = (complete ? input.options : input.options.filter((o) => o.kind.startsWith("reject"))).filter(
-    (o) => o.kind !== "allow_always" || (o.name.trim() !== "" && o.name.length <= OPTION_NAME_MAX),
+    (o) => o.kind !== "allow_always" || (o.name.trim() !== "" && o.name.length <= OPTION_NAME_MAX && lineAsIs(o.name)),
   );
   const buttons = optionButtons(options, input.sessionId, pyStr(ask["action_id"]), lang).map((b) => {
     const option = options.find((o) => o.optionId === b.optionId);

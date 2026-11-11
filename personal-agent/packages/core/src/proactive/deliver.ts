@@ -15,6 +15,7 @@ import { workEventText } from "../assistant/work-items.js";
 import { QUESTION_TOOL } from "../approvals/questions.js";
 import type { JsonObject } from "../json.js";
 import { answerLang, pickLang } from "../language/detect.js";
+import type { Lang } from "../locales/lang.js";
 import { proactiveLines } from "../locales/proactive-lines.js";
 import type { Conversation, OutMessage, View } from "../ports/surface.js";
 import { ITEM_SOURCE, ASSISTANT_SAID_TYPES } from "../subscriptions/event-types.js";
@@ -46,10 +47,12 @@ function terminalOffer(
   ask: Readonly<Record<string, unknown>>,
   offered: readonly unknown[],
   remote: RemoteNotice,
+  lang: Lang,
 ): { options: unknown[]; ask: Readonly<Record<string, unknown>> } {
+  // (judged on the card as drawn, in the person's language: what is stored is what the buttons offer)
   const view = terminalAskView(
     { ask, options: parseOptions(offered), sessionId: remote.sessionId, machine: remote.machine, agent: remote.agent },
-    "en",
+    lang,
   );
   const ids = new Set(view.buttons.map((b) => b.optionId));
   const options = offered.filter((o) => {
@@ -345,7 +348,9 @@ export class Deliveries {
     // A question a terminal asks keeps its whole ask: the board draws its card again with the content, never buttons alone. Only
     // the options its card offers are kept (what was not shown whole offers only those that turn it down), and whether it was.
     const terminal = ask["origin"] === "terminal";
-    const shown = terminal ? terminalOffer(ask, offered, remote) : { options: offered, ask };
+    const prefs = store.prefs.getPrefs(userId);
+    const lang = answerLang(prefs.lang, this.clientLocale(), event["text"]);
+    const shown = terminal ? terminalOffer(ask, offered, remote, lang) : { options: offered, ask };
     const options = shown.options;
     if (
       !store.remotePermissions.saveRemotePermission({
@@ -361,7 +366,6 @@ export class Deliveries {
       return false; // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it)
     }
     const item = parseWorkItem(event["item"]);
-    const prefs = store.prefs.getPrefs(userId);
     const card = this.deps.remote.askCard({
       ask,
       options,
@@ -371,7 +375,7 @@ export class Deliveries {
       about: item ? `#${String(item.seq)} ${item.title}` : "",
       expiresAt,
       zone: zoneOf(prefs),
-      lang: answerLang(prefs.lang, this.clientLocale(), event["text"]),
+      lang,
     });
     try {
       if (terminal) {

@@ -547,6 +547,15 @@ test("a chat attached to the session that carries a terminal's questions draws n
       options: CLAUDE_OPTIONS,
       origin: "terminal_hook",
     });
+    // (as Claw's push names the same origin: not drawn either)
+    await w.server.emit(sid, "permissionRequest", {
+      actionId: "act-term2",
+      tool: "Run: ls",
+      kind: "execute",
+      input: { command: "ls" },
+      options: CLAUDE_OPTIONS,
+      origin: "terminal",
+    });
     // (a second request of the same session is shown: the one before it has been read)
     await w.server.emit(sid, "permissionRequest", {
       actionId: "act-after",
@@ -558,4 +567,6 @@ test("a chat attached to the session that carries a terminal's questions draws n
     await w.until(() => w.permissionCards().length === cards + 1);
     assert.ok(!JSON.stringify(w.permissionCards()).includes("act-term"));
     assert.equal(w.test.store.remotePermissions.getRemotePermission(sid, "act-term"), null);
+    assert.ok(!JSON.stringify(w.permissionCards()).includes("act-term2"));
+    assert.equal(w.test.store.remotePermissions.getRemotePermission(sid, "act-term2"), null);
   }));
