@@ -102,9 +102,11 @@ function checkDescription(v: Record<string, unknown>, at: string, out: OverrideP
 
 function checkEnum(v: unknown, at: string, out: OverrideProblem[]): void {
   if (v === undefined) return;
+  // No surrounding whitespace: a launch path that trims (the app image does)
+  // would otherwise run a value the declaration does not list.
   if (!Array.isArray(v) || v.length === 0 || v.length > OVERRIDE_LIMITS.maxEnumEntries
-    || !v.every((e) => typeof e === "string" && e.trim() !== "" && e.length <= OVERRIDE_LIMITS.maxValueLength)) {
-    out.push({ field: `${at}.enum`, reason: `must be 1-${OVERRIDE_LIMITS.maxEnumEntries} non-empty strings` });
+    || !v.every((e) => typeof e === "string" && e !== "" && e.trim() === e && e.length <= OVERRIDE_LIMITS.maxValueLength)) {
+    out.push({ field: `${at}.enum`, reason: `must be 1-${OVERRIDE_LIMITS.maxEnumEntries} non-empty strings without surrounding whitespace` });
   }
 }
 
@@ -249,8 +251,8 @@ function checkStringValue(
   out: OverrideProblem[],
   patterns: PatternJob[],
 ): string | undefined {
-  if (typeof value !== "string" || value === "") {
-    out.push({ field: at, reason: "must be a non-empty string" });
+  if (typeof value !== "string" || value === "" || value.trim() !== value) {
+    out.push({ field: at, reason: "must be a non-empty string without surrounding whitespace" });
     return undefined;
   }
   const max = rule.maxLength ?? OVERRIDE_LIMITS.maxValueLength;

@@ -133,6 +133,11 @@ test("each value is held to its rule", () => {
   assert.equal(checkOverrides({ image: "registry.example.invalid/extra:9" }, enumed, "task").ok, true);
   assert.equal(checkOverrides({ image: IMAGES[0]!.repo }, enumed, "task").ok, true);
   assert.equal(checkOverrides({ image: "registry.example.invalid/nope:1" }, enumed, "task").ok, false);
+  // A value or an enum entry with surrounding whitespace is refused: the app
+  // path trims the image, which would run a value the declaration never listed.
+  assert.equal(checkOverrides({ image: `${IMAGES[0]!.repo} ` }, PLUGIN, "task").ok, false);
+  assert.deepEqual(overridableDeclarationProblems({ image: { enum: ["registry.example.invalid/app:9 "] } }).map((p) => p.field), ["overridable.image.enum"]);
+  assert.equal(checkOverrides({ image: "registry.example.invalid/app:9 " }, { images: [], overridable: { image: { enum: ["registry.example.invalid/app:9 "] } } }, "app").ok, false);
   // Too many args, and an inherited property name, are refused.
   assert.equal(checkOverrides({ args: ["--a", "--b", "--c", "--d"] }, PLUGIN, "app").ok, false);
   assert.equal(checkOverrides({ env: { constructor: "x" } }, PLUGIN, "app").ok, false);
