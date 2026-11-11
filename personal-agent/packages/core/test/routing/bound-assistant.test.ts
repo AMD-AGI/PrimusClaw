@@ -229,3 +229,33 @@ test("two messages around a rebind: a slow lookup of the earlier token never ove
   );
   assert.deepEqual(w.store.links.boundClawUser(ALICE.id, "tok-other"), { clawUserId: "u-other", current: true });
 });
+
+test("a new token whose owner cannot be read: the earlier account's id and subscription are not kept answering", async () => {
+  const { aw, w } = boundWorld();
+  await w.router.handle(message("on the earlier account"));
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice");
+
+  w.exchange.tokens.set(ALICE.id, "tok-unknown"); // (rebound, or the same account's next token: /v1/me does not answer)
+  await w.router.handle(message("owner unread"));
+
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), null, "the webhook no longer takes the earlier account's events");
+  assert.equal(w.store.notifySubs.getNotifySub(ALICE.id), null);
+  assert.deepEqual(
+    aw.claw.heard.map((h) => h.text),
+    ["on the earlier account"],
+    "the second message did not reach the earlier account's assistant",
+  );
+  assert.equal(w.turns.runs.at(-1)?.credential, "tok-unknown", "a plain turn on the new token, as before");
+
+  w.owners.set("tok-unknown", { id: "u-alice", name: "Liu, Alice", email: "", accountType: "" });
+  await w.router.handle(message("owner read"));
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice");
+  assert.deepEqual(
+    aw.claw.heard.map((h) => [h.key, h.text]),
+    [
+      [TOKEN, "on the earlier account"],
+      ["tok-unknown", "owner read"],
+    ],
+    "reached again once the owner is read",
+  );
+});

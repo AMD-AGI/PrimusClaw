@@ -64,8 +64,8 @@ export class PersonalRouter {
    *
    * The id is read again whenever the token is not the one it was read with (tokens last minutes, so at most once a token):
    * a person who rebinds to another account is followed to it, and one no longer bound is forgotten, so the assistant
-   * never keeps answering for an account the person no longer holds. A subscription is made or mended only with a token
-   * whose owner is the id kept.
+   * never keeps answering for an account the person no longer holds (nor for one whose owner a new token cannot tell yet).
+   * A subscription is made or mended only with a token whose owner is the id kept.
    */
   private async reachBound(userId: string): Promise<void> {
     const { credentials, owners } = this.ctx;
@@ -82,9 +82,15 @@ export class PersonalRouter {
       store.links.forgetBound(userId); // (not bound: the message is answered with the card that binds them)
       return;
     }
-    if (store.links.boundClawUser(userId, token)?.current !== true) {
+    const kept = store.links.boundClawUser(userId, token);
+    if (kept?.current !== true) {
       const clawUserId = await owners.userIdOf(token);
-      if (clawUserId === undefined) return; // (unread: asked again with the next message)
+      if (clawUserId === undefined) {
+        // (unread: asked again with the next message. An id read with an earlier token may be another account's now: it and
+        // its subscription are forgotten rather than kept answering for it; the next read makes the subscription again)
+        if (kept !== null) store.links.forgetBound(userId);
+        return;
+      }
       store.links.setBoundClawUser(userId, clawUserId, token);
     }
     if (subscriptions !== undefined) await subscriptions.ensure(userId, token);
