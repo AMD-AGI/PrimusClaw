@@ -289,11 +289,13 @@ v=<version>
 gh release download "personal-agent-v$v" -R AMD-AGI/PrimusClaw -p "personal-agent-teams-ingress-$v.zip*"
 sha256sum -c "personal-agent-teams-ingress-$v.zip.sha256"
 gh attestation verify "personal-agent-teams-ingress-$v.zip" --repo AMD-AGI/PrimusClaw
-host=$(az functionapp show -g <group> -n <ingress-app> --query defaultHostName -o tsv)
+host=$(az functionapp show -g <group> -n <ingress-app> --query "properties.defaultHostName || defaultHostName" -o tsv)
+scm=$(az functionapp show -g <group> -n <ingress-app> \
+  --query "(properties.hostNameSslStates || hostNameSslStates)[?hostType=='Repository'].name | [0]" -o tsv)
 # The management token goes to curl in a file only you can read, never onto a command line.
 (umask 077; printf 'header = "Authorization: Bearer %s"\n' \
   "$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)" > curl-auth)
-curl -fsS -K curl-auth -X POST "https://${host%.azurewebsites.net}.scm.azurewebsites.net/api/publish?type=zip&RemoteBuild=false" \
+curl -fsS -K curl-auth -X POST "https://$scm/api/publish?type=zip&RemoteBuild=false" \
   -H "Content-Type: application/zip" --data-binary @"personal-agent-teams-ingress-$v.zip"
 rm curl-auth
 ```

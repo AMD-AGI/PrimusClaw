@@ -155,8 +155,14 @@ test("start registers the messaging endpoint, and the outbound trigger when its 
 
 test("the deployable entry registers the functions when it is loaded", () => {
   // Outside a Functions host, @azure/functions runs in its test mode and says it skips the registration.
+  // The test's own environment (tsx needs its temporary directory and home), without the ingress's settings.
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !/^(PRIMUSCLAW_|BOT_|IDENTITY_|WEBSITE_|CONTAINER_NAME$)/.test(name),
+    ),
+  );
   const ran = spawnSync(process.execPath, ["--import", "tsx", join(PACKAGE, "src", "main.ts")], {
-    env: { PATH: process.env["PATH"] ?? "" },
+    env,
     encoding: "utf8",
     timeout: 60_000,
   });
