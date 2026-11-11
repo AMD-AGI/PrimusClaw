@@ -73,6 +73,11 @@ export interface FollowRequest {
   requesterLabel?: string;
   /** R asked X for a review that merges (not a review only): R's account merges once X's approval is on GitHub. */
   mergeByRequester: boolean;
+  /**
+   * Read CI on the head too, when the pull request is open and nothing is merged for R: the answer's `ci` (green, and the names of the
+   * failed, advisory and unfinished checks). For a review that waits for CI to turn green before it is run again (`review-items.ts`).
+   */
+  withChecks?: boolean;
 }
 
 export interface ToolOutcome {
@@ -190,7 +195,7 @@ interface Change {
   instructions: InstructionChanges;
 }
 
-interface PullState {
+export interface PullState {
   checks: ChecksVerdict;
   unresolvedThreads: number;
   threadsComplete: boolean;
@@ -466,7 +471,14 @@ export class GithubReview {
       notice: UNTRUSTED_NOTICE,
       acting: this.actingBlock(ctx, repo, pr),
       pull_request: this.prBlock(ref, repo, pr),
-      checks: { green: state.checks.green, reasons: state.checks.reasons, ...state.checks.summary },
+      checks: {
+        // (the names are in `reasons`; the lists themselves stay out of the overview, whose room the diff needs)
+        green: state.checks.green, reasons: state.checks.reasons, ...overviewChecks(state.checks.summary),
+        ...(state.checks.summary.advisoryFailed.length ? {
+          advisoryFailed: state.checks.summary.advisoryFailed,
+          note: "advisoryFailed are checks the base branch does not require: they do not stop an approval or a merge, as on GitHub. Name them in the review body as not required; they are not findings by themselves.",
+        } : {}),
+      },
       merge_state: {
         status: state.mergeStateStatus, mergeable: state.mergeable, review_decision: state.reviewDecision,
         unresolved_threads: state.unresolvedThreads, threads_complete: state.threadsComplete,
@@ -852,7 +864,13 @@ export class GithubReview {
         await this.closeHeldForEnded(f.sessionId, f.requesterUserId, status);
         return ok({ status, url: pr.url, head_sha: pr.headSha }, redact);
       }
-      if (!asRequester) return ok({ status: "open", url: pr.url, head_sha: pr.headSha }, redact);
+      if (!asRequester) {
+        const ci = f.withChecks ? await this.readChecks(ctx, ref, pr) : null;
+        return ok({
+          status: "open", url: pr.url, head_sha: pr.headSha,
+          ...(ci ? { ci: { green: ci.green, failed: ci.summary.failedNames, advisory: ci.summary.advisoryFailed, pending: ci.summary.pendingNames } } : {}),
+        }, redact);
+      }
       return ok(await this.mergeForRequester(ctx, ref, repo, pr, f), redact);
     }, { skipBudget: true, ref: f.ref });
     // R has no GitHub account bound (or it lapsed): what became of the pull request is still read, with X's account as the review read it.
@@ -884,7 +902,7 @@ export class GithubReview {
     // Already in the merge queue (queued by a person): nothing to write, but the reviewer's held merge of this head is closed below as well.
     const alreadyQueued = state.queueEntry;
     const queue = this.viaQueue(ctx, state);
-    if (!alreadyQueued && !queue && state.mergeStateStatus !== "CLEAN") {
+    if (!alreadyQueued && !queue && !mergeStateOpen(state)) {
       return waiting("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`);
     }
     const method = (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
@@ -1161,6 +1179,8 @@ export class GithubReview {
       outcome = await body(ctx, ref);
     } catch (err) {
       outcome = this.errorOutcome(err, client);
+      // Which checks held a write back, kept on its audit row: the requester is told them by name when the review ends (`review-result.ts`).
+      if (err instanceof Refusal && err.code === "ci_not_green") acc.riskReasons = [...(acc.riskReasons ?? []), ...ciEvidence(err.extra.checks)];
     } finally {
       if (held) {
         const n = (this.inflight.get(held) ?? 1) - 1;
@@ -1838,7 +1858,7 @@ export class GithubReview {
       this.requireGreen(state, headSha);
     }
     state = await this.settleMergeState(ctx, ref, pr, state, approved);
-    if (state.mergeStateStatus !== "CLEAN") {
+    if (!mergeStateOpen(state)) {
       throw new Refusal("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`, { merge_state: state.mergeStateStatus, review_decision: state.reviewDecision, approved_by_this_call: approved });
     }
     if (!ctx.settings.writesEnabled) {
@@ -1993,7 +2013,7 @@ export class GithubReview {
       state = { ...state, ...(await this.readMergeFacts(ctx, ref)) };
       this.requireGreen(state, pr.headSha);
     }
-    if (waited && state.mergeStateStatus === "CLEAN") {
+    if (waited && mergeStateOpen(state)) {
       state = { ...state, checks: await this.readChecks(ctx, ref, pr) };
       this.requireGreen(state, pr.headSha);
     }
@@ -2006,6 +2026,32 @@ export class GithubReview {
     if (!state.threadsComplete) throw new Refusal("threads_unreadable", "the pull request has more review threads than could be read");
     if (state.unresolvedThreads > 0) throw new Refusal("threads_unresolved", `${state.unresolvedThreads} review thread(s) are not resolved`, { unresolved_threads: state.unresolvedThreads });
   }
+}
+
+/**
+ * GitHub's merge state lets the merge through: CLEAN, or UNSTABLE when the only checks not passing are failures the base branch does not
+ * require (`ChecksVerdict.summary.advisoryFailed`, which GitHub reports as UNSTABLE and merges past) and CI is otherwise green.
+ */
+export function mergeStateOpen(state: Pick<PullState, "mergeStateStatus" | "checks">): boolean {
+  if (state.mergeStateStatus === "CLEAN") return true;
+  return state.mergeStateStatus === "UNSTABLE" && state.checks.green && state.checks.summary.advisoryFailed.length > 0;
+}
+
+/** The counts of a checks verdict as the pull request's overview shows them (the name lists left out). */
+function overviewChecks(summary: ChecksVerdict["summary"]): Record<string, unknown> {
+  const { failedNames: _f, pendingNames: _p, advisoryFailed: _a, ...counts } = summary;
+  return counts;
+}
+
+/** The audit row's lines for a `ci_not_green` refusal: `ci_failed: <name>`, `ci_pending: <name>`; read back by `ciOfAudit`. */
+export function ciEvidence(summary: unknown): string[] {
+  const s = (summary ?? {}) as { failedNames?: unknown; pendingNames?: unknown; advisoryFailed?: unknown };
+  const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  const advisory = new Set(names(s.advisoryFailed));
+  return [
+    ...names(s.failedNames).filter((n) => !advisory.has(n)).map((n) => `ci_failed: ${n}`),
+    ...names(s.pendingNames).map((n) => `ci_pending: ${n}`),
+  ];
 }
 
 /**

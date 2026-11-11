@@ -391,11 +391,18 @@ A review asked of someone else meets the assistant in three places:
   green on the head commit (`ci_not_green`) and no review thread is open (`threads_unresolved`);
   an approval that is held (see "High risk": the model's `risk_judgement` and `risk_flags`, or a hard
   hold) is then held for the acting user (`confirmation_required`, `kind: "review"`). `COMMENT` and `REQUEST_CHANGES` are not held to that.
+- **When an own review does not approve.** A review the owner's assistant started for their own account that posts no approval tells
+  the owner why and what is next, in their language: its blocking findings, the checks that were not green, or the other refusal. When
+  CI alone held the approval back (no inline finding, the approval refused `ci_not_green` on the same head), the item waits for CI on
+  that head: the sweep reads its checks with the pull request, runs the review once more in the same session when they are green (an
+  approval then goes on to the merge's confirmation card), and stops waiting on a new head or after 24 hours, saying so. A waiting
+  review holds no slot. `再审 #N` / `review again #N` restarts it.
 - **The merge.** Everything is read again at merge time: CI is green on the **head commit**
   (every check completed and passing; a required check that never reported is missing; a pull
   request with no check at all is not green however clean GitHub calls it; an infrastructure
-  failure is a failure; nothing is re-run), no review thread is unresolved, GitHub's own merge
-  state is `CLEAN` after the approval (GitHub works the state out asynchronously, so an `UNKNOWN`,
+  failure is a failure; nothing is re-run; a failed check the base branch's rules do not require is
+  advisory, named and not blocking, when those rules require at least one check), no review thread is unresolved, GitHub's own merge
+  state is `CLEAN` (or `UNSTABLE` when the only checks not passing are advisory failures) after the approval (GitHub works the state out asynchronously, so an `UNKNOWN`,
   and a `BLOCKED` right after this call's own approval, is looked at again for about seven seconds, one
   request a look, with CI read once more before a merge that had to wait, before the merge is refused as `merge_state_not_clean`), and the repository's own
   protections are met because they are GitHub's. No admin merge, no auto-merge, no branch update, no change to a rule.

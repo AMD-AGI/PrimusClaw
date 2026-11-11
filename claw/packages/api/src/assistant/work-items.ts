@@ -270,8 +270,12 @@ export async function recentEvents(itemId: string, limit = 20): Promise<Array<Wo
 
 /** The most items one user may have waiting for a slot (`queueWhenFull`); past it the limit's refusal stands. */
 export const MAX_QUEUED_ITEMS = 20;
-/** An open item that holds a slot, and one waiting for one (`params.queued`), as SQL over `claw_work_items`. */
-export const RUNNING = "board_state <> 'done' AND NOT (params ? 'queued')";
+/**
+ * An open item that holds a slot, and one waiting for one (`params.queued`), as SQL over `claw_work_items`. An item holds a slot when it is
+ * unfinished: not one waiting for a slot (`queued`), nor a review waiting for CI on its head to turn green before it
+ * is run again (`ci_waiting`, `review-items.ts`), which may wait a day with nothing of it running.
+ */
+export const RUNNING = "board_state <> 'done' AND NOT (params ? 'queued') AND NOT (params ? 'ci_waiting')";
 export const WAITING = "board_state <> 'done' AND params ? 'queued'";
 
 export type InsertWorkItemResult =

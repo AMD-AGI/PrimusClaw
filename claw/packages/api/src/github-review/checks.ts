@@ -23,7 +23,13 @@ export interface CommitStatusInput {
 export interface ChecksVerdict {
   green: boolean;
   reasons: string[];
-  summary: { passed: number; failed: number; pending: number; total: number; required: number; requiredMissing: string[] };
+  summary: {
+    passed: number; failed: number; pending: number; total: number; required: number; requiredMissing: string[];
+    /** The names of the checks that failed and of those not finished, sorted; advisory failures are in `failedNames` too. */
+    failedNames: string[]; pendingNames: string[];
+    /** Failed checks the base branch does not require, which do not make the head red (see the header). */
+    advisoryFailed: string[];
+  };
 }
 
 const PASSING_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
@@ -39,7 +45,11 @@ export function evaluateChecks(input: {
   const reasons: string[] = [];
   const state = new Map<string, "pass" | "fail" | "pending">();
   for (const run of input.checkRuns) {
-    const v = run.status !== "completed" ? "pending" : PASSING_CONCLUSIONS.has(run.conclusion ?? "") ? "pass" : "fail";
+    // A run with a conclusion is finished whatever its status says: GitHub has been seen to keep a finished job's run at `in_progress`
+    // with `conclusion: success` and a `completed_at` (PrimusClaw#712, 2026-11-11, run 130456274919), and a review then waited for ever on
+    // "1 check(s) are not finished". A conclusion GitHub gives only for a finished run, so it is read as the run's result.
+    const finished = run.status === "completed" || (run.conclusion !== null && run.conclusion !== "");
+    const v = !finished ? "pending" : PASSING_CONCLUSIONS.has(run.conclusion ?? "") ? "pass" : "fail";
     // The same name twice: the worse one stands, so a failure is never hidden by another job's success.
     const prior = state.get(run.name);
     if (prior === undefined || rank(v) > rank(prior)) state.set(run.name, v);
@@ -50,21 +60,27 @@ export function evaluateChecks(input: {
     if (prior === undefined || rank(v) > rank(prior)) state.set(s.context, v);
   }
   let passed = 0;
-  let failed = 0;
-  let pending = 0;
-  for (const v of state.values()) {
+  const failedNames: string[] = [];
+  const pendingNames: string[] = [];
+  for (const [name, v] of state) {
     if (v === "pass") passed++;
-    else if (v === "fail") failed++;
-    else pending++;
+    else if (v === "fail") failedNames.push(name);
+    else pendingNames.push(name);
   }
+  failedNames.sort();
+  pendingNames.sort();
+  const failed = failedNames.length;
+  const pending = pendingNames.length;
   const required = input.required ?? [];
   const requiredMissing = required.filter((name) => !state.has(name));
+  const advisoryFailed = required.length > 0 ? failedNames.filter((name) => !required.includes(name)) : [];
+  const blockingFailed = failedNames.filter((name) => !advisoryFailed.includes(name));
 
   if (input.required === null) reasons.push("the required checks of the base branch could not be read");
   if (input.truncated) reasons.push("more checks exist than were read");
   if (state.size === 0) reasons.push("no check has reported on the head commit");
-  if (failed > 0) reasons.push(`${failed} check(s) failed`);
-  if (pending > 0) reasons.push(`${pending} check(s) are not finished`);
+  if (blockingFailed.length > 0) reasons.push(`${blockingFailed.length} check(s) failed: ${blockingFailed.join(", ")}`);
+  if (pending > 0) reasons.push(`${pending} check(s) are not finished: ${pendingNames.join(", ")}`);
   for (const name of required) {
     if (!state.has(name)) reasons.push(`required check ${name} has not reported on the head commit`);
     else if (state.get(name) !== "pass") reasons.push(`required check ${name} has not passed`);
@@ -72,7 +88,7 @@ export function evaluateChecks(input: {
   return {
     green: reasons.length === 0,
     reasons,
-    summary: { passed, failed, pending, total: state.size, required: required.length, requiredMissing },
+    summary: { passed, failed, pending, total: state.size, required: required.length, requiredMissing, failedNames, pendingNames, advisoryFailed },
   };
 }
 
