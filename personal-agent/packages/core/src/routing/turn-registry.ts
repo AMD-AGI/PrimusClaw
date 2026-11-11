@@ -116,9 +116,9 @@ export class TurnRegistry {
   }
 
   /**
-   * `turn` behind the chat's running one: refused when a review is either of them, or when `QUEUED_TURNS_MAX` already wait.
-   * Otherwise it is registered last, with its place in the queue (`waiting`: 1 is right behind the running turn; 0 when it is
-   * the chat's first turn and runs at once).
+   * `turn` behind the chat's running one: refused when a review is either of them, or when `QUEUED_TURNS_MAX` already wait (not
+   * gone to Claw yet). Otherwise it is registered last, with its place among those that wait (`waiting`: 1 is the next to go;
+   * 0 when it is the chat's first turn and runs at once).
    */
   enqueue(key: TurnKey, turn: ActiveTurn): { readonly front: ActiveTurn; readonly waiting: number } | QueueRefusal {
     const entry = this.turns.get(keyOf(key));
@@ -128,9 +128,10 @@ export class TurnRegistry {
       return { front: turn, waiting: 0 };
     }
     if (turn.review || front.review) return "still_working";
-    if (entry.turns.length - 1 >= QUEUED_TURNS_MAX) return "queue_full";
+    const waiting = entry.turns.filter((t) => !t.launched).length;
+    if (waiting >= QUEUED_TURNS_MAX) return "queue_full";
     entry.turns.push(turn);
-    return { front, waiting: entry.turns.length - 1 };
+    return { front, waiting: waiting + 1 };
   }
 
   /** Every turn queued behind the chat's running one that has not gone to Claw yet is given up (`/stop`); how many there were. */

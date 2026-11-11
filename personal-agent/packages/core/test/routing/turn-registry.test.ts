@@ -19,6 +19,7 @@ test("a chat has its running turn and up to five queued behind it; a review queu
   const chat = chatTurnKey("u1");
   const first = new ActiveTurn();
   assert.ok(turns.claim(chat, first));
+  first.launched = true; // (as the starter does once it sends it)
   assert.equal(turns.claim(chat, new ActiveTurn()), false);
   const second = new ActiveTurn();
   assert.deepEqual(turns.enqueue(chat, second), { front: first, waiting: 1 });
@@ -32,6 +33,11 @@ test("a chat has its running turn and up to five queued behind it; a review queu
   assert.ok(second.over && second.ended.isSet);
   assert.deepEqual(turns.of(chat), [first]);
   assert.deepEqual(turns.enqueue(chat, second), { front: first, waiting: 1 });
+  second.launched = true; // (a turn that went to Claw is not withdrawn, nor counted as waiting)
+  const third = new ActiveTurn();
+  assert.deepEqual(turns.enqueue(chat, third), { front: first, waiting: 1 });
+  assert.equal(turns.withdrawQueued(chat), 1);
+  assert.deepEqual(turns.of(chat), [first, second]);
   turns.drop(chat, first);
   assert.ok(first.running.isSet && first.ended.isSet);
   assert.deepEqual(turns.of(chat), [second]);

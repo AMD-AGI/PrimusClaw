@@ -161,6 +161,9 @@ export class TurnStarter {
       return "refused";
     }
     if (queued.front === turn) return "front";
+    // (behind turns that are all stopped it goes at once: nothing to tell)
+    const stoppedInFront = this.ctx.turns.of(key).every((front) => front === turn || front.stopped.isSet);
+    if (stoppedInFront) return "waiting";
     try {
       await chat.say(said.queuedBehind({ n: queued.waiting }));
     } catch (error) {

@@ -141,14 +141,18 @@ test("a message sent after /stop goes to Claw at once, even while the stopped tu
   await w.router.handle(message("/stop"));
   const second = gate();
   w.turns.hold = second.promise;
+  const told = said(w).length;
   await w.router.handle(message("after"));
   await flush();
   assert.deepEqual(
     w.turns.calls.map((c) => c.at(-1)),
     ["first", "after"],
   );
+  assert.equal(said(w).length, told); // (it is not told it is queued: it is not)
+  await w.router.handle(message("queued now"));
+  assert.equal(said(w).at(-1), QUEUED_1); // (behind the turn that runs now it is, and it is the first that waits)
   await w.router.handle(message("/stop")); // (stops the turn that runs now, not the one stopped already)
-  assert.equal(said(w).at(-1), "Stopping the running task.");
+  assert.equal(said(w).at(-1), "Stopping the running task. The message queued behind it was dropped too.");
   assert.equal(w.turns.runs.length, 2);
   await w.router.handle(message("third")); // (both turns in front are stopped: it goes at once too)
   await flush();
