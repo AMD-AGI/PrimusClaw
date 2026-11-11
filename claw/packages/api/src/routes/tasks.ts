@@ -43,6 +43,7 @@ import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
 import { DELETED_SESSION_TASK_READ_SEC } from "../config.js";
+import { checkOverrides, hasOverrides, overrideKeys, overridesAudit, type OverrideProblem, type OverrideValues } from "../marketplace/plugin-overrides.js";
 
 /**
  * The sandbox a plugin-less single task should get.
@@ -139,6 +140,12 @@ interface CreateTaskBody {
    * declares it on the template, per node or for all of them.
    */
   workspace_throwaway?: boolean;
+  /**
+   * Run-time overrides of the plugin (marketplace/plugin-overrides.ts): only keys
+   * the plugin declares overridable. A single task takes `image` and `model`; an
+   * app run (`mode: "app"`) takes those, `args` and `env`. Not with `dag_id`.
+   */
+  overrides?: unknown;
 }
 
 /**
@@ -240,7 +247,7 @@ export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown
 
 async function loadPluginRow(pluginId: number) {
   const r = await db.query(
-    `SELECT id, name, version, images, resource, tools FROM plugins
+    `SELECT id, name, version, images, resource, tools, overridable FROM plugins
      WHERE id = $1 AND deleted_at IS NULL`,
     [pluginId],
   );
@@ -316,6 +323,35 @@ function expandOptsFor(
   };
 }
 
+/**
+ * A single task's overrides, checked against the plugin it names. A DAG has no
+ * single sandbox or model to override, and a task with no plugin has no
+ * declaration to check against: both refuse any override rather than ignore it.
+ */
+export function checkTaskOverrides(
+  body: Pick<CreateTaskBody, "overrides" | "dag_id">,
+  target: { dag: unknown; plugin: { id: unknown; version?: unknown; images?: unknown; overridable?: unknown } | null },
+): { values: OverrideValues; audit?: Record<string, unknown> } | { problems: OverrideProblem[] } {
+  if (body.overrides === undefined || body.overrides === null) return { values: {} };
+  if (target.dag) return { problems: [{ field: "overrides", reason: "is not supported for a DAG run" }] };
+  if (!target.plugin) return { problems: [{ field: "overrides", reason: "needs a plugin_id: only a plugin declares what may be overridden" }] };
+  const checked = checkOverrides(body.overrides, target.plugin, "task");
+  if (!checked.ok) return { problems: checked.problems };
+  if (!hasOverrides(checked.values)) return { values: {} };
+  return { values: checked.values, audit: overridesAudit(checked.values, target.plugin) };
+}
+
+/** The single-task sandbox spec with a checked image override applied; a task the plugin gives no sandbox gets one for the image. */
+export function withImageOverride(
+  spec: Awaited<ReturnType<typeof singleTaskSandboxSpec>>,
+  plugin: { resource?: unknown } | null,
+  image: string | undefined,
+): Awaited<ReturnType<typeof singleTaskSandboxSpec>> {
+  if (image === undefined) return spec;
+  if (spec === "none") return { handle: "main", image, resources: plugin?.resource };
+  return { ...spec, image };
+}
+
 /** What a partially admitted batch reports about the run it stopped on. */
 function refusalReason(refusal: CreateRefusal): string {
   if (isSandboxWorkspaceRefusal(refusal)) return refusal.sandboxWorkspace.error;
@@ -347,9 +383,15 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
 
       const target = await resolveCreateTarget(body, user);
       if ("status" in target) return reply.status(target.status).send({ ok: false, error: target.error });
+      const overrides = checkTaskOverrides(body, target);
+      if ("problems" in overrides) {
+        return reply.status(400).send({ ok: false, error: "plugin_overrides_invalid", problems: overrides.problems });
+      }
       // Outside the transaction: a marketplace lookup is not a decision, and
       // holding the admission lock across it would serialise the fleet on it.
-      const sandboxSpec = target.dag ? undefined : await singleTaskSandboxSpec(target.plugin);
+      const sandboxSpec = target.dag
+        ? undefined
+        : withImageOverride(await singleTaskSandboxSpec(target.plugin), target.plugin, overrides.values.image);
 
       return await withAdmissionTransaction<unknown>(async (client) => {
         // Record the caller's own credentials before anything is queued: a task
@@ -372,12 +414,21 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
             mode: "llm",
             workspace_throwaway: body.workspace_throwaway === true,
             sandbox_spec: sandboxSpec,
+            ...(overrides.values.model ? { model: overrides.values.model } : {}),
+            ...(overrides.audit ? { metadata: { plugin_overrides: overrides.audit } } : {}),
           }, client);
         if (isCreateRefusal(created)) {
           await sendCreateRefusal(reply, created);
           return { commit: false, value: reply };
         }
         if ("task_id" in created) {
+          // Keys only: a value can be anything the plugin let the caller set.
+          if (overrides.audit) {
+            logger.info(
+              { sessionId, taskId: created.task_id, pluginId: body.plugin_id, userId: user.userId, keys: overrideKeys(overrides.values) },
+              "plugin_overrides.applied",
+            );
+          }
           return { commit: true, value: { ok: true, task_id: created.task_id } };
         }
         logger.info(

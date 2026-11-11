@@ -446,6 +446,10 @@ export async function createSingleTask(opts: {
   workspace_throwaway?: boolean;
   /** Use this id instead of generating one (the app run issues its grant for it first). */
   task_id?: string;
+  /** The task's model; Brain's default when absent. */
+  model?: string;
+  /** Merged into the task's metadata next to `derived` (a plugin override's audit record, for one). */
+  metadata?: Record<string, unknown>;
 }, client?: PoolClient): Promise<{ task_id: string } | CreateRefusal> {
   const input = opts.input ?? {};
   // An app's input is the application's own document: Claw does not read it,
@@ -487,7 +491,9 @@ export async function createSingleTask(opts: {
     callback_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}`,
     backend_mcp_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}/backend-mcp`,
     status: "queued",
+    ...(opts.model ? { model: opts.model } : {}),
     metadata: {
+      ...(opts.metadata ?? {}),
       derived: { callback_url: `${INTERNAL_BACKEND_URL}/v1/internal/tasks/${tid}` },
     },
   }, client);

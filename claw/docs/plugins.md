@@ -384,3 +384,88 @@ description: One-line summary used in marketplace previews.
 
 Body content...
 ```
+
+---
+
+## 4. Plugin Run-Time Overrides
+
+A launch of a plugin can change a few declared settings without registering a
+new plugin. The plugin's author declares what may change in `overridable`;
+a launch names its values in `overrides`. Nothing is overridable unless
+declared: a plugin without `overridable` (every plugin registered before the
+field existed) refuses every override and launches exactly as before.
+
+### Declaring (`overridable` on the plugin)
+
+`overridable` is accepted by `POST /v1/plugins`, `POST /v1/plugins/upsert`,
+`PUT`/`PATCH /v1/plugins/:id` and `POST /v1/plugins/:id/new-version` (a new
+version keeps the source version's declaration unless the request sets one),
+and is returned by every plugin read. An invalid declaration is
+`400 bad_request` naming every problem, and nothing is written.
+
+```json
+{
+  "image": { "enum": ["harbor.example/app:rc"] },
+  "model": { "enum": ["model-a", "model-b"], "env": ["APP_MODEL", "APP_REPORT_MODEL"] },
+  "args":  { "items": { "pattern": "^--[a-z-]+(=[A-Za-z0-9._-]+)?$" }, "maxItems": 4 },
+  "env": {
+    "SOURCE_SHA": { "pattern": "^[0-9a-f]{40}$", "description": "Commit to build from" },
+    "MODE": { "enum": ["fast", "full"] }
+  }
+}
+```
+
+| Key     | Value a launch gives | Rule |
+| ------- | -------------------- | ---- |
+| `image` | a string | Must be one of the plugin's `images[].repo`, or of the declaration's own `enum`. |
+| `model` | a string | String rule (below). A task runs on it; an app run gets it in every env name listed in `env` (an app run cannot override `model` when `env` is empty). |
+| `args`  | a list of strings | Appended to the app manifest's `command`. `items` is a string rule for each; `maxItems` 1-64 (default 16). |
+| `env`   | an object of name to string | One string rule per variable name the launch may set. At most 64 names. |
+
+A string rule is a small JSON Schema subset: `type` (`"string"`), `enum`
+(1-256 strings), `pattern` (an ECMAScript regular expression, at most 512
+characters; anchor it with `^...$`), `maxLength` (1-4096, default 4096) and
+`description`. Unknown keys are refused. Values and `enum` entries may not
+have leading or trailing whitespace. All pattern tests of one launch share a
+50 ms budget and run interruptibly, so a pattern that backtracks badly cannot
+stall the API: a value whose test does not finish in time is refused.
+
+### Launching with `overrides`
+
+`POST /v1/sessions/:sessionId/tasks` takes `overrides`:
+
+| Launch | Applicable keys |
+| ------ | --------------- |
+| App run (`mode: "app"`) | `image`, `model`, `args`, `env` |
+| Single task (`plugin_id`, no DAG) | `image`, `model` |
+
+```json
+{
+  "mode": "app",
+  "plugin_id": 42,
+  "input": { "...": "..." },
+  "resources": { "gpus": 8, "workspace": "ws-a" },
+  "overrides": { "model": "model-b", "env": { "SOURCE_SHA": "0123...cdef" } }
+}
+```
+
+Every key must be declared, apply to the launch, and hold a value its rule
+accepts; otherwise the answer is `400 plugin_overrides_invalid` with a
+`problems` list (`field`, `reason`), and nothing is created. A task with
+`overrides` but no `plugin_id`, or with a DAG, is refused the same way. For an
+app run the overrides are applied to a copy of the plugin's manifest, which must
+still validate (a platform-reserved variable such as `LD_PRELOAD` stays
+refused, reported as `issues`); `overrides.image` together with
+`resources.image` is refused (give the image once), and a plugin that declares
+`image` holds `resources.image` to the same list (a plugin that declares nothing
+keeps accepting any `resources.image`, as before). The plugin row itself is
+never changed by a launch.
+
+### Audit
+
+The checked values are recorded on the task, in
+`metadata.plugin_overrides = { plugin_id, plugin_version, values }`; an app run
+also stores the manifest it actually ran with. The API logs
+`plugin_overrides.applied` with the task, plugin, user and the overridden keys,
+never the values. For an app run, `overrides` is part of what an
+`Idempotency-Key` is bound to; a request without it hashes as before.

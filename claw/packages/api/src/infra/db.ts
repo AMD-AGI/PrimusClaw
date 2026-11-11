@@ -10,6 +10,7 @@ import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
 import { lockBoundedMigrationClient, type MigrationLockPolicy } from "./migration-guard.js";
+import { normalizeOverridable } from "../marketplace/plugin-overrides.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -2143,6 +2144,9 @@ export async function initDb(): Promise<void> {
         images JSONB NOT NULL DEFAULT '[]',
         tools JSONB NOT NULL DEFAULT '[]',
         resource JSONB NOT NULL DEFAULT '{}',
+        -- What a launch may override without a new plugin (marketplace/plugin-overrides.ts).
+        -- '{}' is nothing, which is what every row written before the column means.
+        overridable JSONB NOT NULL DEFAULT '{}',
         owner_user_id VARCHAR(255),
         author VARCHAR(255),
         is_public BOOLEAN NOT NULL DEFAULT true,
@@ -2189,6 +2193,9 @@ export async function initDb(): Promise<void> {
     // serve different clients and must not be conflated.
     await client.query(
       `ALTER TABLE plugins ADD COLUMN IF NOT EXISTS anthropic_agent_version INT NOT NULL DEFAULT 1`,
+    ).catch(() => {});
+    await client.query(
+      `ALTER TABLE plugins ADD COLUMN IF NOT EXISTS overridable JSONB NOT NULL DEFAULT '{}'::jsonb`,
     ).catch(() => {});
     // Schema v2 cleanup: drop legacy V1 array column. No rollback path back
     // to V1 — V2 only uses ``resource`` (object).
@@ -3025,8 +3032,8 @@ export const MarketplaceDb = {
     // intentionally not written here so V1 can keep its data untouched.
     const r = await db.query(
       `INSERT INTO plugins (
-        name, description, version, images, tools, resource, owner_user_id, author, is_public, status
-      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10) RETURNING *`,
+        name, description, version, images, tools, resource, owner_user_id, author, is_public, status, overridable
+      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11::jsonb) RETURNING *`,
       [
         payload.name,
         payload.description ?? "",
@@ -3038,6 +3045,7 @@ export const MarketplaceDb = {
         payload.author ?? null,
         payload.is_public ?? true,
         payload.status ?? "active",
+        JSON.stringify(normalizeOverridable(payload.overridable)),
       ],
     );
     return r.rows[0] as JsonObject;
@@ -3057,6 +3065,7 @@ export const MarketplaceDb = {
     if ("images" in patch) add("images", JSON.stringify(patch.images ?? []));
     if ("tools" in patch) add("tools", JSON.stringify(patch.tools ?? []));
     if ("resource" in patch) add("resource", JSON.stringify(patch.resource ?? {}));
+    if ("overridable" in patch) add("overridable", JSON.stringify(normalizeOverridable(patch.overridable)));
     if ("owner_user_id" in patch) add("owner_user_id", patch.owner_user_id);
     if ("author" in patch) add("author", patch.author);
     if ("is_public" in patch) add("is_public", patch.is_public);
