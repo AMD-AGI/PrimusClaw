@@ -30,6 +30,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/deploy/')) && format('run-{0}', github.run_id) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/deploy/')) }}
 
+# The ripgrep release both jobs install: the static musl build, which has PCRE2.
+env:
+  RG_VERSION: 15.2.0
+  RG_SHA256: 33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+
 jobs:
   public-tree-scan:
     name: no internal literals or key-shaped strings in the tree
@@ -40,13 +45,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Not preinstalled on the runner image. The scan needs the PCRE2 build
-      # for its lookahead, which the Ubuntu package provides; the script
-      # verifies that itself and exits 2 rather than reporting a clean tree it
-      # never searched.
+      # for its lookahead; the script verifies that itself and exits 2 rather
+      # than reporting a clean tree it never searched. The release binary is
+      # pinned by version and digest rather than taken from apt, whose mirrors
+      # have failed to resolve on hosted runners and left main red.
       - name: Install ripgrep
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/rg.tar.gz" "https://github.com/BurntSushi/ripgrep/releases/download/$RG_VERSION/ripgrep-$RG_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$RG_SHA256  $RUNNER_TEMP/rg.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/rg"
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP/rg" --strip-components=1
+          echo "$RUNNER_TEMP/rg" >> "$GITHUB_PATH"
 
       - name: Run public-tree-scan
         run: |
@@ -69,8 +78,11 @@ jobs:
 
       - name: Install ripgrep
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/rg.tar.gz" "https://github.com/BurntSushi/ripgrep/releases/download/$RG_VERSION/ripgrep-$RG_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$RG_SHA256  $RUNNER_TEMP/rg.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/rg"
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP/rg" --strip-components=1
+          echo "$RUNNER_TEMP/rg" >> "$GITHUB_PATH"
 
       - name: Run public-message-scan
         run: |

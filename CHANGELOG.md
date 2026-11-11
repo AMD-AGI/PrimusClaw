@@ -10,20 +10,94 @@ Notable changes to PrimusClaw. The format follows
 
 ## Versioning
 
-PrimusClaw is pre-1.0. Until a `v1.0.0` tag exists, treat every interface as
-subject to change and pin what you deploy.
+PrimusClaw publishes three things to its users, and all three are versioned
+the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
-Three things are versioned separately, and they do not currently move together:
+| Release | Tag | Current version |
+|---|---|---|
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | none tagged yet; the first will be 0.1.0 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime`, `-teams` and `-teams-ingress` on npm, the Teams ingress's Function package and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.3.0 |
 
-| Artifact | Versioned by |
-|---|---|
-| Source | git tags (`v*`), which also trigger the image build |
-| Container images | the git tag on a tag push, otherwise `latest` plus a build timestamp |
-| Helm charts | each chart's own `version` in `Chart.yaml` |
+Every tag is a GitHub Release, and its notes are that version's release notes.
+The Teams app package (its manifest `version`) is not covered by these rules.
+
+### Which number moves
+
+Before 1.0.0:
+
+- **PATCH** for a release that only fixes bugs.
+- **MINOR** for a release that adds a feature or makes an incompatible
+  change. Each incompatible change is called out on its own in the release
+  notes, with what a deployment or a user has to do. Incompatible includes
+  the protocol between the connector and Claw
+  (`claw/packages/protocol/src/remote-agents.ts`) and the personal agent's
+  plugin ports (`personal-agent/packages/core/src/plugins/`), not only HTTP
+  APIs and settings.
+
+From 1.0.0 on, [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html):
+MAJOR for an incompatible change, MINOR for an addition, PATCH for a fix.
+
+How this relates to SemVer: SemVer 2.0.0 says nothing about 0.x ("anything
+may change at any time"). PrimusClaw follows the convention npm's caret
+ranges assume instead: within 0.x, MINOR plays the role of MAJOR, so
+`^0.2.3` means `>=0.2.3 <0.3.0` and a PATCH update is always safe to take,
+while a MINOR update may need you to read its notes first. Unlike plain
+SemVer 0.x, features also move MINOR here, so a PATCH update never adds
+behaviour.
+
+### What each release's notes must say
+
+- What changed, from the pull requests' descriptions (Added / Changed /
+  Fixed, as below), with each incompatible change in its own entry.
+- What it needs from the other releases. Claw names the oldest connector it
+  still serves (`minimum_version`, `CONNECTOR_VERSIONS.minimum` in the
+  protocol, today 0.1.3) and the one it recommends; the connector and the
+  personal agent name the oldest Claw a feature of theirs needs, as a
+  `claw-vX.Y.Z` tag once Claw has one.
+
+### Claw: build ids and release tags
+
+A push to `main` that changes the `claw` image's sources (`claw/packages/`,
+`claw/deploy/`, its package, TypeScript and Docker files; a Markdown-only
+change builds nothing) builds that image and pushes it under two tags:
+`latest`, and the build time in UTC+8 (`YYYYMMDDHHMM`, for example
+`202611112010`), which the image also carries as `CLAW_BUILD`. Build ids stay:
+they are how a deployment is pinned and rolled out, and they are internal
+deployment numbers, not release versions.
+
+A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
+build id was built from. It does not rebuild anything: the image to deploy
+for it is that commit's build-id image, named in the release notes. Cut
+one at least whenever what ships carries a new feature or an incompatible
+change.
+
+1. Find the commit of the build you are releasing (the Build workflow run
+   that pushed it logs `CLAW_BUILD in image: '<build id>'`; its `headSha` is
+   the commit).
+2. Move the entries in **[Unreleased]** below that this commit carries into
+   a new section `## [X.Y.Z] - YYYY-MM-DD`, with the build id and the
+   requirements above, and merge that to `main`.
+3. Create the release on the commit, with that section as its notes:
+   `gh release create "claw-vX.Y.Z" --target <commit> --title "Claw X.Y.Z" --notes-file notes.md`.
+
+Do not name a Claw tag `v*`: the image workflows run on any `v*` tag pushed
+to the repository, and the Build workflow then rebuilds its images under the
+tag name and pushes the `claw` image under it. `claw-v*` does not match that
+pattern.
+
+The connector and the personal agent are cut as their own READMEs describe
+([connector](connector/README.md#releasing-maintainers),
+[personal agent](personal-agent/README.md#releasing-maintainers)), with the
+version chosen by these rules.
+
+### Pinning a deployment
 
 **`latest` is the chart default and is a moving target.** For anything you
-intend to reproduce, set an explicit image tag — `--set image.tag=<tag>` — and
-record it.
+intend to reproduce, set an explicit image tag — `--set image.tag=<build id>`
+— and record it. The `claw` chart's own `version` in `Chart.yaml` versions
+the chart package (templates, default values and metadata); it is not a Claw
+release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
