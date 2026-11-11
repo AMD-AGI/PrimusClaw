@@ -30,6 +30,8 @@ export interface Finding {
   line: number | null;
   body: string;
   blocking: boolean;
+  /** The code of the head the finding is about, as the reviewer copied it (`existing_code`): it places the finding (relocate.ts). */
+  code?: string;
 }
 
 export type RejectReason = "wrong" | "not_introduced" | "no_failure" | "duplicate";

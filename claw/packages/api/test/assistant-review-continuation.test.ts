@@ -179,20 +179,21 @@ describe("assistant review continuation", { skip }, () => {
     assert.deepEqual(gh.resolves.map((c) => c.body.variables.id), ["PRRT_1"]);
     const foreign = await service.resolveThread(actor(second.session_id), { pr: PR_REF, thread_id: "PRRT_99", head_sha: H2 });
     assert.equal(foreign.body.reason, "thread_not_recorded");
-    // The new issue is caught: the not-fixed finding said again, and the new one.
+    // The new issue is caught: the not-fixed finding said again (in the body, its thread is still open), and the new one inline.
     const r2 = await post(second.session_id, H2, [{ path: "src/app.ts", line: 4, body: "d_bad is still wrong" }, { path: "src/app.ts", line: 5, body: "e_new_bug breaks it" }]);
     assert.equal(r2.body.status, "submitted", r2.text);
+    assert.deepEqual(r2.body.said_in_body_as_still_open, [{ path: "src/app.ts", line: 4, thread_id: "PRRT_2" }], "no second thread on d_bad");
     await turnEnds(second.session_id);
     const done2 = await w.item(second.item_id);
     assert.deepEqual(done2.params.record.findings.map((f: any) => [f.line, f.thread_id, f.resolved]), [
-      [3, "PRRT_1", true], [4, "PRRT_2", false], [4, "PRRT_3", false], [5, "PRRT_4", false],
+      [3, "PRRT_1", true], [4, "PRRT_2", false], [5, "PRRT_3", false],
     ], "the old ones as they now stand, then this round's");
     assert.equal(done2.params.record.head_sha, H2);
 
     // ---- a third round carries what is still open, not what was resolved.
     const third = await restart(second.item_id);
     const item3 = await w.item(third.item_id);
-    assert.deepEqual(item3.params.continues.findings.map((f: any) => f.thread_id), ["PRRT_2", "PRRT_3", "PRRT_4"]);
+    assert.deepEqual(item3.params.continues.findings.map((f: any) => f.thread_id), ["PRRT_2", "PRRT_3"]);
     assert.deepEqual([item3.params.continues.from_seq, item3.params.continues.head_sha], [2, H2]);
     const o3 = (await service.getPr(actor(third.session_id), { pr: PR_REF })).body as any;
     assert.deepEqual([o3.continuation.scope, o3.continuation.reason], ["unchanged", "head_unchanged"], "nothing pushed since: only the findings to check");

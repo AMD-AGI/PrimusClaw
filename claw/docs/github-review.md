@@ -715,9 +715,9 @@ diff (written once to `.pr-review/pr.diff` in the checkout, excluded from git), 
 read, and the callers a search showed but it did not open, which it opens first; and the diff is
 read once from the checkout rather than in `gh_pr_get` pages.
 
-#### Coverage, checks by language and the finding check
+#### Coverage, checks by language, the finding check and where findings go
 
-Three parts of the deep review are mechanisms rather than instructions, borrowed in idea from
+These parts of the deep review are mechanisms rather than instructions, borrowed in idea from
 [alibaba/open-code-review](https://github.com/alibaba/open-code-review):
 
 - **Coverage.** `gh_pr_get` names, in `coverage.required`, every changed file there is something to
@@ -746,6 +746,18 @@ Three parts of the deep review are mechanisms rather than instructions, borrowed
   (`CLAW_ASSISTANT_REVIEW_MODEL`, else `MEMORY_LLM_MODEL`) with the requester's model key, and fails
   open: when the call fails or times out (3 minutes), every finding is posted as written and the
   result says the check did not run. `CLAW_GITHUB_REVIEW_FINDING_CHECK=false` turns it off.
+
+- **Placing by the code.** Each inline comment and note may carry `existing_code`, the line or the
+  few lines of the head it is about, copied from the diff. When the comment's line does not show that
+  code, the service finds it among the lines the diff shows on the head side (the place nearest the
+  given line; at least one line of four characters or more, consecutive lines in order, a copied
+  `+`/`-` mark ignored) and posts the comment there; the result's `moved_comments` names each move.
+  Code that is not in the diff moves nothing, and a line outside the diff is refused as before.
+- **No second thread on a re-review.** A re-review's inline finding within three lines of a finding
+  of the last review whose thread is still open, on the same file, and that says much the same (most
+  words of the shorter text are in the other), is said in the body under "Still open from the last
+  review" instead of opening another thread (`said_in_body_as_still_open`). A new problem near an old
+  one says other things and gets its own thread.
 
 `CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review has no model or
 reasoning effort of its own: the session runs on the `model` and `effort` its creator sent with
@@ -823,7 +835,7 @@ logs and the audit rows.
 | `CLAW_GITHUB_REVIEW_FAST_MAX_FILES` | 15 | At most this many changed files for the diff-only path |
 | `CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES` | 200 (600 with the deep review off) | At most this many added plus deleted lines for the diff-only path; with the deep review on, a change of a non-test source file takes the sandbox path whatever its size |
 | `CLAW_GITHUB_REVIEW_DEEP_ENABLED` | on | The deep review ("The deep review" above): a required sandbox for source changes, the callers read, the closest tests run, and a second adversarial pass. `false` (or `0`, `no`) gives the review as it was before the switch. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
-| `CLAW_GITHUB_REVIEW_FINDING_CHECK` | on (with the deep review) | The independent check of a deep review's findings before they are posted ("Coverage, checks by language and the finding check" above). `false` (or `0`, `no`) posts the findings as the reviewer wrote them. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
+| `CLAW_GITHUB_REVIEW_FINDING_CHECK` | on (with the deep review) | The independent check of a deep review's findings before they are posted ("Coverage, checks by language, the finding check and where findings go" above). `false` (or `0`, `no`) posts the findings as the reviewer wrote them. Another value than `true`/`1`/`yes`/`false`/`0`/`no` is reported and leaves it on |
 
 The identity provider must give the API's own client the `identity.credential.resolve` scope
 (see [identity-client.md](identity-client.md), external credentials). Without a bound credential
