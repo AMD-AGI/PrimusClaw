@@ -138,6 +138,9 @@ export interface AssistantRemoteAsk {
    * those that refuse.
    */
   input?: unknown;
+  /** A terminal's request: the conversation's title (its project or session name) and the folder it runs in; plain one-line text. */
+  title?: string;
+  cwd?: string;
   /** A terminal's question asked as several cards: which this is (from 0), and how many. */
   question_index?: number;
   question_count?: number;

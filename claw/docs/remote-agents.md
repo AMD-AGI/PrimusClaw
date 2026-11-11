@@ -139,7 +139,8 @@ work to. Closing it from a client only stops the cards; the next prompt of that 
 Each conversation that asks is an item on the owner's list (`origin: "terminal"`, titled with the machine, the agent and the
 conversation). A request puts it in front of them and is said once, with its options as `remote.ask` on the `assistant.say` so a
 channel shows them as buttons. A terminal's `remote.ask` also carries `origin: "terminal"`, the request's `kind` and its `input` whole
-(the command, the edit, the plan, the question; with `question_index` and `question_count` for one question of several): what the
+(the command, the edit, the plan, the question; with `question_index` and `question_count` for one question of several), and where it
+asks: the conversation's `title` and the request's `cwd` (the session's when it names none): what the
 person approves is all of what will run. One whose `input` is over 16 KB as JSON goes without it and offers only the options that
 refuse; one left with nothing to choose is said in words, to be answered in the terminal. An answer from the phone takes the item back
 silently. One from the terminal, or a request that stopped waiting (`timeout`, `session_end`, `connector_restart`), after its card

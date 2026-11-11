@@ -208,6 +208,8 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
         ...(r.ask.expires_at ? { expires_at: r.ask.expires_at } : {}),
         ...(r.ask.origin ? { origin: r.ask.origin } : {}),
         ...(r.ask.kind ? { kind: r.ask.kind } : {}),
+        ...(r.ask.title ? { title: redact(r.ask.title) } : {}),
+        ...(r.ask.cwd ? { cwd: redact(r.ask.cwd) } : {}),
         ...(r.ask.input !== undefined ? { input: redactPublicJson(r.ask.input) } : {}),
         ...(r.ask.question_index !== undefined ? { question_index: r.ask.question_index } : {}),
         ...(r.ask.question_count !== undefined ? { question_count: r.ask.question_count } : {}),
