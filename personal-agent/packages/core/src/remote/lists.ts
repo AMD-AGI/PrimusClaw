@@ -66,7 +66,8 @@ export class Lists {
   }
 
   async sessions(key: string): Promise<Sessions> {
-    const raw = await orOff(() => this.ctx.claw.sessions(key));
+    // (a session a connector opened only to carry a terminal's approval cards is no session to list, switch to or send work to)
+    const raw = (await orOff(() => this.ctx.claw.sessions(key))).filter((s) => s["origin"] !== "terminal_hook");
     return { raw, sessions: raw.map(sessionFrom) };
   }
 

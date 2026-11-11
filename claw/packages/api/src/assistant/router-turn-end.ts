@@ -26,7 +26,9 @@
  */
 import pino from "pino";
 import { db } from "../infra/db.js";
+import { CLAW_ASSISTANT_KEY_BINDING_URL } from "../config.js";
 import { detectLanguage } from "./language.js";
+import { keyRefusalOf } from "./key-refusal.js";
 import {
   ANSWERED_UNSAID_SQL, SAY_TEXT_MAX, publishSayEvent, recordAssistantSay, recordNeedsYouFallback, recordSystemNotice, SayRefused,
   turnHandedOffReview, type SayDeps,
@@ -115,13 +117,29 @@ export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "f
       ? "这个请求我不能处理：它可能涉及访问内部地址、凭据或其他不安全的操作，所以我没有执行。换个问题或说明你想达到的目的，我可以继续帮你。进行中的事项不受影响。"
       : "I can't help with that request: it may involve reaching internal addresses, credentials or something else unsafe, so I did not do it. Ask something else or tell me what you want to achieve, and I'll help. Your work items are not affected.";
   }
+  // The gateway refused the user's own key and the turn could not be run again on the fallback (`model-fallback.ts`): saying it again
+  // meets the same refusal, so they are told what to fix and where.
+  if (why === "key_invalid" || why === "key_missing") {
+    const url = CLAW_ASSISTANT_KEY_BINDING_URL;
+    if (why === "key_invalid") {
+      return chinese
+        ? `你绑定的 APIM Key 无效或已过期，模型网关拒绝了这条消息。重新上传有效的 APIM Key 后再发一次即可${url ? `：\n${url}` : "。"}`
+        : `The APIM key bound to your key is invalid or expired, so the model gateway refused this message. Upload a valid APIM key, then send it again${url ? `:\n${url}` : "."}`;
+    }
+    return chinese
+      ? `你的 key 还没有绑定 APIM Key，模型网关拒绝了这条消息。上传 APIM Key 后再发一次即可${url ? `：\n${url}` : "。"}`
+      : `Your key has no APIM key bound, so the model gateway refused this message. Upload an APIM key, then send it again${url ? `:\n${url}` : "."}`;
+  }
   return chinese
     ? "刚才这条没有处理成功，请再说一次。进行中的事项不受影响。"
     : "That message did not go through; please say it again. Your work items are not affected.";
 }
 
-/** Why a turn that answers the user ended without a word: it failed, the model declined to answer at all, or it was stopped. */
-export type TurnLostWhy = "failed" | "declined" | "stopped";
+/**
+ * Why a turn that answers the user ended without a word: it failed, the model declined to answer at all, it was stopped, or the gateway
+ * refused the user's key (`key-refusal.ts`: none bound, or the one bound is invalid).
+ */
+export type TurnLostWhy = "failed" | "declined" | "stopped" | "key_missing" | "key_invalid";
 
 /**
  * What Brain ends a run with when its model answered nothing twice in a row (or on its last turn): no text and no tool call
@@ -138,7 +156,10 @@ export const EMPTY_TURN_TEXT_RE = /\bended (?:its|its last allowed) turn without
  */
 export function lostWhy(end: Pick<RouterTurnEnd, "failed" | "interrupted" | "fromSweeper" | "finalText">): TurnLostWhy {
   if (end.interrupted && !end.fromSweeper) return "stopped";
-  return end.failed && !end.interrupted && !end.fromSweeper && EMPTY_TURN_TEXT_RE.test(end.finalText ?? "") ? "declined" : "failed";
+  if (!end.failed || end.interrupted || end.fromSweeper) return "failed";
+  if (EMPTY_TURN_TEXT_RE.test(end.finalText ?? "")) return "declined";
+  const key = keyRefusalOf(end.finalText);
+  return key ? `key_${key}` : "failed";
 }
 
 export async function deliverUnsaidAnswer(end: RouterTurnEnd, deps: SayDeps = {}): Promise<"said" | "skipped"> {
@@ -352,7 +373,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   const prompts = runs.map((r) => r.prompt);
   const why = lostWhy(end);
   let text = lost ? turnLostNotice(prompts, why) : answerToDeliver(end.finalText, prompts);
-  if (lost) await takeBack(why === "failed" ? "turn_lost" : why);
+  if (lost) await takeBack(why === "failed" || why === "key_missing" || why === "key_invalid" ? "turn_lost" : why);
   if (!text) {
     if (lost) return "skipped";
     await takeBack("no_text");

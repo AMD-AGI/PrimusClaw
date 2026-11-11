@@ -60,7 +60,7 @@ export class SqliteRemoteSessionNameRepository implements RemoteSessionNameRepos
   }
 }
 
-const PERMISSION_COLUMNS = "session_id, action_id, aad_id, tool, options_json, expires_at, state";
+const PERMISSION_COLUMNS = "session_id, action_id, aad_id, tool, options_json, expires_at, state, message_id, ask_json";
 
 function permission(row: Row): RemotePermission {
   return {
@@ -71,7 +71,21 @@ function permission(row: Row): RemotePermission {
     options: jsonList(col.str(row, "options_json")),
     expiresAt: col.num(row, "expires_at"),
     state: col.str(row, "state"),
+    messageId: col.str(row, "message_id"),
+    ask: askOf(col.str(row, "ask_json")),
   };
+}
+
+function askOf(text: string): Readonly<Record<string, unknown>> | null {
+  if (!text) return null;
+  try {
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export class SqliteRemotePermissionRepository implements RemotePermissionRepository {
@@ -82,8 +96,8 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
     this.ctx.db.run("DELETE FROM remote_permissions WHERE expires_at < ?", now - REMOTE_PERMISSION_KEEP_SECONDS);
     return (
       this.ctx.db.run(
-        "INSERT OR IGNORE INTO remote_permissions (session_id, action_id, aad_id, tool, options_json, expires_at, created_at) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO remote_permissions (session_id, action_id, aad_id, tool, options_json, expires_at, created_at, ask_json) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         p.sessionId,
         p.actionId,
         p.userId,
@@ -91,6 +105,7 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
         pyJsonDumps(p.options),
         p.expiresAt,
         now,
+        p.ask ? JSON.stringify(p.ask) : "",
       ) === 1
     );
   }
@@ -125,6 +140,15 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
     return new Set(rows.map((r) => col.str(r, "session_id")));
   }
 
+  setRemotePermissionMessage(sessionId: string, actionId: string, messageId: string): void {
+    this.ctx.db.run(
+      "UPDATE remote_permissions SET message_id = ? WHERE session_id = ? AND action_id = ?",
+      messageId,
+      sessionId,
+      actionId,
+    );
+  }
+
   forgetRemotePermission(sessionId: string, actionId: string): void {
     this.ctx.db.run("DELETE FROM remote_permissions WHERE session_id = ? AND action_id = ?", sessionId, actionId);
   }
@@ -133,16 +157,12 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
     sessionId: string,
     actionId: string,
     state: RemotePermissionState,
-    options: { readonly onlyIfPending?: boolean } = {},
+    options: { readonly onlyIfPending?: boolean; readonly onlyIfState?: RemotePermissionState } = {},
   ): boolean {
-    const onlyIfPending = options.onlyIfPending ?? true;
-    return (
-      this.ctx.db.run(
-        `UPDATE remote_permissions SET state = ? WHERE session_id = ? AND action_id = ?${onlyIfPending ? " AND state = 'pending'" : ""}`,
-        state,
-        sessionId,
-        actionId,
-      ) === 1
-    );
+    const from = options.onlyIfState ?? ((options.onlyIfPending ?? true) ? "pending" : null);
+    const sql = "UPDATE remote_permissions SET state = ? WHERE session_id = ? AND action_id = ?";
+    return from === null
+      ? this.ctx.db.run(sql, state, sessionId, actionId) === 1
+      : this.ctx.db.run(`${sql} AND state = ?`, state, sessionId, actionId, from) === 1;
   }
 }

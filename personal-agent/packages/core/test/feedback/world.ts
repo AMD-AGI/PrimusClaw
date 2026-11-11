@@ -255,6 +255,8 @@ export function makeWorld(options: WorldOptions = {}) {
   const reporting = new FeedbackReporting({
     service,
     sessions: store.sessions,
+    assistant: claw.assistant,
+    assistantOn: () => options.assistantOn ?? false,
     credential,
     identity,
     clock,

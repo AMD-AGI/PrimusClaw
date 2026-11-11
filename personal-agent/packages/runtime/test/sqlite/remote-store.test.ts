@@ -344,3 +344,36 @@ test("names of the remote sessions a chat started: a title is given once, an acp
   assert.deepEqual(names.remoteSessionAcps("aad-a"), new Map([["s1", "acp-1"]]));
   assert.deepEqual(names.remoteSessionAcps("aad-b"), new Map());
 });
+
+test("a terminal's question keeps its whole ask and the id its card went out as", () => {
+  const { store } = openTestStore();
+  {
+    const perms = store.remotePermissions;
+    const ask = { action_id: "act-t", origin: "terminal", kind: "execute", input: { command: "npm test" } };
+    assert.equal(
+      perms.saveRemotePermission({
+        userId: "u1",
+        sessionId: "s1",
+        actionId: "act-t",
+        tool: "Run",
+        options: [],
+        expiresAt: 9e9,
+        ask,
+      }),
+      true,
+    );
+    assert.deepEqual(perms.getRemotePermission("s1", "act-t")?.ask, ask);
+    assert.equal(perms.getRemotePermission("s1", "act-t")?.messageId, "");
+    perms.setRemotePermissionMessage("s1", "act-t", "m-42");
+    assert.equal(perms.getRemotePermission("s1", "act-t")?.messageId, "m-42");
+    perms.saveRemotePermission({
+      userId: "u1",
+      sessionId: "s1",
+      actionId: "act-o",
+      tool: "Bash",
+      options: [],
+      expiresAt: 9e9,
+    });
+    assert.equal(perms.getRemotePermission("s1", "act-o")?.ask, null);
+  }
+});

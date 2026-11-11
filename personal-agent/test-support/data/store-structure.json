@@ -227,7 +227,7 @@
     "type": "table",
     "name": "remote_permissions",
     "tbl_name": "remote_permissions",
-    "sql": "CREATE TABLE remote_permissions (\n  session_id TEXT NOT NULL, action_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  options_json TEXT NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  PRIMARY KEY (session_id, action_id))"
+    "sql": "CREATE TABLE remote_permissions (\n  session_id TEXT NOT NULL, action_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  options_json TEXT NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL, message_id TEXT NOT NULL DEFAULT '', ask_json TEXT NOT NULL DEFAULT '',\n  PRIMARY KEY (session_id, action_id))"
    },
    {
     "type": "table",
@@ -2271,6 +2271,22 @@
       "notnull": 1,
       "dflt_value": null,
       "pk": 0
+     },
+     {
+      "cid": 8,
+      "name": "message_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 9,
+      "name": "ask_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
      }
     ],
     "indexes": [
@@ -3177,7 +3193,7 @@
     "type": "table",
     "name": "remote_permissions",
     "tbl_name": "remote_permissions",
-    "sql": "CREATE TABLE remote_permissions (\n  session_id TEXT NOT NULL, action_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  options_json TEXT NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  PRIMARY KEY (session_id, action_id))"
+    "sql": "CREATE TABLE remote_permissions (\n  session_id TEXT NOT NULL, action_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  options_json TEXT NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL, message_id TEXT NOT NULL DEFAULT '', ask_json TEXT NOT NULL DEFAULT '',\n  PRIMARY KEY (session_id, action_id))"
    },
    {
     "type": "table",
@@ -5220,6 +5236,22 @@
       "type": "REAL",
       "notnull": 1,
       "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 8,
+      "name": "message_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 9,
+      "name": "ask_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
       "pk": 0
      }
     ],

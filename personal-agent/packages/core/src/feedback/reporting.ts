@@ -4,6 +4,7 @@
 import { errorName } from "../errors.js";
 import { FEEDBACK_TEXT as T } from "../locales/feedback.js";
 import type { IdentityLookup, KeyOwner } from "../plugins/identity-lookup.js";
+import type { ClawAssistantPort } from "../ports/claw/assistant.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { RouteBase } from "../ports/routing.js";
@@ -25,6 +26,9 @@ const REPORTER_LOOKUP_MS = 5_000;
 export interface ReportingDeps {
   readonly service: FeedbackService;
   readonly sessions: Pick<SessionRepository, "getSession">;
+  readonly assistant: Pick<ClawAssistantPort, "session">;
+  /** A 1:1 chat that talks to the person's assistant: its turns are in the assistant's session, which the report's scene is then. */
+  readonly assistantOn: (userId: string) => boolean;
   /** The person's Claw credential if they have one; never asks them for it (`undefined`: not linked). */
   readonly credential: (sender: UserRef) => Promise<string | undefined>;
   readonly identity: IdentityLookup;
@@ -50,11 +54,27 @@ export class FeedbackReporting {
       { userId: sender.id, name, email, scope, conversationId: conversation.ref.id },
       text,
       key,
-      this.deps.sessions.getSession(sender.id, scope) ?? undefined,
+      await this.sessionOf(sender, scope, key),
     );
     await conversation.send(textMessage(replyText(result)));
     const offer = !scope && key ? this.deps.service.makeOffer(sender.id, result) : undefined; // 1:1 only
     if (offer) await conversation.send(offerMessage(offer.offerId, offer.issueNumber));
+  }
+
+  /**
+   * The session whose turns the report shows: the one the chat talks to. A 1:1 chat with the assistant on talks to the assistant's
+   * session (as a thumb's vote is cast there, `thumbs.ts`), so its turns are the ones reported, not the plain chat session's. When the
+   * assistant's session cannot be read, the report goes without turns rather than with another session's.
+   */
+  private async sessionOf(sender: UserRef, scope: string, key: string | undefined): Promise<string | undefined> {
+    if (scope || !key || !this.deps.assistantOn(sender.id))
+      return this.deps.sessions.getSession(sender.id, scope) ?? undefined;
+    try {
+      return (await this.deps.assistant.session(key)).sessionId;
+    } catch (err) {
+      this.deps.log.warn("feedback: the assistant's session could not be read", { why: errorName(err) });
+      return undefined;
+    }
   }
 
   /** What the channel gave, and for what is missing, what the key's platform says; a slow or failed lookup is skipped. */

@@ -11,6 +11,41 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 "Releasing"): a version without a section is not released. While the version is 0.x, a patch release fixes and a minor
 release adds; a change to a plugin port (core's `src/plugins/`) is always a minor release and is called out here.
 
+## 0.2.0
+
+A minor release: it adds behaviour (#713, #720, #725). No plugin port (core's `src/plugins/`) changed.
+
+### Added
+
+- `@primusclaw/personal-agent`: a message typed into a chat attached to a remote agent session while the agent is
+  still answering is sent and queued behind the running turn, not refused with "send it again" (#720).
+- `@primusclaw/personal-agent`: in a group chat that lets the bot read its messages, the chat's recent messages are
+  given to an @mention as untrusted background; `/context off` turns that off for the chat (#725).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a terminal's approval questions on the phone. A coding
+  agent the person started in their own terminal asks before it runs a command, edits a file or starts on a plan; the
+  question arrives in the chat as a card (the command, the edit's both sides, the plan; any field the card does not
+  render is shown as JSON, so nothing is approved unseen), and the card is ended in place when the terminal answers it
+  first. `/approvals [on|off]` reads or sets whether a terminal's questions come to the phone. Needs Claw with #707; the
+  store gains two additive columns on `remote_permissions` (#713).
+
+### Fixed
+
+- `@primusclaw/personal-agent`: with the assistant on, `/sessions` (and the menu's sessions) shows the sessions on the
+  person's machines, as `/agents` does, instead of saying there are none (#716).
+- `@primusclaw/personal-agent`: a chat following a conversation open in a terminal tells the terminal's reply after a
+  few quiet seconds, not after the 30 s / 60 s timings of the phone's own sessions (#717).
+- `@primusclaw/personal-agent`: a reply that starts with a code span no longer streams a lone look-alike backtick and
+  then repeats the whole answer as a second message (#718).
+- `@primusclaw/personal-agent`: a message sent while the chat's own turn runs (a group chat, or a 1:1 chat off the
+  assistant) is queued behind it instead of refused; the assistant's `/stop` answers in the chat's language; a turn
+  the person stopped says it stopped (#724).
+- `@primusclaw/personal-agent`: asked in a group to introduce itself, the agent also names what a 1:1 chat with it
+  adds (connecting your own machine, memory, research, the board, reminders) (#726).
+
+### Docs
+
+- A quick start for running your own personal agent from the published artifacts (`docs/quickstart.md`, #719).
+
 ## 0.1.1
 
 - `@primusclaw/personal-agent`: a remote agent's activity no longer shows, as words the person typed, the entries

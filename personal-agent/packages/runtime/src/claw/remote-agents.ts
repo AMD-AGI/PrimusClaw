@@ -27,6 +27,14 @@ import { anyDataOf, dataOf } from "./answers.js";
 import { type ClawHttp, pyQuote, segment } from "./http.js";
 import { sseEvents } from "./sse-stream.js";
 
+/** The `enabled` of an approvals answer (`{ok, data: {enabled}}`); anything else is not an answer. */
+function enabledOf(answer: unknown): boolean {
+  const data = anyDataOf(answer, "the approvals setting");
+  const enabled = data !== null && typeof data === "object" ? (data as Record<string, unknown>)["enabled"] : undefined;
+  if (typeof enabled !== "boolean") throw new ClawAnswerInvalid("the approvals setting has no enabled");
+  return enabled;
+}
+
 /** `ClawRemoteAgentsPort` over Claw's HTTP API; every call names this client (`X-Claw-Client`) in Claw's audit trail. */
 export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   constructor(
@@ -41,6 +49,14 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   async connectors(key: ClawCredential, options: { includeHidden?: boolean } = {}): Promise<RemoteConnector[]> {
     const path = options.includeHidden === true ? `/connectors?hidden=${REMOTE_HIDDEN_INCLUDE}` : "/connectors";
     return read(remoteConnectorsSchema, anyDataOf(await this.#call("GET", path, key), "connectors"), "connectors");
+  }
+
+  async approvals(key: ClawCredential): Promise<boolean> {
+    return enabledOf(await this.#call("GET", "/approvals", key));
+  }
+
+  async setApprovals(key: ClawCredential, enabled: boolean): Promise<boolean> {
+    return enabledOf(await this.#call("PUT", "/approvals", key, { enabled }));
   }
 
   async pair(key: ClawCredential): Promise<RemotePairing> {

@@ -4,7 +4,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
-import { MarketplaceDb, type JsonObject } from "../infra/db.js";
+import { MarketplaceDb, PLUGIN_LIST_SCOPES, type JsonObject, type PluginListScope } from "../infra/db.js";
 import {
   AccessDeniedError,
   BadGatewayError,
@@ -564,6 +564,16 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
 
   app.get<{ Querystring: Record<string, string | undefined> }>("/v1/plugins", async (req, reply) => {
     const u = getUser(req)!;
+    // `scope`: public plus the caller's own by default, for admins too; `all`
+    // (every plugin) is an admin's explicit ask.
+    const scopeRaw = String(req.query.scope ?? "").trim() || "visible";
+    if (!(PLUGIN_LIST_SCOPES as readonly string[]).includes(scopeRaw)) {
+      return reply.status(400).send(authErrorPayload("bad_request", `scope must be one of ${PLUGIN_LIST_SCOPES.join(", ")}`));
+    }
+    const scope = scopeRaw as PluginListScope;
+    if (scope === "all" && !isAdmin(u)) {
+      return reply.status(403).send(authErrorPayload("forbidden", "scope=all is for admins"));
+    }
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
     const offset = Math.max(0, Number(req.query.offset ?? 0));
     const includeDeleted = req.query.include_deleted === "true" && isAdmin(u);
@@ -582,6 +592,7 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
       owner: String(req.query.owner ?? "") || undefined,
       viewerUserId: u.userId,
       isAdmin: isAdmin(u),
+      scope,
       includeDeleted,
       nameExact: nameExact || undefined,
       nameContains: nameExact ? undefined : nameFuzzy || undefined,
