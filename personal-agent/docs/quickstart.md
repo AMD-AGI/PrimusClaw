@@ -24,7 +24,7 @@ the agent loop against your LLM gateway. What you bring, and what this page sets
 | Claw and its LLM gateway                            | yes, separately | a running deployment ([`deploy/`](../../deploy/README.md)) and its SaFE endpoint, a Claw API key per person |
 | Teams bot registration and app package              | no              | an Azure Bot, an app registration with a client secret (or a managed identity), a Teams app manifest        |
 | Service Bus queues                                  | no              | an Azure Service Bus namespace with two queues                                                              |
-| The ingress between the bot and the inbound queue   | yes             | an Azure Function app (Flex Consumption, Node 26) to deploy it to ([step 4](#4-the-ingress))                |
+| The ingress between the bot and the inbound queue   | yes             | an Azure Function app (Flex Consumption, Node 24+) to deploy it to ([step 4](#4-the-ingress))               |
 
 ## Prerequisites
 
@@ -260,13 +260,13 @@ cannot take the activity (Teams then retries; the worker drops a repeated activi
 `personal-agent-teams-ingress-<version>.zip` (with its `.sha256`), a Function app package that installs and builds
 nothing on the app.
 
-Create a Function app on the Flex Consumption plan with Node.js 26 and a system-assigned identity, and give that
-identity the right to send to the inbound queue:
+Create a Function app on the Flex Consumption plan with Node.js 24 (or later) and a system-assigned identity, and give
+that identity the right to send to the inbound queue:
 
 ```bash
 az storage account create -g <group> -n <ingress-storage> --sku Standard_LRS
 az functionapp create -g <group> -n <ingress-app> --storage-account <ingress-storage> \
-  --flexconsumption-location <region> --runtime node --runtime-version 26 --assign-identity '[system]'
+  --flexconsumption-location <region> --runtime node --runtime-version 24 --assign-identity '[system]'
 principal=$(az functionapp identity show -g <group> -n <ingress-app> --query principalId -o tsv)
 az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal \
   --role "Azure Service Bus Data Sender" \

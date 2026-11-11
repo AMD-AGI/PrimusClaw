@@ -14,7 +14,10 @@
  *
  * The zip is unpacked by Python's zipfile, not by this repository's code.
  *
- *   node --import tsx scripts/ingress-host-smoke.ts --zip <zip> --func <path to func> [--port 7072]
+ * The host's Node worker runs the `node` on PATH. With `--node <major>`, the smoke first checks that this `node` is that
+ * major version, so a run meant for Node 24 cannot pass on another.
+ *
+ *   node --import tsx scripts/ingress-host-smoke.ts --zip <zip> --func <path to func> [--port 7072] [--node 24]
  */
 import { spawn, spawnSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
@@ -177,14 +180,27 @@ if (import.meta.main) {
   const { values } = parseArgs({
     args: process.argv.slice(2),
     strict: true,
-    options: { zip: { type: "string" }, func: { type: "string" }, port: { type: "string", default: "7072" } },
+    options: {
+      zip: { type: "string" },
+      func: { type: "string" },
+      port: { type: "string", default: "7072" },
+      node: { type: "string" },
+    },
   });
   if (values.zip === undefined || values.func === undefined) {
-    console.error("usage: ingress-host-smoke.ts --zip <zip> --func <func> [--port N]");
+    console.error("usage: ingress-host-smoke.ts --zip <zip> --func <func> [--port N] [--node MAJOR]");
     process.exit(2);
+  }
+  // The `node` the host's worker will run: the first on PATH.
+  const nodeVersion = spawnSync("node", ["--version"], { encoding: "utf8" }).stdout.trim();
+  if (values.node !== undefined && !nodeVersion.startsWith(`v${values.node}.`)) {
+    console.error(`ingress-host-smoke: the node on PATH is ${nodeVersion || "missing"}, not Node ${values.node}`);
+    process.exit(1);
   }
   const problems = await run(path.resolve(values.zip), values.func, Number(values.port));
   for (const p of problems) console.error(`ingress-host-smoke: ${p}`);
   if (problems.length > 0) process.exit(1);
-  console.log("ingress-host-smoke: the Function package answers 401, 200, 400 and 500 in a Functions host as expected");
+  console.log(
+    `ingress-host-smoke: the Function package answers 401, 200, 400 and 500 in a Functions host on Node ${nodeVersion} as expected`,
+  );
 }
