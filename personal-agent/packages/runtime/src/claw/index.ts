@@ -3,6 +3,6 @@
 
 export { createClawClient, DEFAULT_CLIENT_LABEL, type ClawClientOptions } from "./client.js";
 export type { Fetch } from "./http.js";
-export { HttpIdentityLookup } from "./identity-lookup.js";
+export { HttpIdentityLookup, type IdentityLookupOptions } from "./identity-lookup.js";
 export { HttpKeyRevoker } from "./key-revoker.js";
 export { ruleText } from "./rule.js";

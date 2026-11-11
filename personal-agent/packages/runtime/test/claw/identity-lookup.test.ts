@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import type { KeyOwner } from "@primusclaw/personal-agent";
+import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { HttpIdentityLookup, type Fetch } from "../../src/index.js";
 
 interface Case {
@@ -105,5 +106,83 @@ describe("the key owner from the platform's /users/self (Python safe.py)", () =>
     const started = performance.now();
     assert.equal(await new HttpIdentityLookup(BASE, fetch, 50).ownerOfKey(KEY), undefined);
     assert.ok(performance.now() - started < 2_000);
+  });
+});
+
+describe("the owner of an exchanged identity token, from Claw's /v1/me (TEAMS_EXCHANGE_FOR_CHAT)", () => {
+  const CLAW = "https://claw.example.com/claw-api";
+  const TOKEN = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1LWFkYSJ9.c2ln";
+
+  /** SaFE refuses a token on /users/self (as it does in production); Claw's /v1/me answers for it with `me`. */
+  function both(me: () => Response): { fetch: Fetch; seen: Array<readonly [string, string]> } {
+    const seen: Array<readonly [string, string]> = [];
+    const fetch: Fetch = (url, init) => {
+      const authorization = (init.headers as Record<string, string>)["Authorization"] ?? "";
+      seen.push([url, authorization]);
+      if (url === `${CLAW}/v1/me`) return Promise.resolve(me());
+      if (url === `${BASE}/users/self`)
+        return Promise.resolve(
+          authorization.startsWith("Bearer ak-")
+            ? Response.json({ id: "u-ada", name: "Ada (key)", email: "ada@example.com", type: "SSO" })
+            : new Response(null, { status: 401 }),
+        );
+      return Promise.resolve(new Response(null, { status: 404 }));
+    };
+    return { fetch, seen };
+  }
+
+  const ME = () =>
+    Response.json({
+      userId: "u-ada",
+      name: "Lovelace, Ada",
+      email: "ada@example.com",
+      roles: ["default"],
+      workspaces: [],
+    });
+
+  it("a token is asked of Claw's /v1/me with the token, never of SaFE's /users/self", async () => {
+    const { fetch, seen } = both(ME);
+    const owner = await new HttpIdentityLookup(BASE, fetch, 50, { clawApiUrl: CLAW }).ownerOfKey(TOKEN);
+    assert.deepEqual(owner, { id: "u-ada", name: "Lovelace, Ada", email: "ada@example.com", accountType: "" });
+    assert.deepEqual(seen, [[`${CLAW}/v1/me`, `Bearer ${TOKEN}`]]);
+  });
+
+  it("an ak- key is still asked of SaFE's /users/self, never of Claw", async () => {
+    const { fetch, seen } = both(ME);
+    const owner = await new HttpIdentityLookup(BASE, fetch, 50, { clawApiUrl: CLAW }).ownerOfKey("ak-ada");
+    assert.deepEqual(owner, { id: "u-ada", name: "Ada (key)", email: "ada@example.com", accountType: "sso" });
+    assert.deepEqual(seen, [[`${BASE}/users/self`, "Bearer ak-ada"]]);
+  });
+
+  it("without Claw's URL a token has no owner, and nothing is asked", async () => {
+    const { fetch, seen } = both(ME);
+    assert.equal(await new HttpIdentityLookup(BASE, fetch, 50).ownerOfKey(TOKEN), undefined);
+    assert.deepEqual(seen, []);
+  });
+
+  it("a /v1/me answer without a name or not an object is no owner; one without an email keeps the name", async () => {
+    const answers: Array<[() => Response, readonly [string, string] | null]> = [
+      [() => Response.json({ userId: "u-ada", roles: [] }), null],
+      [() => Response.json(["u-ada"]), null],
+      [() => new Response("not json", { status: 200 }), null],
+      [() => Response.json({ userId: "u-ada", name: " Ada " }), ["Ada", ""]],
+    ];
+    for (const [me, expected] of answers) {
+      const { fetch } = both(me);
+      const owner = await new HttpIdentityLookup(BASE, fetch, 50, { clawApiUrl: CLAW }).ownerOfKey(TOKEN);
+      assert.deepEqual(whoami(owner), expected);
+    }
+  });
+
+  it("an answer other than 200 is no owner, and is logged with its route, status and credential kind, not the credential", async () => {
+    const logger = new RecordingLogger();
+    const { fetch } = both(() => Response.json({ error: "session_rejected" }, { status: 401 }));
+    const lookup = new HttpIdentityLookup(BASE, fetch, 50, { clawApiUrl: CLAW, logger });
+    assert.equal(await lookup.ownerOfKey(TOKEN), undefined);
+    assert.deepEqual(
+      logger.lines.map((l) => [l.message, l.fields]),
+      [["identity lookup: no owner", { route: "/v1/me", status: 401, credential: "identity_token" }]],
+    );
+    assert.equal(JSON.stringify(logger.lines).includes(TOKEN), false);
   });
 });
