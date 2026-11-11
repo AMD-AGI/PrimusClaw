@@ -734,17 +734,18 @@ Three parts of the deep review are mechanisms rather than instructions, borrowed
 - **The finding check.** Non-blocking suggestions and open questions go in `non_blocking` of
   `gh_review_submit`, not in the body. Before anything is posted, the service has every finding,
   inline and non-blocking, checked by one separate model call that sees the pull request's title and
-  description, its diff and the findings, and nothing of the review's own reasoning. It rejects a
-  finding the diff contradicts, one about a problem the change did not introduce, one that names no
-  wrong outcome, and a repeat; it grades the rest by whether the author would change the code for
-  them. A rejected finding, and one graded unlikely to be acted on, is withdrawn; a blocking finding
-  graded secondary, and a true note about style or upkeep, is posted as a non-blocking note; the
-  notes that remain are listed under the body. A request for changes left with no inline finding is
-  posted as a comment. The result's `finding_check` says what was withdrawn and why, so the answer
-  can say it. The check runs on the review model (`CLAW_ASSISTANT_REVIEW_MODEL`, else
-  `MEMORY_LLM_MODEL`) with the requester's model key, and fails open: when the call fails or times
-  out (3 minutes), every finding is posted as written and the result says the check did not run.
-  `CLAW_GITHUB_REVIEW_FINDING_CHECK=false` turns it off.
+  description, its diff and the findings, and nothing of the review's own reasoning. Its instructions
+  are the call's system prompt and the material its user message, and the ids it answers with are
+  drawn for each call. It rejects a finding the diff contradicts, one about a problem the change did
+  not introduce, one that names no wrong outcome, and a repeat, and estimates for each the chance
+  (`p_act`, 0 to 100) that the author changes the code for it. A rejected note, and one under 20,
+  is withdrawn; the notes that remain are listed under the body. Everything the check reads can be
+  written by the pull request's author, so it never decides a blocking finding: inline findings are
+  posted as the reviewer wrote them, and the ones the check doubted are reported back in the result
+  (`finding_check.doubted_blocking`, next to `withdrawn_notes`). The check runs on the review model
+  (`CLAW_ASSISTANT_REVIEW_MODEL`, else `MEMORY_LLM_MODEL`) with the requester's model key, and fails
+  open: when the call fails or times out (3 minutes), every finding is posted as written and the
+  result says the check did not run. `CLAW_GITHUB_REVIEW_FINDING_CHECK=false` turns it off.
 
 `CLAW_GITHUB_REVIEW_DEEP_ENABLED=false` turns the deep review off. The review has no model or
 reasoning effort of its own: the session runs on the `model` and `effort` its creator sent with

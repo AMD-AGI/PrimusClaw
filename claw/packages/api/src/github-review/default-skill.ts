@@ -294,12 +294,12 @@ const DEEP_REVIEW_STEPS = `## Steps
    - Non-blocking suggestions and open questions for the author go in \`non_blocking\` of
      \`gh_review_submit\`, one entry each with its path, its line (or null) and the note, and not in the
      body: the review lists the ones that hold up under the body.
-   - Before anything is posted, the service has every finding, inline and non-blocking, checked by an
-     independent reviewer that reads the change. It withdraws the ones it can disprove, that were
-     already there before the change, that name no wrong outcome or that repeat another, posts a
-     blocking one it judges secondary as a note, and says what it did in \`finding_check\` of the result.
-     Do not post a withdrawn finding again in another form; say in your answer how many were withdrawn.
-     A \`REQUEST_CHANGES\` review whose inline findings were all withdrawn or made notes is posted as \`COMMENT\`.
+   - Before anything is posted, the service has every finding checked by an independent reviewer that
+     reads the change. It withdraws the non-blocking notes it can disprove, that were already there
+     before the change, that name no wrong outcome, that repeat another or that the author would most
+     likely leave, and names them in \`finding_check.withdrawn_notes\` of the result. Inline findings
+     are posted as you wrote them; the ones it doubted are in \`finding_check.doubted_blocking\`. Do not
+     post a withdrawn note again in another form; say in your answer how many notes were withdrawn.
    - Blocking findings: \`gh_review_submit\` with \`REQUEST_CHANGES\`, the inline comments and the body.
    - No blocking findings: \`gh_review_submit\` with \`APPROVE\` and the body. Then call
      \`gh_pr_merge\`; it re-reads everything and merges only if all gates pass.

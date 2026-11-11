@@ -124,7 +124,7 @@ export interface ReviewDeps {
    * One model call for the independent check of a review's findings (finding-check.ts): the prompt in, the answer's text out, on behalf
    * of the person who asked for the review. Without it, or with `findingCheck` off, findings are posted as the reviewer wrote them.
    */
-  completeFindingCheck?: (prompt: string, signal: AbortSignal, requesterUserId: string) => Promise<string>;
+  completeFindingCheck?: (call: { system: string; prompt: string }, signal: AbortSignal, requesterUserId: string) => Promise<string>;
 }
 
 /** What a re-review is given of the review before it: the head it read and its findings, each with the thread GitHub opened for it. */
@@ -746,22 +746,20 @@ export class GithubReview {
     if (o.event === "APPROVE") this.requireNotAuthor(ctx, pr, "an approval");
     // A held review that its person allowed is posted as it was held: its coverage and its findings were checked before it was held.
     const deep = ctx.settings.deepReview && !o.confirmation;
-    const needsChange = Array.isArray(o.rawComments) && o.rawComments.length > 0;
+    // An approval reads the whole change for its gates anyway (requireApprovable): read once, here.
+    const needsChange = (Array.isArray(o.rawComments) && o.rawComments.length > 0) || (deep && o.event === "APPROVE");
     const change = needsChange ? await this.collectChange(ctx, ref, pr) : null;
     // The deep review's coverage and finding check need the changed files only (the rest of a change is read where it is needed).
     const files = change ? change.files : deep ? await this.readChangedFiles(ctx, ref, pr) : null;
-    let comments = this.checkComments(o.rawComments, change);
-    let event = o.event;
+    const comments = this.checkComments(o.rawComments, change);
+    const event = o.event;
     let text = o.text;
     let checked: FindingCheckOutcome | null = null;
     let coverage: CoverageCheck | null = null;
     if (deep && files) {
-      coverage = await this.requireCoverage(ctx, ref, repo, pr, files, o.coverage, event);
-      const r = await this.checkFindings(ctx, pr, files, comments, o.notes ?? []);
-      checked = r.outcome;
-      // A request for changes whose inline findings the check all withdrew or made notes has nothing left that blocks.
-      if (event === "REQUEST_CHANGES" && comments.length > 0 && r.comments.length === 0) event = "COMMENT";
-      comments = r.comments;
+      coverage = await this.requireCoverage(ctx, ref, repo, pr, change, files, o.coverage, event);
+      // The check withdraws notes only: every inline finding is posted as the reviewer wrote it (finding-check.ts).
+      checked = await this.checkFindings(ctx, pr, files, comments, o.notes ?? []);
       text = this.composeBody(text, checked.nonBlocking, coverage, files);
     } else if (o.notes?.length) {
       text = this.composeBody(text, o.notes, null, null);
@@ -772,14 +770,15 @@ export class GithubReview {
       const risk = await this.requireApprovable(ctx, ref, repo, pr, change, o.flags, o.judgement);
       if (!o.confirmation && risk.level === "high") {
         const review: HeldReview = { event: event, body: text, comments };
-        return this.hold(ctx, ref, pr, headSha, {
+        const held = await this.hold(ctx, ref, pr, headSha, {
           kind: "review", review, reasons: risk.reasons, checks: {},
           message: `The approval is held for ${ctx.cred.login} to confirm. Nothing was posted. Say that the approval waits for their decision and why, in the words of the reasons.`,
         });
+        return { ...held, ...this.checkSummary(checked, coverage) };
       }
     }
     const result = await this.writeReview(ctx, ref, pr, event, text, comments);
-    return { status: result.status, head_sha: headSha, ...result.detail, ...this.checkSummary(o.event, event, checked, coverage) };
+    return { status: result.status, head_sha: headSha, ...result.detail, ...this.checkSummary(checked, coverage) };
   }
 
   /** `gh_pr_merge`: merge what this session approved, if every gate is open; a merge a person confirmed approves first when needed. */
@@ -1691,10 +1690,12 @@ export class GithubReview {
    * The deep review's coverage (coverage.ts): every changed file there is something to read in has a conclusion, or nothing is posted, and
    * an approval needs every one of them reviewed. A re-review that reads only the change since the last head concludes on that change.
    */
-  private async requireCoverage(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, changed: RiskFile[], raw: unknown, event: ReviewEvent): Promise<CoverageCheck> {
+  private async requireCoverage(
+    ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, change: Change | null, changed: RiskFile[], raw: unknown, event: ReviewEvent,
+  ): Promise<CoverageCheck> {
     const continuation = this.deps.continuationOf ? await this.deps.continuationOf(ctx.actor.sessionId) : null;
-    // The scope needs only the files and the repository's configuration of the change; read here only for a re-review.
-    const scope = continuation ? await this.continuationScope(ctx, ref, repo, pr, await this.collectChange(ctx, ref, pr), continuation) : null;
+    // The scope needs the repository's configuration of the change too; read here only for a re-review, and only when not read yet.
+    const scope = continuation ? await this.continuationScope(ctx, ref, repo, pr, change ?? await this.collectChange(ctx, ref, pr), continuation) : null;
     const files = scope && scope.scope !== "full" ? scope.files : changed;
     const c = checkCoverage(files, raw);
     if (c.missing.length) {
@@ -1716,23 +1717,22 @@ export class GithubReview {
    * The independent check of the findings (finding-check.ts), when it is on and a model is wired: the inline comments that stay blocking,
    * and what became of the rest. Off, or with nothing to check, everything is kept as written.
    */
-  private async checkFindings(ctx: Ctx, pr: PrInfo, changed: RiskFile[], comments: ReviewComment[], notes: Finding[]): Promise<{ outcome: FindingCheckOutcome; comments: ReviewComment[] }> {
+  private async checkFindings(ctx: Ctx, pr: PrInfo, changed: RiskFile[], comments: ReviewComment[], notes: Finding[]): Promise<FindingCheckOutcome> {
     const findings = this.findingsOf(comments, notes);
     const complete = this.deps.completeFindingCheck;
     if (!ctx.settings.findingCheck || !complete || findings.length === 0) {
-      return { outcome: { ran: false, error: findings.length ? "off" : undefined, blocking: findings.filter((f) => f.blocking), nonBlocking: notes, demoted: [], withdrawn: [] }, comments };
+      return { ran: false, error: findings.length ? "off" : undefined, blocking: findings.filter((f) => f.blocking), nonBlocking: notes, demoted: [], withdrawn: [], doubted: [] };
     }
-    const outcome = await runFindingCheck((prompt, signal) => complete(prompt, signal, ctx.actor.requesterUserId), {
+    const outcome = await runFindingCheck((call, signal) => complete(call, signal, ctx.actor.requesterUserId), {
       intent: `${clip(pr.title, 300)}\n\n${clip(pr.body, 8000)}`.trim(),
       files: changed.map((f) => ({ path: f.path, previousPath: f.previousPath, patch: f.patch })),
       findings,
     });
-    const kept = new Set(outcome.blocking);
     (this.deps.logger ?? logger).info({
       session_id: ctx.actor.sessionId, ran: outcome.ran, error: outcome.error ?? null, findings: findings.length,
-      withdrawn: outcome.withdrawn.length, demoted: outcome.demoted.length,
+      withdrawn: outcome.withdrawn.length, doubted: outcome.doubted.length,
     }, "github_review.finding_check");
-    return { outcome, comments: comments.filter((_, i) => kept.has(findings[i] as Finding)) };
+    return outcome;
   }
 
   /** The body that is posted: the reviewer's text, the notes that hold up and what was not reviewed, within the body limit. */
@@ -1749,15 +1749,16 @@ export class GithubReview {
   }
 
   /** What the result says of the check and the coverage, so that the reviewer's answer can say what was posted. */
-  private checkSummary(asked: ReviewEvent, posted: ReviewEvent, checked: FindingCheckOutcome | null, coverage: CoverageCheck | null): Record<string, unknown> {
+  private checkSummary(checked: FindingCheckOutcome | null, coverage: CoverageCheck | null): Record<string, unknown> {
     if (!checked && !coverage) return {};
+    const item = (w: FindingCheckOutcome["withdrawn"][number]) => ({ path: w.path, line: w.line, reason: w.reason, why: w.analysis });
     return {
-      ...(posted !== asked ? { event_changed: { asked, posted, why: "every inline finding was withdrawn or made a note by the finding check" } } : {}),
       ...(checked ? {
         finding_check: {
           ran: checked.ran, ...(checked.error ? { error: checked.error } : {}),
-          withdrawn: checked.withdrawn.map((w) => ({ path: w.path, line: w.line, blocking: w.blocking, reason: w.reason, why: w.analysis })),
-          made_notes: checked.demoted,
+          withdrawn_notes: checked.withdrawn.map(item),
+          // Posted all the same: the check never decides a blocking finding. Read them again if you have doubts of your own.
+          doubted_blocking: checked.doubted.map(item),
           posted_blocking: checked.blocking.length, posted_notes: checked.nonBlocking.length,
         },
       } : {}),

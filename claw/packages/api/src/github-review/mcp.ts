@@ -183,8 +183,8 @@ function newGithubReview(settings: () => GithubReviewSettings, database: Queryab
     settings, db: database, sessionStopped: reviewSessionStopped,
     ...reviewItemServiceDeps(),
     // The independent finding check runs on the review's own model, on behalf of the person who asked for the review.
-    completeFindingCheck: (prompt, signal, requesterUserId) => callLlmText(requesterUserId, prompt, {
-      model: CLAW_ASSISTANT_REVIEW_MODEL || MEMORY_LLM_MODEL, maxTokens: 16_000, signal,
+    completeFindingCheck: (call, signal, requesterUserId) => callLlmText(requesterUserId, call.prompt, {
+      system: call.system, model: CLAW_ASSISTANT_REVIEW_MODEL || MEMORY_LLM_MODEL, maxTokens: 16_000, signal,
     }),
     resolveCredential: async (req) => {
       const client = identityClient();

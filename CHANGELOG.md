@@ -104,12 +104,12 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 - The deep GitHub review checks its own findings before posting them: one separate model call, which sees the change, its
-  description and the findings but not the review's reasoning, withdraws the ones the diff contradicts, that the change did
-  not introduce, that name no wrong outcome or that repeat another, and posts secondary blocking ones as notes
-  (`CLAW_GITHUB_REVIEW_FINDING_CHECK`, on by default; it fails open). Non-blocking notes are passed to `gh_review_submit` as
-  `non_blocking` and listed under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the
-  review, a skipped one is named and stops an approval), and the instructions carry short checks for the languages the
-  change touches (#750).
+  description and the findings but not the review's reasoning, withdraws the non-blocking notes the diff contradicts, that
+  the change did not introduce, that name no wrong outcome, that repeat another or that the author would most likely leave
+  (`CLAW_GITHUB_REVIEW_FINDING_CHECK`, on by default; it fails open). Inline findings are always posted as written; the ones
+  the check doubts are reported back to the reviewer. Notes are passed to `gh_review_submit` as `non_blocking` and listed
+  under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the review, a skipped one is
+  named and stops an approval), and the instructions carry short checks for the languages the change touches (#750).
 
 ## [0.1.1] - 2026-11-11
 
