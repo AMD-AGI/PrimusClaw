@@ -559,7 +559,7 @@ directory only you can enter).
   connector that is not running, not connected, paused, or a question no card can carry (a multi-select question, more than
   four answers) leaves the question to the terminal at once.
 - **What a card offers.** A command, an edit or another tool: *Yes*, *No*, *No, and stop*, and, when Claude Code suggests an
-  allow rule for it, *Always allow (this session only)* (the rule is on the card; it is never written to a settings file).
+  allow rule for it, *Always allow this session: <rule>* (never written to a settings file; a rule too long to name is not offered).
   A plan: *Approve (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep planning*. A
   question (`AskUserQuestion`): its own answers, one card per question. No card switches a session into a mode that stops
   asking (auto, accept edits, bypass).

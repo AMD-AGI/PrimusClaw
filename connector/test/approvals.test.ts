@@ -45,13 +45,27 @@ describe("what a card offers, and what the choice tells Claude Code", () => {
     assert.equal(m.cards[0]!.kind, "execute");
     assert.equal(m.cards[0]!.tool, "Run: npm test");
     assert.deepEqual(m.cards[0]!.options.map((o) => [o.optionId, o.kind]), [["allow", "allow_once"], ["allow-session", "allow_always"], ["deny", "reject_once"], ["deny-stop", "reject_once"]]);
-    assert.equal(m.cards[0]!.options[1]!.name, "Always allow (this session only)");
-    assert.equal((m.cards[0]!.input as Record<string, unknown>).always_allows, "Bash(npm test)");
+    assert.equal(m.cards[0]!.options[1]!.name, "Always allow this session: Bash(npm test)");
+    // The input on the card is the request's own, untouched.
+    assert.deepEqual(m.cards[0]!.input, { command: "npm test", description: "Run tests" });
     assert.deepEqual(m.decide(["allow"]), { behavior: "allow" });
     assert.deepEqual(m.decide(["allow-session"]), { behavior: "allow", updatedPermissions: [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "npm test" }], behavior: "allow", destination: "session" }] });
     assert.equal(m.decide(["deny"])!.behavior, "deny");
     assert.equal((m.decide(["deny-stop"]) as { interrupt?: boolean }).interrupt, true);
     assert.equal(m.decide(["something-else"]), null);
+  });
+
+  test("a tool's own argument named like card metadata is shown as it is (nothing is merged into the input)", () => {
+    const sugg = [{ type: "addRules", rules: [{ toolName: "mcp__store__delete" }], behavior: "allow", destination: "localSettings" }];
+    const m = mapRequest(ev(req("mcp__store__delete", { always_allows: "confirm=false", id: "42" }, { permission_suggestions: sugg })))!;
+    assert.deepEqual(m.cards[0]!.input, { always_allows: "confirm=false", id: "42" });
+    assert.equal(m.cards[0]!.options[1]!.name, "Always allow this session: mcp__store__delete");
+  });
+
+  test("an allow rule too long to name on its option is not offered", () => {
+    const sugg = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "x".repeat(300) }], behavior: "allow", destination: "localSettings" }];
+    const m = mapRequest(ev(req("Bash", { command: "ls" }, { permission_suggestions: sugg })))!;
+    assert.deepEqual(m.cards[0]!.options.map((o) => o.optionId), ["allow", "deny", "deny-stop"]);
   });
 
   test("no 'always' option when Claude Code suggested no allow rule (only a mode change)", () => {

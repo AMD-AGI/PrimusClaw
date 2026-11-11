@@ -79,6 +79,8 @@ export const MAX_QUESTION_OPTIONS = 4;
  * approved at the terminal, so nothing can be approved that the owner was not shown. Well inside one event's limit.
  */
 export const CARD_INPUT_MAX = 12 * 1024;
+/** The longest option name the wire carries whole (`OfferedOption.name`). */
+export const OPTION_NAME_MAX = 200;
 export const TOO_LONG_NOTE = "Too long to show in full here: it can only be turned down from the phone; approve it at the terminal.";
 /** What Claude reads when the owner turns a request down from the phone. */
 export const DENIED_MESSAGE = "The user declined this from their phone (Claw).";
@@ -145,17 +147,19 @@ const ruleText = (rules: Array<Record<string, unknown>>): string =>
 export function mapRequest(e: PermissionEvent): Mapping | null {
   if (e.tool_name === "AskUserQuestion") return mapQuestions(e);
   if (e.tool_name === "ExitPlanMode") return mapPlan(e);
-  const rules = sessionRules(e.permission_suggestions);
   const shown = shownInput(redactDeep(e.tool_input));
+  // The rule an "always" answer adds is named in that option itself, in full (never added to the input, which is the request's own
+  // and must show exactly what will run); a rule too long to name there is not offered.
+  const always = `Always allow this session: ${ruleText(sessionRules(e.permission_suggestions))}`;
+  const rules = always.length <= OPTION_NAME_MAX ? sessionRules(e.permission_suggestions) : [];
   const options: OfferedOption[] = [
     ...(shown.complete ? [{ optionId: "allow", name: "Yes", kind: "allow_once" }] : []),
-    ...(shown.complete && rules.length ? [{ optionId: "allow-session", name: "Always allow (this session only)", kind: "allow_always" }] : []),
+    ...(shown.complete && rules.length ? [{ optionId: "allow-session", name: always, kind: "allow_always" }] : []),
     { optionId: "deny", name: "No", kind: "reject_once" },
     { optionId: "deny-stop", name: "No, and stop", kind: "reject_once" },
   ];
-  const input = shown.complete && rules.length ? { ...(shown.input as Record<string, unknown>), always_allows: ruleText(rules) } : shown.input;
   return {
-    cards: [{ tool: toolTitle(e), kind: toolKind(e.tool_name), input, options }],
+    cards: [{ tool: toolTitle(e), kind: toolKind(e.tool_name), input: shown.input, options }],
     decide([c]) {
       if (c === "allow" && shown.complete) return { behavior: "allow" };
       if (c === "allow-session" && shown.complete && rules.length) return { behavior: "allow", updatedPermissions: rules };
