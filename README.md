@@ -1,327 +1,268 @@
 # PrimusClaw
 
 [![Tests](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/tests.yml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/tests.yml)
-[![Lint](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/lint.yaml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/lint.yaml)
 [![Build](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/build.yaml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/build.yaml)
-[![CodeQL](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/codeql.yml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/security/code-scanning)
+[![Personal agent packaging](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/personal-agent-packaging.yml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/personal-agent-packaging.yml)
+[![Connector packaging](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/connector-packaging.yml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/connector-packaging.yml)
+[![CodeQL](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/codeql.yml/badge.svg)](https://github.com/AMD-AGI/PrimusClaw/actions/workflows/codeql.yml)
+<br>
+[![npm: @primusclaw/personal-agent](https://img.shields.io/npm/v/%40primusclaw%2Fpersonal-agent?label=%40primusclaw%2Fpersonal-agent)](https://www.npmjs.com/package/@primusclaw/personal-agent)
+[![npm: @primusclaw/connector](https://img.shields.io/npm/v/%40primusclaw%2Fconnector?label=%40primusclaw%2Fconnector)](https://www.npmjs.com/package/@primusclaw/connector)
+[![Docker image](https://img.shields.io/docker/v/primussafe/personal-agent-teams?sort=semver&label=personal-agent-teams%20image)](https://hub.docker.com/r/primussafe/personal-agent-teams)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-PrimusClaw is an LLM agent orchestration system: an API / Brain / Hands service
-triad that runs autonomous coding-agent sessions inside per-session sandboxes,
-backed by NATS JetStream, PostgreSQL, and S3-compatible object storage.
+PrimusClaw is an open platform for running LLM agents on infrastructure you
+control, and for reaching them from the chat you already use. **Claw** is the
+agent orchestration platform: an API / Brain / Hands service triad that runs
+autonomous agent sessions inside per-session sandboxes. The **personal agent**
+is a chat assistant built on Claw: each person gets a standing assistant that
+works with their own Claw identity, with Microsoft Teams as its first channel.
+The **connector** is a small client for a developer's own machine that lets
+Claw, and the assistant through it, drive the Claude Code, Codex or Cursor
+sessions on that machine, using outbound HTTPS only.
 
-The agent harness is called **Claw** and lives under [`claw/`](claw), an
-npm-workspaces monorepo. The repository also carries the components Claw runs
-against — see [Repository layout](#repository-layout).
+> **Status: pre-1.0.** Every published package is 0.x. Interfaces, configuration
+> and wire formats may change between minor releases; pin what you deploy and
+> read the changelogs before upgrading.
+
+## What's in this repository
+
+| Component | What it is | Path | How it ships | Docs |
+|---|---|---|---|---|
+| **Claw** | Agent orchestration platform: API, Brain (agent loop) and Hands (in-sandbox tool server), in TypeScript | [`claw/`](claw) | Container image `docker.io/primussafe/claw` (one image, three roles), Helm chart in [`claw/deploy/charts/claw`](claw/deploy/charts/claw) | [`claw/README.md`](claw/README.md) |
+| **Personal agent** | Personal chat assistant on Claw: channel-neutral core, Node runtime, Microsoft Teams channel | [`personal-agent/`](personal-agent) | npm: [`@primusclaw/personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent), [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime), [`-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams); image `docker.io/primussafe/personal-agent-teams` | [`personal-agent/README.md`](personal-agent/README.md) |
+| **Connector** | `claw-connector` CLI: connects the coding agents on a developer machine to Claw | [`connector/`](connector) | npm: [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector) | [`connector/README.md`](connector/README.md) |
+| **Agent Sandbox** | Kubernetes control plane for the per-session sandbox pods; a fork of `kubernetes-sigs/agent-sandbox`, in Go, Apache-2.0 | [`sandbox/`](sandbox) | Container images `docker.io/primussafe/agent-sandbox-controlplane` and `docker.io/primussafe/agent-sandbox-envd-injector`, Helm chart in [`sandbox/deploy/helm`](sandbox/deploy/helm) | [`sandbox/README.md`](sandbox/README.md) |
+| **Stack installer** | Installs Agent Sandbox, Claw and an optional LiteLLM gateway in one command | [`deploy/`](deploy) | Scripts and Helm chart in this repository | [`deploy/README.md`](deploy/README.md) |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  person([Person in Microsoft Teams]) --> pa["Personal agent worker<br/>personal-agent/"]
+  pa -->|"HTTPS, as that person"| api
+
+  subgraph claw ["Claw (claw/)"]
+    api["Claw API<br/>sessions, events, memory,<br/>skills, MCP, A2A"]
+    brain["Claw Brain<br/>agent loop, LLM calls,<br/>tool routing"]
+    api -->|"NATS JetStream tasks"| brain
+    brain -->|"events"| api
+  end
+
+  api -->|"signed notifications"| pa
+  brain -->|"LLM requests"| llm["LLM gateway<br/>(e.g. LiteLLM, deploy/litellm)"]
+  subgraph pod ["Per-session sandbox pod"]
+    hands["Claw Hands<br/>MCP tool server:<br/>files, shell, patch"]
+  end
+  brain -->|"create / attach sandbox"| sbx["Sandbox API<br/>(SaFE, or the Agent Sandbox<br/>router in sandbox/)"]
+  sbx -->|"provisions"| pod
+  brain -->|"MCP"| hands
+
+  subgraph dev ["Developer machine"]
+    conn["claw-connector<br/>connector/"] --> agents["Claude Code / Codex / Cursor"]
+  end
+  conn -->|"outbound HTTPS only"| api
+```
+
+- **Claw** keeps its state in PostgreSQL, its task queue and event bus in NATS
+  JetStream, and session workspaces in S3-compatible object storage. One
+  container image serves all three roles, chosen by the entrypoint's first
+  argument (`api`, `brain` or `hands`). See
+  [`claw/README.md`](claw/README.md#architecture) and the design notes in
+  [`claw/docs/`](claw/docs/README.md).
+- **The personal agent** holds no model or sandbox of its own: it is a client
+  of the Claw API, and each person acts with their own Claw identity. With
+  proactive messages switched on, Claw sends it each person's notifications
+  (assistant replies, approvals, finished runs, remote-agent events). See
+  [`personal-agent/README.md`](personal-agent/README.md#architecture).
+- **The connector** opens no port and needs no public address. Claw relays the
+  conversation and keeps an audit trail; the agent, the files, the checkout and
+  the model credentials stay on the developer's machine, and `agents.toml` on
+  that machine decides what each agent may touch. See
+  [`connector/README.md`](connector/README.md) and
+  [`claw/docs/remote-agents.md`](claw/docs/remote-agents.md).
 
 ## Prerequisites
 
 Claw delegates authentication and sandbox workload placement to **SaFE**
 (AMD's Secure Agent Fabric/Environment platform, published separately as
-[AMD-AGI/Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE)). Everywhere this
-README says "SaFE sandbox", that is the system meant. `SAFE_API_URL` is
-**required for any production deployment**, and the API fails closed without it.
+[AMD-AGI/Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE)). `SAFE_API_URL`
+is **required for any production deployment**, and the API fails closed
+without it.
 
 You do not need SaFE to evaluate the project:
 
 | What you want to do | What you need |
 |---|---|
-| Exercise the tool-execution layer end to end | Node 26. Run `make demo` — no cluster, GPU, LLM key, or network egress |
+| Exercise the tool-execution layer end to end | Node 26. Run `make demo`: no cluster, GPU, LLM key, or network egress |
 | Run api / brain / hands locally | Node 26, PostgreSQL, NATS, S3-compatible storage, an LLM gateway |
-| Install the full stack on a cluster | The above, plus Kubernetes and a SaFE endpoint |
-| Install on an **isolated** cluster with no SaFE | `deploy/deploy.sh --insecure-sandbox`, which turns authentication **off entirely** — never on a shared or reachable cluster |
+| Run the personal agent | Node 26 (or Docker), a Claw API and its SaFE endpoint; to answer real people, also a Teams bot registration and an Azure Service Bus namespace (see [its README](personal-agent/README.md#running-the-worker)) |
+| Connect a developer machine | Node.js 22 or newer, a working Claude Code, Codex or Cursor CLI, and the two addresses of your Claw deployment: its API URL and its identity service URL |
+| Install the full stack on a cluster | Kubernetes, `kubectl`, `helm`, a storage class, and a SaFE endpoint |
+| Install on an **isolated** cluster with no SaFE | `deploy/deploy.sh --insecure-sandbox`, which turns sandbox authentication **off entirely**: never on a shared or reachable cluster |
 
-Claw requires **Node 26**, a Current release rather than an LTS.
+Claw and the personal agent require **Node 26** (pinned in
+[`claw/.nvmrc`](claw/.nvmrc)); the connector runs on Node.js 22 or newer.
 
-## Architecture
+## Quick start
 
-```
-                     HTTPS / SSE
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │   Claw API      │  Fastify · sessions, events, memory,
-                 │  (packages/api) │  skills, plugins, MCP, admin, A2A
-                 └────────┬────────┘
-                          │ publish task / subscribe events
-                          ▼
-                 ┌─────────────────┐
-                 │   Claw Brain    │  agent loop · LLM calls · tool
-                 │ (packages/brain)│  routing · SaFE sandbox lifecycle
-                 └────────┬────────┘
-                          │ MCP (bootstrap + tool calls)
-                          ▼
-                 ┌─────────────────┐
-                 │   Claw Hands    │  per-session SaFE sandbox pod
-                 │ (packages/hands)│  MCP tool server (fs / exec / patch)
-                 └─────────────────┘
-
-Shared: NATS JetStream (task queue + event bus) · PostgreSQL (state) ·
-S3 / MinIO (workspace sync) · Anthropic / LiteLLM gateway (LLM)
-```
-
-One container image, three roles selected by the entrypoint's first
-argument (`api` / `brain` / `hands`) — see
-[`deploy/README.md`](claw/deploy/README.md).
-
-## Packages
-
-| Package | Path | Description |
-|---------|------|-------------|
-| **api** | `packages/api` | Public-facing Fastify server: sessions, events (SSE), memory, skills, plugins, MCP, admin, A2A, task DAGs. Persists to PostgreSQL, publishes tasks to NATS. |
-| **brain** | `packages/brain` | Core agent-loop engine: LLM calls, tool routing/resolution, sub-agents, SaFE sandbox lifecycle, workspace↔S3 sync. Pulls tasks from one durable JetStream consumer, `brain-workers`, which the API provisions and every replica shares; whichever replica has capacity takes the next task. |
-| **hands** | `packages/hands` | MCP tool server that runs *inside* the per-session SaFE sandbox (fs / exec / patch tools). Brain talks to it over MCP/HTTP. |
-| **protocol** | `packages/protocol` | The api↔brain contract: shared types, NATS subject builders, sandbox env composition, and the coordination protocols (run leases, task consumer, sandbox handle map, hands parking). |
-| **utils** | `packages/utils` | Domain-free helpers, safe for every role including the in-sandbox one: KV abstraction, secret redaction, constant-time compare, env settings. |
-
-Dependency order is `utils → protocol → {hands, brain, api}`. `hands` runs inside
-the sandbox. It depends on `utils` and `protocol`, but takes from `protocol` only
-the contract it shares with Brain: background-shell records and their
-classification, reclaim causes and reap grace bounds, and the Hands credential
-header. `protocol` has no dependency other than `utils`, and `hands` opens no
-NATS or database connection.
-
-## Repository layout
-
-| Path | Language | What it is |
-|------|----------|------------|
-| [`claw/`](claw) | TypeScript | The agent harness: `api` / `brain` / `hands` npm workspaces, Helm chart, design docs. |
-| [`personal-agent/`](personal-agent) | TypeScript | The personal agent: a chat assistant that works through Claw, with Microsoft Teams as its entry point. Channel-neutral core, Node runtime adapters, Teams adapter. |
-| [`sandbox/`](sandbox) | Go | SaFE sandbox control plane — a fork of [`sigs.k8s.io/agent-sandbox`](sandbox/UPSTREAM.md) that provisions the per-session pods Brain drives. |
-| [`deploy/`](deploy) | — | Whole-stack installer that chains the per-component deploy scripts, plus deployment packaging for the upstream LiteLLM gateway. Each component also keeps its own `deploy/`. |
-| [`docs/`](docs) | — | Sphinx site for the **Python** packages only. TypeScript and Go docs live next to their code. |
-| [`scripts/`](scripts) | — | Repo-wide release verification. Per-component scripts live in each component. |
-
-## Claw package structure
-
-```
-claw/
-├── packages/
-│   ├── utils/           # domain-free helpers (kv/, security/, env settings)
-│   ├── protocol/         # shared types, NATS subjects, sandbox/ coordination
-│   ├── hands/             # in-sandbox MCP tool server
-│   │   └── src/tools/      # fs/, shell/, s3/ tool implementations
-│   ├── brain/             # agent-loop engine
-│   │   ├── src/agent/       # agent loop, engine adapters, prompt, hooks, HITL
-│   │   ├── src/tasks/        # task runner, dispatch, locks, gates
-│   │   ├── src/delivery/      # doorbell intake, claim-next, delivery dispatch
-│   │   ├── src/clients/        # hands, MCP, A2A, run-claim clients
-│   │   ├── src/workspace/       # snapshot sync, reaper, S3 upload
-│   │   └── src/sandbox/          # SaFE sandbox client
-│   └── api/                # public API server
-│       ├── src/routes/       # sessions, events, memory, skills, plugins, mcp, admin, a2a, tasks
-│       ├── src/sessions/      # dispatch, teardown, context, sweepers
-│       ├── src/marketplace/    # plugins, skills, evolution
-│       └── src/infra/           # db, nats, metrics, leader lock, schema guard
-├── deploy/
-│   ├── README.md            # deploy guide (Docker + one-click K8s)
-│   ├── charts/claw/          # Helm chart — single source for all K8s manifests
-│   └── deploy.sh / upgrade.sh / build.sh   # Kaniko or local Docker
-├── docs/                      # design docs (architecture, agent-server, plugins, ...)
-├── scripts/                     # plugin migration/lint scripts
-│   └── start-all.sh / start-api.sh / start-brain.sh / start-hands.sh / stop-all.sh
-├── Dockerfile                    # single image, entrypoint dispatches by role
-└── .env.example
-```
-
-## Quick Start (local dev)
+### Evaluate locally, without a cluster
 
 ```bash
-cd claw
-npm install
-npm run build              # builds all workspaces (tsc)
-
-cp .env.example .env
-# fill in DATABASE_URL, NATS_URL, ANTHROPIC_AUTH_TOKEN, S3_*, SAFE_API_URL,
-# AUTH_INTERNAL_TOKEN, and USER_ENV_ENCRYPTION_KEY (`openssl rand -base64 32`)
-#
-# Against a single-node `nats-server -js`, also set BRAIN_REGISTRY_REPLICAS,
-# BRAIN_CHECKPOINTS_REPLICAS and SYSTEM_ENV_REPLICAS to 1 — JetStream refuses
-# replicated buckets outside a cluster, and the API exits provisioning them.
-
-./scripts/start-all.sh              # starts hands, brain, api together (one terminal)
-# or individually: ./scripts/start-api.sh / ./scripts/start-brain.sh / ./scripts/start-hands.sh
+git clone https://github.com/AMD-AGI/PrimusClaw.git
+cd PrimusClaw
+(cd claw && npm ci && npm run build)
+make demo
 ```
 
-Per-package scripts (`npm run <script> --workspace packages/<name>`):
-`dev` (tsx watch), `build` (tsc), `typecheck`, `test`.
+`make demo` runs the Hands MCP server (the layer that edits files and runs
+commands for an agent) against a throwaway workspace and drives it over the
+real MCP transport. See [`claw/examples/hands-mcp`](claw/examples/hands-mcp/README.md).
+To run the API, Brain and Hands against your own PostgreSQL, NATS, object
+storage and LLM gateway, follow [`claw/README.md`](claw/README.md#build-and-run).
 
-## Try it without a cluster
+### Run the personal agent
 
-`make demo` runs the Hands MCP server — the layer that actually edits files and
-runs commands for an agent — against a throwaway workspace and drives it over the
-real MCP transport. No Kubernetes, no GPU, no LLM API key, no network egress.
-See [`claw/examples/hands-mcp`](claw/examples/hands-mcp/README.md).
+The worker reads its whole configuration from the environment.
+[`personal-agent/examples/worker.env.example`](personal-agent/examples/worker.env.example)
+lists the settings (all but the release gate's test entry and the settings
+only a deployment's own plugins read), and
+[`personal-agent/docs/configuration.md`](personal-agent/docs/configuration.md)
+describes each one. Keep the filled-in file outside any repository.
 
-## Verifying the repository
-
-`make verify` from the repository root builds and tests every tree — TypeScript,
-Go, Python and the docs — plus the lint and license checks. It mirrors CI, so a
-green run should mean a green pull request. `make help` lists the per-tree
-targets if you only need one of them.
-
-### Docker
+From the image published with release 0.1.1 (it runs as uid 65534; the state
+volume must be writable by it):
 
 ```bash
-cd claw
-docker build -t claw:local .
-docker run --env-file .env claw:local api     # or: brain / hands
+docker run --env-file /path/outside/the/repo/worker.env \
+  -v personal-agent-data:/data \
+  docker.io/primussafe/personal-agent-teams:0.1.1
 ```
 
-### Kubernetes
+To build the same image from a checkout instead, run
+`docker build -f personal-agent/Dockerfile -t personal-agent-teams .` from the
+repository root and run `personal-agent-teams` the same way.
 
-Deploy or upgrade prebuilt images in the `primus-claw` namespace — see
-[`claw/deploy/README.md`](claw/deploy/README.md).
+From npm (Node 26):
 
 ```bash
-bash claw/deploy/deploy.sh       # first-time Claw-only install
-bash claw/deploy/upgrade.sh -n primus-claw  # rolling upgrade
+npm install @primusclaw/personal-agent-teams
+node --env-file=/path/outside/the/repo/worker.env \
+  node_modules/@primusclaw/personal-agent-teams/dist/main.js
 ```
 
-### Standalone Stack
+A deployment that adds its own integrations builds the worker in code with
+`buildWorker(env, plugins, options)` from `@primusclaw/personal-agent-teams`.
+See [Running the worker](personal-agent/README.md#running-the-worker).
 
-For Kubernetes standalone mode, the repository also provides a top-level
-orchestrator that always installs Agent Sandbox and Claw. LiteLLM is installed
-by default and can be skipped with `--skip-litellm`:
+### Connect a developer machine
 
 ```bash
-# Production: Sandbox authentication is mandatory.
-SAFE_API_URL=https://safe.example.com bash deploy/deploy.sh --yes
+npm install -g @primusclaw/connector
+claw-connector init       # writes agents.toml; then set `roots`, the directories an agent may work in
+claw-connector login --server https://claw.example.com/claw-api --identity-url https://identity.example.com
+claw-connector service install
+claw-connector doctor
+```
 
-# Preview without mutating cluster state where child installers support it.
+The two URLs are placeholders for the addresses of your Claw deployment.
+Shorter still: ask a chat client built on Claw to connect your dev environment.
+It answers with one command (`npm install -g @primusclaw/connector@latest &&
+claw-connector pair <code> --server <url>`) that installs the connector, pairs
+the machine, writes `agents.toml` for the agents it finds and starts the
+service. See the [connector quick start](connector/README.md#quick-start-about-5-minutes).
+
+### Deploy the full stack
+
+```bash
+# Preview: prints the plan; child installers preview where they support it.
 SAFE_API_URL=https://safe.example.com bash deploy/deploy.sh --dry-run
 
-# Load reusable, non-secret environment settings from a profile.
-cp deploy/profile.example.env /tmp/primus-claw-deploy.env
-bash deploy/deploy.sh --config /tmp/primus-claw-deploy.env --dry-run
-
-# Install only the required Sandbox + Claw components.
-SAFE_API_URL=https://safe.example.com bash deploy/deploy.sh --yes --skip-litellm
-
-# Isolated development cluster only: explicitly acknowledge no Sandbox auth.
-bash deploy/deploy.sh --yes --insecure-sandbox
+# Install Agent Sandbox, Claw and LiteLLM (--skip-litellm to omit the gateway).
+SAFE_API_URL=https://safe.example.com bash deploy/deploy.sh --yes
 ```
 
-The public profile contains no credentials; inject those through Kubernetes
-Secrets, Vault, CI, or an ignored Claw `values.<NAMESPACE>.env` file. The
-LiteLLM wrapper lives under [`deploy/litellm`](deploy/litellm/README.md), and its
-Helm chart lives under [`deploy/litellm/charts/litellm`](deploy/litellm/charts/litellm).
-Provide provider/model routing through a private Helm values file.
-`LITELLM_DATABASE_URL` is optional when the wrapper can discover Claw's PGO
-database, and `LITELLM_MASTER_KEY` is generated or reused from the existing
-Secret.
+Read [`deploy/README.md`](deploy/README.md) for profiles, credentials and the
+LiteLLM wrapper, [`claw/deploy/README.md`](claw/deploy/README.md) to install or
+upgrade Claw alone, and the production posture in [`SECURITY.md`](SECURITY.md)
+before exposing a deployment. `--insecure-sandbox` exists for isolated
+development clusters only: it deploys the sandbox control plane with no
+authentication at all.
 
-## Reserved Workspace Paths
+## Releases and versioning
 
-A session's `/workspace` is yours except for the names below, which the
-platform owns. Pick another name for your own data: what happens to a file you
-create under one of these is decided by the platform's lifecycle for that name,
-not by yours, and nothing warns you at the time.
+The personal agent and the connector are released on tags of their own and
+versioned independently; the Claw and Agent Sandbox images are built from `main`
+and from `v*` tags:
 
-Dropped from the snapshot — a file you create here is not carried into your
-next sandbox and will not be there when the session is rehydrated:
+| Component | Tag | Published to | Release notes |
+|---|---|---|---|
+| Personal agent (three packages and the image, one version) | `personal-agent-vX.Y.Z` | npm; the image to the configured registry (Docker Hub by default) while image publishing is switched on | [`personal-agent/CHANGELOG.md`](personal-agent/CHANGELOG.md) |
+| Connector | `connector-vX.Y.Z` | npm | the [GitHub Release](https://github.com/AMD-AGI/PrimusClaw/releases) of the tag |
+| Claw, Agent Sandbox | images built from `main` (`latest` plus a timestamp tag) and from `v*` tags | Docker Hub | [`CHANGELOG.md`](CHANGELOG.md) |
 
-| Path | Owner |
-|------|-------|
-| `.uploads/` | Files uploaded through the API (`POST /v1/sessions/:id/upload`), put into the sandbox when a run attaches to it, including one already running; expired on their own schedule |
-| `.transcripts/` | Per-run transcripts Brain writes straight to object storage |
-| `.tool-results/` | Whole tool outputs too long for the conversation, kept for the agent to page through |
-| `.deliveries/` | Copies of the files the agent handed you with `deliver_file` |
-| `.hands-binary` | Bootstrap artefact from older releases |
-| `hands.log` | The agent runtime's own log, truncated at every launch |
+After each package's first version, which a maintainer published by hand so
+that it could be given a Trusted Publisher, npm releases are published from
+GitHub Actions with [Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
+(OIDC, no stored npm token) and npm provenance. Each such release carries a
+build provenance attestation you can check with
+`gh attestation verify <file> --repo AMD-AGI/PrimusClaw`, and its publish job
+waits for a required reviewer's approval. The release procedures are in the
+connector's and the personal agent's READMEs.
 
-Reserved but still restored — these are snapshotted to object storage and
-handed back to the next sandbox, so a file you put here survives; it is simply
-kept and expired on the platform's terms, and the API's file listing hides the
-directory from the frontend:
+## Documentation
 
-| Path | Owner |
-|------|-------|
-| `.zip-cache/` | Archives built for download; expired on their own schedule |
-| `.skills/` | Per-session skill state; excluded from the shared-filesystem snapshot only, because the sandbox image provides it |
-
-Regenerable content is also left out of the snapshot for size rather than
-ownership, and will simply be rebuilt: `node_modules`, `.task-venv`,
-`.cache`, `.runtime`, `__pycache__`, `torchinductor_*`, `hsa`, `worktree`, and
-object files (`*.o`, `*.co`). The full list is `WORKSPACE_EXCLUDES` in
-[`claw/packages/brain/src/workspace/excludes.ts`](claw/packages/brain/src/workspace/excludes.ts).
-
-A repository's `.git` is **not** regenerable -- it holds commits that exist nowhere
-else until they are pushed -- so it is carried with the rest of the workspace and a
-sandbox rebuilt from the snapshot is still a repository. It is carried whole or not
-at all: a `.git` over `WORKSPACE_GIT_MAX_BYTES` (default 300 MiB) or
-`WORKSPACE_GIT_MAX_FILES` (default 2000) is left out, and so are the largest of a
-workspace's repositories once they add up to more than
-`WORKSPACE_GIT_TOTAL_MAX_BYTES` (1 GiB) or `WORKSPACE_GIT_TOTAL_MAX_FILES` (10000).
-Either snapshot destination reports it in a `workspace_git_skipped` sandbox event; push
-before leaving such a repository. A repository left out of a sync, or one the sandbox
-cannot measure in `WORKSPACE_GIT_PROBE_TIMEOUT_SEC` (default 60; 8 on a SIGTERM sync),
-does not stop the sync and does not lose its history: the rest of the workspace is saved
-and that repository keeps the copy the last snapshot held. Git's own lock and temporary
-files are not carried. `WORKSPACE_GIT_MAX_BYTES=0` turns `.git` snapshots off.
-
-## Key Environment Variables
-
-See [`.env.example`](claw/.env.example) for the full list.
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `NATS_URL` / `NATS_USER` / `NATS_PASSWORD` | Task queue + event bus |
-| `AUTH_INTERNAL_TOKEN` | Shared secret for Brain↔Hands / Brain↔API / SaFE auth |
-| `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `DEFAULT_MODEL` | LLM gateway |
-| `SAFE_API_URL` / `SANDBOX_NAMESPACE` | SaFE sandbox platform |
-| `LITELLM_API_BASE` / `SAFE_DEFAULT_WORKSPACE` | Defaults embedded in GEAK/Hyperloom prompts; MCP callers can pass `api_base` explicitly |
-| `WORKSPACE_PERSIST_BASE` / `CLAW_DEPLOY_ROOT` | Optional shared workspace persistence and Hands distribution; empty values use S3/Brain HTTP fallbacks |
-| `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_BUCKET` | Workspace object storage |
-| `A2A_AGENTS` / `A2A_PEER_TOKEN_*` | The only peer agents Brain's `a2a_call` tool may reach, by name (a name list, or a JSON array whose `auth_env` names a variable starting with `A2A_PEER_TOKEN_`). Unset, `a2a_call` has no peers. **Breaking:** `a2a_call` no longer accepts a URL or sends the user's key to a peer; see `CHANGELOG.md` |
-| `API_PORT` / `EXECUTOR_PORT` / `MCP_PORT` | Service listen ports (api / brain / hands) |
-
-## Design Docs
-
-Deeper design notes live in [`claw/docs/`](claw/docs/README.md), which indexes
-the published documents and also names the ones cited from source comments that
-are not part of this release, so a grep for a filename gives an answer.
-
-Per-tree documentation: [`claw/`](claw/README.md) ·
-[`personal-agent/`](personal-agent/README.md) ·
-[`sandbox/`](sandbox/README.md) · [`deploy/`](deploy/README.md). The Sphinx site under [`docs/`](docs) covers
-the Python packages only.
+- [`claw/README.md`](claw/README.md): building, running and testing Claw;
+  architecture, reserved workspace paths, key environment variables.
+- [`claw/docs/`](claw/docs/README.md): Claw design notes (sessions, A2A,
+  plugins, remote agents, identity, GitHub review, ...).
+- [`claw/deploy/README.md`](claw/deploy/README.md): Docker and Kubernetes
+  deployment of Claw.
+- [`personal-agent/README.md`](personal-agent/README.md) and its
+  [configuration reference](personal-agent/docs/configuration.md).
+- [`connector/README.md`](connector/README.md): install, `agents.toml`, what
+  the connector enforces, keeping it running.
+- [`sandbox/README.md`](sandbox/README.md): the Agent Sandbox control plane and
+  its security model.
+- [`deploy/README.md`](deploy/README.md): the whole-stack installer.
+- [`docs/`](docs/index.md): the Sphinx site for the Python packages.
 
 ## Contributing
 
-Setup, the `make verify` gate, coverage floors, and the DCO sign-off requirement
-are in [`CONTRIBUTING.md`](CONTRIBUTING.md). Participation is governed by the
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setup,
+the checks a pull request must pass, coverage floors, and the
+[Developer Certificate of Origin](https://developercertificate.org/) sign-off
+(`git commit -s`) required on every commit. `make verify` from the repository
+root builds and tests Claw and Agent Sandbox, runs the LiteLLM wrapper's Python
+tests, builds the docs, and runs the lint and license checks; `make help` lists
+the per-tree targets. The personal agent (`npm run check` in `personal-agent/`) and the connector (see
+its [Development](connector/README.md#development) section) have their own
+checks, which CI runs as separate jobs.
+
+## Security
+
+Please do **not** report vulnerabilities in public issues. Use GitHub's
+[private vulnerability reporting](https://github.com/AMD-AGI/PrimusClaw/security)
+or the AMD Product Security portal, as described in [`SECURITY.md`](SECURITY.md).
+That file also states the security posture a production deployment is
+expected to meet; read it before you deploy.
+
+## Code of Conduct
+
+Participation in this project is governed by the
 [Code of Conduct](CODE_OF_CONDUCT.md).
-
-Vulnerabilities go through the private process in [`SECURITY.md`](SECURITY.md) —
-never a public issue. That file also states the security posture a production
-deployment is expected to meet, which is worth reading before you deploy rather
-than after.
-
-Release notes and the versioning policy: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-PrimusClaw is released under the **MIT License**. The full license text
-is in [`LICENSE`](LICENSE).
+PrimusClaw is released under the [MIT License](LICENSE), with one exception:
+[`sandbox/`](sandbox) is a fork of
+[kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+(© The Kubernetes Authors, with AMD additions) and is licensed under the
+**Apache License 2.0**; see [`sandbox/LICENSE`](sandbox/LICENSE),
+[`sandbox/NOTICE`](sandbox/NOTICE) and [`sandbox/UPSTREAM.md`](sandbox/UPSTREAM.md).
+[`REUSE.toml`](REUSE.toml) records the license of every path.
 
-You may use PrimusClaw commercially, modify it, and distribute it under
-the terms of the MIT license, provided the copyright notice and the
-permission notice are retained in all copies or substantial portions of
-the software.
-
-Third-party agent CLIs that PrimusClaw invokes (`cursor-agent`, Claude
-Code, and OpenAI Codex) are installed at runtime rather than distributed
-with this repository. They are governed by their own separate license
-terms and are NOT covered by the MIT license above — see the
-"Third-Party Tools and Agents" section in [`LICENSE`](LICENSE). You are
-responsible for reviewing and complying with each tool's individual
-license.
-
-The `sandbox/` directory is a **fork** of the upstream
-`sigs.k8s.io/agent-sandbox` project (© The Kubernetes Authors) with
-substantial AMD additions, licensed separately under the **Apache License
-2.0** and NOT covered by the MIT license above. See
-[`sandbox/LICENSE`](sandbox/LICENSE), [`sandbox/NOTICE`](sandbox/NOTICE)
-and [`sandbox/UPSTREAM.md`](sandbox/UPSTREAM.md) for the per-directory
-attribution split.
+Third-party agent CLIs that PrimusClaw starts (Claude Code, OpenAI Codex,
+`cursor-agent`) are installed at run time, not distributed with this
+repository, and are governed by their own license terms; see "Third-Party
+Tools and Agents" in [`LICENSE`](LICENSE).

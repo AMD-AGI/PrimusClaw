@@ -23,9 +23,7 @@ Where each group is read:
   `packages/teams/src/azure/workload-identity.ts`: how the worker reaches Teams, the queues, its Azure identity, the reply
   style.
 - `packages/runtime/src/github/feedback-worker.ts` (`workerInfoFromEnv`): the image tags a feedback report names.
-- **[#615]** `packages/teams/src/assembly/features-switches.ts`: the feature switches marked [#615] below. They, and the
-  process that calls every function above, arrive with pull request
-  [#615](https://github.com/AMD-AGI/PrimusClaw/pull/615).
+- `packages/teams/src/assembly/features-switches.ts`: the feature switches.
 
 ### How switches read
 
@@ -35,8 +33,8 @@ Switches keep the readings of the worker they were ported from, so there are fou
 | ------------- | --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | strict        | `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off` (any case); empty takes the default; any other word stops the worker. | `TEAMS_ASSISTANT_UNDERSTANDING`, `TEAMS_DIRECT_CHAT`, and the reply-style switches `TEAMS_AI_LABEL`, `TEAMS_STREAM_TEXT`, `TEAMS_ASSISTANT_RECEIPT`, `TEAMS_ASSISTANT_PROGRESS`, `TEAMS_ASSISTANT_STREAM_SAY`, `TEAMS_OWN_THUMBS_MOBILE`, `TEAMS_SUGGESTED_REPLIES`, `TEAMS_CITATIONS` |
 | lenient       | On for `1`, `true`, `yes`, `on` (any case); **anything else, a typo included, is off**.                                     | `ASSISTANT_ENABLED`, `TEAMS_EXCHANGE_ENABLED`, `TEAMS_EXCHANGE_FOR_CHAT`, `TEAMS_GITHUB_REVIEW_ENABLED`, `TEAMS_CLAW_EVENTS_GONE`                                                                                                                                                      |
-| exactly `1`   | On only for `1`; **anything else, `true` included, is off**.                                                                | `PROACTIVE_ENABLED`, `ASSISTANT_SCHEDULES_ENABLED`, `ASSISTANT_JOB_WATCH_ENABLED`, `BRIEF_ENABLED`, `REMOTE_AGENTS_ENABLED` [#615]                                                                                                                                                     |
-| on unless off | Off for `0`, `false`, `no`, `off` (any case); **anything else, a typo included, is on**.                                    | `REMOTE_PUSH_ENABLED` [#615]                                                                                                                                                                                                                                                           |
+| exactly `1`   | On only for `1`; **anything else, `true` included, is off**.                                                                | `PROACTIVE_ENABLED`, `ASSISTANT_SCHEDULES_ENABLED`, `ASSISTANT_JOB_WATCH_ENABLED`, `BRIEF_ENABLED`, `REMOTE_AGENTS_ENABLED`                                                                                                                                                            |
+| on unless off | Off for `0`, `false`, `no`, `off` (any case); **anything else, a typo included, is on**.                                    | `REMOTE_PUSH_ENABLED`                                                                                                                                                                                                                                                                  |
 
 `REMOTE_WINDOW_DEFAULT` is `chat` for `chat` and `card` for anything else. Lists are comma separated; people are named
 by their Microsoft Entra object id, in any case.
@@ -105,20 +103,20 @@ The worker identity signs with the `BOT_ASSERTION_*` key, issuer and tenant, but
 
 | Setting                               | Default           | Meaning                                                                                                                                             |
 | ------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PROACTIVE_ENABLED` [#615]            | off               | Exactly `1`: Claw's notifications are taken at `/claw-events/<route>` and posted into the chat.                                                     |
-| `NOTIFY_WEBHOOK_URL` [#615]           | —                 | Required with `PROACTIVE_ENABLED`: where Claw sends this worker's events (each person's route is appended), normally `<public origin>/claw-events`. |
-| `REMOTE_PUSH_ENABLED` [#615]          | on                | An attached chat hears its remote agent between turns; only with `PROACTIVE_ENABLED`; `0`, `false`, `no`, `off` turn it off.                        |
+| `PROACTIVE_ENABLED`                   | off               | Exactly `1`: Claw's notifications are taken at `/claw-events/<route>` and posted into the chat.                                                     |
+| `NOTIFY_WEBHOOK_URL`                  | —                 | Required with `PROACTIVE_ENABLED`: where Claw sends this worker's events (each person's route is appended), normally `<public origin>/claw-events`. |
+| `REMOTE_PUSH_ENABLED`                 | on                | An attached chat hears its remote agent between turns; only with `PROACTIVE_ENABLED`; `0`, `false`, `no`, `off` turn it off.                        |
 | `TEAMS_CLAW_EVENTS_GONE`              | off               | An event for a person with no chat is answered `410 Gone` instead of `200`.                                                                         |
 | `ASSISTANT_ENABLED`                   | off               | The assistant: each person's standing agent in Claw.                                                                                                |
 | `ASSISTANT_USERS`                     | everybody         | Who has it, when the assistant is on.                                                                                                               |
 | `ASSISTANT_REPLY_WINDOW_SECONDS`      | `1800`            | After a person last wrote, how long what the assistant says counts as a reply rather than an unprompted message.                                    |
 | `TEAMS_ASSISTANT_UNDERSTANDING`       | off               | The assistant reads every message of the listed people first. Needs `ASSISTANT_ENABLED`.                                                            |
 | `TEAMS_ASSISTANT_UNDERSTANDING_USERS` | `ASSISTANT_USERS` | Who; must be a subset of `ASSISTANT_USERS`, and someone must be named.                                                                              |
-| `ASSISTANT_SCHEDULES_ENABLED` [#615]  | off               | Exactly `1`: scheduled assistant work.                                                                                                              |
-| `ASSISTANT_JOB_WATCH_ENABLED` [#615]  | off               | Exactly `1`: the assistant watches jobs.                                                                                                            |
-| `BRIEF_ENABLED` [#615]                | off               | Exactly `1`: `/brief` (needs Claw's trigger API).                                                                                                   |
-| `REMOTE_AGENTS_ENABLED` [#615]        | off               | Exactly `1`: remote agents through claw-connector.                                                                                                  |
-| `REMOTE_WINDOW_DEFAULT` [#615]        | `card`            | `chat` or `card`: how a remote agent session shows by default.                                                                                      |
+| `ASSISTANT_SCHEDULES_ENABLED`         | off               | Exactly `1`: scheduled assistant work.                                                                                                              |
+| `ASSISTANT_JOB_WATCH_ENABLED`         | off               | Exactly `1`: the assistant watches jobs.                                                                                                            |
+| `BRIEF_ENABLED`                       | off               | Exactly `1`: `/brief` (needs Claw's trigger API).                                                                                                   |
+| `REMOTE_AGENTS_ENABLED`               | off               | Exactly `1`: remote agents through claw-connector.                                                                                                  |
+| `REMOTE_WINDOW_DEFAULT`               | `card`            | `chat` or `card`: how a remote agent session shows by default.                                                                                      |
 | `TEAMS_DIRECT_CHAT`                   | off               | A chat attached to a remote agent session becomes that agent's own window.                                                                          |
 | `TEAMS_DIRECT_CHAT_USERS`             | everybody         | For whom, when on.                                                                                                                                  |
 | `TEAMS_OBSERVE_USERS`                 | nobody            | Who may say `/observe on` in a group chat, making their assistant the group's observer.                                                             |
@@ -174,11 +172,11 @@ The worker identity signs with the `BOT_ASSERTION_*` key, issuer and tenant, but
 
 ## Feedback reports
 
-| Setting                       | Default | Meaning                                   |
-| ----------------------------- | ------- | ----------------------------------------- |
-| `WORKER_IMAGE_TAG` [#615]     | none    | Named in a report, as the worker's image. |
-| `CLAW_API_IMAGE_TAG` [#615]   | none    | As Claw API's image.                      |
-| `CLAW_BRAIN_IMAGE_TAG` [#615] | none    | As Claw Brain's image.                    |
+| Setting                | Default | Meaning                                   |
+| ---------------------- | ------- | ----------------------------------------- |
+| `WORKER_IMAGE_TAG`     | none    | Named in a report, as the worker's image. |
+| `CLAW_API_IMAGE_TAG`   | none    | As Claw API's image.                      |
+| `CLAW_BRAIN_IMAGE_TAG` | none    | As Claw Brain's image.                    |
 
 The public build records reports and files them nowhere: filing is a `FeedbackSink` plugin. A deployment's own `main`
 can build one with runtime's `feedbackConfigFromEnv` and `feedbackSink`, which read `FEEDBACK_REPO` (`owner/name`),

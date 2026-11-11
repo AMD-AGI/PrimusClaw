@@ -20,7 +20,7 @@
  * The names here are reserved from the user's point of view: one of their own
  * directories called `.uploads` or `.transcripts` is silently dropped from the
  * snapshot and gone in the next sandbox. That is only defensible if they can
- * find out, so the reserved names are listed in the repository README under
+ * find out, so the reserved names are listed in claw/README.md under
  * "Reserved Workspace Paths"; anything added here belongs there too.
  *
  * The reverse does not hold, and reading the README as this list is how it went
