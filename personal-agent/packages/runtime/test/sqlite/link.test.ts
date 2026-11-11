@@ -423,27 +423,53 @@ test("a link records its Claw user, found back from either side", () => {
   assert.equal(links.getKey("aad-a"), "ak-a");
 });
 
-test("a person bound with no link keeps a Claw user id of their own; a link's id wins and an unlink forgets both", () => {
-  const { store } = openTestStore();
-  const { links } = store;
-  links.setClawUserId(ALICE, "u-alice"); // (no link: bound at the identity service only)
+test("a person bound with no link keeps a Claw user id of their own, never found back from it; a link's id wins", () => {
+  const t = openFileTestStore();
+  const { links } = t.store;
+  links.setBoundClawUser(ALICE, "u-alice", "tok-1"); // (no link: bound at the identity service only)
   assert.equal(links.getKey(ALICE), null);
   assert.equal(links.clawUserIdOf(ALICE), "u-alice");
+  assert.deepEqual(links.boundClawUser(ALICE, "tok-1"), { clawUserId: "u-alice", current: true });
+  assert.deepEqual(links.boundClawUser(ALICE, "tok-2"), { clawUserId: "u-alice", current: false }, "read with another token");
   assert.equal(links.needsClawUserId(ALICE), false, "(nothing to backfill: there is no link)");
   assert.deepEqual(links.linkedUsers(), [], "a bound person is not a linked one");
-  assert.deepEqual(links.usersForClawUser("u-alice"), [ALICE]);
-  assert.equal(links.userForClawUser("u-alice"), ALICE);
+  assert.deepEqual(links.usersForClawUser("u-alice"), [], "a Claw user is found back from links only");
+  assert.equal(links.userForClawUser("u-alice"), null);
+  const row = t.raw.prepare("SELECT token_hash FROM bound_users WHERE aad_id = ?").get(ALICE);
+  assert.equal(row?.["token_hash"], createHash("sha256").update("tok-1").digest("hex"), "the token itself is not kept");
+
+  links.setClawUserId(ALICE, "u-elsewhere");
+  assert.equal(links.clawUserIdOf(ALICE), "u-alice", "setClawUserId is the link's only");
 
   links.redeemPending(ALICE, "Alice", links.stashPending("ak-alice"));
   assert.equal(links.clawUserIdOf(ALICE), null, "a new link's own id is read for its key, never the binding's");
-  assert.equal(links.needsClawUserId(ALICE), true);
-  links.setClawUserId(ALICE, "u-other");
-  assert.equal(links.clawUserIdOf(ALICE), "u-other");
-  assert.deepEqual(links.usersForClawUser("u-alice"), []);
-  assert.deepEqual(links.usersForClawUser("u-other"), [ALICE]);
+  assert.equal(links.boundClawUser(ALICE, "tok-1"), null, "a link forgets the binding's id");
+  links.setBoundClawUser(ALICE, "u-other", "tok-1");
+  assert.equal(links.boundClawUser(ALICE, "tok-1"), null, "nothing is kept for a binding beside a link");
+  links.setClawUserId(ALICE, "u-key");
+  assert.equal(links.clawUserIdOf(ALICE), "u-key");
+  assert.deepEqual(links.usersForClawUser("u-key"), [ALICE]);
+  t.close();
+});
 
-  links.setClawUserId(BOB, "u-bob");
+test("a bound person who rebinds to another account loses the earlier subscription; one no longer bound loses both", () => {
+  const { store } = openTestStore();
+  const { links, notifySubs } = store;
+  const sub = { route: "r-1", subscriptionId: "s-1", secret: "x", typesVersion: 1 };
+  links.setBoundClawUser(BOB, "u-bob", "tok-1");
+  notifySubs.saveNotifySub(BOB, sub);
+  links.setBoundClawUser(BOB, "u-bob", "tok-2");
+  assert.notEqual(notifySubs.getNotifySub(BOB), null, "a new token of the same account keeps it");
+  links.setBoundClawUser(BOB, "u-bob-2", "tok-3");
+  assert.equal(notifySubs.getNotifySub(BOB), null, "made with the earlier account's token: forgotten");
+  assert.equal(links.clawUserIdOf(BOB), "u-bob-2");
+
+  notifySubs.saveNotifySub(BOB, sub);
+  links.forgetBound(BOB);
+  assert.equal(links.clawUserIdOf(BOB), null);
+  assert.equal(notifySubs.getNotifySub(BOB), null);
+
+  links.setBoundClawUser(BOB, "u-bob", "tok-1");
   links.unlink(BOB);
   assert.equal(links.clawUserIdOf(BOB), null, "an unlink forgets a bound person's id");
-  assert.equal(links.userForClawUser("u-bob"), null);
 });

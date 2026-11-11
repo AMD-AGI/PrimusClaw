@@ -1,7 +1,9 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/** LinkRepository on SQLite (tables `links`, `pending_keys`, `link_attempts`). */
+/** LinkRepository on SQLite (tables `links`, `pending_keys`, `link_attempts`, `bound_users`). */
+import { createHash } from "node:crypto";
+
 import {
   CODE_ALPHABET,
   CODE_LENGTH,
@@ -14,6 +16,11 @@ import {
 import { type StoreContext, type SecurityEventSink, drawCode } from "./context.js";
 import { type Row, col } from "./database.js";
 import { forgetNotifySub, forgetRepos } from "./forget.js";
+
+/** What `bound_users` keeps of the token an id was read with: whether it is still the one, never the token itself. */
+function tokenHash(credential: string): string {
+  return createHash("sha256").update(credential).digest("hex");
+}
 
 /** What became of one typed code, as the security event names it. */
 type Attempt = "success" | "wrong" | "used" | "expired" | "locked" | "global_limit";
@@ -168,16 +175,36 @@ export class SqliteLinkRepository implements LinkRepository {
     db.run("UPDATE user_prefs SET brief_trigger_id = NULL WHERE aad_id = ?", userId);
   }
 
-  /** On the link when there is one; else kept for a person bound at the identity service only (`bound_users`). */
   setClawUserId(userId: string, clawUserId: string): void {
+    this.ctx.db.run("UPDATE links SET claw_user_id = ? WHERE aad_id = ?", clawUserId, userId);
+  }
+
+  boundClawUser(userId: string, credential: string): { clawUserId: string; current: boolean } | null {
+    const row = this.ctx.db.get("SELECT claw_user_id, token_hash FROM bound_users WHERE aad_id = ?", userId);
+    if (row === undefined) return null;
+    return { clawUserId: col.str(row, "claw_user_id"), current: col.str(row, "token_hash") === tokenHash(credential) };
+  }
+
+  /** Ignored for a linked person (a link's id is read for its key). Another account than before forgets the subscription. */
+  setBoundClawUser(userId: string, clawUserId: string, credential: string): void {
     const { db } = this.ctx;
-    if (db.run("UPDATE links SET claw_user_id = ? WHERE aad_id = ?", clawUserId, userId) > 0) return;
+    if (db.get("SELECT 1 AS one FROM links WHERE aad_id = ?", userId) !== undefined) return;
+    const before = db.get("SELECT claw_user_id FROM bound_users WHERE aad_id = ?", userId);
+    if (before !== undefined && col.str(before, "claw_user_id") !== clawUserId) forgetNotifySub(db, userId);
     db.run(
-      "INSERT OR REPLACE INTO bound_users (aad_id, claw_user_id, updated_at) VALUES (?, ?, ?)",
+      "INSERT OR REPLACE INTO bound_users (aad_id, claw_user_id, token_hash, updated_at) VALUES (?, ?, ?, ?)",
       userId,
       clawUserId,
+      tokenHash(credential),
       this.ctx.now(),
     );
+  }
+
+  /** Ignored for a linked person: their link keeps its own subscription. */
+  forgetBound(userId: string): void {
+    const { db } = this.ctx;
+    if (db.get("SELECT 1 AS one FROM links WHERE aad_id = ?", userId) !== undefined) return;
+    if (db.run("DELETE FROM bound_users WHERE aad_id = ?", userId) > 0) forgetNotifySub(db, userId);
   }
 
   needsClawUserId(userId: string): boolean {
@@ -199,18 +226,13 @@ export class SqliteLinkRepository implements LinkRepository {
   }
 
   userForClawUser(clawUserId: string): string | null {
-    return this.usersForClawUser(clawUserId)[0] ?? null;
+    const row = this.ctx.db.get("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId);
+    return row ? col.str(row, "aad_id") : null;
   }
 
   usersForClawUser(clawUserId: string): string[] {
     return this.ctx.db
-      .all(
-        `SELECT aad_id FROM links WHERE claw_user_id = ?
-         UNION ALL
-         SELECT aad_id FROM bound_users WHERE claw_user_id = ? AND aad_id NOT IN (SELECT aad_id FROM links)`,
-        clawUserId,
-        clawUserId,
-      )
+      .all("SELECT aad_id FROM links WHERE claw_user_id = ?", clawUserId)
       .map((r) => col.str(r, "aad_id"));
   }
 }

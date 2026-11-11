@@ -77,7 +77,7 @@
     "type": "table",
     "name": "bound_users",
     "tbl_name": "bound_users",
-    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, updated_at REAL NOT NULL)"
+    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, token_hash TEXT NOT NULL, updated_at REAL NOT NULL)"
    },
    {
     "type": "table",
@@ -880,6 +880,14 @@
      },
      {
       "cid": 2,
+      "name": "token_hash",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 3,
       "name": "updated_at",
       "type": "REAL",
       "notnull": 1,
@@ -3043,7 +3051,7 @@
     "type": "table",
     "name": "bound_users",
     "tbl_name": "bound_users",
-    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, updated_at REAL NOT NULL)"
+    "sql": "CREATE TABLE bound_users (\n  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, token_hash TEXT NOT NULL, updated_at REAL NOT NULL)"
    },
    {
     "type": "table",
@@ -3846,6 +3854,14 @@
      },
      {
       "cid": 2,
+      "name": "token_hash",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 3,
       "name": "updated_at",
       "type": "REAL",
       "notnull": 1,

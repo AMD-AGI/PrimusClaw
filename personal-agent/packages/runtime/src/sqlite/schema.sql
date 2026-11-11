@@ -123,4 +123,4 @@ CREATE INDEX IF NOT EXISTS observe_cards_by_suggestion ON observe_cards (aad_id,
 CREATE TABLE IF NOT EXISTS group_context_off (
   conversation_id TEXT PRIMARY KEY, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS bound_users (
-  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, updated_at REAL NOT NULL);
+  aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, token_hash TEXT NOT NULL, updated_at REAL NOT NULL);

@@ -110,3 +110,87 @@ test("a linked person is unchanged: the subscription and the id come from the li
     "(the chat itself runs on the token, as before)",
   );
 });
+
+/** Every token the owner of which was looked up, in order. */
+function lookups(w: ReturnType<typeof boundWorld>["w"]): string[] {
+  const asked: string[] = [];
+  const get = w.owners.get.bind(w.owners);
+  w.owners.get = (token: string) => {
+    asked.push(token);
+    return get(token);
+  };
+  return asked;
+}
+
+test("a bound person's Claw user id is read once a token: the next message on the same token asks no one", async () => {
+  const { w } = boundWorld();
+  const asked = lookups(w);
+
+  await w.router.handle(message("one"));
+  await w.router.handle(message("two"));
+  assert.deepEqual(asked, [TOKEN], "read with the token once");
+
+  w.exchange.tokens.set(ALICE.id, "tok-alice-2"); // (the first one expired: same account, a new token)
+  w.owners.set("tok-alice-2", { id: "u-alice", name: "Liu, Alice", email: "", accountType: "" });
+  await w.router.handle(message("three"));
+  assert.deepEqual(asked, [TOKEN, "tok-alice-2"], "read again with the new token");
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice");
+});
+
+test("a bound person who rebinds to another account is followed to it: id, subscription and assistant all on the new one", async () => {
+  const { aw, w } = boundWorld();
+  await w.router.handle(message("before"));
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice");
+  const before = w.store.notifySubs.getNotifySub(ALICE.id);
+  assert.ok(before !== null);
+
+  w.exchange.tokens.set(ALICE.id, "tok-other");
+  w.owners.set("tok-other", { id: "u-other", name: "Other", email: "", accountType: "" });
+  await w.router.handle(message("after"));
+
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-other", "the id the webhook checks events against is the new owner");
+  assert.deepEqual(
+    aw.subsClaw.calls.filter((c) => c.startsWith("create ")),
+    [`create ${TOKEN}`, "create tok-other"],
+    "a subscription made with the new account's token",
+  );
+  const after = w.store.notifySubs.getNotifySub(ALICE.id);
+  assert.ok(after !== null && after.route !== before.route, "the earlier account's route is no longer theirs");
+  assert.deepEqual(
+    aw.claw.heard.map((h) => [h.key, h.text]),
+    [
+      [TOKEN, "before"],
+      ["tok-other", "after"],
+    ],
+  );
+  assert.deepEqual(w.turns.runs, []);
+});
+
+test("a bound person whose binding is gone is forgotten: no id, no subscription, the card that binds them", async () => {
+  const { aw, w } = boundWorld();
+  await w.router.handle(message("bound"));
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice");
+
+  w.exchange.tokens.delete(ALICE.id);
+  await w.router.handle(message("unbound"));
+
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), null);
+  assert.equal(w.store.notifySubs.getNotifySub(ALICE.id), null);
+  assert.deepEqual(
+    aw.claw.heard.map((h) => h.text),
+    ["bound"],
+    "the second message did not reach the assistant",
+  );
+  assert.ok(said(w).includes("<view:binding>"));
+});
+
+test("a linked person who is also bound keeps the link's id: a bound token never overwrites it", async () => {
+  const { w } = boundWorld({ linkedKey: "ak-alice" });
+  w.owners.set("ak-alice", { id: "u-alice-key", name: "Liu, Alice", email: "", accountType: "" });
+
+  await w.router.handle(message("hi"));
+  w.store.links.setBoundClawUser(ALICE.id, "u-alice", TOKEN);
+
+  assert.equal(w.store.links.clawUserIdOf(ALICE.id), "u-alice-key");
+  assert.equal(w.store.links.boundClawUser(ALICE.id, TOKEN), null, "nothing is kept beside a link");
+});

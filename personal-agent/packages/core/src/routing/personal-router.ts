@@ -58,6 +58,11 @@ export class PersonalRouter {
    * A person with no link whose chats run on an exchanged token (bound at the identity service): their Claw user id is
    * read with the token and their subscription made with it, as a link's are, so their 1:1 chat reaches the assistant
    * from this message on (the assistant reaches only a person whose Claw user id and subscription it knows).
+   *
+   * The id is read again whenever the token is not the one it was read with (tokens last minutes, so at most once a token):
+   * a person who rebinds to another account is followed to it, and one no longer bound is forgotten, so the assistant
+   * never keeps answering for an account the person no longer holds. A subscription is made or mended only with a token
+   * whose owner is the id kept.
    */
   private async reachBound(userId: string): Promise<void> {
     const { credentials, owners } = this.ctx;
@@ -70,10 +75,14 @@ export class PersonalRouter {
       if (error instanceof CredentialUnavailable) return; // (the identity service is down: the message says so itself)
       throw error;
     }
-    if (token === undefined) return; // (not bound: the message is answered with the card that binds them)
-    if (store.links.clawUserIdOf(userId) === null) {
+    if (token === undefined) {
+      store.links.forgetBound(userId); // (not bound: the message is answered with the card that binds them)
+      return;
+    }
+    if (store.links.boundClawUser(userId, token)?.current !== true) {
       const clawUserId = await owners.userIdOf(token);
-      if (clawUserId !== undefined) store.links.setClawUserId(userId, clawUserId);
+      if (clawUserId === undefined) return; // (unread: asked again with the next message)
+      store.links.setBoundClawUser(userId, clawUserId, token);
     }
     if (subscriptions !== undefined) await subscriptions.ensure(userId, token);
   }
