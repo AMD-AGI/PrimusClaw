@@ -12,6 +12,7 @@ import { after, before, describe, it } from "node:test";
 import {
   integrationRegistry,
   neutralPlugins,
+  ok,
   noMetrics,
   SecurityLog,
   silentLogger,
@@ -35,6 +36,7 @@ import { openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
 import { teamsSettingsFromEnv } from "../../src/config/env.js";
 import { buildFeatures, ON_BEHALF_PATH, type AssemblyBase } from "../../src/assembly/features.js";
+import { platformPlugins } from "../../src/assembly/plugins.js";
 import { StartupError } from "../../src/assembly/outbound.js";
 import { DEFAULT_STYLE } from "../../src/config/style.js";
 import { toInboundEvent } from "../../src/activity/inbound/to-event.js";
@@ -370,6 +372,133 @@ describe("the deployment's integrations", () => {
     await features.router.settled();
     assert.ok(
       texts(surface).some((t) => t.includes("- Tracker: connected")),
+      JSON.stringify(texts(surface)),
+    );
+  });
+});
+
+// Production: SaFE's /users/self refuses the token (it is for Claw's audience), Claw's /v1/me answers for it.
+const EXCHANGED = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1LWFsaWNlIn0.c2ln";
+let tokenSafe: FakeHttpServer;
+let tokenClaw: FakeHttpServer;
+
+async function startPlatform(): Promise<void> {
+  tokenSafe = await FakeHttpServer.start([
+    {
+      method: "GET",
+      path: "/api/v1/users/self",
+      handle: (r) =>
+        r.headers["authorization"] === "Bearer ak-alice"
+          ? { status: 200, json: { id: "u-alice", name: "alice (key)", email: "alice@example.com" } }
+          : { status: 401, json: { message: "unauthorized" } },
+    },
+  ]);
+  tokenClaw = await FakeHttpServer.start([
+    {
+      method: "GET",
+      path: "/claw-api/v1/me",
+      handle: (r) =>
+        r.headers["authorization"] === `Bearer ${EXCHANGED}`
+          ? { status: 200, json: { userId: "u-alice", name: "Liu, Alice", email: "alice@example.com", roles: [] } }
+          : { status: 401, json: { error: "authentication_required" } },
+    },
+  ]);
+}
+
+async function stopPlatform(): Promise<void> {
+  await tokenSafe.close();
+  await tokenClaw.close();
+}
+
+/** The worker as production assembles it: the platform plugins, chats on the exchange, Alice bound (and linked). */
+function bound() {
+  const base = readSettingsForTest();
+  const settings: Settings = {
+    ...base,
+    safeApiUrl: `${tokenSafe.url}/api/v1`,
+    clawApiUrl: `${tokenClaw.url}/claw-api`,
+    exchange: { ...base.exchange, enabled: true, forChat: true },
+  };
+  const exchange = {
+    enabled: true,
+    tokenFor: (userId: string) => {
+      assert.equal(userId, ALICE.id);
+      return Promise.resolve(ok(EXCHANGED));
+    },
+    bindingRequest: () => Promise.reject(new Error("not asked")),
+    invalidate: () => undefined,
+  };
+  const plugins = platformPlugins(neutralPlugins({ tokenExchange: exchange }), {
+    env: {},
+    settings,
+    secrets: new Map(),
+    fetch: globalThis.fetch,
+    now: () => Date.now() / 1000,
+    logger: silentLogger,
+  });
+  const world = assembled({}, new RecordingLogger(), { plugins, settings });
+  world.store.links.redeemPending(ALICE.id, ALICE.name, world.store.links.stashPending("ak-alice"));
+  return world;
+}
+
+const GROUP_CHAT = {
+  id: "19:group",
+  kind: "group" as const,
+  tenantId: "t1",
+  wire: { conversation: { id: "19:group" } },
+};
+const PERSONAL_CHAT = {
+  id: "dm-a",
+  kind: "personal" as const,
+  tenantId: "t1",
+  wire: { conversation: { id: "dm-a", conversationType: "personal" }, user: { aadObjectId: ALICE.id } },
+};
+
+describe("/whoami of a person whose chats run on an exchanged identity token (TEAMS_EXCHANGE_FOR_CHAT)", () => {
+  before(startPlatform);
+  after(stopPlatform);
+
+  it("in a group it names the token's SaFE user, asked of Claw's /v1/me with the token, never of SaFE", async () => {
+    tokenSafe.requests.length = 0;
+    tokenClaw.requests.length = 0;
+    const { features, surface } = bound();
+    await features.router.handle(
+      inboundMessage({ id: "g-who", sender: ALICE, conversation: GROUP_CHAT, text: "/whoami", mentioned: true }),
+    );
+    await features.router.settled();
+    assert.deepEqual(texts(surface), ["Alice are connected to SaFE user Liu, Alice."]);
+    assert.deepEqual(
+      tokenClaw.requests.map((r) => [r.path, r.headers["authorization"]]),
+      [["/claw-api/v1/me", `Bearer ${EXCHANGED}`]],
+    );
+    assert.deepEqual(tokenSafe.requests, []);
+  });
+
+  it('in a group in Chinese it is not "SaFE 没告诉我是谁的账号"', async () => {
+    const { features, surface } = bound();
+    await features.router.handle(
+      inboundMessage({
+        id: "g-who-zh",
+        sender: ALICE,
+        conversation: GROUP_CHAT,
+        text: "/whoami",
+        mentioned: true,
+        locale: "zh-CN",
+      }),
+    );
+    await features.router.settled();
+    assert.deepEqual(texts(surface), ["Alice 已连接到 SaFE 用户 Liu, Alice。"]);
+  });
+
+  it("in a 1:1 chat its first line names the token's SaFE user", async () => {
+    const { features, surface } = bound();
+    await features.router.handle(
+      inboundMessage({ id: "d-who", sender: ALICE, conversation: PERSONAL_CHAT, text: "/whoami" }),
+    );
+    await features.router.settled();
+    const [first] = texts(surface);
+    assert.ok(
+      first?.startsWith("This chat is connected to SaFE user Liu, Alice (alice@example.com)."),
       JSON.stringify(texts(surface)),
     );
   });
