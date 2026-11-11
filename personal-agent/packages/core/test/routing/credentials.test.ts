@@ -9,7 +9,7 @@ import { AI_NOTICE, type KeyOwner, type Logger, type OutMessage } from "@primusc
 import { FakeSurface } from "../../../../test-support/surface.js";
 import { advanceSeconds, openTestStore } from "../../../../test-support/store.js";
 import { Chat } from "../../src/routing/chat.js";
-import { CredentialUnavailable, Credentials } from "../../src/routing/credentials.js";
+import { CredentialUnavailable, Credentials, IDENTITY_CARD_INTERVAL_SECONDS } from "../../src/routing/credentials.js";
 import type { RouterConfig } from "../../src/routing/deps.js";
 import { KeyOwners } from "../../src/routing/identity.js";
 import { CommandViews } from "../../src/routing/views.js";
@@ -208,23 +208,73 @@ test("a key's owner who never confirmed their identity is answered on the key, w
   assert.deepEqual(said(w.surface), []);
 });
 
-test("after an answer refused for want of a confirmed identity: the card, unless confirmed by now", async () => {
+test("after an answer refused for want of a confirmed identity: the card, at most once a day, kept in the store", async () => {
   const w = world(true, "zh-CN");
   assert.equal(await w.credentials.identityAfterRefusal(w.chat()), true);
   assert.deepEqual(
     cards(w.surface).map((c) => [c.name, c.lead]),
     [["binding", "这一步需要你本人：在这张卡片上确认一次身份，然后再说一遍就行。"]],
   );
-  w.exchange.tokens.set(ALICE.id, "tok-a");
+  // A second refused request the same day: no card (the 0.3.0 acceptance sent the same card again).
   assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false);
+  advanceSeconds(w.clock, IDENTITY_CARD_INTERVAL_SECONDS - 1);
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false);
+  // What was sent when is the store's: another worker on the same store (a restart, a replica) sends none either.
+  const other = new Credentials(
+    { store: w.store, exchange: w.exchange, config: config(true), logger },
+    new CommandViews("Clawy", PUBLIC, note),
+  );
+  assert.equal(await other.identityAfterRefusal(w.chat()), false);
+  assert.equal(cards(w.surface).length, 1);
+  // 24 hours after the card: once more.
+  advanceSeconds(w.clock, 1);
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), true);
+  assert.equal(cards(w.surface).length, 2);
+});
+
+test("after an answer refused for want of a confirmed identity: none once confirmed, and a card not sent spends nothing", async () => {
+  const w = world(true, "zh-CN");
+  w.exchange.tokens.set(ALICE.id, "tok-a");
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false, "confirmed");
+  advanceSeconds(w.clock, 3 * IDENTITY_CARD_INTERVAL_SECONDS);
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false, "confirmed, days later");
   w.exchange.tokens.delete(ALICE.id);
   w.exchange.down = true;
   assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false, "the service down: not 'not bound'");
   w.exchange.down = false;
   w.exchange.bindingDown = true;
-  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false);
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), false, "no confirm link to be had");
+  assert.equal(cards(w.surface).length, 0);
+  w.exchange.bindingDown = false;
+  assert.equal(await w.credentials.identityAfterRefusal(w.chat()), true, "the day's card was not spent by the failure");
   assert.equal(cards(w.surface).length, 1);
   const keyOnly = world(false);
   assert.equal(await keyOnly.credentials.identityAfterRefusal(keyOnly.chat()), false);
   assert.deepEqual(said(keyOnly.surface), []);
+});
+
+test("the binding card is drawn in the person's language, its lead with it", async () => {
+  const model = (w: ReturnType<typeof world>) =>
+    w.surface.outbox.flatMap((r) =>
+      r.op === "send" && r.message.body.type === "view" ? [r.message.body.view.model as Record<string, unknown>] : [],
+    );
+  const zh = world(true, "zh-CN");
+  await zh.credentials.identityAfterRefusal(zh.chat());
+  await zh.credentials.connectIdentity(zh.chat(), "You mentioned me in a group chat. ");
+  await zh.credentials.connectIdentity(zh.chat(), "I need to know which Primus account you are first. ");
+  assert.deepEqual(
+    model(zh).map((m) => [m["lang"], m["lead"], m["notice"]]),
+    [
+      ["zh", "这一步需要你本人：在这张卡片上确认一次身份，然后再说一遍就行。", AI_NOTICE.zh],
+      ["zh", "你在群聊里 @ 了我。", AI_NOTICE.zh],
+      // (a lead the caller has only in English: the whole card in English, never half and half)
+      ["en", "I need to know which Primus account you are first. ", AI_NOTICE.en],
+    ],
+  );
+  const en = world(true, "en-US");
+  await en.credentials.identityAfterRefusal(en.chat());
+  assert.deepEqual(
+    model(en).map((m) => [m["lang"], m["lead"], m["notice"]]),
+    [["en", "That needs you in person: confirm your identity once on this card, then ask again.", AI_NOTICE.en]],
+  );
 });

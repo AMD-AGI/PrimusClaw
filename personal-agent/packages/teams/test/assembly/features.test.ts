@@ -33,7 +33,7 @@ import { FakeExchange } from "../../../../test-support/routing/fixtures.js";
 import { inboundMessage } from "../../../../test-support/inbound.js";
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { SeededRandom } from "../../../../test-support/random.js";
-import { openTestStore } from "../../../../test-support/store.js";
+import { advanceSeconds, openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
 import { teamsSettingsFromEnv } from "../../src/config/env.js";
 import { buildFeatures, ON_BEHALF_PATH, type AssemblyBase } from "../../src/assembly/features.js";
@@ -93,7 +93,7 @@ function assembled(
   overrides: Overrides = {},
   clawUrl = claw.url,
 ) {
-  const { store } = openTestStore();
+  const { store, clock: storeClock } = openTestStore();
   const surface = new FakeSurface();
   const settings: Settings = { ...readSettingsForTest(), ...overrides.settings };
   const plugins = overrides.plugins ?? neutralPlugins();
@@ -120,7 +120,7 @@ function assembled(
     fetch: globalThis.fetch,
     env,
   };
-  return { features: buildFeatures(base), store, surface };
+  return { features: buildFeatures(base), store, surface, storeClock };
 }
 
 function texts(surface: FakeSurface): string[] {
@@ -269,20 +269,20 @@ function securityRecords(security: RecordingLogger, event: string) {
 }
 
 describe("the identity card after a refused answer", () => {
-  it("a say whose turn was refused for want of a confirmed identity is followed by the binding card, once per turn", async () => {
+  it("a say whose turn was refused for want of a confirmed identity is followed by the binding card: once per turn, once a day, none once confirmed", async () => {
     const exchange = new FakeExchange();
     const plugins: Plugins = { ...neutralPlugins(), tokenExchange: exchange };
     const base = readSettingsForTest();
-    const { features, store, surface } = assembled({}, new RecordingLogger(), {
+    const { features, store, surface, storeClock } = assembled({}, new RecordingLogger(), {
       plugins,
       settings: { exchange: { ...base.exchange, forChat: true } },
     });
     store.links.redeemPending(ALICE.id, ALICE.name, store.links.stashPending("ak-alice"));
     const reference = { serviceUrl: "https://smba.test/", conversation: { id: "dm-a" }, bot: { id: "28:bot" } };
-    const say = (id: string) => ({
+    const say = (id: string, turn = "m1") => ({
       type: "assistant.say",
       event_id: id,
-      turn_message_id: "m1",
+      turn_message_id: turn,
       text: "先确认一次身份。",
       needs_identity: true,
     });
@@ -298,15 +298,20 @@ describe("the identity card after a refused answer", () => {
     // A later say of the same turn (it replaces the first) carries the field too: no second card.
     await features.deliverEvent(ALICE.id, reference, say("s2"));
     assert.equal(bindings().length, 1);
-    // Two says of one turn delivered at once: one card.
+    // Another refused turn the same day (the 0.3.0 acceptance's second request): no second card.
+    await features.deliverEvent(ALICE.id, reference, say("s3", "m2"));
+    assert.equal(bindings().length, 1);
+    // A day after the card: the next refused turn offers it again, and two says of that one turn delivered at once send one.
+    advanceSeconds(storeClock, 24 * 3600);
     await Promise.all([
-      features.deliverEvent(ALICE.id, reference, { ...say("s4"), turn_message_id: "m3" }),
-      features.deliverEvent(ALICE.id, reference, { ...say("s5"), turn_message_id: "m3" }),
+      features.deliverEvent(ALICE.id, reference, say("s4", "m3")),
+      features.deliverEvent(ALICE.id, reference, say("s5", "m3")),
     ]);
     assert.equal(bindings().length, 2);
-    // Confirmed by now: a refused turn after that offers nothing.
+    // Confirmed by now: a refused turn, however much later, offers nothing.
     exchange.tokens.set(ALICE.id, "tok-a");
-    await features.deliverEvent(ALICE.id, reference, { ...say("s3"), turn_message_id: "m2" });
+    advanceSeconds(storeClock, 2 * 24 * 3600);
+    await features.deliverEvent(ALICE.id, reference, say("s6", "m4"));
     assert.equal(bindings().length, 2);
   });
 });

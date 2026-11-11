@@ -64,7 +64,7 @@ export class LinkCommands {
     if (stored === null) {
       // only an exchanged token is in play: no key to delete, and only the person can remove the binding
       store.sessions.clearSession(userId);
-      await chat.say(unlinkText.in("en").bindingOnly);
+      await chat.say(unlinkText.in(chat.lang()).bindingOnly);
       return;
     }
     if (subscriptions !== undefined) await subscriptions.remove(userId, stored); // (Claw needs the key to delete it)
@@ -93,8 +93,9 @@ export class LinkCommands {
     exchange.invalidate(chat.sender.id);
     const token = await exchange.tokenFor(chat.sender.id);
     if (!token.ok && token.error.kind === "not_bound") {
-      const card = await this.ctx.credentials.bindingCard(chat, said.notConfirmedYet);
-      await this.ctx.settle(action, chat, card, { fallback: said.notConfirmedLine });
+      const notYet = linkText.in(chat.lang()); // (the card comes back in the person's language, its lead too)
+      const card = await this.ctx.credentials.bindingCard(chat, notYet.notConfirmedYet);
+      await this.ctx.settle(action, chat, card, { fallback: notYet.notConfirmedLine });
       return;
     }
     if (!token.ok) {

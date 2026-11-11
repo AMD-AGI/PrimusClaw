@@ -34,6 +34,25 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 - `@primusclaw/personal-agent-teams`: a second entry, `@primusclaw/personal-agent-teams/connector-hosts`, the Bot
   Connector host rule alone, which the ingress imports.
 
+### Fixed
+
+- `@primusclaw/personal-agent`: the identity card after an answer refused for want of a confirmed identity goes to a
+  person at most once in 24 hours, and never once they confirmed. 0.3.0 sent it after every such answer (one per turn,
+  not once as its notes said): a second refused request the same day got the same card again. When it was last sent is
+  kept in the store (`github_notices`, kind `identity_card`), so a restart or another replica does not send it sooner;
+  a card that could not be sent does not count. One card per turn at most still holds.
+- `@primusclaw/personal-agent`: Claw's "on it" line (收到，我看一下。) that arrives after its turn has begun to answer is
+  dropped. It used to take the receipt under the person's message, replace the reply streaming into it, and close it
+  as the answer, so the reply came as a message of its own above it (the 0.3.0 acceptance, a refused settings change).
+  The line is known by its id (Claw's `lookupAckSayId`); it still closes a receipt in which nothing has been said yet.
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the identity card's title, body, buttons and AI
+  notice are in the person's language; before, a Chinese lead stood over English text and buttons. A lead a caller has
+  only in English keeps the whole card English. Pressing 我已确认 before confirming brings the card back in Chinese too.
+- `@primusclaw/personal-agent`: `/whoami` for a person connected only through an identity binding (no linked key) no
+  longer tells them to send `/unlink`, which cannot remove a binding: it says the chat is connected through a SaFE
+  identity binding and that the account's owner deletes it in SaFE under identity bindings (SaFE's administrator when
+  SaFE does not name the account). `/unlink`'s answer to such a person is now in Chinese for a Chinese speaker.
+
 ## 0.3.0
 
 A minor release: it adds a way to run the Teams worker (#736). No plugin port (core's `src/plugins/`) changed.
@@ -51,8 +70,8 @@ A minor release: it adds a way to run the Teams worker (#736). No plugin port (c
   assistant in a 1:1 chat: their exchanged token now gets them a notification subscription and a Claw user id, which
   before came only from a link (#733).
 - `@primusclaw/personal-agent`: a person whose chats run on their linked key because they never confirmed their identity
-  is offered the identity card once, right after an answer Claw refused for want of it (Claw marks such a reply
-  `needs_identity`), instead of nothing telling them how to fix it (#735).
+  is offered the identity card right after an answer Claw refused for want of it (Claw marks such a reply
+  `needs_identity`), at most once per turn, instead of nothing telling them how to fix it (#735).
 
 ## 0.2.0
 

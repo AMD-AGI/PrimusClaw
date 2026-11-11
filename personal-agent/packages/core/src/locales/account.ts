@@ -14,6 +14,14 @@ export const accountText = defineCatalog({
       ". If this is not you, send /unlink.",
     whoamiUnknown:
       "This chat is connected, but SaFE could not tell me whose account it is. If you do not recognise it, send /unlink.",
+    whoamiBound: (p: { name: string; email: string }) =>
+      `This chat is connected to SaFE user ${p.name}` +
+      (p.email ? ` (${p.email})` : "") +
+      " through a SaFE identity binding. If this is not you, ask that account's owner to delete the binding in SaFE " +
+      "under identity bindings; /unlink cannot remove it.",
+    whoamiBoundUnknown:
+      "This chat is connected through a SaFE identity binding, but SaFE could not tell me whose account it is. If you do " +
+      "not recognise it, ask your SaFE administrator to have the binding deleted; /unlink cannot remove it.",
     memoryUnreadable: (p: { page: string }) =>
       `I could not read your memory settings right now. You can manage them at ${p.page}`,
     memoryUnavailable: "Memory is not available on this deployment.",
@@ -47,6 +55,12 @@ export const accountText = defineCatalog({
     whoamiFirst: (p) =>
       `这个聊天已连接到 SaFE 用户 ${p.name}` + (p.email ? `（${p.email}）` : "") + "。如果不是你，现在发 /unlink。",
     whoamiUnknown: "这个聊天已连接，但 SaFE 没告诉我是谁的账号。如果你不认识它，发 /unlink。",
+    whoamiBound: (p) =>
+      `这个聊天通过 SaFE 身份绑定连接到 SaFE 用户 ${p.name}` +
+      (p.email ? `（${p.email}）` : "") +
+      "。如果不是你，请让这个账号的主人在 SaFE 的身份绑定里删除这个绑定；发 /unlink 删不掉它。",
+    whoamiBoundUnknown:
+      "这个聊天通过 SaFE 身份绑定连接，但 SaFE 没告诉我是谁的账号。如果你不认识它，请找 SaFE 管理员删除这个绑定；发 /unlink 删不掉它。",
     memoryUnreadable: (p) => `我现在读不到你的记忆设置。可以在这里管理：${p.page}`,
     memoryUnavailable: "这个部署没有记忆功能。",
     memoryOff: (p) => `记忆是**关**的：会话之间我什么都不记。打开它或查看存了什么：${p.page}`,

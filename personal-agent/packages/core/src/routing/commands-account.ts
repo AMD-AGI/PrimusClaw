@@ -94,10 +94,18 @@ export class AccountCommands {
       this.memoryOn(key),
     ]);
     const said = accountText.in(zh ? "zh" : "en");
+    // A person connected only through an identity binding (no linked key) cannot remove it with /unlink: only the account's
+    // owner can, in SaFE (`LinkCommands.unlink` says the same).
+    const bindingOnly = this.ctx.deps.store.links.getKey(chat.sender.id) === null;
+    const person = owner === undefined ? undefined : { name: pyStrip(owner.name), email: pyStrip(owner.email) };
     const first =
-      owner === undefined
-        ? said.whoamiUnknown
-        : said.whoamiFirst({ name: pyStrip(owner.name), email: pyStrip(owner.email) });
+      person === undefined
+        ? bindingOnly
+          ? said.whoamiBoundUnknown
+          : said.whoamiUnknown
+        : bindingOnly
+          ? said.whoamiBound(person)
+          : said.whoamiFirst(person);
     const lines = this.ctx.deps.connectionsText({
       owner,
       githubState: github.state,
