@@ -235,9 +235,10 @@ Everything else has a default; [configuration.md](configuration.md) describes ev
 ### 6. Run it
 
 With Docker Compose, from a copy of [`examples/minimal-teams`](../examples/minimal-teams) holding your `.env` (and
-`assertion-key.pem` for the federated token, readable by uid 65534, the user the image runs as):
+`assertion-key.pem` for the federated token, which the image reads as uid 65534):
 
 ```bash
+sudo chown 65534 assertion-key.pem && chmod 0400 assertion-key.pem   # federated token only
 docker compose up -d
 ```
 
@@ -312,12 +313,16 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
    ```bash
    npm install -g @primusclaw/connector@0.1.22
    claw-connector --version        # 0.1.22
-   claw-connector init             # writes agents.toml and prints its path; set `roots`, the directories an agent may use
+   claw-connector init             # writes agents.toml and prints its path
    read -rs CLAW_CONNECTOR_KEY && export CLAW_CONNECTOR_KEY   # the same person's Claw API key, not echoed
    claw-connector login --server https://claw.example.com/claw-api && unset CLAW_CONNECTOR_KEY
    claw-connector service install  # keeps it running (systemd --user on Linux, launchd on macOS)
    claw-connector doctor           # one line per check, with the fix for each problem
    ```
+
+   In `agents.toml`, set `roots`, the directories an agent may work in. The file `init` writes offers Claude Code;
+   to offer Codex or Cursor instead or as well, remove the `#` in front of its block and set its `roots` too (see
+   [agents.toml](../../connector/README.md#agentstoml)).
 
    The connector calls a key sign-in a development key and stores the key as it is (in a file of mode 0600). If your
    Claw deployment runs an identity service with device sign-in, use
