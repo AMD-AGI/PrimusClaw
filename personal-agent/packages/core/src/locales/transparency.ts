@@ -54,10 +54,49 @@ export const REMOTE_LINE: Phrase = {
   zh: "这个聊天连着你自己机器上的 agent 时，你的消息改发给那个 agent。",
 };
 
-/** The section of help about answers and data, in `lang`; `remote`: remote agents are on in this chat. */
-export function dataStatement(lang: string, remote = false): string {
+/**
+ * How much of a group chat's recent messages the deployment keeps as background for an @mention (core's
+ * `GroupContext`, TEAMS_GROUP_CONTEXT_*), when that is on: the newest `messages`, none older than `hours`.
+ */
+export interface GroupContextKept {
+  readonly messages: number;
+  readonly hours: number;
+}
+
+/** "What I see" where a group's recent messages are kept: the group's @mentions are no longer all it sees. */
+export const SEES_LINE: Phrase = {
+  en: "What I see: the messages you send me, with any message you quote and any file you attach.",
+  zh: "我能看到什么：你发给我的消息，以及你引用的消息和附上的文件。",
+};
+
+function plural(count: number, one: string): string {
+  return `${String(count)} ${one}${count === 1 ? "" : "s"}`;
+}
+
+/** Only where the deployment keeps a group's recent messages (#725): what is kept, for how long, where, and how to stop it. */
+export function groupContextLine(lang: Lang, kept: GroupContextKept): string {
+  if (lang === "zh") {
+    return (
+      `群里授权我读取聊天消息后，我还会在内存里暂存该群最近 ${String(kept.messages)} 条、${String(kept.hours)} 小时内` +
+      "没 @我 的消息，不存数据库、不回复，有人 @我 时作为不可信的背景一起带上。在群里 @我 /context off 可关闭。"
+    );
+  }
+  return (
+    "In a group that allows me to read its messages, I also keep its newest " +
+    `${plural(kept.messages, "message")} that ${kept.messages === 1 ? "does" : "do"} not @mention me, for up to ${plural(kept.hours, "hour")}, ` +
+    "in memory only (never stored, never answered), as untrusted background for the next @mention. " +
+    "@mention me with /context off in the group to turn it off."
+  );
+}
+
+/**
+ * The section of help about answers and data, in `lang`; `remote`: remote agents are on in this chat; `groupContext`:
+ * the deployment keeps a group's recent messages (absent: it does not, and a group's @mentions are all it sees).
+ */
+export function dataStatement(lang: string, remote = false, groupContext?: GroupContextKept): string {
   const chosen = toLang(lang);
   const lines = [...DATA_LINES[chosen]];
   if (remote) lines.splice(3, 0, REMOTE_LINE[chosen]); // (after "where it goes")
+  if (groupContext !== undefined) lines.splice(1, 1, SEES_LINE[chosen], groupContextLine(chosen, groupContext));
   return [`**${DATA_TITLE[chosen]}**`, ...lines.map((line) => `- ${line}`)].join("\n");
 }

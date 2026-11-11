@@ -13,6 +13,7 @@
  * @mentions the bot, `background` gives what is kept, marked as untrusted history, for the turn to send before what they
  * wrote.
  */
+import type { GroupContextKept } from "../locales/transparency.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { GroupContextRepository } from "../ports/store/group-context.js";
@@ -84,6 +85,12 @@ export class GroupContext {
 
   get enabled(): boolean {
     return this.deps.settings.messages > 0;
+  }
+
+  /** How much a chat keeps, as help says it (undefined when the deployment keeps nothing). */
+  kept(): GroupContextKept | undefined {
+    if (!this.enabled) return undefined;
+    return { messages: this.deps.settings.messages, hours: this.deps.settings.maxAgeSeconds / 3600 };
   }
 
   /** A group message not addressed to the bot: kept, never answered. */

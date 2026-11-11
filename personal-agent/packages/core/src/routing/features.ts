@@ -5,6 +5,7 @@ import type { GithubConnection } from "../claw/model.js";
 import type { JsonObject } from "../json.js";
 import type { KeyOwner } from "../plugins/identity-lookup.js";
 import type { Lang } from "../locales/lang.js";
+import type { GroupContextKept } from "../locales/transparency.js";
 import type { Conversation, InboundFile, InboundMessage, OutMessage, UserRef } from "../ports/surface.js";
 
 /**
@@ -176,6 +177,8 @@ export interface GroupHistory {
   record(message: InboundMessage): void;
   /** The chat's kept messages as background for a turn ("" none). */
   background(chatId: string): string;
+  /** How much a chat keeps, for help to say (undefined: the deployment keeps nothing). */
+  kept(): GroupContextKept | undefined;
 }
 
 /** The review service's part in the chat (Python `github_review.GithubReview` and `github_connect.GithubConnect`). */
