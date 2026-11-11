@@ -84,7 +84,7 @@ import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
+import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
@@ -3527,7 +3527,9 @@ class TaskRunner {
     // listing reads it to say the turn's files are still on their way, and it
     // is stored before the session is set idle, so no read falls between them.
     const hands = this.workHands();
-    const saves = !!hands && this.request.workspace_throwaway !== true;
+    // Named per save, not per turn: a redelivered turn keeps its message id, and
+    // the finish of an earlier attempt's save must not end this one's.
+    const saveId = !!hands && this.request.workspace_throwaway !== true ? randomUUID() : undefined;
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3546,7 +3548,7 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...(saves ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING } : {}),
+      ...(saveId ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING, [WORKSPACE_SAVE_ID_FIELD]: saveId } : {}),
       ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
       if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
@@ -3662,7 +3664,7 @@ class TaskRunner {
         logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
       } finally {
         await this.announceWorkspaceSave({
-          type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, message_id: this.messageId,
+          type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, save_id: saveId, message_id: this.messageId,
         });
       }
     }

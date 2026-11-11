@@ -11,17 +11,22 @@
  * the object store are not yet the turn's. The API tells a file listing "still
  * being saved" apart from "not there" from two facts on the session's events:
  *
- *   - the turn's own `exec_complete` carries `workspace_save: "pending"` when a
- *     save follows it. On the completion itself, so it is stored before the
- *     session is set idle and no read can fall between the two;
- *   - a `workspaceSave` event with `phase: "finished"` and the same `message_id`
- *     follows once the save is over, however it ended.
+ *   - the turn's own `exec_complete` carries `workspace_save: "pending"` and a
+ *     `workspace_save_id` when a save follows it. On the completion itself, so it
+ *     is stored before the session is set idle and no read can fall between the
+ *     two;
+ *   - a `workspaceSave` event with `phase: "finished"` and that id as `save_id`
+ *     follows once the save is over, however it ended. The id is the save's, not
+ *     the turn's: a redelivered turn keeps its `message_id`, and an earlier
+ *     attempt's finish must not end the retry's save.
  */
 export const WORKSPACE_SAVE_EVENT = "workspaceSave";
 
 /** The `exec_complete` field, and its one value, that says a save follows. */
 export const WORKSPACE_SAVE_PENDING_FIELD = "workspace_save";
 export const WORKSPACE_SAVE_PENDING = "pending";
+/** The `exec_complete` field naming the save that follows it. */
+export const WORKSPACE_SAVE_ID_FIELD = "workspace_save_id";
 
 /** How a save ended: every file up, some failed, nothing to save, or it could not be done. */
 export type WorkspaceSaveOutcome = "synced" | "partial" | "empty" | "failed";
@@ -30,6 +35,8 @@ export interface WorkspaceSaveFinishedEvent {
   type: typeof WORKSPACE_SAVE_EVENT;
   phase: "finished";
   outcome: WorkspaceSaveOutcome;
+  /** The completion's `workspace_save_id`. */
+  save_id?: string;
   message_id?: string;
 }
 

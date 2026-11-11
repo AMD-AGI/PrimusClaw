@@ -10,7 +10,8 @@
  * a half-uploaded tree off as the session's files: see `WORKSPACE_SAVE_EVENT`.
  */
 import {
-  WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, WORKSPACE_SAVE_STALE_MS,
+  WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD,
+  WORKSPACE_SAVE_STALE_MS,
 } from "@claw/protocol";
 import { db, type Querier } from "../infra/db.js";
 
@@ -26,9 +27,11 @@ export interface WorkspaceSaving {
  * Read off the session's last `exec_complete`, which says whether a save follows
  * it: that row is stored before the session is set idle, so an idle session
  * whose save has not finished always finds it. The save is over once a
- * `workspaceSave` `finished` names the same turn, wherever that row landed --
+ * `workspaceSave` `finished` names the same save, wherever that row landed --
  * the two are published one after the other but may be stored by different
- * replicas, so their order in the table is not evidence. A later turn's
+ * replicas, so their order in the table is not evidence. By the save's id, not
+ * the turn's: a redelivered turn keeps its message id, and an earlier attempt's
+ * finish would otherwise end the retry's save. A later turn's
  * completion also ends it: that turn ran only once this save let go of the
  * workspace. And a mark older than WORKSPACE_SAVE_STALE_MS is a save whose Brain
  * died with it.
@@ -53,12 +56,12 @@ export async function workspaceSaving(
           SELECT 1 FROM claw_session_events f
            WHERE f.session_id = $1 AND f.deleted_at IS NULL AND f.event = $2
              AND f.data->>'phase' = 'finished'
-             AND f.data->>'message_id' IS NOT DISTINCT FROM last.data->>'message_id'
+             AND f.data->>'save_id' = last.data->>$5
              -- Bounds the read to the session's recent rows (idx_events_session_recent),
              -- with room for the two having been stored out of order.
              AND f.created_at >= last.created_at - INTERVAL '10 minutes'
         )`,
-    [sessionId, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_PENDING_FIELD, WORKSPACE_SAVE_PENDING],
+    [sessionId, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_PENDING_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_ID_FIELD],
   );
   const row = r.rows[0] as { message_id: string | null; created_at: Date | string } | undefined;
   if (!row) return null;
