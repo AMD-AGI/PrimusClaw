@@ -287,6 +287,7 @@ export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
     route: (event) => features.router.handle(event),
     botName: BOT_NAME,
     logger: deps.logger,
+    groupContext: features.groupContext,
   });
   const consumer =
     inbound === undefined

@@ -26,10 +26,11 @@ import {
 
 import { inboundAction, inboundMessage } from "../inbound.js";
 import { SeededRandom } from "../random.js";
-import { openTestStore } from "../store.js";
+import { openTestStore, type TestStore } from "../store.js";
 import { FakeSurface } from "../surface.js";
 import type { RouterConfig, RouterDeps, RouterLimits } from "../../packages/core/src/routing/deps.js";
-import type { AssistantChat, MessageText, RemoteChat } from "../../packages/core/src/routing/features.js";
+import type { AssistantChat, GroupHistory, MessageText, RemoteChat } from "../../packages/core/src/routing/features.js";
+import { DEFAULT_GROUP_CONTEXT, GroupContext } from "../../packages/core/src/group-context/buffer.js";
 import { Router } from "../../packages/core/src/routing/router.js";
 import { StopButtons } from "../../packages/core/src/turn/stop-buttons.js";
 import type { TurnHooks, TurnOutcome, TurnRun, TurnRunner } from "../../packages/core/src/routing/turn-runner.js";
@@ -181,6 +182,8 @@ export interface WorldOptions {
   readonly limits?: Partial<RouterLimits>;
   readonly reachable?: readonly string[];
   readonly linkLimits?: { readonly perUser: number; readonly global: number; readonly windowSeconds: number };
+  /** The recent messages of group chats (default: core's GroupContext on this store, default settings, no mask). */
+  readonly groupHistory?: GroupHistory;
 }
 
 function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
@@ -198,6 +201,17 @@ function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
     ownThumbsMobile: true,
     ...overrides,
   };
+}
+
+/** Core's GroupContext on the world's store, with the default settings and no mask. */
+function groupHistoryOf(store: TestStore["store"], clock: TestStore["clock"]): GroupHistory {
+  return new GroupContext({
+    settings: DEFAULT_GROUP_CONTEXT,
+    clock,
+    mask: (t) => t,
+    off: store.groupContext,
+    log: silent,
+  });
 }
 
 export function world(options: WorldOptions = {}) {
@@ -250,6 +264,7 @@ export function world(options: WorldOptions = {}) {
     stopCards: new StopButtons({ clock, random: new SeededRandom(5), log: silent }),
     proactive: { muted: () => null, release: () => Promise.resolve() },
     observing: { forward: () => Promise.resolve(), mayTurnOn: () => false, board: () => Promise.resolve() },
+    groupHistory: options.groupHistory ?? groupHistoryOf(store, clock),
     github: undefined,
     subscriptions: undefined,
     reviewStop: undefined,

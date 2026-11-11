@@ -154,6 +154,29 @@ describe("the per-person limits", () => {
       refused({ TEAMS_LINK_MAX_FAILURES_GLOBAL: value }, "TEAMS_LINK_MAX_FAILURES_GLOBAL");
     });
   }
+
+  it("a group chat's recent messages: 30 for 4 hours, 500 characters each, unless set; 0 messages is off", () => {
+    assert.deepEqual(settings().groupContext, { messages: 30, maxAgeSeconds: 14_400, messageChars: 500 });
+    const s = settings({
+      TEAMS_GROUP_CONTEXT_MESSAGES: "10",
+      TEAMS_GROUP_CONTEXT_HOURS: "2",
+      TEAMS_GROUP_CONTEXT_CHARS: "200",
+    });
+    assert.deepEqual(s.groupContext, { messages: 10, maxAgeSeconds: 7200, messageChars: 200 });
+    assert.equal(settings({ TEAMS_GROUP_CONTEXT_MESSAGES: "0" }).groupContext.messages, 0);
+  });
+
+  for (const [name, value] of [
+    ["TEAMS_GROUP_CONTEXT_MESSAGES", "-1"],
+    ["TEAMS_GROUP_CONTEXT_MESSAGES", "201"],
+    ["TEAMS_GROUP_CONTEXT_MESSAGES", "many"],
+    ["TEAMS_GROUP_CONTEXT_HOURS", "0"],
+    ["TEAMS_GROUP_CONTEXT_CHARS", "1.5"],
+  ] as const) {
+    it(`a bad group context setting refuses to start: ${name}=${value}`, () => {
+      refused({ [name]: value }, name);
+    });
+  }
 });
 
 describe("EnvReader and names Object.prototype has", () => {

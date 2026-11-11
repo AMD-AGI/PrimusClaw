@@ -132,11 +132,17 @@ export class GroupRouter {
         text: words.text,
         messageId: message.id,
         clientPlatform: message.clientPlatform,
-        quote: words.quote,
+        quote: this.withHistory(message, words.quote),
         sent: words.sent,
         files,
       });
     }
+  }
+
+  /** The chat's recent messages, as untrusted background, before what the person quoted (either may be ""). */
+  private withHistory(message: InboundMessage, quote: string): string {
+    const history = this.ctx.deps.groupHistory.background(message.conversation.id);
+    return history && quote ? `${history}\n\n${quote}` : history || quote;
   }
 
   /** Which account, in a group: never the sender's email. */

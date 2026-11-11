@@ -10,6 +10,7 @@
 import type {
   ClawPort,
   ClawSessionsPort,
+  GroupContext,
   JsonObject,
   GithubConfirmation,
   GithubReview,
@@ -23,6 +24,7 @@ import type {
 import {
   BOT_NAME,
   chatTurnKey,
+  contextInterceptor,
   Guardrails,
   PublicErrorLog,
   Router,
@@ -71,6 +73,8 @@ export interface Features {
   stop(): void;
   /** The review service (TEAMS_GITHUB_REVIEW_ENABLED; undefined off), for the gate's review scenarios and the tests. */
   readonly review: GithubReview | undefined;
+  /** The recent messages of group chats (kept in memory): the inbound handler drops a chat the bot was removed from. */
+  readonly groupContext: GroupContext;
   /** What the release gate's test entry reads: the subscriptions, and the Claw sessions this worker made. */
   readonly gate: {
     readonly subscriptions: GateSubscriptions | undefined;
@@ -207,6 +211,7 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     stopCards: stopCards(base),
     proactive: proactiveHold(proactive),
     observing: w8.observer,
+    groupHistory: w8.groupContext,
     github: built.review?.service,
     reviewStop: (text) => reviewStop(text),
     handoffs: built.review === undefined ? [] : [REVIEW_HANDOFF], // (`review_for_other` only with the review service)
@@ -249,6 +254,15 @@ function featureTimers(base: AssemblyBase, built: Built): FeatureTimer[] {
       },
     },
     { name: "release_held", everyMs: SWEEP_MS, runAtStart: false, run: () => release.releaseDue() },
+    {
+      name: "sweep_group_context", // (a quiet group's recent messages are dropped once they are too old)
+      everyMs: SWEEP_MS,
+      runAtStart: false,
+      run: () => {
+        built.w8.groupContext.sweep();
+        return Promise.resolve();
+      },
+    },
     {
       name: "resend_approval_cards",
       everyMs: SWEEP_MS,
@@ -350,6 +364,7 @@ export function buildFeatures(given: AssemblyBase): Features {
   const reviewHandlers = review?.service.routeHandlers();
   // (in a group, Python reads `/observe` first, then the feedback answer, then the review-stop words, then review requests)
   const groupInterceptors: RouteHandlers["groupInterceptors"][number][] = [
+    contextInterceptor(w8.groupContext),
     w8.observer.interceptor,
     w8.flow.interceptor,
   ];
@@ -394,5 +409,6 @@ export function buildFeatures(given: AssemblyBase): Features {
     },
     gate: gateOf(parts, base, made),
     review: review?.service,
+    groupContext: w8.groupContext,
   };
 }

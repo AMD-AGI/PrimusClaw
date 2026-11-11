@@ -10,7 +10,7 @@
 import type { InboundEvent, Logger } from "@primusclaw/personal-agent";
 import { silentLogger } from "@primusclaw/personal-agent";
 
-import { toInboundEvent } from "../activity/inbound/index.js";
+import { applyGroupChange, toInboundEvent, type GroupContextChanges } from "../activity/inbound/index.js";
 import type { JsonObject } from "../cards/json.js";
 import type { AckRegistry } from "../messenger/acks.js";
 
@@ -21,6 +21,8 @@ export interface InboundParts {
   readonly route: (event: InboundEvent) => Promise<void>;
   readonly botName: string;
   readonly logger?: Logger;
+  /** The recent messages kept of group chats: a removal, delete or edit in a group changes them (none: nothing kept). */
+  readonly groupContext?: GroupContextChanges;
 }
 
 /** Python's `str(body.get(key) or "")` of an ack's field. */
@@ -38,7 +40,10 @@ export function inboundHandler(parts: InboundParts): (body: JsonObject) => Promi
       parts.acks.resolve(text(body["ack"]), activityId || undefined);
       return;
     }
-    if (body["type"] !== "message" && body["type"] !== "invoke") return;
+    if (body["type"] !== "message" && body["type"] !== "invoke") {
+      if (parts.groupContext !== undefined) applyGroupChange(body, parts.groupContext, (a) => editedText(a, parts));
+      return;
+    }
     const event = toInboundEvent(body, { botName: parts.botName, logger });
     if (!event.ok) {
       logger.warn("an inbound activity was not read", { why: event.error.kind });
@@ -46,4 +51,10 @@ export function inboundHandler(parts: InboundParts): (body: JsonObject) => Promi
     }
     if (event.value !== undefined) await parts.route(event.value);
   };
+}
+
+/** An edited group message's words as a message's are read (the bot's mention taken out); undefined: not a person's. */
+function editedText(activity: Readonly<Record<string, unknown>>, parts: InboundParts): string | undefined {
+  const event = toInboundEvent({ ...activity, type: "message" }, { botName: parts.botName });
+  return event.ok && event.value?.type === "message" ? event.value.text : undefined;
 }
