@@ -92,7 +92,7 @@ export class Prompts {
       return this.say(p.to, readOnlyRefused(lang, this.state.offersTakeover(p.chatKey)));
     }
     const sent = await this.send(p, state);
-    if (sent) this.started(p, state, source, sent.cmdSeq);
+    if (sent) this.started(p, state, source, () => sent.cmdSeq);
   }
 
   /**
@@ -104,37 +104,43 @@ export class Prompts {
   private async queueBehind(p: Prompt, state: RemoteState, source: SentFrom): Promise<void> {
     const text = remoteAgentText.in(this.state.lang(p.chatKey));
     const waiting = this.state.chats.queuedCount(p.chatKey);
+    if (this.state.chats.queuedMessage(p.chatKey, p.messageId)) return; // (redelivered: it is queued, and was said so)
     if (waiting >= QUEUED_PROMPTS_MAX) return this.say(p.to, text.queueFull({ n: QUEUED_PROMPTS_MAX }));
     const sid = state.sessionId;
     let cmdSeq: number | undefined = undefined; // (Claw's number of it, once the send has answered)
     let reader: RemoteTurn | undefined;
     const queued: QueuedPrompt = {
+      messageId: p.messageId,
       get cmdSeq() {
         return cmdSeq;
       },
       start: () => {
         const now = this.state.attached(p.chatKey);
         if (now?.sessionId !== sid) return false; // (the chat left that session meanwhile)
-        this.started(p, now, source, cmdSeq);
+        this.started(p, now, source, () => cmdSeq);
         reader = this.state.chats.turns.get(p.chatKey);
         return true;
       },
     };
     this.state.chats.enqueue(p.chatKey, queued);
     const sent = await this.send(p, state);
-    if (!sent) {
-      // (not sent: it waits no more, and a reader started for it meanwhile would wait for a turn that never comes)
+    if (sent) cmdSeq = sent.cmdSeq;
+    // (refused on the machine before the send answered: the refusal went by while it had no number)
+    const refused = cmdSeq === undefined ? undefined : this.state.chats.takeRefusal(p.chatKey, cmdSeq);
+    // Not sent, a redelivery of a message Claw already has (its turn is read already), or refused: it waits no more, and a reader
+    // started for it meanwhile would wait for a turn that never comes.
+    if (!sent || sent.duplicate || refused !== undefined) {
       if (
         !this.state.chats.removeQueued(p.chatKey, queued) &&
         reader &&
         this.state.chats.turns.get(p.chatKey) === reader
       ) {
-        this.runner.cancel(p.chatKey);
         this.closeTurn(p.chatKey, state);
+        this.runner.stopReading(p.chatKey);
       }
+      if (refused !== undefined) await this.say(p.to, text.queuedRefused({ reason: refused }));
       return;
     }
-    cmdSeq = sent.cmdSeq;
     if (reader) return; // (the turn in front ended while it was sent: its own turn is read already)
     if (!this.state.chats.isQueued(p.chatKey, queued)) return; // (a /stop or a detach meanwhile gave it up, and said so)
     if (source === "card") this.state.view(p.chatKey, state).draft = ""; // (taken: the card's box is empty again)
@@ -152,8 +158,14 @@ export class Prompts {
     await this.say(p.to, readOnlyRefused(lang, this.state.offersTakeover(p.chatKey)));
   }
 
-  /** The prompt to Claw, with Claw's number of it; false (and the person told why) when it did not go. */
-  private async send(p: Prompt, state: RemoteState): Promise<{ readonly cmdSeq: number | undefined } | false> {
+  /**
+   * The prompt to Claw, with Claw's number of it (`duplicate`: Claw had this message already, a redelivery); false (and the person
+   * told why) when it did not go.
+   */
+  private async send(
+    p: Prompt,
+    state: RemoteState,
+  ): Promise<{ readonly cmdSeq: number | undefined; readonly duplicate: boolean } | false> {
     const lang = this.state.lang(p.chatKey);
     const sid = state.sessionId ?? "";
     try {
@@ -169,7 +181,10 @@ export class Prompts {
       );
       this.ctx.sessionNames.titleRemoteSession(sid, sessionTitle(p.text)); // (a new session is named by its first words)
       const seq = out["cmd_seq"];
-      return { cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined };
+      return {
+        cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
+        duplicate: out["duplicate"] === true,
+      };
     } catch (error) {
       if (error instanceof ClawError && error.status === 409 && READ_ONLY_REASONS.includes(error.code)) {
         // (a watch this process did not know of: it restarted)
@@ -196,7 +211,7 @@ export class Prompts {
     return failureText(error, this.ctx.errors, this.ctx.clock.epochMs() / 1000, this.state.lang(chatKey));
   }
 
-  private started(p: Prompt, state: RemoteState, source: SentFrom, cmdSeq?: number): void {
+  private started(p: Prompt, state: RemoteState, source: SentFrom, cmdSeq?: () => number | undefined): void {
     this.ctx.remoteState.setRemoteTurn(p.chatKey, state.sessionId ?? "", true);
     const view = this.state.view(p.chatKey, state); // (every message that went to the session is what the card says was sent)
     view.sent = p.text;

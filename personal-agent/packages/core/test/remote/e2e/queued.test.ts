@@ -185,6 +185,53 @@ test("a queued message the machine refuses before it runs is given up, and the p
     assert.equal(w.answer(), "The report is written.");
   }));
 
+test("a queued message the machine refuses before Claw has answered its send is given up too, and the person is told", () =>
+  remoteWorld(async (w) => {
+    const { sid, prompts, script } = await manual(w);
+    await firstRunning(w, sid, prompts);
+    script.onPrompt = async (srv: FakeRemote, s: string, cmd: FakeCommand) => {
+      prompts.push(cmd);
+      // (refused by the connector, and that event read by the turn in front, before Claw answers the send)
+      await srv.emit(s, "command_rejected", {
+        type: "prompt",
+        reason: "too_many_queued_prompts",
+        cmd_id: cmd.cmd_id ?? null,
+        cmd_seq: seqOf(w, cmd),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    };
+    await w.send("second");
+    await w.until(() => w.said().some((t) => t.startsWith(en.queuedRefused({ reason: "" }))));
+    assert.ok(!w.said().includes(en.queuedBehind({ n: 1 })), "never said to wait");
+    await w.server.say(sid, "The report is written.");
+    await endOf(w, sid, prompts[0]);
+    await w.idle(); // (no reader waits for the refused message)
+    assert.equal(w.answer(), "The report is written.");
+  }));
+
+test("a message delivered again while it waits queues nothing more, and one Claw already has starts no reader", () =>
+  remoteWorld(async (w) => {
+    const { sid, prompts } = await manual(w);
+    await firstRunning(w, sid, prompts);
+    await w.send("second", undefined, [], "act-second");
+    await w.until(() => w.last() === en.queuedBehind({ n: 1 }));
+    const said = w.said().length;
+    await w.send("second", undefined, [], "act-second"); // (the channel delivers it again)
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(w.said().length, said, "nothing said again");
+    assert.equal(w.server.commandsOf("prompt").length, 2);
+    await w.server.say(sid, "The report is written.");
+    await endOf(w, sid, prompts[0]);
+    await w.until(() => w.said().includes("The report is written."));
+    // (delivered once more while its own turn runs: Claw says it has it, and no second reader waits for it)
+    await w.send("second", undefined, [], "act-second");
+    await w.server.say(sid, "Second answer.");
+    await endOf(w, sid, prompts[1]);
+    await w.idle();
+    assert.equal(w.answer(), "Second answer.");
+    assert.equal(w.server.commandsOf("prompt").length, 2);
+  }));
+
 test("the queued message's turn is not ended by the end of the turn in front of it", () =>
   remoteWorld(async (w) => {
     const { sid, prompts } = await manual(w);

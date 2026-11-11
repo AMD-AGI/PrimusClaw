@@ -55,8 +55,8 @@ export interface TurnRequest {
   readonly state: RemoteState;
   /** The person's message the turn answers (a stream answers it); undefined: shown by a progress message. */
   readonly replyTo: string | undefined;
-  /** Claw's number of the prompt the turn answers (undefined: not known, any turn end ends it). */
-  readonly cmdSeq?: number | undefined;
+  /** Claw's number of the prompt the turn answers, read as events come (undefined: not known, any turn end ends it). */
+  readonly cmdSeq?: (() => number | undefined) | undefined;
 }
 
 export class TurnRunner {
@@ -88,6 +88,11 @@ export class TurnRunner {
     this.state.chats.turns.get(chatKey)?.task?.cancel();
   }
 
+  /** Stop reading the chat's turn only (it will have none): the turn of the next queued message, if any, is read instead. */
+  stopReading(chatKey: string): void {
+    this.state.chats.turns.get(chatKey)?.task?.cancel();
+  }
+
   private async guarded(request: TurnRequest, turn: RemoteTurn, signal: AbortSignal): Promise<void> {
     try {
       await this.run(request, turn, signal);
@@ -99,7 +104,7 @@ export class TurnRunner {
       await request.to.send(textMessage(words.watchFailed({ ref })));
     } finally {
       if (this.state.chats.turns.get(request.chatKey) === turn) this.state.chats.turns.delete(request.chatKey);
-      this.over(request, signal);
+      this.over(request);
     }
   }
 
@@ -107,9 +112,8 @@ export class TurnRunner {
    * The turn is over: the turn of the oldest message sent behind it is read next (it runs on the machine now), or, with none
    * waiting, what the agent says next is followed from where the turn ended.
    */
-  private over(request: TurnRequest, signal: AbortSignal): void {
+  private over(request: TurnRequest): void {
     const { chatKey } = request;
-    if (signal.aborted) this.state.chats.dropQueued(chatKey);
     for (let next = this.state.chats.takeQueued(chatKey); next; next = this.state.chats.takeQueued(chatKey)) {
       if (next.start()) return;
     }
@@ -171,6 +175,7 @@ export class TurnRunner {
     display.tail = outcome.tail;
     // The answer and nothing under it: the system operations are on the status card, never a card per turn.
     await display.finish(outcome.parts, { ai: outcome.ai, ...(signer ? { replies: signer.replies } : {}) });
+    if (this.state.chats.queuedCount(chatKey) > 0) await display.handOver?.(); // (the next turn follows at once)
   }
 
   /** The turn could not be read to its end: the session is gone, Claw refused, or the connection was lost. */
@@ -271,9 +276,15 @@ export class TurnRunner {
     }
   }
 
-  /** A message waiting behind this turn was refused on the machine before it ran: it waits no more, and the person is told. */
+  /**
+   * A message waiting behind this turn was refused on the machine before it ran: it waits no more, and the person is told. One whose
+   * send has not answered yet has no number to match: the refusal is kept for that send (`Prompts.queueBehind`).
+   */
   private async queuedRefused(chatKey: string, to: Conversation, cmdSeq: number, reason: string): Promise<void> {
-    if (this.state.chats.takeQueuedSeq(chatKey, cmdSeq) === undefined) return;
+    if (this.state.chats.takeQueuedSeq(chatKey, cmdSeq) === undefined) {
+      this.state.chats.noteRefusal(chatKey, cmdSeq, reason);
+      return;
+    }
     try {
       await to.send(textMessage(remoteAgentText.in(this.state.lang(chatKey)).queuedRefused({ reason })));
     } catch (error) {

@@ -32,7 +32,9 @@ export interface RemoteTurn {
  * after the one in front (`TurnRunner`).
  */
 export interface QueuedPrompt {
-  /** Claw's sequence number of the prompt (a refusal of it names it); undefined when Claw did not give one. */
+  /** The channel's id of the person's message ("" none): a redelivered message queues nothing more. */
+  readonly messageId: string;
+  /** Claw's sequence number of the prompt (a refusal of it names it); undefined while its send is on its way, or none was given. */
   readonly cmdSeq: number | undefined;
   /** Start reading its turn: false when it cannot be (the chat is no longer attached to that session). */
   start(): boolean;
@@ -40,6 +42,8 @@ export interface QueuedPrompt {
 
 /** At most this many messages wait behind a running turn (the connector refuses more: `too_many_queued_prompts`). */
 export const QUEUED_PROMPTS_MAX = 5;
+/** Refusals of prompts no queued message could be matched to yet, kept per chat for the send that is still on its way. */
+export const REFUSALS_KEPT = 20;
 
 /** A turn about to be watched (its task is set right after). */
 export function newTurn(): RemoteTurn {
@@ -71,6 +75,8 @@ export class ChatRegistry {
   readonly turns = new Map<string, RemoteTurn>();
   /** The messages sent while the chat's turn ran, oldest first: each one's turn is read after the one in front. */
   private readonly queuedPrompts = new Map<string, QueuedPrompt[]>();
+  /** Prompt refusals (Claw's number -> the reason) that came before any queued message had that number. */
+  private readonly refusals = new Map<string, Map<number, string>>();
   /** A short watch (`/agent new` waiting for the agent, `/agent mode` for its answer). */
   readonly watchers = new Map<string, Task>();
   /** Whether the agent of the attached session starts in a mode that does not ask (its connector's report). */
@@ -100,6 +106,30 @@ export class ChatRegistry {
     const next = queue?.shift();
     if (queue?.length === 0) this.queuedPrompts.delete(chatKey);
     return next;
+  }
+
+  /** Whether a message with this channel id already waits in the chat's queue. */
+  queuedMessage(chatKey: string, messageId: string): boolean {
+    return messageId !== "" && (this.queuedPrompts.get(chatKey)?.some((q) => q.messageId === messageId) ?? false);
+  }
+
+  /** A prompt refusal no queued message has the number of yet (its send has not answered): kept for that send. */
+  noteRefusal(chatKey: string, cmdSeq: number, reason: string): void {
+    const kept = this.refusals.get(chatKey) ?? new Map<number, string>();
+    kept.set(cmdSeq, reason);
+    for (const oldest of kept.keys()) {
+      if (kept.size <= REFUSALS_KEPT) break;
+      kept.delete(oldest);
+    }
+    this.refusals.set(chatKey, kept);
+  }
+
+  /** The reason the machine refused the prompt `cmdSeq` before its send answered, taken (undefined: not refused). */
+  takeRefusal(chatKey: string, cmdSeq: number): string | undefined {
+    const kept = this.refusals.get(chatKey);
+    const reason = kept?.get(cmdSeq);
+    if (reason !== undefined) kept?.delete(cmdSeq);
+    return reason;
   }
 
   /** Whether `prompt` still waits in the chat's queue. */
@@ -214,5 +244,6 @@ export class ChatRegistry {
     this.readOnly.delete(chatKey);
     this.readOnlyKnown.delete(chatKey);
     this.queuedPrompts.delete(chatKey);
+    this.refusals.delete(chatKey);
   }
 }

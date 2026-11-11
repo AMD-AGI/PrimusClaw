@@ -25,8 +25,11 @@ export class RemoteTurnState {
 
   constructor(
     private readonly errors: PublicErrors,
-    /** Claw's number of the prompt this turn answers: the connector's refusal of it ends the turn (no `turn_end` follows one). */
-    private readonly cmdSeq?: number,
+    /**
+     * Claw's number of the prompt this turn answers, read at each event (a queued message's reader may start before its send has
+     * answered): the connector's refusal of it ends the turn (no `turn_end` follows one).
+     */
+    private readonly seqOf: () => number | undefined = () => undefined,
   ) {}
 
   feed(event: SseEvent): RemoteStep {
@@ -50,12 +53,14 @@ export class RemoteTurnState {
 
   /** A turn end that names another prompt than this turn's. */
   private othersEnd(step: RemoteStep): boolean {
-    return step.finished && this.cmdSeq !== undefined && step.endsSeq !== null && step.endsSeq !== this.cmdSeq;
+    const mine = this.seqOf();
+    return step.finished && mine !== undefined && step.endsSeq !== null && step.endsSeq !== mine;
   }
 
   /** The connector refused the prompt this turn answers. */
   private refusedOwn(step: RemoteStep): boolean {
-    return step.rejected?.type === "prompt" && this.cmdSeq !== undefined && step.rejected.cmdSeq === this.cmdSeq;
+    const mine = this.seqOf();
+    return step.rejected?.type === "prompt" && mine !== undefined && step.rejected.cmdSeq === mine;
   }
 
   private end(stopReason: string, note: string | null): void {

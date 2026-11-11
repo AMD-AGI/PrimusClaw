@@ -267,8 +267,8 @@ export class RemoteWorld {
     await this.idle();
   }
 
-  /** One message from the user, without waiting for the turn it starts. */
-  async send(typed: string, user = USER_A, quotes: readonly string[] = []): Promise<void> {
+  /** One message from the user, without waiting for the turn it starts (`messageId`: the channel's id, to deliver one again). */
+  async send(typed: string, user = USER_A, quotes: readonly string[] = [], messageId?: string): Promise<void> {
     const to = this.conversationOf(user);
     const key = own(KEY_OF, user.id) ?? "";
     const sender = user;
@@ -292,7 +292,7 @@ export class RemoteWorld {
       return;
     }
     const message = {
-      id: this.id("act"),
+      id: messageId ?? this.id("act"),
       text,
       quotes: quotes.map((messageId) => ({ messageId })),
     } as unknown as InboundMessage;
