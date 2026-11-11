@@ -12,7 +12,8 @@
  *   hand-off can then post the message twice.
  * - A delete is never handed to the queue (the relay has no delete): one Teams does not take throws DeleteUnsupportedError.
  *
- * Secrets and bodies are never logged: one line per send with the operation, status and latency.
+ * Secrets and bodies are never logged: one line per send with the operation, status and latency, and the target
+ * conversation's id and the activity's kind (`outboundLogFields`).
  */
 import { pyStr, silentLogger, type Clock, type Logger } from "@primusclaw/personal-agent";
 import { plainDecorations } from "../activity/decorations.js";
@@ -29,6 +30,7 @@ import {
   type TeamsEnvelope,
 } from "../outbound/outbox.js";
 import { DeadlineError, TokenError, UnaddressableError, UndeliverableError } from "./errors.js";
+import { outboundLogFields } from "../outbound/log-fields.js";
 import { DEFAULT_CONNECTOR_HOSTS, type ServiceUrlPolicy } from "./hosts.js";
 import { Lanes } from "./lanes.js";
 import { DEFAULT_LIMITS, type ConnectorLimits } from "./limits.js";
@@ -60,6 +62,9 @@ interface Described {
   readonly operation: string;
   readonly kind: string;
   readonly key: string;
+  /** For the log: the target conversation's id ("-" when there is none) and the activity's kind ("card", "message", ...). */
+  readonly conversation: string;
+  readonly content: string;
 }
 
 function describe(envelope: JsonObject): Described {
@@ -70,6 +75,7 @@ function describe(envelope: JsonObject): Described {
     operation: pyStr(envelope["operation"]) || "send",
     kind: pyStr(activity["type"]) || "message",
     key: pyStr(conversation["id"]),
+    ...outboundLogFields(envelope),
   };
 }
 
@@ -142,6 +148,8 @@ export class ConnectorOutbox implements DirectOutbox {
       attempts: answer.attempts,
       tookMs: this.clock.monotonicMs() - started,
       activityId: answer.id ?? "-",
+      conversation: described.conversation,
+      content: described.content,
     });
     return { activityId: answer.id };
   }
@@ -151,11 +159,13 @@ export class ConnectorOutbox implements DirectOutbox {
     described: Described,
     options: PublishOptions,
   ): Promise<Delivered | undefined> {
-    const { operation, kind, key } = described;
+    const { operation, kind, key, conversation, content } = described;
     this.logger.info("direct send skipped: the conversation stays on the queue", {
       operation,
       kind,
       leftMs: this.queuedFor(key),
+      conversation,
+      content,
     });
     if (operation === "delete") {
       // the queue cannot delete, and a delete must not restart the window
@@ -185,6 +195,8 @@ export class ConnectorOutbox implements DirectOutbox {
           operation: described.operation,
           kind: described.kind,
           reason: (error as Error).message,
+          conversation: described.conversation,
+          content: described.content,
         });
         current = plain;
         return await this.deliver(current, false, options.signal);
@@ -210,13 +222,15 @@ export class ConnectorOutbox implements DirectOutbox {
     options: PublishOptions,
   ): Promise<Delivered | undefined> {
     if (!(error instanceof UndeliverableError || error instanceof UnaddressableError)) throw error;
-    const { operation, kind, key } = described;
+    const { operation, kind, key, conversation, content } = described;
     const fields = {
       operation,
       kind,
       reason: error.message,
       attempts: error instanceof UndeliverableError ? error.attempts : 0,
       tookMs: this.clock.monotonicMs() - started,
+      conversation,
+      content,
     };
     if (operation === "delete") {
       // the relay Function has no delete: never handed to the queue
@@ -283,7 +297,8 @@ export class ConnectorOutbox implements DirectOutbox {
    * StreamRefusedError when Teams did not take it, or when the conversation is on the queue just now.
    */
   async publishStream(envelope: TeamsEnvelope, options: PublishOptions = {}): Promise<Delivered> {
-    const { kind, key } = describe(envelope);
+    const described = describe(envelope);
+    const { kind, key } = described;
     const { signal } = options;
     const started = this.clock.monotonicMs();
     const answer = await this.lanes.hold(
@@ -296,7 +311,7 @@ export class ConnectorOutbox implements DirectOutbox {
           return await this.once(request, this.limits.requestTimeoutMs, 1, "send", signal);
         } catch (error) {
           throwIfAborted(signal); // (dropped: the caller's reason, not a refusal)
-          throw this.streamRefused(error, kind, started);
+          throw this.streamRefused(error, described, started);
         }
       },
       signal,
@@ -306,18 +321,21 @@ export class ConnectorOutbox implements DirectOutbox {
       status: answer.status,
       tookMs: this.clock.monotonicMs() - started,
       activityId: answer.id ?? "-",
+      conversation: described.conversation,
+      content: described.content,
     });
     return { activityId: answer.id };
   }
 
-  private streamRefused(error: unknown, kind: string, started: number): unknown {
+  private streamRefused(error: unknown, described: Described, started: number): unknown {
     const tookMs = this.clock.monotonicMs() - started;
+    const { kind, conversation, content } = described;
     if (error instanceof UndeliverableError) {
-      this.logger.warn("direct stream refused", { kind, reason: error.message, tookMs });
+      this.logger.warn("direct stream refused", { kind, reason: error.message, tookMs, conversation, content });
       return new StreamRefusedError(error.message, error.status, error.code);
     }
     if (error instanceof DeadlineError || error instanceof UnaddressableError) {
-      this.logger.warn("direct stream not sent", { kind, reason: error.name, tookMs });
+      this.logger.warn("direct stream not sent", { kind, reason: error.name, tookMs, conversation, content });
       return new StreamRefusedError(error.name);
     }
     return error;
