@@ -41,6 +41,11 @@ A minor release: it adds behaviour (#713, #720, #725). No plugin port (core's `s
   the person stopped says it stopped (#724).
 - `@primusclaw/personal-agent`: asked in a group to introduce itself, the agent also names what a 1:1 chat with it
   adds (connecting your own machine, memory, research, the board, reminders) (#726).
+- `@primusclaw/personal-agent-runtime`, `@primusclaw/personal-agent-teams`: `/whoami` names the account of a person whose
+  chats run on an exchanged identity token: a person's own key (`ak-...`) is still asked of the platform's `/users/self`,
+  any other credential of Claw's `GET /v1/me` (#730).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a feedback report from a 1:1 chat with the assistant
+  on shows the assistant session's turns, the ones the person saw, instead of the plain chat session's (#731).
 
 ### Docs
 
