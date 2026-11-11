@@ -130,14 +130,18 @@ only a deployment's own plugins read), and
 [`personal-agent/docs/configuration.md`](personal-agent/docs/configuration.md)
 describes each one. Keep the filled-in file outside any repository.
 
-From the published image (runs as uid 65534; the state volume must be writable
-by it):
+From the image published with release 0.1.1 (it runs as uid 65534; the state
+volume must be writable by it):
 
 ```bash
 docker run --env-file /path/outside/the/repo/worker.env \
   -v personal-agent-data:/data \
   docker.io/primussafe/personal-agent-teams:0.1.1
 ```
+
+To build the same image from a checkout instead, run
+`docker build -f personal-agent/Dockerfile -t personal-agent-teams .` from the
+repository root and run `personal-agent-teams` the same way.
 
 From npm (Node 26):
 
