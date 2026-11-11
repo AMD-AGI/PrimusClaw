@@ -425,7 +425,9 @@ and is returned by every plugin read. An invalid declaration is
 A string rule is a small JSON Schema subset: `type` (`"string"`), `enum`
 (1-256 strings), `pattern` (an ECMAScript regular expression, at most 512
 characters; anchor it with `^...$`), `maxLength` (1-4096, default 4096) and
-`description`. Unknown keys are refused.
+`description`. Unknown keys are refused. All pattern tests of one launch share a
+50 ms budget and run interruptibly, so a pattern that backtracks badly cannot
+stall the API: a value whose test does not finish in time is refused.
 
 ### Launching with `overrides`
 

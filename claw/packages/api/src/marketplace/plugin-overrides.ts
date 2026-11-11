@@ -23,6 +23,7 @@
  * This module is pure (no database, no I/O) so the write path (db.ts) and every
  * launch path read the same rules.
  */
+import { createContext, runInContext } from "node:vm";
 import { BadRequestError } from "../shared/errors.js";
 
 /** The surfaces a plugin is launched from. */
@@ -69,6 +70,14 @@ export const OVERRIDE_LIMITS = {
   maxArgs: 64,
   defaultMaxArgs: 16,
   maxDescriptionLength: 1000,
+  /**
+   * Wall-clock budget for every `pattern` test of one launch, together. A
+   * pattern is the author's and a value the caller's, and a backtracking
+   * pattern (`^(a+)+$`) can take seconds on a short value: the tests run in a
+   * VM context whose timeout interrupts them, so the most a launch can hold the
+   * event loop for is this, and a value whose test did not finish is refused.
+   */
+  patternBudgetMs: 50,
 } as const;
 
 /** The variable names an app manifest accepts; the manifest validator has the last word on reserved names. */
@@ -200,7 +209,46 @@ export function storedOverridable(v: unknown): OverridableDeclaration {
   return overridableDeclarationProblems(v).length === 0 ? (v as OverridableDeclaration) : {};
 }
 
-function checkStringValue(value: unknown, rule: StringRule, at: string, out: OverrideProblem[]): string | undefined {
+/** A pattern test deferred until every value is known, so one budget covers them all. */
+interface PatternJob {
+  at: string;
+  pattern: string;
+  value: string;
+}
+
+let patternContext: ReturnType<typeof createContext> | undefined;
+
+/**
+ * Which of `jobs` match, as one interruptible run; `null` when the run did not
+ * finish within `budgetMs` (or failed), which the caller treats as no match.
+ */
+export function runPatternJobs(jobs: Array<{ pattern: string; value: string }>, budgetMs: number = OVERRIDE_LIMITS.patternBudgetMs): boolean[] | null {
+  if (jobs.length === 0) return [];
+  patternContext ??= createContext(Object.create(null));
+  // Only a string crosses into the context, and only a string comes back.
+  patternContext.__jobs = JSON.stringify(jobs.map((j) => [j.pattern, j.value]));
+  try {
+    const out = runInContext(
+      "JSON.stringify(JSON.parse(__jobs).map(([p, v]) => new RegExp(p, 'u').test(v)))",
+      patternContext,
+      { timeout: budgetMs, displayErrors: false },
+    );
+    const parsed = JSON.parse(String(out)) as unknown;
+    return Array.isArray(parsed) && parsed.length === jobs.length ? parsed.map((x) => x === true) : null;
+  } catch {
+    return null;
+  } finally {
+    patternContext.__jobs = undefined;
+  }
+}
+
+function checkStringValue(
+  value: unknown,
+  rule: StringRule,
+  at: string,
+  out: OverrideProblem[],
+  patterns: PatternJob[],
+): string | undefined {
   if (typeof value !== "string" || value === "") {
     out.push({ field: at, reason: "must be a non-empty string" });
     return undefined;
@@ -214,10 +262,8 @@ function checkStringValue(value: unknown, rule: StringRule, at: string, out: Ove
     out.push({ field: at, reason: "is not one of the values the plugin allows" });
     return undefined;
   }
-  if (rule.pattern && !new RegExp(rule.pattern, "u").test(value)) {
-    out.push({ field: at, reason: "does not match the pattern the plugin declares" });
-    return undefined;
-  }
+  // Tested later, with every other pattern of this launch, under one budget.
+  if (rule.pattern) patterns.push({ at, pattern: rule.pattern, value });
   return value;
 }
 
@@ -255,6 +301,7 @@ export function checkOverrides(
   if (!isPlainObject(requested)) return { ok: false, problems: [{ field: "overrides", reason: "must be an object" }] };
   const decl = storedOverridable(plugin.overridable);
   const out: OverrideProblem[] = [];
+  const patterns: PatternJob[] = [];
   const values: OverrideValues = {};
   for (const key of Object.keys(requested)) {
     const at = `overrides.${key}`;
@@ -274,7 +321,7 @@ export function checkOverrides(
     const value = requested[key];
     if (k === "image") {
       const allowed = [...pluginImageRepos(plugin.images), ...(decl.image!.enum ?? [])];
-      const v = checkStringValue(value, { maxLength: OVERRIDE_LIMITS.maxValueLength }, at, out);
+      const v = checkStringValue(value, { maxLength: OVERRIDE_LIMITS.maxValueLength }, at, out, patterns);
       if (v !== undefined) {
         if (allowed.includes(v)) values.image = v;
         else out.push({ field: at, reason: "is not one of the plugin's images" });
@@ -284,7 +331,7 @@ export function checkOverrides(
         out.push({ field: at, reason: "the plugin names no env variable that carries the model of an app run" });
         continue;
       }
-      const v = checkStringValue(value, decl.model!, at, out);
+      const v = checkStringValue(value, decl.model!, at, out, patterns);
       if (v !== undefined) values.model = v;
     } else if (k === "args") {
       const rule = decl.args!;
@@ -295,7 +342,7 @@ export function checkOverrides(
       }
       const args: string[] = [];
       value.forEach((a, i) => {
-        const v = checkStringValue(a, rule.items ?? {}, `${at}[${i}]`, out);
+        const v = checkStringValue(a, rule.items ?? {}, `${at}[${i}]`, out, patterns);
         if (v !== undefined) args.push(v);
       });
       if (args.length === value.length) values.args = args;
@@ -311,12 +358,17 @@ export function checkOverrides(
           out.push({ field: `${at}.${name}`, reason: "the plugin does not declare this variable overridable" });
           continue;
         }
-        const s = checkStringValue(v, rule, `${at}.${name}`, out);
+        const s = checkStringValue(v, rule, `${at}.${name}`, out, patterns);
         if (s !== undefined) env[name] = s;
       }
       values.env = env;
     }
   }
+  const matched = runPatternJobs(patterns);
+  patterns.forEach((j, i) => {
+    if (matched === null) out.push({ field: j.at, reason: "could not be checked against the plugin's pattern in time" });
+    else if (!matched[i]) out.push({ field: j.at, reason: "does not match the pattern the plugin declares" });
+  });
   if (out.length > 0) return { ok: false, problems: out };
   return { ok: true, values };
 }

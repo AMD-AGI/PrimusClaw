@@ -21,6 +21,7 @@
  *   V3 each key's value is held to its rule (enum, pattern, maxLength, images)
  *   V4 a key that does not apply to the surface is refused, not ignored
  *   V5 the app manifest gets env, model env names, args and image; the original is untouched
+ *   V6 a backtracking pattern cannot hold the event loop: its test is cut off and the value refused
  *   W1 plugin writes: an invalid declaration is 400 and stores nothing; a valid one round-trips and a new version keeps it
  *   A1 an app run with overrides stores the effective manifest and an audit record
  *   A2 an app run's undeclared or reserved override is 400 and writes nothing
@@ -39,6 +40,7 @@ import {
   normalizeOverridable,
   overridableDeclarationProblems,
   overrideKeys,
+  runPatternJobs,
 } from "../src/marketplace/plugin-overrides.js";
 import { BadRequestError } from "../src/shared/errors.js";
 import { postgresSkipReason } from "./support/pg-cluster.js";
@@ -182,6 +184,24 @@ test("the app manifest gets the overrides; the plugin's own is untouched", () =>
   assert.deepEqual(validateAppManifest(out), []);
   assert.equal(applyAppOverrides(MANIFEST, {}, DECL), MANIFEST);
   assert.deepEqual(overrideKeys({ model: "m", env: { A: "1" } }), ["model", "env.A"]);
+});
+
+// V6
+test("a backtracking pattern is cut off, and its value refused", () => {
+  const evil = { ...PLUGIN, overridable: { env: { X: { pattern: "^(a+)+$" }, Y: { pattern: "^ok$" } } } };
+  const value = `${"a".repeat(40)}!`;
+  const t0 = performance.now();
+  const out = checkOverrides({ env: { X: value, Y: "ok" } }, evil, "app");
+  const ms = performance.now() - t0;
+  assert.equal(out.ok, false);
+  assert.match(JSON.stringify(out), /could not be checked against the plugin's pattern in time/);
+  assert.ok(ms < 2000, `the check returned after ${ms.toFixed(0)}ms`);
+  // The same pattern on a value it settles quickly is an ordinary answer.
+  assert.equal(checkOverrides({ env: { X: "aaaa", Y: "ok" } }, evil, "app").ok, true);
+  assert.equal(checkOverrides({ env: { X: "aaab", Y: "ok" } }, evil, "app").ok, false);
+  assert.deepEqual(runPatternJobs([{ pattern: "^a$", value: "a" }, { pattern: "^a$", value: "b" }]), [true, false]);
+  assert.deepEqual(runPatternJobs([]), []);
+  assert.equal(runPatternJobs([{ pattern: "^(a+)+$", value }], 20), null);
 });
 
 const skip = postgresSkipReason();
