@@ -69,6 +69,7 @@ export type RouterStore = Pick<
   | "idempotency"
   | "assistantMessages"
   | "notifySubs"
+  | "reviewDelegation"
   | "now"
 >;
 

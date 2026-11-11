@@ -50,6 +50,7 @@ export const COMMAND_CARDS = entries(
         confirmUrl: "https://claw.example.com/sign-in/confirm?c=xyz",
         lead: "",
         notice: AI_NOTICE.en,
+        lang: "en",
       }),
   ],
   [

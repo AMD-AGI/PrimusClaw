@@ -125,8 +125,9 @@ export function proactiveParts(
 
 /**
  * The card that confirms a person's identity after an assistant message refused for want of it (`needs_identity`), in their own
- * chat, once per turn (an event claim per person and turn, so a later say of the same turn, the same event delivered again, or
- * two says of one turn delivered at once, send none).
+ * chat: at most once per person in 24 hours and none once they confirmed (`Credentials.identityAfterRefusal`), and never twice
+ * for one turn (an event claim per person and turn, so a later say of the same turn, the same event delivered again, or two
+ * says of one turn delivered at once, send none).
  */
 function identityAfterRefusal(
   base: Pick<AssemblyBase, "store" | "logger">,

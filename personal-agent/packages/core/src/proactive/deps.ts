@@ -96,8 +96,9 @@ export interface ProactiveDeps {
   readonly requestScope?: RequestScope;
   /**
    * After an assistant message whose turn was refused for want of a confirmed identity (`needs_identity`), in the person's own
-   * chat: the card that confirms it (`Credentials.identityAfterRefusal`), once per turn (`turn`: the message the turn answers,
-   * else the say's own id; a later say of the same turn replaces the first and carries the field too). Default: none.
+   * chat: the card that confirms it (`Credentials.identityAfterRefusal`: at most once per person in 24 hours, none once they
+   * confirmed), and never twice for one turn (`turn`: the message the turn answers, else the say's own id; a later say of the
+   * same turn replaces the first and carries the field too). Default: none.
    */
   readonly identityAfterRefusal?: (userId: string, conversation: Conversation, turn: string) => Promise<void>;
 }

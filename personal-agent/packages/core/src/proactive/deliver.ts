@@ -24,7 +24,7 @@ import { clientLocaleOf, noRequestScope } from "../ports/request-scope.js";
 import { pyRstrip, pyStrip } from "../text/py-text.js";
 import { replyParts } from "../turn/answer-parts.js";
 import type { ProactiveDeps } from "./deps.js";
-import { EXPIRES_KEY, REMOTE_SAID, finishedAt, type AnsweredInChat } from "./events.js";
+import { EXPIRES_KEY, REMOTE_SAID, finishedAt, turnAckOf, type AnsweredInChat } from "./events.js";
 import { remoteAskExpiry, zoneOf } from "./quiet.js";
 import { noteCard } from "../remote/views.js";
 import { parseOptions } from "../remote/options.js";
@@ -83,7 +83,13 @@ function str(value: unknown): string {
  */
 const NEEDS_YOU = "work_item.needs_you";
 
+/** How many turns this process remembers that a say of theirs was delivered for (`Deliveries.answered`). */
+export const ANSWERED_TURNS_MAX = 512;
+
 export class Deliveries {
+  /** Turns a say of which (other than Claw's "on it" line) this process began to deliver, newest last. */
+  private readonly answered = new Set<string>();
+
   constructor(
     private readonly deps: ProactiveDeps,
     private readonly answeredInChat: (event: JsonObject, now: number) => AnsweredInChat,
@@ -193,8 +199,41 @@ export class Deliveries {
     return sent;
   }
 
+  /**
+   * Claw's "on it" line for a turn that has already begun to answer: a say of the turn was delivered (or is being), or the
+   * receipt under the person's message is showing the reply's words. The line came late (it was decided before the answer,
+   * or the two crossed on the way here): it is dropped, never put in the receipt's place, where it would replace the words of
+   * a reply that is being written or close it as if it were the answer (2026-11-11 0.3.0 acceptance: a refusal streamed into
+   * the receipt, the line closed it as "收到，我看一下。", and the refusal came as a message of its own).
+   */
+  private lateTurnAck(conversation: Conversation, event: JsonObject): boolean {
+    const turn = turnAckOf(event);
+    if (!turn) {
+      const own = event["turn_message_id"];
+      if (event["type"] === "assistant.say" && typeof own === "string" && own) this.noteAnswered(own);
+      return false;
+    }
+    if (this.answered.has(turn)) return true;
+    const receipt = this.deps.receipts.openOf(conversation.ref.id);
+    return receipt !== undefined && receipt.answeredBy(turn) && receipt.answering;
+  }
+
+  private noteAnswered(turn: string): void {
+    this.answered.delete(turn);
+    this.answered.add(turn);
+    while (this.answered.size > ANSWERED_TURNS_MAX) {
+      const oldest = this.answered.values().next();
+      if (oldest.done === true) break;
+      this.answered.delete(oldest.value);
+    }
+  }
+
   /** What the assistant said (or a work item that needs the person and was not said). */
   private async sendSaidWords(userId: string, conversation: Conversation, event: JsonObject): Promise<boolean> {
+    if (this.lateTurnAck(conversation, event)) {
+      this.deps.logger.info('the turn\'s "on it" line came after the turn began to answer; dropped');
+      return false;
+    }
     const card = await this.remoteCard(userId, conversation, event);
     if (card !== undefined) return card;
     let words = workEventText(parseWorkItem(event["item"]) ?? null, event["text"]);

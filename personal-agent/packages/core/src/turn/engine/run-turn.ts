@@ -221,20 +221,17 @@ class TurnRun {
     });
     // (recorded as soon as the answer is in the chat: Claw's run.completed of this run is already on its way, and waits for it)
     this.tell(ok && state.answer ? "delivered" : "failed", state.messageId);
-    await this.extras(state, sessionId, ok, stopped, thumbs);
+    // A turn the person stopped went as they asked: no Report a problem card under it, unless its end says it failed (a stop
+    // Claw did not confirm, on a turn that failed: `endingParts` adds the error line then).
+    const wentWrong = stopped ? !ok && !confirmed : !ok || (this.controls.toolDenied?.() ?? false);
+    await this.extras(state, sessionId, wentWrong, thumbs);
   }
 
-  private async extras(
-    state: TurnState,
-    sessionId: string,
-    ok: boolean,
-    stopped: boolean,
-    thumbs: boolean,
-  ): Promise<void> {
+  private async extras(state: TurnState, sessionId: string, wentWrong: boolean, thumbs: boolean): Promise<void> {
     const { ctx } = this;
     if (state.deliveries.length) await offerDeliveries(ctx, sessionId, state.deliveries); // whatever the end, a file is the user's
     if (thumbs && ctx.request.ownThumbs) await offerThumbs(ctx);
-    if (!ok || stopped || (this.controls.toolDenied?.() ?? false)) await offerReport(ctx);
+    if (wentWrong) await offerReport(ctx);
     // detached: the turn is over for the chat, whatever the sandbox takes to answer
     if (thumbs && ctx.request.showChanges) detach(() => offerChanges(ctx, sessionId));
   }

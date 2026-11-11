@@ -55,23 +55,40 @@ export function linkCard(model: LinkCardView): CardMessage {
   );
 }
 
+/** The binding card's own words (its lead and notice come with the model). */
+const BINDING_WORDS = {
+  en: {
+    title: (bot: string) => `Connect ${bot}`,
+    body:
+      "Open the link, sign in to your Primus account and confirm once. After that I work as you on " +
+      "the Primus platform, with your own permissions.",
+    note:
+      "The link works once and runs out in 10 minutes. I use a token that lasts 5 minutes, never your " +
+      "password. You can remove the connection in SaFE under identity bindings.",
+    open: "Open link",
+    confirmed: "I confirmed",
+  },
+  zh: {
+    title: (bot: string) => `连接 ${bot}`,
+    body: "打开链接，登录你的 Primus 账号并确认一次。之后我在 Primus 平台上以你的身份、用你自己的权限做事。",
+    note: "链接只能用一次，10 分钟后失效。我用的是 5 分钟有效的令牌，从不用你的密码。你可以在 SaFE 的身份绑定里删除这个连接。",
+    open: "打开链接",
+    confirmed: "我已确认",
+  },
+} as const;
+
 export function bindingCard(model: BindingCardView): CardMessage {
+  const words = BINDING_WORDS[model.lang === "zh" ? "zh" : "en"];
   return message(
     [
-      header(`Connect ${model.bot}`, { tone: "accent", subtitle: model.lead.trim(), emoji: "connect" }),
-      text(
-        "Open the link, sign in to your Primus account and confirm once. After that I work as you on " +
-          "the Primus platform, with your own permissions.",
-      ),
-      note(
-        "The link works once and runs out in 10 minutes. I use a token that lasts 5 minutes, never your " +
-          "password. You can remove the connection in SaFE under identity bindings.",
-      ),
+      header(words.title(model.bot), { tone: "accent", subtitle: model.lead.trim(), emoji: "connect" }),
+      text(words.body),
+      note(words.note),
       note(model.notice),
     ],
     buttons([
-      openUrl("Open link", model.confirmUrl),
-      execute("I confirmed", "primusclaw.bind", { primusclaw: "bind", action: "confirm" }),
+      openUrl(words.open, model.confirmUrl),
+      execute(words.confirmed, "primusclaw.bind", { primusclaw: "bind", action: "confirm" }),
     ]),
   );
 }

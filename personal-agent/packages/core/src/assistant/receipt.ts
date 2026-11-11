@@ -87,6 +87,8 @@ export class Receipt {
   behind: string | undefined;
   unsent = false;
   private want: Wanted | undefined;
+  /** Words of the reply were given to be shown (they may still be on their way to the channel). */
+  private wordsShown = false;
   private sender: Promise<void> | undefined;
   private readonly closedWaiters: (() => void)[] = [];
   private readonly closer = new AbortController();
@@ -130,6 +132,11 @@ export class Receipt {
     return turn !== this.behind;
   }
 
+  /** Words of the reply are shown in it, or on their way to it: its turn has begun to answer. */
+  get answering(): boolean {
+    return this.stream.streamed !== "" || this.wordsShown;
+  }
+
   /** Resolves when the receipt is closed (or being closed): what follows the turn stops then. */
   closed(): Promise<void> {
     return this.done ? Promise.resolve() : new Promise((resolve) => this.closedWaiters.push(resolve));
@@ -146,6 +153,7 @@ export class Receipt {
     const text = this.head && pyStrip(words) ? `${this.head}\n\n${words}` : words;
     const shown = this.stream.streamed;
     if (pyStrip(text) && text.startsWith(shown) && text !== shown && cpLength(text) <= STREAM_SAY_MAX) {
+      this.wordsShown = true;
       this.show({ kind: "streaming", text });
     }
   }

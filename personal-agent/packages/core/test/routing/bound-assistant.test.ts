@@ -259,3 +259,64 @@ test("a new token whose owner cannot be read: the earlier account's id and subsc
     "reached again once the owner is read",
   );
 });
+
+test("/whoami for a person bound with no link names the binding and what removes it, not /unlink", async () => {
+  const { w } = boundWorld();
+  await w.router.handle(message("/whoami", { locale: "zh-CN" }));
+  const zh = said(w).at(-1) ?? "";
+  assert.ok(
+    zh.startsWith(
+      "这个聊天通过 SaFE 身份绑定连接到 SaFE 用户 Liu, Alice（alice@example.com）。" +
+        "如果不是你，请让这个账号的主人在 SaFE 的身份绑定里删除这个绑定；发 /unlink 删不掉它。\n\n",
+    ),
+    zh,
+  );
+  assert.ok(!zh.includes("现在发 /unlink"), zh);
+  await w.router.handle(message("/whoami", { locale: "en-US" }));
+  const en = said(w).at(-1) ?? "";
+  assert.ok(
+    en.startsWith(
+      "This chat is connected to SaFE user Liu, Alice (alice@example.com) through a SaFE identity binding. " +
+        "If this is not you, ask that account's owner to delete the binding in SaFE under identity bindings; " +
+        "/unlink cannot remove it.\n\n",
+    ),
+    en,
+  );
+  // What it says is what works: /unlink does not remove the binding (only its owner can, in SaFE), and says so.
+  await w.router.handle(message("/unlink", { locale: "zh-CN" }));
+  assert.equal(
+    said(w).at(-1),
+    "这个聊天通过 SaFE 身份绑定以你的身份工作，只有你能删除这个绑定：在 SaFE 的身份绑定里删除。删除之前我会继续为你工作。",
+  );
+  await w.router.handle(message("/whoami", { locale: "zh-CN" }));
+  assert.ok(
+    said(w).at(-1)?.startsWith("这个聊天通过 SaFE 身份绑定连接到 SaFE 用户 Liu, Alice"),
+    "still bound after /unlink",
+  );
+});
+
+test("/whoami for a person bound with no link whose account SaFE does not name: the binding, and the administrator", async () => {
+  const { w } = boundWorld();
+  w.owners.delete(TOKEN);
+  await w.router.handle(message("/whoami", { locale: "zh-CN" }));
+  assert.ok(
+    said(w)
+      .at(-1)
+      ?.startsWith(
+        "这个聊天通过 SaFE 身份绑定连接，但 SaFE 没告诉我是谁的账号。如果你不认识它，请找 SaFE 管理员删除这个绑定；发 /unlink 删不掉它。",
+      ),
+    said(w).at(-1) ?? "",
+  );
+});
+
+test("/whoami for a person with a linked key still offers /unlink, which removes that key", async () => {
+  const { w } = boundWorld({ bound: false, linkedKey: "ak-alice" });
+  w.owners.set("ak-alice", { id: "u-alice", name: "Liu, Alice", email: "alice@example.com", accountType: "" });
+  await w.router.handle(message("/whoami", { locale: "zh-CN" }));
+  assert.ok(
+    said(w)
+      .at(-1)
+      ?.startsWith("这个聊天已连接到 SaFE 用户 Liu, Alice（alice@example.com）。如果不是你，现在发 /unlink。"),
+    said(w).at(-1) ?? "",
+  );
+});

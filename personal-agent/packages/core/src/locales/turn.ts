@@ -25,6 +25,8 @@ export const turnText = defineCatalog({
     /** A turn still running when its stream has to close: the answer follows as a message of its own. */
     stillWorking: "Still working on it; the result will follow as a new message.",
     interrupted: "Interrupted.",
+    /** What a turn the person stopped ends with. */
+    stopped: "Stopped.",
     /** The final message of a stream whose turn ended with nothing to say (it is never empty). */
     doneShort: "Done.",
     /** What a failed turn says; the error itself, and its reference, go to the log only. */
@@ -47,6 +49,7 @@ export const turnText = defineCatalog({
     thinking: "思考中…",
     stillWorking: "仍在处理，完成后另发结果。",
     interrupted: "已中断。",
+    stopped: "已停止。",
     doneShort: "完成。",
     taskFailed: "任务出错了，没有完成。可以回复 /feedback 告诉 PrimusClaw 团队。",
     openSession: "打开会话",
@@ -81,7 +84,6 @@ export const turnEnglish = {
   onlyTheAsker: " (only the person who asked can open it)",
   wholeCutNote: "\n\n… (the rest did not fit in three messages)",
   couldNotLoad: (name: string, count: number) => `Could not load ${name}${count > 1 ? ` (x${String(count)})` : ""}`,
-  stopped: "Stopped.",
   lostConnection: "I lost the connection to PrimusClaw before the task finished.",
   openSessionLink: "Open the session",
   keyRejected:

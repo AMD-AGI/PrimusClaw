@@ -76,7 +76,7 @@ export function endingParts(ctx: TurnContext, ending: Ending): string[] {
   const text = turnText.in(langOf(ctx));
   const errorLine = `${text.taskFailed} [${text.openSession}](${link})`;
   if (stopped && !answer) {
-    const stop = shown ? `${shown}\n\n${turnEnglish.stopped}` : turnEnglish.stopped;
+    const stop = shown ? `${shown}\n\n${text.stopped}` : text.stopped;
     return [!ok && !confirmed ? `${stop}\n\n${errorLine}` : stop];
   }
   if (!ok && !answer) return [shown ? `${shown}\n\n${errorLine}` : errorLine];
