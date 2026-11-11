@@ -20,6 +20,7 @@ import pino from "pino";
 import { S3_API_ENDPOINT, S3_PLUGINS_BUCKET } from "../config.js";
 import { MarketplaceDb, type JsonObject } from "../infra/db.js";
 import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
+import { storedOverridable } from "./plugin-overrides.js";
 import {
   AccessDeniedError,
   BadGatewayError,
@@ -322,6 +323,7 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     images: Array.isArray(r.images) ? r.images : [],
     tools,
     resource,
+    overridable: storedOverridable(r.overridable),
     owner_user_id: r.owner_user_id,
     author: r.author,
     is_public: r.is_public ?? true,
@@ -654,14 +656,14 @@ export async function upsertPlugin(
 
 function pluginInplaceUpdates(payload: JsonObject): JsonObject {
   const out: JsonObject = {};
-  for (const k of ["name", "description", "version", "images", "tools", "resource", "owner_user_id", "author", "is_public", "status"]) {
+  for (const k of ["name", "description", "version", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status"]) {
     if (k in payload) out[k] = payload[k];
   }
   return out;
 }
 
 function pluginNewVersionOverrides(payload: JsonObject): JsonObject | null {
-  const keys = ["description", "images", "tools", "resource", "owner_user_id", "author", "is_public", "status"];
+  const keys = ["description", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status"];
   const out: JsonObject = {};
   for (const k of keys) {
     if (k in payload) out[k] = payload[k];
@@ -685,6 +687,7 @@ export async function createPluginNewVersion(
     images: src.images ?? [],
     tools: src.tools ?? [],
     resource: src.resource ?? {},
+    overridable: storedOverridable(src.overridable),
     owner_user_id: src.owner_user_id,
     author: src.author,
     is_public: coalesceIsPublic(src.is_public),
