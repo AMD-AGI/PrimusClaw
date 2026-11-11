@@ -464,6 +464,18 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.equal(decode.includes("atomesh"), false);
 });
 
+test("Infera frontend starts sshd on its own port, runs the server detached and holds the waited pid", () => {
+  for (const pdMode of ["aggregated", "disaggregated"] as const) {
+    const body = buildInferaWorkloadBody({ ...INFERA_COMMON, pdMode }) as Record<string, any>;
+    const frontend = decodeEp(body.entryPoints[0]);
+    const base = inferaSshPortBase(INFERA_COMMON.displayName);
+    assert.ok(frontend.includes(`export MN_SSH_PORT=${base + 20}\n`), frontend);
+    assert.ok(frontend.includes("/usr/sbin/sshd -p \"${MN_SSH_PORT}\""), frontend);
+    assert.match(frontend, /\n\( setsid python3 -m infera\.server .* < \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+    assert.equal(sshPortForPod("frontend", null, base), base + 20);
+  }
+});
+
 test("PD entrypoints run the server detached and hold the waited pid", () => {
   for (const [build, routerCommand] of [
     [buildAtomWorkloadBody, "( setsid atomesh launch"],
@@ -538,10 +550,10 @@ test("PD entrypoints carry no sshd without a key", () => {
   assert.equal(decodeEp(body.entryPoints[1]).includes("sshd"), false);
 });
 
-test("discoverRolePods groups SGLangRouter pods by role name", () => {
+test("discoverRolePods groups SGLangRouter pods by resourceId", () => {
   const workload = {
     pods: [
-      { podId: "claw-1-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running", resourceId: 0 },
+      { podId: "claw-1-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running" },
       { podId: "claw-1-prefill-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
       { podId: "claw-1-decode-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
     ],
@@ -587,15 +599,47 @@ test("sshPortForPod matches the port the idle entryPoint computes in-pod", () =>
   assert.equal(sshPortForPod("worker", null, base), 20032, "unparseable ordinal falls back to the leader");
 });
 
+test("discoverRolePods reads roles from resourceId, an absent one being role 0", () => {
+  // SaFE serialises resourceId with omitempty, so role 0 carries none.
+  const pd = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running" },
+        { podId: "wl-x-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
+        { podId: "wl-y-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
+      ],
+    },
+    "disaggregated",
+    25032,
+  );
+  assert.deepStrictEqual(pd.frontend.map((p) => p.podIp), ["172.16.6.11"]);
+  assert.deepStrictEqual(pd.prefill.map((p) => p.podIp), ["10.235.225.141"]);
+  assert.deepStrictEqual(pd.decode.map((p) => p.podIp), ["10.235.225.70"]);
+
+  const aggregated = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-6d4f8b9c7-x2k9p", podIP: "10.0.0.9", phase: "Running" },
+        { podId: "wl-g-1", podIP: "10.0.0.2", phase: "Running", resourceId: 1 },
+        { podId: "wl-g-0", podIP: "10.0.0.1", phase: "Running", resourceId: 1 },
+      ],
+    },
+    "aggregated",
+    2222,
+  );
+  assert.deepStrictEqual(aggregated.frontend.map((p) => p.podIp), ["10.0.0.9"]);
+  assert.deepStrictEqual(aggregated.worker.map((p) => p.podIp), ["10.0.0.1", "10.0.0.2"]);
+});
+
 test("discoverRolePods maps PD pods by slot index and drops dead ones", () => {
   const workload = {
     pods: [
       { podId: "test-role0-abc", podIP: "192.0.2.1", phase: "Running" },
-      { podId: "test-role1-def", podIP: "192.0.2.2", phase: "Running" },
-      { podId: "test-role2-ghi", podIP: "192.0.2.3", phase: "Running" },
+      { podId: "test-role1-def", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+      { podId: "test-role2-ghi", podIP: "192.0.2.3", phase: "Running", resourceId: 2 },
       // A crashed replica keeps its IP but has no sshd: SSHing to it fails the round.
-      { podId: "test-role2-dead", podIP: "192.0.2.9", phase: "Failed" },
-      { podId: "test-role1-nopod", podIP: "", phase: "Pending" },
+      { podId: "test-role2-dead", podIP: "192.0.2.9", phase: "Failed", resourceId: 2 },
+      { podId: "test-role1-nopod", podIP: "", phase: "Pending", resourceId: 1 },
     ],
   };
   const groups = discoverRolePods(workload, "disaggregated", 2222);
@@ -609,9 +653,9 @@ test("discoverRolePods maps PD pods by slot index and drops dead ones", () => {
 test("discoverRolePods orders an LWS group leader-first", () => {
   const workload = {
     pods: [
-      { podId: "test-role1-lws-2", podIP: "192.0.2.4", phase: "Running" },
-      { podId: "test-role1-lws-0", podIP: "192.0.2.2", phase: "Running" },
-      { podId: "test-role1-lws-1", podIP: "192.0.2.3", phase: "Running" },
+      { podId: "test-role1-lws-2", podIP: "192.0.2.4", phase: "Running", resourceId: 1 },
+      { podId: "test-role1-lws-0", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+      { podId: "test-role1-lws-1", podIP: "192.0.2.3", phase: "Running", resourceId: 1 },
     ],
   };
   const groups = discoverRolePods(workload, "aggregated", 2222);
@@ -621,7 +665,7 @@ test("discoverRolePods orders an LWS group leader-first", () => {
 
 test("gpuPodsReady waits for every role the topology needs", () => {
   const onlyPrefill = discoverRolePods(
-    { pods: [{ podId: "test-role1-a", podIP: "192.0.2.2", phase: "Running" }] },
+    { pods: [{ podId: "test-role1-a", podIP: "192.0.2.2", phase: "Running", resourceId: 1 }] },
     "disaggregated",
     2222,
   );

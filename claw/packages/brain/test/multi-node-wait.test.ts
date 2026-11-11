@@ -54,9 +54,9 @@ function fakeClock() {
 
 /** A live Infera worker pod, the shape discoverRolePods reads.
  *
- *  role1 rather than role0: a colocated topology's positional roles are
+ *  Resource 1 rather than 0: a colocated topology's positional roles are
  *  ["frontend", "worker"], and readiness is the worker's. */
-const workerPod = { podId: "wl-1-role1-abc-0", podIP: "10.0.0.1", phase: "Running" };
+const workerPod = { podId: "wl-1-role1-abc-0", podIP: "10.0.0.1", phase: "Running", resourceId: 1 };
 
 interface WaitCase {
   entries: Entry[];

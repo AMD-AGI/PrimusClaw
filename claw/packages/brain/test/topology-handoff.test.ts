@@ -41,6 +41,7 @@ const INFERA: MultiNodeContext = {
   sshPrivateKey: PEM,
   sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
   sshPortBase: 2222,
+  routerIps: ["10.0.0.1"],
   prefillIps: ["10.0.0.2", "10.0.0.6"],
   decodeIps: ["10.0.0.3"],
   workerIps: ["10.0.0.4"],
@@ -78,6 +79,7 @@ test("infera: every legacy variable equals its handoff field", () => {
   assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, handoff.service_url, "service_url");
   assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, i.ssh_key_file, "infera.ssh_key_file");
   assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, String(i.ssh_port_base), "infera.ssh_port_base");
+  assert.equal(env.HYPERLOOM_MN_EXT_ROUTER_IPS, i.router_ips?.join(","), "infera.router_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, i.prefill_ips.join(","), "infera.prefill_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_DECODE_IPS, i.decode_ips.join(","), "infera.decode_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, i.worker_ips.join(","), "infera.worker_ips");

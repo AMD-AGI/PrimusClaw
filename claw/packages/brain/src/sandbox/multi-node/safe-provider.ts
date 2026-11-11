@@ -828,6 +828,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       sshPrivateKey: keypair?.privateKeyPem,
       sshKeyPath: SANDBOX_SSH_KEY_PATH,
       sshPortBase,
+      routerIps: groups.frontend.map((p) => p.podIp),
       prefillIps: groups.prefill.map((p) => p.podIp),
       decodeIps: groups.decode.map((p) => p.podIp),
       workerIps: groups.worker.map((p) => p.podIp),
