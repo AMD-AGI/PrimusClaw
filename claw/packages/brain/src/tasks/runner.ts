@@ -3490,6 +3490,51 @@ class TaskRunner {
       error_count: result.errorCount,
     });
 
+    // The turn's end, published before the workspace is saved rather than after.
+    //
+    // The answer is final the moment the engine returns, and `exec_complete` is
+    // what hands the session back (`agent_status` idle, the next queued message
+    // dispatched). Saving /workspace below is bounded by nothing but the number of
+    // files in it: a review that cloned a large repository uploaded 79,353 files
+    // in 62 minutes, and for all of that time the session read `running` with the
+    // answer already on screen. Nothing the API does with `exec_complete` reads
+    // what the save writes -- deliveries are stored when `deliver_file` answers,
+    // skill files travel in the event -- and the next run on this workspace still
+    // waits for the save: it takes the same workspace lock, which this run holds
+    // until it has settled below. What still follows the save is the handoff to
+    // Backend (`deliverAgentDone`), so a task whose successors read its files is
+    // not reported done before they are there.
+    //
+    // The run may already have stood down: a lost lease, or the lock's
+    // self-fence, after which another brain may hold this run. A success
+    // published from here would then close the successor's row, so it is not
+    // published -- not first, and not on a retry once the stand-down arrives
+    // mid-publish. The ending is the stand-down's, as if the abort had been seen
+    // before this method was entered.
+    if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
+    await this.onEvent({
+      type: "exec_complete",
+      session_id: this.sessionId,
+      message_id: this.messageId,
+      user_id: this.request.user_id || "default",
+      final_text: result.finalText,
+      token_usage: result.tokenUsage,
+      turns: result.turns,
+      failed: false,
+      error_count: result.errorCount,
+      tool_stats: result.toolStats,
+      elapsed_ms: result.elapsedMs,
+      skills_used: result.skillsUsed,
+      selected_skills: Object.keys(this.request.skills || {}),
+      skills_to_save: result.pendingSkills,
+      skill_file_mutations: result.pendingSkillFileMutations,
+      prompt: this.request.prompt,
+      delivery_count: this.msg.info.deliveryCount,
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
+    }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
+      if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
+      throw err;
+    });
     // Ahead of the upload below, for the runs that reap at all: a process still
     // writing while /workspace is read gets captured half-written, and anything
     // it would have written after the read is lost when it is killed anyway.
@@ -3600,37 +3645,12 @@ class TaskRunner {
       tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
     });
 
-    // The run may have stood down while it was saving its work: a lost lease,
-    // or the lock's self-fence, after which another brain may hold this run.
-    // A success published from here would then close the successor's row, so
-    // it is not published -- not first, and not on a retry once the stand-down
-    // arrives mid-publish. The ending is the stand-down's, as if the abort had
-    // been seen before this method was entered.
+    // The save is the one long stretch of this method, and the run can stand
+    // down during it. The turn's end is already published, and was this run's to
+    // publish; the task is not, once another brain may hold it -- reporting it
+    // done would close that brain's row. The ending from here is the stand-down's.
     if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
-    await this.onEvent({
-      type: "exec_complete",
-      session_id: this.sessionId,
-      message_id: this.messageId,
-      user_id: this.request.user_id || "default",
-      final_text: result.finalText,
-      token_usage: result.tokenUsage,
-      turns: result.turns,
-      failed: false,
-      error_count: result.errorCount,
-      tool_stats: result.toolStats,
-      elapsed_ms: result.elapsedMs,
-      skills_used: result.skillsUsed,
-      selected_skills: Object.keys(this.request.skills || {}),
-      skills_to_save: result.pendingSkills,
-      skill_file_mutations: result.pendingSkillFileMutations,
-      prompt: this.request.prompt,
-      delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
-    }, { stillMine: () => !this.leaseLost }).catch((err: unknown) => {
-      if (err instanceof EmitStoodDownError) throw LEASE_LOST_ABORT_REASON;
-      throw err;
-    });
-    // Persist the user-visible completion event before handing task state to
+    // The user-visible completion event is persisted before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
     // task execution without losing the session's terminal event.
     await deliverAgentDone(

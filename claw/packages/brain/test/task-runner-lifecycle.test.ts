@@ -76,8 +76,7 @@ function fakeKv() {
   return { kv: kv as unknown as KV, store };
 }
 
-function fakeEmitter() {
-  const events: Array<Record<string, unknown>> = [];
+function fakeEmitter(events: Array<Record<string, unknown>> = []) {
   const emitter = {
     async emit(_sessionId: string, evt: Record<string, unknown>) { events.push(evt); },
   };
@@ -104,8 +103,7 @@ function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
  * `makeHandsClient` returns a bare object: the stubbed workspace/S3 helpers
  * never dereference it, so no MCP transport is opened.
  */
-function stubSideEffects(over: Partial<TaskRunnerSideEffects> = {}) {
-  const calls: string[] = [];
+function stubSideEffects(over: Partial<TaskRunnerSideEffects> = {}, calls: string[] = []) {
   const transcripts: Array<Record<string, unknown>> = [];
   const transcriptLogs: Array<Array<Record<string, unknown>>> = [];
   const record = <T>(name: string, value: T) => (...args: unknown[]) => {
@@ -209,6 +207,8 @@ async function runScenario(opts: {
    * this task_id delivered its callback and `ackAndClearCallback` deleted it.
    */
   seedClearedCallback?: boolean;
+  /** Arrays the scenario's events and calls are mirrored into as they happen, for a stub to read mid-run. */
+  observe?: { events: Array<Record<string, unknown>>; calls: string[] };
 }) {
   const sessionId = opts.sessionId ?? SESSION;
   const { msg, verdicts } = fakeMsg(opts.deliveryCount ?? 1);
@@ -252,8 +252,8 @@ async function runScenario(opts: {
       })),
     );
   }
-  const { emitter, events } = fakeEmitter();
-  const { sideEffects, calls, transcripts, transcriptLogs } = stubSideEffects(opts.sideEffects);
+  const { emitter, events } = fakeEmitter(opts.observe?.events);
+  const { sideEffects, calls, transcripts, transcriptLogs } = stubSideEffects(opts.sideEffects, opts.observe?.calls);
 
   // Snapshot of what the session had been told by the time the engine started,
   // for the assertions about what must be announced before any slow work.
@@ -373,6 +373,45 @@ test("a repository left out is reported beside a partial upload, not instead of 
   const statuses = r.events.filter((e) => e.type === "sandboxStatus").map((e) => e.status);
   assert.ok(statuses.includes("workspace_sync_partial"));
   assert.ok(statuses.includes("workspace_git_skipped"));
+});
+
+test("the turn ends on the session before the workspace is saved, and the task is reported done only after", async () => {
+  // Seen on 2026-11-11: a review that cloned a large repository spent 62 minutes
+  // uploading 79,353 files after its answer, and the session read `running` the
+  // whole time because `exec_complete` -- what the API sets the session idle on --
+  // waited for the upload. The turn's end does not depend on the upload; the
+  // Backend handoff and the ack still follow it.
+  let eventsAtSave: string[] = [];
+  let callsAtSave: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const r = await runScenario({
+    taskId: "task-save-after-turn",
+    engineBehavior: withSandbox,
+    sideEffects: {
+      syncWorkspaceToS3: (async () => {
+        eventsAtSave = events.map((e) => String(e.type));
+        callsAtSave = [...calls];
+        return { ...SYNCED, exhausted: true, failedCount: 3, uploaded: 2, totalFiles: 5 };
+      }) as never,
+    },
+    observe: { events, calls },
+  });
+
+  assert.deepEqual(
+    eventsAtSave.slice(-2), ["executionStats", "exec_complete"],
+    `the session had been told the turn ended before the save began: ${eventsAtSave.join(", ")}`,
+  );
+  assert.ok(!callsAtSave.includes("postAgentDone"), "Backend is not told the task is done before its files are saved");
+  const types = r.events.map((e) => (e.type === "sandboxStatus" ? `sandboxStatus:${String(e.status)}` : String(e.type)));
+  assert.equal(types.filter((t) => t === "exec_complete").length, 1, "one completion");
+  assert.ok(
+    types.indexOf("exec_complete") < types.indexOf("sandboxStatus:workspace_sync_partial"),
+    `what the save reports follows the turn's end: ${types.join(", ")}`,
+  );
+  assert.equal(r.completion?.failed, false);
+  assert.ok(r.calls.indexOf("syncWorkspaceToS3") < r.calls.indexOf("postAgentDone"), r.calls.join(", "));
+  assert.deepEqual(r.verdicts, ["ack"]);
 });
 
 // ── fatal ────────────────────────────────────────────────────────────────
