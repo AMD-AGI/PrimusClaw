@@ -73,19 +73,23 @@ export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
     return changed;
   }
 
-  /** Everything the agent has written this turn, as it is shown (under its head, with a signer). */
-  private saidText(): string {
-    const text = this.segments
+  /**
+   * Everything the agent has written this turn, as it is shown (under its head, with a signer). `settled`: only what the rest of the
+   * text can no longer change, for the bubble while the agent still writes (`streamable`).
+   */
+  private saidText(settled = false): string {
+    let text = this.segments
       .map((s) => pyStrip(s))
       .filter(Boolean)
       .join("\n\n");
+    if (settled) text = withoutOpenCode(text);
     // (its links become words; a link still being written changes what was streamed, and the answer then comes whole)
     const shown = pyRstrip(inertAnswer(this.cutError(redactText(text).text)));
     return this.signer !== null && shown ? this.signer.first(shown) : shown;
   }
 
   streamable(streamed: string): string {
-    const text = this.saidText();
+    const text = this.saidText(true);
     if (!text || cpLength(text) > STREAM_TEXT_MAX || !text.startsWith(streamed)) return streamed;
     return text;
   }
@@ -98,7 +102,7 @@ export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
   finishStream(input: StreamFinishInput): StreamFinish | undefined {
     const said = this.saidText();
     if (!input.streamed || !said.startsWith(input.streamed)) return defaultStreamFinish(input);
-    let shown = input.streamable || input.streamed; // (what came after the last update, while it still fits the bubble)
+    let shown = bubbleEnd(said, input);
     const rest = pyStrip(said.slice(shown.length));
     let more = rest ? answerParts(rest) : [];
     if (this.signer !== null && more.length > 0) more = this.signer.later(more, 2);
@@ -118,6 +122,49 @@ export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
     }
     return { final, rest: follow };
   }
+}
+
+/** What the bubble ends with: all the agent wrote while it fits (a code span held back while it was open, too), else what it showed. */
+function bubbleEnd(said: string, input: StreamFinishInput): string {
+  return said && cpLength(said) <= STREAM_TEXT_MAX ? said : input.streamable || input.streamed;
+}
+
+/** A fence line, as the rich text reads one (`links/answer.ts`): its backticks open a code block, not a code span. */
+const FENCE_LINE = /^ {0,3}(?:`{3,}|~{3,})/u;
+
+/**
+ * `text` up to a code span still being written: on its last line (where the agent is still writing; a span never crosses a line), the
+ * first run of backticks that no later run of the same length closes, and what follows it. Streamed, such a backtick is shown as a
+ * look-alike (`inertAnswer`: one the rich text cannot pair), and once the agent closes the span it is a backtick again: the text no
+ * longer begins with what the bubble shows, so the bubble ends on that lone character and the answer follows as a message of its own
+ * (2026-11-11 guide re-check: a reply that began with `` `hook.txt` `` ended its bubble on "ˋ"). Escaped backticks open nothing.
+ */
+export function withoutOpenCode(text: string): string {
+  const start = text.lastIndexOf("\n") + 1;
+  const line = text.slice(start);
+  if (FENCE_LINE.test(line)) return text;
+  const runs: [number, number][] = [];
+  for (let i = 0; i < line.length;) {
+    if (line.charAt(i) === "\\") {
+      i += 2;
+      continue;
+    }
+    if (line.charAt(i) !== "`") {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (line.charAt(j) === "`") j += 1;
+    runs.push([i, j - i]);
+    i = j;
+  }
+  for (let n = 0; n < runs.length; n += 1) {
+    const [at, length] = runs[n] ?? [0, 0];
+    const closer = runs.findIndex(([, l], m) => m > n && l === length);
+    if (closer < 0) return text.slice(0, start + at);
+    n = closer;
+  }
+  return text;
 }
 
 /** The turn shown in the chat (a stream, else a progress message), as a `TurnDisplay`. */
