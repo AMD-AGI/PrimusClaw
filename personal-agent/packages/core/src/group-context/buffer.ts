@@ -59,8 +59,16 @@ const HEAD =
   "unless the person asks.";
 const OPEN = "<group_chat_history>";
 const CLOSE = "</group_chat_history>";
-/** The block's own tags and the channel's mention tags, taken out of what a member wrote. */
-const TAGS = /<\/?(?:group_chat_history|at)>/giu;
+/** The channel's mention tags, taken out of what a member wrote. */
+const AT_TAGS = /<\/?at>/giu;
+
+/**
+ * What a member wrote (or is called), as it may stand inside the block: one line, and no angle bracket of its own, so
+ * no spelling of a tag (`</group_chat_history >`, a line break before `>`, ...) can close the block or open another.
+ */
+function inert(text: string): string {
+  return squashSpaces(text).replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
 
 /** One line per message: what it says cannot start a line of its own or close the block. */
 function lineOf(kept: Kept): string {
@@ -84,7 +92,7 @@ export class GroupContext {
     if (!this.enabled || !chatId || this.deps.off.contextOff(chatId)) return;
     const text = this.cleaned(message.text);
     if (!text) return;
-    const name = cpHead(squashSpaces(this.deps.mask(message.sender.name)), NAME_CHARS) || "someone";
+    const name = inert(cpHead(squashSpaces(this.deps.mask(message.sender.name)), NAME_CHARS)) || "someone";
     const kept = this.chats.get(chatId) ?? [];
     this.chats.delete(chatId); // (re-inserted below: the Map's order is the order chats last heard something)
     kept.push({ id: message.id, atMs: this.deps.clock.epochMs(), name, text });
@@ -164,9 +172,9 @@ export class GroupContext {
   }
 
   private cleaned(text: string): string {
-    const one = squashSpaces(pyStrip(this.deps.mask(text).replace(TAGS, "")));
+    const one = squashSpaces(pyStrip(this.deps.mask(text).replace(AT_TAGS, "")));
     const limit = this.deps.settings.messageChars;
-    return cpLength(one) > limit ? `${cpHead(one, limit)}… [cut]` : one;
+    return inert(cpLength(one) > limit ? `${cpHead(one, limit)}… [cut]` : one);
   }
 
   private fresh(kept: readonly Kept[]): Kept[] {
