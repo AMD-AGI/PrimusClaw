@@ -1324,6 +1324,12 @@ record it.
   slash-command lines) are no longer shown as typed in the terminal. A message of several lines, pasted as `[Pasted text #1]`, is
   confirmed instead of ending as `terminal_input_unconfirmed`; a long message whose input-box row ends two columns short of the
   rule is submitted instead of refused; the terminal tests stop their tmux servers (#698).
+- `@primusclaw/connector` 0.1.23: opt-in approval hooks (`claw-connector hooks install --approvals`) put the questions a Claude
+  Code session started in a terminal asks (a command, an edit, leaving plan mode, a multiple-choice question) on the owner's phone
+  as cards while the terminal keeps asking, first answer wins; nothing changes until they are installed (#706). A conversation run
+  by the connector's own adapter is no longer reported as open in a terminal, so its permission card on the phone no longer
+  produces a "waiting for you in a terminal" notice (#714). A message typed into a busy terminal is watched for up to 20 s instead
+  of 3 s, the phone is told after 3 s that it waits, and one never shown is refused as `terminal_input_unseen` (#721).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
