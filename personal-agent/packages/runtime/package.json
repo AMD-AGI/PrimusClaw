@@ -1,6 +1,6 @@
 {
   "name": "@primusclaw/personal-agent-runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Node adapters for the personal agent's ports: clock, randomness, logging (and, as the port lands, storage, Claw, metrics, HTTP).",
   "license": "MIT",
   "repository": {
@@ -29,7 +29,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@primusclaw/personal-agent": "0.1.0",
+    "@primusclaw/personal-agent": "0.1.1",
     "fastify": "^5.12.8",
     "zod": "^4.6.7"
   }
