@@ -464,10 +464,39 @@ test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine r
   assert.equal(decode.includes("atomesh"), false);
 });
 
+test("PD entrypoints run the server detached and hold the waited pid", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "( setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "( setsid python3 -m sglang_router.launch_router"],
+  ] as const) {
+    for (const sshAuthorizedKey of ["", "ssh-ed25519 AAAATEST primus-claw-sess-1"]) {
+      const body = build({
+        ...COMMON,
+        model: "/models/m",
+        framework: "sglang",
+        kvTransferBackend: "mooncake",
+        pdMode: "disaggregated",
+        sshAuthorizedKey,
+        sshPortBase: 25032,
+      }) as Record<string, any>;
+      const [router, prefill, decode] = body.entryPoints.map(decodeEp);
+      assert.ok(router.includes(routerCommand), router);
+      assert.match(router, /< \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+      for (const ep of [prefill, decode]) {
+        assert.match(ep, /\n\( setsid "\$\{args\[@\]\}" < \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+      }
+      for (const ep of [router, prefill, decode]) {
+        const execs = ep.split("\n").filter((line) => line.startsWith("exec "));
+        assert.deepStrictEqual(execs, ["exec tail -f /dev/null"], ep);
+      }
+    }
+  }
+});
+
 test("PD entrypoints start sshd on the shared port before the server when a key is given", () => {
   for (const [build, routerCommand] of [
-    [buildAtomWorkloadBody, "exec atomesh launch"],
-    [buildSGLangRouterWorkloadBody, "exec python3 -m sglang_router.launch_router"],
+    [buildAtomWorkloadBody, "setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "setsid python3 -m sglang_router.launch_router"],
   ] as const) {
     const body = build({
       ...COMMON,

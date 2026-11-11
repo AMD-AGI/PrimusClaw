@@ -576,6 +576,13 @@ function shellSingleQuote(value: string): string {
 }
 
 /**
+ * Last line of every PD entrypoint. The launcher waits on this process, so a
+ * server stopped or relaunched by any tool never ends the container. The server
+ * itself runs detached in its own session, reaped by the launcher as PID 1.
+ */
+const PD_HOLD = "exec tail -f /dev/null";
+
+/**
  * SGLang model-gateway command.
  *
  * SaFE replaces `{prefill}` and `{decode}` with the engine Service URLs. The
@@ -585,12 +592,13 @@ function shellSingleQuote(value: string): string {
 function sglangRouterEntrypoint(): string {
   return [
     "set -euo pipefail",
-    "exec python3 -m sglang_router.launch_router \\",
+    "( setsid python3 -m sglang_router.launch_router \\",
     "  --pd-disaggregation \\",
     `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
     "  --decode {decode} \\",
     "  --host 0.0.0.0 \\",
-    "  --port \"${ATOM_SERVER_PORT}\"",
+    "  --port \"${ATOM_SERVER_PORT}\" < /dev/null & )",
+    PD_HOLD,
   ].join("\n");
 }
 
@@ -601,13 +609,14 @@ function sglangRouterEntrypoint(): string {
 function atomRouterEntrypoint(framework: string): string {
   return [
     "set -euo pipefail",
-    "exec atomesh launch \\",
+    "( setsid atomesh launch \\",
     "  --host 0.0.0.0 \\",
     "  --port \"${ATOM_SERVER_PORT}\" \\",
     "  --pd-disaggregation \\",
     `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
     "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
-    `  --backend ${shellSingleQuote(framework)}`,
+    `  --backend ${shellSingleQuote(framework)} < /dev/null & )`,
+    PD_HOLD,
   ].join("\n");
 }
 
@@ -678,7 +687,7 @@ function atomEngineEntrypoint(
   for (const word of [...shellWords(serverArgs), ...shellWords(roleArgs)]) {
     lines.push(`  ${shellSingleQuote(word)}`);
   }
-  lines.push(")", "exec \"${args[@]}\"");
+  lines.push(")", "( setsid \"${args[@]}\" < /dev/null & )", PD_HOLD);
   return lines.join("\n");
 }
 
@@ -723,7 +732,8 @@ interface PdClusterBodyOptions {
  * SaFE CreateWorkloadRequest for a router, prefill, decode cluster.
  *
  * The router is a CPU process. Both engine roles request GPUs and RDMA because
- * the KV transfer plane needs a device. Entry points start the servers directly.
+ * the KV transfer plane needs a device. Entry points start the servers detached
+ * and then hold the launcher's waited pid.
  *
  * @param p Prompt-derived sizes, image, model, and env.
  * @param opts Kind and router command. Engine commands are shared.
