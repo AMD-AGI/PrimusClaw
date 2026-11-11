@@ -84,6 +84,12 @@ export class CommandTable {
       return true;
     }
     if (!assistant.on(userId)) return false;
+    // `/sessions` (the menu's "sessions") with remote agents: the sessions there are, the ones `/agents` shows, never "there are
+    // no sessions" beside a card that lists them (2026-11-11 guide re-check).
+    if (parseCommand(text) === "sessions" && this.ctx.deps.remote.enabled) {
+      await this.ctx.deps.remote.agents(chat.sender, key, chat.conversation);
+      return true;
+    }
     const hidden = assistant.hiddenCommand(text, chat.lang()); // (one conversation: no sessions or repositories)
     if (hidden !== undefined) {
       await chat.say(hidden);

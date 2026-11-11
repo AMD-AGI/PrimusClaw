@@ -49,6 +49,15 @@ export class PersonalText {
       ["new", !(attached && on((id) => assistant.on(id)))], // (in an attached chat: a new agent session, the assistant's)
     ];
     for (const [word, enabled] of rules) if (!enabled) off.add(word);
+    // The menu's "sessions" with the assistant on is `/sessions`: what `/agents` shows, the sessions there are on the person's machines
+    // (`command-table.ts`); as `/agent sessions` it said there were none beside a card that listed them (2026-11-11 guide re-check).
+    if (
+      remote.enabled &&
+      on((id) => assistant.on(id)) &&
+      menuCommand(message.text, group) === "/agent sessions" &&
+      !/agent/iu.test(message.text)
+    )
+      return "/sessions";
     return naturalCommand(menuCommand(message.text, group), group, off);
   }
 
