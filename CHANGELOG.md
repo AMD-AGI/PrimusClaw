@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.1.2 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.2.0 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.4.0 |
 
@@ -101,6 +101,12 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611120713` (commit da45d1eb). A minor release: two additions to the deep GitHub review,
+nothing incompatible; new setting `CLAW_GITHUB_REVIEW_FINDING_CHECK` (on by default), no schema change. Connector
+requirements unchanged from 0.1.0.
 
 ### Added
 - The deep GitHub review checks its own findings before posting them: one separate model call, which sees the change, its
