@@ -138,12 +138,18 @@ work to. Closing it from a client only stops the cards; the next prompt of that 
 
 Each conversation that asks is an item on the owner's list (`origin: "terminal"`, titled with the machine, the agent and the
 conversation). A request puts it in front of them and is said once, with its options as `remote.ask` on the `assistant.say` so a
-channel shows them as buttons; an answer, from either side, takes it back, and nothing more is said. More than five requests of one
-conversation within a minute are not said one by one: one message a minute says how many wait. A conversation whose request was put
+channel shows them as buttons. A terminal's `remote.ask` also carries `origin: "terminal"`, the request's `kind` and its `input` whole
+(the command, the edit, the plan, the question; with `question_index` and `question_count` for one question of several): what the
+person approves is all of what will run. One whose `input` is over 16 KB as JSON goes without it and offers only the options that
+refuse; one left with nothing to choose is said in words, to be answered in the terminal. An answer from the phone takes the item back
+silently. One from the terminal, or a request that stopped waiting (`timeout`, `session_end`, `connector_restart`), after its card
+went out is said once more as `remote.kind: "resolved"` with `remote.resolved: {action_id, by}`, so a channel that shows that card marks
+it in place (its text is one line for a channel that does not); a request asked and answered before Claw put it to anyone is never
+said. More than five requests of one conversation within a minute are not said one by one: one message a minute says how many wait. A conversation whose request was put
 to its owner this way is left out of the "waiting for a minute" notice for terminals (below), which would only repeat it.
 
 The owner turns all of this off (and on) with `PUT /v1/remote-agents/approvals`; while it is off a connector that asks is told
-`approvals_off`, opens nothing, and leaves the prompt to the terminal.
+`approvals_off`, opens nothing, and leaves the prompt to the terminal, and a session already open puts nothing more to them.
 
 ## Whether a session asks before it acts
 

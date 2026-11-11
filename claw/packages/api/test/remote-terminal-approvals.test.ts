@@ -15,9 +15,13 @@
  *      nothing is opened; on again, it opens; another user's switch is theirs
  *   T4 a request is put to the user once, with its options as buttons, saying the machine, the agent, the conversation and its folder;
  *      the item waits on them; answered at the terminal the item is done (answered in the terminal) and nothing more is said; the next
- *      request reopens it and is said again; a closed session closes it
+ *      request reopens it and is said again; a card answered at the terminal, or still waiting when the conversation ends, is said
+ *      as resolved so the channel marks it; one asked and answered in one batch is never put to the user; a closed session closes it
  *   T5 one conversation asking many times in a minute: the first five are put one by one, then one message says how many wait, once
  *   T6 new terminal sessions are limited per minute on their own
+ *   T7 a terminal's request goes whole on its card (kind, input, which question): one too large keeps only the options that refuse,
+ *      and one with nothing left to choose is said in words, to the terminal
+ *   T8 turned off, an open session puts nothing more to the user
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -97,10 +101,13 @@ describe("approvals from terminals", { skip }, () => {
     ["permissionRequest", { actionId, tool, kind: "question", input: null, toolCallId: null, options: OPTIONS, timeout_ms: 3_600_000, origin: "terminal_hook", cwd: "/home/u/work/claw" }];
   const resolved = (actionId: string, by: string, optionId: string | null = null): [string, Recorded] => ["permission_resolved", { actionId, optionId, by }];
   const remoteItem = async (sid: string) => (await w.q("SELECT * FROM claw_work_items WHERE worker_session_id = $1", [`remote:${sid}`]))[0];
+  /** What was pushed of the session of `itemId` (filed under the item or not), oldest first. */
   const pushed = async (itemId: string) => (await w.q(
-    `SELECT o.payload FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id
-      WHERE s.item_id = $1 ORDER BY o.id`, [itemId],
+    `SELECT o.payload FROM claw_notification_outbox o
+      WHERE o.payload->'remote'->>'session_id' = (SELECT params->>'session_id' FROM claw_work_items WHERE item_id = $1) ORDER BY o.id`, [itemId],
   )).map((r: Recorded) => r.payload as Recorded);
+  /** How many messages are filed under the item (the one per wait that told the user of it). */
+  const filed = async (itemId: string) => (await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE item_id = $1", [itemId]))[0].n;
 
   test("T1 one session per terminal conversation, never one of the user's sessions", async () => {
     const cid = await machine("alice", "laptop");
@@ -194,22 +201,79 @@ describe("approvals from terminals", { skip }, () => {
     assert.deepEqual([got[0].remote.kind, got[0].remote.session_id, got[0].remote.ask.action_id], ["needs_you", sid, "act-1"]);
     assert.deepEqual(got[0].remote.ask.options, OPTIONS);
 
+    // Answered at the terminal after its card went out: the card is marked (kind resolved, one line for a channel that cannot).
     await events("alice", cid, sid, [resolved("act-1", "terminal")]);
     const done = await remoteItem(sid);
     assert.deepEqual([done.board_state, done.outcome, done.summary], ["done", "answered", "已在终端里回答"]);
-    assert.equal((await pushed(item.item_id)).length, 1, "an answer is not news");
+    got = await pushed(item.item_id);
+    assert.equal(got.length, 2, JSON.stringify(got));
+    assert.deepEqual([got[1].remote.kind, got[1].remote.resolved, got[1].remote.ask], ["resolved", { action_id: "act-1", by: "terminal" }, undefined]);
+    assert.equal(got[1].text, "（这个请求已在终端里回答）");
 
     await events("alice", cid, sid, [ask("act-2", "Run: make test")]);
     assert.equal((await remoteItem(sid)).board_state, "needs_you");
     got = await pushed(item.item_id);
-    assert.equal(got.length, 2);
-    assert.match(got[1].text, /在等你回答：Run: make test/);
-    await events("alice", cid, sid, [resolved("act-2", "u_alice", "o0")]);
+    assert.equal(got.length, 3);
+    assert.match(got[2].text, /在等你回答：Run: make test/);
+    // Answered on the phone: the channel knows; nothing is said.
+    await events("alice", cid, sid, [resolved("act-2", "phone", "o0")]);
     assert.equal((await remoteItem(sid)).summary, "已回答");
-    await events("alice", cid, sid, [ask("act-3"), ["session_closed", { reason: "terminal_ended" }]]);
+    assert.equal((await pushed(item.item_id)).length, 3);
+    // Asked and answered at the terminal before Claw put it to anyone (one batch): never put to the user.
+    await events("alice", cid, sid, [ask("act-3"), resolved("act-3", "terminal")]);
+    assert.equal((await pushed(item.item_id)).length, 3);
+    assert.equal((await remoteItem(sid)).board_state, "done");
+    // A card still waiting when the conversation ends is marked as no longer waiting.
+    await events("alice", cid, sid, [ask("act-4")]);
+    await events("alice", cid, sid, [["session_closed", { reason: "terminal_ended" }]]);
     const closed = await remoteItem(sid);
     assert.deepEqual([closed.board_state, closed.outcome], ["done", "dropped"]);
-    assert.equal((await pushed(item.item_id)).length, 3);
+    got = await pushed(item.item_id);
+    assert.equal(got.length, 5, JSON.stringify(got.map((g) => g.text)));
+    assert.deepEqual([got[4].remote.kind, got[4].remote.resolved], ["resolved", { action_id: "act-4", by: "session_end" }]);
+  });
+
+  test("T7 a terminal's request goes whole: its kind, what it would do, and which question of several it is", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const sid = (await open("alice", cid, "conv-1")).body.data.session_id as string;
+    const plan = "## Plan\n" + "1. step\n".repeat(400);
+    const options = [
+      { optionId: "plan-approve", name: "Approve", kind: "allow_once" }, { optionId: "plan-reject", name: "Keep planning", kind: "reject_once" },
+    ];
+    await events("alice", cid, sid, [started,
+      ["permissionRequest", { ...ask("act-1", "Plan: refactor auth")[1], kind: "switch_mode", input: { plan }, options }],
+      ["permissionRequest", { ...ask("act-2", "Which color?")[1], question_index: 1, question_count: 2 }],
+      ["permissionRequest", { ...ask("act-3", "Plan: huge")[1], kind: "switch_mode", input: { plan: "x".repeat(20_000) }, options }],
+      ["permissionRequest", { ...ask("act-4", "Write big.txt")[1], kind: "edit", input: { content: "y".repeat(20_000) }, options: [OPTIONS[0]] }],
+    ]);
+    const got = await pushed((await remoteItem(sid)).item_id);
+    assert.equal(got.length, 4, JSON.stringify(got.map((g) => g.text)));
+    assert.equal(await filed((await remoteItem(sid)).item_id), 1, "one message is filed as the one that told of the wait");
+    const [a1, a2, a3, a4] = got.map((g) => g.remote);
+    assert.deepEqual([a1.ask.origin, a1.ask.kind, a1.ask.input.plan], ["terminal", "switch_mode", plan], "the whole plan, not cut");
+    assert.deepEqual(a1.ask.options, options);
+    assert.deepEqual([a2.ask.question_index, a2.ask.question_count, a2.ask.kind], [1, 2, "question"]);
+    // Too large to carry whole: only the options that refuse, and no input.
+    assert.deepEqual([a3.ask.input, a3.ask.options.map((o: Recorded) => o.optionId)], [undefined, ["plan-reject"]]);
+    // Nothing left that may be chosen: said in words, to the terminal.
+    assert.equal(a4.ask, undefined);
+    assert.match(got[3].text, /Write big\.txt。这个请求没法在这里完整显示，请到终端里回答。$/);
+  });
+
+  test("T8 with the approvals turned off, an open session puts nothing more to the user", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const sid = (await open("alice", cid, "conv-1")).body.data.session_id as string;
+    await events("alice", cid, sid, [started, ask("act-1")]);
+    const itemId = (await remoteItem(sid)).item_id;
+    assert.equal((await pushed(itemId)).length, 1);
+    await call("alice", "PUT", "/v1/remote-agents/approvals", { enabled: false });
+    await events("alice", cid, sid, [ask("act-2")]);
+    assert.equal((await pushed(itemId)).length, 1);
+    assert.equal((await remoteItem(sid)).board_state, "needs_you", "still on the list");
   });
 
   test("T5 many requests of one conversation in a minute: five one by one, then one message says how many wait", async () => {
