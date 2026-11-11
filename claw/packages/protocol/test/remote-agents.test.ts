@@ -205,3 +205,26 @@ test("a hide request: hidden a boolean first, then 1 to 50 refs of printable ASC
   assert.equal(parseHiddenRequest({ refs: refs(REMOTE_HIDE_LIMITS.maxRefs), hidden: true }).ok, true);
   assert.equal(REMOTE_HIDDEN_INCLUDE, "include");
 });
+
+test("a terminal's session open: agent, conversation ref, folder and a title cut to one line's length", async () => {
+  const { parseTerminalSessionOpen, parseApprovalsSetting, TERMINAL_HOOK_COMMANDS } = await import("../src/remote-agents.js");
+  const ok = parseTerminalSessionOpen({ agent_id: "claude", ref: "0b1c-2d", cwd: "/home/u/repo", title: `  ${"长".repeat(100)}  ` });
+  assert.ok(ok.ok);
+  assert.deepEqual([ok.value.ref, Array.from(ok.value.title).length], ["0b1c-2d", 80]);
+  assert.deepEqual(parseTerminalSessionOpen({ agent_id: "claude", ref: "r", cwd: "/x" }), { ok: true, value: { agent_id: "claude", ref: "r", cwd: "/x", title: "" } });
+  for (const [body, error] of [
+    [null, "body_required"],
+    [{ agent_id: "bad id", ref: "r", cwd: "/x" }, "invalid_agent_id"],
+    [{ agent_id: "claude", ref: "has space", cwd: "/x" }, "invalid_ref"],
+    [{ agent_id: "claude", ref: "r".repeat(129), cwd: "/x" }, "invalid_ref"],
+    [{ agent_id: "claude", ref: "r", cwd: "" }, "invalid_cwd"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x\n" }, "invalid_cwd"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x", title: "a\nb" }, "invalid_title"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x", title: 3 }, "invalid_title"],
+  ] as const) {
+    assert.deepEqual(parseTerminalSessionOpen(body), { ok: false, error }, JSON.stringify(body));
+  }
+  assert.deepEqual(parseApprovalsSetting({ enabled: false }), { ok: true, value: { enabled: false } });
+  assert.deepEqual(parseApprovalsSetting({ enabled: "false" }), { ok: false, error: "enabled_required" });
+  assert.deepEqual([...TERMINAL_HOOK_COMMANDS], ["decision", "close"]);
+});

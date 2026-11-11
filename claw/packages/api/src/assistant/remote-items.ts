@@ -36,13 +36,14 @@ import { randomUUID } from "node:crypto";
 import pino from "pino";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
+  REMOTE_ORIGIN_TERMINAL_HOOK,
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
-import { recordSystemNotice } from "./outbound.js";
+import { personWritesChinese, recordSystemNotice } from "./outbound.js";
 import { clipOneLine, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -75,6 +76,12 @@ const NOTICE_ANSWER_MAX = 400;
 const UNCONFIRMED_KEPT = 400;
 /** At most this many of a session's moving events are applied in one pass; the next post applies the rest. */
 const EVENTS_PER_PASS = 100;
+/**
+ * How many of one terminal conversation's requests are put to the user one by one in a minute; past that one message says how many
+ * wait (once a minute), so a session that asks for everything does not fill the chat.
+ */
+export const TERMINAL_ASKS_PER_MINUTE = 5;
+const MINUTE_MS = 60_000;
 /** The newest message chunks of a turn its answer is read from. */
 const ANSWER_CHUNKS = 400;
 
@@ -83,7 +90,11 @@ export const remoteItemsOn = (): boolean => CLAW_ASSISTANT_ENABLED && CLAW_REMOT
 /** The worker session id a remote session's item is filed under. Never a Claw session, so no run, sweep or watchdog finds it. */
 export const remoteWorkerSessionId = (remoteSessionId: string): string => `remote:${remoteSessionId}`;
 
-export type RemoteOrigin = "chat" | "assistant";
+/**
+ * Who the session's work is from: the user in an attached chat, the assistant for them, or (`terminal`) the person at a terminal on the
+ * machine, whose conversation's approvals its hook carries to the phone (a terminal-hook session, `store.openTerminalSession`).
+ */
+export type RemoteOrigin = "chat" | "assistant" | "terminal";
 export type RemoteLang = "zh" | "en";
 
 /** What a remote item keeps beside the row (`claw_work_items.params`). */
@@ -114,6 +125,13 @@ export interface RemoteParams {
   closed_event_id?: number;
   /** Cancels sent whose turn_end has not come yet, oldest first (`PendingCancel`). */
   cancels?: PendingCancel[];
+  /** A terminal's item: the conversation's title (its name, or the start of its first prompt) and folder, as its connector said them. */
+  title?: string;
+  cwd?: string;
+  /** A terminal's item: when (ms) each of its requests was put to the user one by one within the last minute (`TERMINAL_ASKS_PER_MINUTE`). */
+  asked_at?: number[];
+  /** A terminal's item: when (ms) the user was last told that more were waiting than are put one by one. */
+  summarized_at?: number;
   /** Prompts (`cmd_seq`) Claw ended as `delivery_unconfirmed`: an end of the machine's own for one of them still ends the item. */
   unconfirmed?: number[];
   /** What each of those asked (`asked` when it was ended), by `cmd_seq`: said with its answer should that come once the item moved on. */
@@ -512,15 +530,81 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
   return changed;
 }
 
+/**
+ * A terminal-hook session's item, made when its first request comes (a session that never asks has none): filed under the session as
+ * every remote item is, origin `terminal`, titled with the machine, the agent and the conversation. Null for any other session, or
+ * when the owner has no assistant to file it under.
+ */
+async function terminalItem(q: Querier, owner: string, sessionId: string): Promise<boolean> {
+  const s = (await q(
+    `SELECT s.connector_id::text AS connector_id, s.agent_id, s.cwd, c.name,
+            (SELECT e.data->>'title' FROM claw_remote_events e WHERE e.session_id = s.session_id AND e.type = 'session_started'
+              ORDER BY e.id DESC LIMIT 1) AS title
+       FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
+      WHERE s.session_id = $1 AND s.owner_user_id = $2 AND s.origin = $3`,
+    [sessionId, owner, REMOTE_ORIGIN_TERMINAL_HOOK],
+  )).rows[0];
+  if (!s) return false;
+  const asks = (await q(
+    `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND type = $2 LIMIT 1`, [sessionId, REMOTE_EVENT_PERMISSION_REQUEST],
+  )).rows.length > 0;
+  if (!asks) return false;
+  const assistant = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [owner])).rows[0];
+  if (!assistant) return false;
+  const machine = flat(s.name, 60) || `machine-${String(s.connector_id).slice(0, 8)}`;
+  const title = flat(s.title, 80);
+  const cwd = flat(s.cwd, 300);
+  const lang: RemoteLang = (await personWritesChinese(q, owner, title)) ? "zh" : "en";
+  const asked = title || cwdTail(cwd) || (lang === "zh" ? "终端会话" : "terminal conversation");
+  const params: RemoteParams = {
+    connector_id: String(s.connector_id), session_id: sessionId, agent_id: String(s.agent_id), machine, asked, origin: "terminal", lang,
+    open_turns: 0, open_cmd_seqs: [], waiting: [], last_event_id: 0, title, cwd,
+  };
+  const seq = Number((await q("SELECT COALESCE(MAX(seq), 0)::int + 1 AS next FROM claw_work_items WHERE user_id = $1", [owner])).rows[0].next);
+  const itemId = newWorkItemId();
+  await q(
+    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
+     VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb) ON CONFLICT (worker_session_id) DO NOTHING`,
+    [itemId, owner, seq, remoteTitle(machine, String(s.agent_id), asked, lang), remoteWorkerSessionId(sessionId), JSON.stringify(params)],
+  );
+  await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
+           SELECT $1, 'created', 'remote', 0, NULL WHERE EXISTS (SELECT 1 FROM claw_work_items WHERE item_id = $1)`, [itemId]);
+  return true;
+}
+
+/** The last two parts of a folder, which is how a person names their project. */
+export function cwdTail(cwd: string): string {
+  const parts = cwd.split(/[\\/]+/).filter(Boolean);
+  return parts.slice(-2).join("/");
+}
+
+/** What a terminal's request says to the user, in their language: where it waits, and what for. */
+export function terminalAskNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, what: string): string {
+  const where = [flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(p.lang === "zh" ? "，" : ", ");
+  return p.lang === "zh"
+    ? `${p.machine} 上终端里的 ${p.agent_id}${where ? `（${where}）` : ""}在等你回答：${what}。在下面选，或直接在终端里回答，先答的算数。`
+    : `${p.agent_id} in a terminal on ${p.machine}${where ? ` (${where})` : ""} is waiting for you: ${what}. Choose below, or answer in the terminal; whichever comes first counts.`;
+}
+
+/** Said instead of each request once more of one conversation's wait than are put one by one in a minute. */
+export function terminalBusyNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, waiting: number): string {
+  const where = [flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(p.lang === "zh" ? "，" : ", ");
+  return p.lang === "zh"
+    ? `${p.machine} 上终端里的 ${p.agent_id}${where ? `（${where}）` : ""}一分钟内问了很多次，现在有 ${waiting} 个在等你；不再逐条推送，请到终端里处理（发 /approvals off 可关掉终端审批推送）。`
+    : `${p.agent_id} in a terminal on ${p.machine}${where ? ` (${where})` : ""} asked many times within a minute and ${waiting} wait for you now; they are no longer sent one by one: answer them in the terminal (/approvals off stops approvals from terminals).`;
+}
+
 async function applySession(owner: string, sessionId: string): Promise<Notice[] | null> {
   return inTransaction(async (q) => {
-    const item = (await q(
+    const find = async () => (await q(
       `SELECT w.item_id, w.seq, w.board_state, w.attention_seq, w.params, a.session_id AS router_sid
          FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
         WHERE w.worker_session_id = $1 AND w.user_id = $2 AND w.kind = 'remote' FOR UPDATE OF w`,
       [remoteWorkerSessionId(sessionId), owner],
     )).rows[0] as { item_id: string; seq: number; board_state: string; attention_seq: number; params: RemoteParams; router_sid: string } | undefined;
-    if (!item) return null;
+    const found = (await find()) ?? (await terminalItem(q, owner, sessionId) ? await find() : undefined);
+    if (!found) return null;
+    const item = found;
     const events = (await q(
       `SELECT id, type, occurred_at, data FROM claw_remote_events
         WHERE session_id = $1 AND id > $2 AND type = ANY($3::text[]) AND COALESCE(data->>'replay', '') <> 'true'
@@ -600,6 +684,14 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       );
       tell(`undelivered:${e.id}`, "undelivered", remoteNotice("undelivered", p, item.seq, ""));
     };
+    if (p.origin === "terminal") {
+      await applyTerminal(events, p, board, write, (key, text, ask) => notices.push({
+        userId: owner, routerSid: item.router_sid, itemId: item.item_id, key: `remote:${item.item_id}:${key}`, text,
+        remote: { kind: "needs_you", session_id: sessionId, machine: p.machine, agent: p.agent_id, ...(ask ? { ask } : {}) },
+      }));
+      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
+      return notices;
+    }
     for (const e of events) {
       p.last_event_id = e.id;
       // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
@@ -777,6 +869,75 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
     return notices;
   });
+}
+
+type ItemWrite = (set: string, values: unknown[], ev: { kind: string; summary: string | null; question?: string | null; result?: unknown }) => Promise<void>;
+
+/**
+ * A terminal's item (`origin: "terminal"`) takes its session's events: a request puts it in front of the user (needs_you) and is put to
+ * them with its options, so a channel shows them as buttons; an answer, from the phone or at the terminal, takes it back, and the item
+ * is done once nothing waits; a closed session closes it. Nothing else is said: the person at the terminal sees the rest. More than
+ * {@link TERMINAL_ASKS_PER_MINUTE} requests of one conversation in a minute are not put one by one: once a minute one message says how
+ * many wait. `p` is changed in place (the caller writes it).
+ */
+async function applyTerminal(
+  events: MovingEvent[], p: RemoteParams, board: string, write: ItemWrite,
+  say: (key: string, text: string, ask?: AssistantRemoteAsk) => void, now: number = Date.now(),
+): Promise<void> {
+  const zh = p.lang === "zh";
+  for (const e of events) {
+    p.last_event_id = e.id;
+    if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
+      const actionId = flat(e.data.actionId, 128);
+      if (!actionId || p.waiting.includes(actionId)) continue;
+      p.waiting.push(actionId);
+      const what = flat(e.data.tool, 120) || (zh ? "一个操作" : "an action");
+      const question = zh ? `等你回答：${what}` : `Waiting for your answer: ${what}`;
+      const reopen = board === "done";
+      board = "needs_you";
+      await write(
+        `board_state = 'needs_you', last_report_kind = 'waiting', pending_question = $2, attention_seq = attention_seq + 1,
+         outcome = NULL, closed_at = NULL${reopen ? ", generation = generation + 1" : ""}`,
+        [question], { kind: "waiting", summary: question, question },
+      );
+      const recent = (Array.isArray(p.asked_at) ? p.asked_at : []).filter((t) => Number.isFinite(t) && now - t < MINUTE_MS);
+      if (recent.length < TERMINAL_ASKS_PER_MINUTE) {
+        p.asked_at = [...recent, now];
+        say(`ask:${e.id}`, terminalAskNotice(p, what), askOf(e, actionId, what) ?? undefined);
+      } else {
+        p.asked_at = recent;
+        if (!(Number(p.summarized_at) > now - MINUTE_MS)) {
+          p.summarized_at = now;
+          say(`busy:${e.id}`, terminalBusyNotice(p, p.waiting.length));
+        }
+      }
+    } else if (e.type === REMOTE_EVENT_PERMISSION_RESOLVED) {
+      const actionId = flat(e.data.actionId, 128);
+      if (!p.waiting.includes(actionId)) continue;
+      p.waiting = p.waiting.filter((a) => a !== actionId);
+      if (p.waiting.length || board === "done") continue;
+      board = "done";
+      const by = flat(e.data.by, 32);
+      // The connector says who answered: the terminal, the phone, or nobody (it timed out, the conversation or the connector ended).
+      const summary = by === "terminal" ? (zh ? "已在终端里回答" : "answered in the terminal")
+        : ["timeout", "session_end", "connector_restart"].includes(by) ? (zh ? "不再等待" : "no longer waiting")
+          : (zh ? "已回答" : "answered");
+      await write(
+        `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL, closed_at = NOW()`,
+        [summary], { kind: "answer", summary, result: { by: by || null, remote_event_id: e.id } },
+      );
+    } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
+      const unanswered = p.waiting.length > 0;
+      p.waiting = [];
+      if (board === "done") continue;
+      board = "done";
+      const summary = zh ? "终端会话已结束" : "the terminal conversation ended";
+      await write(
+        `board_state = 'done', outcome = $2, last_report_kind = 'dropped', summary = $3, pending_question = NULL, closed_at = NOW()`,
+        [unanswered ? "dropped" : "answered", summary], { kind: "dropped", summary },
+      );
+    }
+  }
 }
 
 /**

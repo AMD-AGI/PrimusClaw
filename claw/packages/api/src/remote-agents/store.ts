@@ -12,9 +12,9 @@ import { randomUUID } from "node:crypto";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
-  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
+  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
-  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
+  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
 } from "@claw/protocol";
 import { withHidden } from "./hidden.js";
 
@@ -770,10 +770,17 @@ export async function recentCommandCount(q: Querier, owner: string): Promise<num
 const READ_ONLY_SQL = `COALESCE((SELECT e.data->>'read_only' = 'true' FROM claw_remote_events e
    WHERE e.session_id = s.session_id AND e.type IN ('session_started', 'session_resumed') ORDER BY e.id DESC LIMIT 1), false)`;
 
+/**
+ * Not a session a connector opened for a terminal's approvals (`origin` 'terminal_hook', {@link openTerminalSession}): those are not
+ * sessions the user opened, so they never count against the open-session limit, are never closed to make room, and are never one the
+ * assistant lists to send work to.
+ */
+const NOT_TERMINAL_HOOK_SQL = `s.origin IS DISTINCT FROM '${REMOTE_ORIGIN_TERMINAL_HOOK}'`;
+
 export async function findSession(owner: string, sessionId: string, q: Querier = direct): Promise<Row | null> {
   const r = await q(
     `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at,
-            ${READ_ONLY_SQL} AS read_only
+            ${READ_ONLY_SQL} AS read_only, origin, ref
        FROM claw_remote_sessions s WHERE owner_user_id = $1 AND session_id = $2`,
     [owner, sessionId],
   );
@@ -783,7 +790,7 @@ export async function findSession(owner: string, sessionId: string, q: Querier =
 export async function listSessions(owner: string, connectorId: string | null, limit: number): Promise<Row[]> {
   return (await direct(
     `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, mode, status, created_at, updated_at,
-            ${READ_ONLY_SQL} AS read_only
+            ${READ_ONLY_SQL} AS read_only, origin, ref
        FROM claw_remote_sessions s
       WHERE owner_user_id = $1 AND ($2::uuid IS NULL OR connector_id = $2::uuid)
       ORDER BY created_at DESC LIMIT $3`,
@@ -817,7 +824,7 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
               ) x
             ), '[]'::json) AS events
        FROM claw_remote_sessions s
-      WHERE s.owner_user_id = $1 AND s.status = 'active'
+      WHERE s.owner_user_id = $1 AND s.status = 'active' AND ${NOT_TERMINAL_HOOK_SQL}
       ORDER BY s.updated_at DESC LIMIT $2`,
     [owner, limit, events, ACTIVITY_TEXT],
   )).rows;
@@ -955,6 +962,8 @@ async function commandIssued(q: Querier, owner: string, connectorId: string, cmd
 
 export type IssueOutcome =
   | { status: "rate_limited" }
+  /** The session carries a terminal's approvals ({@link openTerminalSession}): it takes only a decision and a close. */
+  | { status: "terminal_hook_session" }
   | { status: "gone" }
   | { status: "queued" | "duplicate"; row: Row };
 
@@ -995,6 +1004,11 @@ export async function issueCommand(r: IssueRequest): Promise<IssueOutcome> {
     // never pruned, does: for every command, not only a decision, or the retry would run it twice.
     const prior = await commandIssued(q, r.owner, r.connectorId, r.cmdId);
     if (prior) return { status: "duplicate", row: prior } as IssueOutcome;
+    // A session that carries a terminal's approvals takes an answer and a close, nothing that would make an agent act.
+    if (!TERMINAL_HOOK_COMMANDS.includes(r.type as RemoteCommandType)) {
+      const origin = (await q("SELECT origin FROM claw_remote_sessions WHERE session_id = $1", [r.sessionId])).rows[0]?.origin;
+      if (origin === REMOTE_ORIGIN_TERMINAL_HOOK) return { status: "terminal_hook_session" } as IssueOutcome;
+    }
     if (await recentCommandCount(q, r.owner) >= r.commandsPerMinute) return { status: "rate_limited" } as IssueOutcome;
     const queued = await enqueueCommand(q, { connectorId: r.connectorId, cmdId: r.cmdId, sessionId: r.sessionId, type: r.type, payload: r.payload });
     await writeAudit(q, {
@@ -1077,7 +1091,7 @@ async function reclaimable(q: Querier, owner: string, need: number, onlineWindow
             ${onlineSql(2)} AS online,
             ${READ_ONLY_SQL} AS read_only
        FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
-      WHERE s.owner_user_id = $1 AND s.status = 'active'
+      WHERE s.owner_user_id = $1 AND s.status = 'active' AND ${NOT_TERMINAL_HOOK_SQL}
         AND NOT EXISTS (SELECT 1 FROM claw_remote_commands m WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id)
         AND (s.updated_at < NOW() - make_interval(secs => $4::float8)
           -- A watch: what its terminal writes is the terminal's turn, never one of Claw's, so it never keeps the session open.
@@ -1120,7 +1134,7 @@ export async function createSession(p: {
     await lock(q, `sessions:${p.owner}`);
     await lock(q, `commands:${p.owner}`);
     const n = Number((await q(
-      "SELECT COUNT(*) AS n FROM claw_remote_sessions WHERE owner_user_id = $1 AND status = 'active'", [p.owner],
+      `SELECT COUNT(*) AS n FROM claw_remote_sessions s WHERE owner_user_id = $1 AND status = 'active' AND ${NOT_TERMINAL_HOOK_SQL}`, [p.owner],
     )).rows[0].n);
     const victims = n >= p.maxActive
       ? await reclaimable(q, p.owner, n - p.maxActive + 1, p.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs)
@@ -1221,4 +1235,69 @@ export async function sessionsWaiting(
     out.set(r.session_id, list);
   }
   return out;
+}
+
+/** Whether the owner wants the approvals their terminals ask for on the phone. No row: they do. */
+export async function approvalsEnabled(owner: string, q: Querier = direct): Promise<boolean> {
+  const r = (await q("SELECT enabled FROM claw_remote_approval_settings WHERE owner_user_id = $1", [owner])).rows[0];
+  return r ? r.enabled === true : true;
+}
+
+/** Turn the approvals from terminals on or off for the owner (`/approvals on|off`); audited. */
+export async function setApprovalsEnabled(owner: string, enabled: boolean, client: string | null): Promise<void> {
+  await inTransaction(async (q) => {
+    await q(
+      `INSERT INTO claw_remote_approval_settings (owner_user_id, enabled, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (owner_user_id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()`,
+      [owner, enabled],
+    );
+    await writeAudit(q, { owner, actor: owner, client, action: "approvals.set", detail: { enabled } });
+  });
+}
+
+export type TerminalSessionOutcome =
+  | { status: "opened"; session_id: string; created: boolean }
+  | { status: "approvals_off" | "agent_not_found" | "rate_limited" | "gone" };
+
+/**
+ * The session that carries the approvals one conversation open in a terminal asks for: the one this connector already has open for
+ * that conversation (`ref`), else a new one. Nothing is queued for the connector (it opened it, and posts its events itself). Not a
+ * session the user opened: it is left out of the open-session limit and never reclaimed (`NOT_TERMINAL_HOOK_SQL`), and new ones are
+ * limited on their own ({@link TERMINAL_SESSION_LIMITS}.opensPerMinute). Refused while the owner has the approvals off.
+ */
+export async function openTerminalSession(
+  owner: string, connectorId: string, o: RemoteTerminalSessionOpen, opensPerMinute: number = TERMINAL_SESSION_LIMITS.opensPerMinute,
+): Promise<TerminalSessionOutcome> {
+  return goneAsStatus(() => inTransaction(async (q): Promise<TerminalSessionOutcome> => {
+    // One at a time per connector and conversation: two hooks of one conversation asking at once find one session.
+    await lock(q, `terminal:${connectorId}:${o.ref}`);
+    if (!await approvalsEnabled(owner, q)) return { status: "approvals_off" };
+    const live = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2", [connectorId, owner])).rows[0];
+    if (!live || live.revoked_at) throw new ConnectorGone();
+    const agent = (await q("SELECT 1 FROM claw_remote_agents WHERE connector_id = $1 AND agent_id = $2", [connectorId, o.agent_id])).rows[0];
+    if (!agent) return { status: "agent_not_found" };
+    const open = (await q(
+      `SELECT session_id::text AS session_id FROM claw_remote_sessions
+        WHERE connector_id = $1 AND ref = $2 AND origin = $3 AND status = 'active'`,
+      [connectorId, o.ref, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0];
+    if (open) return { status: "opened", session_id: String(open.session_id), created: false };
+    const recent = Number((await q(
+      `SELECT COUNT(*) AS n FROM claw_remote_audit
+        WHERE owner_user_id = $1 AND action = 'session.created' AND detail->>'origin' = $2 AND ts > NOW() - interval '1 minute'`,
+      [owner, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0].n);
+    if (recent >= opensPerMinute) return { status: "rate_limited" };
+    const sessionId = randomUUID();
+    await q(
+      `INSERT INTO claw_remote_sessions (session_id, owner_user_id, connector_id, agent_id, cwd, mode, origin, ref)
+       VALUES ($1, $2, $3, $4, $5, NULL, $6, $7)`,
+      [sessionId, owner, connectorId, o.agent_id, o.cwd, REMOTE_ORIGIN_TERMINAL_HOOK, o.ref],
+    );
+    await writeAudit(q, {
+      owner, actor: owner, client: "connector", connectorId, agentId: o.agent_id, sessionId,
+      action: "session.created", detail: { origin: REMOTE_ORIGIN_TERMINAL_HOOK, ref: o.ref, cwd: o.cwd },
+    });
+    return { status: "opened", session_id: sessionId, created: true };
+  }));
 }

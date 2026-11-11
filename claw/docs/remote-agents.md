@@ -41,6 +41,7 @@ session), or an access token from the identity provider (see
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
 | `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may. Body (optional): `{received_late?, why?, session_id?}`; `received_late` (default `true`) says the command was already past the live TTL when it reached the connector; `session_id` is the command's session. Answers `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a prompt, and a `cancel` or `close` of its session was queued after it), `expired` (it reached the connector past the live TTL: never one received in time that then waited on the machine) or `gone` (Claw no longer holds it). Closing a session deletes its acting commands, so for one of those the answer is `session_closed` when `session_id` names a closed session of this connector's, and `gone` otherwise. Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. An answer about a command Claw holds is audited (`command.confirmed`, `command.refused_late`); one about an id it does not hold is not. See "A command received late" below. |
+| `POST .../connectors/:cid/terminal-sessions` | `{agent_id, ref, cwd, title?}`: the session that carries the approvals one conversation open in a terminal asks for (see [Approvals from terminals](#approvals-from-terminals)). The open one of this connector for `ref` (`200`, `created: false`), else a new one (`201`, `created: true`); `{session_id, created}`. `409 approvals_off` while the owner has them off, `404 agent_not_found` for an agent the machine does not report, `429 rate_limited` past 30 new ones a minute. |
 | `POST .../connectors/:cid/revoke` | Revoke one of the caller's connectors, as the user-side `DELETE /v1/remote-agents/connectors/:cid` does (the row stays revoked, its commands go, its sessions close): what `claw-connector logout` calls with a device sign-in, whose access token the user-side route refuses. The token names a user, not a connector, so it may revoke any of that user's connectors. `404 not_found` for a row that is not the caller's or is already revoked. |
 
 Command frames are `event: command` with `data: {v, cmd_id, type, session_id, issued_at, sent_at, ...}`; `issued_at` is when Claw
@@ -118,6 +119,31 @@ one, 400 `invalid_takeover` when it is not a boolean): the person confirmed that
 machine is to be ended so that this session continues it. Claw forwards it in `session.new` and records it in the
 `session.created` audit row; it does not interpret it. Because it ends a process, it is a live command: the `session.new` carries `takeover_until` (now + the live-command TTL) and is dropped, like a `prompt`, when nobody collects it within that TTL; the connector refuses one past its deadline (`takeover_expired`). A connector that can do this says `takeover: true` in the agent's
 capabilities; one that cannot ignores the field, and the session is watched read-only as above.
+
+### Approvals from terminals
+
+A coding agent its person started in their own terminal (not through Claw) asks there before it runs a command, edits a file, leaves
+plan mode or puts a multiple-choice question. A connector whose hook sees such a prompt opens one session per terminal conversation
+with `POST .../connectors/:cid/terminal-sessions` (`ref` is the agent's own conversation id) and posts each prompt on it as a
+`permissionRequest` whose `data.origin` is `terminal_hook`, with the options the terminal offers. The owner answers it as any other,
+with `POST .../sessions/:id/decisions`. The terminal keeps its own prompt: whichever answer comes first is the one the agent takes,
+and the connector posts `permission_resolved` with `data.by` saying who answered (`terminal`, the phone, or `timeout`, `session_end`,
+`connector_restart` when nobody did). The session's `session_started` names the conversation (`origin`, `ref`, `title`, `cwd`) and is not
+`read_only`: a decision must reach it.
+
+Such a session (`origin: "terminal_hook"` in the session list) is not one the user opened. It takes a `decision` and a `close`, and
+refuses everything else (`409 terminal_hook_session`): the conversation belongs to the person at the terminal. It does not count
+against the open-session limit, is never closed to make room for one, and is not one the assistant lists, attaches a chat to, or sends
+work to. Closing it from a client only stops the cards; the next prompt of that conversation opens a new one.
+
+Each conversation that asks is an item on the owner's list (`origin: "terminal"`, titled with the machine, the agent and the
+conversation). A request puts it in front of them and is said once, with its options as `remote.ask` on the `assistant.say` so a
+channel shows them as buttons; an answer, from either side, takes it back, and nothing more is said. More than five requests of one
+conversation within a minute are not said one by one: one message a minute says how many wait. A conversation whose request was put
+to its owner this way is left out of the "waiting for a minute" notice for terminals (below), which would only repeat it.
+
+The owner turns all of this off (and on) with `PUT /v1/remote-agents/approvals`; while it is off a connector that asks is told
+`approvals_off`, opens nothing, and leaves the prompt to the terminal.
 
 ## Whether a session asks before it acts
 
@@ -320,7 +346,9 @@ that is online, is said once to its owner through their assistant: the machine, 
 waits for and the conversation's title. Someone at that terminal answers within the minute and is
 never told; working and finishing in a terminal are never pushed (the person there sees them). The
 episode ends when the conversation stops waiting or its machine goes offline, and a later wait is
-told again once (`claw_remote_terminal_waits`).
+told again once (`claw_remote_terminal_waits`). A conversation whose request its hook already put to the
+owner as a card (see [Approvals from terminals](#approvals-from-terminals)), not yet answered, is not told
+this way: the card said it.
 
 ## User side
 
@@ -333,6 +361,7 @@ told again once (`claw_remote_terminal_waits`).
 | `POST /v1/remote-agents/sessions` | `{connector_id, agent_id, cwd, mode?, resume_ref?}`. `409 connector_offline` unless online; `409 connector_outdated` (with `data.version`, `data.upgrade_command`) when its connector is below the minimum version. |
 | `GET .../sessions`, `GET .../sessions/:id` | List (each active session with `waiting`: the permission requests it waits on its user for now, asked since its last turn ended and not answered, so a client lists those first), and read one with `connector_online`. |
 | `POST .../sessions/:id/commands` | `{type: prompt\|cancel\|set_mode\|resume\|close, ...}`. `Idempotency-Key` makes a retry queue one command. |
+| `GET`, `PUT /v1/remote-agents/approvals` | `{enabled}`: whether the approvals the caller's terminals ask for are put to them (on unless they turn it off; `PUT` is audited as `approvals.set`). |
 | `POST .../sessions/:id/decisions` | `{action_id, option_id}`, an option the agent offered. Answered twice, counted once: a different second choice is `409 already_decided`, even after the connector has acknowledged the first, because the audit trail remembers it. |
 | `GET .../sessions/:id/events` | History, a `historyComplete` marker, then live events, in the frame format of `/v1/chat/sessions/:id/messages`; resume with `Last-Event-ID` or `?after=`; when both are sent `Last-Event-ID` wins, because a browser reconnecting to the same URL changes only that header. `?mode=replay` returns JSON pages. |
 | `GET /v1/remote-agents/audit` | The caller's audit trail, filterable by `session_id` and `connector_id`. |
