@@ -352,6 +352,7 @@ export function formatPluginVersionRow(r: JsonObject): JsonObject {
     created_at: formatTs(r.created_at),
     updated_at: formatTs(r.updated_at),
     deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    expires_at: r.expires_at ? formatTs(r.expires_at) : null,
   };
 }
 
@@ -369,6 +370,18 @@ export async function getViewablePlugin(
   const row = await MarketplaceDb.pluginGetById(pluginId, false);
   if (!row || !canViewPlugin(row, userId, admin)) return null;
   return formatPluginRow(row, true);
+}
+
+/**
+ * Whether a new launch may name this plugin: it exists, is not deleted, is not
+ * a temporary plugin past its expiry, and the user may see it. One answer for
+ * all four, so a private plugin's id is not an existence oracle.
+ */
+export async function pluginLaunchable(pluginId: number, userId: string | undefined, admin: boolean): Promise<boolean> {
+  const row = await MarketplaceDb.pluginGetById(pluginId, false);
+  if (!row || !canViewPlugin(row, userId, admin)) return false;
+  const expires = row.expires_at ? new Date(row.expires_at as string | Date).getTime() : NaN;
+  return !(Number.isFinite(expires) && expires <= Date.now());
 }
 
 /**

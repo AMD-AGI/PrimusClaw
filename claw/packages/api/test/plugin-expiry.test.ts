@@ -25,6 +25,7 @@
  *   X10 an admission in flight holds its plugin against the sweep; a DAG whose plugin is gone is refused
  *   X11 a DAG cannot hand its runner a private plugin its own owner may not see
  *   X12 a queued message and a DAG template hold the plugin they name while they are written
+ *   X13 a new session turn and a retry may not name a gone, expired or foreign plugin
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -280,7 +281,9 @@ describe("temporary plugins against Postgres", { skip }, () => {
     const writer = await h.app.db.db.pool.connect();
     try {
       await writer.query("BEGIN");
-      await holdPluginReference(writer, id);
+      // The lock a reference write takes (holdPluginReference also refuses an
+      // already-expired plugin, so it is taken here directly).
+      await writer.query("SELECT 1 FROM plugins WHERE id = $1 FOR SHARE", [id]);
       assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "held while the write is in flight");
       await writer.query("INSERT INTO claw_task_dags (dag_id, name, plugin_id) VALUES ('d-x12', 'd', $1)", [id]);
       await writer.query("COMMIT");
@@ -288,12 +291,41 @@ describe("temporary plugins against Postgres", { skip }, () => {
       writer.release();
     }
     assert.deepEqual(await expiry.sweepExpiredPlugins(h.app.db.db.pool), [], "and kept by the template once written");
-    await holdPluginReference({ query: (t: string, p?: unknown[]) => q(t, p) }, null);
+    assert.equal(await holdPluginReference({ query: (t: string, p?: unknown[]) => q(t, p) }, null), true, "no plugin, nothing to hold");
     await q("DELETE FROM claw_task_dags");
     const { insertTaskDag } = await import("../src/tasks/dags/db.js");
-    const row = await insertTaskDag({ dag_id: "d-x12b", name: "d", plugin_id: id, nodes: [] } as any, {} as any, "u1", false);
-    assert.equal(Number(row!.plugin_id), id, "insertTaskDag still writes through its transaction");
+    const live = await addRaw("dag-live", false, "2999-01-01T00:00:00Z");
+    const row = await insertTaskDag({ dag_id: "d-x12b", name: "d", plugin_id: live, nodes: [] } as any, {} as any, "u1", false);
+    assert.equal(Number(row!.plugin_id), live, "insertTaskDag still writes through its transaction");
+    // A template naming an expired plugin is refused rather than stored.
+    await assert.rejects(
+      insertTaskDag({ dag_id: "d-x12c", name: "d", plugin_id: id, nodes: [] } as any, {} as any, "u1", false),
+      /plugin that does not exist or has expired/,
+    );
     await q("DELETE FROM claw_task_dags");
+  });
+  // X13
+  test("a session turn and a retry may not name a gone, expired or foreign plugin", async () => {
+    const { pluginLaunchable } = await import("../src/marketplace/plugins.js");
+    const live = await addRaw("turn-live", false, "2999-01-01T00:00:00Z");
+    const expired = await addRaw("turn-expired", false, new Date(Date.now() - 1000).toISOString());
+    const permanent = await addRaw("turn-permanent", true, null);
+    const foreign = Number(((await q(
+      "INSERT INTO plugins (name, version, owner_user_id, is_public) VALUES ('turn-foreign', '1', 'u2', false) RETURNING id",
+    )).rows[0] as { id: string }).id);
+    assert.equal(await pluginLaunchable(live, "u1", false), true);
+    assert.equal(await pluginLaunchable(permanent, "u1", false), true);
+    assert.equal(await pluginLaunchable(expired, "u1", false), false);
+    assert.equal(await pluginLaunchable(foreign, "u1", false), false);
+    assert.equal(await pluginLaunchable(foreign, "admin", true), true);
+    assert.equal(await pluginLaunchable(987654, "u1", true), false);
+
+    const { retryTask } = await import("../src/tasks/lifecycle.js");
+    await q("INSERT INTO claw_tasks (task_id, session_id, name, status, plugin_id, executor, mode) VALUES ('t-x13a', 'sx', 't', 'failed', $1, 'brain', 'llm'), ('t-x13b', 'sx', 't', 'failed', $2, 'brain', 'llm')", [expired, live]);
+    assert.deepEqual(await retryTask("t-x13a"), { ok: false }, "a retry may not bring back an expired plugin");
+    const again = await retryTask("t-x13b") as { ok?: boolean; task_id?: string };
+    assert.equal(again.ok, true, JSON.stringify(again));
+    await q("DELETE FROM claw_tasks");
   });
 });
 

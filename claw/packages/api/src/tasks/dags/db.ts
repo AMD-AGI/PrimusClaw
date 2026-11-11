@@ -9,6 +9,7 @@
  */
 import { db, inTransaction } from "../../infra/db.js";
 import { holdPluginReference } from "../../marketplace/plugin-expiry.js";
+import { BadRequestError } from "../../shared/errors.js";
 import type { TaskDagDef, DagDerived } from "./types.js";
 
 export interface TaskDagRow {
@@ -48,7 +49,9 @@ export async function insertTaskDag(
   // In one transaction with a hold on the plugin it names, so the expiry sweep
   // cannot delete that plugin between its reference check and this write.
   const r = await inTransaction(async (query) => {
-    await holdPluginReference({ query }, def.plugin_id ?? null);
+    if (!(await holdPluginReference({ query }, def.plugin_id ?? null))) {
+      throw new BadRequestError("plugin_id names a plugin that does not exist or has expired");
+    }
     return query(
     `INSERT INTO claw_task_dags
        (dag_id, name, version, description, plugin_id, trust_level,

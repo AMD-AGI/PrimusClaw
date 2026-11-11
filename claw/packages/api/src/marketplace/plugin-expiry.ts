@@ -87,6 +87,13 @@ export function requestedPluginExpiry(
   return at;
 }
 
+/** A write named a plugin that is gone by the time it was held; routes answer 404 plugin_not_found. */
+export class PluginGoneError extends Error {
+  constructor() {
+    super("plugin_not_found");
+  }
+}
+
 /** Whether `err` is the database refusing a public temporary plugin. */
 export function isTemporaryPublicViolation(err: unknown): boolean {
   const e = err as { code?: string; constraint?: string } | null;
@@ -114,16 +121,22 @@ export async function holdPluginForAdmission(client: PoolClient, pluginId: numbe
 
 /**
  * Hold a plugin row for the rest of a transaction that writes a reference to
- * it without admitting a run (a queued message, a DAG template), whatever
- * state the plugin is in: the write is not refused, only kept from racing the
- * sweep. A no-op for a null id.
+ * it without admitting a run (a queued message, a DAG template). False when
+ * the plugin is gone (deleted, or past its expiry), and the caller refuses
+ * the write rather than store a reference to it. True for a null id.
  */
 export async function holdPluginReference(
   q: { query: (text: string, params?: unknown[]) => Promise<unknown> },
   pluginId: number | string | null | undefined,
-): Promise<void> {
-  if (pluginId === null || pluginId === undefined) return;
-  await q.query("SELECT 1 FROM plugins WHERE id = $1 FOR SHARE", [pluginId]);
+): Promise<boolean> {
+  if (pluginId === null || pluginId === undefined) return true;
+  // Read after the lock is granted: a sweep that held the row first has
+  // committed by then, and a plugin it deleted reads as gone here.
+  const r = await q.query(
+    `SELECT 1 FROM plugins WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL} FOR SHARE`,
+    [pluginId],
+  ) as { rows?: unknown[] };
+  return (r.rows?.length ?? 0) > 0;
 }
 
 /** The expired private plugins this pass may take, locked; one an admission holds is skipped. */

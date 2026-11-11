@@ -3472,7 +3472,7 @@ export const MarketplaceDb = {
       } else conds.push("is_public = true");
     }
     const r = await db.query(
-      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at
+      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at, expires_at
          FROM plugins WHERE ${conds.join(" AND ")} ORDER BY ${PLUGIN_VERSION_ORDER}`,
       args,
     );

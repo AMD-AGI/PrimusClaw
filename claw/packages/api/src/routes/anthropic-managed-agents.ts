@@ -22,7 +22,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import crypto from "node:crypto";
 import { db, MarketplaceDb } from "../infra/db.js";
-import { canViewPlugin, ownerOrAdmin, formatPluginRow } from "../marketplace/plugins.js";
+import { canViewPlugin, ownerOrAdmin, formatPluginRow, pluginLaunchable } from "../marketplace/plugins.js";
+import { holdPluginReference } from "../marketplace/plugin-expiry.js";
 import { getUser } from "../auth/middleware.js";
 import { anthropicErrorPayload } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
@@ -202,7 +203,8 @@ function parsePrimusClawMetadata(metadata: unknown): PrimusClawAgentHint | null 
  */
 async function canUsePlugin(pluginId: number, userId: string, admin: boolean): Promise<boolean> {
   const row = await MarketplaceDb.pluginGetById(pluginId, false);
-  return !!row && row.status !== "archived" && canViewPlugin(row, userId, admin);
+  return !!row && row.status !== "archived" && canViewPlugin(row, userId, admin)
+    && await pluginLaunchable(pluginId, userId, admin);
 }
 
 /** Best-effort resolved-agent echo for a Session response (agents.create() is stateless — no table to read back from). */
@@ -1212,6 +1214,7 @@ interface UserMessageTurnConfig {
 
 type UserMessageGateResult =
   | { kind: "missing" }
+  | { kind: "plugin_gone" }
   | { kind: "queued"; messageId: string }
   | { kind: "dispatch"; messageId: string; userEnv: Record<string, string> };
 
@@ -1237,6 +1240,11 @@ async function gateUserMessageTurn(
     // None for a session that acts as a user (see `loadUserEnvForSession`).
     const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
     if (locked.rows[0].agent_status === "running") {
+      // The queued row references the plugin: hold it against the expiry sweep, and refuse one that is gone.
+      if (!(await holdPluginReference(client, config.pluginId ?? null))) {
+        await client.query("ROLLBACK");
+        return { kind: "plugin_gone" };
+      }
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",
@@ -1402,6 +1410,9 @@ function registerAnthropicEventRoutes(app: FastifyInstance): void {
     );
     if (gate.kind === "missing") {
       return sendError(reply, 404, "not_found_error", "session not found");
+    }
+    if (gate.kind === "plugin_gone") {
+      return sendError(reply, 404, "not_found_error", "the session's agent plugin no longer exists");
     }
     const sentEvent = { id: `evt_${Date.now()}`, type: "user.message", content: [{ type: "text", text: messageContent }], processed_at: new Date().toISOString() };
     if (gate.kind === "queued") return reply.send({ data: [sentEvent] });
