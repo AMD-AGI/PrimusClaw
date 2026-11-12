@@ -1462,7 +1462,8 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
  * 其他问题，随时告诉我", "Let me know if you need anything else", "Any questions?") asks for nothing, so a reply that only answers and
  * ends with one does not ask. An offer is a clause that opens with one: "If you need more details, please send the repository" still
  * asks (its second clause), and so does "Which repository should I use if you have any other requirements?" (a question that opens
- * with no offer). Known to pass wrongly: "Done, any questions?" (an answer and an offer in one sentence).
+ * with no offer). Known to pass wrongly: "Done, any questions?" (an answer and an offer in one sentence). Not counted: a question
+ * without its mark ("哪个仓库", "Which repository should I use"); routers mark their questions, and the judge reads the reply.
  */
 export function asksUser(text: string, choices = 0): boolean {
   if (choices >= 2) return true;
@@ -1481,7 +1482,8 @@ export function asksUser(text: string, choices = 0): boolean {
 const CLOSING_OFFER = new RegExp([
   String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?(有|需要)(任何|其他|别的|更多|什么)?(问题|疑问|需要|帮助|事|其他|别的)`,
   String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?有(任何|其他|别的|更多)`,
-  String.raw`^(如|若)?有(任何|其他|别的)?(问题|需要|疑问)`,
+  String.raw`^(如|若)?有(任何|其他|别的|什么)?(问题|需要|疑问|事)`,
+  String.raw`^(还)?需要(任何|其他|别的|什么)`,
   String.raw`^(有)?需要的话`,
   // A bare "tell me" with nothing to tell, whatever courtesy leads it: the second half of "如果有任何问题，欢迎随时告诉我" / "If you
   // have questions, feel free to let me know". "把题目告诉我" names what to tell, so it is no offer.
@@ -1496,16 +1498,15 @@ const CLOSING_OFFER = new RegExp([
 ].join("|"), "i");
 /** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
 const ASKS: readonly RegExp[] = [
-  /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|给我|发给我|发我|回复|指明|明确|描述|选择|选一)/,
+  /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|回复|指明|明确|描述|选择|选一)/,
   // Asked of the person ("需要你补充一下"), not the assistant saying what it does next ("我确认一下", "先简单说明一下").
-  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认|发|给)|告诉我|发给我|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
+  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认|发|给)|告诉我|发给我(?!们)|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
   // "把仓库名发我", "请把…发我", "需要你提供…", "我需要知道…" / "我需要仓库名" (not "我需要先查一下": what the assistant does next).
-  /把.{1,30}(发|告诉|给|发给)(我|我们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
-  /我(还|们)?需要(知道|了解|你的|您的)|我(还|们)?需要[^，,。]{0,16}(名|名称|名字|地址|链接|编号|ID|id|路径|题目|主题|信息|细节|内容)/,
-  // An imperative that opens the clause ("说一下要做什么", "给我题目和要求"), and a question without its mark ("你想开哪个题",
-  // "具体是哪个仓库呢").
-  /^(请)?(再)?(说|讲)(一下|一声|说)|^(请)?(给|发)我[^\p{P}\s]/u,
-  /((你|您)[^。\n]{0,20}(哪个|哪些|哪一|哪里|哪儿|什么(?!都|也)|多少)|是哪(个|些|一))[^，,。\n]{0,12}[呢吗呀]?[。.!！]?$|(哪个|哪些|什么)[^。\n]{0,12}(呢|吗)[。.!！]?$/,
+  /(?<![我会来])把.{1,30}(发|告诉|给|发给)我(?!们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
+  // "我需要知道…", and a clause that is only what is needed ("我需要仓库名和测试名"), not "我需要先查一下仓库名是否存在".
+  /我(还|们)?需要知道|^我(还|们)?需要(你的|您的)?[^，,。]{0,12}(名|名称|名字|编号|ID|id|链接|地址|路径)(和[^，,。]{0,12}(名|名称|名字|编号|ID|id|链接|地址|路径))?[。.!！]?$/,
+  // An imperative that opens the clause and names what to give ("说一下要做什么", "给我题目和要求"; not "给我一点时间").
+  /^(请)?(再)?(说|讲)(一下|一声)|^(请)?(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)|告知(我|我们)/,
   /(你|您)(是)?(指|想|要|希望|说的是)[^。\n]{0,40}还是/,
   /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
   /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
