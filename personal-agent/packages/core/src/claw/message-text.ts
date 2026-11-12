@@ -39,19 +39,39 @@ export const RULE_TTL_MS = 600_000;
 /** A reply-style rule is about 1 KB; anything this large is not one. */
 export const RULE_MAX_BYTES = 32_768;
 
-/** A regular expression for `text` as it is written. */
-function literal(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Where a heading of `words` whose rest (`words` without its first letter, then `tail`) is found at `at` starts: "\n\n## ", then
+ * one word (the chat app's short name) and the words, or the words alone with their first letter upper case. -1 when the text
+ * there is not such a heading.
+ */
+function headingStart(text: string, words: string, at: number): number {
+  const start = text.lastIndexOf("\n\n## ", at - 1);
+  if (start === -1) return -1;
+  const first = text.charAt(at - 1);
+  const name = text.slice(start + 5, at - 1);
+  if (name === "") return first === words.charAt(0).toUpperCase() ? start : -1;
+  return first === words.charAt(0) && /^\S+ $/.test(name) ? start : -1;
 }
 
-/** A heading that ends with `words`, after any chat app's name (or none): "\n\n## <name> <words>". */
-function anyHeading(words: string): string {
-  const first = words.charAt(0);
-  return `\n\n## (?:[^\n]* )?[${first}${first.toUpperCase()}]${literal(words.slice(1))}`;
+/** Where the last heading of `words` followed by `tail` starts in `text`, or -1. */
+function lastHeading(text: string, words: string, tail: string): number {
+  const rest = words.slice(1) + tail;
+  for (let at = text.lastIndexOf(rest); at > 0; at = text.lastIndexOf(rest, at - 1)) {
+    const start = headingStart(text, words, at);
+    if (start !== -1) return start;
+  }
+  return -1;
 }
 
-const CHANGE_SECTIONS = new RegExp(`${anyHeading(CHANGE_WORDS)}\n\n${literal(CHANGE_SUMMARY_RULE)}`, "g");
-const RULE_HEADINGS = new RegExp(anyHeading(RULE_WORDS));
+/** Where the first heading of `words` starts in `text`, or -1. */
+function firstHeading(text: string, words: string): number {
+  const rest = words.slice(1);
+  for (let at = text.indexOf(rest, 1); at !== -1; at = text.indexOf(rest, at + 1)) {
+    const start = headingStart(text, words, at);
+    if (start !== -1) return start;
+  }
+  return -1;
+}
 
 /**
  * `text` as the person wrote it, with what the worker appended taken off again, whichever chat app's name the headings
@@ -60,7 +80,8 @@ const RULE_HEADINGS = new RegExp(anyHeading(RULE_WORDS));
  * the rule: it is cut where the rule's heading first starts.
  */
 export function withoutRule(text: string): string {
-  const at = [...text.matchAll(CHANGE_SECTIONS)].at(-1)?.index ?? text.search(RULE_HEADINGS);
+  const change = lastHeading(text, CHANGE_WORDS, `\n\n${CHANGE_SUMMARY_RULE}`);
+  const at = change !== -1 ? change : firstHeading(text, RULE_WORDS);
   return at === -1 ? text : text.slice(0, at);
 }
 

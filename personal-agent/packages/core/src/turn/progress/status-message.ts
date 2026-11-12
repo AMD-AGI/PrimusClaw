@@ -56,8 +56,10 @@ export const PREPARING_AFTER_SECONDS = 1.5;
 export const FINAL_SETTLE_SECONDS = 1.0;
 /** ... and one that is late anyway is covered by sending DONE_LINE once more this long afterwards. */
 export const REASSERT_SECONDS = 6.0;
-/** The chat closes a stream this long after it opened; this one is closed by its final message before that. */
-export const STREAM_CLOSE_SECONDS = 9 * 60;
+/** A stream is closed by its final message this long before the chat would close it (`SurfaceCaps.streamSeconds`). */
+export const STREAM_CLOSE_MARGIN_SECONDS = 60;
+/** When a stream is closed on a chat that closes one 10 minutes after it opened (Teams). */
+export const STREAM_CLOSE_SECONDS = 10 * 60 - STREAM_CLOSE_MARGIN_SECONDS;
 
 export interface StatusOptions<S> {
   readonly clock: Clock;
@@ -174,7 +176,8 @@ export class StatusMessage<S> {
   private async closeInTime(signal: AbortSignal): Promise<void> {
     const live = this.live;
     if (!live) return;
-    await sleepSeconds(this.clock, Math.max(STREAM_CLOSE_SECONDS - live.age(), 0), signal);
+    const closeAt = Math.max(this.surface.caps.streamSeconds - STREAM_CLOSE_MARGIN_SECONDS, 0);
+    await sleepSeconds(this.clock, Math.max(closeAt - live.age(), 0), signal);
     await this.closeEarly(live, turnText.in(this.lang).stillWorking, "before the chat's limit", signal);
   }
 

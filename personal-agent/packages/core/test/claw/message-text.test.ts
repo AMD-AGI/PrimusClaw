@@ -45,6 +45,19 @@ describe("withoutRule", () => {
     assert.equal(withoutRule(`first\n\n${RULE_HEADING}\n\n${RULE}`), "first");
   });
 
+  it("a heading the user wrote with more than a chat app's one-word name before it is theirs", () => {
+    const mine = "my notes\n\n## A Teams reply style (formatting only, facts unchanged)\n\nkeep this";
+    assert.equal(withoutRule(mine), mine);
+    assert.equal(withoutRule(`${mine}\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`), mine);
+  });
+
+  it("reads a long run of blank lines and hashes at once", () => {
+    const long = "\n".repeat(50_000) + "## ".repeat(20_000) + " reply style";
+    const started = Date.now();
+    assert.equal(withoutRule(long), long);
+    assert.ok(Date.now() - started < 1000);
+  });
+
   it("keeps the user's own blank lines", () => {
     assert.equal(withoutRule(`first\n\nsecond\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`), "first\n\nsecond");
   });
