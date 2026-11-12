@@ -106,9 +106,21 @@ class EchoConversation implements Conversation {
     return this.ref.kind === "personal" ? text : redactText(text).text;
   }
 
+  /** `message` as this chat shows it: every word a member reads masked in a group (its text, buttons and options). */
   private shown(message: OutMessage): EchoMessage {
     const drawn = render(message, this.caps);
-    return { ...drawn, text: this.masked(drawn.text) };
+    if (this.ref.kind === "personal") return drawn;
+    const mask = (text: string) => this.masked(text);
+    const choices = drawn.choices && {
+      ...drawn.choices,
+      options: drawn.choices.options.map((o) => ({ ...o, title: mask(o.title) })),
+    };
+    return {
+      ...drawn,
+      text: mask(drawn.text),
+      buttons: drawn.buttons.map((b) => ({ ...b, title: mask(b.title) })),
+      ...(choices === undefined ? {} : { choices }),
+    };
   }
 
   get replyTo(): MessageId {

@@ -167,6 +167,28 @@ function turns(shared: Shared): void {
   });
 }
 
+/** A token's shape that core's redaction knows (a GitHub personal access token), made up. */
+const TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+
+function masking(shared: Shared): void {
+  it("in a group, a credential in what the bot posts is masked: every member reads it", async () => {
+    const run = runOf(shared);
+    const who = person("mask");
+    await linked(run, who);
+    const group: KitChat = { id: "kit-group-mask", kind: "group" };
+    const answer = run.claw.answer;
+    run.claw.answer = (text) => (text.includes("paste the token") ? `Echo: the token is ${TOKEN}, done` : answer(text));
+    try {
+      await run.driver.say(group, who, "paste the token", { mentionsBot: true });
+      await run.shown(group, (m) => m.final && m.text.includes("done"), "the group's answer");
+    } finally {
+      run.claw.answer = answer;
+    }
+    const leaked = run.driver.seen(group).filter((m) => JSON.stringify(m).includes(TOKEN));
+    assert.deepEqual(leaked, [], "the token is masked in the group");
+  });
+}
+
 function claw(shared: Shared): void {
   it("a message to the assistant names this surface, and the reply Claw sends back reaches the chat it came from", async () => {
     const run = runOf(shared);
@@ -311,6 +333,7 @@ export function surfaceConformance(sut: SurfaceUnderTest, options: { readonly vi
     names(shared);
     identity(shared);
     turns(shared);
+    masking(shared);
     claw(shared);
     cards(shared, options.views ?? true);
     lastly(shared);
