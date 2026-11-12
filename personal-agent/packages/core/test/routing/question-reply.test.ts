@@ -107,9 +107,9 @@ test("the answered card speaks the chat's language, not the reply's: 1 or a type
     assert.equal(card.body.view.model.replied, "zh", `${typed} ${locale}`);
     assert.match(card.body.fallbackText, /^已回答：/, `${typed} ${locale}`);
   }
-  // and an English chat stays English whatever is typed
+  // and an English chat stays English, though the question is Chinese
   const w = waiting();
-  await w.router.handle(message("火锅", { locale: "en-US" }));
+  await w.router.handle(message("1", { locale: "en-US" }));
   const card = cardUpdate(w);
   assert.ok(card?.body.type === "view" && card.body.view.name === "questionAnswered");
   assert.equal(card.body.view.model.replied, "en");
