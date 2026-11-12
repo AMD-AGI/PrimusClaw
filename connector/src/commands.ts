@@ -146,7 +146,7 @@ Cursor cannot take a "Yes" from a hook, so approving happens at the terminal`,
   pair: {
     usage: "pair CODE --server URL",
     about: `connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
-agents.toml if there is none (the agents found here, working in this folder), saves the
+agents.toml if there is none (the agents found here that are signed in, working in this folder), saves the
 sign-in, offers the Claude Code hooks as init does, and starts the service.
 [--name HOST] [--no-start] [--hooks | --no-hooks] [--no-approval-hooks]`,
     run: (rest, ctx) => cmdPair(rest, ctx, {

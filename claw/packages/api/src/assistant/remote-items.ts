@@ -44,7 +44,7 @@ import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onli
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
 import { personWritesChinese, recordSystemNotice } from "./outbound.js";
-import { clipOneLine, TITLE_MAX } from "./work-items.js";
+import { clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
 
@@ -205,8 +205,23 @@ const tailLines = (v: string, max: number): string => {
   return chars.length > max ? `…${chars.slice(chars.length - (max - 1)).join("")}` : text;
 };
 
+/** What a title keeps of what was asked even when the machine's and the agent's names already fill `TITLE_MAX`. */
+const TITLE_ASKED_MIN = 16;
+
+/** `head` whole (a machine's or a tool's name is never cut), then as much of `asked` as fits, cut after a whole word. */
+const titled = (head: string, asked: string): string => {
+  const h = head.replace(/\s+/g, " ").trimStart();
+  const room = Math.max(TITLE_MAX - graphemes(h).length, TITLE_ASKED_MIN);
+  return `${h}${clipWords(asked, room)}`.trimEnd();
+};
+
 /** The item's title: machine, agent, and the start of what it was asked. */
 export function remoteTitle(machine: string, agent: string, asked: string, lang: RemoteLang): string {
+  return titled(lang === "zh" ? `${machine} ${agent}：` : `${machine} ${agent}: `, asked);
+}
+
+/** The title an item made before titles were cut on a word boundary carries: the whole line cut at `TITLE_MAX` code points. */
+export function legacyRemoteTitle(machine: string, agent: string, asked: string, lang: RemoteLang): string {
   return clipOneLine(lang === "zh" ? `${machine} ${agent}：${asked}` : `${machine} ${agent}: ${asked}`, TITLE_MAX);
 }
 
@@ -214,7 +229,7 @@ export function remoteTitle(machine: string, agent: string, asked: string, lang:
 export function remoteTitleWithoutMachine(p: Partial<RemoteParams>): string {
   const agent = remoteAgentName(p);
   const asked = String(p.asked ?? "").trim();
-  return clipOneLine(p.lang === "zh" ? `${agent}：${asked}` : `${agent}: ${asked}`, TITLE_MAX);
+  return titled(p.lang === "zh" ? `${agent}：` : `${agent}: `, asked);
 }
 
 export interface NotePrompt {
@@ -782,8 +797,9 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         if (tool) {
           p.tool = tool;
           // Its title named the agent's id: named by the tool now, unless it is no longer the title it was made with.
-          await q("UPDATE claw_work_items SET title = $3 WHERE item_id = $1 AND title = $2", [
+          await q("UPDATE claw_work_items SET title = $3 WHERE item_id = $1 AND title IN ($2, $4)", [
             item.item_id, remoteTitle(p.machine, p.agent_id, p.asked, p.lang), remoteTitle(p.machine, remoteAgentName(p), p.asked, p.lang),
+            legacyRemoteTitle(p.machine, p.agent_id, p.asked, p.lang),
           ]);
         }
       }

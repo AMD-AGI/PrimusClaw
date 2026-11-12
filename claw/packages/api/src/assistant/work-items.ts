@@ -51,6 +51,31 @@ export function clipOneLine(text: string, max: number): string {
   return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, max).join("");
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** The characters of `text` as a reader counts them (an emoji with its modifiers, a letter with its accents: one each). */
+export const graphemes = (text: string): string[] => Array.from(graphemeSegmenter.segment(text), (x) => x.segment);
+/** A letter or digit of a script that separates words with spaces: two of them side by side are one word. Han and kana break anywhere. */
+const inWord = (g: string): boolean =>
+  /^[\p{L}\p{N}_]/u.test(g) && !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(g);
+
+/**
+ * One line, at most `max` user-perceived characters (graphemes), cut where a reader sees a break: a text that does not fit ends in
+ * "…" after its last whole word (a single word longer than the room is cut where it must be), never in the middle of an emoji or a
+ * combined character.
+ */
+export function clipWords(text: string, max: number): string {
+  const gs = graphemes(text.replace(/\s+/g, " ").trim());
+  if (gs.length <= max) return gs.join("");
+  if (max < 1) return "";
+  let end = max - 1;
+  if (end > 0 && inWord(gs[end - 1]!) && inWord(gs[end]!)) {
+    let start = end - 1;
+    while (start > 0 && inWord(gs[start - 1]!)) start--;
+    if (start > 0) end = start;
+  }
+  return `${gs.slice(0, end).join("").trimEnd()}…`;
+}
+
 // --- What a report does -------------------------------------------------------------
 
 export interface ReportTransition {

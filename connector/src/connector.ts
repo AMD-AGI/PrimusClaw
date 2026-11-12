@@ -780,7 +780,11 @@ export class Connector {
         if (report === null) break;
         this.healthReport = report;
         if (JSON.stringify(this.healthReport.problems) !== before) {
-          this.d.log.info("health", { problems: this.healthReport.problems.map((p) => `${p.agent ?? "machine"}:${p.code}`) });
+          // With the one command or edit that fixes each: a log read on the machine is read by the person who can run it.
+          this.d.log.info("health", {
+            problems: this.healthReport.problems.map((p) => `${p.agent ?? "machine"}:${p.code}`),
+            ...(this.healthReport.problems.length ? { fix: this.healthReport.problems.map((p) => `${p.agent ?? "machine"}: ${p.fix}`) } : {}),
+          });
           this.wakeHeartbeat?.();
         }
       } catch (e) { this.d.log.warn("health check failed", { error: errMessage(e) }); }
