@@ -4,6 +4,8 @@
 /**
  * The command the Claude Code approval hooks run (approvals.ts):
  *   `approval-hook.js ask|settled --dir <Claude config dir> --socket <connector socket> --managed-by claw-connector`
+ * and the Cursor ones (cursor-approvals.ts):
+ *   `approval-hook.js ask|settled --agent cursor --hold <seconds> --dir <Cursor config dir> --socket <connector socket> --managed-by claw-connector`
  *
  * `ask` (the `PermissionRequest` hook) hands the request to the running connector and prints the owner's decision, if one
  * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session in a
@@ -13,6 +15,11 @@
  * unexpected, and it prints nothing and exits 0, which leaves the question to the terminal, where Claude Code shows it all the
  * while. Claude Code stops it with SIGTERM when the person at the terminal interrupts the turn; the connector sees the socket
  * close and withdraws the card.
+ *
+ * For Cursor only a session of the Cursor Agent CLI started by hand is handed on (`CURSOR_INVOKED_AS` is set by the CLI's
+ * launcher; a session the connector itself runs has `CLAW_CONNECTOR_AGENT`). Its `ask` prints `{"permission":"deny",...}` when
+ * the owner turned the call down from the phone, and nothing otherwise, which lets Cursor go on as it would have (measured:
+ * an empty answer is not a refusal).
  */
 import net from "node:net";
 
@@ -42,10 +49,13 @@ async function main(): Promise<void> {
   const dir = arg("--dir");
   const socket = arg("--socket");
   if ((mode !== "ask" && mode !== "settled") || !dir || !socket) {
-    process.stderr.write("usage: approval-hook ask|settled --dir <Claude config dir> --socket <path>\n");
+    process.stderr.write("usage: approval-hook ask|settled [--agent cursor --hold <seconds>] --dir <config dir> --socket <path>\n");
     return;
   }
-  if (process.env.CLAUDE_CODE_ENTRYPOINT !== "cli") return;
+  const agent = arg("--agent") === "cursor" ? "cursor" : "claude";
+  if (agent === "claude" && process.env.CLAUDE_CODE_ENTRYPOINT !== "cli") return;
+  if (agent === "cursor" && (!process.env.CURSOR_INVOKED_AS || process.env.CLAW_CONNECTOR_AGENT)) return;
+  const holdS = Number(arg("--hold"));
   const text = await readStdin();
   if (text.length >= MAX_STDIN) return;
   let event: unknown;
@@ -59,7 +69,10 @@ async function main(): Promise<void> {
     sock.setEncoding("utf8");
     sock.on("connect", () => {
       clearTimeout(connectTimer);
-      sock.write(`${JSON.stringify({ v: 1, type: mode, dir, event })}\n`);
+      const msg = agent === "cursor"
+        ? { v: 1, type: mode, agent, dir, event, ...(mode === "ask" && Number.isFinite(holdS) && holdS > 0 ? { hold_ms: Math.round(holdS * 1000) } : {}) }
+        : { v: 1, type: mode, dir, event };
+      sock.write(`${JSON.stringify(msg)}\n`);
       if (mode === "settled") sock.end();
     });
     sock.on("data", (c: string) => { if (buf.length < MAX_STDIN) buf += c; });
@@ -78,6 +91,14 @@ async function main(): Promise<void> {
   try { r = JSON.parse(line); } catch { return; }
   const decision = typeof r === "object" && r !== null ? (r as { decision?: unknown }).decision : null;
   if (typeof decision !== "object" || decision === null) return;
+  if (agent === "cursor") {
+    // Only a refusal is ever printed for Cursor: an `allow` would change nothing there, and nothing printed lets Cursor ask.
+    const d = decision as { permission?: unknown; user_message?: unknown; agent_message?: unknown };
+    if (d.permission !== "deny") return;
+    const out = JSON.stringify({ permission: "deny", user_message: String(d.user_message ?? ""), agent_message: String(d.agent_message ?? "") });
+    await new Promise<void>((resolve) => process.stdout.write(out, () => resolve()));
+    return;
+  }
   const behavior = (decision as { behavior?: unknown }).behavior;
   if (behavior !== "allow" && behavior !== "deny") return;
   const out = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } });

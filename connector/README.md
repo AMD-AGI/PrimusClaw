@@ -576,12 +576,41 @@ directory only you can enter).
 - A card nobody answers is withdrawn after an hour; the terminal still has the question. The audit log records each request,
   answer and withdrawal (`approval_requested`, `permission_resolved`, `approval_withdrawn`), never what was typed.
 
+### Cursor
+
+```sh
+claw-connector hooks install --approvals --agent cursor [--hold 60]   # "hooks uninstall --agent cursor" takes them out
+```
+
+This adds `beforeShellExecution` and `beforeMCPExecution` hooks, plus `afterShellExecution`, `afterMCPExecution`,
+`postToolUseFailure`, `beforeSubmitPrompt`, `stop` and `sessionEnd`, to the user-level `hooks.json` of the Cursor configuration
+directory (`$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`; `--config-dir` names another), merged the same way
+(marked `--managed-by claw-connector`). Their questions are filed under a `cursor` agent of `agents.toml` whose Cursor directory that is,
+and only for folders inside its roots.
+
+Cursor's hooks can do less than Claude Code's (measured on the Cursor Agent CLI 2026.11.11): a hook runs *before* Cursor decides
+whether to ask, Cursor shows its own question only after the hook has returned, and a hook can turn a call down or let Cursor ask, but
+never approve one. So for Cursor the phone goes first and the terminal second:
+
+- A shell command or MCP call that Cursor would ask about (not on the allow lists of `cli-config.json` or the project's
+  `.cursor/cli.json`, not run in the sandbox, Run Everything off) is put on your phone, and Cursor waits up to `--hold` seconds
+  (default 60, 5 to 3600) while it is there. The terminal shows "Working" meanwhile.
+- **No** on the phone blocks it (the agent is told you declined it from your phone). **Ask me at the terminal**, or no answer
+  within the hold, lets Cursor go on as it would have: it asks at the terminal, where you approve it. There is no **Yes** on the
+  phone, because Cursor would still ask at the terminal.
+- Ctrl-C at the terminal, a new prompt or the end of the conversation withdraws the card at once.
+- A call Cursor would not ask about is neither put on the phone nor held. That is judged from those files: a command line this
+  cannot split for sure (`$(...)`, backticks) counts as asked about, and Cursor's own extra checks (a recursive delete outside the
+  sandbox, an administrator's list) are not seen, so such a call is asked about at the terminal only.
+- Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
+  editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
+
 ## Commands
 
 | Command | |
 |---|---|
 | `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks before adding the Claude Code session hooks to Claude's `settings.json`; `--hooks` adds them without asking, `--no-hooks` skips them, and with nobody to answer (a script, a pipe) they are not added and the `hooks install` command is printed instead. |
-| `hooks install\|uninstall\|status [--approvals]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
+| `hooks install\|uninstall\|status [--approvals] [--agent claude\|cursor] [--hold SECONDS]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). `--agent cursor`: Cursor's approval hooks instead (see [Cursor](#cursor)), in the Cursor directory of each `cursor` agent; `--hold` is how long Cursor waits for the phone. |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |

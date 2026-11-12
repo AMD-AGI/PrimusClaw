@@ -53,6 +53,8 @@ export interface HarnessOptions {
   /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
   preset?: string;
   safeModes?: string[];
+  /** The kind of the "fake" agent (default "example"; "cursor" makes it the agent Cursor's approval hooks are filed under). */
+  kind?: string;
   /** A second agent, "fake2", on the same stand-in adapter; this is the rest of its table (for example `approval = "never"`). */
   secondToml?: string;
   timing?: Partial<ConnectorTiming>;
@@ -108,7 +110,7 @@ export class Harness {
     const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
 id = ${JSON.stringify(id)}
-${o.attach && id === "fake" ? "" : 'kind = "example"'}
+${o.attach && id === "fake" ? "" : `kind = ${JSON.stringify(id === "fake" && o.kind ? o.kind : "example")}`}
 name = "Fake agent"
 ${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
