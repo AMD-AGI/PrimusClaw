@@ -469,6 +469,11 @@ export interface SaveSkillOptions {
   query?: Querier;
   /** Where a new (or revived) skill came from. An update keeps the origin the skill was created with. */
   origin?: SkillOrigin;
+  /**
+   * Refuse rather than update when the name is already visible. For the platform's own new skills: a skill the user
+   * created meanwhile, under the lock this save takes, is never overwritten with generated content.
+   */
+  createOnly?: boolean;
 }
 
 /**
@@ -503,6 +508,9 @@ export async function saveSkill(
       [skillName, userId]
     )).rows[0];
 
+    if (visibleRow && opts.createOnly) {
+      return { ok: false, error: "invalid", message: `skill '${skillName}' already exists; nothing was saved` };
+    }
     if (visibleRow) {
       const newStatus = visibleRow.status === "probation" && source === "manual"
         ? "active"
@@ -1377,22 +1385,28 @@ async function promotePatternToSkill(userId: string, patternId: number): Promise
   }
 
   // Save as 'auto-pattern' source → starts in 'probation'. A user with no room keeps every skill they have.
-  const saved = await saveSkill(
-    result.skill_name, userId,
-    result.skill_content, "auto-pattern",
-    sampledIds[sampledIds.length - 1],
-    result.skill_description || "",
-    { origin: "auto" },
-  );
+  // createOnly: the collision check above ran before the lock; a skill of this name created since is not overwritten.
+  const saved = await inTransaction(async (q) => {
+    const r = await saveSkill(
+      result.skill_name!, userId,
+      result.skill_content!, "auto-pattern",
+      sampledIds[sampledIds.length - 1],
+      result.skill_description || "",
+      { origin: "auto", createOnly: true, query: q },
+    );
+    if (r.ok) {
+      await recordSkillEvent(q, {
+        userId, skillName: result.skill_name!, version: r.version, op: "create", actor: "auto",
+        detail: { origin: "auto", pattern_id: patternId },
+      });
+    }
+    return r;
+  });
   if (!saved.ok) {
     logger.info({ patternId, userId, reason: saved.error }, "skill.pattern_promote_refused");
     await releaseClaim();
     return;
   }
-  await recordSkillEvent(db.query, {
-    userId, skillName: result.skill_name, version: saved.version, op: saved.created ? "create" : "update", actor: "auto",
-    detail: { origin: "auto", pattern_id: patternId },
-  }).catch((err) => logger.warn({ err: (err as Error)?.message }, "skill.auto_audit_failed"));
 
   // Find the new skill row and link it back to the pattern
   const skillRow = (await db.query(
@@ -1439,17 +1453,21 @@ export async function maybeCreateSkill(sessionId: string, userId: string, event:
       if (blocked) { logger.warn({ reason: blocked }, "skill.create_blocked"); return; }
 
       // Delegate to saveSkill so soft-deleted rows are revived correctly; a full user is refused, never evicted.
-      const saved = await saveSkill(
-        result.skill_name, userId,
-        result.skill_content, "auto",
-        sessionId, result.skill_description || "",
-        { origin: "auto" },
-      );
+      const saved = await inTransaction(async (q) => {
+        const r = await saveSkill(
+          result.skill_name!, userId,
+          result.skill_content!, "auto",
+          sessionId, result.skill_description || "",
+          { origin: "auto", createOnly: true, query: q },
+        );
+        if (r.ok) {
+          await recordSkillEvent(q, {
+            userId, skillName: result.skill_name!, version: r.version, op: "create", actor: "auto", sessionId, detail: { origin: "auto" },
+          });
+        }
+        return r;
+      });
       if (!saved.ok) { logger.info({ userId, reason: saved.error }, "skill.create_refused"); return; }
-      await recordSkillEvent(db.query, {
-        userId, skillName: result.skill_name, version: saved.version, op: saved.created ? "create" : "update", actor: "auto",
-        sessionId, detail: { origin: "auto" },
-      }).catch((err) => logger.warn({ err: (err as Error)?.message }, "skill.auto_audit_failed"));
       // Set change_reason separately (saveSkill doesn't accept it)
       await db.query(
         `UPDATE claw_skills SET change_reason = $1 WHERE skill_name = $2 AND user_id = $3 AND deleted_at IS NULL`,
@@ -2085,6 +2103,9 @@ async function applyEvolveBatch(
   let mutationVersionsApplied = 0;
   try {
     await client.query("BEGIN");
+    // Under the user's skill lock, as every other write: the limit check before COMMIT holds only if no other write
+    // to the skill can commit in between.
+    await lockUserSkills((text, params) => client.query(text, params), userId);
     let bumpVersion = false;
     const changeReasons: string[] = [];
 
@@ -2309,6 +2330,7 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
     let undoneCount = 0;
     try {
       await client.query("BEGIN");
+      await lockUserSkills((text, params) => client.query(text, params), userId);
       let needVersionDecrement = false;
       for (const m of [...muts].reverse()) {
         if (m.type === "improve_skill" && m.previous_content) {

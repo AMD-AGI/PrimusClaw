@@ -24,7 +24,7 @@
  *   K11 a disabled skill is kept but not offered to a turn
  *   K12 a delete is audited; a draft older than 24 hours is cleaned up, a newer one kept
  *   K13 the platform's own save (source auto) is refused when full and drops nothing, and so is an unproven one past
- *       the probation limit
+ *       the probation limit; a new one never overwrites a skill of the user's with that name
  *   K14 the same save twice (a completion handled again) writes and records once
  *   K15 a longer SKILL.md that, with the files the skill already has, passes 256 KB is refused
  */
@@ -346,6 +346,13 @@ describe("personal skills: save", { skip }, () => {
     assert.deepEqual([sixth.ok, (sixth as any).error], [false, "full"]);
     const rows = await skills();
     assert.deepEqual(rows.map((x) => [x.skill_name, x.status, x.deleted_at]), [0, 1, 2, 3, 4].map((i) => [`auto-${i}`, "probation", null]), "no unproven skill was dropped for it");
+
+    // A new skill the platform makes never overwrites one of the user's that has the name by now.
+    assert.equal((await save({ name: "users-own", content: "the user's text" })).ok, true);
+    const clash = await svc.saveSkill("users-own", "alice", "generated text", "auto-pattern", "s-1", "d", { origin: "auto", createOnly: true });
+    assert.equal(clash.ok, false);
+    const [own] = await q("SELECT content, source, origin FROM claw_skills WHERE skill_name = 'users-own'");
+    assert.deepEqual([own.content, own.source, own.origin], ["the user's text", "manual", "api"]);
   });
 
   test("K14 the same save twice writes and records once", async () => {
