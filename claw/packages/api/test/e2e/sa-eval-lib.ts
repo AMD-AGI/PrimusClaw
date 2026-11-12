@@ -1469,10 +1469,13 @@ export function asksUser(text: string, choices = 0): boolean {
   // The sentences of the reply (a list item or a line is one), and the clauses of each that are no offer.
   const sentences = text.split(/[。！!；;\n]+|(?<=[.])\s+/).map((t) => t.trim()).filter(Boolean);
   return sentences.some((sentence) => {
-    const kept = sentence.split(/[,，]/).map((c) => c.replace(/^[^\p{L}\p{N}]+/u, "").trim()).filter((c) => c && !CLOSING_OFFER.test(c));
+    const kept = sentence.split(/[,，]/).map((c) => c.replace(/^[^\p{L}\p{N}]+/u, "").trim())
+      .filter((c) => c && !CLOSING_OFFER.test(c) && !NEGATED.test(c));
     return kept.length > 0 && ASKS.some((re) => re.test(kept.join(", ")));
   });
 }
+/** A clause that says no request is needed ("不需要你提供仓库名", "No need to send the repository"). */
+const NEGATED = /不需要|不用|无需|不必|不想|没必要|\b(no need|don't need|do not need|not necessary|needn't)\b/i;
 /** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
 const CLOSING_OFFER = new RegExp([
   String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?(有|需要)(任何|其他|别的|更多|什么)?(问题|疑问|需要|帮助|事|其他|别的)`,

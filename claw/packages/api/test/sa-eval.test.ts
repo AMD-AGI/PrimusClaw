@@ -1419,6 +1419,7 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "请直接提供仓库名。", "请直接给我仓库名。", "请直接说明你要哪个仓库。", "Please directly provide the repository name.", "麻烦告知我仓库名。",
     "请帮忙提供仓库名。", "请尽快告知我仓库名。", "请务必提供仓库和测试名。", "麻烦帮我确认仓库名。", "Kindly provide the repository name.",
     "Please make sure to provide the repository name.",
+    "请不要猜，告诉我仓库名。",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
@@ -1459,6 +1460,7 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "你昨天告诉我的仓库已经处理好了。", "你要的报告已经发了，还是老样子。",
     "我需要确认仓库名。", "我需要检查一下仓库名。", "我需要核对仓库地址。", "项目负责人已经告知我仓库暂停维护。", "我已经告知我们团队这个结果。",
     "我需要知道的内容刚才已经说过了。",
+    "不需要你提供仓库名。", "不需要您提供仓库名。", "我不需要你提供仓库名。", "我不想请你提供仓库名。", "No need to send me the repository.",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
