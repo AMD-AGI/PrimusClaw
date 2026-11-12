@@ -141,6 +141,12 @@
    },
    {
     "type": "table",
+    "name": "group_language",
+    "tbl_name": "group_language",
+    "sql": "CREATE TABLE group_language (\n  conversation_id TEXT PRIMARY KEY, lang TEXT NOT NULL, updated_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "held_events",
     "tbl_name": "held_events",
     "sql": "CREATE TABLE held_events (\n  event_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, event_json TEXT NOT NULL, held_at REAL NOT NULL)"
@@ -1555,6 +1561,43 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_group_context_off_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "group_language": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "conversation_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "lang",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "updated_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_group_language_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0
@@ -3222,6 +3265,12 @@
    },
    {
     "type": "table",
+    "name": "group_language",
+    "tbl_name": "group_language",
+    "sql": "CREATE TABLE group_language (\n  conversation_id TEXT PRIMARY KEY, lang TEXT NOT NULL, updated_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "held_events",
     "tbl_name": "held_events",
     "sql": "CREATE TABLE held_events (\n  event_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, event_json TEXT NOT NULL, held_at REAL NOT NULL)"
@@ -4636,6 +4685,43 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_group_context_off_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "group_language": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "conversation_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "lang",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "updated_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_group_language_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0

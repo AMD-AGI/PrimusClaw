@@ -43,12 +43,14 @@ export class RouterContext {
   /** The chat an event is answered in: its conversation, as the person who sent it. */
   chatOf(event: InboundEvent, scope: string): Chat {
     const conversation = this.deps.surface.conversation(event.conversation);
-    return new Chat(this.deps.store, event.sender, conversation, scope, event.locale);
+    const written = event.type === "message" ? event.text : "";
+    return new Chat(this.deps.store, event.sender, conversation, scope, event.locale, written);
   }
 
   /** A chat in another conversation of the same person (their 1:1 chat, a group a request waited in). */
   chatIn(chat: Chat, ref: ConversationRef, scope = ""): Chat {
-    return new Chat(this.deps.store, chat.sender, this.deps.surface.conversation(ref), scope, chat.locale);
+    const written = scope ? chat.written : "";
+    return new Chat(this.deps.store, chat.sender, this.deps.surface.conversation(ref), scope, chat.locale, written);
   }
 
   /** A click as a feature handler is given it. */

@@ -12,9 +12,10 @@ import { groupText } from "../locales/group.js";
 import type { MessageInterceptor, MessageRoute } from "../ports/routing.js";
 import type { InboundAction, InboundMessage } from "../ports/surface.js";
 import { pyLower, pySplit } from "../text/py-text.js";
-import { helpLang, learnLang, type Chat } from "./chat.js";
+import { groupChosenLang, learnLang, type Chat } from "./chat.js";
 import type { SessionCommands } from "./commands-session.js";
 import type { RouterContext } from "./context.js";
+import { GROUP_LANG_VERB, type GroupLanguages } from "./group-language.js";
 import type { GroupRemote, GroupWords } from "./group-remote.js";
 import type { Onboarding } from "./onboarding.js";
 import { hasFiles, type PersonalText } from "./personal-text.js";
@@ -42,6 +43,7 @@ export class GroupRouter {
     private readonly onboarding: Onboarding,
     private readonly remote: GroupRemote,
     private readonly starter: TurnStarter,
+    private readonly languages: GroupLanguages,
   ) {}
 
   async route(event: InboundMessage | InboundAction, chat: Chat): Promise<void> {
@@ -58,6 +60,10 @@ export class GroupRouter {
       await this.onboarding.click(action, chat);
       return;
     }
+    if (action.verb === GROUP_LANG_VERB) {
+      await this.languages.click(action, chat); // (the chat's: anyone in it may pick)
+      return;
+    }
     const handler = this.ctx.deps.handlers.clicks.find((h) => h.verbs.includes(action.verb));
     if (handler?.inGroup !== undefined) await handler.inGroup(this.ctx.clickRoute(action, chat));
   }
@@ -72,6 +78,11 @@ export class GroupRouter {
     const words = this.words(message);
     learnLang(this.ctx.deps.store, chat.sender.id, message.text);
     const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
+    // (the group's language is the chat's: set by anyone, read before the account check; and asked once, at the first @mention,
+    // whatever it says: a `/lang` that set it leaves nothing to ask)
+    const language = !choice && (await this.languages.command(chat, words.text));
+    await this.languages.askOnce(chat);
+    if (language) return;
     if (!choice && (await this.groupOwn(message, chat, words))) return;
     const route: MessageRoute = {
       sender: chat.sender,
@@ -101,7 +112,7 @@ export class GroupRouter {
     const [first = ""] = pySplit(words.text);
     const word = pyLower(first);
     if (empty || word === "/help") {
-      const lang = helpLang(this.ctx.deps.store, chat.sender.id, chat.locale, message.text);
+      const lang = chat.lang(); // (the group's language; with none, that of the words that asked)
       // (`assistant`: what help says a 1:1 chat adds is what the asker's own 1:1 chat offers; nothing of their settings is shown)
       const assistant = this.ctx.deps.assistant.on(chat.sender.id);
       const groupContext = this.ctx.deps.groupHistory.kept(message.conversation.id); // (a group that said /context off keeps none)
@@ -117,11 +128,11 @@ export class GroupRouter {
       return true;
     }
     if (github !== undefined && word === "/github") {
-      await chat.say(groupText.in("en").githubOneToOne);
+      await chat.say(groupText.in(chat.lang()).githubOneToOne);
       return true;
     }
     if (!this.oneToOneOnly(word, words.text, remote.enabled)) return false;
-    await chat.say(groupText.in("en").oneToOneOnly({ word }));
+    await chat.say(groupText.in(chat.lang()).oneToOneOnly({ word }));
     return true;
   }
 
@@ -192,7 +203,7 @@ export class GroupRouter {
   }
 
   private async stopReviews(chat: Chat, pulls: readonly (readonly [string, number])[], text: string): Promise<void> {
-    const zh = hasCjk(text);
+    const zh = (groupChosenLang(this.ctx.deps.store, chat.scope) ?? (hasCjk(text) ? "zh" : "en")) === "zh";
     const said = groupText.in(zh ? "zh" : "en");
     const key = await this.ctx.credentials.credential(chat, false);
     let items: WorkItem[] | undefined;

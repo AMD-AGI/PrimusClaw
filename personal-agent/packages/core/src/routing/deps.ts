@@ -61,6 +61,7 @@ export type RouterStore = Pick<
   | "links"
   | "references"
   | "prefs"
+  | "groupLanguage"
   | "members"
   | "sessions"
   | "repoHistory"

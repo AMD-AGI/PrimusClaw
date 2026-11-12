@@ -15,6 +15,7 @@ import { SessionCommands } from "./commands-session.js";
 import { SettingsCommands } from "./commands-settings.js";
 import { RouterContext } from "./context.js";
 import type { RouterDeps } from "./deps.js";
+import { GroupLanguages } from "./group-language.js";
 import { GroupRemote } from "./group-remote.js";
 import { GroupRouter } from "./group-router.js";
 import { LinkCommands } from "./link-commands.js";
@@ -57,6 +58,7 @@ export class Router {
       this.onboarding,
       new GroupRemote(this.ctx, this.text),
       this.starter,
+      new GroupLanguages(this.ctx),
     );
   }
 

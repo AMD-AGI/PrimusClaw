@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import type { RemoteAgentCommand, RemotePrompt } from "../../src/routing/features.js";
 import { ALICE, BOB } from "./fixtures.js";
-import { link, message, said, world } from "./world.js";
+import { groupAsked, link, message, said, world } from "./world.js";
 
 function bound() {
   const keys = new Set<string>();
@@ -33,6 +33,7 @@ function bound() {
   });
   link(w, ALICE.id, "ak-alice");
   link(w, BOB.id, "ak-bob");
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   const say = (text: string, user = ALICE) =>
     w.router.handle(message(text, { kind: "group", conversation: "g-1", user }));
   return { w, keys, prompts, agents, stops, say };
