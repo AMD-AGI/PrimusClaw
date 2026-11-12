@@ -16,6 +16,7 @@ import { toInboundEvent } from "../../packages/teams/src/activity/inbound/to-eve
 import { assistantRenderers } from "../../packages/teams/src/views/assistant/index.js";
 import { AssistantChoiceClicks } from "../../packages/core/src/assistant/choice-clicks.js";
 import { SayPlanner } from "../../packages/core/src/assistant/say.js";
+import { silentLogger } from "../../packages/core/src/ports/logger.js";
 import { AssistantWorld, ALICE } from "./assistant-world.js";
 import { world } from "../routing/world.js";
 
@@ -31,6 +32,7 @@ async function teamsWorld() {
         new AssistantChoiceClicks({
           store: aw.store,
           deliver: (message) => (late.w ? late.w.router.handle(message) : Promise.reject(new Error("no router"))),
+          logger: silentLogger,
         }),
       ],
     },

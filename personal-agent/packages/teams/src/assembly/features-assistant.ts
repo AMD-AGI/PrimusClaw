@@ -183,7 +183,7 @@ export function assistantParts(base: AssemblyBase, inputs: AssistantInputs): Ass
   });
   const watch = new WatchClicks({ store, claw: claw.workItems, exchange, logger });
   const linked = (userId: string): boolean => store.links.getKey(userId) !== null;
-  const choices = new AssistantChoiceClicks({ store, deliver: (message) => hooks.typed(message) });
+  const choices = new AssistantChoiceClicks({ store, deliver: (message) => hooks.typed(message), logger });
   const clicks = [new WorkCardClicks(work, watch, exchange, linked, logger), actionClicks(actions), choices];
   return { subs, chat: assistant, board, receipts, directChat, actions, clicks };
 }

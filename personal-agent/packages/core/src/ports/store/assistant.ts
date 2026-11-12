@@ -74,10 +74,12 @@ export interface ChoiceCard {
   readonly text: string;
   readonly options: readonly string[];
   readonly multiple: boolean;
-  /** What was picked and sent, in the card's order (empty while it is open). */
+  /** What was picked, in the card's order: being sent ('busy') or sent ('done'); empty before the first press. */
   readonly chosen: readonly string[];
-  /** 'open' until it is sent, then 'done'. */
+  /** 'open'; 'busy' while a press sends it (since `busyAt`); 'done' once it was sent. */
   readonly state: CardState;
+  /** When the press that is sending it began (0 never). */
+  readonly busyAt: number;
   readonly lang: string;
   readonly createdAt: number;
 }
@@ -128,8 +130,13 @@ export interface AssistantButtonRepository {
   ): string;
   /** Null once it is older than ASSISTANT_MESSAGE_KEEP_SECONDS. */
   getChoiceCard(cardId: string): ChoiceCard | null;
-  /** An open card is sent with `chosen` (it moves to 'done'); true if this call sent it, so of two presses exactly one is sent. */
-  chooseChoiceCard(cardId: string, chosen: readonly string[]): boolean;
+  /**
+   * A press claims the card to send `chosen`: an open card, or one a press began sending more than `staleSeconds` ago and never
+   * finished (the worker stopped mid-send), moves to 'busy' with `chosen`. True if this call claimed it, so of two presses
+   * exactly one sends.
+   */
+  claimChoiceCard(cardId: string, chosen: readonly string[], staleSeconds: number): boolean;
+  moveChoiceCard(cardId: string, state: CardState, options?: MoveOptions): boolean;
 }
 
 export interface AssistantMessageRepository {

@@ -68,6 +68,8 @@ export const assistantCardText = defineCatalog({
     choiceNone: "Pick an option first, then press Send.",
     choiceSent: (p: { answer: string }) => `Sent: ${p.answer}`,
     choiceGone: "This choice is no longer open. Reply in the chat instead.",
+    choiceSending: (p: { answer: string }) => `Sending: ${p.answer}`,
+    choiceFailed: "That did not go through. Press Send again.",
     /** How the options picked are joined into the person's message. */
     choiceJoin: ", ",
   },
@@ -116,6 +118,8 @@ export const assistantCardText = defineCatalog({
     choiceNone: "请先选一项，再点发送。",
     choiceSent: (p) => `已发送：${p.answer}`,
     choiceGone: "这个选择已经失效，请直接在聊天里回复。",
+    choiceSending: (p) => `正在发送：${p.answer}`,
+    choiceFailed: "没有发出去，请再点一次发送。",
     choiceJoin: "、",
   },
 });

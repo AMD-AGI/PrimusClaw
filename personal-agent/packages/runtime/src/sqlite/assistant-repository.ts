@@ -256,7 +256,7 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
 
   getChoiceCard(cardId: string): ChoiceCard | null {
     const row = this.ctx.db.get(
-      "SELECT card_id, aad_id, text, options_json, multiple, chosen_json, lang, state, created_at FROM assistant_choice_cards " +
+      "SELECT card_id, aad_id, text, options_json, multiple, chosen_json, lang, state, busy_at, created_at FROM assistant_choice_cards " +
         "WHERE card_id = ? AND created_at >= ?",
       cardId,
       this.ctx.now() - ASSISTANT_MESSAGE_KEEP_SECONDS,
@@ -271,18 +271,27 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
       chosen: jsonStrings(col.str(row, "chosen_json") || "[]"),
       lang: col.str(row, "lang"),
       state: col.str(row, "state"),
+      busyAt: col.num(row, "busy_at"),
       createdAt: col.num(row, "created_at"),
     };
   }
 
-  chooseChoiceCard(cardId: string, chosen: readonly string[]): boolean {
+  claimChoiceCard(cardId: string, chosen: readonly string[], staleSeconds: number): boolean {
+    const now = this.ctx.now();
     return (
       this.ctx.db.run(
-        "UPDATE assistant_choice_cards SET state = 'done', chosen_json = ? WHERE card_id = ? AND state = 'open'",
+        "UPDATE assistant_choice_cards SET state = 'busy', chosen_json = ?, busy_at = ? " +
+          "WHERE card_id = ? AND (state = 'open' OR (state = 'busy' AND busy_at < ?))",
         pyJsonDumps(chosen),
+        now,
         cardId,
+        now - staleSeconds,
       ) === 1
     );
+  }
+
+  moveChoiceCard(cardId: string, state: CardState, options?: MoveOptions): boolean {
+    return moveCard(this.ctx.db, "assistant_choice_cards", cardId, state, options);
   }
 }
 
