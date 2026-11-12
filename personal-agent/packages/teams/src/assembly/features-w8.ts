@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 
 import type { JsonObject, OutMessage, UserRef } from "@primusclaw/personal-agent";
 import {
+  chatCredentialOf,
   DailyBrief,
   FeedbackFlow,
   FeedbackReporting,
@@ -122,7 +123,9 @@ export function w8Parts(
     reporting,
     sessions: store.sessions,
     claw: { sessions: claw.sessions, assistant: claw.assistant },
-    credential,
+    // A vote is cast as the person's chats run: someone bound but never linked has no key, and their turns run on the
+    // exchanged token, so a key-only vote was never recorded for them.
+    credential: chatCredentialOf(store.links, settings.exchange.forChat ? base.exchange : undefined),
     assistantOn: options.assistantOn,
     sha256Hex: (text) => createHash("sha256").update(text, "utf8").digest("hex"),
     mask,

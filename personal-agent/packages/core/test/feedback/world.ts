@@ -7,6 +7,7 @@
  * surface, and routes built the way the router hands them over. Mirrors the Python tests' `linked_world`.
  */
 import {
+  chatCredentialOf,
   ClawError,
   FeedbackFlow,
   FeedbackReporting,
@@ -33,6 +34,7 @@ import {
   type SettleOptions,
   type SinkError,
   type SseEvent,
+  type TokenExchange,
   type UserRef,
 } from "@primusclaw/personal-agent";
 import { createHash } from "node:crypto";
@@ -213,6 +215,8 @@ export interface WorldOptions {
   /** What the platform says of a key: an owner, nothing, a failure, or no answer at all. */
   readonly lookup?: KeyOwner | "fail" | "never" | undefined;
   readonly assistantOn?: boolean;
+  /** Chats run on this exchange (as the assembly passes it to the thumbs); none: on the linked key. */
+  readonly exchange?: TokenExchange;
 }
 
 export type World = ReturnType<typeof makeWorld>;
@@ -267,7 +271,7 @@ export function makeWorld(options: WorldOptions = {}) {
     reporting,
     sessions: store.sessions,
     claw,
-    credential,
+    credential: chatCredentialOf(store.links, options.exchange),
     assistantOn: () => options.assistantOn ?? false,
     sha256Hex: (text) => createHash("sha256").update(text).digest("hex"),
     mask,
