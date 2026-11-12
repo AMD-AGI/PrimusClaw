@@ -26,7 +26,7 @@ import {
   type HttpResponse,
   type HttpRoute,
 } from "@primusclaw/personal-agent-runtime";
-import type { GateSubscriptions } from "@primusclaw/personal-agent-worker";
+import type { GateSubscriptions } from "@primusclaw/personal-agent-runtime/worker";
 import { z } from "zod";
 
 import type { JsonObject } from "../cards/json.js";

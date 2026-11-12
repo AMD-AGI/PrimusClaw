@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 
 import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { silentLogger } from "@primusclaw/personal-agent";
-import { StartupError } from "@primusclaw/personal-agent-worker";
+import { StartupError } from "@primusclaw/personal-agent-runtime/worker";
 
 import { FederatedCredential, readWorkerKey } from "../azure/workload-identity.js";
 import type { TeamsSettings } from "../config/env.js";

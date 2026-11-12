@@ -111,7 +111,7 @@ jobs:
           echo "workflow_changed=false" >> $GITHUB_OUTPUT
         fi
 
-        # personal-agent-teams: the four npm packages, built from personal-agent/ and the Claw wire contract it
+        # personal-agent-teams: the three npm packages, built from personal-agent/ and the Claw wire contract it
         # compiles in (claw/packages/protocol), installed into personal-agent/Dockerfile's image. Built only:
         # never pushed by this workflow (see "Push with Buildah").
         if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(personal-agent/|claw/packages/protocol/|claw/tsconfig\.base\.json$|LICENSE$)'; then
@@ -226,7 +226,7 @@ jobs:
             exit 1
           fi
 
-      # The personal agent's image as it would run: as uid 65534, with the four packages at the version they were
+      # The personal agent's image as it would run: as uid 65534, with the three packages at the version they were
       # built as, and, started through the release gate's test entry (loopback only, no queue, no real Teams or
       # Claw), answering /healthz and naming its build on /metrics.
       - name: Smoke-test the personal agent image
@@ -241,9 +241,9 @@ jobs:
           USER_ID=$(podman run --rm "$IMAGE" id -u)
           echo "user in image: $USER_ID"
           [[ "$USER_ID" == "65534" ]] || { echo "::error::the image runs as uid $USER_ID, expected 65534"; exit 1; }
-          GOT=$(podman run --rm -w /app "$IMAGE" node -p 'const v=(n)=>require("./node_modules/@primusclaw/"+n+"/package.json").version; [v("personal-agent"),v("personal-agent-runtime"),v("personal-agent-worker"),v("personal-agent-teams")].join(" ")')
+          GOT=$(podman run --rm -w /app "$IMAGE" node -p 'const v=(n)=>require("./node_modules/@primusclaw/"+n+"/package.json").version; [v("personal-agent"),v("personal-agent-runtime"),v("personal-agent-teams")].join(" ")')
           echo "packages in image: $GOT"
-          [[ "$GOT" == "$VERSION $VERSION $VERSION $VERSION" ]] || { echo "::error::packages in the image are '$GOT', expected $VERSION"; exit 1; }
+          [[ "$GOT" == "$VERSION $VERSION $VERSION" ]] || { echo "::error::packages in the image are '$GOT', expected $VERSION"; exit 1; }
           podman run -d --name pa-smoke --network host \
             -e TEAMS_ENCRYPTION_KEYS="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_')" \
             -e TEAMS_DB_PATH=/data/state.db -e PUBLIC_BASE_URL=https://claw.example.com \

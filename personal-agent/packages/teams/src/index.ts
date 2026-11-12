@@ -3,8 +3,8 @@
 
 /**
  * @primusclaw/personal-agent-teams: the personal agent on Microsoft Teams. It implements core's Surface for Teams and runs
- * the worker package's process on it (`teamsSurface`, `buildWorker`, `main`); it depends on core, on the runtime's public
- * interface and on the worker package, never on another surface package.
+ * runtime's worker process on it (`teamsSurface`, `buildWorker`, `main`); it depends on core, on the runtime's public
+ * interface and on runtime's worker (`@primusclaw/personal-agent-runtime/worker`), never on another surface package.
  */
 export * from "./caps.js";
 export * from "./activity/reference.js";
@@ -21,6 +21,6 @@ export type {
   WorkerEnv,
   WorkerOptions,
   WorkerServices,
-} from "@primusclaw/personal-agent-worker";
+} from "@primusclaw/personal-agent-runtime/worker";
 export { buildWorker, teamsSurface } from "./assembly/worker.js";
 export { main } from "./main.js";

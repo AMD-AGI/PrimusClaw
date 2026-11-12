@@ -91,6 +91,7 @@ test("Teams is named as people know it, with the teams package's version, and th
     teamsSettingsFromEnv({ TEAMS_INSTALL_HINT_URL: "https://teams.example/app" }, { queues: false }),
   );
   assert.equal(shape.channelName, "Teams");
+  assert.equal(shape.surfaceId, "teams");
   assert.equal(shape.installHintUrl, "https://teams.example/app");
   assert.match(shape.version, /^\d+\.\d+\.\d+$/);
   assert.equal(teamsSurface().name, "teams");

@@ -1,7 +1,7 @@
 {
   "name": "@primusclaw/personal-agent-runtime",
   "version": "0.7.2",
-  "description": "Node adapters for the personal agent's ports: clock, randomness, logging (and, as the port lands, storage, Claw, metrics, HTTP).",
+  "description": "Node adapters for the personal agent's ports (clock, randomness, logging, storage, Claw, metrics, HTTP), and, at @primusclaw/personal-agent-runtime/worker, the worker process on any chat surface.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,6 +17,10 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/types/worker.d.ts",
+      "default": "./dist/worker.js"
     }
   },
   "files": [

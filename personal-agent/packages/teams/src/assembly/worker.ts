@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The worker on Teams (`BuildWorker`): the worker package's assembly with the Teams surface. What is Teams' own is here:
+ * The worker on Teams (`BuildWorker`): runtime's worker assembly with the Teams surface. What is Teams' own is here:
  * its settings (OUTBOUND_MODE, BOT_*, SERVICEBUS_*, the reply style), secrets from Azure Key Vault, how it reaches Teams
  * (the outbound queue or the Bot Connector), its `TeamsSurface` with the Adaptive Card renderers, the inbound queue's
  * consumer, and the release gate's test entry (its routes on the loopback instead of the queue).
@@ -27,7 +27,7 @@ import {
   type SurfaceDeps,
   type SurfaceShape,
   type WorkerEnv,
-} from "@primusclaw/personal-agent-worker";
+} from "@primusclaw/personal-agent-runtime/worker";
 
 import { toInboundEvent } from "../activity/inbound/to-event.js";
 import { activityOfReference } from "../activity/outbound.js";
@@ -108,6 +108,7 @@ export function teamsShape(teams: Pick<TeamsSettings, "style" | "installHintUrl"
     restoreRef: (stored) => restoreConversationRef(stored),
     refOf,
     followWire,
+    surfaceId: "teams",
     channelName: "Teams",
     version: teamsVersion(),
   };

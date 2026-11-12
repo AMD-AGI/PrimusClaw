@@ -2,7 +2,7 @@
   "name": "@primusclaw/personal-agent-workspace",
   "version": "0.0.0",
   "private": true,
-  "description": "The personal agent: a chat assistant that works through Claw. Channel-neutral core, Node runtime adapters, the surface-neutral worker, Microsoft Teams adapter.",
+  "description": "The personal agent: a chat assistant that works through Claw. Channel-neutral core, Node runtime adapters, Microsoft Teams adapter.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -11,7 +11,6 @@
   "workspaces": [
     "packages/core",
     "packages/runtime",
-    "packages/worker",
     "packages/teams",
     "packages/teams-ingress"
   ],

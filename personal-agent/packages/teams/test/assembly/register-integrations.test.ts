@@ -20,7 +20,7 @@ import {
   silentLogger,
   type IntegrationRegistry,
 } from "@primusclaw/personal-agent";
-import { withRegistered } from "@primusclaw/personal-agent-worker";
+import { withRegistered } from "@primusclaw/personal-agent-runtime/worker";
 
 import { buildWorker } from "../../src/assembly/worker.js";
 

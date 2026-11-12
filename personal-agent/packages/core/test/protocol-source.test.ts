@@ -43,7 +43,7 @@ test("no other file of any package reaches into the protocol package, and none r
     .filter(([, v]) => typeof v !== "function")
     .map(([k]) => k);
   const restated = new RegExp(`\\b(?:const|let|var)\\s+(?:${constants.join("|")})\\b`);
-  const files = ["core", "runtime", "worker", "teams"].flatMap((p) => sourceFiles(path.join(packages, p, "src")));
+  const files = ["core", "runtime", "teams"].flatMap((p) => sourceFiles(path.join(packages, p, "src")));
   assert.ok(files.length > 0);
   for (const file of files) {
     const text = fs.readFileSync(file, "utf8");

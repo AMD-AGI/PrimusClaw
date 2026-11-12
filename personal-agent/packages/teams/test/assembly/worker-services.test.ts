@@ -14,7 +14,7 @@ import { after, before, it } from "node:test";
 
 import { noMetrics, SecurityLog, silentLogger, type InboundEvent, type Router } from "@primusclaw/personal-agent";
 import { alsRequestScope } from "@primusclaw/personal-agent-runtime";
-import { ON_BEHALF_PATH, workerServices, type WorkerServices } from "@primusclaw/personal-agent-worker";
+import { ON_BEHALF_PATH, workerServices, type WorkerServices } from "@primusclaw/personal-agent-runtime/worker";
 
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { openTestStore } from "../../../../test-support/store.js";

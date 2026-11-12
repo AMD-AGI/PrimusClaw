@@ -60,6 +60,11 @@ export interface SurfaceShape {
    * review was asked in (Teams: service_url, tenant, bot_id).
    */
   followWire(asked: ConversationRef): Readonly<Record<string, string>>;
+  /**
+   * The surface's id on the Claw wire ("teams", "slack"): sent as the person's notification subscription's `surface`, so
+   * Claw sends an assistant reply back to the surface the message came from.
+   */
+  readonly surfaceId: string;
   /** The surface's name as people know it ("Teams"): what a report's words and an unreadable file's line call it. */
   readonly channelName: string;
   /** The build the worker runs (the surface package's version): what a report names. */

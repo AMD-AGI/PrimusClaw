@@ -7,7 +7,7 @@
  * before it takes a message: status 2 for a secret that cannot be read, 1 for anything else (a setting that cannot work).
  */
 import { neutralPlugins, type Plugins } from "@primusclaw/personal-agent";
-import { runMain, type PluginFactory, type WorkerEnv } from "@primusclaw/personal-agent-worker";
+import { runMain, type PluginFactory, type WorkerEnv } from "@primusclaw/personal-agent-runtime/worker";
 
 import { buildWorker } from "./assembly/worker.js";
 

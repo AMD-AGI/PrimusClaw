@@ -70,8 +70,20 @@ test("a tarball carries its bundles, declarations, licence and run-time files, a
 });
 
 test("a bundle that reads a file the tarball lacks, or imports the Claw sources by path, fails", () => {
-  const runtime = ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/sqlite/schema.sql"];
-  const reads = (text: string) => (): string => text;
+  const runtime = [
+    "package.json",
+    "dist/LICENSE",
+    "dist/index.js",
+    "dist/types/index.d.ts",
+    "dist/sqlite/schema.sql",
+    "dist/worker.js",
+    "dist/types/worker.d.ts",
+  ];
+  // (only dist/index.js reads the text: dist/worker.js, runtime's worker entry, reads nothing)
+  const reads =
+    (text: string) =>
+    (file: string): string =>
+      file === "dist/index.js" ? text : "";
   const schema = 'readFileSync(new URL("./sqlite/schema.sql", import.meta.url), "utf8")';
   assert.deepEqual(fileProblems(spec("runtime"), runtime, reads(schema)), []);
   assert.deepEqual(fileProblems(spec("runtime"), runtime, reads('new URL("./sqlite/other.sql", import.meta.url)')), [
@@ -81,6 +93,10 @@ test("a bundle that reads a file the tarball lacks, or imports the Claw sources 
     fileProblems(spec("runtime"), runtime, reads('export * from "../../../../claw/packages/protocol/src/x.js";')),
     ["dist/index.js imports the Claw sources by path instead of carrying them"],
   );
+  assert.deepEqual(fileProblems(spec("runtime"), runtime.slice(0, 5), reads(schema)), [
+    "missing from the package: dist/worker.js (run npm run build first)",
+    "missing from the package: dist/types/worker.d.ts (run npm run build first)",
+  ]);
 });
 
 const manifest = (over: Record<string, unknown> = {}): Record<string, unknown> => ({

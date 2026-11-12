@@ -25,7 +25,7 @@ import {
   readSettings,
   systemClock,
 } from "@primusclaw/personal-agent-runtime";
-import { buildFeatures, workCardPoster, type AssemblyBase } from "@primusclaw/personal-agent-worker";
+import { buildFeatures, workCardPoster, type AssemblyBase } from "@primusclaw/personal-agent-runtime/worker";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
 import { inboundMessage } from "../../../../test-support/inbound.js";
