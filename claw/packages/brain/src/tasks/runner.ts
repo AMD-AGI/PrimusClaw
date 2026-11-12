@@ -23,7 +23,7 @@ import {
   syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
   TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
-import { invalidateSyncManifest } from "../workspace/sync-delta.js";
+import { invalidateSyncManifest, isRestoreHeldInProcess, releaseRestoreHold, withoutAddresses } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import { cutDrainedCalls } from "../agent/drain-shield.js";
@@ -734,6 +734,17 @@ interface TaskCheckpoint extends CheckpointState {
  * the same entry when a run comes back. The three places that build this prefix
  * (here, workspace-reaper, admin-routes) have to agree; a drift is silent.
  */
+/**
+ * The stable `reason` a `workspace_sync_failed` or `workspace_restore_failed`
+ * event carries for an error: the two failures every workspace transfer meets
+ * named as such, anything else by its error class.
+ */
+function workspaceTransferFailureReason(e: unknown, errMsg: string): string {
+  if (isHandsNetworkError(e)) return "sandbox_unreachable";
+  if (/Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)) return "payload_too_large";
+  return (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
+}
+
 function checkpointKey(sessionId: string, messageId: string): string {
   // A trailing empty token is not a legal NATS subject, so a run with no
   // message id gets an explicit placeholder instead of `task-ckpt.<sid>.`.
@@ -1863,7 +1874,10 @@ class TaskRunner {
       const frozenUidHex = this.userIdHex;
       const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
-        .run(() => fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot))
+        .run(async () => {
+          this.refuseSharedSyncIfHeld(frozenHands);
+          return fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot);
+        })
         .then(async (info) => {
           if (this.taskFinished || this.abortCtrl.signal.aborted) return info;
           this.lastSyncedTurn = turnSnapshot;
@@ -2202,11 +2216,12 @@ class TaskRunner {
     // most recent file state that exists anywhere, so it has to be promoted
     // first. No-ops when no snapshot was ever written.
     await this.recoverInflightCheckpoint("sandbox_rebuild");
+    // A new sandbox, whatever address it was given: a hold this process kept for
+    // an earlier one at that address is not this one's (see resolveResumeState).
+    releaseRestoreHold(newHands, this.sessionId);
     // Always rehydrate after a rebuild: the new sandbox is empty regardless
     // of whether ensureHands reused a (concurrently-revived) KV entry.
-    try { await fx().syncWorkspaceFromS3(newHands, this.sessionId, this.request.user_id || "default"); } catch (e) {
-      logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed_after_rebuild");
-    }
+    await this.restoreWorkspaceFromS3(newHands, this.request.user_id || "default", "after_rebuild");
     this.handsUrl = newUrl;
     this.handsToken = newToken;
     this.handsIdentity = newIdentity ?? null;
@@ -3227,6 +3242,70 @@ class TaskRunner {
   }
 
   /**
+   * Refuse the shared-filesystem snapshot of a sandbox whose restore failed.
+   *
+   * That snapshot is what the next sandbox of the session is filled from, by a
+   * restore that succeeds and so leaves the new sandbox unheld: an incomplete
+   * /workspace written there would come back as a whole one, and that sandbox's
+   * S3 saves would prune what it lacks. Refused, the snapshot stays the last one
+   * a whole workspace wrote (or none, and the next sandbox restores from S3); a
+   * SIGTERM falls back to the S3 save, which a held sandbox makes add-only.
+   *
+   * This is this process's note; the sandbox's own note is checked by the sync
+   * command itself (`restoreHeldGuard` in workspace/sync.ts), so a check that
+   * could not be asked cannot let the snapshot through.
+   */
+  private refuseSharedSyncIfHeld(hands: HandsClient): void {
+    if (isRestoreHeldInProcess(hands, this.sessionId)) {
+      throw new Error("workspace_sync_held: this sandbox's restore failed, so its /workspace is not the session's");
+    }
+  }
+
+  /**
+   * Fill a new sandbox's /workspace from the session's S3 prefix, and say so
+   * when it could not be filled.
+   *
+   * A failure does not end the run: the turn goes on in the workspace it has.
+   * But it is not silent either. The user is told, as a `sandboxStatus`
+   * `workspace_restore_failed` event, that /workspace is missing files the
+   * session saved; and `syncWorkspaceFromS3` has already held the sandbox, so
+   * the saves that follow keep every saved file instead of deleting the ones the
+   * restore did not bring back, or replacing them with what the new sandbox
+   * started with (`holdAfterFailedRestore`). Never throws.
+   */
+  private async restoreWorkspaceFromS3(
+    hands: HandsClient, userId: string, site: "new_sandbox" | "resume_fallback" | "after_rebuild",
+  ): Promise<void> {
+    logger.info({ sessionId: this.sessionId, site }, "s3.restore_start");
+    try {
+      await fx().syncWorkspaceFromS3(hands, this.sessionId, userId);
+      metrics.onWorkspaceRestore("ok");
+      logger.info({ sessionId: this.sessionId, site }, "s3.restore_done");
+    } catch (e) {
+      const errMsg = (e as { message?: string })?.message
+        ? String((e as { message: string }).message).slice(0, 500)
+        : String(e);
+      const reason = workspaceTransferFailureReason(e, errMsg);
+      // The user is told what went wrong, never where: a sandbox's address is
+      // internal and a presigned URL is a credential.
+      const shown = withoutAddresses(errMsg);
+      metrics.onWorkspaceRestore("failed");
+      logger.warn({ err: e, sessionId: this.sessionId, site, reason }, "s3.restore_failed");
+      await this.onEvent({
+        type: "sandboxStatus",
+        status: "workspace_restore_failed",
+        reason,
+        message: "The saved workspace could not be restored, so /workspace is missing files this session saved "
+          + `(${shown}). The saved copy is kept as it was: saves from this sandbox add new files to it `
+          + "and do not delete or replace any.",
+        message_id: this.messageId,
+      }).catch((err: unknown) => {
+        logger.warn({ err, sessionId: this.sessionId }, "s3.restore_failed_event_failed");
+      });
+    }
+  }
+
+  /**
    * Plan Y v2 resume path has three modes (checkpoint-architecture-redesign
    * §5.6): sandbox_reuse (ensureHands returned created=false — KV hit +
    * /health pass — so /workspace is already intact), workspace_restore
@@ -3252,16 +3331,20 @@ class TaskRunner {
         + `continue from step ${ckpt.script.step}; its earlier steps' work went with the sandbox`,
       );
     }
+    // A sandbox just created starts with nothing held, whatever address it was
+    // given: pod IPs are reused, and a hold this process kept for an earlier
+    // sandbox of this session at the same address is not this one's. Released
+    // here, after the one way out above that restores nothing, and before every
+    // route below -- each of which restores into the new sandbox, the
+    // shared-filesystem one included, which never reaches the S3 restore's own
+    // release -- so the sandbox is held again exactly when its own restore fails.
+    if (created && this.hands) releaseRestoreHold(this.hands, this.sessionId);
     if (!ckpt) {
       // No prior progress: still run S3 baseline restore for new sandboxes
       // so any pre-Plan-Y persisted workspace materializes back into
       // /workspace (legacy chat sessions, dev mode).
       if (created) {
-        logger.info({ sessionId: this.sessionId }, "s3.restore_start");
-        try { await fx().syncWorkspaceFromS3(this.hands!, this.sessionId, this.userId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed");
-        }
-        logger.info({ sessionId: this.sessionId }, "s3.restore_done");
+        await this.restoreWorkspaceFromS3(this.hands!, this.userId, "new_sandbox");
       }
       this.resumeMode = "skip_no_ckpt";
     } else if (!created) {
@@ -3312,11 +3395,7 @@ class TaskRunner {
       if (!restored) {
         // Either no workspace_sync to restore from, or restore failed.
         // Fall back to the legacy S3 baseline restore (best-effort).
-        logger.info({ sessionId: this.sessionId }, "s3.restore_start");
-        try { await fx().syncWorkspaceFromS3(this.hands!, this.sessionId, this.userId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed");
-        }
-        logger.info({ sessionId: this.sessionId }, "s3.restore_done");
+        await this.restoreWorkspaceFromS3(this.hands!, this.userId, "resume_fallback");
         this.resumeMode = "no_data_turn0";
       }
     }
@@ -3784,7 +3863,7 @@ class TaskRunner {
                 reason: "upload_exhausted",
                 // Out of what this sync tried to upload: files the last sync that
                 // landed already put in S3 are not attempts.
-                message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
+                message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0) - (r.withheld ?? 0)}, failed=${r.failedCount}`,
                 message_id: this.messageId,
               });
             }
@@ -3792,12 +3871,7 @@ class TaskRunner {
             const errMsg = (e as { message?: string })?.message
               ? String((e as { message: string }).message).slice(0, 500)
               : String(e);
-            const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
-            const reason = isHandsNetworkError(e)
-              ? "sandbox_unreachable"
-              : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
-                ? "payload_too_large"
-                : errType;
+            const reason = workspaceTransferFailureReason(e, errMsg);
             logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
             await this.onEvent({
               type: "sandboxStatus",
@@ -4046,10 +4120,11 @@ class TaskRunner {
       const workHands = this.workHands();
       if (workHands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
         try {
-          await workspaceSigtermSyncSemaphore.run(() =>
-            fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
-              { kind: "sigterm" }),
-          );
+          await workspaceSigtermSyncSemaphore.run(async () => {
+            this.refuseSharedSyncIfHeld(workHands);
+            return fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
+              { kind: "sigterm" });
+          });
           syncedFlag = true;
           sigtermSyncResult = "success";
           logger.info({ sessionId: this.sessionId, turns: ckptState.turns_completed },

@@ -107,6 +107,35 @@ test("T3 a takeover that finds its sandbox gone fails the run and says why", asy
   assert.deepEqual(second.republished, []);
 });
 
+test("T3b a takeover that finds its sandbox gone keeps a restore hold at that address: it restored nothing", async () => {
+  // The new sandbox is never restored into on this path, and its handle can be
+  // reused by a later message without a restore. A hold this process kept for a
+  // sandbox of the session at the same address must survive it.
+  const { holdAfterFailedRestore, isRestoreHeld } = await import("../src/workspace/sync-delta.js");
+  const atAddress = {
+    generation: "http://hands.test",
+    callTool: async (tool: string) => (tool === "write" ? "Written to x" : "clear\n__claw_sync_done__"),
+  } as unknown as import("../src/clients/hands.js").HandsClient;
+
+  const { kv } = sharedKv();
+  await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 30,
+    answer: async (name, _args, w, signal) => {
+      if (name === "bash") return { text: "started", structured: { shell_id: "sh-live" } };
+      w.abort.abort(SIGTERM_ABORT_REASON);
+      return untilAborted(signal);
+    },
+  });
+  // Held after the first worker, which created (and so released) its own sandbox.
+  await holdAfterFailedRestore(atAddress, SESSION, "Request failed with status code 413");
+  const second = await runWorker({
+    kvCkpt: kv, script: START_THEN_WAIT, sandboxCreated: true, seq: 31,
+    answer: async () => ({ structured: { finished: true } }),
+  });
+  assert.match(second.done[0]?.failureReason ?? second.done[0]?.finalText ?? "", /script_sandbox_lost/);
+  assert.equal(await isRestoreHeld(atAddress, SESSION), true, "the hold went with a sandbox nothing restored into");
+});
+
 test("T4 a drain cuts off the step in flight; the successor runs that step again, and only it", async () => {
   const { kv } = sharedKv();
   const script: ScriptStep[] = [

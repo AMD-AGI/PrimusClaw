@@ -17,7 +17,16 @@ import {
 import { HandsClient, isHandsNetworkError, isHandsToolTimeout } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
-import { TRUNCATED_FOOTER, invalidateSyncManifest, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
+import {
+  TRUNCATED_FOOTER,
+  holdAfterFailedRestore,
+  invalidateSyncManifest,
+  isRestoreHeld,
+  planUploadDelta,
+  releaseRestoreHold,
+  seedSyncManifest,
+  withoutAddresses,
+} from "./sync-delta.js";
 import {
   configuredGitLimits,
   enforceListedGit,
@@ -180,6 +189,14 @@ export interface SyncWorkspaceResult {
    * sentence the user is shown.
    */
   git?: GitReport;
+  /**
+   * Set when a restore into this sandbox failed (`holdAfterFailedRestore`), so
+   * the sync deleted nothing and uploaded only files the prefix did not have:
+   * how many listed files it left out because an object of that name is already
+   * saved. `uploaded + unchanged + failedCount + withheld` is `totalFiles`.
+   * Absent otherwise.
+   */
+  withheld?: number;
 }
 
 /**
@@ -805,12 +822,47 @@ export async function syncWorkspaceToS3(
   // A doubtful listing also takes the record away before anything is uploaded:
   // the upload puts objects under the prefix the record does not name, and a
   // later prune by that record would never delete them.
-  if (!listing.trusted) await invalidateSyncManifest(hands, s3Prefix);
-  const delta = listing.trusted
+  //
+  // A sandbox whose restore failed holds part of what the prefix has, beside what
+  // it started with (a fresh clone, say) under the same names, and its listing is
+  // complete for the sandbox and wrong about the session. Its save only adds:
+  // files the prefix has no object for go up, nothing is replaced, and the prune
+  // below does not run -- run, it deleted every file the restore had not brought
+  // back. It keeps no record either, since what it leaves out is not in S3 as it
+  // is here. See RESTORE_HOLD_PATH.
+  const restoreHeld = await isRestoreHeld(hands, sessionId);
+  if (!listing.trusted || restoreHeld) await invalidateSyncManifest(hands, s3Prefix);
+  const delta = listing.trusted && !restoreHeld
     ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
   let pending = delta ? delta.pending : files;
   const unchanged = delta?.unchanged ?? 0;
+  let withheld = 0;
+  if (restoreHeld) {
+    // Nothing the session has saved may be replaced. Into the session's own
+    // prefix, that means only files it has no object for, and a prefix that cannot
+    // be listed gets nothing. Into any other -- the in-flight checkpoint's -- it
+    // means nothing at all: a failed terminal save copies that whole prefix over
+    // the session's (`copyS3Prefix`), objects an earlier attempt left there
+    // included. What that costs is the new files of a held sandbox whose terminal
+    // save then fails as well; the held terminal save is what keeps them.
+    const sessionPrefix = `users/${userId}/sessions/${sessionId}/`;
+    let saved: Set<string> | null = null;
+    if (s3Prefix === sessionPrefix) {
+      saved = await listPrefixKeys(s3Prefix).catch((e: unknown) => {
+        logger.warn({ sessionId, s3Prefix, err: (e as { message?: string })?.message ?? String(e) },
+          "s3.sync.held_listing_failed");
+        return null;
+      });
+    }
+    pending = saved ? files.filter((f) => !saved.has(localPathToS3Key(f, s3Prefix))) : [];
+    withheld = files.length - pending.length;
+    logger.warn(
+      { sessionId, s3Prefix, listed: files.length, adding: pending.length, withheld },
+      "s3.sync.held_restore_incomplete",
+    );
+  }
+  const heldResult: Pick<SyncWorkspaceResult, "withheld"> = restoreHeld ? { withheld } : {};
   let uploaded = 0;
   let lastFailures: UploadBatchResult["failed"] = [];
 
@@ -818,15 +870,18 @@ export async function syncWorkspaceToS3(
   // nothing pending, where deleted files still have to be pruned.
   const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
     // Only once every file is up. A prune after a partial upload would be
-    // deleting the old copy of something whose new copy did not arrive.
-    const prune = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
-      .catch((e: unknown) => {
-      logger.warn(
-        { sessionId, err: (e as { message?: string })?.message ?? String(e) },
-        "s3.prune.failed",
-      );
-      return { deleted: 0, complete: false };
-    });
+    // deleting the old copy of something whose new copy did not arrive. Never
+    // from a held sandbox (above).
+    const prune = restoreHeld
+      ? { deleted: 0, complete: false }
+      : await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
+        .catch((e: unknown) => {
+          logger.warn(
+            { sessionId, err: (e as { message?: string })?.message ?? String(e) },
+            "s3.prune.failed",
+          );
+          return { deleted: 0, complete: false };
+        });
     const pruned = prune.deleted;
     // After the prune, so a sync that dies in it leaves no manifest rather than
     // one claiming a state S3 was not left in. A repository left out of the
@@ -841,6 +896,7 @@ export async function syncWorkspaceToS3(
       uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false,
       ...(delta ? { unchanged } : {}),
       ...gitResult,
+      ...heldResult,
     };
   };
 
@@ -889,6 +945,7 @@ export async function syncWorkspaceToS3(
     empty: false,
     ...(delta ? { unchanged } : {}),
     ...gitResult,
+    ...heldResult,
   };
 }
 
@@ -944,6 +1001,21 @@ function isInternalRelPath(rel: string): boolean {
  */
 export function isRestoreSkipped(rel: string): boolean {
   return isArchiveRelPath(rel) || isInternalRelPath(rel);
+}
+
+/** Every object key under `prefix`, paginated. */
+async function listPrefixKeys(prefix: string): Promise<Set<string>> {
+  const s3 = getS3Client();
+  const keys = new Set<string>();
+  let continuationToken: string | undefined;
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: continuationToken,
+    }));
+    for (const obj of resp.Contents || []) if (obj.Key) keys.add(obj.Key);
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
 }
 
 /** List all object keys under prefix, paginated, minus everything that belongs
@@ -1084,12 +1156,52 @@ async function downloadRound(
 }
 
 /**
+ * A restore that ran out of retries with files still missing. Thrown, like any
+ * other restore failure, so the caller tells the user: the files that did not
+ * come back are in S3 and not in /workspace. The message carries the first
+ * failure's error (a 413, say), which is what the caller's reason is read from,
+ * without the addresses in it (`withoutAddresses`).
+ */
+export class WorkspaceRestoreIncomplete extends Error {
+  constructor(readonly restored: number, readonly total: number, readonly failed: number, firstError = "") {
+    const first = withoutAddresses(firstError).slice(0, 200);
+    super(`workspace restore incomplete: restored=${restored}/${total}, failed=${failed}${first ? `; first: ${first}` : ""}`);
+    this.name = "WorkspaceRestoreIncomplete";
+  }
+}
+
+/**
  * Rehydrate a freshly-created sandbox with the "current" S3 workspace state
  * (top-level files, excluding historical claw-<mid> archive subdirs). Called
  * after ensureHands creates a new workload; skipped when reusing an existing
  * one. Failures are retried up to MAX_UPLOAD_ROUNDS with freshly signed URLs.
+ *
+ * Throws when the workspace was not restored in full: the listing failed, a
+ * download call failed (a 413 from Hands, an unreachable sandbox), or files were
+ * still missing after the last round (WorkspaceRestoreIncomplete). Before it
+ * throws, the sandbox is held (`holdAfterFailedRestore`), so no later save
+ * from it deletes the files that are in S3 and not in /workspace.
  */
 export async function syncWorkspaceFromS3(
+  hands: HandsClient,
+  sessionId: string,
+  userId: string,
+  options?: { s3PrefixOverride?: string },
+): Promise<number> {
+  let restored: number;
+  try {
+    restored = await restoreWorkspaceFromS3(hands, sessionId, userId, options);
+  } catch (e) {
+    const message = (e as { message?: string })?.message ?? String(e);
+    await holdAfterFailedRestore(hands, sessionId, message);
+    logger.error({ sessionId, err: message.slice(0, 500) }, "s3.restore.failed_prune_held");
+    throw e;
+  }
+  releaseRestoreHold(hands, sessionId);
+  return restored;
+}
+
+async function restoreWorkspaceFromS3(
   hands: HandsClient,
   sessionId: string,
   userId: string,
@@ -1140,7 +1252,7 @@ export async function syncWorkspaceFromS3(
     "s3.restore.exhausted",
   );
   await putBackGitDirs();
-  return downloaded;
+  throw new WorkspaceRestoreIncomplete(downloaded, keys.length, lastFailures.length, lastFailures[0]?.error);
 }
 
 /**

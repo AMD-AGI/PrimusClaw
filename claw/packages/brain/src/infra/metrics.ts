@@ -548,6 +548,13 @@ const resumeWorkspaceModeTotal = new Counter({
   registers: [registry],
 });
 
+const workspaceRestoreTotal = new Counter({
+  name: "claw_brain_workspace_restore_total",
+  help: "Restores of a new sandbox's /workspace from the session's S3 prefix, by result. A failed one holds every later prune of that sandbox.",
+  labelNames: ["result"] as const, // "ok" | "failed"
+  registers: [registry],
+});
+
 const taskRedeliveryTotal = new Counter({
   name: "claw_brain_task_redelivery_total",
   help: "NATS task redeliveries observed by this brain pod.",
@@ -1113,6 +1120,9 @@ export const metrics = {
     mode: "sandbox_reuse" | "workspace_restore" | "no_data_turn0" | "skip_no_ckpt",
   ): void {
     resumeWorkspaceModeTotal.inc({ mode });
+  },
+  onWorkspaceRestore(result: "ok" | "failed"): void {
+    workspaceRestoreTotal.inc({ result });
   },
   onTaskRedelivery(has_checkpoint: "true" | "false"): void {
     taskRedeliveryTotal.inc({ has_checkpoint });
