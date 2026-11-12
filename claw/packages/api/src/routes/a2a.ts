@@ -22,7 +22,7 @@ import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js"
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
-import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_AUTO_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
@@ -967,7 +967,9 @@ async function publishA2AExecuteTask(
     history,
     // A peer agent's message is not the user's word: no memory tools (memory/service.ts memoryAccess).
     memory_enabled: false,
-    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+    skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+    // Nor its skills: a peer's request saves nothing into the user's personal skills.
+    user_skills_enabled: false,
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
@@ -2075,7 +2077,7 @@ async function handleLegacyInvoke(
   try {
     const payload: Record<string, unknown> = {
       session_id: target.taskId, prompt: text, history: [], memory_enabled: false,
-      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED, user_id: "a2a",
+      skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED, user_skills_enabled: false, user_id: "a2a",
     };
     if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));

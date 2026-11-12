@@ -34,6 +34,7 @@ export function applyReviewProfileBackstop(request: ExecuteRequest): void {
   request.withhold_sandbox_keys = true;
   request.memory_enabled = false;
   request.skill_evolution_enabled = false;
+  request.user_skills_enabled = false;
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "topology", "workspace_id", "rules_text"] as const) delete request[field];
   const review = request.mcp_servers?.[REVIEW_SERVER_NAME];
   request.mcp_servers = review ? { [REVIEW_SERVER_NAME]: review } : {};

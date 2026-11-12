@@ -484,11 +484,17 @@ export interface ExecuteRequest {
    */
   memory_enabled?: boolean;
   /**
-   * Whether the API keeps skills the agent saves (CLAW_SKILL_EVOLUTION_ENABLED).
-   * Anything but `true` means Brain neither offers nor runs save_skill and the
-   * *_skill_file tools: the API would drop what they write.
+   * Whether the platform writes skills on its own (CLAW_SKILL_AUTO_EVOLUTION_ENABLED). Brain reads it only from an
+   * API that predates `user_skills_enabled`, which used this field for what that one says now.
    */
   skill_evolution_enabled?: boolean;
+  /**
+   * Whether the API keeps the skills this turn saves (CLAW_USER_SKILLS_ENABLED, and only in the user's own
+   * conversation). Anything but `true` means Brain neither offers nor runs save_skill and the *_skill_file tools:
+   * the API would drop what they write. Absent means an API that predates the field: `skill_evolution_enabled`
+   * decides instead.
+   */
+  user_skills_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;

@@ -1,29 +1,167 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { db } from "../infra/db.js";
+import { createHash } from "node:crypto";
+import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { scanMemoryContent } from "../memory/gates.js";
+import { scanInjection, scanSecrets } from "../memory/gates.js";
 import {
   EVOLVE_EVIDENCE_GOOD_COUNT, EVOLVE_EVIDENCE_BAD_COUNT, MAX_SELECTED_SKILLS,
-  CLAW_SKILL_EVOLUTION_ENABLED,
+  CLAW_USER_SKILLS_ENABLED,
 } from "../config.js";
 import pino from "pino";
 
 const logger = pino({ name: "skill-service" });
 
 // ===== Capacity & policy constants =====
+// The one place a personal skill's limits are set: the skill routes, the save_skill tool's path (events/consumer.ts)
+// and the platform's own writes all check these.
 
-const MAX_SKILLS_PER_USER = 20;
+/** Skills one user keeps (every name not deleted, disabled ones included). A save past it is refused; none is dropped. */
+export const USER_SKILL_MAX = 50;
+/** SKILL.md, in characters. */
+export const SKILL_MD_MAX_CHARS = 20_000;
+/** The description, in characters: what a turn's skill list shows of each skill. */
+export const SKILL_DESCRIPTION_MAX_CHARS = 300;
+/** One supporting file, in bytes. */
+export const SKILL_FILE_MAX_BYTES = 64 * 1024;
+/** Supporting files per skill. */
+export const SKILL_FILES_MAX = 20;
+/** SKILL.md and every supporting file together, in bytes. */
+export const SKILL_TOTAL_MAX_BYTES = 256 * 1024;
+/**
+ * A new personal skill's name: kebab-case, at most 64 characters (the Agent Skills rule). Not the platform's
+ * `SKILL_NAME_RE` (brain/src/agent/platform-defaults.ts), which is wider. A name stored before this rule keeps working.
+ */
+export const USER_SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** How long an unconfirmed draft (claw_skill_drafts) is kept. */
+export const SKILL_DRAFT_TTL_HOURS = 24;
 const MAX_PROBATION_SKILLS = 5;
-/** Per-skill total bytes (SKILL.md + all sub-files combined). */
-const MAX_SKILL_TOTAL_BYTES = 50 * 1024;
-/** Per-sub-file bytes. SKILL.md itself uses scanMemoryContent's 5000-char cap. */
-const MAX_SUB_FILE_BYTES = 10 * 1024;
-/** Maximum sub-files per skill. */
-const MAX_SUB_FILES_PER_SKILL = 20;
 /** Whitelisted sub-file root directories (Hermes-compatible). */
 const ALLOWED_SUB_DIRS = ["references", "templates", "scripts", "assets"];
+
+/** Where a skill came from (`claw_skills.origin`). */
+export type SkillOrigin = "chat" | "worker" | "api" | "import" | "auto";
+/**
+ * Who changed a skill (`claw_skill_events.actor`). `model` is the save_skill tool's direct save, until saving from a
+ * conversation goes through a confirmed draft (`model_confirmed`); `auto` is the platform's own writes.
+ */
+export type SkillActor = "user_cmd" | "model_confirmed" | "model" | "api" | "import" | "auto";
+export type SkillEventOp =
+  | "draft" | "create" | "update" | "disable" | "enable" | "delete" | "restore" | "rollback" | "refused";
+
+// ===== Content checks =====
+
+/** Why a write was refused. */
+export type SkillWriteRefusal =
+  | "invalid_name" | "invalid" | "too_large" | "too_many_files" | "secret" | "injection" | "full" | "not_found";
+
+export interface SkillWriteRefused {
+  ok: false;
+  error: SkillWriteRefusal;
+  /** For the caller to show. Never holds what was refused. */
+  message: string;
+  /** Where a secret or injection was found: `SKILL.md`, `description` or the file's path, and the 1-based line. */
+  at?: { file: string; line: number | null; kind: string };
+}
+
+/**
+ * The first line of `text` that `scan` flags, with what it flagged, or null. Line by line so a refusal can say where
+ * ("line 12 looks like a GitHub token") without repeating any of it. A match only the whole text makes (one that spans
+ * lines) is reported with no line.
+ */
+export function firstFlaggedLine(text: string, scan: (t: string) => string | null): { line: number | null; kind: string } | null {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const kind = scan(lines[i]);
+    if (kind) return { line: i + 1, kind };
+  }
+  const kind = scan(text);
+  return kind ? { line: null, kind } : null;
+}
+
+function where(at: { file: string; line: number | null }): string {
+  return at.line === null ? at.file : `${at.file} line ${at.line}`;
+}
+
+/**
+ * The secret and instruction-hijack checks every user-saved part of a skill passes (the description, SKILL.md, each
+ * text file; a binary file is opaque). A secret is always refused. An instruction to the agent is refused unless the
+ * caller says the user confirmed it (`allowInjection`), and always for an imported skill.
+ */
+export function scanSkillParts(
+  parts: Array<{ file: string; text: string }>,
+  opts: { origin: SkillOrigin; allowInjection?: boolean },
+): SkillWriteRefused | null {
+  for (const p of parts) {
+    const hit = firstFlaggedLine(p.text, scanSecrets);
+    if (hit) {
+      const at = { file: p.file, ...hit };
+      return { ok: false, error: "secret", message: `not saved: ${where(at)} looks like a credential (${hit.kind}). Replace it with a placeholder such as <YOUR_TOKEN>.`, at };
+    }
+  }
+  if (opts.allowInjection && opts.origin !== "import") return null;
+  for (const p of parts) {
+    const hit = firstFlaggedLine(p.text, scanInjection);
+    if (hit) {
+      const at = { file: p.file, ...hit };
+      return { ok: false, error: "injection", message: `not saved: ${where(at)} reads as an instruction to override the agent (${hit.kind})`, at };
+    }
+  }
+  return null;
+}
+
+/** The check a skill the platform writes on its own gets (evolution, pattern promotion): length, hijack, secret. */
+function autoSkillBlocked(text: string, maxChars: number): string | null {
+  if ([...text].length > maxChars) return `content too long (max ${maxChars} chars)`;
+  const injection = scanInjection(text);
+  if (injection) return `threat pattern '${injection}'`;
+  const secret = scanSecrets(text);
+  return secret ? `looks like a credential (${secret})` : null;
+}
+
+/** SKILL.md and every supporting file, in path order: what a cached copy of the skill is keyed by. */
+export function skillContentSha(content: string, files: Array<{ path: string; content: string; is_binary?: boolean }>): string {
+  const h = createHash("sha256");
+  h.update("SKILL.md\0").update(content).update("\0");
+  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    h.update(f.path).update("\0").update(f.is_binary ? "b" : "t").update("\0").update(f.content).update("\0");
+  }
+  return h.digest("hex");
+}
+
+async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
+  const row = (await q("SELECT content FROM claw_skills WHERE id = $1", [skillId])).rows[0];
+  if (!row) return;
+  const files = (await q("SELECT file_path, content, is_binary FROM claw_skill_files WHERE skill_id = $1", [skillId])).rows
+    .map((f: any) => ({ path: f.file_path, content: f.content, is_binary: !!f.is_binary }));
+  await q("UPDATE claw_skills SET content_sha = $1 WHERE id = $2", [skillContentSha(row.content || "", files), skillId]);
+}
+
+/** One writer per user at a time, so a count and the insert that follows it hold together. Inside a transaction. */
+async function lockUserSkills(q: Querier, userId: string): Promise<void> {
+  await q("SELECT pg_advisory_xact_lock(hashtext('claw_skills'), hashtext($1))", [userId]);
+}
+
+/** What happened to a skill, for audit. Never what a refused write carried. */
+export async function recordSkillEvent(q: Querier, e: {
+  userId: string; skillName: string; version?: number | null; op: SkillEventOp; actor: SkillActor;
+  sessionId?: string | null; detail?: Record<string, unknown>;
+}): Promise<void> {
+  await q(
+    `INSERT INTO claw_skill_events (user_id, skill_name, version, op, actor, session_id, detail)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [e.userId, e.skillName, e.version ?? null, e.op, e.actor, e.sessionId ?? null, JSON.stringify(e.detail ?? {})],
+  );
+}
+
+/** A refusal's trace, outside any transaction the refusal rolled back. Best effort: an audit failure refuses nothing more. */
+async function recordRefusal(userId: string, skillName: string, actor: SkillActor, sessionId: string | null | undefined, r: SkillWriteRefused): Promise<void> {
+  await recordSkillEvent(db.query, {
+    userId, skillName: String(skillName || "").slice(0, 200), op: "refused", actor, sessionId,
+    detail: { reason: r.error, ...(r.at ? { file: r.at.file, line: r.at.line, kind: r.at.kind } : {}) },
+  }).catch((err) => logger.warn({ err: (err as Error)?.message, userId, reason: r.error }, "skill.refusal_audit_failed"));
+}
 
 // ===== Sub-file path validation =====
 
@@ -72,7 +210,7 @@ export async function getUserActiveSkills(userId: string): Promise<Record<string
   const rows = (await db.query(`
     SELECT DISTINCT ON (skill_name) skill_name, content, description, version, id
     FROM claw_skills
-    WHERE user_id = $1 AND status IN ('active', 'probation') AND deleted_at IS NULL
+    WHERE user_id = $1 AND status IN ('active', 'probation') AND deleted_at IS NULL AND enabled
     ORDER BY skill_name, version DESC
   `, [userId])).rows;
 
@@ -131,7 +269,7 @@ export async function selectSkillsForTask(
 ): Promise<Record<string, SkillBundle>> {
   // Feature flag: empty selection short-circuits all callers (sessions route +
   // event-consumer pending branch) without touching their loops.
-  if (!CLAW_SKILL_EVOLUTION_ENABLED) return {};
+  if (!CLAW_USER_SKILLS_ENABLED) return {};
   const all = await getUserActiveSkills(userId);
   const names = Object.keys(all);
   if (names.length <= maxSkills) return all;
@@ -216,57 +354,25 @@ export async function getActiveSkillVersions(userId: string, skillNames: string[
   return versions;
 }
 
-/**
- * Soft-delete the least-valuable active skill to make room for a new one.
- * Score = effectiveness × log(1 + inject_count). Lowest score gets evicted.
- * - inject_count = how many times this skill was loaded into a task context
- * - effectiveness = positive_count / (positive + negative + neutral) from outcomes
- * - high effectiveness but rarely loaded → some weight
- * - heavily loaded but low effectiveness (often fails) → demoted
- * - never loaded (inject=0) has score 0 → first to go
- */
-async function evictLeastUsedSkill(userId: string): Promise<void> {
-  const victim = (await db.query(`
-    SELECT skill_name, version, inject_count, effectiveness,
-           (effectiveness * LN(1 + inject_count)) as score
-    FROM claw_skills
-    WHERE user_id = $1 AND status IN ('active', 'probation') AND deleted_at IS NULL
-    ORDER BY score ASC, last_accessed ASC
-    LIMIT 1
-  `, [userId])).rows[0];
-
-  if (victim) {
-    await db.query(
-      "UPDATE claw_skills SET deleted_at = NOW() WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NULL",
-      [victim.skill_name, userId]
-    );
-    logger.info({
-      userId, evicted: victim.skill_name, version: victim.version, status: "active_or_probation",
-      injectCount: victim.inject_count, effectiveness: victim.effectiveness,
-      score: parseFloat(victim.score).toFixed(3),
-    }, "skill.evicted_least_valuable");
-  }
-}
-
-async function evictOldestProbation(userId: string): Promise<void> {
-  const victim = (await db.query(`
+async function evictOldestProbation(userId: string, q: Querier = db.query): Promise<void> {
+  const victim = (await q(`
     SELECT id, skill_name FROM claw_skills
     WHERE user_id = $1 AND status = 'probation' AND deleted_at IS NULL
     ORDER BY last_accessed ASC LIMIT 1
   `, [userId])).rows[0];
   if (victim) {
-    await db.query("UPDATE claw_skills SET deleted_at = NOW() WHERE id = $1", [victim.id]);
+    await q("UPDATE claw_skills SET deleted_at = NOW() WHERE id = $1", [victim.id]);
     logger.info({ userId, evicted: victim.skill_name }, "skill.evicted_oldest_probation");
   }
 }
 
-async function ensureProbationCapacity(userId: string): Promise<void> {
-  const count = (await db.query(
+async function ensureProbationCapacity(userId: string, q: Querier = db.query): Promise<void> {
+  const count = (await q(
     "SELECT COUNT(*) AS n FROM claw_skills WHERE user_id = $1 AND status = 'probation' AND deleted_at IS NULL",
     [userId]
   )).rows[0].n;
   if (parseInt(count) >= MAX_PROBATION_SKILLS) {
-    await evictOldestProbation(userId);
+    await evictOldestProbation(userId, q);
   }
 }
 
@@ -332,13 +438,27 @@ export async function checkProbationGraduation(userId: string, skillName: string
   }
 }
 
-// ===== Save Skill (from save_skill tool) =====
+// ===== Save Skill =====
+
+export type SaveSkillResult =
+  | { ok: true; id: number; version: number; created: boolean }
+  | SkillWriteRefused;
+
+export interface SaveSkillOptions {
+  /**
+   * The transaction to write in. Without one, the save is its own transaction. A caller that passes one owns it: the
+   * user's skill lock is taken in it and held until it ends.
+   */
+  query?: Querier;
+  /** Where a new (or revived) skill came from. An update keeps the origin the skill was created with. */
+  origin?: SkillOrigin;
+}
 
 /**
- * Save / update a skill.
- * - New skill: INSERT v1 (with capacity check + LRU eviction)
- * - Existing skill: in-place UPDATE the active row's content, do NOT bump version
- *   (avoid silent shadowing when prior versions exist from evolution)
+ * Save / update a skill. Content only; the checks a user's save passes are `saveUserSkill`'s.
+ * - Existing skill: in-place UPDATE of the visible row; the version moves when the content changes
+ * - Deleted skill: the row comes back
+ * - New skill: INSERT v1, refused when the user already has USER_SKILL_MAX skills. Nothing is ever dropped to make room.
  */
 export async function saveSkill(
   skillName: string,
@@ -347,72 +467,95 @@ export async function saveSkill(
   source: string,
   sessionId?: string,
   description = "",
-): Promise<void> {
-  // Case 1: active OR probation row exists → in-place update, keep version.
-  //   - active: just refresh content; user can override their own / system's existing skill
-  //   - probation: also refresh content; B1 fix — without this clause we silently
-  //     dropped the new content via ON CONFLICT DO NOTHING in Case 3 (since v=1 was occupied).
-  //     If the caller is a manual save (source='manual'), the user is vouching for the new
-  //     content → graduate it to 'active' immediately. If the caller is auto* (re-save during
-  //     pattern re-promotion), keep it in probation so feedback gating still applies.
-  const visibleRow = (await db.query(
-    `SELECT id, status, content FROM claw_skills
-     WHERE skill_name = $1 AND user_id = $2
-       AND status IN ('active', 'probation') AND deleted_at IS NULL
-     ORDER BY version DESC LIMIT 1`,
-    [skillName, userId]
-  )).rows[0];
+  opts: SaveSkillOptions = {},
+): Promise<SaveSkillResult> {
+  const run = async (q: Querier): Promise<SaveSkillResult> => {
+    await lockUserSkills(q, userId);
+    // Case 1: active OR probation row exists → in-place update.
+    //   - active: just refresh content; user can override their own / system's existing skill
+    //   - probation: also refresh content; B1 fix — without this clause we silently
+    //     dropped the new content via ON CONFLICT DO NOTHING in Case 3 (since v=1 was occupied).
+    //     If the caller is a manual save (source='manual'), the user is vouching for the new
+    //     content → graduate it to 'active' immediately. If the caller is auto* (re-save during
+    //     pattern re-promotion), keep it in probation so feedback gating still applies.
+    const visibleRow = (await q(
+      `SELECT id, status, content FROM claw_skills
+       WHERE skill_name = $1 AND user_id = $2
+         AND status IN ('active', 'probation') AND deleted_at IS NULL
+       ORDER BY version DESC LIMIT 1`,
+      [skillName, userId]
+    )).rows[0];
 
-  if (visibleRow) {
-    const newStatus = visibleRow.status === "probation" && source === "manual"
-      ? "active"
-      : visibleRow.status;
-    // Bump version when content actually changes — keeps stats isolation
-    // (shouldEvolveSkill scopes feedback to the active version number).
-    const contentChanged = visibleRow.content !== content;
-    await db.query(
-      `UPDATE claw_skills SET content = $1, description = $2, source = $3,
-                              source_session = $4, status = $5, last_accessed = NOW()
-                              ${contentChanged ? ", version = version + 1" : ""}
-       WHERE id = $6`,
-      [content, description, source, sessionId || null, newStatus, visibleRow.id]
-    );
-    return;
-  }
+    if (visibleRow) {
+      const newStatus = visibleRow.status === "probation" && source === "manual"
+        ? "active"
+        : visibleRow.status;
+      // Bump version when content actually changes — keeps stats isolation
+      // (shouldEvolveSkill scopes feedback to the active version number).
+      const contentChanged = visibleRow.content !== content;
+      const row = (await q(
+        `UPDATE claw_skills SET content = $1, description = $2, source = $3,
+                                source_session = $4, status = $5, last_accessed = NOW()
+                                ${contentChanged ? ", version = version + 1" : ""}
+         WHERE id = $6 RETURNING id, version`,
+        [content, description, source, sessionId || null, newStatus, visibleRow.id]
+      )).rows[0];
+      await refreshContentSha(q, row.id);
+      return { ok: true, id: row.id, version: row.version, created: false };
+    }
 
-  // Case 2: only soft-deleted row(s) exist → revive the highest-version one
-  //         (this is the "delete then save_skill again" scenario)
-  const softDeletedRow = (await db.query(
-    "SELECT id FROM claw_skills WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NOT NULL ORDER BY version DESC LIMIT 1",
-    [skillName, userId]
-  )).rows[0];
+    // A skill not visible now takes a place among the user's skills, whether it is new or comes back.
+    const count = Number((await q(
+      "SELECT COUNT(DISTINCT skill_name) AS n FROM claw_skills WHERE user_id = $1 AND deleted_at IS NULL",
+      [userId]
+    )).rows[0].n);
+    if (count >= USER_SKILL_MAX) {
+      return {
+        ok: false, error: "full",
+        message: `skills are full (${count}/${USER_SKILL_MAX}). Nothing was saved; delete or update an existing skill first.`,
+      };
+    }
 
-  if (softDeletedRow) {
-    await db.query(
-      `UPDATE claw_skills
-       SET content = $1, description = $2, source = $3,
-           source_session = $4, status = 'active', deleted_at = NULL, last_accessed = NOW()
-       WHERE id = $5`,
-      [content, description, source, sessionId || null, softDeletedRow.id]
-    );
-    return;
-  }
+    // Case 2: only soft-deleted row(s) exist → revive the highest-version one
+    //         (this is the "delete then save_skill again" scenario)
+    const softDeletedRow = (await q(
+      "SELECT id FROM claw_skills WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NOT NULL ORDER BY version DESC LIMIT 1",
+      [skillName, userId]
+    )).rows[0];
 
-  // Case 3: truly new skill → capacity check then INSERT.
-  // E4: auto-created skills start in 'probation' so we can validate them with real
-  // execution feedback before they're trusted enough to participate in evolution.
-  // Manually created skills (source='manual') skip probation since the user vouches.
-  const existing = await getUserSkillNames(userId);
-  if (existing.length >= MAX_SKILLS_PER_USER) {
-    await evictLeastUsedSkill(userId);
-  }
-  const initialStatus = source === "auto" || source === "auto-pattern" ? "probation" : "active";
-  if (initialStatus === "probation") await ensureProbationCapacity(userId);
-  await db.query(`
-    INSERT INTO claw_skills (skill_name, user_id, version, content, description, source, status, source_session)
-    VALUES ($1, $2, 1, $3, $4, $5, $6, $7)
-    ON CONFLICT (skill_name, user_id, version) DO NOTHING
-  `, [skillName, userId, content, description, source, initialStatus, sessionId || null]);
+    if (softDeletedRow) {
+      const row = (await q(
+        `UPDATE claw_skills
+         SET content = $1, description = $2, source = $3,
+             source_session = $4, status = 'active', deleted_at = NULL, last_accessed = NOW(),
+             enabled = TRUE, origin = $6
+         WHERE id = $5 RETURNING id, version`,
+        [content, description, source, sessionId || null, softDeletedRow.id, opts.origin ?? null]
+      )).rows[0];
+      await refreshContentSha(q, row.id);
+      return { ok: true, id: row.id, version: row.version, created: true };
+    }
+
+    // Case 3: truly new skill → INSERT.
+    // E4: auto-created skills start in 'probation' so we can validate them with real
+    // execution feedback before they're trusted enough to participate in evolution.
+    // Manually created skills (source='manual') skip probation since the user vouches.
+    const initialStatus = source === "auto" || source === "auto-pattern" ? "probation" : "active";
+    if (initialStatus === "probation") await ensureProbationCapacity(userId, q);
+    const row = (await q(`
+      INSERT INTO claw_skills (skill_name, user_id, version, content, description, source, status, source_session, origin)
+      VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (skill_name, user_id, version) DO NOTHING
+      RETURNING id, version
+    `, [skillName, userId, content, description, source, initialStatus, sessionId || null, opts.origin ?? null])).rows[0];
+    if (!row) {
+      // A v1 row of this name in another status (archived, rolled back) holds the key; nothing was written, as before.
+      return { ok: false, error: "invalid", message: `skill '${skillName}' has an earlier version that is not active; nothing was saved` };
+    }
+    await refreshContentSha(q, row.id);
+    return { ok: true, id: row.id, version: row.version, created: true };
+  };
+  return opts.query ? run(opts.query) : inTransaction(run);
 }
 
 // ===== Skill Sub-files (E2: multi-file support) =====
@@ -423,28 +566,49 @@ export interface SkillFileInput {
   is_binary?: boolean;
 }
 
+/** Who a file write is for, and where it was made. Defaults: the REST routes. */
+export interface SkillFileWriteOptions {
+  actor?: SkillActor;
+  origin?: SkillOrigin;
+  sessionId?: string | null;
+  allowInjection?: boolean;
+  /** A transaction to write in (see SaveSkillOptions.query). */
+  query?: Querier;
+}
+
+/** A file write's checks that need no database: its path, its size, and (text only) secrets and hijack. */
+function checkFileInput(input: SkillFileInput, opts: SkillFileWriteOptions): SkillWriteRefused | null {
+  const pathCheck = validateSubFilePath(input.file_path);
+  if (!pathCheck.ok) return { ok: false, error: "invalid", message: pathCheck.error || "invalid file_path" };
+  if (typeof input.content !== "string") return { ok: false, error: "invalid", message: "content required" };
+  const size = Buffer.byteLength(input.content, "utf8");
+  if (size > SKILL_FILE_MAX_BYTES) {
+    return { ok: false, error: "too_large", message: `file too large: ${size} > ${SKILL_FILE_MAX_BYTES} bytes` };
+  }
+  if (input.is_binary) return null;
+  return scanSkillParts([{ file: input.file_path, text: input.content }], { origin: opts.origin ?? "api", allowInjection: opts.allowInjection });
+}
+
 /**
- * Validate a sub-file write against capacity rules.
- * Returns null on success, error string otherwise.
+ * Validate a sub-file write against the skill's capacity: total size and file count, counting what is stored.
+ * Returns null on success, the refusal otherwise.
  */
 async function validateFileWrite(
+  q: Querier,
   skillId: number,
   filePath: string,
   contentSize: number,
   isUpdate: boolean,
-): Promise<string | null> {
-  if (contentSize > MAX_SUB_FILE_BYTES) {
-    return `file too large: ${contentSize} > ${MAX_SUB_FILE_BYTES} bytes`;
-  }
+): Promise<SkillWriteRefused | null> {
   // Total size check (mainSize = SKILL.md byte length)
-  const stats = (await db.query(
+  const stats = (await q(
     "SELECT content FROM claw_skills WHERE id = $1",
     [skillId]
   )).rows[0];
-  if (!stats) return "parent skill not found";
+  if (!stats) return { ok: false, error: "not_found", message: "parent skill not found" };
   const mainSize = Buffer.byteLength(stats.content || "", "utf8");
 
-  const fileRows = (await db.query(
+  const fileRows = (await q(
     "SELECT file_path, size_bytes FROM claw_skill_files WHERE skill_id = $1",
     [skillId]
   )).rows;
@@ -456,18 +620,18 @@ async function validateFileWrite(
     count++;
   }
   const newTotal = mainSize + subTotal + contentSize;
-  if (newTotal > MAX_SKILL_TOTAL_BYTES) {
-    return `skill total size would exceed ${MAX_SKILL_TOTAL_BYTES} bytes (current ${mainSize + subTotal}, adding ${contentSize})`;
+  if (newTotal > SKILL_TOTAL_MAX_BYTES) {
+    return { ok: false, error: "too_large", message: `skill total size would exceed ${SKILL_TOTAL_MAX_BYTES} bytes (current ${mainSize + subTotal}, adding ${contentSize})` };
   }
-  if (!isUpdate && count + 1 > MAX_SUB_FILES_PER_SKILL) {
-    return `too many sub-files: ${count + 1} > ${MAX_SUB_FILES_PER_SKILL}`;
+  if (!isUpdate && count + 1 > SKILL_FILES_MAX) {
+    return { ok: false, error: "too_many_files", message: `too many sub-files: ${count + 1} > ${SKILL_FILES_MAX}` };
   }
   return null;
 }
 
 /** Find the active or probation skill row id for (user, name). */
-async function findVisibleSkillId(skillName: string, userId: string): Promise<number | null> {
-  const row = (await db.query(
+async function findVisibleSkillId(skillName: string, userId: string, q: Querier = db.query): Promise<number | null> {
+  const row = (await q(
     `SELECT id FROM claw_skills
      WHERE skill_name = $1 AND user_id = $2 AND status IN ('active', 'probation') AND deleted_at IS NULL
      ORDER BY version DESC LIMIT 1`,
@@ -476,88 +640,209 @@ async function findVisibleSkillId(skillName: string, userId: string): Promise<nu
   return row?.id ?? null;
 }
 
+/** A refusal thrown out of a transaction so that what it wrote is rolled back. */
+class SkillRefusal extends Error {
+  constructor(readonly refusal: SkillWriteRefused) { super(refusal.message); }
+}
+
+/**
+ * Run `body` in the caller's transaction (under a savepoint, so a refusal undoes only this write) or in its own.
+ * A `SkillRefusal` thrown by `body` comes back as its refusal, with nothing written.
+ */
+async function writeSkillTx<T>(query: Querier | undefined, body: (q: Querier) => Promise<T>): Promise<T | SkillWriteRefused> {
+  try {
+    if (!query) return await inTransaction(body);
+    await query("SAVEPOINT skill_write");
+    try {
+      const out = await body(query);
+      await query("RELEASE SAVEPOINT skill_write");
+      return out;
+    } catch (err) {
+      await query("ROLLBACK TO SAVEPOINT skill_write");
+      throw err;
+    }
+  } catch (err) {
+    if (err instanceof SkillRefusal) return err.refusal;
+    throw err;
+  }
+}
+
+type FileAction = "add" | "update" | "remove" | "upsert";
+
+/** One file write on a skill row, under the user's lock. Throws a SkillRefusal for anything it refuses. */
+async function writeSkillFileRow(q: Querier, userId: string, skillId: number, input: SkillFileInput, action: FileAction): Promise<void> {
+  const exists = (await q(
+    "SELECT id FROM claw_skill_files WHERE skill_id = $1 AND file_path = $2",
+    [skillId, input.file_path]
+  )).rows[0];
+  if (action === "remove") {
+    if (!exists) throw new SkillRefusal({ ok: false, error: "not_found", message: `file '${input.file_path}' not found` });
+    await q("DELETE FROM claw_skill_files WHERE id = $1", [exists.id]);
+    return;
+  }
+  if (action === "add" && exists) {
+    throw new SkillRefusal({ ok: false, error: "invalid", message: `file '${input.file_path}' already exists; use update_skill_file` });
+  }
+  if (action === "update" && !exists) {
+    throw new SkillRefusal({ ok: false, error: "not_found", message: `file '${input.file_path}' not found` });
+  }
+  const sizeBytes = Buffer.byteLength(input.content, "utf8");
+  const capErr = await validateFileWrite(q, skillId, input.file_path, sizeBytes, !!exists);
+  if (capErr) throw new SkillRefusal(capErr);
+  if (exists) {
+    await q(
+      `UPDATE claw_skill_files
+       SET content = $1, is_binary = $2, size_bytes = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [input.content, !!input.is_binary, sizeBytes, exists.id]
+    );
+  } else {
+    await q(
+      `INSERT INTO claw_skill_files (skill_id, user_id, file_path, content, is_binary, size_bytes)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [skillId, userId, input.file_path, input.content, !!input.is_binary, sizeBytes]
+    );
+  }
+}
+
+/** A file add, update or remove on the user's visible skill, checked, audited, and the skill's fingerprint kept. */
+async function mutateSkillFile(
+  userId: string,
+  skillName: string,
+  input: SkillFileInput,
+  action: Exclude<FileAction, "upsert">,
+  opts: SkillFileWriteOptions,
+): Promise<{ ok: boolean; error?: string; refusal?: SkillWriteRefusal }> {
+  const actor = opts.actor ?? "api";
+  const path = validateSubFilePath(input.file_path);
+  const pre: SkillWriteRefused | null = action !== "remove" ? checkFileInput(input, opts)
+    : path.ok ? null : { ok: false, error: "invalid", message: path.error || "invalid file_path" };
+  if (pre) {
+    if (pre.error === "secret" || pre.error === "injection") await recordRefusal(userId, skillName, actor, opts.sessionId, pre);
+    return { ok: false, error: pre.message, refusal: pre.error };
+  }
+  const out = await writeSkillTx(opts.query, async (q) => {
+    await lockUserSkills(q, userId);
+    const skillId = await findVisibleSkillId(skillName, userId, q);
+    if (!skillId) throw new SkillRefusal({ ok: false, error: "not_found", message: `skill '${skillName}' not found` });
+    await writeSkillFileRow(q, userId, skillId, input, action);
+    await refreshContentSha(q, skillId);
+    const version = (await q("SELECT version FROM claw_skills WHERE id = $1", [skillId])).rows[0]?.version ?? null;
+    await recordSkillEvent(q, {
+      userId, skillName, version, op: "update", actor, sessionId: opts.sessionId,
+      detail: { file_path: input.file_path, file_action: action },
+    });
+    return { ok: true as const };
+  });
+  if (out.ok) return { ok: true };
+  if (out.error === "too_large" || out.error === "too_many_files") await recordRefusal(userId, skillName, actor, opts.sessionId, out);
+  return { ok: false, error: out.message, refusal: out.error };
+}
+
 export async function addSkillFile(
   userId: string,
   skillName: string,
   input: SkillFileInput,
-): Promise<{ ok: boolean; error?: string }> {
-  const pathCheck = validateSubFilePath(input.file_path);
-  if (!pathCheck.ok) return { ok: false, error: pathCheck.error };
-
-  const skillId = await findVisibleSkillId(skillName, userId);
-  if (!skillId) return { ok: false, error: `skill '${skillName}' not found` };
-
-  const exists = (await db.query(
-    "SELECT id FROM claw_skill_files WHERE skill_id = $1 AND file_path = $2",
-    [skillId, input.file_path]
-  )).rows[0];
-  if (exists) return { ok: false, error: `file '${input.file_path}' already exists; use update_skill_file` };
-
-  const sizeBytes = Buffer.byteLength(input.content, "utf8");
-  const capErr = await validateFileWrite(skillId, input.file_path, sizeBytes, false);
-  if (capErr) return { ok: false, error: capErr };
-
-  // Security scan (text only — base64 binary is opaque)
-  if (!input.is_binary) {
-    const blocked = scanMemoryContent(input.content, MAX_SUB_FILE_BYTES);
-    if (blocked) return { ok: false, error: blocked };
-  }
-
-  await db.query(
-    `INSERT INTO claw_skill_files (skill_id, user_id, file_path, content, is_binary, size_bytes)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [skillId, userId, input.file_path, input.content, !!input.is_binary, sizeBytes]
-  );
-  return { ok: true };
+  opts: SkillFileWriteOptions = {},
+): Promise<{ ok: boolean; error?: string; refusal?: SkillWriteRefusal }> {
+  return mutateSkillFile(userId, skillName, input, "add", opts);
 }
 
 export async function updateSkillFile(
   userId: string,
   skillName: string,
   input: SkillFileInput,
-): Promise<{ ok: boolean; error?: string }> {
-  const pathCheck = validateSubFilePath(input.file_path);
-  if (!pathCheck.ok) return { ok: false, error: pathCheck.error };
-
-  const skillId = await findVisibleSkillId(skillName, userId);
-  if (!skillId) return { ok: false, error: `skill '${skillName}' not found` };
-
-  const sizeBytes = Buffer.byteLength(input.content, "utf8");
-  const capErr = await validateFileWrite(skillId, input.file_path, sizeBytes, true);
-  if (capErr) return { ok: false, error: capErr };
-
-  if (!input.is_binary) {
-    const blocked = scanMemoryContent(input.content, MAX_SUB_FILE_BYTES);
-    if (blocked) return { ok: false, error: blocked };
-  }
-
-  const result = await db.query(
-    `UPDATE claw_skill_files
-     SET content = $1, is_binary = $2, size_bytes = $3, updated_at = NOW()
-     WHERE skill_id = $4 AND file_path = $5`,
-    [input.content, !!input.is_binary, sizeBytes, skillId, input.file_path]
-  );
-  if (!result.rowCount) return { ok: false, error: `file '${input.file_path}' not found` };
-  return { ok: true };
+  opts: SkillFileWriteOptions = {},
+): Promise<{ ok: boolean; error?: string; refusal?: SkillWriteRefusal }> {
+  return mutateSkillFile(userId, skillName, input, "update", opts);
 }
 
 export async function removeSkillFile(
   userId: string,
   skillName: string,
   filePath: string,
-): Promise<{ ok: boolean; error?: string }> {
-  const pathCheck = validateSubFilePath(filePath);
-  if (!pathCheck.ok) return { ok: false, error: pathCheck.error };
+  opts: SkillFileWriteOptions = {},
+): Promise<{ ok: boolean; error?: string; refusal?: SkillWriteRefusal }> {
+  return mutateSkillFile(userId, skillName, { file_path: filePath, content: "" }, "remove", opts);
+}
 
-  const skillId = await findVisibleSkillId(skillName, userId);
-  if (!skillId) return { ok: false, error: `skill '${skillName}' not found` };
+// ===== A user's save: every check, one transaction, audited =====
 
-  const result = await db.query(
-    "DELETE FROM claw_skill_files WHERE skill_id = $1 AND file_path = $2",
-    [skillId, filePath]
+export interface UserSkillInput {
+  name: string;
+  description?: string;
+  content: string;
+  /** Supporting files to write with it: each added, or replaced when the skill has it. Files not named are kept. */
+  files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+}
+
+export interface UserSkillSaveContext {
+  origin: SkillOrigin;
+  actor: SkillActor;
+  sessionId?: string | null;
+  /** The user saw the instruction-like text and confirmed it (a confirmation card). Never for `origin: "import"`. */
+  allowInjection?: boolean;
+  /** A transaction to write in (see SaveSkillOptions.query); the save is a savepoint in it. */
+  query?: Querier;
+}
+
+/**
+ * Save a skill a user asked for, from any path (the skill routes, the save_skill tool, a confirmed draft): the name
+ * rule for a new name, the size limits, no secret, no instruction hijack, room for a new skill. SKILL.md, the files
+ * and the audit event are written together or not at all; a refusal writes only its own audit event, and never what
+ * it refused.
+ */
+export async function saveUserSkill(userId: string, input: UserSkillInput, ctx: UserSkillSaveContext): Promise<SaveSkillResult> {
+  const name = typeof input.name === "string" ? input.name : "";
+  const refuse = async (r: SkillWriteRefused): Promise<SkillWriteRefused> => {
+    await recordRefusal(userId, name, ctx.actor, ctx.sessionId, r);
+    return r;
+  };
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  const content = typeof input.content === "string" ? input.content : "";
+  const files = Array.isArray(input.files) ? input.files : [];
+  if (!name) return refuse({ ok: false, error: "invalid_name", message: "skill_name required" });
+  if (!content.trim()) return refuse({ ok: false, error: "invalid", message: "content required" });
+  const known = (await (ctx.query ?? db.query)(
+    "SELECT 1 FROM claw_skills WHERE user_id = $1 AND skill_name = $2 LIMIT 1", [userId, name],
+  )).rows.length > 0;
+  if (!known && !USER_SKILL_NAME_RE.test(name)) {
+    return refuse({ ok: false, error: "invalid_name", message: "skill_name must be kebab-case: lowercase letters, digits and '-', starting with a letter or digit, at most 64 characters" });
+  }
+  if ([...content].length > SKILL_MD_MAX_CHARS) {
+    return refuse({ ok: false, error: "too_large", message: `SKILL.md is too long (max ${SKILL_MD_MAX_CHARS} characters)` });
+  }
+  if ([...description].length > SKILL_DESCRIPTION_MAX_CHARS) {
+    return refuse({ ok: false, error: "too_large", message: `description is too long (max ${SKILL_DESCRIPTION_MAX_CHARS} characters)` });
+  }
+  if (files.length > SKILL_FILES_MAX) {
+    return refuse({ ok: false, error: "too_many_files", message: `too many sub-files: ${files.length} > ${SKILL_FILES_MAX}` });
+  }
+  for (const f of files) {
+    const bad = checkFileInput({ file_path: f.path, content: f.content, is_binary: f.is_binary }, { origin: ctx.origin, allowInjection: ctx.allowInjection });
+    if (bad) return refuse(bad);
+  }
+  const scanned = scanSkillParts(
+    [{ file: "description", text: description }, { file: "SKILL.md", text: content }],
+    { origin: ctx.origin, allowInjection: ctx.allowInjection },
   );
-  if (!result.rowCount) return { ok: false, error: `file '${filePath}' not found` };
-  return { ok: true };
+  if (scanned) return refuse(scanned);
+
+  const out = await writeSkillTx(ctx.query, async (q) => {
+    const saved = await saveSkill(name, userId, content, "manual", ctx.sessionId ?? undefined, description, { query: q, origin: ctx.origin });
+    if (!saved.ok) throw new SkillRefusal(saved);
+    for (const f of files) {
+      await writeSkillFileRow(q, userId, saved.id, { file_path: f.path, content: f.content, is_binary: f.is_binary }, "upsert");
+    }
+    if (files.length) await refreshContentSha(q, saved.id);
+    await recordSkillEvent(q, {
+      userId, skillName: name, version: saved.version, op: saved.created ? "create" : "update", actor: ctx.actor,
+      sessionId: ctx.sessionId, detail: { origin: ctx.origin, files: files.map((f) => f.path) },
+    });
+    return saved;
+  });
+  if (!out.ok) return refuse(out);
+  return out;
 }
 
 export async function getSkillFiles(userId: string, skillName: string): Promise<Array<{ file_path: string; size_bytes: number; is_binary: boolean; updated_at: string }>> {
@@ -1034,7 +1319,7 @@ async function promotePatternToSkill(userId: string, patternId: number): Promise
     return;
   }
 
-  const blocked = scanMemoryContent(result.skill_content, 5000);
+  const blocked = autoSkillBlocked(result.skill_content, SKILL_MD_MAX_CHARS);
   if (blocked) {
     logger.warn({ reason: blocked }, "skill.pattern_promote_blocked");
     await releaseClaim();
@@ -1062,13 +1347,19 @@ async function promotePatternToSkill(userId: string, patternId: number): Promise
     return;
   }
 
-  // Save as 'auto-pattern' source → starts in 'probation'
-  await saveSkill(
+  // Save as 'auto-pattern' source → starts in 'probation'. A user with no room keeps every skill they have.
+  const saved = await saveSkill(
     result.skill_name, userId,
     result.skill_content, "auto-pattern",
     sampledIds[sampledIds.length - 1],
     result.skill_description || "",
+    { origin: "auto" },
   );
+  if (!saved.ok) {
+    logger.info({ patternId, userId, reason: saved.error }, "skill.pattern_promote_refused");
+    await releaseClaim();
+    return;
+  }
 
   // Find the new skill row and link it back to the pattern
   const skillRow = (await db.query(
@@ -1110,18 +1401,17 @@ export async function maybeCreateSkill(sessionId: string, userId: string, event:
     });
 
     if (result.should_create && result.skill_content && result.skill_name) {
-      const blocked = scanMemoryContent(result.skill_content, 5000);
+      const blocked = autoSkillBlocked(result.skill_content, SKILL_MD_MAX_CHARS);
       if (blocked) { logger.warn({ reason: blocked }, "skill.create_blocked"); return; }
 
-      // Delegate to saveSkill so soft-deleted rows are revived correctly
-      if (existingSkills.length >= MAX_SKILLS_PER_USER) {
-        await evictLeastUsedSkill(userId);
-      }
-      await saveSkill(
+      // Delegate to saveSkill so soft-deleted rows are revived correctly; a full user is refused, never evicted.
+      const saved = await saveSkill(
         result.skill_name, userId,
         result.skill_content, "auto",
         sessionId, result.skill_description || "",
+        { origin: "auto" },
       );
+      if (!saved.ok) { logger.info({ userId, reason: saved.error }, "skill.create_refused"); return; }
       // Set change_reason separately (saveSkill doesn't accept it)
       await db.query(
         `UPDATE claw_skills SET change_reason = $1 WHERE skill_name = $2 AND user_id = $3 AND deleted_at IS NULL`,
@@ -1550,7 +1840,7 @@ async function validateMutation(
   }
   if (m.type === "improve_skill") {
     if (!m.revised_content) return { ok: false, error: "improve_skill missing revised_content" };
-    const blocked = scanMemoryContent(m.revised_content, 5000);
+    const blocked = autoSkillBlocked(m.revised_content, SKILL_MD_MAX_CHARS);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
     return { ok: true, validation: {
       mutation: m, previousContent: currentContent,
@@ -1561,7 +1851,8 @@ async function validateMutation(
     const pc = validateSubFilePath(m.file_path);
     if (!pc.ok) return { ok: false, error: `improve_file path: ${pc.error}` };
     if (m.new_content === undefined) return { ok: false, error: "improve_file missing new_content" };
-    const blocked = scanMemoryContent(m.new_content, 10 * 1024);
+    if (Buffer.byteLength(m.new_content, "utf8") > SKILL_FILE_MAX_BYTES) return { ok: false, error: "improve_file too large" };
+    const blocked = autoSkillBlocked(m.new_content, SKILL_FILE_MAX_BYTES);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
     const existing = await getSkillFile(userId, skillName, m.file_path);
     if (!existing) return { ok: false, error: `improve_file: '${m.file_path}' not found` };
@@ -1574,10 +1865,10 @@ async function validateMutation(
     const pc = validateSubFilePath(m.file_path);
     if (!pc.ok) return { ok: false, error: `add_file path: ${pc.error}` };
     if (!m.content) return { ok: false, error: "add_file missing content" };
-    if (Buffer.byteLength(m.content, "utf8") > MAX_SUB_FILE_BYTES) {
-      return { ok: false, error: `add_file too large (${Buffer.byteLength(m.content, "utf8")} > ${MAX_SUB_FILE_BYTES})` };
+    if (Buffer.byteLength(m.content, "utf8") > SKILL_FILE_MAX_BYTES) {
+      return { ok: false, error: `add_file too large (${Buffer.byteLength(m.content, "utf8")} > ${SKILL_FILE_MAX_BYTES})` };
     }
-    const blocked = scanMemoryContent(m.content, 10 * 1024);
+    const blocked = autoSkillBlocked(m.content, SKILL_FILE_MAX_BYTES);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
     const existing = await getSkillFile(userId, skillName, m.file_path);
     if (existing) return { ok: false, error: `add_file: '${m.file_path}' already exists; use improve_file` };
@@ -1602,7 +1893,7 @@ async function validateMutation(
   if (m.type === "create_new_skill") {
     if (!m.skill_name || !m.skill_content) return { ok: false, error: "create_new_skill missing skill_name/skill_content" };
     if (m.skill_name === skillName) return { ok: false, error: "create_new_skill: cannot reuse parent skill name" };
-    const blocked = scanMemoryContent(m.skill_content, 5000);
+    const blocked = autoSkillBlocked(m.skill_content, SKILL_MD_MAX_CHARS);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
     return { ok: true, validation: {
       mutation: m, previousContent: null,
@@ -1672,7 +1963,7 @@ async function applyEvolveBatch(
       [activeId]
     )).rows[0];
     const mainSize = Buffer.byteLength(currentContent, "utf8");
-    if (mainSize + Number(totalRow.total) + cumulativeDelta > MAX_SKILL_TOTAL_BYTES) {
+    if (mainSize + Number(totalRow.total) + cumulativeDelta > SKILL_TOTAL_MAX_BYTES) {
       logger.warn({ skillName, cumulativeDelta }, "skill.evolution_batch_exceeds_capacity");
       return;
     }
@@ -1714,20 +2005,31 @@ async function applyEvolveBatch(
   // parent-row transaction (validation already passed above).
   if (plans.length === 1 && plans[0].mutation.type === "create_new_skill") {
     const m = plans[0].mutation as Extract<Mutation, { type: "create_new_skill" }>;
-    const existing = await getUserSkillNames(userId);
-    if (existing.length >= MAX_SKILLS_PER_USER) {
-      await evictLeastUsedSkill(userId);
+    // A user with no room keeps every skill they have: the sibling is not created.
+    const spawned = await inTransaction(async (q) => {
+      await lockUserSkills(q, userId);
+      const count = Number((await q(
+        "SELECT COUNT(DISTINCT skill_name) AS n FROM claw_skills WHERE user_id = $1 AND deleted_at IS NULL", [userId],
+      )).rows[0].n);
+      if (count >= USER_SKILL_MAX) return false;
+      await ensureProbationCapacity(userId, q);
+      const row = (await q(`
+        INSERT INTO claw_skills (skill_name, user_id, version, content, description, source, status, change_reason, source_session, analysis, origin)
+        VALUES ($1, $2, 1, $3, $4, 'auto', 'probation', $5, $6, $7, 'auto')
+        ON CONFLICT (skill_name, user_id, version) DO NOTHING
+        RETURNING id
+      `, [
+        m.skill_name, userId, m.skill_content, m.skill_description || "",
+        m.reason || "Spawned from evolution", sessionId,
+        JSON.stringify({ spawned_from: skillName, verifier: plans[0].verifier }),
+      ])).rows[0];
+      if (row) await refreshContentSha(q, row.id);
+      return true;
+    });
+    if (!spawned) {
+      logger.info({ newSkill: m.skill_name, parentSkill: skillName, userId }, "skill.spawn_refused_full");
+      return;
     }
-    await ensureProbationCapacity(userId);
-    await db.query(`
-      INSERT INTO claw_skills (skill_name, user_id, version, content, description, source, status, change_reason, source_session, analysis)
-      VALUES ($1, $2, 1, $3, $4, 'auto', 'probation', $5, $6, $7)
-      ON CONFLICT (skill_name, user_id, version) DO NOTHING
-    `, [
-      m.skill_name, userId, m.skill_content, m.skill_description || "",
-      m.reason || "Spawned from evolution", sessionId,
-      JSON.stringify({ spawned_from: skillName, verifier: plans[0].verifier }),
-    ]);
     logger.info({ newSkill: m.skill_name, parentSkill: skillName }, "skill.spawned_from_evolution");
     return;
   }
@@ -1828,6 +2130,7 @@ async function applyEvolveBatch(
       );
     }
 
+    await refreshContentSha((text, params) => client.query(text, params), activeId);
     await client.query("COMMIT");
     logger.info(
       { skillName, mutations: plans.length, applied: mutationVersionsApplied, bumpVersion },
@@ -1855,7 +2158,22 @@ async function applyEvolveBatch(
 // that contains a previous_content_snippet. Legacy multi-version skills fall back to
 // the old "restore archived v-1 row" path.
 
-export async function manualRollback(skillName: string, userId: string): Promise<boolean> {
+/** Undo the latest change to a skill (`manualRollbackInner`), then keep its fingerprint and audit trail. */
+export async function manualRollback(skillName: string, userId: string, actor: SkillActor = "api"): Promise<boolean> {
+  const done = await manualRollbackInner(skillName, userId);
+  if (!done) return false;
+  const row = (await db.query(
+    `SELECT id, version FROM claw_skills WHERE skill_name = $1 AND user_id = $2 AND status IN ('active', 'probation')
+       AND deleted_at IS NULL ORDER BY version DESC LIMIT 1`,
+    [skillName, userId],
+  )).rows[0];
+  if (row) await refreshContentSha(db.query, row.id);
+  await recordSkillEvent(db.query, { userId, skillName, version: row?.version ?? null, op: "rollback", actor })
+    .catch((err) => logger.warn({ err: (err as Error)?.message, skillName }, "skill.rollback_audit_failed"));
+  return true;
+}
+
+async function manualRollbackInner(skillName: string, userId: string): Promise<boolean> {
   const current = (await db.query(
     `SELECT id, version, content, description, analysis
      FROM claw_skills
@@ -2090,11 +2408,28 @@ export async function manualRollback(skillName: string, userId: string): Promise
 
 // ===== Delete Skill (all versions) =====
 
-export async function deleteSkill(skillName: string, userId: string): Promise<number> {
+export async function deleteSkill(skillName: string, userId: string, actor: SkillActor = "api"): Promise<number> {
+  return inTransaction(async (q) => {
+    const result = await q(
+      "UPDATE claw_skills SET deleted_at = NOW() WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING version",
+      [skillName, userId]
+    );
+    const n = result.rowCount ?? 0;
+    if (n) {
+      const version = Math.max(...result.rows.map((r: any) => Number(r.version)));
+      await recordSkillEvent(q, { userId, skillName, version, op: "delete", actor });
+    }
+    return n;
+  });
+}
+
+/** Drafts nobody confirmed within SKILL_DRAFT_TTL_HOURS are deleted. */
+export async function cleanupExpiredSkillDrafts(): Promise<number> {
   const result = await db.query(
-    "UPDATE claw_skills SET deleted_at = NOW() WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NULL",
-    [skillName, userId]
+    "DELETE FROM claw_skill_drafts WHERE created_at < NOW() - make_interval(hours => $1::int)",
+    [SKILL_DRAFT_TTL_HOURS],
   );
+  if (result.rowCount) logger.info({ deleted: result.rowCount }, "skill_drafts.expired_cleanup");
   return result.rowCount ?? 0;
 }
 

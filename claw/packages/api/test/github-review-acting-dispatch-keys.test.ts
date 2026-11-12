@@ -170,7 +170,7 @@ test("D5 a turn of a review someone asked of the owner is claimed with the fixed
   assert.equal(request.sandbox_profile, "review");
   assert.deepEqual(request.tools_allowlist, PROFILE_TOOLS);
   assert.equal(request.max_turns, 197, "the turns left: 200 for the review less the 3 it took (the day has more)");
-  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.withhold_sandbox_keys], [false, false, true]);
+  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.user_skills_enabled, request.withhold_sandbox_keys], [false, false, false, true]);
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology"]) assert.equal(field in request, false, field);
   assert.equal(request.platform_key, "pk-live", "Brain still runs it with the session's keys: the reviewer's own");
   const own = (await claim("u-bob", "claude-opus-5.5", undefined, { acting_as: "u-bob" })).request;
@@ -182,7 +182,7 @@ test("D6 a task of a DAG in a review someone asked of the owner is dispatched wi
   assert.equal(request.sandbox_profile, "review");
   assert.deepEqual(request.tools_allowlist, PROFILE_TOOLS);
   assert.deepEqual(request.mcp_servers, {});
-  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.max_turns, request.workspace_id], [false, false, 197, undefined]);
+  assert.deepEqual([request.memory_enabled, request.skill_evolution_enabled, request.user_skills_enabled, request.max_turns, request.workspace_id], [false, false, false, 197, undefined]);
   const own = await dispatchDag({ platform_key: "pk-user-1", _server_managed_credentials: true, acting_as: "u-bob" });
   assert.equal(own.sandbox_profile, undefined);
 });

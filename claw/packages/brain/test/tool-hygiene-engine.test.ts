@@ -5,8 +5,9 @@
  * The engine's half of tool hygiene, through the real engine and loop with only
  * the LLM faked.
  *
- *   T1 the skill-writing tools reach the model only when the request says skill
- *      self-evolution is on
+ *   T1 the skill-writing tools reach the model only when the request says the API
+ *      keeps saved skills (`user_skills_enabled`; from an older API,
+ *      `skill_evolution_enabled`), and never in a session that acts as a user
  *   T2 an MCP server that does not connect is told to the user (a progress
  *      event) and to the model (a line in the prompt)
  */
@@ -39,14 +40,23 @@ async function run(over: Record<string, unknown>) {
   return { tools: (body.tools ?? []).map((t) => t.name), userText, events };
 }
 
-test("T1 skill tools reach the model only with skill_evolution_enabled", async () => {
+const SKILL_WRITERS = ["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"];
+
+test("T1 skill tools reach the model only with user_skills_enabled, or skill_evolution_enabled from an API without it", async () => {
   const off = await run({});
-  assert.ok(!off.tools.includes("save_skill"), "offered with self-evolution off");
+  assert.ok(!off.tools.includes("save_skill"), "offered with saving off");
   assert.ok(off.tools.includes("bash"), "the tool list is the real one");
-  const on = await run({ skill_evolution_enabled: true });
-  for (const name of ["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]) {
-    assert.ok(on.tools.includes(name), `${name} missing with self-evolution on`);
-  }
+  const on = await run({ user_skills_enabled: true });
+  for (const name of SKILL_WRITERS) assert.ok(on.tools.includes(name), `${name} missing with user_skills_enabled`);
+  // The API says which switch decides: auto-evolution on and the user's own skills off offers nothing.
+  const autoOnly = await run({ user_skills_enabled: false, skill_evolution_enabled: true });
+  for (const name of SKILL_WRITERS) assert.ok(!autoOnly.tools.includes(name), `${name} offered with user_skills_enabled false`);
+  // An API from before the field: the old one decides, as it did.
+  const legacy = await run({ skill_evolution_enabled: true });
+  for (const name of SKILL_WRITERS) assert.ok(legacy.tools.includes(name), `${name} missing from an older API's request`);
+  // A session that acts as a user never saves into the requester's skills.
+  const acting = await run({ user_skills_enabled: true, withhold_sandbox_keys: true });
+  for (const name of SKILL_WRITERS) assert.ok(!acting.tools.includes(name), `${name} offered to a session that acts as a user`);
 });
 
 test("T2 an MCP server that is down is told to the user and to the model", async () => {

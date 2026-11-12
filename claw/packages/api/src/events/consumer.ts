@@ -19,9 +19,8 @@ import {
 } from "@claw/protocol";
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
-import { scanMemoryContent } from "../memory/gates.js";
 import {
-  saveSkill, recordSkillFeedback,
+  saveUserSkill, recordSkillFeedback,
   selectSkillsForTask,
   addSkillFile, updateSkillFile, removeSkillFile,
   maybeRecordTaskPattern,
@@ -31,7 +30,7 @@ import { appEventIdentity } from "./app-events.js";
 import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import { skipsSkillSelection } from "../assistant/role-profile.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
@@ -997,7 +996,7 @@ export const eventNotificationPorts = {
  * substituted). Production reads every one from here.
  */
 export const completionPorts = {
-  saveSkill,
+  saveUserSkill,
   recordSkillFeedback,
   checkProbationGraduation,
   maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
@@ -1148,10 +1147,10 @@ async function handleComplete(
   }
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
-  // Gated by CLAW_SKILL_EVOLUTION_ENABLED. When OFF: drop, warn for audit.
+  // Gated by CLAW_USER_SKILLS_ENABLED. When OFF: drop, warn for audit.
   const skillsToSave = sandboxOnly ? [] : (event as any).skills_to_save || [];
   const skillFileMutations = sandboxOnly ? [] : (event as any).skill_file_mutations || [];
-  if (!CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (!CLAW_USER_SKILLS_ENABLED) {
     if (skillsToSave.length || skillFileMutations.length) {
       logger.warn({
         sessionId,
@@ -1161,36 +1160,32 @@ async function handleComplete(
     }
   } else {
     // 4. Process explicit save_skill events (from Brain's save_skill tool).
-    // Skills saved via tool are user-vouched, so source='manual' (skip probation).
+    // Skills saved via tool are user-vouched, so source='manual' (skip probation). Every check a user's save passes
+    // (name, size, secret, instruction hijack, room) is saveUserSkill's; a refusal is audited there.
     for (const skill of skillsToSave) {
-      const blocked = scanMemoryContent(skill.content, 5000);
-      if (blocked) { logger.warn({ reason: blocked }, "skill.blocked"); continue; }
       try {
-        await completionPorts.saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
-        logger.info({ skillName: skill.skill_name, sessionId }, "skill.saved");
-
-        // Sub-files passed in the same save_skill call (rare path; usually they come via mutations)
-        for (const f of skill.files || []) {
-          const r = await addSkillFile(userId, skill.skill_name, {
-            file_path: f.path, content: f.content, is_binary: f.is_binary,
-          });
-          if (!r.ok) logger.warn({ skill: skill.skill_name, path: f.path, err: r.error }, "skill_file.inline_save_failed");
-        }
+        const saved = await completionPorts.saveUserSkill(userId, {
+          name: skill.skill_name, content: skill.content, description: skill.description || "",
+          files: Array.isArray(skill.files) ? skill.files : [],
+        }, { origin: "worker", actor: "model", sessionId });
+        if (saved.ok) logger.info({ skillName: skill.skill_name, sessionId, version: saved.version }, "skill.saved");
+        else logger.warn({ skillName: skill.skill_name, sessionId, reason: saved.error }, "skill.save_refused");
       } catch (err) {
         logger.error({ err, sessionId }, "skill.save_failed");
       }
     }
 
     // 4.5. Process sub-file mutations (E2: add/update/remove_skill_file)
+    const fileWrite = { actor: "model" as const, origin: "worker" as const, sessionId };
     for (const m of skillFileMutations) {
       try {
         let r;
         if (m.action === "add") {
-          r = await addSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary });
+          r = await addSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary }, fileWrite);
         } else if (m.action === "update") {
-          r = await updateSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary });
+          r = await updateSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary }, fileWrite);
         } else if (m.action === "remove") {
-          r = await removeSkillFile(userId, m.skill_name, m.file_path);
+          r = await removeSkillFile(userId, m.skill_name, m.file_path, fileWrite);
         } else {
           logger.warn({ action: m.action }, "skill_file.unknown_action");
           continue;
@@ -1245,11 +1240,11 @@ async function handleComplete(
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
   //
-  //    Gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, no feedback is
+  //    Gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED — when OFF, no feedback is
   //    recorded and probation skills don't graduate. selected_skills/skills_used
   //    on the event are also harmless to ignore because selectSkillsForTask
   //    already returns {} upstream.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
     //    Attribution rules (revised after the "no-disk-write" optimization broke
     //    the simple selected ∩ used model):
     //
@@ -1338,7 +1333,7 @@ async function handleComplete(
   //     These produce signal but losing one occurrence is acceptable —
   //     a summary will be regenerated on the next exec_complete, and
   //     pattern occurrences accumulate over many sessions.
-  //     Pattern recording gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary
+  //     Pattern recording gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED. Summary
   //     stays unconditional. Memory is never extracted in the background.
   // A review someone asked of the owner learns nothing for the owner: no pattern, no skill evolution from what a stranger's pull request
   // made its model do (`github-review/review-profile.ts`). A session whose profile cannot be read is treated as one.
@@ -1346,7 +1341,7 @@ async function handleComplete(
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
+    if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED && learns) {
       completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
@@ -1356,8 +1351,8 @@ async function handleComplete(
   //     Skill evolution is the highest-value background task and the most
   //     expensive to lose (LLM-decided multi-mutation batches), so it goes
   //     into a real DB-backed queue. marketplace/evolve-worker.ts polls and runs jobs
-  //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
-  if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
+  //     with retries and crash recovery. Gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED.
+  if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED && learns) {
     try {
       await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
@@ -1648,7 +1643,8 @@ if (pending) {
     prompt: pending.content,
     history,
     memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
-    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+    skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+    user_skills_enabled: CLAW_USER_SKILLS_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",

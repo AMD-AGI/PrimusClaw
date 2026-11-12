@@ -22,7 +22,7 @@ import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
 } from "../auth/session-credentials.js";
-import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_AUTO_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { sessionEffortFromRow } from "../sessions/session-model.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
@@ -503,9 +503,10 @@ function executeRequestOf(opts: Parameters<typeof buildExecuteRequest>[0]): Exec
     ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
     prompt: rendered.prompt ?? undefined,
     history: [],
-    // A task, DAG node or application run is not the user's conversation: no memory tools.
+    // A task, DAG node or application run is not the user's conversation: no memory tools, and no saving skills.
     memory_enabled: false,
-    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+    skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+    user_skills_enabled: false,
     script: rendered.script as ExecuteRequest["script"] | undefined,
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,

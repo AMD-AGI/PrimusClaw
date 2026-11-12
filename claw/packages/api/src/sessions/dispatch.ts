@@ -18,7 +18,7 @@ import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { memoryAccess } from "../memory/service.js";
-import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import { selectSkillsForTask } from "../marketplace/skill-service.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
@@ -319,7 +319,8 @@ export async function dispatchTaskToBrain(
       prompt: content,
       history,
       memory_enabled: (await memoryAccess(sessionId, userId)).serves,
-      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+      skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+      user_skills_enabled: CLAW_USER_SKILLS_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",

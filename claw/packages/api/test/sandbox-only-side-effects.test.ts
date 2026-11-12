@@ -15,7 +15,8 @@
 
 process.env.CLAW_NOTIFICATIONS_ENABLED = "1";
 process.env.CLAW_MEMORY_ENABLED = "1";
-process.env.CLAW_SKILL_EVOLUTION_ENABLED = "1";
+process.env.CLAW_USER_SKILLS_ENABLED = "1";
+process.env.CLAW_SKILL_AUTO_EVOLUTION_ENABLED = "1";
 // For the requested review below: its session is told apart only while GitHub review is on.
 process.env.CLAW_GITHUB_REVIEW_ENABLED = "1";
 
@@ -90,7 +91,7 @@ beforeEach(async () => {
   calls = [];
   const spy = (name: string, result: unknown = undefined) => async () => { calls.push(name); return result; };
   Object.assign(completionPorts, originalPorts, {
-    saveSkill: spy("saveSkill"),
+    saveUserSkill: spy("saveUserSkill", { ok: true, id: 1, version: 1, created: true }),
     recordSkillFeedback: spy("recordSkillFeedback"),
     checkProbationGraduation: spy("checkProbationGraduation"),
     maybeSummarize: spy("maybeSummarize"),
@@ -137,7 +138,7 @@ async function consume(event: Record<string, unknown>): Promise<void> {
 }
 
 const SIDE_EFFECTS = [
-  "saveSkill", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
+  "saveUserSkill", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
   "maybeRecordTaskPattern", "enqueueEvolutionJob", "recordRunFinished",
 ];
 

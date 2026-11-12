@@ -501,7 +501,8 @@ export class AgentEngine {
       // stranger's text made it write, and every later session of the requester would read it.
       router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
       router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
-      router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
+      // Skill writes: only where the API keeps them, and never in a session that acts as a user, for the reason above.
+      router.skillEvolutionEnabled = (request.user_skills_enabled ?? request.skill_evolution_enabled) === true && !request.withhold_sandbox_keys;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {

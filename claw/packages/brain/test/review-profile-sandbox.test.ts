@@ -134,12 +134,12 @@ test("S3 the fingerprint tells a review sandbox from any other; a SaFE deploymen
 test("S4 the backstop strips a review request to its profile, and its tools are the fixed list met by the request's own", () => {
   const r = request({
     sandbox_profile: "review", skills: { s: { content: "x", enabled: true } }, tool_ids: [1], plugin_id: 3, plugin_tools: [], user_env: { GH_TOKEN: "t" },
-    topology: { nodes: 2 } as never, memory_enabled: true, skill_evolution_enabled: true,
+    topology: { nodes: 2 } as never, memory_enabled: true, skill_evolution_enabled: true, user_skills_enabled: true,
     mcp_servers: { github_review: { type: "http", url: "http://api/mcp" }, mine: { type: "http", url: "http://x" } },
   } as never);
   applyReviewProfileBackstop(r);
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "topology", "workspace_id"]) assert.equal(field in r, false, field);
-  assert.deepEqual([r.withhold_sandbox_keys, r.memory_enabled, r.skill_evolution_enabled], [true, false, false]);
+  assert.deepEqual([r.withhold_sandbox_keys, r.memory_enabled, r.skill_evolution_enabled, r.user_skills_enabled], [true, false, false, false]);
   assert.deepEqual(Object.keys(r.mcp_servers ?? {}), ["github_review"]);
   const wide = reviewProfileAllowlist(parseToolAllowlist(["*"]));
   for (const name of ["read", "grep", "bash", "task", "mcp__github_review__gh_pr_get"]) assert.equal(wide.allows(name), true, name);
