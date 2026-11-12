@@ -61,7 +61,8 @@
  *   M1  review_mode_set can only make reviews ask more
  *   X1  channel_action runs a listed action at once only when the message is its command typed whole; anything else is put to
  *       the user as that command with a button (an `assistant.say` carrying it), and runs nothing; a handoff's name is no channel action
- *   X1s a channel action goes only to the subscription of the surface its message came from, not the surface used last
+ *   X1s a channel action, and the button that puts one to the person, go only to the subscription of the surface its message
+ *       came from, not the surface used last
  *   U1  what a worker wrote in the item list (summary, question) never makes a signed-in message allow a write or run a channel
  *       action: the list renders it as untrusted data, and no phrase but the exact command does either
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
@@ -1085,7 +1086,7 @@ describe("assistant review tools", { skip }, () => {
     assert.equal((await w.q("SELECT review_mode FROM claw_github_review_settings WHERE user_id = $1", [alice.userId]))[0].review_mode, "high_risk_confirm");
   });
 
-  test("X1s a channel action goes to the surface its message came from, whichever the person used last", async () => {
+  test("X1s a channel action, or its button, goes to the surface its message came from, whichever the person used last", async () => {
     const ctx = { ...DEFAULT_CTX, actions: [{ name: "/brief", usage: "/brief on HH:MM", summary: "每个工作日的晨报" }] };
     const teams = await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
     const slack = await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
@@ -1102,6 +1103,12 @@ describe("assistant review tools", { skip }, () => {
       const fromTeams = await userTurn(alice, "/brief off", { context: ctx });
       const off = await rt.channelAction(fromTeams, { name: "brief", args: "off" }) as Recorded;
       assert.deepEqual((await w.q("SELECT subscription_id FROM claw_notification_outbox WHERE event_id = $1", [off.event_id])).map((r) => r.subscription_id), [teams]);
+      // Put to the person as a button instead (not the command typed whole): the button, too, goes to the message's surface.
+      const askedOnSlack = await userTurn(alice, "每天十点给我晨报", { context: { ...ctx, channel: "slack", channel_message_id: "slack-ts-2" } });
+      const shown = await rt.channelAction(askedOnSlack, { name: "brief", args: "on 10:00" }) as Recorded;
+      assert.equal(shown.ran, false);
+      const card = await w.q("SELECT subscription_id, payload FROM claw_notification_outbox WHERE event_id = $1", [shown.say_id]);
+      assert.deepEqual(card.map((r) => [r.subscription_id, r.payload.confirm_action?.channel_message_id]), [[slack, "slack-ts-2"]]);
     } finally {
       await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = $1", [alice.userId]);
     }

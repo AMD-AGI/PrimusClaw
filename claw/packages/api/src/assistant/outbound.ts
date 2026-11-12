@@ -1128,6 +1128,8 @@ export async function recordActionConfirm(
     type: "assistant.say", fallback: true, item: null, confirmAction: input.action,
     sayId: deterministicEventId("assistant.confirm_action", input.userId, input.key),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
+    // The button runs the action on the message it answers (`channel_message_id`): only that message's surface has it.
+    sourceTurn: input.action.message_id,
   });
   if (!stored) return null;
   return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
