@@ -32,8 +32,8 @@ A SaFE API key is checked with RFC 7662 token introspection at the identity prov
 
 A sandbox runs in a SaFE workspace the caller belongs to.
 
-- A caller in one workspace uses that workspace.
-- A caller in several workspaces sets metadata `agent-sandbox.io/workspace`.
+- With workspace SAR off, a caller listed on one SaFE User workspace uses that workspace. Several workspaces, or a system-admin, set metadata `agent-sandbox.io/workspace`.
+- With workspace SAR on, every caller sets metadata `agent-sandbox.io/workspace`. An omitted workspace returns `400 workspace_required`. The control plane does not list Workspaces.
 - A `system-admin` always sets metadata `agent-sandbox.io/workspace` and may choose any workspace.
 - A workspace the caller does not belong to returns `403 user_not_in_workspace`.
 

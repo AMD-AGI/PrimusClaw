@@ -129,16 +129,17 @@ func testService(t *testing.T, now time.Time, intercept ...interceptor.Funcs) (*
 	rec := &memRecord{}
 	reclaimer := &memReclaimer{}
 	svc := New(Options{
-		Client:    cl,
-		Namespace: "agent-sandbox-system",
-		DataKey:   bytes32('k'),
-		Authn:     staticAuth{},
-		Attest:    checker,
-		Identity:  staticIdentity{},
-		Authz:     authz.NewClient(workspaceReviewer{allow: []string{"top-models", "lab"}}, "primus:"),
-		Reclaimer: reclaimer,
-		Record:    rec,
-		Now:       func() time.Time { return now },
+		Client:      cl,
+		Namespace:   "agent-sandbox-system",
+		DataKey:     bytes32('k'),
+		Authn:       staticAuth{},
+		Attest:      checker,
+		Identity:    staticIdentity{},
+		Authz:       authz.NewClient(workspaceReviewer{allow: []string{"lab", "prod"}}, "primus:"),
+		ReviewOwner: true,
+		Reclaimer:   reclaimer,
+		Record:      rec,
+		Now:         func() time.Time { return now },
 	})
 	return svc, priv, rec, reclaimer
 }
@@ -199,7 +200,7 @@ func signGrantShape(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest, kind
 func sampleRequest(expires time.Time) IssueRequest {
 	return IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
-		Owner:       OwnerRequest{UserID: "u-123", Workspaces: []string{"top-models"}},
+		Owner:       OwnerRequest{UserID: "u-123", Workspaces: []string{"lab"}},
 		PlatformKey: "ak-test",
 		Issuer:      IssuerRequest{SessionID: "s-8f2a", AppRunID: "ar-01ja"},
 		Roles: map[string]RoleRequest{
@@ -292,7 +293,7 @@ func TestIssueReplayMatchesExecutionSpec(t *testing.T) {
 	}{
 		{"session", func(r *IssueRequest) { r.Issuer.SessionID = "s-other" }},
 		{"app run", func(r *IssueRequest) { r.Issuer.AppRunID = "ar-other" }},
-		{"workspace", func(r *IssueRequest) { r.Owner.Workspaces = []string{"lab"} }},
+		{"workspace", func(r *IssueRequest) { r.Owner.Workspaces = []string{"prod"} }},
 		{"budget", func(r *IssueRequest) { r.GPUHoursBudget = 2 }},
 		{"lifetime", func(r *IssueRequest) { r.MaxSandboxSeconds = 60 }},
 		{"cards", func(r *IssueRequest) { r.Templates[0].PerGPUCount = []int32{1} }},

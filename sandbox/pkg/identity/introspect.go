@@ -52,55 +52,6 @@ type Token struct {
 	expires time.Time
 }
 
-// HasRole reports whether the token carries role.
-func (t Token) HasRole(role string) bool {
-	for _, r := range t.Roles {
-		if r == role {
-			return true
-		}
-	}
-	return false
-}
-
-type cacheEntry struct {
-	token   Token
-	expires time.Time
-}
-
-// boundedCache is a TTL map that evicts expired entries, then one entry, when full.
-type boundedCache struct {
-	entries map[string]cacheEntry
-}
-
-func (b *boundedCache) get(key string, now time.Time) (cacheEntry, bool) {
-	e, ok := b.entries[key]
-	if !ok {
-		return cacheEntry{}, false
-	}
-	if !now.Before(e.expires) {
-		delete(b.entries, key)
-		return cacheEntry{}, false
-	}
-	return e, true
-}
-
-func (b *boundedCache) put(key string, e cacheEntry, now time.Time) {
-	if _, ok := b.entries[key]; !ok && len(b.entries) >= maxCacheSize {
-		for k, old := range b.entries {
-			if !now.Before(old.expires) {
-				delete(b.entries, k)
-			}
-		}
-		if len(b.entries) >= maxCacheSize {
-			for k := range b.entries {
-				delete(b.entries, k)
-				break
-			}
-		}
-	}
-	b.entries[key] = e
-}
-
 // Client calls the identity introspection endpoint with HTTP Basic client credentials.
 // Active answers are cached for up to 30s, never past the token exp, and inactive
 // answers for 5s, in separate caches. Concurrent lookups of one key share one call.
@@ -115,8 +66,8 @@ type Client struct {
 	group        singleflight.Group
 
 	mu       sync.Mutex
-	positive boundedCache
-	negative boundedCache
+	positive TTL[Token]
+	negative TTL[Token]
 	logged   map[string]time.Time
 }
 
@@ -135,8 +86,6 @@ func NewClient(endpoint, clientID, clientSecret, audience string) *Client {
 		http:         &http.Client{Timeout: callTimeout},
 		now:          time.Now,
 		cacheKey:     key,
-		positive:     boundedCache{entries: map[string]cacheEntry{}},
-		negative:     boundedCache{entries: map[string]cacheEntry{}},
 		logged:       map[string]time.Time{},
 	}
 }
@@ -330,10 +279,10 @@ func (c *Client) cached(key string) (Token, error, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	if e, ok := c.positive.get(key, now); ok {
-		return e.token, nil, true
+	if tok, ok := c.positive.Get(key, now); ok {
+		return tok, nil, true
 	}
-	if _, ok := c.negative.get(key, now); ok {
+	if _, ok := c.negative.Get(key, now); ok {
 		return Token{}, ErrInactive, true
 	}
 	return Token{}, nil, false
@@ -345,12 +294,12 @@ func (c *Client) store(key string, tok Token, active bool) {
 	defer c.mu.Unlock()
 	now := c.now()
 	if !active {
-		c.negative.put(key, cacheEntry{expires: now.Add(negativeTTL)}, now)
+		c.negative.Put(key, Token{}, now.Add(negativeTTL), now, maxCacheSize)
 		return
 	}
 	expires := now.Add(positiveTTL)
 	if !tok.expires.IsZero() && tok.expires.Before(expires) {
 		expires = tok.expires
 	}
-	c.positive.put(key, cacheEntry{token: tok, expires: expires}, now)
+	c.positive.Put(key, tok, expires, now, maxCacheSize)
 }

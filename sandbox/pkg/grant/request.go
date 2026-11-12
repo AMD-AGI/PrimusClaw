@@ -110,6 +110,11 @@ func validateIssue(req IssueRequest, now time.Time) error {
 	if req.Owner.UserID == "" || len(req.Owner.Workspaces) == 0 {
 		return opErr(http.StatusBadRequest, "invalid_grant", "owner userId and workspaces are required")
 	}
+	for _, ws := range req.Owner.Workspaces {
+		if ws == "" {
+			return opErr(http.StatusBadRequest, "invalid_grant", "workspace name is empty")
+		}
+	}
 	if req.Issuer.AppRunID == "" {
 		return opErr(http.StatusBadRequest, "invalid_grant", "issuer.appRunId is required")
 	}

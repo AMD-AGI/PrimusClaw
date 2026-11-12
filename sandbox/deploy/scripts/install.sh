@@ -29,7 +29,7 @@
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
 #   IDENTITY_INTROSPECT_URL=                  # set to enable /v1 authentication (recommended)
-#   IDENTITY_TOKEN_URL=                       # optional at install; with auth on, the process exits until it is set
+#   IDENTITY_TOKEN_URL=                       # token endpoint; the process exits only when ENABLE_WORKLOAD_ASSERTION=true and this is unset
 #   RBAC_SUBJECT_PREFIX=primus:               # prefix of identity users and groups in SubjectAccessReview
 #   ALLOW_INSECURE_NO_AUTH=false              # true = install WITHOUT auth (dev clusters only)
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement

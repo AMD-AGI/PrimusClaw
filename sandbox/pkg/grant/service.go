@@ -62,8 +62,6 @@ type Service struct {
 	attest     AttestationChecker
 	identity   Introspector
 	authz      Authorizer
-	users      UserReader
-	workspaces WorkspaceLister
 	reclaimer  Reclaimer
 	exists     SandboxExists
 	promoter   PendingPromoter
@@ -74,6 +72,8 @@ type Service struct {
 	writes     grantLocks
 	// attestWorkloads is true when every Workload carries an identity assertion.
 	attestWorkloads bool
+	// reviewOwner is true when a grant-key create must review the owner's workspace.
+	reviewOwner bool
 }
 
 // grantLocks serialises the read-modify-write of one grant inside this process,
@@ -110,22 +110,23 @@ func (s *Service) SetPromoter(p PendingPromoter) {
 
 // Options configures a Service.
 type Options struct {
-	Client     ctrlclient.Client
-	Reader     ctrlclient.Reader
-	Namespace  string
-	DataKey    []byte
-	Authn      Authenticator
-	Attest     AttestationChecker
-	Identity   Introspector
-	Authz      Authorizer
-	Users      UserReader
-	Workspaces WorkspaceLister
-	Reclaimer  Reclaimer
-	Exists     SandboxExists
-	Record     Recorder
-	Now        func() time.Time
+	Client    ctrlclient.Client
+	Reader    ctrlclient.Reader
+	Namespace string
+	DataKey   []byte
+	Authn     Authenticator
+	Attest    AttestationChecker
+	Identity  Introspector
+	Authz     Authorizer
+	Reclaimer Reclaimer
+	Exists    SandboxExists
+	Record    Recorder
+	Now       func() time.Time
 	// AttestWorkloads is true when every Workload carries an identity assertion.
 	AttestWorkloads bool
+	// ReviewOwner is true when a grant-key create reviews the owner's workspace.
+	// A User authorizer does not set this; workspace SAR does.
+	ReviewOwner bool
 }
 
 // New returns a grant service. Client and Namespace are required.
@@ -147,13 +148,12 @@ func New(opt Options) *Service {
 		attest:          opt.Attest,
 		identity:        opt.Identity,
 		authz:           opt.Authz,
-		users:           opt.Users,
-		workspaces:      opt.Workspaces,
 		reclaimer:       opt.Reclaimer,
 		exists:          opt.Exists,
 		record:          opt.Record,
 		now:             now,
 		attestWorkloads: opt.AttestWorkloads,
+		reviewOwner:     opt.ReviewOwner,
 	}
 }
 
@@ -188,7 +188,7 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	} else if tok.Email != "" {
 		req.Owner.UserName = tok.Email
 	}
-	if err := s.checkWorkspaces(ctx, tok.Subject, tok.Groups, req.Owner.Workspaces); err != nil {
+	if err := s.checkWorkspaces(ctx, tok, req.Owner.Workspaces); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	roles, expanded, stored, err := expandTemplates(req.Issuer.AppRunID, req.Roles, req.Templates)

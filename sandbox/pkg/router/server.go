@@ -40,7 +40,7 @@ type Config struct {
 	// Identity validates caller credentials on /v1 when EnableAuth is set.
 	Identity *identity.Client
 	// Authz resolves the caller's platform role. nil reads the role from the token.
-	Authz              *authz.Client
+	Authz              authz.RoleSource
 	WorkloadManagerURL string
 	Namespace          string
 	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.

@@ -191,10 +191,16 @@ fi
 # ── 10. Permission review (SubjectAccessReview) ───────────────────────────────
 section "10. Permission review"
 CP_SA="system:serviceaccount:${NAMESPACE}:agent-sandbox-controlplane"
-if [[ "$(kubectl auth can-i create subjectaccessreviews.authorization.k8s.io --as="${CP_SA}" 2>/dev/null)" == "yes" ]]; then
-    pass "controlplane may create SubjectAccessReviews"
+SAR="$(kget get deploy agent-sandbox-controlplane \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_WORKSPACE_SAR")].value}' 2>/dev/null || true)"
+if [[ "${SAR}" == "true" ]]; then
+    if [[ "$(kubectl auth can-i create subjectaccessreviews.authorization.k8s.io --as="${CP_SA}" 2>/dev/null)" == "yes" ]]; then
+        pass "controlplane may create SubjectAccessReviews"
+    else
+        fail "controlplane SubjectAccessReview" "${CP_SA} lacks system:auth-delegator"
+    fi
 else
-    fail "controlplane SubjectAccessReview" "${CP_SA} lacks system:auth-delegator"
+    pass "controlplane SubjectAccessReview" "skipped (ENABLE_WORKSPACE_SAR is not true)"
 fi
 RBAC_PREFIX="$(kget get deploy agent-sandbox-controlplane \
     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RBAC_SUBJECT_PREFIX")].value}')"
