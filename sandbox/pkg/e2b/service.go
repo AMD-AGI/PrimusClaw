@@ -95,6 +95,7 @@ type caller struct {
 	userID  string
 	groups  []string
 	admin   bool
+	token   identity.Token
 }
 
 // lookup resolves a grant key, or introspects any other key and returns the owner quota record.
@@ -112,20 +113,9 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 	if err != nil {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
-	platformRole := identity.PlatformRole(token.Roles)
-	if s.grants.WorkspaceSAR() {
-		platformRole, err = s.grants.PlatformRole(ctx, token.Subject, token.Groups)
-		if err != nil {
-			return caller{}, err
-		}
-	} else if platformRole != identity.RoleSystemAdmin {
-		user, err := s.grants.ReadOwnerUser(ctx, token.Subject)
-		if err != nil {
-			return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "user is temporarily unreadable")
-		}
-		if user != nil && user.Admin {
-			platformRole = identity.RoleSystemAdmin
-		}
+	platformRole, err := s.grants.PlatformRole(ctx, token)
+	if err != nil {
+		return caller{}, err
 	}
 	admin := platformRole == identity.RoleSystemAdmin
 	var grantID string
@@ -144,6 +134,7 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		userID:  token.Subject,
 		groups:  token.Groups,
 		admin:   admin,
+		token:   token,
 	}, nil
 }
 
@@ -222,9 +213,13 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, err
 	}
 	var workspace string
-	subjectKey := apiKey
+	// A grant key is not an identity subject. It is replaced only when the owner is rechecked.
+	subjectKey := ""
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, who.groups, body.Metadata[workspaceMetadata], who.admin)
+		workspace, err = s.grants.OwnerWorkspace(ctx, who.token, body.Metadata[workspaceMetadata])
+		if err == nil {
+			subjectKey = apiKey
+		}
 	} else {
 		workspace, err = grantWorkspace(snap.Workspaces, tpl.Workspace)
 		if err == nil && s.grants.ChecksGrantOwner() {

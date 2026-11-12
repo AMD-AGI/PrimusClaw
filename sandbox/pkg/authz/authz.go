@@ -23,8 +23,6 @@ import (
 	"golang.org/x/sync/singleflight"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
@@ -65,17 +63,18 @@ const (
 // ErrUnavailable means the review could not be answered. It is never a deny.
 var ErrUnavailable = errors.New("authorization is unavailable")
 
-// workspaceGVR is the cluster-scoped SaFE Workspace.
-var workspaceGVR = schema.GroupVersionResource{Group: "amd.com", Version: "v1", Resource: "workspaces"}
+// ErrEmptyWorkspace means the caller named no workspace. An empty name is not a review of every workspace.
+var ErrEmptyWorkspace = errors.New("workspace name is empty")
+
+// ErrWorkspaceRequired means the caller must set a workspace. It is not a denial of a named workspace.
+var ErrWorkspaceRequired = errors.New("workspace required")
+
+// ErrNotInWorkspace means the subject may not use the requested workspace.
+var ErrNotInWorkspace = errors.New("user not in workspace")
 
 // Reviewer creates one SubjectAccessReview.
 type Reviewer interface {
 	Create(ctx context.Context, review *authorizationv1.SubjectAccessReview, opts metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error)
-}
-
-type entry struct {
-	allowed bool
-	expires time.Time
 }
 
 // Client asks SubjectAccessReview questions for identity subjects. Allowed answers
@@ -87,12 +86,12 @@ type Client struct {
 	group    singleflight.Group
 
 	mu      sync.Mutex
-	entries map[string]entry
+	entries identity.TTL[bool]
 }
 
 // NewClient returns a client that prefixes users and groups with prefix.
 func NewClient(reviewer Reviewer, prefix string) *Client {
-	return &Client{reviewer: reviewer, prefix: prefix, now: time.Now, entries: map[string]entry{}}
+	return &Client{reviewer: reviewer, prefix: prefix, now: time.Now}
 }
 
 // PrefixFromEnv returns RBAC_SUBJECT_PREFIX when set, else DefaultSubjectPrefix.
@@ -114,18 +113,48 @@ func FromClientset(clientset kubernetes.Interface) (*Client, error) {
 	return NewClient(clientset.AuthorizationV1().SubjectAccessReviews(), prefix), nil
 }
 
+// workspaceUse is the review for one named workspace. An empty name is not this review.
+func workspaceUse(name string) authorizationv1.ResourceAttributes {
+	return authorizationv1.ResourceAttributes{Group: "amd.com", Resource: "workspaces", Name: name, Verb: "use"}
+}
+
 // CanUseWorkspace reports whether the subject may use workspace ws.
-func (c *Client) CanUseWorkspace(ctx context.Context, sub string, groups []string, ws string) (bool, error) {
-	return c.Allowed(ctx, sub, groups, authorizationv1.ResourceAttributes{
-		Group: "amd.com", Resource: "workspaces", Name: ws, Verb: "use",
-	})
+// An empty name is rejected and is not a review of every workspace.
+func (c *Client) CanUseWorkspace(ctx context.Context, tok identity.Token, ws string) (bool, error) {
+	if ws == "" {
+		return false, ErrEmptyWorkspace
+	}
+	return c.Allowed(ctx, tok.Subject, tok.Groups, workspaceUse(ws))
+}
+
+// CanUseAllWorkspaces reports whether the subject may use any workspace.
+// It is the only review that leaves the workspace name empty.
+func (c *Client) CanUseAllWorkspaces(ctx context.Context, tok identity.Token) (bool, error) {
+	return c.Allowed(ctx, tok.Subject, tok.Groups, workspaceUse(""))
+}
+
+// ChooseWorkspace returns the requested workspace when the subject may use it.
+// A missing request is workspace_required. This client does not list workspaces.
+func (c *Client) ChooseWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	if requested == "" {
+		return "", ErrWorkspaceRequired
+	}
+	ok, err := c.CanUseWorkspace(ctx, tok, requested)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", ErrNotInWorkspace
+	}
+	return requested, nil
 }
 
 // PlatformRole returns system-admin when the subject may delete sessions,
 // system-admin-readonly when it may list them, and default otherwise.
-func (c *Client) PlatformRole(ctx context.Context, sub string, groups []string) (string, error) {
+// The review uses tok.Groups. Token roles are not added as groups.
+func (c *Client) PlatformRole(ctx context.Context, tok identity.Token) (string, error) {
 	attrs := authorizationv1.ResourceAttributes{Group: "runtime.agent-sandbox.io", Resource: "sessions", Verb: "delete"}
-	ok, err := c.Allowed(ctx, sub, groups, attrs)
+	ok, err := c.Allowed(ctx, tok.Subject, tok.Groups, attrs)
 	if err != nil {
 		return "", err
 	}
@@ -133,7 +162,7 @@ func (c *Client) PlatformRole(ctx context.Context, sub string, groups []string) 
 		return identity.RoleSystemAdmin, nil
 	}
 	attrs.Verb = "list"
-	if ok, err = c.Allowed(ctx, sub, groups, attrs); err != nil {
+	if ok, err = c.Allowed(ctx, tok.Subject, tok.Groups, attrs); err != nil {
 		return "", err
 	}
 	if ok {
@@ -155,7 +184,7 @@ func (c *Client) CallerRole(ctx context.Context, tok identity.Token) (string, er
 	if c == nil {
 		return identity.PlatformRole(tok.Roles), nil
 	}
-	return c.PlatformRole(ctx, tok.Subject, tok.Groups)
+	return c.PlatformRole(ctx, tok)
 }
 
 // Allowed reviews attrs for the prefixed subject and groups. An empty subject is denied.
@@ -237,18 +266,10 @@ func cacheKey(spec authorizationv1.SubjectAccessReviewSpec) string {
 func (c *Client) cached(key string) (bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.entries[key]
-	if !ok {
-		return false, false
-	}
-	if !c.now().Before(e.expires) {
-		delete(c.entries, key)
-		return false, false
-	}
-	return e.allowed, true
+	return c.entries.Get(key, c.now())
 }
 
-// store caches an answer, evicting expired entries, then one entry, when full.
+// store caches an answer. The map is the same bounded TTL map introspection uses.
 func (c *Client) store(key string, allowed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,45 +278,18 @@ func (c *Client) store(key string, allowed bool) {
 	if allowed {
 		ttl = allowTTL
 	}
-	if _, ok := c.entries[key]; !ok && len(c.entries) >= maxCacheSize {
-		for k, old := range c.entries {
-			if !now.Before(old.expires) {
-				delete(c.entries, k)
-			}
-		}
-		if len(c.entries) >= maxCacheSize {
-			for k := range c.entries {
-				delete(c.entries, k)
-				break
-			}
-		}
-	}
-	c.entries[key] = entry{allowed: allowed, expires: now.Add(ttl)}
+	c.entries.Put(key, allowed, now.Add(ttl), now, maxCacheSize)
 }
 
-// WorkspaceLister lists SaFE Workspace names.
-type WorkspaceLister struct {
-	client dynamic.Interface
+// ResolveRole returns the platform role of tok. A nil source reads the token roles.
+func ResolveRole(src RoleSource, ctx context.Context, tok identity.Token) (string, error) {
+	if src == nil {
+		return identity.PlatformRole(tok.Roles), nil
+	}
+	return src.CallerRole(ctx, tok)
 }
 
-// NewWorkspaceLister reads cluster-scoped amd.com/v1 Workspaces.
-func NewWorkspaceLister(client dynamic.Interface) *WorkspaceLister {
-	return &WorkspaceLister{client: client}
-}
-
-// ListWorkspaces returns the names of all Workspaces. A read error wraps ErrUnavailable.
-func (l *WorkspaceLister) ListWorkspaces(ctx context.Context) ([]string, error) {
-	if l == nil || l.client == nil {
-		return nil, fmt.Errorf("%w: workspace client is not configured", ErrUnavailable)
-	}
-	list, err := l.client.Resource(workspaceGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("%w: list workspaces: %v", ErrUnavailable, err)
-	}
-	names := make([]string, 0, len(list.Items))
-	for _, item := range list.Items {
-		names = append(names, item.GetName())
-	}
-	sort.Strings(names)
-	return names, nil
+// RoleSource resolves the platform role of an introspected caller.
+type RoleSource interface {
+	CallerRole(ctx context.Context, tok identity.Token) (string, error)
 }

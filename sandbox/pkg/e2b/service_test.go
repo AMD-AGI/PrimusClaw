@@ -28,8 +28,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
+	"sigs.k8s.io/agent-sandbox/pkg/usercr"
 )
 
 type fakeRunner struct {
@@ -127,7 +129,7 @@ func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandbo
 // testPlaneInWorkspacesWith builds the default grant plane with the given permission reviews.
 func testPlaneInWorkspacesWith(t *testing.T, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
-	return testPlaneReviewed(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"top-models"}, az)
+	return testPlaneReviewed(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"prod"}, az)
 }
 
 func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
@@ -135,15 +137,16 @@ func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 	return testPlaneConfigured(t, maxSec, perGPU, maxSandboxes, spec, workspaces, func(o *grant.Options) {
 		if az != nil {
 			o.Authz = az
+			o.ReviewOwner = true
 		}
 	})
 }
 
-// testPlaneSAROff builds the default grant plane with workspace SAR off and SaFE Users from users.
+// testPlaneSAROff builds the default grant plane with the User authorizer and no workspace SAR.
 func testPlaneSAROff(t *testing.T, users staticUsers, attest bool) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
-	return testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"top-models"}, func(o *grant.Options) {
-		o.Users = users
+	return testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"lab"}, func(o *grant.Options) {
+		o.Authz = usercr.NewFromReader(users)
 		o.AttestWorkloads = attest
 	})
 }
@@ -168,8 +171,7 @@ func testPlaneConfigured(t *testing.T, maxSec int64, perGPU []int32, maxSandboxe
 	opts := grant.Options{
 		Client: cl, Namespace: "agent-sandbox-system", DataKey: bytes32(),
 		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{},
-		Workspaces: staticWorkspaces{"lab", "prod", "top-models"},
-		Now:        func() time.Time { return now },
+		Now: func() time.Time { return now },
 	}
 	configure(&opts)
 	gs := grant.New(opts)
@@ -256,21 +258,64 @@ type fakeAuthz struct {
 	err        error
 }
 
-func (f *fakeAuthz) CanUseWorkspace(_ context.Context, sub string, _ []string, ws string) (bool, error) {
+func (f *fakeAuthz) CanUseWorkspace(_ context.Context, tok identity.Token, ws string) (bool, error) {
+	if ws == "" {
+		return false, authz.ErrEmptyWorkspace
+	}
 	if f.err != nil {
 		return false, f.err
 	}
-	return f.admins[sub] || contains(f.workspaces[sub], "*") || contains(f.workspaces[sub], ws), nil
+	return f.admins[tok.Subject] || contains(f.workspaces[tok.Subject], "*") || contains(f.workspaces[tok.Subject], ws), nil
 }
 
-func (f *fakeAuthz) PlatformRole(_ context.Context, sub string, _ []string) (string, error) {
+func (f *fakeAuthz) CanUseAllWorkspaces(_ context.Context, tok identity.Token) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.admins[tok.Subject] || contains(f.workspaces[tok.Subject], "*"), nil
+}
+
+func (f *fakeAuthz) PlatformRole(_ context.Context, tok identity.Token) (string, error) {
 	if f.err != nil {
 		return "", f.err
 	}
-	if f.admins[sub] {
+	if f.admins[tok.Subject] {
 		return identity.RoleSystemAdmin, nil
 	}
 	return identity.RoleDefault, nil
+}
+
+// ChooseWorkspace is the test double of a permission review. One listed workspace is still inferred here.
+// The production SAR client does not infer a workspace.
+func (f *fakeAuthz) ChooseWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	all, err := f.CanUseAllWorkspaces(ctx, tok)
+	if err != nil {
+		return "", err
+	}
+	if all {
+		if requested == "" {
+			return "", authz.ErrWorkspaceRequired
+		}
+		return requested, nil
+	}
+	if requested != "" {
+		ok, err := f.CanUseWorkspace(ctx, tok, requested)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", authz.ErrNotInWorkspace
+		}
+		return requested, nil
+	}
+	names := f.workspaces[tok.Subject]
+	if len(names) == 1 && names[0] != "" && names[0] != "*" {
+		return names[0], nil
+	}
+	if len(names) == 0 {
+		return "", authz.ErrNotInWorkspace
+	}
+	return "", authz.ErrWorkspaceRequired
 }
 
 // defaultAuthz lets the grant owner use any workspace, u-1 use lab, u-2 use lab and prod,
@@ -283,16 +328,11 @@ func defaultAuthz() *fakeAuthz {
 }
 
 // staticUsers serves SaFE Users by id. A missing id is a User that does not exist.
-type staticUsers map[string]grant.OwnerUser
+type staticUsers map[string]usercr.User
 
-func (u staticUsers) ReadUser(_ context.Context, userID string) (grant.OwnerUser, error) {
+func (u staticUsers) Read(_ context.Context, userID string) (usercr.User, error) {
 	return u[userID], nil
 }
-
-// staticWorkspaces lists a fixed set of workspaces.
-type staticWorkspaces []string
-
-func (w staticWorkspaces) ListWorkspaces(context.Context) ([]string, error) { return w, nil }
 
 func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	cases := []struct {

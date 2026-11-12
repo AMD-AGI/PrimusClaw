@@ -36,7 +36,6 @@ import (
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
-	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/builder"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
@@ -295,19 +294,6 @@ func main() {
 		log.Error("failed to create K8s clientset", "error", err)
 		os.Exit(1)
 	}
-	if authz.WorkspaceSARFromEnv() {
-		az, err := authz.FromClientset(clientset)
-		if err != nil {
-			log.Error("workspace SAR config is invalid", "error", err)
-			os.Exit(1)
-		}
-		routerCfg.Authz = az
-		wmCfg.Authz = routerCfg.Authz
-		log.Info("workspace SAR enabled", "subjectPrefix", authz.PrefixFromEnv())
-	} else {
-		log.Info("workspace SAR disabled")
-	}
-
 	workloadmanager.InitPublicKeyCache(ctx, clientset)
 
 	// Shared by the Router and the Workload Manager. Not waited for here: until
@@ -322,6 +308,7 @@ func main() {
 		log.Error("failed to create dynamic client", "error", err)
 		os.Exit(1)
 	}
+	membership, reviewOwner := wireWorkspaceAuth(clientset, dynamicClient, &routerCfg, &wmCfg)
 	dynamicFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
 	crdInformers := workloadmanager.NewCRDInformers(dynamicFactory)
 	if err := crdInformers.RunAndWaitForCacheSync(ctx); err != nil {
@@ -396,17 +383,7 @@ func main() {
 		log.Error("identity attestation config is invalid", "error", err)
 		os.Exit(1)
 	}
-	if os.Getenv("ENABLE_WORKLOAD_ASSERTION") == "true" {
-		if attester == nil {
-			log.Error("ENABLE_WORKLOAD_ASSERTION=true requires IDENTITY_TOKEN_URL, IDENTITY_CLIENT_ID and IDENTITY_CLIENT_SECRET")
-			os.Exit(1)
-		}
-		workloads.SetAttestWorkloads(true)
-		log.Info("workload assertion enabled")
-	}
-	if attester != nil {
-		workloads.SetIdentityAttester(attester)
-	}
+	wireWorkloadAssertion(workloads, attester)
 	st = workloadmanager.NewWorkloadSessionStore(st, workloads)
 	defer st.Close()
 
@@ -473,7 +450,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, dynamicClient, callerIdentity, routerCfg.Authz, apiServer, st, workloads, wmCfg.Namespace)
+	grants, err := startGrants(ctx, mgr.GetClient(), mgr.GetAPIReader(), clientset, callerIdentity, membership, reviewOwner, apiServer, st, workloads, wmCfg.Namespace)
 	if err != nil {
 		log.Error("grant service init failed", "error", err)
 		os.Exit(1)
@@ -599,7 +576,7 @@ func retryOwnerPolicy(ctx context.Context, grants *grant.Service, policy grant.O
 // startGrants serves the grant admin API from SandboxGrant CRs and reaps
 // expired grants. Claw remains the authority; this process keeps the
 // execution copy.
-func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, dyn dynamic.Interface, ids *identity.Client, az *authz.Client, api *workloadmanager.Server, st store.Store, workloads *workloadmanager.SafeWorkloadCreator, namespace string) (*grant.Service, error) {
+func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Reader, clientset kubernetes.Interface, ids *identity.Client, authorizer grant.Authorizer, reviewOwner bool, api *workloadmanager.Server, st store.Store, workloads *workloadmanager.SafeWorkloadCreator, namespace string) (*grant.Service, error) {
 	dataKey, err := grant.DataKeyFromEnv()
 	if err != nil {
 		return nil, fmt.Errorf("GRANT_DATA_KEY: %w", err)
@@ -619,31 +596,22 @@ func startGrants(ctx context.Context, cl ctrlclient.Client, reader ctrlclient.Re
 	if ids != nil {
 		introspector = ids
 	}
-	var authorizer grant.Authorizer
-	if az != nil {
-		authorizer = az
-	}
-	var users grant.UserReader
-	if dyn != nil {
-		users = grant.NewUserCRMembership(dyn)
-	}
 	ns := grant.Namespace(namespace)
 	svc := grant.New(grant.Options{
-		Client:     cl,
-		Reader:     reader,
-		Namespace:  ns,
-		DataKey:    dataKey,
-		Authn:      grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),
-		Attest:     attest,
-		Identity:   introspector,
-		Authz:      authorizer,
-		Users:      users,
-		Workspaces: authz.NewWorkspaceLister(dyn),
-		Reclaimer:  workloadmanager.NewGrantReclaimer(api),
-		Exists:     workloadmanager.NewGrantExists(st, workloads),
-		Record:     api,
+		Client:    cl,
+		Reader:    reader,
+		Namespace: ns,
+		DataKey:   dataKey,
+		Authn:     grant.NewTokenReviewAuthenticator(clientset, grant.AllowedCallersFromEnv()),
+		Attest:    attest,
+		Identity:  introspector,
+		Authz:     authorizer,
+		Reclaimer: workloadmanager.NewGrantReclaimer(api),
+		Exists:    workloadmanager.NewGrantExists(st, workloads),
+		Record:    api,
 
 		AttestWorkloads: workloads.AttestWorkloads(),
+		ReviewOwner:     reviewOwner,
 	})
 	api.WithGrants(svc)
 	go svc.Run(ctx, 30*time.Second)

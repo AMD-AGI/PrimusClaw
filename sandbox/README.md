@@ -288,12 +288,19 @@ not silently install an unauthenticated control plane.
 ```bash
 # Recommended: authenticate /v1 callers through identity provider introspection.
 # The client Secret (client_id, client_secret) must exist in the release namespace.
-# IDENTITY_TOKEN_URL can be added later: the process exits until it is set.
+# IDENTITY_TOKEN_URL is required only when ENABLE_WORKLOAD_ASSERTION=true.
 IDENTITY_INTROSPECT_URL=https://<identity>/oauth/introspect deploy/scripts/install.sh
 
 # Development clusters only: install without authentication.
 ALLOW_INSECURE_NO_AUTH=true deploy/scripts/install.sh
 ```
+
+`ENABLE_WORKSPACE_SAR` defaults to false: workspace use is read from the SaFE User.
+Set it true only after `ENABLE_WORKLOAD_ASSERTION=true`, and set `RBAC_SUBJECT_PREFIX`
+to the same value as SaFE `rbac.subject_prefix`. `ENABLE_WORKLOAD_ASSERTION` defaults
+to false. The process exits for a missing `IDENTITY_TOKEN_URL` only when that switch
+is true. Turn SaFE `sandbox.admission` on last. A builtin identity has no Group
+subjects; the platform ClusterRole bindings apply when SaFE projects external groups.
 
 The supported install path is the Helm-backed installer above. Files under
 `deploy/k8s/` and `deploy/k8s-kata/` are environment-specific templates: they

@@ -52,7 +52,7 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		role, err := s.cfg.Authz.CallerRole(c.Request.Context(), tok)
+		role, err := authz.ResolveRole(s.cfg.Authz, c.Request.Context(), tok)
 		if err != nil {
 			log.Warn("WM: caller platform role unreadable", "userId", tok.Subject, "error", err)
 			abortCaller(c, authz.Unavailable)

@@ -19,6 +19,7 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
+	"sigs.k8s.io/agent-sandbox/pkg/usercr"
 )
 
 // fakeIntrospector maps keys to tokens. A missing key is inactive.
@@ -48,7 +49,7 @@ func ownerPlane(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy) (
 // ownerPlaneWith builds an identity-key plane on a fake cluster with the given permission reviews.
 func ownerPlaneWith(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPolicy, az *fakeAuthz) (*Service, *fakeRunner, client.Client) {
 	t.Helper()
-	return ownerPlaneOptions(t, ids, policy, grant.Options{Authz: az})
+	return ownerPlaneOptions(t, ids, policy, grant.Options{Authz: az, ReviewOwner: az != nil})
 }
 
 // ownerPlaneOptions builds an identity-key plane on a fake cluster. opts supplies the
@@ -61,7 +62,6 @@ func ownerPlaneOptions(t *testing.T, ids *fakeIntrospector, policy grant.OwnerPo
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
 	opts.Client, opts.Namespace = cl, "agent-sandbox-system"
-	opts.Workspaces = staticWorkspaces{"any-ws", "lab", "prod"}
 	gs := grant.New(opts)
 	if err := gs.SetOwnerPolicy(context.Background(), policy); err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestSAROffIdentityKeyUsesTheUserCR(t *testing.T) {
 		"u-1": {MaxSandboxes: 4, MaxGPUs: 8, MaxSandboxSeconds: 3600},
 		"u-7": {MaxSandboxes: 4, MaxGPUs: 8, MaxSandboxSeconds: 3600},
 	}
-	plane, runner, _ := ownerPlaneOptions(t, ids, policy, grant.Options{Users: users})
+	plane, runner, _ := ownerPlaneOptions(t, ids, policy, grant.Options{Authz: usercr.NewFromReader(users)})
 	ctx := context.Background()
 	ws := func(name string) CreateBody {
 		return CreateBody{TemplateID: "runner", Metadata: map[string]string{workspaceMetadata: name}}
@@ -211,7 +211,7 @@ func TestSAROffIdentityKeyUsesTheUserCR(t *testing.T) {
 
 func TestSAROffGrantKeyCreateChecksOwnerOnlyForAssertion(t *testing.T) {
 	for _, attest := range []bool{false, true} {
-		users := staticUsers{"u-123": {Found: true, Workspaces: []string{"top-models"}}}
+		users := staticUsers{"u-123": {Found: true, Workspaces: []string{"lab"}}}
 		plane, runner, keys := testPlaneSAROff(t, users, attest)
 		delete(users, "u-123")
 		_, _, err := plane.Create(context.Background(), keys["dev"], CreateBody{TemplateID: "runner"})
@@ -223,6 +223,9 @@ func TestSAROffGrantKeyCreateChecksOwnerOnlyForAssertion(t *testing.T) {
 		}
 		if want := map[bool]int{false: 1, true: 0}[attest]; len(runner.created) != want {
 			t.Fatalf("attest=%v runner calls = %d", attest, len(runner.created))
+		}
+		if !attest && runner.created[0].SubjectKey != "" {
+			t.Fatalf("grant key entered SubjectKey: %q", runner.created[0].SubjectKey)
 		}
 	}
 }

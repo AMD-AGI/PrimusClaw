@@ -92,9 +92,14 @@ controlplane:
     # group (RBAC_SUBJECT_PREFIX); it must not be empty when workspaceSAR is true
     # and must match the prefix SaFE uses for its RBAC projection. The platform
     # ClusterRoles of this chart are bound to
-    # Group <subjectPrefix>system-admin and <subjectPrefix>system-admin-readonly.
+    # Group <subjectPrefix><adminGroup> and <subjectPrefix><viewerGroup>.
+    # adminGroup and viewerGroup are the identity group names, without the prefix.
+    # A builtin identity has no Group subjects, so those bindings apply when SaFE
+    # projects external groups. subjectPrefix must equal SaFE rbac.subject_prefix.
     rbac:
       subjectPrefix: "primus:"
+      adminGroup: system-admin
+      viewerGroup: system-admin-readonly
       workspaceSAR: false
   # Graceful drain on rollout or eviction, in Kubernetes order:
   #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +17,8 @@ import (
 	dynfake "k8s.io/client-go/dynamic/fake"
 
 	"sigs.k8s.io/agent-sandbox/pkg/authz"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
+	"sigs.k8s.io/agent-sandbox/pkg/usercr"
 )
 
 // userObject builds a SaFE User listing one workspace and an optional role.
@@ -34,73 +37,63 @@ func userObject(name, role, workspace string) *unstructured.Unstructured {
 	}}
 }
 
-// userCRService returns a service with workspace SAR off that reads the given Users.
+// userCRService returns a service whose authorizer reads the given Users.
 func userCRService(users ...runtime.Object) *Service {
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
-		userGVR: "UserList",
+		usercr.UserGVR: "UserList",
 	}, users...)
-	return New(Options{Users: NewUserCRMembership(dc)})
+	return New(Options{Authz: usercr.New(dc)})
 }
 
-func TestSAROffChecksTheUserCR(t *testing.T) {
-	svc := userCRService(userObject("user-1", "", "lab"), userObject("admin-1", SystemAdminRole, "lab"))
+func TestUserCRChecksTheListedWorkspace(t *testing.T) {
+	svc := userCRService(userObject("user-1", "", "lab"), userObject("admin-1", identity.RoleSystemAdmin, "lab"))
 	ctx := context.Background()
-	if err := svc.checkWorkspaces(ctx, "user-1", nil, []string{"lab"}); err != nil {
+	if err := svc.checkWorkspaces(ctx, identity.Token{Subject: "user-1"}, []string{"lab"}); err != nil {
 		t.Fatalf("listed workspace: %v", err)
 	}
-	if err := svc.checkWorkspaces(ctx, "user-1", nil, []string{"prod"}); !IsReason(err, "user_not_in_workspace") {
+	if err := svc.checkWorkspaces(ctx, identity.Token{Subject: "user-1"}, []string{"prod"}); !IsReason(err, "user_not_in_workspace") {
 		t.Fatalf("unlisted workspace err=%v", err)
 	}
-	if err := svc.checkWorkspaces(ctx, "nobody", nil, []string{"lab"}); !IsReason(err, "user_not_in_workspace") {
+	if err := svc.checkWorkspaces(ctx, identity.Token{Subject: "nobody"}, []string{"lab"}); !IsReason(err, "user_not_in_workspace") {
 		t.Fatalf("missing user err=%v", err)
 	}
-	if err := svc.checkWorkspaces(ctx, "admin-1", nil, []string{"prod"}); err != nil {
+	if err := svc.checkWorkspaces(ctx, identity.Token{Subject: "admin-1"}, []string{"prod"}); err != nil {
 		t.Fatalf("system admin: %v", err)
 	}
 }
 
-func TestSAROffWithoutUserReaderIsUnavailable(t *testing.T) {
-	err := New(Options{}).checkWorkspaces(context.Background(), "user-1", nil, []string{"lab"})
+func TestNoAuthorizerIsUnavailable(t *testing.T) {
+	err := New(Options{}).checkWorkspaces(context.Background(), identity.Token{Subject: "user-1"}, []string{"lab"})
 	if !IsReason(err, "membership_unavailable") {
 		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestSAROffOwnerWorkspaceUsesTheUserCR(t *testing.T) {
+func TestUserCROwnerWorkspaceUsesTheUser(t *testing.T) {
 	svc := userCRService(userObject("user-1", "", "lab"))
 	ctx := context.Background()
-	if ws, err := svc.OwnerWorkspace(ctx, "user-1", nil, "", false); err != nil || ws != "lab" {
+	if ws, err := svc.OwnerWorkspace(ctx, identity.Token{Subject: "user-1"}, ""); err != nil || ws != "lab" {
 		t.Fatalf("only workspace = %q, %v", ws, err)
 	}
-	if _, err := svc.OwnerWorkspace(ctx, "user-1", nil, "prod", false); !IsReason(err, "user_not_in_workspace") {
+	if _, err := svc.OwnerWorkspace(ctx, identity.Token{Subject: "user-1"}, "prod"); !IsReason(err, "user_not_in_workspace") {
 		t.Fatalf("unlisted workspace err=%v", err)
 	}
-	if _, err := svc.OwnerWorkspace(ctx, "nobody", nil, "", false); !IsReason(err, "user_not_in_workspace") {
+	if _, err := svc.OwnerWorkspace(ctx, identity.Token{Subject: "nobody"}, ""); !IsReason(err, "user_not_in_workspace") {
 		t.Fatalf("missing user err=%v", err)
 	}
-	if _, err := svc.OwnerWorkspace(ctx, "admin-1", nil, "", true); !IsReason(err, "workspace_required") {
+	admin := identity.Token{Subject: "admin-1", Roles: []string{identity.RoleSystemAdmin}}
+	if _, err := svc.OwnerWorkspace(ctx, admin, ""); !IsReason(err, "workspace_required") {
 		t.Fatalf("admin without a workspace err=%v", err)
 	}
-	if ws, err := svc.OwnerWorkspace(ctx, "admin-1", nil, "prod", true); err != nil || ws != "prod" {
+	if ws, err := svc.OwnerWorkspace(ctx, admin, "prod"); err != nil || ws != "prod" {
 		t.Fatalf("admin workspace = %q, %v", ws, err)
 	}
 }
 
-func TestSAROnAllWorkspacesStillNeedsAWorkspace(t *testing.T) {
-	svc := New(Options{Authz: authz.NewClient(workspaceReviewer{allow: []string{""}}, "primus:")})
-	if _, err := svc.OwnerWorkspace(context.Background(), "admin-1", nil, "", true); !IsReason(err, "workspace_required") {
+func TestSARWithoutARequestedWorkspaceIsRequired(t *testing.T) {
+	svc := New(Options{Authz: authz.NewClient(workspaceReviewer{allow: []string{"lab", ""}}, "primus:")})
+	if _, err := svc.OwnerWorkspace(context.Background(), identity.Token{Subject: "user-1"}, ""); !IsReason(err, "workspace_required") {
 		t.Fatalf("err=%v", err)
-	}
-}
-
-func TestReadOwnerUserReportsSystemAdmin(t *testing.T) {
-	svc := userCRService(userObject("admin-1", SystemAdminRole, "lab"))
-	u, err := svc.ReadOwnerUser(context.Background(), "admin-1")
-	if err != nil || u == nil || !u.Admin {
-		t.Fatalf("user = %+v, %v", u, err)
-	}
-	if u, err := New(Options{}).ReadOwnerUser(context.Background(), "admin-1"); err != nil || u != nil {
-		t.Fatalf("no reader = %+v, %v", u, err)
 	}
 }
 
@@ -112,8 +105,8 @@ func (failingReviewer) Create(context.Context, *authorizationv1.SubjectAccessRev
 }
 
 func TestMemberStillNeedsTheWorkspace(t *testing.T) {
-	svc := New(Options{Authz: authz.NewClient(workspaceReviewer{allow: []string{"global-control-plane"}}, "primus:")})
-	err := svc.checkWorkspaces(context.Background(), "user-1", nil, []string{"top-models"})
+	svc := New(Options{Authz: authz.NewClient(workspaceReviewer{allow: []string{"lab"}}, "primus:")})
+	err := svc.checkWorkspaces(context.Background(), identity.Token{Subject: "user-1"}, []string{"prod"})
 	if !IsReason(err, "user_not_in_workspace") {
 		t.Fatalf("err=%v", err)
 	}
@@ -121,8 +114,24 @@ func TestMemberStillNeedsTheWorkspace(t *testing.T) {
 
 func TestWorkspaceReviewErrorIsUnavailable(t *testing.T) {
 	svc := New(Options{Authz: authz.NewClient(failingReviewer{}, "primus:")})
-	err := svc.checkWorkspaces(context.Background(), "user-1", nil, []string{"top-models"})
+	err := svc.checkWorkspaces(context.Background(), identity.Token{Subject: "user-1"}, []string{"lab"})
 	if !IsReason(err, "membership_unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateIssueRejectsAnEmptyWorkspaceName(t *testing.T) {
+	now := time.Now()
+	req := IssueRequest{
+		GrantID:     "gr-ok",
+		Owner:       OwnerRequest{UserID: "u-1", Workspaces: []string{"lab", ""}},
+		Issuer:      IssuerRequest{AppRunID: "ar-1"},
+		Roles:       map[string]RoleRequest{"dev": {}},
+		ExpiresAt:   now.Add(time.Hour),
+		Attestation: "a",
+		PlatformKey: "ak",
+	}
+	if err := validateIssue(req, now); !IsReason(err, "invalid_grant") {
 		t.Fatalf("err=%v", err)
 	}
 }

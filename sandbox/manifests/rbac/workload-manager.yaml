@@ -40,9 +40,6 @@ rules:
     resources: ["users"]
     verbs: ["get"]
   - apiGroups: ["amd.com"]
-    resources: ["workspaces"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["amd.com"]
     resources: ["workloads"]
     # update writes spec.timeout. patch is not granted.
     verbs: ["create", "delete", "get", "list", "update", "watch"]

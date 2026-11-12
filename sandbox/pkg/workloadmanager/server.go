@@ -52,7 +52,7 @@ type Config struct {
 	// Identity validates caller credentials on /v1 when EnableAuth is set.
 	Identity *identity.Client
 	// Authz resolves the caller's platform role. nil reads the role from the token.
-	Authz      *authz.Client
+	Authz      authz.RoleSource
 	Namespace  string
 	GCInterval time.Duration
 	DefaultTTL time.Duration

@@ -67,7 +67,8 @@ func TestIntrospectActiveInactiveAndUnavailable(t *testing.T) {
 	ctx := context.Background()
 
 	tok, err := c.Introspect(ctx, "ak-good")
-	if err != nil || tok.Subject != "u-1" || tok.Username != "alice" || tok.Email != "a@example.com" || !tok.HasRole("system-admin") ||
+	if err != nil || tok.Subject != "u-1" || tok.Username != "alice" || tok.Email != "a@example.com" ||
+		len(tok.Roles) != 1 || tok.Roles[0] != "system-admin" ||
 		len(tok.Groups) != 1 || tok.Groups[0] != "system-admin" {
 		t.Fatalf("active = %+v %v", tok, err)
 	}

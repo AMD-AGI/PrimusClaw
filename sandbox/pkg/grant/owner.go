@@ -21,6 +21,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 const (
@@ -440,80 +441,16 @@ func (s *Service) deleteDroppedOwnerTemplates(ctx context.Context, wanted map[st
 	return nil
 }
 
-// OwnerWorkspace picks the workspace for an identity-key sandbox. A requested
-// workspace must pass the workspace check. A subject allowed to use every workspace
-// must request one. Anyone else, with no request, is given the only workspace they
-// may use; more than one requires a request. With workspace SAR off, admin is the
-// caller's platform admin flag and the SaFE User lists the workspaces.
-func (s *Service) OwnerWorkspace(ctx context.Context, userID string, groups []string, requested string, admin bool) (string, error) {
-	if !s.WorkspaceSAR() {
-		return s.userWorkspace(ctx, userID, requested, admin)
+// OwnerWorkspace picks the workspace for an identity-key sandbox.
+// The authorizer decides: workspace SAR requires a named workspace, and the User authorizer
+// may return the only workspace listed on the User.
+func (s *Service) OwnerWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	if s.authz == nil {
+		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "authorization client is not configured")
 	}
-	if requested != "" {
-		if err := s.checkWorkspaces(ctx, userID, groups, []string{requested}); err != nil {
-			return "", err
-		}
-		return requested, nil
-	}
-	all, err := s.canUse(ctx, userID, groups, "")
+	ws, err := s.authz.ChooseWorkspace(ctx, tok, requested)
 	if err != nil {
-		return "", err
+		return "", membershipErr(err, requested)
 	}
-	if all {
-		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-	}
-	if s.workspaces == nil {
-		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "workspace client is not configured")
-	}
-	names, err := s.workspaces.ListWorkspaces(ctx)
-	if err != nil {
-		return "", opWrap(http.StatusServiceUnavailable, "membership_unavailable", "workspaces are temporarily unreadable", err)
-	}
-	var allowed []string
-	for _, ws := range names {
-		ok, err := s.canUse(ctx, userID, groups, ws)
-		if err != nil {
-			return "", err
-		}
-		if ok {
-			allowed = append(allowed, ws)
-		}
-	}
-	switch len(allowed) {
-	case 0:
-		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user may not use any workspace")
-	case 1:
-		return allowed[0], nil
-	default:
-		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-	}
-}
-
-// userWorkspace picks the workspace from the SaFE User. An admin must request a
-// workspace and may use any. Others may use a listed workspace, and with no request
-// are given their only listed workspace.
-func (s *Service) userWorkspace(ctx context.Context, userID, requested string, admin bool) (string, error) {
-	if admin {
-		if requested == "" {
-			return "", opErr(http.StatusBadRequest, "workspace_required", "system-admin must set metadata agent-sandbox.io/workspace")
-		}
-		return requested, nil
-	}
-	u, err := s.readUser(ctx, userID)
-	if err != nil {
-		return "", err
-	}
-	if requested != "" {
-		if err := u.allows([]string{requested}); err != nil {
-			return "", err
-		}
-		return requested, nil
-	}
-	if !u.Found {
-		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
-	}
-	if len(u.Workspaces) != 1 {
-		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-	}
-	return u.Workspaces[0], nil
+	return ws, nil
 }
