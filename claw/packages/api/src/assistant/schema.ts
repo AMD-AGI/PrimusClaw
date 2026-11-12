@@ -279,6 +279,17 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_messages_received ON claw_assistant_messages(received_at)",
   );
+  // The chat surfaces a user has written to their assistant from, each with when it was last: what a proactive message (one no
+  // message of theirs started) is routed by (`notifications/surfaces.ts`). Written with each message (`recordAssistantMessage`) and,
+  // unlike the messages, kept: the surface they used last is still the one to reach them on after a quiet week.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_surfaces (
+      user_id         TEXT NOT NULL,
+      surface         TEXT NOT NULL,
+      last_inbound_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, surface)
+    )
+  `);
   // The items the turn answering the message looked into (`work_recall`, `tools.ts`): a say about how one of them is going is refused
   // until the turn has.
   await client.query("ALTER TABLE claw_assistant_messages ADD COLUMN IF NOT EXISTS recalled_items TEXT[] NOT NULL DEFAULT '{}'");

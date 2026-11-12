@@ -102,6 +102,19 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Changed
+
+- An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
+  a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
+  (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,
+  a scheduled or long run's end) to the surface they wrote from last. A surface with no subscription that takes the event
+  falls back to the next most recent one; a person who never wrote, or whose subscriptions all name one surface, gets it
+  on each, as before. A subscription names its surface with the new `surface` field (`POST`/`PATCH
+  /v1/notification-subscriptions`, a lowercase label; absent is `teams`); the Teams worker of the personal agent sends
+  `teams`, and an older worker, which names none, is `teams` too. Outbox, signing, retries, redelivery and the say caps
+  are unchanged. Schema: `claw_notification_subscriptions.surface` (default `'teams'`) and the new table
+  `claw_assistant_surfaces`, both added at start-up; no new setting (#787).
+
 ## [0.3.1] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611121517` (commit e7255a96). No schema change, no new setting. Connector requirements

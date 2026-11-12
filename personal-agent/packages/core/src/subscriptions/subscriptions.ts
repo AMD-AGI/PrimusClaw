@@ -20,6 +20,7 @@ import { ASSISTANT_TYPES_VERSION, RUN_SOURCES, wantedTypes, type WantedTypes } f
 import type { ClawSubscription } from "../ports/claw/index.js";
 import type { ClawSubscriptions, SubscriptionStore } from "./ports.js";
 import { pyRstrip } from "../text/py-text.js";
+import { NOTIFICATION_SURFACE_DEFAULT } from "../protocol.js";
 
 /** Notifications off on Claw, or Claw unreachable: a subscription is tried again at most daily. */
 export const RETRY_SECONDS = 24 * 3600;
@@ -45,6 +46,11 @@ export interface SubscriptionsOptions {
   readonly assistantFor?: (aadId: string) => boolean;
   /** (key) -> the Claw user id the key is of; undefined when that could not be read. Absent: ids are not filled in. */
   readonly userIdOf?: (key: string) => Promise<string | undefined>;
+  /**
+   * The chat surface this worker is (`teams`, `slack`, ...), sent as the subscription's `surface`: Claw sends a reply back to the
+   * surface the person's message came from, and a proactive message to the one they used last. Absent: Teams.
+   */
+  readonly surface?: string;
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -64,6 +70,7 @@ export class Subscriptions {
   private readonly understood: (aadId: string) => boolean;
   private readonly assistantFor: (aadId: string) => boolean;
   private readonly userIdOf: ((key: string) => Promise<string | undefined>) | undefined;
+  private readonly surface: string;
 
   constructor(options: SubscriptionsOptions) {
     this.store = options.store;
@@ -75,6 +82,7 @@ export class Subscriptions {
     this.understood = options.understood ?? (() => false);
     this.assistantFor = options.assistantFor ?? (() => true);
     this.userIdOf = options.userIdOf;
+    this.surface = options.surface ?? NOTIFICATION_SURFACE_DEFAULT;
   }
 
   /** This person's subscription gets the assistant's events (so the assistant can reach them). */
@@ -179,7 +187,7 @@ export class Subscriptions {
     if (this.assistantOnFor(aadId)) {
       for (const rung of wantedTypes(this.understood(aadId))) {
         try {
-          created = await this.claw.create(key, url, rung.types, rung.sources);
+          created = await this.claw.create(key, url, rung.types, rung.sources, this.surface);
           version = rung.version;
           break;
         } catch (error) {
@@ -188,7 +196,7 @@ export class Subscriptions {
       }
     }
     // (a Claw that does not know the assistant's events yet: the subscription it has always made; the types come with `ensure`)
-    created ??= await this.claw.create(key, url);
+    created ??= await this.claw.create(key, url, [], [], this.surface);
     this.store.notifySubs.saveNotifySub(aadId, {
       route,
       subscriptionId: required(created.subscription_id),
@@ -226,18 +234,23 @@ export class Subscriptions {
     return this.store.notifySubs.getNotifySub(aadId);
   }
 
-  /** The best rung the subscription has already, or the best Claw takes; throws Claw's last refusal when it takes none. */
+  /**
+   * The best rung the subscription has already, or the best Claw takes; throws Claw's last refusal when it takes none. A subscription
+   * Claw lists with another surface than this worker's is changed to this worker's with it (a Claw from before the label lists none).
+   */
   private async mend(aadId: string, key: string, subscriptionId: string, row: ClawSubscription): Promise<number> {
     const disabled = row.enabled === false;
+    const otherSurface = typeof row.surface === "string" && row.surface !== this.surface;
     const has = new Set(row.event_types ?? []);
     const hasSources = new Set(row.sources && row.sources.length > 0 ? row.sources : RUN_SOURCES);
     let refused: unknown = new ClawError(400);
     for (const rung of wantedTypes(this.understood(aadId))) {
-      if (!disabled && covers(rung, has, hasSources)) return rung.version;
+      if (!disabled && !otherSurface && covers(rung, has, hasSources)) return rung.version;
       try {
         await this.claw.updateTypes(key, subscriptionId, rung.types, {
           enable: disabled,
           ...(rung.sources ? { sources: rung.sources } : {}),
+          ...(otherSurface ? { surface: this.surface } : {}),
         });
         return rung.version;
       } catch (error) {

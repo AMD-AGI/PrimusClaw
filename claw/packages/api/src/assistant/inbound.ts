@@ -27,6 +27,7 @@ import type { DecidedVia } from "../github-review/store.js";
 import { redactStoredText, redactStoredValue } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
+import { messageSurface, recordSurfaceUsed } from "../notifications/surfaces.js";
 import { isChosenLanguage, type ChosenLanguage } from "./language.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
@@ -115,6 +116,10 @@ export const CHANNEL_VIAS = ["on_behalf"] as const;
 export type ChannelVia = (typeof CHANNEL_VIAS)[number];
 
 export interface ChannelContext {
+  /**
+   * The chat surface the message came from (`teams`, `slack`, ...): a reply of the turn answering it goes back there, and the
+   * person's proactive messages go to the surface they wrote from last (`notifications/surfaces.ts`). Absent: Teams.
+   */
   channel?: string;
   /** How the message reached the chat (`ChannelVia`); absent: typed there, or not said. */
   via?: ChannelVia;
@@ -264,6 +269,9 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
       `DELETE FROM claw_assistant_messages WHERE session_id = $1 AND received_at < NOW() - $2::interval`,
       [m.sessionId, MESSAGE_RETENTION],
     );
+    // The surface it came from (a channel that names none is Teams): where the person is reached when no message of theirs started
+    // what is said (`preferredSurfaces`).
+    await recordSurfaceUsed((text, params) => tx.query(text, params), m.userId, messageSurface(m.context.channel));
   }
 }
 
