@@ -1411,6 +1411,8 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "If you want, which repository should I use?",
     "Which repository should I use, if you have any preference?",
     "随时告诉我你想开哪个题。",
+    "把题目告诉我。",
+    "如有需要，请告诉我仓库名。",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
@@ -1441,6 +1443,9 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "提前开题就是提前做开题报告。如果有任何问题，请告诉我。",
     "提前开题就是提前做开题报告。如有问题，请随时告诉我。",
     "I opened the issue. If you have any questions, please let me know.",
+    "提前开题就是提前做开题报告。如果有任何问题，欢迎随时告诉我。",
+    "提前开题就是提前做开题报告。有需要的话，可以随时联系我。",
+    "I opened the issue. If anything comes up, feel free to let me know.",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);

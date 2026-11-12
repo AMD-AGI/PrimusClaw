@@ -1481,9 +1481,11 @@ export function asksUser(text: string, choices = 0): boolean {
 const CLOSING_OFFER = new RegExp([
   String.raw`^(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
   String.raw`^(如|若)?有(任何|其他|别的)?(问题|需要|疑问)`,
-  // A bare "tell me" with nothing to tell: the second half of "如果有任何问题，请告诉我" / "If you have questions, please let me know".
-  String.raw`^(请)?(随时)?(告诉|联系|找|问)(我|我们)[。！!.~～]*$`,
-  String.raw`^(please )?(just )?(let me know|tell me|reach out|ask( me)?)[.!]*$`,
+  String.raw`^(有)?需要的话`,
+  // A bare "tell me" with nothing to tell, whatever courtesy leads it: the second half of "如果有任何问题，欢迎随时告诉我" / "If you
+  // have questions, feel free to let me know". "把题目告诉我" names what to tell, so it is no offer.
+  String.raw`^(请|欢迎|可以|随时|都|也|再|就|直接|您|你|尽管|还)*(告诉|联系|找|问)(我|我们)(一声|就好|就行|即可)?[。！!.~～]*$`,
+  String.raw`^(please |feel free to |just |do |you can )*(let me know|tell me|reach out|ask( me)?|contact me)[.!]*$`,
   String.raw`^随时(告诉|找|问|联系)(我|我们)?[。！!.?？~～]*$`,
   String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
   String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,
