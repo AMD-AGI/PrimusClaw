@@ -36,6 +36,11 @@ export interface World {
   /** Every request path the marketplace saw, in order. */
   paths: string[];
   script(turns: Turn[]): void;
+  /**
+   * Answers a POST to the API's internal routes (INTERNAL_BACKEND_URL is this server): given the path and the parsed
+   * body, returns the status and JSON body. Unset: 404.
+   */
+  internal?: (path: string, body: Record<string, unknown>, headers: http.IncomingHttpHeaders) => { status: number; body: unknown };
   close(): Promise<void>;
 }
 
@@ -96,6 +101,19 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       if (!t || t.fail) { res.statusCode = 500; res.end("boom"); return; }
       res.setHeader("content-type", "application/zip");
       setTimeout(() => res.end(t.zip), t.delayMs ?? 0);
+      return;
+    }
+    if (url.startsWith("/v1/internal/") && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(body || "{}"); } catch { /* left empty */ }
+        const out = world.internal ? world.internal(url, parsed, req.headers) : { status: 404, body: { ok: false, error: "not_found" } };
+        res.statusCode = out.status;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(out.body));
+      });
       return;
     }
     if (url.includes("/v1/messages")) {
