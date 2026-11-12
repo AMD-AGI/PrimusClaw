@@ -136,6 +136,16 @@ test("each option the adapter offered can be chosen and its own id is what claw 
   }
 });
 
+test("the card's language is kept with its request when the card is shown", async () => {
+  for (const lang of ["zh", "en"] as const) {
+    await remoteWorld(async (w) => {
+      w.setLang(AAD, lang);
+      const { sid } = await asked(w, CODEX_OPTIONS);
+      assert.equal(perm(w, sid)?.lang, lang);
+    });
+  }
+});
+
 test("the click replaces the card with what was chosen and by whom", () =>
   remoteWorld(async (w) => {
     const { card } = await asked(w, CLAUDE_OPTIONS, "claude");
