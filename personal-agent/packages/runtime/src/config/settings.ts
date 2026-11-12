@@ -20,7 +20,7 @@ import {
 } from "@primusclaw/personal-agent";
 import { DEFAULT_CLIENT_LABEL } from "../claw/client.js";
 import { type Env, EnvReader, pyRepr, withoutTrailingSlash } from "./env.js";
-import { ENV_NAMES, secretsSourceOf } from "./secrets.js";
+import { SECRET_SETTING_NAMES, secretsSourceOf } from "./secrets.js";
 
 /** The public client id of the GitHub CLI: an OAuth app most organizations already allow; its device flow needs no secret. */
 export const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
@@ -119,7 +119,7 @@ function secret(read: EnvReader, store: Secrets, name: SecretName): string {
     // never the environment's value: it may be the stale one the vault replaced
     throw new ConfigError(`SECRETS_SOURCE=keyvault but ${name} was not read from the vault`);
   }
-  return read.required(ENV_NAMES[name]);
+  return read.required(SECRET_SETTING_NAMES[name]);
 }
 
 function exchangeSettings(read: EnvReader, store: Secrets, publicBaseUrl: string): ExchangeSettings {
