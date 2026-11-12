@@ -34,6 +34,7 @@ import { registerInternalTaskRoutes } from "../src/routes/internal-tasks.js";
 import { registerAdminRoutes } from "../src/routes/admin.js";
 import { registerInternalWorkspaceRoutes } from "../src/routes/internal-workspaces.js";
 import { registerInternalMemoryRoutes } from "../src/routes/internal-memory.js";
+import { registerInternalSkillRoutes } from "../src/routes/internal-skills.js";
 import { registerInternalRunRoutes } from "../src/routes/internal-runs.js";
 import { registerInternalAppRoutes } from "../src/routes/internal-apps.js";
 import { registerAssistantMcpRoutes } from "../src/assistant/mcp.js";
@@ -44,6 +45,7 @@ const REGISTRARS: Array<(app: FastifyInstance) => Promise<void>> = [
   registerAdminRoutes,
   registerInternalWorkspaceRoutes,
   registerInternalMemoryRoutes,
+  registerInternalSkillRoutes,
   registerInternalRunRoutes,
   registerInternalAppRoutes,
   // The assistant's MCP service is off by default; asked for here so it is held to the same rule.

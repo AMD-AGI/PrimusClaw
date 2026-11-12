@@ -537,9 +537,6 @@ export const BYOK_VERIFY_MODELS_URL = env("BYOK_VERIFY_MODELS_URL");
 export const BYOK_VERIFY_API_STYLE = env("BYOK_VERIFY_API_STYLE");
 export const ANTHROPIC_BASE_URL = env("ANTHROPIC_BASE_URL");
 
-// --- Skill selection ---
-export const MAX_SELECTED_SKILLS = envInt("MAX_SELECTED_SKILLS", 3);
-
 // --- Phase-2 feature flags (default OFF; opt-in per deployment) ---
 // When false: long-term memory read and write paths are short-circuited.
 export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
@@ -555,9 +552,10 @@ export const CLAW_MEMORY_CATALOGUE_MAX_TOKENS = envInt("CLAW_MEMORY_CATALOGUE_MA
 export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIEW_DAYS", 30, { min: 1 });
 export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
 // Personal skills, two switches.
-// CLAW_USER_SKILLS_ENABLED: a user's own skills reach their turns, and what a turn saves (the save_skill tool and
-// the *_skill_file tools) is kept. Off: no skill is selected for a turn, Brain neither offers nor runs the
-// skill-writing tools, and what a worker sends to save is dropped. The skill routes (/v1/users/:id/skills) work
+// CLAW_USER_SKILLS_ENABLED: a user's own skills are listed to the turns of their own conversations
+// (`request.user_skills`, sessions/user-skills.ts), and what such a turn saves (the save_skill tool and the
+// *_skill_file tools) is kept. Off: no skill is listed to a turn, Brain neither offers nor runs the skill-writing
+// tools, and what a worker sends to save is dropped. The skill routes (/v1/users/:id/skills) work
 // either way, as before: they are the user's own explicit writes, under the same checks.
 export const CLAW_USER_SKILLS_ENABLED = envBool("CLAW_USER_SKILLS_ENABLED", false);
 // CLAW_SKILL_AUTO_EVOLUTION_ENABLED: skills the platform writes on its own -- pattern promotion, the evolution

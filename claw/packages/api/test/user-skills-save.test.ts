@@ -320,8 +320,7 @@ describe("personal skills: save", { skip }, () => {
     await save({ name: "on-skill" });
     await save({ name: "off-skill" });
     await q("UPDATE claw_skills SET enabled = FALSE WHERE skill_name = 'off-skill'");
-    assert.deepEqual(Object.keys(await svc.getUserActiveSkills("alice")), ["on-skill"]);
-    assert.deepEqual(Object.keys(await svc.selectSkillsForTask("alice", "anything", 5)).sort(), ["on-skill"]);
+    assert.deepEqual((await svc.userSkillManifest("alice")).map((e) => e.name), ["on-skill"]);
     assert.equal((await rest("GET", "/v1/users/me/skills")).body.data.length, 2, "the user still sees it");
   });
 

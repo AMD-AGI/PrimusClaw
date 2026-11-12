@@ -24,7 +24,6 @@ import {
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
-import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
 import { replyLanguageFor, withReplyLanguage, type ChosenLanguage } from "./language.js";
 import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
@@ -103,18 +102,6 @@ export async function sessionRole(sessionId: string): Promise<SessionRole | null
   if (row.role === "router") return { role: "router", userId: row.user_id };
   if (row.role === "observer") return { role: "observer", userId: row.user_id, scope: row.title as string };
   return { role: "worker", userId: row.user_id, itemId: row.item_id as string, seq: Number(row.seq), title: row.title as string };
-}
-
-/**
- * Whether a turn of this session must skip skill selection: a router's or an observer's, which costs an LLM call they have no use for, and a review someone
- * asked of the owner, whose fixed profile has none of the owner's skills (`github-review/review-profile.ts`). Both skill entries (the
- * immediate turn and the queued one) ask here.
- */
-export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
-  if (await reviewProfileSession(sessionId)) return true;
-  if (!CLAW_ASSISTANT_ENABLED) return false;
-  const role = (await sessionRole(sessionId))?.role;
-  return role === "router" || role === "observer";
 }
 
 /**
@@ -301,7 +288,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
     task.mcp_servers = {};
-    for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    for (const field of ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    task.user_skills_enabled = false;
     task.skip_platform_defaults = true;
     withSystemAppend(task, renderObserverSystem(role.scope));
     logger.info({ sessionId, taskId, scope: role.scope, prompt: OBSERVER_PROMPT_VERSION }, "assistant.observer_turn");
@@ -330,7 +318,9 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The plugin's log reads: bounded to their last lines, and masked before the model reads them (Brain, `log-reads.ts`).
     if (lookups.logReads) task.log_reads = lookups.logReads;
     else delete task.log_reads;
-    for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    // Nor the user's personal skills (`user_skills`): that list is for a turn that works in a sandbox, which is the worker's.
+    for (const field of ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    task.user_skills_enabled = false;
     if (read) {
       task.plugin_id = read.pluginId;
       task.plugin_tools = read.pluginTools;

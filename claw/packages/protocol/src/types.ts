@@ -276,6 +276,22 @@ export type RunPhase = "executing" | "waiting";
 /** Why a run is not executing. Waits are the whole reason A2 exists. */
 export type RunWaitReason = "approval" | "background_command";
 
+/**
+ * One of the user's personal skills as a turn is told of it (`ExecuteRequest.user_skills`). The text is not here: the
+ * API answers it for the turn (`POST /v1/internal/skills/read` with the session, the turn, `name` and `content_sha`).
+ */
+export interface UserSkillManifestEntry {
+  name: string;
+  version: number;
+  description: string;
+  /** `auto`: listed to the model. `manual`: used only when the user names it. */
+  invocation: "auto" | "manual";
+  /** SKILL.md and every supporting file; changes whenever any of them does. */
+  content_sha: string;
+  /** Where the skill came from (`chat`, `worker`, `api`, `import`, `auto`); null for one stored before it was kept. */
+  origin: "chat" | "worker" | "api" | "import" | "auto" | null;
+}
+
 /** Brain task execution request (Backend Dispatcher → Brain HTTP). */
 export interface ExecuteRequest {
   // ── Task identity ─────────────────────────────────────────────────────
@@ -558,6 +574,15 @@ export interface ExecuteRequest {
     description?: string;
     files?: Array<{ path: string; content: string; is_binary?: boolean }>;
   }>;
+  /**
+   * The user's personal skills this turn may use: name, version, description (at most 300 characters), invocation,
+   * fingerprint and origin of each, most recently used first, and none of their text. Brain lists the `auto` ones to
+   * the model and reads a skill only when it is used, from the API (`POST /v1/internal/skills/read`, keyed by
+   * `content_sha`); a `manual` one is used only when the user names it. Sent only on a turn of the user's own
+   * conversation (CLAW_USER_SKILLS_ENABLED; never on a review, an observer's or router's turn, a session that acts
+   * as a user, or a group chat). Absent: none. Separate from `skills`, which is what a caller passes explicitly.
+   */
+  user_skills?: UserSkillManifestEntry[];
   /** AgentHooks attached to this task (see brain/src/agent/hooks.ts). */
   hooks?: {
     pre?: Array<{ type: "tool"; name: string; args: Record<string, unknown> }>;

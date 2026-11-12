@@ -9,11 +9,13 @@
  *      name wins when both are set
  *   W2 with only auto-evolution on (as a deployment that kept the old setting has it): no skill reaches a turn, and
  *      what a worker's turn saves is dropped, while the auto-evolution steps of a completion still run
+ *   W3 and Brain's read of a skill is refused in a live turn of the user's own chat, with nothing of the skill
  *
  * The flags are read when the modules load, so W2 sets them first, and W1 reads them in child processes.
  */
 
 process.env.CLAW_SKILL_EVOLUTION_ENABLED = "true";
+process.env.AUTH_INTERNAL_TOKEN = "switches-internal-token";
 delete process.env.CLAW_SKILL_AUTO_EVOLUTION_ENABLED;
 delete process.env.CLAW_USER_SKILLS_ENABLED;
 
@@ -23,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import test, { after, before } from "node:test";
 
 const config = await import("../src/config.js");
-const { selectSkillsForTask } = await import("../src/marketplace/skill-service.js");
+const { userSkillsForTurn } = await import("../src/sessions/user-skills.js");
 const { consumeEventDelivery, tombstoneReader, completionPorts } = await import("../src/events/consumer.js");
 const { db } = await import("../src/infra/db.js");
 const { sc } = await import("../src/infra/nats.js");
@@ -100,16 +102,16 @@ after(async () => {
 test("W2 auto-evolution alone: no skill reaches a turn and a turn's saves are dropped; its own steps still run", async () => {
   assert.deepEqual([config.CLAW_USER_SKILLS_ENABLED, config.CLAW_SKILL_AUTO_EVOLUTION_ENABLED], [false, true], "the premise");
 
-  // No skill is selected, and the database is not even asked.
+  // No skill is listed and the turn keeps none, and the database is not even asked.
   const statements: string[] = [];
   const query = db.query;
   db.query = (async (text: string, ...rest: unknown[]) => { statements.push(text); return (query as any)(text, ...rest); }) as typeof db.query;
   try {
-    assert.deepEqual(await selectSkillsForTask("u-1", "write my weekly report"), {});
+    assert.deepEqual(await userSkillsForTurn(SESSION, "u-1"), { enabled: false });
   } finally {
     db.query = query;
   }
-  assert.equal(statements.some((s) => /claw_skills/.test(s)), false);
+  assert.deepEqual(statements, []);
 
   await seedSession(h, SESSION);
   await seedRun(h, "run-1", SESSION, { status: "running", messageId: "m-1" });
@@ -130,4 +132,22 @@ test("W2 auto-evolution alone: no skill reaches a turn and a turn's saves are dr
   assert.ok(!calls.includes("saveUserSkill"), "a turn's save is kept with the user's skills off");
   assert.ok(calls.includes("recordSkillFeedback"), "auto-evolution's feedback step did not run: this test proves nothing");
   assert.ok(calls.includes("enqueueEvolutionJob"));
+});
+
+test("W3 with the user's skills off, Brain's read of one is refused in a live turn of the user's own chat", async () => {
+  await seedSession(h, "skill-switches-read");
+  await seedRun(h, "run-read", "skill-switches-read", { status: "running", messageId: "m-read" });
+  await h.sql("INSERT INTO claw_skills (user_id, skill_name, version, status) VALUES ('u-1', 'read-me', 1, 'active')");
+  const Fastify = (await import("fastify")).default;
+  const app = Fastify();
+  await (await import("../src/routes/internal-skills.js")).registerInternalSkillRoutes(app);
+  try {
+    const res = await app.inject({
+      method: "POST", url: "/v1/internal/skills/read", headers: { authorization: "Bearer switches-internal-token" },
+      payload: { session_id: "skill-switches-read", message_id: "m-read", name: "read-me" },
+    });
+    assert.deepEqual([res.statusCode, res.json().error], [403, "not_served"]);
+  } finally {
+    await app.close();
+  }
 });

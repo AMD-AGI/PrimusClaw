@@ -93,7 +93,7 @@ describe("assistant observe", { skip }, () => {
     await w.q("DELETE FROM claw_pending_messages WHERE id = $1", [row.id]);
     const run = await w.openRun(sessionId);
     await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [run.taskId, row.content]);
-    const task: Record<string, unknown> = { task_id: run.taskId, message_id: run.messageId, prompt: row.content, mcp_servers: { mine: { type: "http", url: "http://elsewhere" } }, skills: { s: 1 } };
+    const task: Record<string, unknown> = { task_id: run.taskId, message_id: run.messageId, prompt: row.content, mcp_servers: { mine: { type: "http", url: "http://elsewhere" } }, skills: { s: 1 }, user_skills: [{ name: "x" }], user_skills_enabled: true };
     await w.mod.role.applySessionRoleToTask(task, sessionId);
     const server = (task.mcp_servers as Record<string, any>).assistant;
     return { run, task, token: server.token as string, content: row.content as string };
@@ -306,7 +306,7 @@ describe("assistant observe", { skip }, () => {
     assert.ok(verdict.ok);
     assert.equal(verdict.claims.role, "observer");
     assert.equal(verdict.claims.sid, watcher);
-    assert.equal(await w.mod.role.skipsSkillSelection(watcher), true);
+    assert.deepEqual([turn.task.user_skills, turn.task.user_skills_enabled], [undefined, false], "none of the owner's personal skills");
     const role = await w.mod.role.sessionRole(watcher);
     assert.deepEqual(role, { role: "observer", userId: "alice", scope: GROUP });
   });

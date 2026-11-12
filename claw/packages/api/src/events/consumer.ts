@@ -21,7 +21,6 @@ import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
 import {
   saveUserSkill, recordSkillFeedback,
-  selectSkillsForTask,
   addSkillFile, updateSkillFile, removeSkillFile,
   maybeRecordTaskPattern,
   checkProbationGraduation,
@@ -31,7 +30,7 @@ import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-e
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED } from "../config.js";
-import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { applyTurnUserSkills, userSkillsForTurn, userSkillsServe } from "../sessions/user-skills.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
 import { ackBeforeLookupInBackground, noteTextPreview } from "../assistant/lookup-ack.js";
@@ -1147,16 +1146,18 @@ async function handleComplete(
   }
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
-  // Gated by CLAW_USER_SKILLS_ENABLED. When OFF: drop, warn for audit.
+  // Gated by CLAW_USER_SKILLS_ENABLED, and kept only from a session the user's skills serve (`userSkillsServe`: the
+  // same turns that are offered the tools). Otherwise: dropped, warned for audit.
   const skillsToSave = sandboxOnly ? [] : (event as any).skills_to_save || [];
   const skillFileMutations = sandboxOnly ? [] : (event as any).skill_file_mutations || [];
-  if (!CLAW_USER_SKILLS_ENABLED) {
-    if (skillsToSave.length || skillFileMutations.length) {
+  const skillWrites = skillsToSave.length > 0 || skillFileMutations.length > 0;
+  if (!CLAW_USER_SKILLS_ENABLED || (skillWrites && !(await userSkillsServe(sessionId, userId)))) {
+    if (skillWrites) {
       logger.warn({
         sessionId,
         skills: skillsToSave.length,
         mutations: skillFileMutations.length,
-      }, "skill.write_skipped_flag_off");
+      }, CLAW_USER_SKILLS_ENABLED ? "skill.write_skipped_session_not_served" : "skill.write_skipped_flag_off");
     }
   } else {
     // 4. Process explicit save_skill events (from Brain's save_skill tool).
@@ -1242,8 +1243,8 @@ async function handleComplete(
   //
   //    Gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED — when OFF, no feedback is
   //    recorded and probation skills don't graduate. selected_skills/skills_used
-  //    on the event are also harmless to ignore because selectSkillsForTask
-  //    already returns {} upstream.
+  //    on the event are harmless to ignore: no skill is inlined into a turn
+  //    (`request.skills` is no longer filled from the user's skills).
   if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
     //    Attribution rules (revised after the "no-disk-write" optimization broke
     //    the simple selected ∩ used model):
@@ -1509,42 +1510,6 @@ function resolvePendingRequestShape(
 }
 
 /**
- * The active skills a queued turn keeps, bundled the way a live turn gets them.
- *
- * Absent rather than empty when nothing is active, because an empty object and
- * "no skills were resolved" mean different things downstream.
- */
-async function pendingSkillBundle(
-  sessionId: string,
-  userId: string,
-  content: string,
-): Promise<Record<string, {
-  content: string; enabled: boolean; version?: number; description?: string;
-  files?: Array<{ path: string; content: string; is_binary?: boolean }>;
-}> | undefined> {
-let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
-try {
-  // A router turn has no use for skills, and selecting them can cost an LLM call (see sessions/dispatch.ts).
-  const activeSkills = await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
-  pendingSkills = {};
-  for (const [name, bundle] of Object.entries(activeSkills)) {
-    pendingSkills[name] = {
-      content: bundle.content,
-      description: bundle.description,
-      enabled: true,
-      version: bundle.version,
-      files: bundle.files,
-    };
-  }
-  if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
-} catch {
-  pendingSkills = undefined;
-}
-
-  return pendingSkills;
-}
-
-/**
  * Dispatch the next message parked behind this session, if there is one and the session is free.
  *
  * Extracted from the completion handler rather than duplicated, because the
@@ -1581,7 +1546,8 @@ if (pending) {
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
-  const pendingSkills = await pendingSkillBundle(sessionId, pendingUserId, pending.content || "");
+  // Asked now, as the immediate path asks it: whose session it is and what the user's skills are when the turn is sent on.
+  const pendingUserSkills = await userSkillsForTurn(sessionId, pendingUserId);
   const rawTools = pending.tool_ids;
   const toolIds: number[] = Array.isArray(rawTools)
     ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
@@ -1644,11 +1610,9 @@ if (pending) {
     history,
     memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
     skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
-    user_skills_enabled: CLAW_USER_SKILLS_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
-    skills: pendingSkills,
     tool_ids: toolIds.length ? toolIds : undefined,
     plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
     ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
@@ -1661,6 +1625,7 @@ if (pending) {
     topology: asJsonObject(pending.topology),
     ...(Array.isArray(pending.tools_allowlist) && pending.tools_allowlist.length ? { tools_allowlist: pending.tools_allowlist } : {}),
   };
+  applyTurnUserSkills(task, pendingUserSkills);
   // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });
