@@ -19,7 +19,8 @@
  *       plain text: the parity run's K2; a lookup that failed as well) has its text delivered as the answer, once; a say after the lookup, a refused say, or no
  *       lookup at all leaves the turn alone as in T2
  *   T10 every such turn is counted by what its end did (`claw_assistant_router_unsaid_total`): its text delivered, delivered in place
- *       of an early line (K2), the system's notice, or left unsaid after a say that answered; a turn that said its answer is not counted
+ *       of an early line (K2), the system's notice, said with an internal id left out, or left unsaid after a say that answered; a turn
+ *       that said its answer is not counted; an attach command for the user to send is delivered as written (N23)
  *   T11 a turn a worker's answer woke that ended without saying it -- stopped for the user's next message, failed, written in plain
  *       text, or silent -- has the answer said by the system at once, once, about the item (release gate run 1108021655-0c1088: the
  *       turn was stopped for the next message and the answer came only from the silent sweep five minutes later); a turn that said it,
@@ -322,7 +323,7 @@ describe("assistant router turn end", { skip }, () => {
   test("T10 each turn that ended without its answer said is counted by what its end did; one that said its answer is not", async () => {
     const family = w.h.app.metrics.registry.getSingleMetric("claw_assistant_router_unsaid_total");
     assert.ok(family, "the counter is on the api registry");
-    const OUTCOMES = ["delivered", "replaced_early_line", "lost_notice", "withheld", "refused", "after_say"] as const;
+    const OUTCOMES = ["delivered", "replaced_early_line", "lost_notice", "withheld", "redacted", "refused", "after_say"] as const;
     const read = async () => {
       const values = (await family.get()).values;
       return Object.fromEntries(OUTCOMES.map((o) => [o, values.find((v) => v.labels.outcome === o)?.value ?? 0]));
@@ -386,6 +387,18 @@ describe("assistant router turn end", { skip }, () => {
     await w.q("TRUNCATE claw_assistant_says");
     assert.equal(await end(await endedTurn("autopilot 有几台节点"), { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。" }), "said");
     assert.deepEqual(await gained(), { withheld: 1 });
+
+    // A turn whose plain text has an internal id and nothing else internal: said without the id.
+    await w.q("TRUNCATE claw_assistant_says");
+    assert.equal(await end(await endedTurn("autopilot 有几台节点"), { finalText: "有 3 台（会话 3f2b8c1e-9a4d-4e6f-8b2a-1c5d7e9f0a3b）。" }), "said");
+    assert.deepEqual(await gained(), { redacted: 1 });
+
+    // A turn whose plain text is an attach command for the user to send: delivered as written, not withheld (N23).
+    await w.q("TRUNCATE claw_assistant_says");
+    const attach = "发送 /agent attach 8bd9c2e4-1f3a-4b5c-9d6e-7f8a9b0c1d2e 就能连到那个会话。";
+    assert.equal(await end(await endedTurn("怎么链接？"), { finalText: attach }), "said");
+    assert.deepEqual(await gained(), { delivered: 1 });
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[attach, false]]);
 
     // A report turn ends silent on purpose: nothing to count.
     await w.q("TRUNCATE claw_assistant_says");

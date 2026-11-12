@@ -34,7 +34,7 @@ import {
   turnHandedOffReview, type SayDeps,
 } from "./outbound.js";
 import { citedNumbers } from "./citations.js";
-import { internalTextIn, userWordsOf } from "./internal-text.js";
+import { internalTextIn, userWordsOf, withoutInternalIds } from "./internal-text.js";
 import { answerEventItemOf, TOOL_NAME_PREFIX, WORK_EVENT_PREFIX } from "./prompts.js";
 import { ROUTER_ASSISTANT_READS, ROUTER_SPEAK_TOOL } from "./read-tools.js";
 import { releaseHeldSays } from "./say-hold.js";
@@ -112,6 +112,12 @@ export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "f
   const chinese = detectLanguage(own.join("\n")) === "Chinese";
   // The person stopped it (`/stop`): what they asked for happened, and asking them to say it again would be wrong.
   if (why === "stopped") return chinese ? "已停止。" : "Stopped.";
+  // The answer was written and held back for internal text in it: the turn did not fail, and asking again would meet the same check.
+  if (why === "withheld") {
+    return chinese
+      ? "这条回答里带了系统内部的信息（工具名或内部编号），按规则没有发给你。进行中的事项不受影响。"
+      : "The answer to this contained internal details (a tool name or an internal id), so it was not sent to you. Your work items are not affected.";
+  }
   if (why === "declined") {
     return chinese
       ? "这个请求我不能处理：它可能涉及访问内部地址、凭据或其他不安全的操作，所以我没有执行。换个问题或说明你想达到的目的，我可以继续帮你。进行中的事项不受影响。"
@@ -137,9 +143,10 @@ export function turnLostNotice(prompts: readonly string[], why: TurnLostWhy = "f
 
 /**
  * Why a turn that answers the user ended without a word: it failed, the model declined to answer at all, it was stopped, or the gateway
- * refused the user's key (`key-refusal.ts`: none bound, or the one bound is invalid).
+ * refused the user's key (`key-refusal.ts`: none bound, or the one bound is invalid). Or its answer was held back for internal text
+ * in it (`withheld`, never from `lostWhy`: the turn itself ended well).
  */
-export type TurnLostWhy = "failed" | "declined" | "stopped" | "key_missing" | "key_invalid";
+export type TurnLostWhy = "failed" | "declined" | "stopped" | "key_missing" | "key_invalid" | "withheld";
 
 /**
  * What Brain ends a run with when its model answered nothing twice in a row (or on its last turn): no text and no tool call
@@ -388,13 +395,27 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
       return "skipped";
     }
   }
-  // The router's own words with internal text in them (a tool name, an item_id, ...): never shown. The turn is answered with
-  // the system's notice instead, as one that said nothing is (`say` would have refused the same text).
-  const leaked = !lost && internalTextIn(text, userWordsOf(prompts));
+  // The router's own words with internal text in them (a tool name, an item_id, ...): never shown (`say` would have refused the same
+  // text). When an id is all there is, the answer is said without it; otherwise the system says why there is no answer, and not "say it
+  // again": the same question would meet the same check (N23, 2026-11-11: an attach command's session id, refused before it was allowed).
+  const words = userWordsOf(prompts);
+  let leaked = !lost && internalTextIn(text, words);
+  let redacted = false;
+  if (leaked === "an internal id") {
+    const chinese = detectLanguage(words) === "Chinese";
+    const rewritten = withoutInternalIds(text, words, chinese ? "（内部编号已略去）" : "(internal id omitted)");
+    if (!internalTextIn(rewritten, words)) {
+      logger.warn({ sessionId: end.sessionId, runIds: end.runIds, leaked }, "assistant.unsaid_answer_redacted");
+      await takeBack("redacted");   // what was shown as it was written had the id in it
+      text = rewritten;
+      leaked = false;
+      redacted = true;
+    }
+  }
   if (leaked) {
     logger.warn({ sessionId: end.sessionId, runIds: end.runIds, leaked }, "assistant.unsaid_answer_withheld");
     await takeBack("withheld");
-    text = turnLostNotice(prompts);
+    text = turnLostNotice(prompts, "withheld");
     if (!text) return "skipped";
   }
   const began = new Date(Math.min(...runs.map((r) => new Date(r.began).getTime())));
@@ -449,6 +470,6 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     throw err;
   }
   logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.unsaid_answer_delivered");
-  metrics.onAssistantRouterUnsaid(earlyLine ? "replaced_early_line" : "delivered");
+  metrics.onAssistantRouterUnsaid(earlyLine ? "replaced_early_line" : redacted ? "redacted" : "delivered");
   return "said";
 }
