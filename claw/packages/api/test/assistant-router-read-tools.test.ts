@@ -137,10 +137,11 @@ describe("assistant router read tools", { skip }, () => {
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__get_nodes"), "by name: a tool autopilot does not list is not offered");
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__apply_host_exclusion_add"));
     assert.equal(task.skip_platform_defaults, true, "no default MCP server and no default skill list");
-    // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain.
+    // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain. With
+    // CLAW_USER_SKILLS_ENABLED off this is the list as it was before the router had skill_read, written out, not taken from the constant.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
-      allow_after: ["say", "work_recall", "memory_recall", "skill_read", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
+      allow_after: ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
       // A plugin server words its own errors, so a failed read of one marks the turn like an answer; only the web is clean here.
       clean_failures: ["web_search", "web_fetch"],
     });
@@ -158,6 +159,11 @@ describe("assistant router read tools", { skip }, () => {
       assert.ok(!text.includes("SKILL.md") && !text.includes("Platform Skills"), "no skill is named to the router");
       assert.ok(!text.includes("autopilot-nodes") && !text.includes("skill_read") && !text.includes("personal skills"), "nor a personal skill");
     }
+    // Nor does the rest of the turn's reckoning know skill_read, and /metrics shows none of the personal-skill series.
+    const { ROUTER_ASSISTANT_READS } = await import("../src/assistant/read-tools.js");
+    assert.deepEqual(ROUTER_ASSISTANT_READS, ["work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state"]);
+    const { registry } = await import("../src/infra/metrics.js");
+    assert.doesNotMatch(await registry.metrics(), /claw_user_skill_/);
     assert.ok(task.prompt.startsWith(`${QUESTION}\n\n`), "the user's words first");
   });
 

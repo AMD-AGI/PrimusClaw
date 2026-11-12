@@ -332,6 +332,10 @@ describe("assistant: the user's personal skills", { skip }, () => {
     assert.ok(task.read_taint.sources.length > 0, "the rule has its lookups");
     assert.ok(!allows(task.read_taint.sources, READ), "not a source");
     assert.ok(allows(task.read_taint.allow_after, READ), "allowed after a lookup");
+    const { ROUTER_ASSISTANT_READS } = await import("../src/assistant/read-tools.js");
+    assert.ok(ROUTER_ASSISTANT_READS.includes("skill_read"), "a say before it did not answer from it");
+    const { registry } = await import("../src/infra/metrics.js");
+    assert.match(await registry.metrics(), /# TYPE claw_user_skill_read_total counter/, "its metrics are registered");
 
     // Brain's own rule, built from this request.
     const afterSkill = parseReadTaint(task.read_taint)!;

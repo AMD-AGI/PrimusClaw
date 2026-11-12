@@ -107,7 +107,7 @@ describe("assistant router lookups", { skip }, () => {
     // After any of them has answered, the turn no longer acts for the person.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
-      allow_after: ["say", "work_recall", "memory_recall", "skill_read", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
+      allow_after: ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
       // A failed GitHub or web lookup read nothing: the turn may still start the work.
       clean_failures: [...ROUTER_GITHUB_READ_TOOLS.map((t) => `mcp__github__${t}`), "web_search", "web_fetch"],
     });
