@@ -1460,22 +1460,33 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
  * options or more); or a sentence of it is a question; or it asks in so many words, in Chinese or English ("请说明一下…", "请告诉我…",
  * "Send me the repository", "Could you tell me…"), which a router often writes instead of a question. A generic closing offer ("如果还有
  * 其他问题，随时告诉我", "Let me know if you need anything else", "Any questions?") asks for nothing, so a reply that only answers and
- * ends with one does not ask.
+ * ends with one does not ask. An offer is a clause that opens with one: "If you need more details, please send the repository" still
+ * asks (its second clause), and so does "Which repository should I use if you have any other requirements?" (a question that opens
+ * with no offer). Known to pass wrongly: "Done, any questions?" (an answer and an offer in one sentence).
  */
 export function asksUser(text: string, choices = 0): boolean {
   if (choices >= 2) return true;
-  // The sentences of the reply (a list item or a line is one; each keeps its own end mark), less the generic offers that end an answer.
-  const sentences = text.split(/(?<=[。！!；;?？\n])|(?<=[.])\s+/).map((t) => t.trim()).filter((t) => t && !CLOSING_OFFER.test(t));
-  return sentences.some((t) => /[?？]/.test(t) || ASKS.some((re) => re.test(t)));
+  // The sentences of the reply (a list item or a line is one; each keeps its own end mark), and the clauses of each.
+  const sentences = text.split(/(?<=[。！!；;?？\n])|(?<=[.])\s+/).map((t) => t.trim()).filter(Boolean);
+  return sentences.some((sentence) => {
+    const clauses = sentence.split(/[,，]/).map((c) => c.replace(/^[^\p{L}\p{N}]+/u, "").trim()).filter(Boolean);
+    const offer = (c: string): boolean => CLOSING_OFFER.test(c);
+    // A question whose first or last clause is no offer ("If you want, which repo?"; "Which repo, if you have any preference?").
+    if (/[?？]/.test(sentence) && clauses.length && (!offer(clauses[0]!) || !offer(clauses.at(-1)!))) return true;
+    const kept = clauses.filter((c) => !offer(c)).join(", ");
+    return kept !== "" && ASKS.some((re) => re.test(kept));
+  });
 }
-/** A closing offer that asks for nothing: "if there is anything else, tell me", "feel free to ask". */
+/** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
 const CLOSING_OFFER = new RegExp([
-  String.raw`(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
-  String.raw`随时(告诉|找|问|联系)`,
+  String.raw`^(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
+  String.raw`^有(任何|其他|别的)?(问题|需要|疑问)`,
+  String.raw`^随时(告诉|找|问|联系)(我|我们)?[。！!.?？~～]*$`,
   String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
   String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,
-  String.raw`\bif (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
-  String.raw`\b(feel free|anything else|any (other |more |further )?questions?)\b`,
+  String.raw`^if (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
+  String.raw`^(let me know|tell me) if\b`,
+  String.raw`^(feel free|anything else|any (other |more |further )?questions?|is there anything else|do you have any (other |more |further )?questions?|hope this helps)\b`,
 ].join("|"), "i");
 /** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
 const ASKS: readonly RegExp[] = [

@@ -1401,8 +1401,16 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "Could you tell me which cluster you mean",
     "你是想重新开之前的调研，还是新建一个事项",
     "I need the repository and the failing test name.",
-    // A question stays a question with a closing offer after it.
+    // A question stays a question with a closing offer after it, or inside it; a request after an opening offer still asks.
     "Which repository should the issue go in? Let me know if you need anything else.",
+    "Which repository did you mean? If you need anything else, let me know.",
+    "Which repository should I use if you have any other requirements?",
+    "If you need more details, please send the repository and test name.",
+    "如果你有更多细节，请告诉我是哪个仓库。",
+    "📌 If it's somewhere else, or has another state, send me its name.",
+    "If you want, which repository should I use?",
+    "Which repository should I use, if you have any preference?",
+    "随时告诉我你想开哪个题。",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
