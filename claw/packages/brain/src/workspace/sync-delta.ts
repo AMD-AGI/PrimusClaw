@@ -463,12 +463,17 @@ export async function holdAfterFailedRestore(hands: HandsClient, sessionId: stri
 
 /**
  * Whether a save from this sandbox must leave every object in place: true when a
- * restore into it failed, and also when the sandbox cannot say. A held save
+ * restore into it failed, and also when the sandbox cannot say (unless
+ * `unknownIsHeld` is false: for a caller whose own work needs the same sandbox
+ * to answer, and so cannot go ahead where this could not ask). A held save
  * deletes and replaces nothing, and what it leaves out is still there for the
  * next save that can tell, so the doubtful case costs a deferred save at most.
  */
-export async function isRestoreHeld(hands: HandsClient, sessionId: string): Promise<boolean> {
+export async function isRestoreHeld(
+  hands: HandsClient, sessionId: string, opts: { unknownIsHeld?: boolean } = {},
+): Promise<boolean> {
   if (restoreHeld.has(restoreHoldKey(hands, sessionId))) return true;
+  const unknown = opts.unknownIsHeld ?? true;
   let raw: string | null;
   try {
     raw = finishedOutput(await bash(
@@ -477,11 +482,11 @@ export async function isRestoreHeld(hands: HandsClient, sessionId: string): Prom
       STATE_TIMEOUT_SEC,
     ));
   } catch {
-    return true;
+    return unknown;
   }
-  return raw?.trim() !== "clear";
+  const answer = raw?.trim();
+  return answer === "held" ? true : answer === "clear" ? false : unknown;
 }
-
 /**
  * Forget this process's hold on a sandbox a restore has just filled in full. The
  * hold was for a sandbox at this address that could not be restored; a restore

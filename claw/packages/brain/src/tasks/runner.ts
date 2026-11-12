@@ -23,7 +23,7 @@ import {
   syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
   TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
-import { invalidateSyncManifest, releaseRestoreHold, withoutAddresses } from "../workspace/sync-delta.js";
+import { invalidateSyncManifest, isRestoreHeld, releaseRestoreHold, withoutAddresses } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import { cutDrainedCalls } from "../agent/drain-shield.js";
@@ -1874,7 +1874,10 @@ class TaskRunner {
       const frozenUidHex = this.userIdHex;
       const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
-        .run(() => fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot))
+        .run(async () => {
+          await this.refuseSharedSyncIfHeld(frozenHands);
+          return fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot);
+        })
         .then(async (info) => {
           if (this.taskFinished || this.abortCtrl.signal.aborted) return info;
           this.lastSyncedTurn = turnSnapshot;
@@ -3239,6 +3242,24 @@ class TaskRunner {
   }
 
   /**
+   * Refuse the shared-filesystem snapshot of a sandbox whose restore failed.
+   *
+   * That snapshot is what the next sandbox of the session is filled from, by a
+   * restore that succeeds and so leaves the new sandbox unheld: an incomplete
+   * /workspace written there would come back as a whole one, and that sandbox's
+   * S3 saves would prune what it lacks. Refused, the snapshot stays the last one
+   * a whole workspace wrote (or none, and the next sandbox restores from S3); a
+   * SIGTERM falls back to the S3 save, which a held sandbox makes add-only.
+   */
+  private async refuseSharedSyncIfHeld(hands: HandsClient): Promise<void> {
+    // A sandbox that cannot say is not refused here: the snapshot is a command it
+    // runs, which a sandbox that cannot answer this one will not run either.
+    if (await isRestoreHeld(hands, this.sessionId, { unknownIsHeld: false })) {
+      throw new Error("workspace_sync_held: this sandbox's restore failed, so its /workspace is not the session's");
+    }
+  }
+
+  /**
    * Fill a new sandbox's /workspace from the session's S3 prefix, and say so
    * when it could not be filled.
    *
@@ -4097,10 +4118,11 @@ class TaskRunner {
       const workHands = this.workHands();
       if (workHands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
         try {
-          await workspaceSigtermSyncSemaphore.run(() =>
-            fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
-              { kind: "sigterm" }),
-          );
+          await workspaceSigtermSyncSemaphore.run(async () => {
+            await this.refuseSharedSyncIfHeld(workHands);
+            return fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
+              { kind: "sigterm" });
+          });
           syncedFlag = true;
           sigtermSyncResult = "success";
           logger.info({ sessionId: this.sessionId, turns: ckptState.turns_completed },
