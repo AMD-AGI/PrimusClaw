@@ -120,3 +120,45 @@ test("a sandbox whose restore failed writes no shared-filesystem snapshot", asyn
 test("a sandbox restored in full snapshots to the shared filesystem as before", async () => {
   assert.ok(await runWith(false) >= 1);
 });
+
+test("the shared-disk sync command itself refuses a sandbox carrying the hold note, before writing anything", async () => {
+  // Another Brain process has no in-memory note, and a separate check could fail
+  // to answer; the sandbox's note is read by the very command that would write
+  // the snapshot.
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { restoreHeldGuard, syncWorkspace } = await import("../src/workspace/sync.js");
+  const { RESTORE_HOLD_PATH } = await import("../src/workspace/sync-delta.js");
+
+  const dir = mkdtempSync(join(tmpdir(), "claw-hold-guard-"));
+  try {
+    const note = join(dir, "restore-incomplete");
+    const guard = restoreHeldGuard().replaceAll(RESTORE_HOLD_PATH, note);
+    const run = () => spawnSync("bash", ["-c", `${guard}echo OK`], { encoding: "utf-8" });
+    assert.equal(run().stdout.trim(), "OK", "no note: the sync runs");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(note, "{}");
+    const held = run();
+    assert.equal(held.status, 3);
+    assert.equal(held.stdout, "", "nothing after the guard ran");
+    assert.match(held.stderr, /workspace_sync_held/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  const commands: string[] = [];
+  const hands = {
+    generation: "http://10.0.0.12:9100/mcp",
+    callTool: async (_tool: string, args: { command?: string }) => {
+      const command = String(args.command ?? "");
+      if (command.includes("__claw_git_begin__")) return "__claw_git_begin__\n__claw_git_end__:0";
+      commands.push(command);
+      return "exit 3\nstdout: \nstderr: workspace_sync_held: this sandbox's restore failed";
+    },
+  } as unknown as HandsClient;
+  await assert.rejects(() => syncWorkspace(hands, "6f1c2a8e-3b4d-4e5f-9a0b-1c2d3e4f5a6b", USER, 1), /workspace_sync_held/);
+  assert.equal(commands.length, 1);
+  assert.ok(commands[0].startsWith(restoreHeldGuard()), "the guard comes first in the sync command");
+});
