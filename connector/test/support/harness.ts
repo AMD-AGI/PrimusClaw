@@ -21,7 +21,7 @@ import { FAST } from "./timing.js";
 export const ADAPTER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-adapter.mjs");
 export const FAKE_CLAUDE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-claude.mjs");
 
-export { tmpdir, onCleanup } from "./tmp.js";
+export { tmpdir, onCleanup, onExitSync } from "./tmp.js";
 export { FAST } from "./timing.js";
 
 /** An agent made from the claude-attach preset, with a stand-in `claude` command and a Claude config directory of its own. */
