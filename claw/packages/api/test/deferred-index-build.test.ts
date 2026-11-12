@@ -173,9 +173,13 @@ describe("deferred concurrent index builds", { skip }, () => {
   test("D4 index.ts starts the deferred builds after listen without waiting; initDb holds none of them", () => {
     const main = readFileSync(join(SRC_DIR, "index.ts"), "utf8");
     const listenAt = main.indexOf("await app.listen(");
-    const startAt = main.indexOf("buildDeferredIndexes()");
-    assert.ok(listenAt > 0 && startAt > listenAt, "buildDeferredIndexes is started after app.listen");
-    assert.doesNotMatch(main.slice(startAt - 40, startAt), /await\s*$/, "and is not awaited");
+    // Started as the `deferred_index_build` loop (startup/background.ts), the one phase index.ts runs after listen.
+    const afterAt = main.indexOf("await startBackgroundLoops(background, loops.afterListen, logger);");
+    assert.ok(listenAt > 0 && afterAt > listenAt, "the after-listen loops are started after app.listen");
+    const background = readFileSync(join(SRC_DIR, "startup", "background.ts"), "utf8");
+    assert.match(background, /afterListen: \[loop\("deferred_index_build"\)\]/, "and the deferred build is that phase");
+    assert.match(main, /\n {4}deferred_index_build: \(\) => \{ void buildDeferredIndexes\(\)\.catch\(/, "not awaited");
+    assert.equal(main.indexOf("buildDeferredIndexes()"), main.lastIndexOf("buildDeferredIndexes()"), "and started nowhere else");
 
     const SRC = readFileSync(join(SRC_DIR, "infra", "db.ts"), "utf8");
     const init = SRC.slice(SRC.indexOf("export async function initDb"), SRC.indexOf("export const DEFERRED_INDEX_LOCK_ID"));

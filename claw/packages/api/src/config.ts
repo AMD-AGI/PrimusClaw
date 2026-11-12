@@ -20,6 +20,7 @@ import {
   type RunLeaseTiming,
 } from "@claw/protocol";
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readApiBackground } from "./startup/background.js";
 
 /**
  * Read a setting, treating blank the same as unset.
@@ -104,6 +105,11 @@ function routerEffortSetting(raw: string): ReasoningEffort | null {
 }
 
 export const API_PORT = envInt("API_PORT", 8000);
+/**
+ * CLAW_API_BACKGROUND: `on` (default) or `off`. Off, the process answers HTTP and starts no background loop
+ * (`startup/background.ts` names them). Any other value is refused at startup (`index.ts`).
+ */
+export const CLAW_API_BACKGROUND = readApiBackground(process.env.CLAW_API_BACKGROUND);
 export const APP_ENV = env("APP_ENV", "production");
 
 /**

@@ -111,6 +111,15 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- `CLAW_API_BACKGROUND` (`on` by default, or `off`): off, the API answers HTTP and starts no background loop -- no
+  scheduler, sweeper, external resolver or run-event consumer, no evolve, upload or plugin-expiry sweep, no trigger
+  scheduler, no notification or A2A push delivery (a request's own kick included), no GitHub-event or job watch, no daily
+  session maintenance, no deferred index build or boot-time SYSTEM_ENV publish, and none of the remote agents' wake relay
+  or sweeps. For a process serving requests against a database whose other replicas run that work. Startup logs
+  `api.background_off` naming every loop skipped; any other value is refused at startup. No schema change.
+
 ### Changed
 
 - Personal skills have their own switch, `CLAW_USER_SKILLS_ENABLED` (off by default): a user's skills reaching their

@@ -37,6 +37,11 @@ export interface PairingRouteOptions {
   claimQueue?: number;
   /** Codes one person may ask for per minute. */
   codesPerMinute?: number;
+  /**
+   * Start the hourly prune here (`startPairingPrune`). Defaults to true; `routes/remote-agents.ts` passes false and starts it
+   * with its other loops, so CLAW_API_BACKGROUND=off leaves it off.
+   */
+  pruneUnboundGrants?: boolean;
 }
 
 const CLAIM_PER_MINUTE = 10;
@@ -146,7 +151,11 @@ export async function registerPairingRoutes(app: FastifyInstance, opts: PairingR
     return reply.status(201).send({ ok: true, data: { token: out.token, server, ...(out.name ? { name: out.name } : {}) } });
   });
 
-  // Claimed codes that never registered, and old codes. Hourly on every replica; idempotent.
+  if (opts.pruneUnboundGrants ?? true) startPairingPrune(app);
+}
+
+/** Claimed codes that never registered, and old codes. Hourly on every replica; idempotent. Stops with the server. */
+export function startPairingPrune(app: FastifyInstance): void {
   const timer = setInterval(() => {
     pruneUnboundGrants().catch((err) => logger.warn({ err: (err as Error)?.message }, "remote_agents.pairing_prune_failed"));
   }, 60 * 60 * 1000);
