@@ -80,23 +80,38 @@ export class KitRun {
     private readonly worker: Worker,
     private readonly running: Promise<void>,
     private readonly removeDir: () => void,
-  ) {}
+  ) {
+    // (a worker that fails while the tests run is reported by `stop`, which awaits `running`; until then it is not unhandled)
+    running.catch(() => undefined);
+  }
 
   /** Build the surface's worker and run it until `stop`; resolves once it answers /healthz. */
   static async start(sut: SurfaceUnderTest, options: RunOptions = {}): Promise<KitRun> {
     const claw = await KitClaw.start();
-    const driver = await sut.open();
     const dir = tempDir();
-    const port = await freePort();
-    const logger = new RecordingLogger();
-    const env = { ...(await coreEnv(claw, dir.path, port, options)), ...driver.env };
-    const worker = await driver.buildWorker(env, () => ({}), { logger });
-    const running = worker.run();
-    const baseUrl = `http://127.0.0.1:${String(port)}`;
-    const run = new KitRun(claw, driver, baseUrl, logger, worker, running, dir.remove);
-    await run.until(async () => (await fetch(`${baseUrl}/healthz`).catch(() => undefined))?.ok === true, "/healthz");
-    driver.attach(baseUrl);
-    return run;
+    let driver: ChatDriver | undefined;
+    let run: KitRun | undefined;
+    try {
+      driver = await sut.open();
+      const port = await freePort();
+      const logger = new RecordingLogger();
+      const env = { ...(await coreEnv(claw, dir.path, port, options)), ...driver.env };
+      const worker = await driver.buildWorker(env, () => ({}), { logger });
+      const baseUrl = `http://127.0.0.1:${String(port)}`;
+      run = new KitRun(claw, driver, baseUrl, logger, worker, worker.run(), dir.remove);
+      const up = async () => (await fetch(`${baseUrl}/healthz`).catch(() => undefined))?.ok === true;
+      await run.until(up, "/healthz");
+      driver.attach(baseUrl);
+      return run;
+    } catch (error) {
+      // (a start that failed leaves nothing open: the worker if it was built, the fakes, the directory)
+      if (run !== undefined) await run.stop().catch(() => undefined);
+      else {
+        await Promise.allSettled([claw.close(), driver?.close()]);
+        dir.remove();
+      }
+      throw error;
+    }
   }
 
   /** Wait until `check` holds; fails naming `what`, with what the chats were shown and the worker's log. */

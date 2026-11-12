@@ -174,7 +174,8 @@ app:
   `undefined` when the platform did not say it), `update(id, message)`, `delete(id)`, `outgoing(message)` (the
   envelope `send` would publish, built without sending), `deliver(envelope)` (publish a stored envelope, possibly in
   another process), `openStream(replyTo, status)`, plus `replyTo` (the message this reference was read from), `edited`
-  and `markSettled` (which card messages were settled by an edit).
+  (the messages this conversation tried to replace) and `markSettled(id)` (count a card message as settled without editing
+  it, when it is about to be deleted).
 - **`LiveStream`**: `inform(status)`, `emit(text)` (the whole text so far; it only grows), `finish(message)`.
 
 **`SurfaceCaps`** says what the surface can do. Core reads the identity and the limits itself; the booleans describe the

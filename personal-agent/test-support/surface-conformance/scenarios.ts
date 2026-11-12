@@ -107,9 +107,17 @@ function identity(shared: Shared): void {
     const run = runOf(shared);
     const who = person("stranger");
     const dm = dmOf(who);
+    const before = run.claw.requests.length;
     await run.driver.say(dm, who, "hello");
     await run.shown(dm, (m) => m.final && m.text.length > 0, "the connect message");
-    assert.deepEqual(run.claw.callsBy(who.id, "POST", "/v1/sessions"), []);
+    // (nothing was sent to Claw for them: no session, no message, no subscription, under any credential)
+    assert.deepEqual(
+      run.claw.requests
+        .slice(before)
+        .filter((r) => r.method !== "GET")
+        .map((r) => `${r.method} ${r.path}`),
+      [],
+    );
   });
 }
 
@@ -222,7 +230,9 @@ function cards(shared: Shared, views: boolean): void {
       await run.driver.press(dm, who, card, send, ["staging"]);
       const path = `/v1/sessions/${session}/messages`;
       await run.until(() => run.claw.calls("POST", path).length > 0, "the pick sent to Claw");
-      assert.equal((run.claw.calls("POST", path)[0]?.json as Record<string, unknown>)["content"], "staging");
+      const picked = run.claw.calls("POST", path)[0];
+      assert.equal(picked?.headers["authorization"], `Bearer ${keyOf(who.id)}`, "sent with the picker's own key");
+      assert.equal((picked.json as Record<string, unknown>)["content"], "staging");
       await settled(run, dm, card);
     },
   );
