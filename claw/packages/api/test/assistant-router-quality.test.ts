@@ -18,7 +18,8 @@
  *      before it (2026-11-06 parity run, S2); any other message in that language to a Chinese user still is
  *   Q10 say follows the language the user chose in their channel (`channel_context.reply_language`), not the one their message is in:
  *      an English answer to a Chinese message of a /lang en user goes through; one to an English message of a /lang zh user is refused,
- *      unless the message asked for English by name (translate, answer in English, an English reply); an old client's turn is as before
+ *      unless the message asked for English by name (translate, answer in English, an English reply); a Chinese answer to a /lang en user
+ *      is refused unless they asked for Chinese; an old client's turn is as before
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -116,9 +117,14 @@ describe("router quality, through the tools", { skip }, () => {
     const say = async (turn: unknown, text: string) => w.mod.tools.say(turn as never, { text }, w.sayDeps);
     const refused = (err: any) => err.code === "reply_language" && /answered in Chinese \(\[Reply language: Chinese\]\)/.test(err.message);
 
-    // /lang en, a message in Chinese: the English answer is the one asked for.
+    // /lang en, a message in Chinese: an answer in Chinese is refused, and the English one, naming a Chinese title, is the one asked for.
     const en = await chosenTurn("帮我看看 main 上的构建为什么挂了", { reply_language: "en" });
-    assert.equal((await say(en, "The build on main failed on a flaky test; a rerun is green.")).ok, true);
+    await assert.rejects(say(en, "main 上的构建挂在一个不稳定的测试上，重跑已经通过。"), (err: any) =>
+      err.code === "reply_language" && /the message is in Chinese, but this user is answered in English \(\[Reply language: English\]\)/.test(err.message));
+    assert.equal((await say(en, "The build on main failed on a flaky test (修复构建); a rerun is green.")).ok, true);
+    // Unless they asked for Chinese by name.
+    const zhAsked = await chosenTurn("用中文回复：构建为什么挂了？", { reply_language: "en" });
+    assert.equal((await say(zhAsked, "构建挂在一个不稳定的测试上。")).ok, true);
 
     // /lang zh, a message in English: an English answer is refused as one to a Chinese user, and the Chinese one goes through.
     const zh = await chosenTurn("Why is the build on main red?", { reply_language: "zh" });
@@ -141,6 +147,7 @@ describe("router quality, through the tools", { skip }, () => {
     await assert.rejects(say(old, "The build failed on a flaky test."), refused);
     const oldEn = await chosenTurn("Why is the build red?", {});
     assert.equal((await say(oldEn, "The build failed on a flaky test.")).ok, true);
+    assert.equal((await say(oldEn, "构建挂在一个不稳定的测试上。")).ok, true, "a Chinese answer to an English message is not refused without a choice, as before");
   });
 
   test("Q4 work_create tells the user at once that it started, once, in their language, only when answering them", async () => {
@@ -351,6 +358,19 @@ describe("router quality, pure", () => {
     assert.deepEqual(bare("Taken on as #6, and #8 is next.", 6), [8]);
   });
 
+  test("Q2c an answer due in English the user chose is refused only when it is Chinese with no English word of its own", async () => {
+    const { replyLanguageMismatch } = await import("../src/assistant/language.js");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], null, true), "Chinese");
+    assert.equal(replyLanguageMismatch("构建在 CI 上挂了，PR #12 需要 rebase。", "English", [], null, true), "Chinese");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], null, false), null, "no choice: never refused, as before");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], "Chinese", true), null, "Chinese asked for by name");
+    assert.equal(replyLanguageMismatch("The PR 修复登录超时 is merged.", "English", [], null, true), null, "English that names a Chinese title");
+    assert.equal(replyLanguageMismatch("#6 修复登录超时", "English", ["修复登录超时"], null, true), null, "an item title alone");
+    assert.equal(replyLanguageMismatch("Done: “构建没问题”", "English", [], null, true), null, "a quotation");
+    assert.equal(replyLanguageMismatch("ビルドは問題ありません。", "English", [], null, true), null, "not Chinese");
+    assert.equal(replyLanguageMismatch("All good.", "English", [], null, true), null);
+  });
+
   test("Q2b the language a message asks a text in is read from the user's own words, and only that one is let through", async () => {
     const { replyLanguageMismatch, requestedTextLanguage } = await import("../src/assistant/language.js");
     for (const [message, asked] of [
@@ -444,7 +464,7 @@ describe("router quality, the prompt", () => {
       ["work_recall for how far an item got", /call work_recall\(item, "live"\) for each item asked about, all in one step/],
       ["memory and channel tools", /the memory tools of the Memory section[\s\S]*channel_action, whether the user typed its command or said it in words/],
       ["a declined request in a line", /A request you will not carry out[^\n]*say so in one short line/],
-      ["every say in the reply language", /Write every say in it, the last one too \(say refuses a reply due in Chinese that has no Chinese in it\)/],
+      ["every say in the reply language", /Write every say in it, the last one too \(say refuses a reply due in Chinese that has no Chinese in it, and a reply all in Chinese to a user who chose English\)/],
       // router-v22: the line names the language the user chose, whatever their message is in, and an answer asked for in a named language is in it.
       ["the line names the chosen language", /Reply in the language a line like \[Reply language: X\] after the user's message names[^\n]*even when the message itself is written in another one: X is the language the user chose to be answered in, or else the one their message is in\. Without that line, reply in the language of the user's latest message\./],
       ["a translation said alone, in its language", /a text \(把这句翻成英文, translate it into English\) is said alone, in that language, with nothing before or after it \(no 译文：, no quotes, no note\)/],

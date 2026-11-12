@@ -187,14 +187,20 @@ const LANGUAGE_LOOKBACK = 5;
  * messages, newest first). Null when it cannot be told. `messageId`: the message the turn answers (the token's `mid`).
  */
 export async function turnReplyLanguage(sessionId: string, messageId: string, prompt: string): Promise<string | null> {
+  return (await turnLanguage(sessionId, messageId, prompt)).language;
+}
+
+/** `turnReplyLanguage`, and whether it is the one the person chose in their channel rather than the one read from their words. */
+async function turnLanguage(sessionId: string, messageId: string, prompt: string): Promise<{ language: string | null; chosen: boolean }> {
   const report = prompt.startsWith(WORK_EVENT_PREFIX);
   const chosen = await chosenReplyLanguage((t, p) => db.query(t, p), sessionId, report ? null : messageId);
-  return replyLanguageFor(chosen, report ? null : prompt, async () => (await db.query(
+  const language = await replyLanguageFor(chosen, report ? null : prompt, async () => (await db.query(
     `SELECT content FROM claw_conversation_turns
       WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL AND NOT starts_with(content, $2)
       ORDER BY turn_index DESC LIMIT $3`,
     [sessionId, WORK_EVENT_PREFIX, LANGUAGE_LOOKBACK],
   )).rows.map((r: { content: string }) => r.content));
+  return { language, chosen: chosen !== null };
 }
 
 /**
@@ -218,10 +224,10 @@ async function assertSayReadable(
       `the message names ${bare.map((i) => `#${i.seq}`).join(", ")} by number alone, which the user cannot recognise: write each item as its number and title (${named}) and call say again`,
     );
   }
-  const expected = await turnReplyLanguage(claims.sid, claims.mid, prompt);
+  const { language: expected, chosen } = await turnLanguage(claims.sid, claims.mid, prompt);
   // A text the user asked for in a named language (a translation) is said in that language, and not refused for it.
   const asked = prompt.startsWith(WORK_EVENT_PREFIX) ? null : requestedTextLanguage(prompt);
-  const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title), asked) : null;
+  const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title), asked, chosen) : null;
   if (expected && found) {
     throw new ToolRefused(
       "reply_language",

@@ -84,6 +84,9 @@ export interface StartTurn {
   readonly typed?: boolean;
 }
 
+/** A turn as it was started: with the language its sender had chosen then (`TurnRun.replyLang`). */
+type Started = StartTurn & { readonly replyLang?: Lang };
+
 /**
  * Starting and following a turn (the Python `Agent._start_turn`, `_queue_behind`, `_guarded`, `_record_session`,
  * `_record_turn`): a new task is admitted under the person's task limit; a message sent while the chat's turn runs is
@@ -101,7 +104,9 @@ export class TurnStarter {
   }
 
   /** The turn that runs (its end is `done`), or undefined when none was started (the person was told why). */
-  async start(request: StartTurn): Promise<RunningTurn | undefined> {
+  async start(started: StartTurn): Promise<RunningTurn | undefined> {
+    // (the sender's choice as the message came, not as it is when a queued turn goes)
+    const request: Started = { ...started, ...this.replyLang(started) };
     const { chat, review } = request;
     if (await this.answersQuestion(request)) return undefined;
     const key = review
@@ -136,7 +141,7 @@ export class TurnStarter {
   }
 
   /** The turn goes to Claw now; its end is `done`. */
-  private async launch(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<RunningTurn> {
+  private async launch(request: Started, key: TurnKey, turn: ActiveTurn): Promise<RunningTurn> {
     turn.launched = true;
     let run: TurnRun;
     try {
@@ -153,7 +158,7 @@ export class TurnStarter {
    * message, whether or not that turn ever reports its end); the caller does not wait for it. Not at all when it was given up
    * meanwhile (`/stop`, said there).
    */
-  private async afterFront(request: StartTurn, key: TurnKey, turn: ActiveTurn): Promise<void> {
+  private async afterFront(request: Started, key: TurnKey, turn: ActiveTurn): Promise<void> {
     for (;;) {
       if (turn.over) return;
       const turns = this.ctx.turns.of(key);
@@ -251,7 +256,7 @@ export class TurnStarter {
     };
   }
 
-  private async runOf(request: StartTurn): Promise<TurnRun> {
+  private async runOf(request: Started): Promise<TurnRun> {
     const { chat, review } = request;
     const { store, config, logger } = this.ctx.deps;
     const session = await this.sessionPart(request);
@@ -274,7 +279,7 @@ export class TurnStarter {
       sent: request.sent ?? "",
       files: request.files ?? [],
       lang: review?.lang ?? chat.lang(),
-      ...this.replyLang(request),
+      ...(request.replyLang === undefined ? {} : { replyLang: request.replyLang }),
       ownThumbs: this.ownThumbs(request),
       notifies: this.ctx.deps.subscriptions !== undefined && store.notifySubs.getNotifySub(chat.sender.id) !== null,
       review: review?.fields,

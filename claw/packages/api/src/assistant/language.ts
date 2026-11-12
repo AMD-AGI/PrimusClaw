@@ -324,18 +324,26 @@ export function requestedTextLanguage(message: string): string | null {
  * (`[Reply language: X]`): the language it is in, or null when it is in that language or cannot be told apart from it.
  * `asked`: the language the user asked the text in (`requestedTextLanguage`), which a message in it is never refused for.
  *
- * Asked only of an answer due in Chinese, and refused only when it has no Chinese character at all once the user's item titles
+ * Asked of an answer due in Chinese, and refused only when it has no Chinese character at all once the user's item titles
  * (`others`, quoted from elsewhere) are left out: an answer to a Chinese message with none is in another language, whatever it
- * quotes. The other way cannot be told safely: an English sentence may quote a Chinese title of anything (a pull request, a page)
- * at any length, and a short Japanese answer may be all kanji, so an answer due in English, Japanese or Korean is never refused
- * here (the prompt asks for it). Pure, for the tests.
+ * quotes. The other way cannot be told safely from the answer alone: an English sentence may quote a Chinese title of anything (a pull
+ * request, a page) at any length, and a short Japanese answer may be all kanji, so an answer due in English, Japanese or Korean is not
+ * refused here (the prompt asks for it), with one exception, `chosen`: English the user chose to be answered in (`/lang en`), whatever
+ * they write in. Then the model's pull is toward the language of the message, and an answer is refused when it is Chinese with not one
+ * English word of its own: Chinese characters outside the item titles and quotations, and no English function word (`the`, `is`, `you`)
+ * beside them, which every English sentence that only quotes a Chinese name has. Pure, for the tests.
  */
 export function replyLanguageMismatch(
-  text: string, expected: string, others: readonly string[] = [], asked: string | null = null,
+  text: string, expected: string, others: readonly string[] = [], asked: string | null = null, chosen = false,
 ): string | null {
-  if (expected !== "Chinese") return null;
   let own = text;
   for (const o of others) if (o.trim()) own = own.split(o).join(" ");
+  if (expected === "English" && chosen) {
+    if (asked && asked !== "English") return null;
+    const words = unquoted(wording(readable(own)));
+    return /\p{Script=Han}/u.test(words) && englishWords(words) === 0 && readLanguage(own).language === "Chinese" ? "Chinese" : null;
+  }
+  if (expected !== "Chinese") return null;
   if (/\p{Script=Han}/u.test(wording(own))) return null;
   const found = readLanguage(own).language;
   return found && found !== expected && found !== asked ? found : null;
