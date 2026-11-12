@@ -93,6 +93,28 @@ test("a reply that names an option, by its label or its number, answers with tha
   }
 });
 
+test("the answered card speaks the chat's language, not the reply's: \"1\" or \"a\" in a Chinese chat leaves it Chinese", async () => {
+  const question = { ...QUESTION, options: [...QUESTION.options, { id: "a", label: "a" }] };
+  for (const [typed, locale] of [
+    ["1", "zh-CN"],
+    ["a", "zh-CN"],
+    ["1", ""], // no locale and no chosen language: the question's (Chinese), not the digit's
+  ] as const) {
+    const w = waiting({ questions: [question] });
+    await w.router.handle(message(typed, { locale }));
+    const card = cardUpdate(w);
+    assert.equal(card?.body.type, "view", typed);
+    assert.equal(card.body.view.model.replied, "zh", `${typed} ${locale}`);
+    assert.match(card.body.fallbackText ?? "", /^已回答：/, `${typed} ${locale}`);
+  }
+  // and an English chat stays English whatever is typed
+  const w = waiting();
+  await w.router.handle(message("火锅", { locale: "en-US" }));
+  const card = cardUpdate(w);
+  assert.equal(card?.body.type, "view");
+  assert.equal(card.body.view.model.replied, "en");
+});
+
 test("a card whose id the chat never gave is answered all the same, and the answer is said below it", async () => {
   const w = waiting({ cardId: "" });
   await w.router.handle(message("火锅"));
