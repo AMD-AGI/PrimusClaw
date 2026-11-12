@@ -1463,7 +1463,8 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
  * ends with one does not ask. An offer is a clause that opens with one: "If you need more details, please send the repository" still
  * asks (its second clause), and so does "Which repository should I use if you have any other requirements?" (a question that opens
  * with no offer). Known to pass wrongly: "Done, any questions?" (an answer and an offer in one sentence). Not counted: a question
- * without its mark ("哪个仓库", "Which repository should I use"); routers mark their questions, and the judge reads the reply.
+ * without its mark ("哪个仓库", "Which repository should I use"), and "我需要仓库名" (as often the assistant's own next step, "我需要
+ * 确认仓库名"); routers mark their questions and ask in so many words, and the judge reads every reply.
  */
 export function asksUser(text: string, choices = 0): boolean {
   if (choices >= 2) return true;
@@ -1503,10 +1504,10 @@ const ASKS: readonly RegExp[] = [
   /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认|发|给)|(?<!(你|您|过|经|曾|已)[^，,。]{0,6})告诉我|发给我(?!们)|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
   // "把仓库名发我", "请把…发我", "需要你提供…", "我需要知道…" / "我需要仓库名" (not "我需要先查一下": what the assistant does next).
   /(?<![我会来])把.{1,30}(发|告诉|给|发给)我(?!们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
-  // "我需要知道…", and a clause that is only what is needed ("我需要仓库名和测试名"), not "我需要先查一下仓库名是否存在".
-  /我(还|们)?需要知道|^我(还|们)?需要(你的|您的)?[^，,。]{0,12}(名|名称|名字|编号|ID|id|链接|地址|路径)(和[^，,。]{0,12}(名|名称|名字|编号|ID|id|链接|地址|路径))?[。.!！]?$/,
+  // "我需要知道…"; a bare "我需要…" is not counted: "我需要确认仓库名" is the assistant's own next step as often as a request.
+  /我(还|们)?需要知道/,
   // An imperative that opens the clause and names what to give ("说一下要做什么", "给我题目和要求"; not "给我一点时间").
-  /^(请)?(再)?(说|讲)(一下|一声)|^(请)?(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)|告知(我|我们)/,
+  /^(请)?(再)?(说|讲)(一下|一声)|^(请)?(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)|^(请)?(你|您)?告知(我|我们)/,
   /(你|您)(是)?(指|想|希望|说的是)[^。\n]{0,40}还是/,
   /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
   /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
