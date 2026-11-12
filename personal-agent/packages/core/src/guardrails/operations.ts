@@ -30,8 +30,24 @@ export const DEFAULT_LIMITS: Readonly<Record<SensitiveOperation, Limit>> = {
   remote_agent: { count: 10, windowSeconds: 3600 },
 };
 
-/** PA_LIMIT_PR_MERGE=20/3600; 0 turns that limit off. (The older TEAMS_LIMIT_ names are read by the runtime.) */
-export const ENV_PREFIX = "PA_LIMIT_";
+/**
+ * TEAMS_LIMIT_PR_MERGE=20/3600; 0 turns that limit off. The prefix `parseLimits` reads when it is not given one.
+ *
+ * @deprecated The worker reads `LIMIT_ENV_PREFIX` (`PA_LIMIT_`), and `TEAMS_LIMIT_` only as its older alias; pass
+ * `{ prefix: LIMIT_ENV_PREFIX }` to `parseLimits`. Kept, with its value, for callers of 0.8.0 and earlier.
+ */
+export const ENV_PREFIX = "TEAMS_LIMIT_";
+
+/** PA_LIMIT_PR_MERGE=20/3600; 0 turns that limit off. The worker's own prefix for the limits. */
+export const LIMIT_ENV_PREFIX = "PA_LIMIT_";
+
+/** How `parseLimits` names the variables it asks for, and the one a malformed value is reported under. */
+export interface ParseLimitsOptions {
+  /** The prefix of each limit's name (default: `ENV_PREFIX`, `TEAMS_LIMIT_`, as before this option existed). */
+  readonly prefix?: string;
+  /** The variable a value was read from, for the error (default: the name asked for). */
+  readonly source?: (name: string) => string;
+}
 
 const DIGITS = /^\d+$/;
 
@@ -49,18 +65,21 @@ function parseOne(name: string, raw: string, fallback: Limit): Limit {
 }
 
 /**
- * The limits from the environment: `PA_LIMIT_<OPERATION>` is `COUNT/SECONDS` (`20/3600`), or `0` to turn that
- * limit off. Unset takes the default. Anything else throws (the worker stops at start: a typo must not lift a limit),
- * naming the variable `source` says the value was read from (default: the name asked for).
+ * The limits from the environment: `<prefix><OPERATION>` is `COUNT/SECONDS` (`20/3600`), or `0` to turn that limit
+ * off. Unset takes the default. Anything else throws (the worker stops at start: a typo must not lift a limit), naming
+ * the variable `options.source` says the value was read from. Called without options it asks for the
+ * `TEAMS_LIMIT_<OPERATION>` names, as it always did; the worker passes `{ prefix: LIMIT_ENV_PREFIX }`.
  */
 export function parseLimits(
   env: (name: string) => string,
-  source: (name: string) => string = (name) => name,
+  options: ParseLimitsOptions = {},
 ): Map<SensitiveOperation, Limit> {
+  const prefix = options.prefix ?? ENV_PREFIX; // eslint-disable-line @typescript-eslint/no-deprecated -- the default before the option
+  const source = options.source ?? ((name: string) => name);
   const limits = new Map<SensitiveOperation, Limit>();
   for (const operation of SENSITIVE_OPERATION_NAMES) {
     const fallback = DEFAULT_LIMITS[operation];
-    const name = ENV_PREFIX + operation.toUpperCase();
+    const name = prefix + operation.toUpperCase();
     const raw = strip(env(name));
     if (!raw) limits.set(operation, fallback);
     else if (raw === "0") limits.set(operation, { count: 0, windowSeconds: fallback.windowSeconds });

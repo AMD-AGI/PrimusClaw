@@ -8,6 +8,7 @@ import {
   DEFAULT_MESSAGE_WINDOW_SECONDS,
   DEFAULT_GROUP_CONTEXT,
   decimalBigInt,
+  LIMIT_ENV_PREFIX,
   parseLimits,
   type AssistantSettings,
   type ExchangeSettings,
@@ -208,10 +209,10 @@ function directChat(read: EnvReader): Settings["directChat"] {
 /** PA_LIMIT_<OPERATION> (or the older TEAMS_LIMIT_<OPERATION>); a malformed one stops the worker with the message the guardrails give. */
 function limitsOf(read: EnvReader): Settings["sensitiveLimits"] {
   try {
-    return parseLimits(
-      (name) => read.raw(name),
-      (name) => read.source(name),
-    );
+    return parseLimits((name) => read.raw(name), {
+      prefix: LIMIT_ENV_PREFIX,
+      source: (name) => read.source(name),
+    });
   } catch (err) {
     if (err instanceof ConfigError) throw err;
     throw new ConfigError(err instanceof Error ? err.message : String(err));

@@ -28,13 +28,16 @@ works with any Claw.
   `PA_EXCHANGE_*`, `PA_GITHUB_REVIEW_*`, `PA_USER_*`, `PA_LINK_*`, `PA_LIMIT_<OPERATION>`, `PA_GROUP_CONTEXT_*`,
   `PA_DIRECT_CHAT(_USERS)` and the rest listed in docs/configuration.md, "Setting names". A surface's own settings keep
   its prefix (`TEAMS_STREAMING`, `TEAMS_AI_LABEL`, `TEAMS_GATE_*`). Runtime's `ENV_NAMES` and the Teams package's name
-  the `PA_` variables; core's `ENV_PREFIX` is `PA_LIMIT_`, and `parseLimits` takes an optional `source` that names the
-  variable a value was read from in its message. The secret ids (`SecretName`) and the Key Vault entries are unchanged.
+  the `PA_` variables. Core adds `LIMIT_ENV_PREFIX` (`PA_LIMIT_`) and an optional second argument to `parseLimits`
+  (`{ prefix, source }`: the prefix to read, and the variable a value was read from for its message); called as before
+  it reads the `TEAMS_LIMIT_` names as before. The secret ids (`SecretName`) and the Key Vault entries are unchanged.
 - `@primusclaw/personal-agent-runtime`: the channel context reads the people a message @mentions from
   `message.mentions` as the surface gave them, no longer rebuilt in Teams' mention shape.
 
 ### Deprecated
 
+- `@primusclaw/personal-agent`: `ENV_PREFIX` (still `TEAMS_LIMIT_`, the prefix `parseLimits` reads when given none);
+  use `LIMIT_ENV_PREFIX`.
 - The `TEAMS_` names of those settings. Each is still read when its `PA_` name is unset or blank; when both are set the
   `PA_` name wins and the worker warns that the `TEAMS_` one is ignored. A worker that reads any of them logs one warning
   at start naming each with its replacement (never a value). They are removed only in a release whose notes say so.

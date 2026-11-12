@@ -6,7 +6,10 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   DEFAULT_LIMITS,
+  ENV_PREFIX,
   Guardrails,
+  LIMIT_ENV_PREFIX,
+  SENSITIVE_OPERATION_NAMES,
   SENSITIVE_OPERATIONS,
   correlationId,
   parseLimits,
@@ -108,24 +111,55 @@ test("a limit of zero is off and the defaults are on", () => {
 
 test("the limits are read from the environment and a typo stops the worker", () => {
   const env: Record<string, string> = { PA_LIMIT_PR_MERGE: "5/600", PA_LIMIT_APPROVAL: "0" };
-  const limits = parseLimits((name) => own(env, name) ?? "");
+  const options = { prefix: LIMIT_ENV_PREFIX };
+  const limits = parseLimits((name) => own(env, name) ?? "", options);
   assert.deepEqual(limits.get("pr_merge"), { count: 5, windowSeconds: 600 });
   assert.equal(limits.get("approval")?.count, 0);
   assert.deepEqual(limits.get("pr_review"), DEFAULT_LIMITS.pr_review);
   assert.deepEqual(limits.get("remote_agent"), DEFAULT_LIMITS.remote_agent);
   for (const bad of ["5", "five/600", "5/0", "-1/600", "5/600/1"]) {
-    assert.throws(() => parseLimits((name) => (name === "PA_LIMIT_PR_REVIEW" ? bad : "")), /PA_LIMIT_PR_REVIEW/);
+    assert.throws(
+      () => parseLimits((name) => (name === "PA_LIMIT_PR_REVIEW" ? bad : ""), options),
+      /PA_LIMIT_PR_REVIEW/,
+    );
   }
-  assert.deepEqual(parseLimits((name) => (name === "PA_LIMIT_REMOTE_AGENT" ? " 3 / 60 " : "")).get("remote_agent"), {
-    count: 3,
-    windowSeconds: 60,
+  assert.deepEqual(
+    parseLimits((name) => (name === "PA_LIMIT_REMOTE_AGENT" ? " 3 / 60 " : ""), options).get("remote_agent"),
+    { count: 3, windowSeconds: 60 },
+  );
+});
+
+test("the 0.8.0 exports keep their meaning: ENV_PREFIX is TEAMS_LIMIT_, and parseLimits(env) reads those names", () => {
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- the deprecated export is what this test pins
+  assert.equal(ENV_PREFIX, "TEAMS_LIMIT_");
+  assert.equal(LIMIT_ENV_PREFIX, "PA_LIMIT_");
+  const asked: string[] = [];
+  const env: Record<string, string> = {
+    TEAMS_LIMIT_PR_MERGE: "5/600",
+    TEAMS_LIMIT_APPROVAL: "0",
+    PA_LIMIT_PR_REVIEW: "1/1",
+  };
+  const limits = parseLimits((name) => {
+    asked.push(name);
+    return own(env, name) ?? "";
   });
+  assert.deepEqual(
+    asked,
+    SENSITIVE_OPERATION_NAMES.map((operation) => `TEAMS_LIMIT_${operation.toUpperCase()}`),
+  );
+  assert.deepEqual(limits.get("pr_merge"), { count: 5, windowSeconds: 600 });
+  assert.equal(limits.get("approval")?.count, 0);
+  assert.deepEqual(limits.get("pr_review"), DEFAULT_LIMITS.pr_review, "a PA_ name is not read by an old-style call");
+  assert.throws(
+    () => parseLimits((name) => (name === "TEAMS_LIMIT_PR_REVIEW" ? "five" : "")),
+    /^RangeError: TEAMS_LIMIT_PR_REVIEW must be/,
+  );
 });
 
 test("a malformed limit is named by the variable it was read from", () => {
   const source = (name: string): string => name.replace(/^PA_/, "TEAMS_");
   assert.throws(
-    () => parseLimits((name) => (name === "PA_LIMIT_PR_MERGE" ? "five" : ""), source),
+    () => parseLimits((name) => (name === "PA_LIMIT_PR_MERGE" ? "five" : ""), { prefix: LIMIT_ENV_PREFIX, source }),
     /^RangeError: TEAMS_LIMIT_PR_MERGE must be COUNT\/SECONDS/,
   );
 });
