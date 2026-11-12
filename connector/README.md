@@ -566,10 +566,23 @@ directory only you can enter).
   asking (auto, accept edits, bypass).
 - **Nothing is approved unseen.** A card carries the request whole (credentials masked). One too long for that (over 12 KB
   as JSON) is shown cut and offers only the options that turn it down; it is approved at the terminal.
-- **Which conversations.** Only sessions in a terminal (`CLAUDE_CODE_ENTRYPOINT=cli`); one this connector runs already asks
-  through its own cards. The folder must be inside the roots of the agent that reads that Claude config directory (a
-  `claude-attach` agent, or the one derived from a `claude` agent). A session in `bypassPermissions` asks only its questions
-  and plan approvals, so only those reach the chat.
+- **Which conversations.** Only sessions with a person at the terminal. The folder must be inside the roots of the agent that
+  reads that Claude config directory (a `claude-attach` agent, or the one derived from a `claude` agent).
+- **Automation sends nothing.** The hook leaves a session with nobody to answer alone, at once, and Claude Code behaves as
+  without it (measured on 2.1.322, from what the hook is handed):
+  - `claude -p` / `--print`, and `claude` with its stdin piped in: Claude Code sets `CLAUDE_CODE_ENTRYPOINT=sdk-cli` and
+    `CLAUDE_CODE_SESSION_ATTENDED=0` for those itself, whatever the shell exported, so a script that runs them is never carded;
+  - a session this connector runs (its adapter is `sdk-cli` too): it already asks through its own cards;
+  - a session in `bypassPermissions` (`--dangerously-skip-permissions`) or `dontAsk` mode: bypass mode still raises Claude
+    Code's multiple-choice questions, but those stay in the terminal;
+  - anything started with `CLAW_APPROVAL_HOOKS=off` in its environment (also `0`, `false`, `no`). Use it for what the hook
+    cannot tell from a person: a script that drives an interactive `claude` in tmux, or a terminal you do not want on your
+    phone (`CLAW_APPROVAL_HOOKS=off claude`, or export it in that shell).
+- **A machine set up before.** Where the session hooks are installed and the approval hooks are not, the next
+  `claw-connector` command you run at a terminal (`status`, `doctor`, `service install`, ...) asks once whether to add them
+  (`[y/N]`; yes runs `hooks install --approvals` for you). The answer is kept in the state directory
+  (`approval-hooks-offer.json`) and never asked again for that Claude config directory; a no prints the command. Nothing is
+  asked where nobody can answer (a script, a pipe, the service), after `--json`, or with `CLAW_APPROVAL_HOOKS=off`.
 - **On Claw's side** each conversation's questions go on a session of its own (`origin: "terminal_hook"`) that carries
   nothing but these cards: it cannot be sent a prompt. Turning the cards off there (`/approvals off`) makes the connector
   leave every question to the terminal.
@@ -606,6 +619,7 @@ never approve one. So for Cursor the phone goes first and the terminal second:
   it: such a run still holds every command that is not on an allow list for the phone first (then runs it, as `--force` says).
 - A Cursor session keeps the hooks it started with: install, uninstall or a new `--hold` takes effect in the next one.
 - Claw and the chat still say "the first answer counts" on these cards; the card's event says `terminal_asks: "after_card"`.
+- `CLAW_APPROVAL_HOOKS=off` in the environment of `agent` leaves its questions in the terminal, as for Claude Code.
 - Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
   editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
 
@@ -638,7 +652,7 @@ commands handled), `connector-id.json` (the identity alone, written once and flu
 by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
 `logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
-(the last `doctor` report), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+(the last `doctor` report), `approval-hooks-offer.json` (the answer to the one-time offer of the approval hooks), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
 
 ## Keeping it running
 

@@ -26,6 +26,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { UNATTENDED_MODES } from "./approval-skip.js";
 import {
   CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, type CursorDecision, type CursorRules, cursorWouldAsk, loadCursorRules, mapCursorRequest,
   parseCursorEvent,
@@ -337,6 +338,12 @@ export class ApprovalBroker {
     const once = (r: ConnectorReply) => { if (!done) { done = true; reply(r); } };
     const e = parsePermissionEvent(raw);
     if (!e) { once({ v: 1, decision: null, why: "not_a_permission_request" }); return () => {}; }
+    // The hook already leaves a session in such a mode alone (approval-skip.ts); this holds for a hook of another version too.
+    if (e.permission_mode !== undefined && UNATTENDED_MODES.has(e.permission_mode)) {
+      this.d.audit("approval_skipped", { ref: e.session_id, tool: e.tool_name, reason: "unattended_mode", mode: e.permission_mode });
+      once({ v: 1, decision: null, why: "unattended_mode" });
+      return () => {};
+    }
     const mapping = mapRequest(e);
     if (!mapping) {
       this.d.audit("approval_skipped", { ref: e.session_id, tool: e.tool_name, reason: "no_card_shape" });

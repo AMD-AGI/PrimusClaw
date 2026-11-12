@@ -8,8 +8,9 @@
  *   `approval-hook.js ask|settled --agent cursor --hold <seconds> --dir <Cursor config dir> --socket <connector socket> --managed-by claw-connector`
  *
  * `ask` (the `PermissionRequest` hook) hands the request to the running connector and prints the owner's decision, if one
- * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session in a
- * terminal is handed on (`CLAUDE_CODE_ENTRYPOINT=cli`): one the connector itself runs already asks through its own cards.
+ * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session with a
+ * person at its terminal is handed on (approval-skip.ts): not `claude -p`, not one the connector itself runs (it already asks
+ * through its own cards), not a question asked in bypass mode, and nothing at all with `CLAW_APPROVAL_HOOKS=off`.
  *
  * It imports nothing of the connector and never gets in the way: no connector, a connector that does not answer, anything
  * unexpected, and it prints nothing and exits 0, which leaves the question to the terminal, where Claude Code shows it all the
@@ -17,11 +18,12 @@
  * close and withdraws the card.
  *
  * For Cursor only a session of the Cursor Agent CLI started by hand is handed on (`CURSOR_INVOKED_AS` is set by the CLI's
- * launcher; a session the connector itself runs has `CLAW_CONNECTOR_AGENT`). Its `ask` prints `{"permission":"deny",...}` when
+ * launcher; a session the connector itself runs has `CLAW_CONNECTOR_AGENT`; `CLAW_APPROVAL_HOOKS=off` opts out too). Its `ask` prints `{"permission":"deny",...}` when
  * the owner turned the call down from the phone, and nothing otherwise, which lets Cursor go on as it would have (measured:
  * an empty answer is not a refusal).
  */
 import net from "node:net";
+import { optedOut, skipReason } from "./approval-skip.js";
 
 const CONNECT_MS = 300;
 const STDIN_MS = 2000;
@@ -53,14 +55,16 @@ async function main(): Promise<void> {
     return;
   }
   const agent = arg("--agent") === "cursor" ? "cursor" : "claude";
-  if (agent === "claude" && process.env.CLAUDE_CODE_ENTRYPOINT !== "cli") return;
-  if (agent === "cursor" && (!process.env.CURSOR_INVOKED_AS || process.env.CLAW_CONNECTOR_AGENT)) return;
+  // Decided from the environment before stdin is read, where it can be: an unattended session costs nothing.
+  if (agent === "claude" && skipReason(process.env, null, mode) !== null) return;
+  if (agent === "cursor" && (optedOut(process.env) || !process.env.CURSOR_INVOKED_AS || process.env.CLAW_CONNECTOR_AGENT)) return;
   const holdS = Number(arg("--hold"));
   const text = await readStdin();
   if (text.length >= MAX_STDIN) return;
   let event: unknown;
   try { event = JSON.parse(text); } catch { return; }
-  if (typeof event !== "object" || event === null) return;
+  if (typeof event !== "object" || event === null || Array.isArray(event)) return;
+  if (agent === "claude" && skipReason(process.env, event as Record<string, unknown>, mode) !== null) return;
 
   const reply = await new Promise<string>((resolve) => {
     let buf = "";

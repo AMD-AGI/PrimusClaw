@@ -298,13 +298,14 @@ describe("the Cursor hook program over the real socket", () => {
     } finally { await close(); }
   });
 
-  test("not a hand-started Cursor CLI session (no CURSOR_INVOKED_AS, or one the connector runs): nothing sent, nothing printed", async () => {
+  test("not a hand-started Cursor CLI session (no CURSOR_INVOKED_AS, one the connector runs, or opted out): nothing sent, nothing printed", async () => {
     const state = tmpdir("cc-appr-");
     const r = rig();
     const close = await serveApprovals(state, r.broker, (m) => String(m.dir), () => {});
     try {
       assert.deepEqual(await runCursorHook("ask", approvalSocketFile(state), shell("npm publish"), {}).exited, { code: 0, out: "" });
       assert.deepEqual(await runCursorHook("ask", approvalSocketFile(state), shell("npm publish"), { CURSOR_INVOKED_AS: "agent", CLAW_CONNECTOR_AGENT: "cursor" }).exited, { code: 0, out: "" });
+      assert.deepEqual(await runCursorHook("ask", approvalSocketFile(state), shell("npm publish"), { CURSOR_INVOKED_AS: "agent", CLAW_APPROVAL_HOOKS: "off" }).exited, { code: 0, out: "" });
       assert.equal(r.cards().length, 0);
       assert.equal(r.opened.length, 0);
     } finally { await close(); }
