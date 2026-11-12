@@ -58,12 +58,16 @@ export const graphemes = (text: string): string[] => Array.from(graphemeSegmente
 const inWord = (g: string): boolean =>
   /^[\p{L}\p{N}_]/u.test(g) && !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(g);
 
+/** How far past `max` {@link clipWords} goes to keep a word whole rather than leave less than `atLeast`. */
+const WORD_OVERRUN_MAX = 12;
+
 /**
  * One line, at most `max` user-perceived characters (graphemes), cut where a reader sees a break: a text that does not fit ends in
- * "…" after its last whole word (a single word longer than the room is cut where it must be), never in the middle of an emoji or a
- * combined character.
+ * "…" after its last whole word, never in the middle of an emoji or a combined character. When that would keep fewer than
+ * `atLeast` characters, the word that crosses `max` is kept whole instead (the text then runs up to `WORD_OVERRUN_MAX` past it);
+ * a word longer than that, or one that fills the whole room, is cut where it must be.
  */
-export function clipWords(text: string, max: number): string {
+export function clipWords(text: string, max: number, atLeast = 0): string {
   const gs = graphemes(text.replace(/\s+/g, " ").trim());
   if (gs.length <= max) return gs.join("");
   if (max < 1) return "";
@@ -71,7 +75,13 @@ export function clipWords(text: string, max: number): string {
   if (end > 0 && inWord(gs[end - 1]!) && inWord(gs[end]!)) {
     let start = end - 1;
     while (start > 0 && inWord(gs[start - 1]!)) start--;
-    if (start > 0) end = start;
+    let stop = end;
+    while (stop < gs.length && inWord(gs[stop]!)) stop++;
+    if (start > 0 && graphemes(gs.slice(0, start).join("").trimEnd()).length >= atLeast) end = start;
+    else if (start > 0 && stop - end <= WORD_OVERRUN_MAX) {
+      if (stop >= gs.length) return gs.join("");
+      end = stop;
+    }
   }
   return `${gs.slice(0, end).join("").trimEnd()}…`;
 }

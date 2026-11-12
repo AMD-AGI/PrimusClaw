@@ -205,14 +205,17 @@ const tailLines = (v: string, max: number): string => {
   return chars.length > max ? `…${chars.slice(chars.length - (max - 1)).join("")}` : text;
 };
 
-/** What a title keeps of what was asked even when the machine's and the agent's names already fill `TITLE_MAX`. */
+/** What a title keeps of what was asked (with its "…") even when the machine's and the agent's names already fill `TITLE_MAX`. */
 const TITLE_ASKED_MIN = 16;
 
-/** `head` whole (a machine's or a tool's name is never cut), then as much of `asked` as fits, cut after a whole word. */
+/**
+ * `head` whole (a machine's or a tool's name is never cut), then as much of `asked` as fits, cut after a whole word; at least
+ * `TITLE_ASKED_MIN` characters of it, the word that crosses that kept whole, so the title may run past `TITLE_MAX`.
+ */
 const titled = (head: string, asked: string): string => {
   const h = head.replace(/\s+/g, " ").trimStart();
   const room = Math.max(TITLE_MAX - graphemes(h).length, TITLE_ASKED_MIN);
-  return `${h}${clipWords(asked, room)}`.trimEnd();
+  return `${h}${clipWords(asked, room, TITLE_ASKED_MIN - 1)}`.trimEnd();
 };
 
 /** The item's title: machine, agent, and the start of what it was asked. */

@@ -12,7 +12,18 @@ test("a long machine name keeps the tool's name and the whole first word of what
   // The title before: the whole line cut at 40 code points, "work" shown as "wor".
   assert.equal(legacyRemoteTitle(machine, "Claude Code", "work", "zh"), `${machine} Claude Code：wor`);
   assert.equal(remoteTitle(machine, "Claude Code", "work", "zh"), `${machine} Claude Code：work`);
-  assert.equal(remoteTitle(machine, "Claude Code", "work on the flaky CI job", "en"), `${machine} Claude Code: work on the…`);
+  assert.equal(remoteTitle(machine, "Claude Code", "work on the flaky CI job", "en"), `${machine} Claude Code: work on the flaky…`);
+  // Never fewer than 16 characters of what was asked: the word that crosses them is kept whole, past TITLE_MAX.
+  assert.equal(remoteTitle(machine, "Claude Code", "please update connector settings", "en"), `${machine} Claude Code: please update connector…`);
+  // A word too long to keep whole is cut where it must be.
+  assert.equal(remoteTitle(machine, "Claude Code", "edit /home/u/work/claw/packages/api/src/assistant", "en"), `${machine} Claude Code: edit /home/u/work…`);
+});
+
+test("clipWords keeps at least what it is asked to, a crossing word whole, or the whole text when that word ends it", () => {
+  assert.equal(clipWords("please update connector settings", 16), "please update…");
+  assert.equal(clipWords("please update connector settings", 16, 15), "please update connector…");
+  assert.equal(clipWords("please update connectors", 16, 15), "please update connectors");
+  assert.equal(clipWords("please supercalifragilisticexpialidocious", 16, 15), "please supercal…");
 });
 
 test("what was asked is cut after its last whole word, with an ellipsis, and the title stays within TITLE_MAX when the names leave room", () => {
