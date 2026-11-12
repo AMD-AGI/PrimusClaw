@@ -1456,6 +1456,7 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "有事告诉我。", "有什么事告诉我。", "有事随时告诉我。", "需要任何东西告诉我。", "这取决于你想做什么。", "我不知道你想做什么。",
     "我需要先查一下仓库名是否存在。", "我需要确认一下仓库名称是否可用。", "我需要的内容已经找到了。", "请给我一点时间，我马上检查。",
     "给我一点时间，我来确认。", "请给我几分钟处理。", "给我看看，我先检查一下。", "我会把结果发给我们的群。",
+    "你昨天告诉我的仓库已经处理好了。", "你要的报告已经发了，还是老样子。",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
