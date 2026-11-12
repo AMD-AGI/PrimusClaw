@@ -43,6 +43,56 @@ port (core's `src/plugins/`), setting or store change; works with any Claw.
 - The notification subscription's `surface` (#787) is the worker's surface's own id (`SurfaceShape.surfaceId`, Teams'
   `teams`), no longer a fixed `teams` in the worker.
 
+## 0.8.0
+
+A minor release: a worker names its chat surface to Claw so an assistant message returns to the surface it came from
+(#787), core takes its channel's name, id and limits from the surface (#789) and the worker process moves into a
+surface-neutral runtime entry (#788), and a remote approval card ends in the language it was shown in (#794). The
+runtime's SQLite store gains one column (`remote_permissions.lang`), added in place at start; nothing to do for a
+deployment of the published packages.
+
+**Claw:** return-to-source routing is Claw's (claw-v0.4.0 and later reads the subscription's `surface`). With an older
+Claw the `surface` this worker sends is ignored and every subscription gets every message, as before; nothing else in
+this release needs a newer Claw.
+
+### Changed
+
+- `@primusclaw/personal-agent`: exported ports change for anyone implementing them (the published runtime and Teams
+  packages implement all of them, so a deployment of the published packages has nothing to do):
+  `ClawNotificationsPort.create` takes an optional `surface` and `updateTypes` an optional `{ surface }`;
+  `IntentReader.read` and `readMode` take the channel's name; Claw's `NewSession` and `SendOptions` carry an optional
+  `channel`; `SurfaceCaps` now extends `SurfaceIdentity` (`channel`, `name`, `shortName`) and `SurfaceLimits`
+  (`citationsMax`, `suggestionsMax`, `streamSeconds`) and `Conversation` gains `caps` and `replyTo`; `RemotePermission`
+  gains `lang` (and `NewRemotePermission` an optional `lang`) (#787, #789, #794).
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the worker's notification subscription names its
+  chat surface (`surface`, `teams` for the Teams worker) on create, and a subscription Claw lists with another surface
+  is changed to the worker's on the next reconcile. With claw-v0.4.0 and later, a reply goes back to the surface the
+  person's message came from and a proactive message to the surface they used last; a person with one surface sees no
+  change (#787).
+- `@primusclaw/personal-agent`: core no longer holds Teams' own constants and words: the channel id, its names
+  ("Microsoft Teams", "Teams"), the citation and suggestion limits and the stream's lifetime come from the
+  conversation's surface, so another chat app can be added as an adapter package without editing core. The Teams
+  worker's output is unchanged (#789).
+
+- `@primusclaw/personal-agent-runtime`: a second entry, `@primusclaw/personal-agent-runtime/worker`, the worker process
+  without any chat app (the features behind the router, the store and Claw client from the environment, the HTTP
+  endpoints, `/metrics`, the background loops, `runMain`, `assembleWorker`) and the `SurfaceAdapter` interface a chat
+  app implements. `@primusclaw/personal-agent-teams` keeps only the Teams wiring (`teamsSurface()`) and still exports
+  `buildWorker`, `main` and the worker types it exported before, so a plugin host built on it needs no change; the Teams
+  worker behaves as before (#788).
+
+### Fixed
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: a remote agent's approval card (a terminal's
+  question, connector approval hooks) ends, and answers a click, in the language it was shown in: a Chinese card
+  answered at the terminal, timed out or ended stayed Chinese only by chance and could turn English ("answered at the
+  terminal" in the tool name's language); a click answered in the person's set language, English when unset. The card's
+  language is stored with it (`remote_permissions.lang`); a card stored before falls back to the person's language
+  (#794).
+
 ## 0.7.2
 
 A patch release: one fix (#785). No plugin port (core's `src/plugins/`) and no store change; works with any Claw.
