@@ -15,33 +15,68 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.8.0
 
-A minor release (0.8.0): the worker process moves out of the Teams package into runtime as a surface-neutral entry,
-`@primusclaw/personal-agent-runtime/worker`, so another chat app can run the same worker as a package of its own without
-touching Teams. The Teams worker behaves as before. No new npm package (the release publishes the same three), no plugin
-port (core's `src/plugins/`), setting or store change; works with any Claw.
+A minor release: a worker names its chat surface to Claw so an assistant message returns to the surface it came from
+(#787), core takes its channel's name, id and limits from the surface (#789) and the worker process moves into a
+surface-neutral runtime entry (#788), and a remote approval card ends in the language it was shown in (#794). The
+runtime's SQLite store gains one column (`remote_permissions.lang`), added in place at start; nothing to do for a
+deployment of the published packages.
 
-### Added
-
-- `@primusclaw/personal-agent-runtime/worker`: the worker process on any surface: the features behind the router, the
-  store and the Claw client from the environment, the HTTP endpoints, `/metrics` and the background loops
-  (`assembleWorker`, `runMain`), and the `SurfaceAdapter` interface a surface package implements to run it (its
-  settings, its `Surface`, its `SurfaceShape`, how a stored conversation reference is read back, where its inbound
-  events come from). It uses core and runtime's main entry only, and needs no Service Bus, Bot Connector or Azure
-  setting; runtime's main entry (`@primusclaw/personal-agent-runtime`) does not carry it.
-- The layering (`npm run depcruise`) refuses a surface package importing another surface's (a Slack package importing
-  Teams), the worker importing any surface package or npm package, and the rest of runtime importing the worker.
+**Claw:** return-to-source routing is Claw's (claw-v0.4.0 and later reads the subscription's `surface`). With an older
+Claw the `surface` this worker sends is ignored and every subscription gets every message, as before; nothing else in
+this release needs a newer Claw.
 
 ### Changed
 
-- `@primusclaw/personal-agent-teams` keeps only what is Teams' own: its settings, Azure Key Vault, the queues and the
+- `@primusclaw/personal-agent`: exported ports and helpers change for anyone implementing or importing them (the
+  published runtime and Teams packages implement and call all of them, so a deployment of the published packages has
+  nothing to do). Ports: `ClawNotificationsPort.create` takes an optional `surface` and `updateTypes` an optional
+  `surface` option; `IntentReader.read`, `readMode` and `readAnswer` take the channel's name; Claw's `NewSession` and
+  `SendOptions` carry an optional `channel`; `SurfaceCaps` now extends `SurfaceIdentity` (`channel`, `name`,
+  `shortName`) and `SurfaceLimits` (`citationsMax`, `suggestionsMax`, `streamSeconds`), `Conversation` gains `caps` and
+  `replyTo`, and `turn.TurnSurface` requires `caps`; `ChannelContextRequest` requires `channel`; `RemotePermission`
+  gains `lang` (and `NewRemotePermission` an optional `lang`). Helpers that named Teams now take the channel: the
+  constants `INTENT_PROMPT`, `MODE_PROMPT`, `ANSWER_PROMPT`, `LABEL_DESCRIPTION`, `DATA_LINES`, `RULE_HEADING`,
+  `CHANGE_HEADING` and `CHANGE_SECTION` are replaced by functions of the channel (`intentPrompt`, `modePrompt`,
+  `answerPrompt`, `labelDescription`, `dataLines` and the reply-style heading helpers), and `messageContent`,
+  `voteMessageId`, `scopeOf`, `logTurnStarted` and `CommandViews.link` take the channel as a required argument;
+  `turn.uploadFolder` and `dataStatement` take it as an optional one, and called without it no longer assume Teams
+  (`uploadFolder` returns `<message>` instead of `teams/<message>`, `dataStatement` no longer names Microsoft Teams)
+  (#787, #789, #794).
+- `@primusclaw/personal-agent-teams` keeps only what is Teams' own (its settings, Azure Key Vault, the queues and the
   Bot Connector, `TeamsSurface` and its renderers, the inbound consumer and the release gate's test entry, as
-  `teamsSurface()`. `buildWorker`, `main` and the types `BuildWorker`, `PluginFactory`, `Worker`, `WorkerEnv`,
+  `teamsSurface()`); `buildWorker`, `main` and the types `BuildWorker`, `PluginFactory`, `Worker`, `WorkerEnv`,
   `WorkerOptions` and `WorkerServices` are still exported from it, unchanged, so a deployment's own entry keeps its
-  imports.
-- The notification subscription's `surface` (#787) is the worker's surface's own id (`SurfaceShape.surfaceId`, Teams'
-  `teams`), no longer a fixed `teams` in the worker.
+  imports. The subscription's `surface` is the surface's own id (`SurfaceShape.surfaceId`, Teams' `teams`) (#788).
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the worker's notification subscription names its
+  chat surface (`surface`, `teams` for the Teams worker) on create, and a subscription Claw lists with another surface
+  is changed to the worker's on the next reconcile. With claw-v0.4.0 and later, a reply goes back to the surface the
+  person's message came from and a proactive message to the surface they used last; a person with one surface sees no
+  change (#787).
+- `@primusclaw/personal-agent`: core no longer holds Teams' own constants and words: the channel id, its names
+  ("Microsoft Teams", "Teams"), the citation and suggestion limits and the stream's lifetime come from the
+  conversation's surface, so another chat app can be added as an adapter package without editing core. The Teams
+  worker's output is unchanged (#789).
+
+- `@primusclaw/personal-agent-runtime`: a second entry, `@primusclaw/personal-agent-runtime/worker`, the worker process
+  without any chat app (the features behind the router, the store and Claw client from the environment, the HTTP
+  endpoints, `/metrics`, the background loops, `runMain`, `assembleWorker`) and the `SurfaceAdapter` interface a chat
+  app implements. `@primusclaw/personal-agent-teams` keeps only the Teams wiring (`teamsSurface()`) and still exports
+  `buildWorker`, `main` and the worker types it exported before, so a plugin host built on it needs no change; the Teams
+  worker behaves as before (#788).
+
+### Fixed
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: a remote agent's approval card (a terminal's
+  question, connector approval hooks) ends, and answers a click, in the language it was shown in: a Chinese card
+  answered at the terminal, timed out or ended stayed Chinese only by chance and could turn English ("answered at the
+  terminal" in the tool name's language); a click answered in the person's set language, English when unset. The card's
+  language is stored with it (`remote_permissions.lang`); a card stored before falls back to the person's language
+  (#794). `/board` redraws such a card in the same stored language, not in the item title's (#796).
 
 ### Fixed
 
