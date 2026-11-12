@@ -687,3 +687,47 @@ func decodeEvent(b []byte) chunk {
 	})
 	return c
 }
+
+// Output that lands just after the exit is kept even when the command last
+// wrote long before it.
+func TestAwaitOutputCountsQuietFromExit(t *testing.T) {
+	p := newProc(1, "", processConfig{}, Command{})
+	p.add(chunk{data: []byte("early")})
+	p.mu.Lock()
+	p.last = time.Now().Add(-30 * time.Second)
+	p.mu.Unlock()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		p.add(chunk{data: []byte("result")})
+	}()
+	p.awaitOutput(make(chan struct{}))
+	p.finish(0, "")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.chunks {
+		if string(c.data) == "result" {
+			return
+		}
+	}
+	t.Fatalf("result dropped: %+v", p.chunks)
+}
+
+// Input to a process that has ended is refused rather than left blocking on a
+// pipe nothing reads.
+func TestWriteInputAfterEndIsRefused(t *testing.T) {
+	_, w := io.Pipe()
+	p := newProc(7, "", processConfig{}, Command{Stdin: w})
+	p.finish(0, "")
+	s := newProcesses(nil)
+	s.byPID[7] = p
+	done := make(chan error, 1)
+	go func() { done <- s.writeInput(selector{PID: 7}, []byte("x")) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("input accepted after end")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeInput blocked after end")
+	}
+}

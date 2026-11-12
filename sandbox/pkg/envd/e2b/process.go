@@ -191,16 +191,18 @@ const (
 )
 
 // awaitOutput returns once the output pipes close, or once output written
-// before the exit has arrived: a quiet period after the last chunk, a grace
-// when nothing was written, and a ceiling in any case.
+// before the exit has arrived: a quiet period after the exit or the last chunk,
+// whichever is later, a grace when nothing was written, and a ceiling in any case.
 func (p *proc) awaitOutput(closed <-chan struct{}) {
 	started := time.Now()
 	deadline := started.Add(outputQuietCeiling)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
 	for time.Now().Before(deadline) {
 		select {
 		case <-closed:
 			return
-		case <-time.After(10 * time.Millisecond):
+		case <-tick.C:
 		}
 		p.mu.Lock()
 		last := p.last
@@ -209,7 +211,12 @@ func (p *proc) awaitOutput(closed <-chan struct{}) {
 			if time.Since(started) >= outputFirstByteGrace {
 				return
 			}
-		} else if time.Since(last) >= outputQuietPeriod {
+			continue
+		}
+		if last.Before(started) {
+			last = started
+		}
+		if time.Since(last) >= outputQuietPeriod {
 			return
 		}
 	}
@@ -315,7 +322,11 @@ func (s *processes) writeInput(sel selector, data []byte) error {
 	}
 	p.mu.Lock()
 	w := p.cmd.Stdin
+	exited := p.exited
 	p.mu.Unlock()
+	if exited {
+		return rpcErr("failed_precondition", "process has exited")
+	}
 	if w == nil {
 		return rpcErr("failed_precondition", "stdin is closed")
 	}
