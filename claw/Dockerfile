@@ -192,7 +192,12 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /app/package.json       ./package.json
 COPY --from=builder /app/node_modules       ./node_modules
 COPY --from=builder /app/packages           ./packages
-RUN rm -rf packages/*/src packages/*/tsconfig*.json
+# Sources and tests are not shipped. Nor is the base image's global npm (and npx): nothing in this image runs them --
+# API, Brain and Hands start with `node` (deploy/entrypoint.sh) and spawn no package manager -- and npm's bundled
+# dependencies are what the image scan finds HIGH vulnerabilities in, on Node's release cadence rather than ours
+# (.github/scripts/image-scan.sh). The builder stage keeps npm for `npm ci`.
+RUN rm -rf packages/*/src packages/*/test packages/*/tsconfig*.json \
+      /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Reaper entry-point sanity guard. This image doubles as the workspace-reaper
 # CronJob image, which runs `node /app/packages/brain/dist/reaper-entry.js`.

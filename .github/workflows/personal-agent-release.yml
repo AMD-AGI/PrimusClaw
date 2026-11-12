@@ -60,6 +60,7 @@ on:
     paths:
       - ".github/workflows/personal-agent-release.yml"
       - "personal-agent/scripts/release-workflow-check.sh"
+      - ".github/scripts/image-scan.sh"
 
 # Least privilege for the default GITHUB_TOKEN; the publish jobs add what they need.
 permissions:
@@ -340,6 +341,32 @@ jobs:
           mkdir -p "$OUT"
           buildah push "localhost/personal-agent-teams:$VERSION" "oci-archive:$OUT/personal-agent-teams.oci.tar:personal-agent-teams:$VERSION"
           echo "sha256=$(sha256sum "$OUT/personal-agent-teams.oci.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Day of the scanner's database cache
+        id: scan-day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # Trivy's vulnerability database and checks bundle, one cache a day. Trivy still replaces a database past its
+      # own next-update time, exactly as on any runner, so the cache saves the download and changes no answer.
+      - name: Restore the scanner's database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+            ~/.cache/trivy/policy
+          key: image-scan-trivy-0.74.0-${{ steps.scan-day.outputs.day }}
+          restore-keys: image-scan-trivy-0.74.0-
+
+      # The archive publish-image would push, through the scan that gates the publication of a public image: the same
+      # Trivy release and parameters, no ignore list (.github/scripts/image-scan.sh says what fails and why). A
+      # finding fails this job, and with it the release, when the image is to be published; otherwise the same table
+      # is reported and the run goes on.
+      - name: Scan the image as its publication will
+        env:
+          ARCHIVE: ${{ runner.temp }}/personal-agent-image/personal-agent-teams.oci.tar
+          IMAGE_SCAN_ENFORCE: ${{ steps.plan.outputs.image == 'on' }}
+        run: bash .github/scripts/image-scan.sh personal-agent-teams "$ARCHIVE"
 
       # What a reviewer needs in front of them before approving the publish jobs. The comparison is made by this file
       # and is no substitute for opening the run's workflow file.

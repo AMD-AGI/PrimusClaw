@@ -59,7 +59,11 @@ FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app /app
-RUN mkdir -p /data && chown 65534:65534 /data
+# The base image's global npm (and npx) go: the worker is started with `node` and spawns no package manager, and
+# npm's bundled dependencies are what the image scan finds HIGH vulnerabilities in (.github/scripts/image-scan.sh).
+# The build stage keeps npm.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+ && mkdir -p /data && chown 65534:65534 /data
 USER 65534:65534
 # The worker's endpoint (PORT) and /metrics (METRICS_PORT), at their defaults.
 EXPOSE 8080 9090

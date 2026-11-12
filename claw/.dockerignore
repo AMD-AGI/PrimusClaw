@@ -1,0 +1,16 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# The build context is this directory, and `COPY packages/ packages/` takes all of it. Whatever a working tree holds
+# besides the sources -- installed modules, earlier builds, per-environment values files with credentials in them,
+# test fixtures full of key-shaped strings -- would otherwise ride along into the image and in front of the scan that
+# gates its publication. deploy/build.sh already leaves most of these out of its own tar; this file applies the same
+# rule to every other way the image is built (CI, release-verify, a plain `docker build`).
+.git
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+deploy/values.*.env
+packages/*/test
+**/*.log
