@@ -13,7 +13,7 @@ test("the worker does not start when a secret cannot be read", async () => {
   const lines: string[] = [];
   assert.equal(await main({}, neutralPlugins(), (line) => lines.push(line)), 2);
   assert.equal(lines.length, 1);
-  assert.match(lines[0] ?? "", /CRITICAL secrets: .*TEAMS_ENCRYPTION_KEYS.*the worker does not start without them$/);
+  assert.match(lines[0] ?? "", /CRITICAL secrets: .*PA_ENCRYPTION_KEYS.*the worker does not start without them$/);
 });
 
 test("a setting that cannot work stops the worker with status 1 and says which", async () => {

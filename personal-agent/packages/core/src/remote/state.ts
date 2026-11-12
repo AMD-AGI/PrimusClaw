@@ -43,7 +43,7 @@ export class ChatState {
     }
   }
 
-  /** TEAMS_DIRECT_CHAT is on for this 1:1 chat's person (a group binding keeps its session card). */
+  /** PA_DIRECT_CHAT is on for this 1:1 chat's person (a group binding keeps its session card). */
   directOn(chatKey: string): boolean {
     return !isGroupKey(chatKey) && this.ctx.directChat.on(chatKey);
   }

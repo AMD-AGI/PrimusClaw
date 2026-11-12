@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The review delegation (TEAMS_GITHUB_REVIEW_ENABLED), as the Python worker's `main.run` builds `GithubReview` and
+ * The review delegation (PA_GITHUB_REVIEW_ENABLED), as the Python worker's `main.run` builds `GithubReview` and
  * `Agent.__init__` attaches it: the identity service's GitHub credentials, the device flow `/github` connects with, the
- * public pull request reader, the request reader on the platform's model gateway (TEAMS_REVIEW_INTENT_MODEL), and the chat
+ * public pull request reader, the request reader on the platform's model gateway (PA_REVIEW_INTENT_MODEL), and the chat
  * it runs in (its turns start on the router, its onboarding and connect cards are the router's). What it gives back: the
  * router's GitHub part, its handlers, the handoff the assistant can send back, the follows it takes up again at start, the
  * open review cards it sweeps, and the stopped items it hears of.
@@ -153,7 +153,7 @@ function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost):
   };
 }
 
-/** The review service and the handoff the assistant sends back; undefined with TEAMS_GITHUB_REVIEW_ENABLED off. */
+/** The review service and the handoff the assistant sends back; undefined with PA_GITHUB_REVIEW_ENABLED off. */
 export function reviewParts(
   base: AssemblyBase,
   inputs: ReviewInputs,

@@ -46,7 +46,7 @@ export function chatCredentialOf(
  * What Claw is called with for a person, and what a person who has none is told (the Python `Agent._credential`,
  * `_unlinked`, `_connect_identity`, `_binding_card`, `_ask_to_link`, `_background_credential`, `_fresh_credential`).
  *
- * A chat runs on the person's linked key; with TEAMS_EXCHANGE_FOR_CHAT on, on a fresh exchanged token when they have a
+ * A chat runs on the person's linked key; with PA_EXCHANGE_FOR_CHAT on, on a fresh exchanged token when they have a
  * confirmed binding, else their linked key, else they get the card that binds them.
  */
 export class Credentials {

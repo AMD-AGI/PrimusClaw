@@ -93,9 +93,9 @@ flowchart LR
   `OUTBOUND_MODE=direct` it posts to the Bot Connector itself, which is what Teams' streaming and message deletion need;
   the queue stays as the fallback. The bot's token is only ever sent to Bot Connector hosts on an allow-list
   (`packages/teams/src/connector/hosts.ts`).
-- **State.** One SQLite database (`TEAMS_DB_PATH`): links between chat identities and Claw, sessions, conversation
+- **State.** One SQLite database (`PA_DB_PATH`): links between chat identities and Claw, sessions, conversation
   references, subscriptions, pending approvals, feedback. Credentials in it are encrypted with Fernet keys
-  (`TEAMS_ENCRYPTION_KEYS`).
+  (`PA_ENCRYPTION_KEYS`).
 - **HTTP.** `/healthz`; `/primus-claw-agent/link`, where the console exchanges a new Claw API key for a one-time code the
   person types as `/link CODE`; `/claw-events/<route>` for Claw's signed notifications when proactive messages are on;
   the routes a deployment's plugins add. `/metrics` (Prometheus) listens on a port of its own (`METRICS_PORT`).
@@ -103,7 +103,7 @@ flowchart LR
 ### Claw and claw-connector
 
 The worker is a client of the Claw API (`CLAW_API_URL`) and holds no model or sandbox of its own. Each person acts with
-their own Claw identity: either an API key they link from the console (`/link`), or, with `TEAMS_EXCHANGE_ENABLED`, a
+their own Claw identity: either an API key they link from the console (`/link`), or, with `PA_EXCHANGE_ENABLED`, a
 token exchanged for them with the identity service (see [claw/docs/identity-client.md](../claw/docs/identity-client.md)).
 Claw sends the worker notifications for each person's subscription (assistant replies, approvals, finished runs,
 remote-agent events), signed with that person's secret.
@@ -249,15 +249,22 @@ posts the outbound queue to the Bot Connector, which needs a bot that is a user-
 values (all but the release gate's test entry); [`docs/configuration.md`](docs/configuration.md) describes each one.
 In short:
 
-- **Required:** `CLAW_API_URL`, `SAFE_API_URL`, `PUBLIC_BASE_URL`, `TEAMS_ENCRYPTION_KEYS`, and either
+- **Required:** `CLAW_API_URL`, `SAFE_API_URL`, `PUBLIC_BASE_URL`, `PA_ENCRYPTION_KEYS`, and either
   `SERVICEBUS_NAMESPACE` (with the worker identity) or the two `SERVICEBUS_*_CONNECTION_STRING`s. Direct outbound mode
   adds the bot's identity (`BOT_*`).
-- **Secrets** (`TEAMS_ENCRYPTION_KEYS`, `TEAMS_EXCHANGE_CLIENT_SECRET`, and a deployment's GitHub App key) come from the
+- **Secrets** (`PA_ENCRYPTION_KEYS`, `PA_EXCHANGE_CLIENT_SECRET`, and a deployment's GitHub App key) come from the
   environment by default, or from Azure Key Vault with `SECRETS_SOURCE=keyvault`. Put them in a secret store, never in
   a file in a repository.
 - **Features** are off until switched on: notifications from Claw (`PROACTIVE_ENABLED`), the assistant
-  (`ASSISTANT_ENABLED`), remote agents (`REMOTE_AGENTS_ENABLED`), the token exchange (`TEAMS_EXCHANGE_ENABLED`), review
-  for a colleague (`TEAMS_GITHUB_REVIEW_ENABLED`) and more.
+  (`ASSISTANT_ENABLED`), remote agents (`REMOTE_AGENTS_ENABLED`), the token exchange (`PA_EXCHANGE_ENABLED`), review
+  for a colleague (`PA_GITHUB_REVIEW_ENABLED`) and more.
+- **Setting names.** The worker's own settings, the ones every chat surface shares (the store, the encryption keys, the
+  exchange, review, the per-person limits and the like), carry the `PA_` prefix (personal agent). Releases up to 0.7
+  named them `TEAMS_` (`TEAMS_ENCRYPTION_KEYS`, `TEAMS_USER_MESSAGE_LIMIT`, ...); those names are still read, so an
+  existing deployment needs no change. When both are set the `PA_` name wins, and a worker that reads a `TEAMS_` name
+  logs one warning at start naming its `PA_` replacement. A surface's own settings keep the surface's prefix
+  (`TEAMS_STREAMING`, `TEAMS_AI_LABEL`). The full list is in
+  [`docs/configuration.md`](docs/configuration.md#setting-names).
 
 ## Releasing (maintainers)
 

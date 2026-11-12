@@ -37,7 +37,7 @@ describe("the token exchange settings", () => {
   it("flag off by default in settings", () => {
     assert.equal(settings().exchange.enabled, false);
     assert.equal(settings().exchange.tokenUrl, "");
-    refused({ TEAMS_EXCHANGE_ENABLED: "true" }, "TEAMS_EXCHANGE_CLIENT_ID");
+    refused({ TEAMS_EXCHANGE_ENABLED: "true" }, "environment variable PA_EXCHANGE_CLIENT_ID is required");
     const s = settings(ON);
     assert.ok(s.exchange.enabled);
     assert.equal(s.exchange.tokenUrl, `${s.publicBaseUrl}/oauth/token`);
@@ -46,7 +46,7 @@ describe("the token exchange settings", () => {
 
   it("the exchange for chat flag is off by default and needs the exchange", () => {
     assert.equal(settings().exchange.forChat, false);
-    refused({ TEAMS_EXCHANGE_FOR_CHAT: "true" }, "TEAMS_EXCHANGE_FOR_CHAT needs TEAMS_EXCHANGE_ENABLED");
+    refused({ TEAMS_EXCHANGE_FOR_CHAT: "true" }, "TEAMS_EXCHANGE_FOR_CHAT needs PA_EXCHANGE_ENABLED");
     assert.equal(settings({ ...ON, TEAMS_EXCHANGE_FOR_CHAT: "true" }).exchange.forChat, true);
     const s = settings(ON);
     assert.ok(s.exchange.enabled && !s.exchange.forChat);
@@ -55,8 +55,8 @@ describe("the token exchange settings", () => {
 
 describe("the review for a colleague", () => {
   it("needs the exchange and the owners whose pull requests are taken", () => {
-    refused({ TEAMS_GITHUB_REVIEW_ENABLED: "on" }, "TEAMS_GITHUB_REVIEW_ENABLED needs TEAMS_EXCHANGE_ENABLED");
-    refused({ ...ON, TEAMS_GITHUB_REVIEW_ENABLED: "on" }, "needs TEAMS_GITHUB_REVIEW_OWNERS");
+    refused({ TEAMS_GITHUB_REVIEW_ENABLED: "on" }, "TEAMS_GITHUB_REVIEW_ENABLED needs PA_EXCHANGE_ENABLED");
+    refused({ ...ON, TEAMS_GITHUB_REVIEW_ENABLED: "on" }, "needs PA_GITHUB_REVIEW_OWNERS");
     const s = settings({
       ...ON,
       TEAMS_GITHUB_REVIEW_ENABLED: "on",

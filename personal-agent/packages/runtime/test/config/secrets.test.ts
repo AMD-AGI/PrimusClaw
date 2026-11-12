@@ -46,7 +46,7 @@ describe("where the secrets come from", () => {
   it("a secret the environment does not hold fails, naming it and never a value", async () => {
     await assert.rejects(new EnvSecretSource({}).load(["TEAMS_ENCRYPTION_KEYS"]), {
       name: "SecretsUnavailable",
-      message: "environment variable TEAMS_ENCRYPTION_KEYS is required",
+      message: "environment variable PA_ENCRYPTION_KEYS is required",
     });
     const unreadable = new EnvSecretSource({ FEEDBACK_GITHUB_KEY_FILE: "/missing.pem" }, () => {
       throw new Error("ENOENT");

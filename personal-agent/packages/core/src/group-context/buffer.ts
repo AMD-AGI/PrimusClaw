@@ -20,7 +20,7 @@ import type { GroupContextRepository } from "../ports/store/group-context.js";
 import type { InboundMessage } from "../ports/surface.js";
 import { cpHead, cpLength, pyStrip, squashSpaces } from "../text/py-text.js";
 
-/** How much a group's context keeps (the deployment's TEAMS_GROUP_CONTEXT_* settings). */
+/** How much a group's context keeps (the deployment's PA_GROUP_CONTEXT_* settings). */
 export interface GroupContextSettings {
   /** The most messages kept per chat; 0 turns the feature off (nothing is kept). */
   readonly messages: number;

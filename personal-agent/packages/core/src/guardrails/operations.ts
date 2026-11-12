@@ -30,8 +30,8 @@ export const DEFAULT_LIMITS: Readonly<Record<SensitiveOperation, Limit>> = {
   remote_agent: { count: 10, windowSeconds: 3600 },
 };
 
-/** TEAMS_LIMIT_PR_MERGE=20/3600; 0 turns that limit off. */
-export const ENV_PREFIX = "TEAMS_LIMIT_";
+/** PA_LIMIT_PR_MERGE=20/3600; 0 turns that limit off. (The older TEAMS_LIMIT_ names are read by the runtime.) */
+export const ENV_PREFIX = "PA_LIMIT_";
 
 const DIGITS = /^\d+$/;
 
@@ -49,10 +49,14 @@ function parseOne(name: string, raw: string, fallback: Limit): Limit {
 }
 
 /**
- * The limits from the environment: `TEAMS_LIMIT_<OPERATION>` is `COUNT/SECONDS` (`20/3600`), or `0` to turn that
- * limit off. Unset takes the default. Anything else throws (the worker stops at start: a typo must not lift a limit).
+ * The limits from the environment: `PA_LIMIT_<OPERATION>` is `COUNT/SECONDS` (`20/3600`), or `0` to turn that
+ * limit off. Unset takes the default. Anything else throws (the worker stops at start: a typo must not lift a limit),
+ * naming the variable `source` says the value was read from (default: the name asked for).
  */
-export function parseLimits(env: (name: string) => string): Map<SensitiveOperation, Limit> {
+export function parseLimits(
+  env: (name: string) => string,
+  source: (name: string) => string = (name) => name,
+): Map<SensitiveOperation, Limit> {
   const limits = new Map<SensitiveOperation, Limit>();
   for (const operation of SENSITIVE_OPERATION_NAMES) {
     const fallback = DEFAULT_LIMITS[operation];
@@ -60,7 +64,7 @@ export function parseLimits(env: (name: string) => string): Map<SensitiveOperati
     const raw = strip(env(name));
     if (!raw) limits.set(operation, fallback);
     else if (raw === "0") limits.set(operation, { count: 0, windowSeconds: fallback.windowSeconds });
-    else limits.set(operation, parseOne(name, raw, fallback));
+    else limits.set(operation, parseOne(source(name), raw, fallback));
   }
   return limits;
 }

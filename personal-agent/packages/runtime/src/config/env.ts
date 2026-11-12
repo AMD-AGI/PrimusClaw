@@ -1,7 +1,9 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { ConfigError, decimalBigInt, own, pyStrip } from "@primusclaw/personal-agent";
+import { ConfigError, decimalBigInt, pyStrip } from "@primusclaw/personal-agent";
+
+import { settingSource, settingValue } from "./aliases.js";
 
 /** The process environment, or a test's. */
 export type Env = Readonly<Record<string, string | undefined>>;
@@ -9,13 +11,22 @@ export type Env = Readonly<Record<string, string | undefined>>;
 const ON = ["1", "true", "yes", "on"];
 const OFF = ["0", "false", "no", "off"];
 
-/** Reads settings out of an environment, with the worker's rules: a typo stops the worker, it never picks a value. */
+/**
+ * Reads settings out of an environment, with the worker's rules: a typo stops the worker, it never picks a value. A
+ * setting that has a `PA_` name and an older `TEAMS_` name is read under either (`settingSource`), and a message about
+ * its value names the variable it was read from.
+ */
 export class EnvReader {
   constructor(readonly env: Env) {}
 
+  /** The variable `name` is read from (the `PA_` or the `TEAMS_` name of a pair; any other name as it is). */
+  source(name: string): string {
+    return settingSource(this.env, name);
+  }
+
   /** The raw value ("" unset). */
   raw(name: string, fallback = ""): string {
-    return own(this.env, name) ?? fallback;
+    return settingValue(this.env, name) ?? fallback;
   }
 
   /** The value without surrounding white space ("" unset). */
@@ -26,7 +37,7 @@ export class EnvReader {
   /** A value that must be set and not blank. */
   required(name: string): string {
     const value = this.text(name);
-    if (value === "") throw new ConfigError(`environment variable ${name} is required`);
+    if (value === "") throw new ConfigError(`environment variable ${this.source(name)} is required`);
     return value;
   }
 
@@ -35,7 +46,7 @@ export class EnvReader {
     const value = this.text(name).toLowerCase();
     if (value === "") return fallback;
     if (!ON.includes(value) && !OFF.includes(value)) {
-      throw new ConfigError(`${name} must be on or off, not ${pyRepr(value)}`);
+      throw new ConfigError(`${this.source(name)} must be on or off, not ${pyRepr(value)}`);
     }
     return ON.includes(value);
   }
@@ -52,7 +63,7 @@ export class EnvReader {
     // Python's `raw.isdigit() and int(raw) > 0`: decimal digits of any script
     const number = decimalBigInt(value);
     if (number === undefined || number <= 0n) {
-      throw new ConfigError(`${name} must be a positive whole number, not ${pyRepr(value)}`);
+      throw new ConfigError(`${this.source(name)} must be a positive whole number, not ${pyRepr(value)}`);
     }
     return Number(number);
   }
@@ -63,7 +74,7 @@ export class EnvReader {
     const match = /^([+-]?)(\p{Nd}+(?:_\p{Nd}+)*)$/u.exec(value);
     const digits = match === null ? undefined : decimalBigInt((match[2] ?? "").replaceAll("_", ""));
     if (match === null || digits === undefined) {
-      throw new ConfigError(`${name} must be a whole number, not ${pyRepr(value)}`);
+      throw new ConfigError(`${this.source(name)} must be a whole number, not ${pyRepr(value)}`);
     }
     return Number(match[1] === "-" ? -digits : digits);
   }

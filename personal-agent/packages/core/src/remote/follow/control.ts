@@ -165,7 +165,7 @@ export class FollowControl {
   }
 
   /**
-   * TEAMS_DIRECT_CHAT is on for this person: an attachment that still has the session card as its window is moved to the chat,
+   * PA_DIRECT_CHAT is on for this person: an attachment that still has the session card as its window is moved to the chat,
    * here and in the store, so nothing reads it as a card any more (the card itself is left where it is).
    */
   chatIsWindow(chatKey: string): void {

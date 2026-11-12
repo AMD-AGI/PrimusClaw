@@ -5,7 +5,7 @@
  * The features behind the router, built and wired as the Python worker's `main.build_agent`, `Agent.__init__` and
  * `main.build_worker_app` wire them: the router with every feature it hands messages to, what carries Claw's events into the
  * chat (`/claw-events`), the background loops of `main.run`, what runs once at start, and what the release gate's test entry
- * reads. The review service (TEAMS_GITHUB_REVIEW_ENABLED) is built in `features-review.ts`.
+ * reads. The review service (PA_GITHUB_REVIEW_ENABLED) is built in `features-review.ts`.
  */
 import type {
   ClawPort,
@@ -35,6 +35,8 @@ import {
   noModelRefusalPolicy,
   TerminalApprovalsCommand,
 } from "@primusclaw/personal-agent";
+
+import { settingSource } from "@primusclaw/personal-agent-runtime";
 
 import { StartupError } from "./startup-error.js";
 import { assistantParts, type AssistantParts } from "./features-assistant.js";
@@ -85,7 +87,7 @@ export interface Features {
   start(): Promise<void>;
   /** The worker stops: the assistant's open receipts are dropped, so their close timers do not keep the process up. */
   stop(): void;
-  /** The review service (TEAMS_GITHUB_REVIEW_ENABLED; undefined off), for the gate's review scenarios and the tests. */
+  /** The review service (PA_GITHUB_REVIEW_ENABLED; undefined off), for the gate's review scenarios and the tests. */
   readonly review: GithubReview | undefined;
   /** The recent messages of group chats (kept in memory): the inbound handler drops a chat the bot was removed from. */
   readonly groupContext: GroupContext;
@@ -117,14 +119,14 @@ function recordingClaw(claw: ClawPort, made: string[]): ClawPort {
   });
 }
 
-/** The route the Python worker serves for TEAMS_ON_BEHALF_USERS (link_api.py); a deployment's plugin adds it here. */
+/** The route the Python worker serves for PA_ON_BEHALF_USERS (link_api.py); a deployment's plugin adds it here. */
 export const ON_BEHALF_PATH = "/primus-claw-agent/on-behalf";
 
 /**
  * A setting that turns on something this worker would not do stops the start: production runs it, so a worker that
  * quietly ran without it would be a different worker.
  * - CLAWY_FALLBACK_MODEL with no model refusal policy: the fallback would never be used.
- * - TEAMS_ON_BEHALF_USERS with no plugin serving the on-behalf route: the route would not exist.
+ * - PA_ON_BEHALF_USERS with no plugin serving the on-behalf route: the route would not exist.
  */
 function refuseMissing(base: AssemblyBase): void {
   const { settings, plugins } = base;
@@ -137,7 +139,7 @@ function refuseMissing(base: AssemblyBase): void {
     !plugins.routeExtensions.some((route) => route.method === "POST" && route.path === ON_BEHALF_PATH)
   )
     throw new StartupError(
-      `TEAMS_ON_BEHALF_USERS is set, but no plugin serves ${ON_BEHALF_PATH}: unset it or run with the plugin that does`,
+      `${settingSource(base.env, "PA_ON_BEHALF_USERS")} is set, but no plugin serves ${ON_BEHALF_PATH}: unset it or run with the plugin that does`,
     );
 }
 

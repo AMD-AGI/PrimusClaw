@@ -39,6 +39,7 @@ import {
   secretsSourceOf,
   systemClock,
   wantedSecrets,
+  warnLegacySettings,
 } from "@primusclaw/personal-agent-runtime";
 
 import { buildInfoText, withBuildInfo } from "./build-info.js";
@@ -119,6 +120,7 @@ export async function envSecrets(
 }
 
 async function assemblyBase(env: WorkerEnv, prepared: PreparedSurface, deps: Basics) {
+  warnLegacySettings(env, deps.logger);
   const names = wantedSecrets(env);
   const secrets = await (prepared.loadSecrets ? prepared.loadSecrets(names, deps) : envSecrets(env, names));
   const settings = readSettings(env, secrets);

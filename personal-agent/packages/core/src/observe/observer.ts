@@ -39,7 +39,7 @@ export interface ObserverDeps {
   readonly observe: ObserveRepository;
   readonly links: Pick<LinkRepository, "getKey">;
   readonly assistant: Pick<ClawAssistantPort, "observeScope" | "observe" | "observations" | "session" | "send">;
-  /** Who may turn it on (TEAMS_OBSERVE_USERS, any case); empty: nobody. */
+  /** Who may turn it on (PA_OBSERVE_USERS, any case); empty: nobody. */
   readonly users: readonly string[];
   /** A conversation from the reference the store kept for a group (the channel's `ConversationRef.wire`). */
   readonly conversationOf: (wire: JsonObject) => Conversation;

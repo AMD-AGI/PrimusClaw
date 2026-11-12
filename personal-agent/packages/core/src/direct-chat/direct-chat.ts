@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The chat itself as the window of an agent session on the person's machine (TEAMS_DIRECT_CHAT, teams_agent/direct_chat.py).
+ * The chat itself as the window of an agent session on the person's machine (PA_DIRECT_CHAT, teams_agent/direct_chat.py).
  *
  * For the people it is on for, a chat attached to an agent session is a plain conversation with that agent: every message says in
  * its first line who speaks (`agentHead`, `CLAWY_HEAD`), a line of the agent's that looks like a head is escaped (`guardHeads`),

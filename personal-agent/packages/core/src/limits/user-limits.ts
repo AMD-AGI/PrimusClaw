@@ -3,12 +3,12 @@
 
 import type { UserLimits } from "../config/settings.js";
 
-/** TEAMS_USER_MESSAGE_LIMIT: messages per window and person. */
+/** PA_USER_MESSAGE_LIMIT: messages per window and person. */
 export const DEFAULT_MESSAGE_LIMIT = 20;
-/** TEAMS_USER_MESSAGE_WINDOW_SECONDS. */
+/** PA_USER_MESSAGE_WINDOW_SECONDS. */
 export const DEFAULT_MESSAGE_WINDOW_SECONDS = 60;
 /**
- * TEAMS_USER_MAX_CONCURRENT_TASKS. A review request starts up to 10 pull requests at once, each a task; the default
+ * PA_USER_MAX_CONCURRENT_TASKS. A review request starts up to 10 pull requests at once, each a task; the default
  * leaves room for that beside the person's 1:1 chat and a group.
  */
 export const DEFAULT_MAX_CONCURRENT_TASKS = 12;

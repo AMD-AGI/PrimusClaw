@@ -107,19 +107,27 @@ test("a limit of zero is off and the defaults are on", () => {
 });
 
 test("the limits are read from the environment and a typo stops the worker", () => {
-  const env: Record<string, string> = { TEAMS_LIMIT_PR_MERGE: "5/600", TEAMS_LIMIT_APPROVAL: "0" };
+  const env: Record<string, string> = { PA_LIMIT_PR_MERGE: "5/600", PA_LIMIT_APPROVAL: "0" };
   const limits = parseLimits((name) => own(env, name) ?? "");
   assert.deepEqual(limits.get("pr_merge"), { count: 5, windowSeconds: 600 });
   assert.equal(limits.get("approval")?.count, 0);
   assert.deepEqual(limits.get("pr_review"), DEFAULT_LIMITS.pr_review);
   assert.deepEqual(limits.get("remote_agent"), DEFAULT_LIMITS.remote_agent);
   for (const bad of ["5", "five/600", "5/0", "-1/600", "5/600/1"]) {
-    assert.throws(() => parseLimits((name) => (name === "TEAMS_LIMIT_PR_REVIEW" ? bad : "")), /TEAMS_LIMIT_PR_REVIEW/);
+    assert.throws(() => parseLimits((name) => (name === "PA_LIMIT_PR_REVIEW" ? bad : "")), /PA_LIMIT_PR_REVIEW/);
   }
-  assert.deepEqual(parseLimits((name) => (name === "TEAMS_LIMIT_REMOTE_AGENT" ? " 3 / 60 " : "")).get("remote_agent"), {
+  assert.deepEqual(parseLimits((name) => (name === "PA_LIMIT_REMOTE_AGENT" ? " 3 / 60 " : "")).get("remote_agent"), {
     count: 3,
     windowSeconds: 60,
   });
+});
+
+test("a malformed limit is named by the variable it was read from", () => {
+  const source = (name: string): string => name.replace(/^PA_/, "TEAMS_");
+  assert.throws(
+    () => parseLimits((name) => (name === "PA_LIMIT_PR_MERGE" ? "five" : ""), source),
+    /^RangeError: TEAMS_LIMIT_PR_MERGE must be COUNT\/SECONDS/,
+  );
 });
 
 test("give back returns one count and never more than were taken", () => {

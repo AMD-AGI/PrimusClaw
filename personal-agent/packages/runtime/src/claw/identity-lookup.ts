@@ -29,7 +29,7 @@ export interface IdentityLookupOptions {
 /**
  * Who a credential belongs to. A person's own key (`ak-...`) is asked of the platform's `/users/self` with the key itself
  * (the Python worker's `safe.whoami`, `safe.safe_user` and `safe.user_id_of`, which read the same answer). An identity
- * token exchanged for them (TEAMS_EXCHANGE_FOR_CHAT) is asked of Claw's `/v1/me` with the token, when Claw's URL is
+ * token exchanged for them (PA_EXCHANGE_FOR_CHAT) is asked of Claw's `/v1/me` with the token, when Claw's URL is
  * given: the platform does not take such a token on its data routes, and Claw answers with the platform's id, name and
  * email of the token's subject (it has no account type: ""). Any failure is no owner: an answer other than 200, a timeout
  * or a broken connection, a body that is not JSON or not an object. The caller says so, or tries again later (the

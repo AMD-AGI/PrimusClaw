@@ -69,7 +69,7 @@ export function messageTextFor(channelName: string): MessageText {
   };
 }
 
-/** TEAMS_USER_*: messages per window, tasks at once (Python `limits.UserLimits` and `MessageRateLimiter`). */
+/** PA_USER_* (or the older TEAMS_USER_*): messages per window, tasks at once (Python `limits.UserLimits` and `MessageRateLimiter`). */
 export function routerLimits(limits: UserLimits, clock: Clock): RouterLimits {
   const rate = new MessageRateLimiter(limits.messageLimit, limits.messageWindowSeconds, clock);
   return {
@@ -99,9 +99,6 @@ export function channelContextBuilder(
   pending: (userId: string) => readonly PendingEntry[] = () => [],
 ): ChannelContextBuilder {
   return (request) => {
-    const mentions = request.message.mentions.map((m) => ({
-      mentioned: { id: m.channelUserId, name: m.name, aadObjectId: m.userId },
-    }));
     const known = store.members.knownMembers().map((m) => ({
       id: m.id,
       name: m.name,
@@ -109,10 +106,10 @@ export function channelContextBuilder(
       ...(m.email ? { email: m.email } : {}),
     }));
     const people = peopleOf(
-      mentions,
+      request.message.mentions,
       request.message.text,
       known,
-      (aad) => store.links.clawUserIdOf(aad),
+      (directoryId) => store.links.clawUserIdOf(directoryId),
       (channelId) => store.members.userForChannelId(channelId),
     );
     const actions = channelActions(request.parts as Parameters<typeof channelActions>[0]);
