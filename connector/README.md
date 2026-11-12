@@ -813,8 +813,8 @@ npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the r
 A release is a GitHub Release whose tag is `connector-vX.Y.Z`. Which number it moves, and what its notes must say (each incompatible
 change called out, the wire protocol with Claw included, and the oldest Claw a feature needs), follow the repository's versioning rules in
 the root [CHANGELOG.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/CHANGELOG.md#versioning), shared with Claw and the personal agent:
-before 1.0.0, a release that only fixes moves PATCH and one that adds a feature or breaks compatibility moves MINOR. 0.1.23 already carried a
-feature (#706, approval hooks for terminal sessions), so the next release is 0.2.0, not 0.1.24. Publishing a release starts
+before 1.0.0, PATCH for fixes and small features, MINOR only for a big feature or an incompatible change (the wire protocol with Claw
+included); releases are batched into the day's release window unless urgent. Publishing a release starts
 [connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml): it builds, tests and
 checks the tarball, signs a build-provenance attestation for it, attaches it to the release and publishes it to npm with Trusted Publishing
 (an OIDC credential; no npm token is stored anywhere). Only stable `MAJOR.MINOR.PATCH` versions are released: a prerelease needs a dist-tag,

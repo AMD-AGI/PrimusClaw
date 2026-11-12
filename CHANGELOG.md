@@ -26,14 +26,15 @@ The Teams app package (its manifest `version`) is not covered by these rules.
 
 Before 1.0.0:
 
-- **PATCH** for a release that only fixes bugs.
-- **MINOR** for a release that adds a feature or makes an incompatible
-  change. Each incompatible change is called out on its own in the release
-  notes, with what a deployment or a user has to do. Incompatible includes
-  the protocol between the connector and Claw
-  (`claw/packages/protocol/src/remote-agents.ts`) and the personal agent's
-  plugin ports (`personal-agent/packages/core/src/plugins/`), not only HTTP
-  APIs and settings.
+- **PATCH** for a release that fixes bugs or adds small features: prefer it.
+- **MINOR** only for a big feature or an incompatible change. Each
+  incompatible change is called out on its own in the release notes, with
+  what a deployment or a user has to do, and a MINOR release's notes say
+  which change or feature made it MINOR. Incompatible includes the protocol
+  between the connector and Claw (`claw/packages/protocol/src/remote-agents.ts`),
+  the personal agent's plugin ports (`personal-agent/packages/core/src/plugins/`)
+  and any other export of a published package, not only HTTP APIs and
+  settings.
 
 From 1.0.0 on, [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html):
 MAJOR for an incompatible change, MINOR for an addition, PATCH for a fix.
@@ -42,9 +43,15 @@ How this relates to SemVer: SemVer 2.0.0 says nothing about 0.x ("anything
 may change at any time"). PrimusClaw follows the convention npm's caret
 ranges assume instead: within 0.x, MINOR plays the role of MAJOR, so
 `^0.2.3` means `>=0.2.3 <0.3.0` and a PATCH update is always safe to take,
-while a MINOR update may need you to read its notes first. Unlike plain
-SemVer 0.x, features also move MINOR here, so a PATCH update never adds
-behaviour.
+while a MINOR update may need you to read its notes first.
+
+### When releases are cut
+
+Changes are released in batches, not one release per change: each of Claw,
+the connector and the personal agent is cut at most once in a day's release
+window (06:00-09:00 UTC), from whatever is merged by then, and never while
+the nightly evaluation runs (18:17-20:20 UTC). An urgent fix, or a release
+the maintainers ask for, may go out at once, outside the window.
 
 ### What each release's notes must say
 
@@ -69,9 +76,10 @@ deployment numbers, not release versions.
 A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
 build id was built from. It does not rebuild anything: the image to deploy
 for it is that commit's build-id image, named in the release notes. Every
-production rollout of a new build id is a release and gets a tag: PATCH when
-it only fixes bugs, MINOR when it adds a feature or makes an incompatible
-change, so a user can name the version that carries a fix.
+production rollout of a new build id is a release and gets a tag, by the
+rules above (PATCH unless a big feature or an incompatible change makes it
+MINOR), so a user can name the version that carries a fix. Several merged
+changes go out as one rollout in the day's window.
 
 1. Find the commit of the build you are releasing (the Build workflow run
    that pushed it logs `CLAW_BUILD in image: '<build id>'`; its `headSha` is
