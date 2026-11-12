@@ -779,7 +779,13 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           `SELECT data->>'agent' AS tool FROM claw_remote_events WHERE session_id = $1 AND type = 'session_started' ORDER BY id DESC LIMIT 1`,
           [sessionId],
         )).rows[0]?.tool);
-        if (tool) p.tool = tool;
+        if (tool) {
+          p.tool = tool;
+          // Its title named the agent's id: named by the tool now, unless it is no longer the title it was made with.
+          await q("UPDATE claw_work_items SET title = $3 WHERE item_id = $1 AND title = $2", [
+            item.item_id, remoteTitle(p.machine, p.agent_id, p.asked, p.lang), remoteTitle(p.machine, remoteAgentName(p), p.asked, p.lang),
+          ]);
+        }
       }
       const said = await applyTerminal(events, p, board, write, await approvalsEnabled(owner, q));
       // A message filed under the item is the one that told the user of its current wait (one per `attention_seq`): the last request
