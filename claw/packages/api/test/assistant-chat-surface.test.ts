@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { CHAT_REPLY_RULE, chatSurface, DEFAULT_CHANNEL } from "../src/assistant/chat-surface.js";
+import { CHAT_REPLY_RULE, chatSurface, DEFAULT_CHANNEL, turnChatSurface } from "../src/assistant/chat-surface.js";
 import { readToolsOfPlugin, ROUTER_RULES } from "../src/assistant/read-tools.js";
 import { renderRouterReadSection } from "../src/assistant/prompts.js";
 
@@ -40,4 +40,22 @@ test("CS3 the GitHub line tells a person without GitHub to bind it where they ta
   const other = renderRouterReadSection({ ...shown, where: "in the chat" });
   assert.match(other, /sending \/github bind to Clawy in the chat \(/);
   assert.doesNotMatch(other, /Teams/);
+});
+
+test("CS4 a turn's own message decides its channel; only a turn with no message of the person's follows their latest", async () => {
+  /** A session whose rows are `rows` (message id -> channel_context.channel, null for none), newest last. */
+  const querier = (rows: Array<[string, string | null]>) => async (text: string, params?: unknown[]) => {
+    if (text.includes("message_id = $2")) {
+      const row = rows.find(([id]) => id === params?.[1]);
+      return { rows: row ? [{ channel: row[1] }] : [] } as never;
+    }
+    const named = rows.filter(([, channel]) => channel);
+    return { rows: named.length ? [{ channel: named.at(-1)![1] }] : [] } as never;
+  };
+  const rows: Array<[string, string | null]> = [["m1", "chatapp"], ["m2", null], ["m3", "teams"], ["m4", "chatapp"]];
+  assert.equal((await turnChatSurface(querier(rows), "s", "m2")).channel, "teams", "a message that names none is Teams'");
+  assert.equal((await turnChatSurface(querier(rows), "s", "m3")).channel, "teams");
+  assert.equal((await turnChatSurface(querier(rows), "s", "m4")).channel, "chatapp");
+  assert.equal((await turnChatSurface(querier(rows), "s", "report")).channel, "chatapp", "no message: the latest that names one");
+  assert.equal((await turnChatSurface(querier([]), "s", "report")).channel, "teams");
 });
