@@ -5,7 +5,8 @@
  * Temporary directories for the tests, removed when the test file ends. Every directory `tmpdir` makes is
  * recorded; the file's `after` hook first runs what `onCleanup` registered (a connector to stop, a stand-in Claw to
  * close), newest first, then kills the adapters still recorded in a children.json under them (they run detached and
- * would outlive the file), so nothing is still writing, and then removes the directories. A file that dies before its
+ * would outlive the file) and every process the file itself started that is still running (SIGTERM, SIGKILL after a
+ * short grace), so nothing is still writing, and then removes the directories. A file that dies before its
  * hooks run (an uncaught error, `process.exit`) does the same, synchronously, on the process's `exit`; one interrupted by
  * SIGINT, SIGTERM or SIGHUP runs the whole cleanup first and then ends by that signal.
  *
@@ -16,7 +17,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after } from "node:test";
-import { ChildRegistry } from "../../src/children.js";
+import { ChildProcess } from "node:child_process";
+import { ChildRegistry, processStart } from "../../src/children.js";
 
 const made = new Set<string>();
 const closers: Array<() => unknown> = [];
@@ -94,6 +96,68 @@ function killRecordedAdapters(): void {
   }
 }
 
+/**
+ * Every process this file's own process starts (spawn, exec, execFile and fork all go through ChildProcess#spawn, the
+ * connector's adapters included), so that none outlives the file: a test's detached sleeper or stand-in agent, or one
+ * that ignores SIGTERM, was left running for good by an interrupted run, its group untouched by the signal `timeout`
+ * or Ctrl-C sends. A detached child leads its own group and the group is stopped; any other only the child itself.
+ */
+interface Started { child: ChildProcess; pid: number; detached: boolean; start: string | null }
+const started: Started[] = [];
+/** Node's own, undeclared in its types: every child_process function that starts a process calls it on a new ChildProcess. */
+type SpawnMethod = (this: ChildProcess, options: { detached?: boolean }) => unknown;
+const proto = ChildProcess.prototype as unknown as { spawn: SpawnMethod };
+const spawnChild = proto.spawn;
+proto.spawn = function (this: ChildProcess, options: { detached?: boolean }) {
+  const ret = spawnChild.call(this, options);
+  if (Number.isInteger(this.pid) && this.pid! > 1) {
+    // Read now, while the child cannot have been reaped: a pid recycled later then no longer matches.
+    started.push({ child: this, pid: this.pid!, detached: options?.detached === true, start: process.platform === "linux" ? processStart(this.pid!) : null });
+  }
+  return ret;
+};
+
+const groupAlive = (pgid: number): boolean => {
+  try { process.kill(-pgid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+};
+/** The id to signal for `s` (negative for a group), or null when nothing of it is left or the pid is someone else's now. */
+function target(s: Started): number | null {
+  if ([process.pid, process.ppid].includes(s.pid)) return null;
+  const exited = s.child.exitCode !== null || s.child.signalCode !== null;
+  const now = process.platform === "linux" ? processStart(s.pid) : (exited ? null : "");
+  const same = process.platform === "linux" ? now !== null && now === s.start : !exited;
+  if (s.detached) {
+    // The leader still the child started, or gone with its group living on (a group id is not handed out while any
+    // member lives): the connector's own rule for its adapters (ChildRegistry.isOurs).
+    if (same || (now === null && groupAlive(s.pid))) return -s.pid;
+    return null;
+  }
+  return same && !exited ? s.pid : null;
+}
+/** Send `sig` to what of `of` is still running; returns those it was sent to. */
+function signalStarted(sig: NodeJS.Signals, of: Started[] = started): Started[] {
+  const sent: Started[] = [];
+  for (const s of of) {
+    const id = target(s);
+    if (id === null) continue;
+    try { process.kill(id, sig); sent.push(s); } catch { /* gone */ }
+  }
+  return sent;
+}
+/** How long what this file started gets, after SIGTERM, to end before it is sent SIGKILL. */
+const CHILD_GRACE_MS = 1_000;
+/** SIGTERM what this file started and is still running, then SIGKILL what is left after CHILD_GRACE_MS. */
+async function stopStarted(): Promise<void> {
+  let live = signalStarted("SIGTERM");
+  for (let by = Date.now() + CHILD_GRACE_MS; live.length > 0 && Date.now() < by;) {
+    await new Promise((r) => setTimeout(r, 25));
+    live = live.filter((s) => target(s) !== null);
+  }
+  signalStarted("SIGKILL", live);
+}
+/** Synchronous, for `exit` and for an interrupted file whose cleanup ran out of time: SIGKILL, no grace. */
+function killStarted(): void { try { signalStarted("SIGKILL"); } catch { /* the directories go regardless */ } }
+
 function removeAll(): void {
   for (const dir of made) {
     forceRemove(dir);
@@ -102,8 +166,9 @@ function removeAll(): void {
 }
 
 /**
- * Close what was registered (newest first), kill the adapters still recorded under the directories made, then remove
- * them. Safe to call more than once.
+ * Close what was registered (newest first), kill the adapters still recorded under the directories made, stop what
+ * this file started and left running (SIGTERM, then SIGKILL after CHILD_GRACE_MS), then remove the directories. Safe to
+ * call more than once.
  */
 export async function cleanupTmp(): Promise<void> {
   for (const close of closers.splice(0).reverse()) {
@@ -111,6 +176,7 @@ export async function cleanupTmp(): Promise<void> {
   }
   // What a stopped connector still lists is what it could not stop, or what a test recorded and left.
   try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
+  try { await stopStarted(); } catch { /* the directories go regardless */ }
   removeAll();
 }
 
@@ -120,6 +186,7 @@ after(cleanupTmp);
 process.on("exit", () => {
   runExitSync();
   try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
+  killStarted();
   removeAll();
 });
 
@@ -143,6 +210,7 @@ function onSignal(sig: (typeof SIGNALS)[number]): void {
     ended = true;
     runExitSync();
     try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
+    killStarted();
     removeAll();
     for (const s of SIGNALS) process.removeListener(s, onSignal);
     // Another listener (none of ours) keeps the process alive after a re-raise: exit with the code the signal would give.
