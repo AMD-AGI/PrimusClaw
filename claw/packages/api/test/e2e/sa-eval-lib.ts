@@ -18,7 +18,9 @@
  *                    session, named in channel_context.files); fixture is a path relative to the cases directory.
  *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?}) is sent
  *                    with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through `files`)
- *   route            answer | item | review | confirm | clarify         expected handling of the last turn
+ *   route            answer | item | review | confirm | clarify         expected handling of the last turn; clarify: answered in the
+ *                    chat with a final reply that asks the person (`asksUser`: a question mark, a request for what is missing, or a
+ *                    choice put to them)
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
  *   said             true: the last turn must have answered with a message of its own: a say of the router's, or the plain text it
@@ -939,6 +941,8 @@ export interface Say {
   fallback: boolean;
   /** The files the message hands the user (a worker's deliveries), with the item whose worker delivered each. */
   files: SaidFile[];
+  /** The options of the choice the message puts to the user (its `choices`), in order; empty when it puts none. */
+  choices: string[];
 }
 
 export const saysOf = (events: readonly LiveEvent[]): Say[] => events
@@ -955,6 +959,7 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     files: (Array.isArray(e.data.files) ? e.data.files : []).filter((f: any) => f && typeof f.name === "string").map((f: any) => ({
       name: String(f.name), content_type: String(f.content_type ?? ""), item_id: typeof f.item_id === "string" ? f.item_id : null,
     })),
+    choices: (Array.isArray(e.data.choices?.options) ? e.data.choices.options : []).filter((o: unknown) => typeof o === "string"),
   }));
 
 /** The files the user was handed by these items' messages, in order. */
@@ -1309,6 +1314,8 @@ export interface Observed {
   /** Every text the user was shown in the case (in baseline: the session's answers). */
   shown: string[];
   final: string;
+  /** The options of the choice the final answer put to the user (assistant mode; absent in baseline and in older recordings). */
+  finalChoices?: number;
   firstReplyMs: number | null;
   finalMs: number | null;
   /** Per turn: when its own first reply arrived, from when it was sent. */
@@ -1448,6 +1455,66 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
   return { applies: true, pass: lang === "zh" ? ratio >= 0.2 : ratio < 0.05, detail: `cjk ${ratio.toFixed(2)}` };
 }
 
+/**
+ * Whether a reply asks the person for what is missing, the check of `route: clarify`: it has a question mark (as before: whatever the
+ * question, the judge reads what it asks); or it puts a choice to them (`choices`: two options or more); or it asks in so many words,
+ * in Chinese or English ("请说明一下…", "请告诉我…", "Send me the repository", "Could you tell me…"), which a router often writes
+ * instead of a question. Those words count only outside a generic closing offer: each sentence is read clause by clause, and a clause
+ * that opens with an offer ("如果有任何问题，请告诉我", "Let me know if you need anything else") is set aside, so an answer that ends
+ * with one does not ask, while "If you need more details, please send the repository" does (its second clause). Not counted: a
+ * question without its mark ("哪个仓库"), and "我需要仓库名" (as often the assistant's own next step, "我需要确认仓库名").
+ */
+export function asksUser(text: string, choices = 0): boolean {
+  if (choices >= 2 || /[?？]/.test(text)) return true;
+  // The sentences of the reply (a list item or a line is one), and the clauses of each that are no offer.
+  const sentences = text.split(/[。！!；;\n]+|(?<=[.])\s+/).map((t) => t.trim()).filter(Boolean);
+  return sentences.some((sentence) => {
+    const kept = sentence.split(/[,，]/).map((c) => c.replace(/^[^\p{L}\p{N}]+/u, "").trim())
+      .filter((c) => c && !CLOSING_OFFER.test(c) && !NEGATED.test(c));
+    return kept.length > 0 && ASKS.some((re) => re.test(kept.join(", ")));
+  });
+}
+/** A clause that says no request is needed ("不需要你提供仓库名", "No need to send the repository"). */
+const NEGATED = /不需要|不用|无需|不必|不想|没必要|\b(no need|don't need|do not need|not necessary|needn't)\b/i;
+/** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
+const CLOSING_OFFER = new RegExp([
+  String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?(有|需要)(任何|其他|别的|更多|什么)?(问题|疑问|需要|帮助|事|其他|别的)`,
+  String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?有(任何|其他|别的|更多)`,
+  String.raw`^(如|若)?有(任何|其他|别的|什么)?(问题|需要|疑问|事)`,
+  String.raw`^(还)?需要(任何|其他|别的|什么)`,
+  String.raw`^(有)?需要的话`,
+  // A bare "tell me" with nothing to tell, whatever courtesy leads it: the second half of "如果有任何问题，欢迎随时告诉我" / "If you
+  // have questions, feel free to let me know". "把题目告诉我" names what to tell, so it is no offer.
+  String.raw`^(请|欢迎|可以|随时|都|也|再|就|直接|您|你|尽管|还)*(告诉|联系|找|问)(我|我们)(一声|就好|就行|即可)?[。！!.~～]*$`,
+  String.raw`^(please |feel free to |just |do |you can )*(let me know|tell me|reach out|ask( me)?|contact me)[.!]*$`,
+  String.raw`^随时(告诉|找|问|联系)(我|我们)?[。！!.?？~～]*$`,
+  String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
+  String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,
+  String.raw`^if (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
+  String.raw`^(please |just |do |feel free to )*(let me know|tell me) if\b`,
+  String.raw`^(feel free|anything else|any (other |more |further )?questions?|is there anything else|do you have any (other |more |further )?questions?|hope this helps)\b`,
+].join("|"), "i");
+/** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
+const ASKS: readonly RegExp[] = [
+  /(请|麻烦)(你|您)?(直接|再|先|具体|简单|帮忙|帮我|尽快|尽早|务必|及时|一并|也)*(说明|说一下|说下|讲一下|讲讲|告诉|告知|补充|提供|确认|给出|回复|指明|明确|描述|选择|选一)/,
+  /请(你|您)?(直接|再|帮忙|尽快|务必)*(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)/,
+  // Asked of the person ("需要你补充一下"), not the assistant saying what it does next ("我确认一下", "先简单说明一下").
+  /请问|麻烦(你|您)?(说明|告诉|告知|补充|提供|确认|发|给)|(?<!(你|您|过|经|曾|已)[^，,。]{0,6})告诉我|发给我(?!们)|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
+  // "把仓库名发我", "请把…发我", "需要你提供…", "我需要知道…" / "我需要仓库名" (not "我需要先查一下": what the assistant does next).
+  /(?<![我会来])把.{1,30}(发|告诉|给|发给)我(?!们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
+  // "我需要知道…"; a bare "我需要…" is not counted: "我需要确认仓库名" is the assistant's own next step as often as a request.
+  /我(还|们)?需要知道(?!的)/,
+  // An imperative that opens the clause and names what to give ("说一下要做什么", "给我题目和要求"; not "给我一点时间").
+  /^(请)?(再)?(说|讲)(一下|一声)|^(请)?(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)|^(请)?(你|您)?告知(我|我们)/,
+  /(你|您)(是)?(指|想|希望|说的是)[^。\n]{0,40}还是/,
+  /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
+  /\b(please|kindly)( \w+ly| just| also| help me| make sure to)* (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
+  /\b(let me know|tell me) (which|what|where|who|when|how|whether)\b/i,
+  /\bI (still )?need (to know|more (details|information|info)|a few details|some details|your|the (name|repo|repository|id|link|path|test|job|cluster|workload))\b/i,
+  // Only as the sentence's own request ("Send me the repo", "If it is elsewhere, send me its name"), not "I'll send the report".
+  /(^|[,:]\s*)[^\p{L}\p{N}]*(reply|respond) with\b|(^|[,:]\s*)[^\p{L}\p{N}]*send (me|those|these|them|the|it|its|their)\b|\bdo you mean\b/iu,
+];
+
 /** The deterministic checks of a case. Checks that do not apply in a mode are listed as skipped, never as passed silently. */
 export function grade(c: EvalCase, o: Observed): Check[] {
   const out: Check[] = [];
@@ -1456,7 +1523,11 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   if (c.route) {
     const name = `route=${c.route}`;
     if (o.mode === "baseline") skip(name);
-    else if (c.route === "clarify") out.push({ name, pass: o.route === "answer" && /[?？]/.test(o.final), detail: `was ${o.route}` });
+    // Asked in the chat: no item, no card, and a reply that asks (a question, a request for what is missing, or a choice).
+    else if (c.route === "clarify") {
+      const asks = asksUser(o.final, o.finalChoices ?? 0);
+      out.push({ name, pass: o.route === "answer" && asks, detail: o.route === "answer" && !asks ? "answered without asking" : `was ${o.route}` });
+    }
     else out.push({ name, pass: o.route === c.route, detail: `was ${o.route}` });
   }
   // A question answered in the chat starts no work, whatever the case lists.
