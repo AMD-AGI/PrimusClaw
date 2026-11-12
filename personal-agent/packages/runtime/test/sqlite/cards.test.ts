@@ -310,21 +310,19 @@ test("a choice card keeps its options for a day, is sent once with what was pick
     chosen: [],
     lang: "zh",
     state: "open",
-    busyAt: 0,
     createdAt: store.now(),
   });
-  assert.equal(buttons.claimChoiceCard(card, ["staging"], 120), true);
-  assert.equal(buttons.claimChoiceCard(card, ["prod"], 120), false, "of two presses exactly one sends");
+  assert.equal(buttons.claimChoiceCard(card, ["staging"]), true);
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "of two presses exactly one sends");
   assert.deepEqual([buttons.getChoiceCard(card)?.state, buttons.getChoiceCard(card)?.chosen], ["busy", ["staging"]]);
-  assert.equal(buttons.getChoiceCard(card)?.busyAt, store.now());
-  advanceSeconds(clock, 121);
-  assert.equal(buttons.claimChoiceCard(card, ["staging"], 120), true, "a send never finished may be taken over");
+  advanceSeconds(clock, 3600);
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "never taken over while a press sends it");
   assert.equal(buttons.moveChoiceCard(card, "done", { onlyFrom: "busy" }), true);
-  assert.equal(buttons.claimChoiceCard(card, ["prod"], 0), false, "never once it was sent");
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "never once it was sent");
   assert.deepEqual([buttons.getChoiceCard(card)?.state, buttons.getChoiceCard(card)?.chosen], ["done", ["staging"]]);
   const single = buttons.addChoiceCard("aad-a", { text: "", options: ["a", "b"], multiple: false, lang: "" });
   assert.equal(buttons.getChoiceCard(single)?.multiple, false);
-  assert.equal(buttons.claimChoiceCard("forged", ["a"], 0), false);
+  assert.equal(buttons.claimChoiceCard("forged", ["a"]), false);
   advanceSeconds(clock, ASSISTANT_MESSAGE_KEEP_SECONDS + 1);
   assert.equal(buttons.getChoiceCard(card), null);
   const kept = buttons.addChoiceCard("aad-a", { text: "", options: ["a", "b"], multiple: false, lang: "" });

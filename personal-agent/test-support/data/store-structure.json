@@ -59,7 +59,7 @@
     "type": "table",
     "name": "assistant_choice_cards",
     "tbl_name": "assistant_choice_cards",
-    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open',\n  busy_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL)"
+    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
    },
    {
     "type": "table",
@@ -783,14 +783,6 @@
      },
      {
       "cid": 8,
-      "name": "busy_at",
-      "type": "REAL",
-      "notnull": 1,
-      "dflt_value": "0",
-      "pk": 0
-     },
-     {
-      "cid": 9,
       "name": "created_at",
       "type": "REAL",
       "notnull": 1,
@@ -3148,7 +3140,7 @@
     "type": "table",
     "name": "assistant_choice_cards",
     "tbl_name": "assistant_choice_cards",
-    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open',\n  busy_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL)"
+    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
    },
    {
     "type": "table",
@@ -3872,14 +3864,6 @@
      },
      {
       "cid": 8,
-      "name": "busy_at",
-      "type": "REAL",
-      "notnull": 1,
-      "dflt_value": "0",
-      "pk": 0
-     },
-     {
-      "cid": 9,
       "name": "created_at",
       "type": "REAL",
       "notnull": 1,

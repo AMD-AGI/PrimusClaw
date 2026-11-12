@@ -24,7 +24,7 @@
         "items": [
          {
           "size": "Medium",
-          "text": "✅ 已发送：prod（生产）、staging（测试）",
+          "text": "✅ 你选了：prod（生产）、staging（测试）",
           "type": "TextBlock",
           "weight": "Bolder",
           "wrap": true

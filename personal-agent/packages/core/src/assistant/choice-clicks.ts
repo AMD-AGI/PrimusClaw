@@ -4,12 +4,13 @@
 /**
  * Send on a choice the assistant put to the person (`assistant_choice`): what they picked becomes their next message, exactly as if
  * they had typed it, through the router's whole path (their rate, their chat, the assistant), so the assistant reads it as any
- * other message. The card is not trusted: its button carries only the id of the card this worker recorded, the options are read
- * from the record, and a pick the card never offered is no pick. A press claims the card first ('busy'), so of two presses exactly
- * one sends; it is 'done' only once the router took the message, and only then is the card replaced in place by what was sent (and
- * the same line said as a message: a phone does not redraw an edited card). A send that failed gives the card back to be pressed
- * again; one the worker never finished (it stopped mid-send) may be pressed again after `CHOICE_SEND_SECONDS`, and sends what
- * was claimed, under the same message id. In a group chat the press is the presser's message there.
+ * other message, and what becomes of it (taken, queued, or the person told it could not be sent, as for a typed one) is that
+ * path's. The card is not trusted: its button carries only the id of the card this worker recorded, the options are read from the
+ * record, and a pick the card never offered is no pick. A press claims the card first ('busy'), so of two presses exactly one
+ * sends; it is 'done' once the router took the message, and only then is the card replaced in place by what was picked (and the
+ * same line said as a message: a phone does not redraw an edited card). A send that threw before the router took it gives the
+ * card back to be pressed again. A card is never taken over while 'busy' (two sends could then both reach Claw): one whose worker
+ * stopped mid-send says so, and the person replies in the chat. In a group chat the press is the presser's message there.
  */
 import { viewMessage } from "../approvals/click.js";
 import { errorName } from "../errors.js";
@@ -26,9 +27,6 @@ import { finish } from "./finish.js";
 export const CHOICE_VERB = "assistant_choice";
 /** The id of a choice card's input, whose value is the picked options' places on the card ("0", "0,2"). */
 export const CHOICE_INPUT = "choice";
-/** How long a press may be sending before another press may take the card over (the first one's worker stopped mid-send). */
-export const CHOICE_SEND_SECONDS = 120;
-
 export interface ChoiceClickDeps {
   readonly store: Pick<StorePort, "assistantButtons">;
   /** Handles `message` as the router handles one the person typed (`Router.handle`); throws when it was not handled. */
@@ -107,13 +105,17 @@ export class AssistantChoiceClicks implements ClickHandler {
       await this.sent(click, card, card.chosen, lang, false); // (pressed again: what was sent is shown, nothing is sent again)
       return;
     }
-    // (a card left 'busy' is a send that never finished: what it claimed is what goes, under the same message id)
-    const chosen = card.state === "busy" ? [...card.chosen] : pickedOn(card, click.action.data[CHOICE_INPUT]);
+    if (card.state !== "open") {
+      // (a press is sending it: nothing is sent again)
+      await click.settle(t.choiceSending({ answer: card.chosen.join(t.choiceJoin) }), { announce: false });
+      return;
+    }
+    const chosen = pickedOn(card, click.action.data[CHOICE_INPUT]);
     if (!chosen.length || (!card.multiple && chosen.length > 1)) {
       await this.again(click, card, lang, t.choiceNone);
       return;
     }
-    if (!buttons.claimChoiceCard(card.cardId, chosen, CHOICE_SEND_SECONDS)) {
+    if (!buttons.claimChoiceCard(card.cardId, chosen)) {
       const now = buttons.getChoiceCard(card.cardId) ?? card; // (a double press loses here)
       if (now.state === "done") await this.sent(click, now, now.chosen, lang, false);
       else await click.settle(t.choiceSending({ answer: now.chosen.join(t.choiceJoin) }), { announce: false });
@@ -138,7 +140,7 @@ export class AssistantChoiceClicks implements ClickHandler {
     await click.settle(viewMessage({ name: "choiceCard", model }), { announce: false });
   }
 
-  /** The card replaced by what was sent (said as a line too when `announce`). */
+  /** The card replaced by what was picked and sent (said as a line too when `announce`). */
   private async sent(
     click: ClickRoute,
     card: ChoiceCard,

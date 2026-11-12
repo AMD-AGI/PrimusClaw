@@ -459,6 +459,6 @@ test("a choice is radio buttons (check boxes for several) whose places are the v
   ]);
   const sent = cardOf(assistantRenderers.choiceChosen({ text: "Which?", chosen: ["a", "c"], lang: "en" }));
   valid(sent);
-  assert.deepEqual(texts(body(sent)), ["✅ Sent: a, c", "Which?"]);
+  assert.deepEqual(texts(body(sent)), ["✅ You picked: a, c", "Which?"]);
   assert.deepEqual(actions(sent), [], "nothing left to press");
 });

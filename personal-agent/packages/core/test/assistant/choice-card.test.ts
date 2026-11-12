@@ -13,21 +13,23 @@
  *   CC5 nothing picked, or several on a single choice: nothing is sent, the card comes back open with a note
  *   CC6 a card that is not the presser's, unknown, or a pick the card never offered: nothing is sent
  *   CC7 in a group chat the press is the presser's own message there, to the bot
- *   CC8 a send that failed is never shown as sent: the card comes back open and a press sends it, once; a send the worker never
- *       finished can be pressed again after a while and sends what was claimed, once; while it is sending, a press sends nothing
+ *   CC8 a send that threw is never shown as picked: the card comes back open and a press sends it, once; a card a press is still
+ *       sending is never sent again
+ *   CC9 a message Claw does not take is told as for a typed one, and typing it again sends it
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { AssistantWorld } from "../../../../test-support/assistant/assistant-world.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
-import { AssistantChoiceClicks, CHOICE_SEND_SECONDS, pickedOn } from "../../src/assistant/choice-clicks.js";
+import { AssistantChoiceClicks, pickedOn } from "../../src/assistant/choice-clicks.js";
 import { choiceOf } from "../../src/assistant/events.js";
+import { ClawError } from "../../src/claw/errors.js";
 import { SayPlanner } from "../../src/assistant/say.js";
 import { silentLogger } from "../../src/ports/logger.js";
 import type { OutMessage } from "../../src/ports/surface.js";
 import { ALICE, BOB } from "../routing/fixtures.js";
-import { clickOf, link, said, world } from "../routing/world.js";
+import { clickOf, link, message, said, world } from "../routing/world.js";
 
 const VERB = "assistant_choice";
 
@@ -154,7 +156,7 @@ test("CC2 Send in a 1:1 chat: the pick is the person's next message to the assis
   const shown = viewOf(updates[0].message);
   assert.ok(shown.name === "choiceChosen");
   assert.deepEqual([shown.model.chosen, shown.model.text, shown.model.lang], [["staging"], "部署到哪个集群？", "zh"]);
-  assert.ok(said(w).includes("已发送：staging"), "and said as a line, for a phone");
+  assert.ok(said(w).includes("你选了：staging"), "and said as a line, for a phone");
   const recorded = aw.store.assistantButtons.getChoiceCard(id);
   assert.deepEqual([recorded?.state, recorded?.chosen], ["done", ["staging"]]);
 });
@@ -202,7 +204,7 @@ test("CC4 several picked: one message, in the card's order, joined in the card's
   await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: zh, choice: "0,2,2" }));
   await w.router.settled();
   assert.deepEqual(heard(), ["AMD-AGI/PrimusClaw, AMD-AGI/Primus-Turbo", "日报、月报"]);
-  assert.ok(said(w).includes("Sent: AMD-AGI/PrimusClaw, AMD-AGI/Primus-Turbo"));
+  assert.ok(said(w).includes("You picked: AMD-AGI/PrimusClaw, AMD-AGI/Primus-Turbo"));
 });
 
 test("CC5 nothing picked, or several on a single choice: nothing is sent and the card comes back open with a note", async () => {
@@ -251,10 +253,10 @@ test("CC7 in a group chat the press is the presser's own message there, to the b
   const run = w.turns.runs.at(-1);
   assert.ok(run, "the group's turn was started by the press");
   assert.deepEqual([run.userId, run.text, run.group], [BOB.id, "staging", true]);
-  assert.ok(said(w).includes("已发送：staging"));
+  assert.ok(said(w).includes("你选了：staging"));
 });
 
-test("CC8 a send that failed is given back: never shown as sent, and the next press reaches the assistant exactly once", async () => {
+test("CC8 a send that threw is given back: never shown as picked, and the next press reaches the assistant exactly once", async () => {
   const { aw, w, card, heard, failing } = await choiceWorld();
   const id = card({ options: ["prod", "staging"] });
   failing.next = 1;
@@ -264,7 +266,7 @@ test("CC8 a send that failed is given back: never shown as sent, and the next pr
   const back = viewOf(w.surface.outbox.filter((r) => r.op === "update").at(-1)?.message);
   assert.ok(back.name === "choiceCard");
   assert.equal(back.model.note, "没有发出去，请再点一次发送。");
-  assert.ok(!said(w).some((t) => t.startsWith("已发送")), "never said to be sent");
+  assert.ok(!said(w).some((t) => t.startsWith("你选了")), "never said to be sent");
 
   await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "1" }));
   await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "1" }));
@@ -273,20 +275,37 @@ test("CC8 a send that failed is given back: never shown as sent, and the next pr
   assert.equal(aw.store.assistantButtons.getChoiceCard(id)?.state, "done");
 });
 
-test("CC8 a send the worker never finished: a press while it may still run sends nothing; after a while one sends what was claimed", async () => {
+test("CC8 a card a press is still sending is never sent again, however long it waits: the person is told to reply in the chat", async () => {
   const { aw, w, card, heard } = await choiceWorld();
   const id = card({ options: ["prod", "staging"] });
-  // (a press claimed it and the worker stopped before the router took the message)
-  assert.ok(aw.store.assistantButtons.claimChoiceCard(id, ["staging"], CHOICE_SEND_SECONDS));
-
+  // (a press claimed it and its worker stopped before the router took the message)
+  assert.ok(aw.store.assistantButtons.claimChoiceCard(id, ["staging"]));
   await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "0" }));
-  assert.deepEqual(heard(), [], "it may still be sending");
-  assert.ok(said(w).includes("note::正在发送：staging"), "the card says it is being sent");
-
-  advanceSeconds(aw.clock, CHOICE_SEND_SECONDS + 1);
-  await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "0" }));
+  advanceSeconds(aw.clock, 3600);
   await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "0" }));
   await w.router.settled();
-  assert.deepEqual(heard(), ["staging"], "what was claimed, once");
-  assert.equal(aw.store.assistantButtons.getChoiceCard(id)?.state, "done");
+  assert.deepEqual(heard(), [], "never a second send that could race the first");
+  assert.equal(
+    said(w).filter((t) => t === "note::正在发送：staging。如果一直没有回应，请直接在聊天里回复。").length,
+    2,
+  );
+});
+
+test("CC9 Claw refusing the message is told as for a typed one: the person learns it was not delivered and can type it", async () => {
+  const { aw, w, card, heard } = await choiceWorld();
+  const id = card({ options: ["prod", "staging"] });
+  aw.claw.fail.set("send", new ClawError(503, "unavailable"));
+  await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "1" }));
+  await w.router.settled();
+  assert.deepEqual(heard(), []);
+  const out = said(w);
+  assert.ok(out.includes("你选了：staging"), "the card says what was picked, not that it arrived");
+  assert.ok(
+    out.some((t) => t.startsWith("I cannot reach your assistant just now") || t.startsWith("暂时连不上你的助理")),
+    `the assistant path's own notice for a message Claw did not take: ${out.join(" | ")}`,
+  );
+  aw.claw.fail.delete("send");
+  await w.router.handle(message("staging"));
+  await w.router.settled();
+  assert.deepEqual(heard(), ["staging"], "typed again, it goes");
 });
