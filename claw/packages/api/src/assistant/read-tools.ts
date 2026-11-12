@@ -91,9 +91,13 @@ export function readToolPatterns(server: string): string[] {
  * the user the exact comment on a card, and only their press posts it (`schedules.ts`); a draft is written from what was read, so it
  * must come after the reads. `devenv_pair` shows the user, in their own chat, a one-time code that connects nothing until they run
  * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs). `pr_state` only reads where a
- * pull request stands (`review-tools.ts`).
+ * pull request stands (`review-tools.ts`). `skill_read` reads one of the user's own personal skills (`skill-tools.ts`).
+ *
+ * None of them is a source of the rule (`read_taint.sources` is the lookups alone): what they read is the user's or Claw's own, so
+ * reading it never stops the turn from acting. `skill_read` above all: a router that read a skill must still start the work it
+ * describes.
  */
-export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"] as const;
+export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "skill_read", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"] as const;
 
 /** The tool a router turn speaks with (`router-turn-end.ts`, `saidOnlyBeforeLookups`). */
 export const ROUTER_SPEAK_TOOL = "say";
@@ -103,7 +107,7 @@ export const ROUTER_SPEAK_TOOL = "say";
  * not derived from AFTER_READ_TOOLS, which also holds what speaks or drafts after a read (`deliver_text`, `github_comment`).
  */
 export const ROUTER_ASSISTANT_READS: readonly string[] = [
-  "work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
+  "work_recall", "memory_recall", "skill_read", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
 ];
 
 /**

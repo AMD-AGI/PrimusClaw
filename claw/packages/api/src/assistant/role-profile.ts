@@ -29,7 +29,7 @@ import { replyLanguageFor, withReplyLanguage, type ChosenLanguage } from "./lang
 import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
-  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
+  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_SKILLS_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
   ROUTER_DEVENV_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
   type AskedOfOtherLine, type ManifestItem,
@@ -59,6 +59,7 @@ import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
 import { disciplineOn } from "./discipline.js";
 import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
 import { routerCite } from "./citations.js";
+import { routerSkillParts } from "./skill-tools.js";
 import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
 const logger = pino({ name: "assistant-role" });
@@ -318,7 +319,8 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The plugin's log reads: bounded to their last lines, and masked before the model reads them (Brain, `log-reads.ts`).
     if (lookups.logReads) task.log_reads = lookups.logReads;
     else delete task.log_reads;
-    // Nor the user's personal skills (`user_skills`): that list is for a turn that works in a sandbox, which is the worker's.
+    // Nor the user's personal skills as a worker is told of them (`user_skills`): that list is for a turn that works in a sandbox. The
+    // router's own are listed with its message and read with skill_read (`skill-tools.ts`), below.
     for (const field of ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
     task.user_skills_enabled = false;
     if (read) {
@@ -398,6 +400,13 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ? await routerTurnRecall(role.userId, sessionId, message.content)
       : null;
     if (recall) state.push(recall.text);
+    // The user's personal skills (`skill-tools.ts`): what skill_read is in the system prompt, the same on every turn; the list of them
+    // with the message, so that saving or using one changes no system prompt.
+    const skills = await routerSkillParts(role.userId, sessionId);
+    if (skills) {
+      withSystemAppend(task, skills.prompt);
+      if (skills.list) state.push(skills.list);
+    }
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
@@ -432,6 +441,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(recall ? { turnRecall: recall.ids } : {}),
+      ...(skills ? { userSkills: ROUTER_SKILLS_PROMPT_VERSION, userSkillsListed: skills.list !== null } : {}),
       ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),

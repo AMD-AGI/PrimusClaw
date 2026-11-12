@@ -159,6 +159,30 @@ const assistantRouterUnsaidTotal = new Counter({
   registers: [registry],
 });
 
+// The user's personal skills as the assistant's router sees them (`assistant/skill-tools.ts`): the characters of the list a router turn
+// is given with its message, how many turns had to leave some out for its budget, and every `skill_read` by its outcome (`ok`, a
+// skill or file the user does not have `not_found`, or one refused because the conversation is not where their skills are `not_here`).
+// The reads are the signal that a skill was used without being named.
+const userSkillListedChars = new Histogram({
+  name: "claw_user_skill_listed_chars",
+  help: "Characters of the personal skill list given to a turn, by role.",
+  labelNames: ["role"] as const,
+  buckets: [0, 100, 250, 500, 1000, 1500, 2000, 3000],
+  registers: [registry],
+});
+const userSkillTruncatedTotal = new Counter({
+  name: "claw_user_skill_truncated_total",
+  help: "Turns whose personal skill list left skills out for its budget, by role.",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillReadTotal = new Counter({
+  name: "claw_user_skill_read_total",
+  help: "Reads of a personal skill, by role and outcome.",
+  labelNames: ["role", "outcome"] as const,
+  registers: [registry],
+});
+
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
 const admissionDecisionTotal = new Counter({
@@ -425,5 +449,12 @@ export const metrics = {
   },
   onAssistantRouterUnsaid(outcome: RouterUnsaidOutcome): void {
     assistantRouterUnsaidTotal.inc({ outcome });
+  },
+  onUserSkillListed(role: "router", chars: number, truncated: boolean): void {
+    userSkillListedChars.observe({ role }, chars);
+    if (truncated) userSkillTruncatedTotal.inc({ role });
+  },
+  onUserSkillRead(role: "router", outcome: "ok" | "not_found" | "not_here"): void {
+    userSkillReadTotal.inc({ role, outcome });
   },
 };
