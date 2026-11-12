@@ -103,16 +103,16 @@ test("the answered card speaks the chat's language, not the reply's: \"1\" or \"
     const w = waiting({ questions: [question] });
     await w.router.handle(message(typed, { locale }));
     const card = cardUpdate(w);
-    assert.equal(card?.body.type, "view", typed);
-    assert.equal((card.body.view.model as { replied?: string }).replied, "zh", `${typed} ${locale}`);
-    assert.match(card.body.fallbackText ?? "", /^已回答：/, `${typed} ${locale}`);
+    assert.ok(card?.body.type === "view" && card.body.view.name === "questionAnswered", `${typed} ${locale}`);
+    assert.equal(card.body.view.model.replied, "zh", `${typed} ${locale}`);
+    assert.match(card.body.fallbackText, /^已回答：/, `${typed} ${locale}`);
   }
   // and an English chat stays English whatever is typed
   const w = waiting();
   await w.router.handle(message("火锅", { locale: "en-US" }));
   const card = cardUpdate(w);
-  assert.equal(card?.body.type, "view");
-  assert.equal((card.body.view.model as { replied?: string }).replied, "en");
+  assert.ok(card?.body.type === "view" && card.body.view.name === "questionAnswered");
+  assert.equal(card.body.view.model.replied, "en");
 });
 
 test("a card whose id the chat never gave is answered all the same, and the answer is said below it", async () => {
