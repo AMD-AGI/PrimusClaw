@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { ALICE } from "./fixtures.js";
-import { link, message, said, world } from "./world.js";
+import { groupAsked, link, message, said, world } from "./world.js";
 
 function gate(): { promise: Promise<void>; open: () => void } {
   let open = (): void => undefined;
@@ -186,6 +186,7 @@ test("one message queued and /stop says it was dropped, in the chat's language",
 
 test("in a group chat a sender's second message is queued behind their first, not refused", async () => {
   const w = world();
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   link(w, ALICE.id, "ak");
   const first = gate();
   w.turns.hold = first.promise;

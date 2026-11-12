@@ -9,10 +9,11 @@ import type { OutMessage } from "@primusclaw/personal-agent";
 
 import { AI_NOTICE, dataStatement } from "../../src/locales/transparency.js";
 import { ALICE } from "./fixtures.js";
-import { link, message, PUBLIC, said, world } from "./world.js";
+import { groupAsked, link, message, PUBLIC, said, world } from "./world.js";
 
 test("test_help_through_the_worker_in_a_1to1_chat_and_in_a_group", async () => {
   const w = world();
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   link(w, ALICE.id, "ak");
   await w.router.handle(message("/help", { id: "h1" }));
   await w.router.handle(message("你能做什么", { id: "h2" }));

@@ -176,7 +176,8 @@ export class Onboarding {
     try {
       const conversation = await this.openPersonal(chat);
       if (conversation === undefined) throw new Error("no 1:1 conversation");
-      await this.ctx.chatIn(chat, conversation.ref).say(groupText.in(chat.lang()).targeted({ bot: config.botName }));
+      const dm = this.ctx.chatIn(chat, conversation.ref); // (said to them alone: in their language, not the group's)
+      await dm.say(groupText.in(dm.lang()).targeted({ bot: config.botName }));
     } catch (error) {
       logger.warn("group: the 1:1 line about a private message did not go out", { error: errorName(error) });
       return;

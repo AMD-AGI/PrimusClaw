@@ -9,7 +9,7 @@ import type { InboundFile } from "../ports/surface.js";
 import { REPO_HOST } from "../commands/repo.js";
 import { routingText } from "../locales/routing.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
-import type { Chat } from "./chat.js";
+import { groupChosenLang, type Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 import { answerWaitingQuestion } from "./question-reply.js";
 import { ActiveTurn, chatTurnKey, QUEUED_TURNS_MAX, reviewTurnKey, type TurnKey } from "./turn-registry.js";
@@ -286,10 +286,16 @@ export class TurnStarter {
     };
   }
 
-  /** The language the sender chose to be answered in, for a chat turn (a review's answer follows its request's language). */
+  /**
+   * The language a chat turn is to be answered in, when one was chosen (a review's answer follows its request's language): in a
+   * group the group's (`groupChosenLang`; the sender's own choice is not read there), in a 1:1 chat the person's.
+   */
   private replyLang(request: StartTurn): { replyLang?: Lang } {
     if (request.review !== undefined) return {};
-    const lang = chosenLang(this.ctx.deps.store.prefs.getPrefs(request.chat.sender.id));
+    const { store } = this.ctx.deps;
+    const lang = request.chat.scope
+      ? groupChosenLang(store, request.chat.scope)
+      : chosenLang(store.prefs.getPrefs(request.chat.sender.id));
     return lang === undefined ? {} : { replyLang: lang };
   }
 

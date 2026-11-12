@@ -164,7 +164,13 @@ export function renderHelp(language: string, options: HelpOptions = {}): string 
   const oneToOne = chat.group ? oneToOneBlock(lang, chat, bot) : undefined;
   if (oneToOne !== undefined) out.push(oneToOne);
   out.push(authorityText(zh, chat.parts));
-  if (chat.group) out.push(zh ? "设置只能在和我的 1:1 聊天里改。" : "Settings are changed in a 1:1 chat with me.");
+  if (chat.group)
+    out.push(
+      zh
+        ? `设置只能在和我的 1:1 聊天里改。\n只有这个群的回复语言在群里设：@${bot} 说「这个群用英文」（或中文、跟随提问者）。`
+        : "Settings are changed in a 1:1 chat with me.\n" +
+            `This group's language is set here: @${bot} "use English in this group" (or Chinese, or "follow the asker").`,
+    );
   // (every help: 1:1, group and the assistant's)
   out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"), options.groupContext));
   out.push(

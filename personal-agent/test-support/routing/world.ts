@@ -386,3 +386,8 @@ export function link(w: World, userId: string, key: string): void {
   if (w.store.links.redeemPending(userId, "Someone", w.store.links.stashPending(key)) !== "ok")
     throw new Error("link failed");
 }
+
+/** The group `conversation` was asked which language to use before (no language card at its next @mention). */
+export function groupAsked(w: World, conversation = "g-1"): void {
+  w.store.groupLanguage.markGroupLanguageAsked(conversation);
+}

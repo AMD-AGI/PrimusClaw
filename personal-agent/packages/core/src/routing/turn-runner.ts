@@ -47,8 +47,9 @@ export interface TurnRun {
   readonly files: readonly InboundFile[];
   readonly lang: Lang;
   /**
-   * The language the person chose to be answered in (`/lang zh|en`, `chosenLang`), told to Claw after the message; undefined: they
-   * chose none, and the answer is in the language of what they wrote. A chat turn's only: a group's is the sender's.
+   * The language the turn is to be answered in, told to Claw after the message: in a 1:1 chat the one the person chose (`/lang
+   * zh|en`, `chosenLang`), in a group the group's (`groupChosenLang`); undefined: none was chosen, and the answer is in the language
+   * of what they wrote. A chat turn's only: a review's follows its request.
    */
   readonly replyLang?: Lang;
   /** The answer gets thumbs of the worker's own (a phone, whose own thumbs never reach the worker). */

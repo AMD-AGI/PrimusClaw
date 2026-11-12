@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import type { RemoteAgentCommand, RemotePrompt } from "../../src/routing/features.js";
 import { ALICE } from "./fixtures.js";
-import { link, message, said, world } from "./world.js";
+import { groupAsked, link, message, said, world } from "./world.js";
 
 function attachedWorld(attached = true) {
   const prompts: RemotePrompt[] = [];
@@ -25,6 +25,7 @@ function attachedWorld(attached = true) {
     },
   });
   link(w, ALICE.id, "ak");
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   return { w, prompts, agents, listed };
 }
 

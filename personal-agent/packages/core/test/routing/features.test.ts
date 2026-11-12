@@ -14,7 +14,7 @@ import type {
   UnderstandRequest,
 } from "../../src/routing/features.js";
 import { ALICE } from "./fixtures.js";
-import { clickOf, link, message, said, world } from "./world.js";
+import { clickOf, groupAsked, link, message, said, world } from "./world.js";
 
 function assistantWorld(understands = false) {
   const routed: AssistantRouteRequest[] = [];
@@ -229,6 +229,7 @@ test("a group binds to the sender's agent session, talks to it while bound, and 
   const { w, prompts, agents, attachedKeys } = remoteWorld();
   attachedKeys.clear();
   link(w, ALICE.id, "ak");
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   const g = (text: string) => message(text, { kind: "group", conversation: "g-1" });
   await w.router.handle(g("/agent sessions"));
   await w.router.handle(g("切到 dev-pod 的 claude"));

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { ALICE, BOB } from "./fixtures.js";
-import { link, message, said, world } from "./world.js";
+import { groupAsked, link, message, said, world } from "./world.js";
 
 const CONV = "g-1";
 
@@ -79,6 +79,7 @@ test("test_a_group_session_made_before_it_could_be_shared_is_replaced", async ()
 
 test("test_unlinked_sender_gets_a_chat_reply_and_no_credential_is_used", async () => {
   const w = world();
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   link(w, ALICE.id, "ak-alice");
   await w.router.handle(gmsg("review the PR", { user: BOB }));
   assert.deepEqual(w.turns.calls, []);
@@ -152,6 +153,7 @@ test("asking a group to introduce itself answers with help, which names what a 1
     ["what can you do", "**More in a 1:1 chat with me**", "Connect your own dev machine"],
   ] as const) {
     const w = world({ remote: { enabled: true } });
+    groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
     link(w, ALICE.id, "ak-alice");
     await w.router.handle(gmsg(text));
     await w.router.settled();
@@ -193,25 +195,21 @@ test("test_whoami_in_a_group_does_not_print_the_email", async () => {
   assert.equal(text, "Alice are connected to SaFE user alice.");
 });
 
-test("a group turn carries the language its sender chose, and only theirs", async () => {
+test("a group turn carries no member's own language: with none set for the group, each message's language decides", async () => {
   const w = world();
   link(w, ALICE.id, "ak-alice");
   link(w, BOB.id, "ak-bob");
-  w.store.prefs.setLang(ALICE.id, "en"); // (/lang en in her own 1:1 chat)
+  w.store.prefs.setLang(ALICE.id, "en"); // (/lang en in her own 1:1 chat: not read in a group, group-language.test.ts)
+  w.store.prefs.setLang(BOB.id, "zh");
   await w.router.handle(gmsg("帮我看看这个 PR", { id: "g1" }));
   await w.router.settled();
-  await w.router.handle(gmsg("帮我看看这个 PR", { user: BOB, id: "g2" }));
-  await w.router.settled();
-  w.store.prefs.setLang(BOB.id, "zh");
-  await w.router.handle(gmsg("check this PR", { user: BOB, id: "g3" }));
+  await w.router.handle(gmsg("check this PR", { user: BOB, id: "g2" }));
   await w.router.settled();
   assert.deepEqual(
-    w.turns.runs.map((r) => r.replyLang),
-    ["en", undefined, "zh"],
+    w.turns.runs.map((r) => [r.replyLang, r.lang]),
+    [
+      [undefined, "zh"],
+      [undefined, "en"],
+    ],
   );
-  // /lang auto: what she writes decides again, and nothing is sent.
-  w.store.prefs.setLang(ALICE.id, "en", false);
-  await w.router.handle(gmsg("帮我再看看", { id: "g4" }));
-  await w.router.settled();
-  assert.equal(w.turns.runs.at(-1)?.replyLang, undefined);
 });

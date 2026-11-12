@@ -13,7 +13,7 @@ import { contextInterceptor, DEFAULT_GROUP_CONTEXT, GroupContext, parseContext }
 
 import { openTestStore } from "../../../../test-support/index.js";
 import { ALICE, BOB } from "../routing/fixtures.js";
-import { link, message, said, silent, world } from "../routing/world.js";
+import { groupAsked, link, message, said, silent, world } from "../routing/world.js";
 
 function gmsg(text: string, options: { user?: typeof ALICE; mentioned?: boolean; targeted?: boolean } = {}) {
   const m = message(text, { kind: "group", conversation: "g-1", ...(options.user ? { user: options.user } : {}) });
@@ -31,6 +31,7 @@ function setup(messages = DEFAULT_GROUP_CONTEXT.messages, granted = true) {
   });
   const w = world({ testStore, groupHistory: context, handlers: { groupInterceptors: [contextInterceptor(context)] } });
   link(w, ALICE.id, "ak-alice");
+  groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   return { w, context };
 }
 
@@ -161,6 +162,7 @@ test("a group that said /context off is told, in its own help, that its @mention
   const { w } = setup();
   await w.router.handle(gmsg("/context off"));
   await w.router.handle(gmsg("/help"));
+  groupAsked(w, "g-2");
   await w.router.handle(message("/help", { id: "h-other", kind: "group", conversation: "g-2" }));
   const [offGroup = "", otherGroup = ""] = said(w).slice(-2);
   assert.ok(offGroup.includes(`- ${OLD_SEES_EN}`) && !offGroup.includes(KEPT_EN), offGroup);

@@ -17,6 +17,7 @@ import type { AssistantButtonRepository, AssistantCardRepository, AssistantMessa
 import type { FeedbackRepository } from "./feedback.js";
 import type { GithubConfirmationRepository, ReviewDelegationRepository } from "./github.js";
 import type { GroupContextRepository } from "./group-context.js";
+import type { GroupLanguageRepository } from "./group-language.js";
 import type { IdempotencyRepository } from "./idempotency.js";
 import type { LinkRepository } from "./link.js";
 import type { NotifySubscriptionRepository } from "./notify.js";
@@ -42,6 +43,7 @@ export interface StorePort {
   readonly approvals: ApprovalRepository;
   readonly observe: ObserveRepository;
   readonly groupContext: GroupContextRepository;
+  readonly groupLanguage: GroupLanguageRepository;
   readonly assistantCards: AssistantCardRepository;
   readonly assistantButtons: AssistantButtonRepository;
   readonly assistantMessages: AssistantMessageRepository;
@@ -65,6 +67,7 @@ export type * from "./assistant.js";
 export type * from "./feedback.js";
 export type * from "./github.js";
 export type * from "./group-context.js";
+export type * from "./group-language.js";
 export type * from "./idempotency.js";
 export type * from "./link.js";
 export type * from "./notify.js";
