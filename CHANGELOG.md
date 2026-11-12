@@ -119,6 +119,16 @@ release version, and its `appVersion` stays `latest`.
   session maintenance, no deferred index build or boot-time SYSTEM_ENV publish, and none of the remote agents' wake relay
   or sweeps. For a process serving requests against a database whose other replicas run that work. Startup logs
   `api.background_off` naming every loop skipped; any other value is refused at startup. No schema change (#807).
+- A user's personal skills reach their turns as a list, not as text: a turn of the user's own conversation carries
+  `user_skills` (name, version, description, invocation, fingerprint and origin of each skill that is active and
+  enabled; never a probation, disabled or deleted one), and Brain reads a skill only when it is used, from
+  `POST /v1/internal/skills/read` (SKILL.md and its file list, or one file; the internal token, a live chat turn of
+  the session, and the session's owner as the user). This replaces the per-turn LLM selection that put up to three
+  whole skills into `skills` (`selectSkillsForTask`, and `MAX_SELECTED_SKILLS` with it). Only the user's own
+  conversations get the list, and only they keep what a turn saves: not a group chat (`config.memory: "off"`), a
+  session that acts as a user or runs a review, an assistant router's or observer's turn, an application's run, or a
+  session that carried an A2A, task or DAG run. Brain does not use the list yet. Off while `CLAW_USER_SKILLS_ENABLED`
+  is (#806).
 
 ### Changed
 
