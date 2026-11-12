@@ -15,6 +15,43 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.7.0
+
+A minor release: each group chat gets its own reply language (#775), and the card of a question a terminal asks says how
+that agent's terminal asks (#773). No plugin port (core's `src/plugins/`) changed. The runtime's SQLite store gains one
+table (`group_language`), created at start; nothing to do for a deployment. The `personal-agent-teams` image no longer
+contains npm or npx, which it never ran (#774: the image scan found six HIGH findings in the base image's bundled npm).
+
+**Claw:** the per-agent wording of #773 reads the connector's `terminal_asks` (connector 0.2.0) as Claw passes it from
+claw-v0.3.0 on; with an older Claw or connector a terminal's card keeps Claude Code's wording. The group language works
+with any Claw: it rides on the `[Reply language: ...]` line a plain session reads.
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: each group chat has its own reply language, set by
+  any member with `@Clawy /lang en|zh|auto` or a sentence that names the group ("这个群用英文", "use English in this group",
+  "follow the asker"), and announced in the chat in both languages with who set it. The first @mention in a group with
+  no setting gets a card asking which language to use (中文 / English / 跟随提问者); a pick by any member stores it. In a group
+  the group's setting decides (in 0.6.0 a group turn carried the sender's own `/lang` (#771); now it carries the
+  group's) and the chat's fixed texts follow it; with no setting, or "follow the asker", each message is answered in its
+  own language. A request for one answer in a language ("answer in English", a translation) is not a setting. A person's
+  1:1 chat keeps their own `/lang` (#775).
+
+### Changed
+
+- `@primusclaw/personal-agent`: the core's exported `StorePort` gains a required `groupLanguage` repository
+  (`GroupLanguageRepository`: `groupLanguage`, `setGroupLanguage` and the asked-once marks of the first-@ card). The
+  runtime's SQLite store implements it, so a deployment of the published packages has nothing to do; a store of one's own
+  must add it (#775).
+
+### Fixed
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the card of a question a terminal asks no longer
+  tells every user that "the first answer counts": its note follows the connector's `terminal_asks` (Cursor: the
+  terminal asks only after the card is answered or its wait is over; Codex: typing in the terminal takes the question
+  back), and Cursor's "hand back to the terminal" option is in the person's language (交回终端). Claude Code's wording is
+  unchanged (#773).
+
 ## 0.6.0
 
 A minor release: a choice the assistant puts to the person is a card (#765), a reply language chosen with `/lang`
