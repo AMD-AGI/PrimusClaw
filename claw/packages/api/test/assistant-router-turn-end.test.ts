@@ -25,6 +25,8 @@
  *       text, or silent -- has the answer said by the system at once, once, about the item (release gate run 1108021655-0c1088: the
  *       turn was stopped for the next message and the answer came only from the silent sweep five minutes later); a turn that said it,
  *       naming the item or not, is left alone
+ *   T13 a completion that names no message still returns the answer and the lost-turn notice to the surface of the turn's message
+ *       (read from its runs), not to the surface the person used last
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -494,5 +496,34 @@ describe("assistant router turn end", { skip }, () => {
     const plain = await endedTurn("autopilot 有几台节点");
     assert.equal(await end(plain, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: plain.mid }), "said");
     assert.deepEqual(voids(), []);
+  });
+  test("T13 a completion that names no message still returns the answer, or the lost-turn notice, to the surface of the turn's message", async () => {
+    const teams = await w.subscribe("alice");
+    const slack = await w.subscribe("alice");
+    await w.q("UPDATE claw_notification_subscriptions SET surface = 'slack' WHERE subscription_id = $1", [slack]);
+    await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = 'alice'");
+    // Teams is the surface used last; the turns below answer messages that came from Slack.
+    await w.q("INSERT INTO claw_assistant_surfaces (user_id, surface, last_inbound_at) VALUES ('alice', 'slack', NOW() - interval '1 minute'), ('alice', 'teams', NOW())");
+    const fromSlack = async (prompt: string) => {
+      const turn = await endedTurn(prompt);
+      await w.q(
+        "INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, 'alice', $3, $4::jsonb)",
+        [alice.routerSid, turn.mid, prompt, JSON.stringify({ channel: "slack" })],
+      );
+      return turn;
+    };
+    const subsOf = async (text: RegExp) => (await w.q(
+      "SELECT o.subscription_id, s.text FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id",
+    )).filter((r) => text.test(r.text)).map((r) => r.subscription_id);
+    try {
+      assert.equal(await end(await fromSlack("How is the build going?"), { finalText: "Still running." }), "said");
+      assert.deepEqual(await subsOf(/^Still running\.$/), [slack], "the answer, though the completion named no message");
+      assert.equal(await end(await fromSlack("And the tests?"), { failed: true, finalText: "partial" }), "said");
+      assert.deepEqual(await subsOf(/did not go through/), [slack], "the lost-turn notice too");
+      assert.ok(teams);
+    } finally {
+      await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = 'alice'");
+      await w.q("DELETE FROM claw_assistant_messages WHERE user_id = 'alice'");
+    }
   });
 });

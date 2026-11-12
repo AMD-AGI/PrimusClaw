@@ -91,6 +91,11 @@ export interface SayInput {
    * handed a review to the person's channel says nothing more (`turnHandedOffReview`): its say is refused.
    */
   turnMessageId?: string;
+  /**
+   * The person's message whose turn says it, when the caller knows it but not as `turnMessageId` (a completion that did not name its
+   * message, `router-turn-end.ts`): it only routes the say back to that message's surface (`routeToSurface`).
+   */
+  sourceTurn?: string;
   /** What the message cites, already checked (`citations.ts`): carried by its event to the channel and the web client. */
   sources?: AssistantSaySource[];
   /** Its deliveries are held until this turn (a message id) ends or hands a review over (`say-hold.ts`). */
@@ -437,6 +442,7 @@ async function storeCapNotice(input: SayInput, text: string, deps: SayDeps): Pro
     return storeOne({
       type: "assistant.say", fallback: true, item: null, sayId: id(hour),
       userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
+      ...(input.turnMessageId ? { sourceTurn: input.turnMessageId } : {}),
     });
   }, (stored) => announce(stored, deps));
 }
@@ -676,6 +682,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text: said, item, sources: input.sources, suggested: input.suggested,
         ...(input.choice ? { choice: input.choice } : {}),
         ...(input.turnMessageId ? { turnMessageId: input.turnMessageId } : {}),
+        ...(input.sourceTurn ? { sourceTurn: input.sourceTurn } : {}),
         ...(input.needsIdentity ? { needsIdentity: true } : {}),
         // After the turn's start notice a say adds to that notice (`amends`); otherwise a later say takes the place of the turn's first one.
         ...(notice ? { amends: notice } : replaces ? { replaces } : {}),
