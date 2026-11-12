@@ -16,7 +16,6 @@ import {
   redactText,
   ReviewHandoffAction,
   routedReviewTurns,
-  type ConversationRef,
   type Guardrails,
   type JsonObject,
   type PostWorkCard,
@@ -75,19 +74,6 @@ export function workCardPoster(base: Pick<AssemblyBase, "store">): PostWorkCard 
 export interface ReviewParts {
   readonly service: GithubReview;
   readonly handoff: ReviewHandoffAction;
-}
-
-/** The channel's fields a followed review keeps to open the reviewer's chat again (Python: service_url, tenant, bot_id). */
-function followWire(asked: ConversationRef): Readonly<Record<string, string>> {
-  const wire = asked.wire as JsonObject;
-  const bot = wire["bot"];
-  const botId = typeof bot === "object" && bot !== null && !Array.isArray(bot) ? (bot as JsonObject)["id"] : undefined;
-  const serviceUrl = wire["serviceUrl"];
-  return {
-    service_url: typeof serviceUrl === "string" ? serviceUrl : "",
-    tenant: asked.tenantId,
-    bot_id: typeof botId === "string" ? botId : "",
-  };
 }
 
 /** The chat the service runs in: the router's turns, onboarding, link steps and binding card (Python `Host`). */
@@ -159,7 +145,7 @@ function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost):
       securityLog.event(event as SecurityEventName, fields);
     },
     host,
-    followWire,
+    followWire: (asked) => shape.followWire(asked),
     restoreRef: (stored) => shape.restoreRef(stored),
     owners: review.owners,
     installUrl: shape.installHintUrl,

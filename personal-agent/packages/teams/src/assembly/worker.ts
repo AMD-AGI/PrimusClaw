@@ -7,7 +7,14 @@
  * (the outbound queue or the Bot Connector), its `TeamsSurface` with the Adaptive Card renderers, the inbound queue's
  * consumer, and the release gate's test entry (its routes on the loopback instead of the queue).
  */
-import { NOTE, redactText, type ConversationKind, type JsonObject, type Logger } from "@primusclaw/personal-agent";
+import {
+  NOTE,
+  redactText,
+  type ConversationKind,
+  type ConversationRef,
+  type JsonObject,
+  type Logger,
+} from "@primusclaw/personal-agent";
 import { cryptoRandom } from "@primusclaw/personal-agent-runtime";
 import {
   assembleWorker,
@@ -72,12 +79,25 @@ export function replyStyle(style: Style): ReplyStyle {
 }
 
 /** A stored reference as the surface posts to it; one that names no conversation still gets one (its send then fails). */
-export function refOf(reference: JsonObject): ReturnType<SurfaceShape["refOf"]> {
+export function refOf(reference: JsonObject): ConversationRef {
   const restored = restoreConversationRef(reference);
   if (restored !== undefined) return restored;
   const conversation = reference["conversation"];
   const type = isObject(conversation) ? conversation["conversationType"] : undefined;
   return { id: "", kind: type === "groupChat" ? "group" : "personal", tenantId: "", wire: reference };
+}
+
+/** The Teams fields a followed review keeps to open the reviewer's chat again (Python: service_url, tenant, bot_id). */
+export function followWire(asked: ConversationRef): Readonly<Record<string, string>> {
+  const wire = asked.wire as JsonObject;
+  const bot = wire["bot"];
+  const botId = typeof bot === "object" && bot !== null && !Array.isArray(bot) ? (bot as JsonObject)["id"] : undefined;
+  const serviceUrl = wire["serviceUrl"];
+  return {
+    service_url: typeof serviceUrl === "string" ? serviceUrl : "",
+    tenant: asked.tenantId,
+    bot_id: typeof botId === "string" ? botId : "",
+  };
 }
 
 /** What the features read of Teams besides its port. */
@@ -87,6 +107,7 @@ export function teamsShape(teams: Pick<TeamsSettings, "style" | "installHintUrl"
     installHintUrl: teams.installHintUrl,
     restoreRef: (stored) => restoreConversationRef(stored),
     refOf,
+    followWire,
     channelName: "Teams",
     version: teamsVersion(),
   };

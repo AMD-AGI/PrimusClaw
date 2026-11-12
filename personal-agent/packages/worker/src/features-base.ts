@@ -55,6 +55,11 @@ export interface SurfaceShape {
   restoreRef(stored: JsonObject): ConversationRef | undefined;
   /** A stored reference as the surface posts to it: one that names no conversation still gets one (its send then fails). */
   refOf(stored: JsonObject): ConversationRef;
+  /**
+   * The surface's fields a followed review keeps to open the reviewer's chat again after a restart, from the chat the
+   * review was asked in (Teams: service_url, tenant, bot_id).
+   */
+  followWire(asked: ConversationRef): Readonly<Record<string, string>>;
   /** The surface's name as people know it ("Teams"): what a report's words and an unreadable file's line call it. */
   readonly channelName: string;
   /** The build the worker runs (the surface package's version): what a report names. */
