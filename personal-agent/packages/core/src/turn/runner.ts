@@ -174,6 +174,7 @@ export class TurnEngine implements TurnRunner {
       quote: run.quote,
       sent: run.sent,
       lang: run.lang,
+      ...(run.replyLang === undefined ? {} : { replyLang: run.replyLang }),
       files: run.files,
       ...(review ? reviewRequest(review) : {}),
     };

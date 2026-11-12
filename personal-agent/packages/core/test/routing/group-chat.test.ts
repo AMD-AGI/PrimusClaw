@@ -192,3 +192,26 @@ test("test_whoami_in_a_group_does_not_print_the_email", async () => {
   assert.ok(text.includes("alice") && !text.includes("@example.com"));
   assert.equal(text, "Alice are connected to SaFE user alice.");
 });
+
+test("a group turn carries the language its sender chose, and only theirs", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak-alice");
+  link(w, BOB.id, "ak-bob");
+  w.store.prefs.setLang(ALICE.id, "en"); // (/lang en in her own 1:1 chat)
+  await w.router.handle(gmsg("帮我看看这个 PR", { id: "g1" }));
+  await w.router.settled();
+  await w.router.handle(gmsg("帮我看看这个 PR", { user: BOB, id: "g2" }));
+  await w.router.settled();
+  w.store.prefs.setLang(BOB.id, "zh");
+  await w.router.handle(gmsg("check this PR", { user: BOB, id: "g3" }));
+  await w.router.settled();
+  assert.deepEqual(
+    w.turns.runs.map((r) => r.replyLang),
+    ["en", undefined, "zh"],
+  );
+  // /lang auto: what she writes decides again, and nothing is sent.
+  w.store.prefs.setLang(ALICE.id, "en", false);
+  await w.router.handle(gmsg("帮我再看看", { id: "g4" }));
+  await w.router.settled();
+  assert.equal(w.turns.runs.at(-1)?.replyLang, undefined);
+});

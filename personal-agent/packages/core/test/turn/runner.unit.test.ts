@@ -158,6 +158,13 @@ it("the run's credential reaches Claw, the new session and its model are recorde
   assert.equal(chat.streamOps.length, 0); // no stream where the style has none
 });
 
+it("a run with a chosen language sends it after the message; one without sends the words alone", async () => {
+  const chosen = await go({ script: ANSWER, run: { text: "帮我看看", replyLang: "en" } });
+  assert.deepEqual(chosen.claw.calls[0], ["create", "ak-run", "帮我看看\n\n[Reply language: English]"]);
+  const none = await go({ script: ANSWER, run: { text: "帮我看看" } });
+  assert.deepEqual(none.claw.calls[0], ["create", "ak-run", "帮我看看"]);
+});
+
 it("a provider's fresh credential is used instead of the run's", async () => {
   const { claw } = await go({ script: ANSWER, run: { provider: () => Promise.resolve("tok-fresh") } });
   assert.deepEqual(claw.calls[0], ["create", "tok-fresh", "go"]);

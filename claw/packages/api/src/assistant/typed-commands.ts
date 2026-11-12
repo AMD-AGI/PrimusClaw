@@ -10,7 +10,7 @@
  * English answers ("Say 撤销 #1343 to undo it", "or reply 批准 #5ec155", 2026-11-09). So every such hint is made here, from the turn's
  * reply language (`language.ts`), never written into a tool result or a card by hand.
  */
-import { languageToAnswerIn } from "./language.js";
+import { replyLanguageFor, type ChosenLanguage } from "./language.js";
 
 export type TypedCommand = "approve" | "deny" | "undo";
 /** Chinese, or English for every other language: the commands are read in these two only. */
@@ -27,11 +27,14 @@ export function commandLanguage(replyLanguage: string | null | undefined): Comma
   return replyLanguage === "Chinese" ? "zh" : "en";
 }
 
-/** The commands' language for the message a turn answers, and failing that (`ok`, `#3`) the user's earlier ones, newest first. */
+/**
+ * The commands' language for the message a turn answers: the language the user chose in their channel (`chosen`,
+ * `channel_context.reply_language`) when they chose one, else the message's, and failing that (`ok`, `#3`) the user's earlier ones, newest first.
+ */
 export async function commandLanguageOf(
-  message: string, earlier: () => Promise<readonly string[]> | readonly string[] = () => [],
+  message: string, earlier: () => Promise<readonly string[]> | readonly string[] = () => [], chosen: ChosenLanguage | null = null,
 ): Promise<CommandLanguage> {
-  return commandLanguage(await languageToAnswerIn(message, earlier));
+  return commandLanguage(await replyLanguageFor(chosen, message, earlier));
 }
 
 /** The command exactly as the user types it: `approve #a3f9c2`, `批准 #a3f9c2`, `undo #12`. */

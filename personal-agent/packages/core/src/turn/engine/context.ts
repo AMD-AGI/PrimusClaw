@@ -3,6 +3,7 @@
 
 /** Everything one turn runs with: who it acts for, what it sends, where it answers, and what it reports back. */
 
+import { replyLanguageLine } from "../../language/chosen.js";
 import type { Lang } from "../../locales/lang.js";
 import type { PullRef } from "../../claw/model.js";
 import type { Integrations } from "../../plugins/integrations.js";
@@ -66,6 +67,8 @@ export interface TurnRequest {
   readonly sent?: string;
   /** The language the person is answered in (undefined: the language of `text`). */
   readonly lang?: Lang;
+  /** The language the person chose to be answered in, told to Claw after the message (`replyLanguageLine`); undefined: none chosen. */
+  readonly replyLang?: Lang;
   /** What the user sent with the message. */
   readonly files?: readonly InboundFile[];
 }
@@ -208,10 +211,13 @@ function withQuote(text: string, quote: string): string {
 
 /**
  * What Claw is sent: the quoted messages, then what the user wrote (with the addresses behind its links), then where the
- * files they sent are. `text` stays the words alone: the session's title, the language of the answer.
+ * files they sent are, then the language they chose to be answered in (`replyLanguageLine`), when they chose one. `text` stays the
+ * words alone: the session's title, the language of the answer.
  */
 export function messageOf(ctx: TurnContext): string {
   const said = withQuote(ctx.request.sent || ctx.request.text, ctx.request.quote ?? "");
   const note = ctx.record.filesNote;
-  return said && note ? `${said}\n\n${note}` : said || note;
+  const message = said && note ? `${said}\n\n${note}` : said || note;
+  const chosen = ctx.request.replyLang;
+  return message && chosen !== undefined ? `${message}\n\n${replyLanguageLine(chosen)}` : message;
 }

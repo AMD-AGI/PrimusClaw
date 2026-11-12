@@ -27,6 +27,7 @@ import type { DecidedVia } from "../github-review/store.js";
 import { redactStoredText, redactStoredValue } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
+import { isChosenLanguage, type ChosenLanguage } from "./language.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
 const logger = pino({ name: "assistant-inbound" });
@@ -126,6 +127,11 @@ export interface ChannelContext {
   files: ChannelFile[];
   /** The session the chat is attached to (`ChannelAttached`); null: the channel says it is attached to none; absent: not said. */
   attached?: ChannelAttached | null;
+  /**
+   * The language the person chose to be answered in, in the channel (Clawy's `/lang zh|en`); absent: they chose none (`/lang auto`, or a
+   * channel from before it), and the language is read from what they write (`language.ts`). The sender's own choice, in a group as well.
+   */
+  reply_language?: ChosenLanguage;
 }
 
 /**
@@ -201,7 +207,24 @@ export function parseChannelContext(raw: unknown): ChannelContext {
     ...(channel ? { channel } : {}), ...(via ? { via } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
     people, actions, repos, handoffs, files: parseFiles(c.files),
     ...(attached !== undefined ? { attached } : {}),
+    ...(isChosenLanguage(c.reply_language) ? { reply_language: c.reply_language } : {}),
   };
+}
+
+/**
+ * The language the person chose to be answered in, as of the turn answering `messageId`: what that message's channel said
+ * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included). A turn that answers no message of theirs (a
+ * worker's report woke the assistant) follows their latest message to it. Null: no choice, and the language is read from their words.
+ */
+export async function chosenReplyLanguage(q: Querier, sessionId: string, messageId: string | null): Promise<ChosenLanguage | null> {
+  const select = "SELECT channel_context->>'reply_language' AS chosen FROM claw_assistant_messages WHERE session_id = $1";
+  type Row = { chosen: unknown };
+  let row: Row | undefined = messageId
+    ? (await q(`${select} AND message_id = $2`, [sessionId, messageId])).rows[0] as Row | undefined
+    : undefined;
+  row ??= (await q(`${select} ORDER BY received_at DESC LIMIT 1`, [sessionId])).rows[0] as Row | undefined;
+  const chosen = row?.chosen;
+  return isChosenLanguage(chosen) ? chosen : null;
 }
 
 /**

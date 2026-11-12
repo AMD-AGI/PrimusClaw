@@ -26,7 +26,7 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
-import { languageToAnswerIn, withReplyLanguage } from "./language.js";
+import { replyLanguageFor, withReplyLanguage } from "./language.js";
 import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
@@ -44,7 +44,7 @@ import { askedOfOthers, askedOfOthersTotals, type AskedOfOthersTotals } from "./
 import { reviewContextFor } from "./review-tools.js";
 import { toldRefs } from "./told.js";
 import { earlierFilesOf, promptImagesOf, renderFilesState } from "./files.js";
-import { turnMessage } from "./inbound.js";
+import { chosenReplyLanguage, turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobHttpSources, jobWatchesEnabled } from "./job-watch.js";
@@ -223,15 +223,18 @@ async function earlierUserMessages(sessionId: string): Promise<string[]> {
 }
 
 /**
- * Say in which language to answer, beside the message being answered (`language.ts`). The message the turn starts
- * with is the user's own, or a worker's report that woke the assistant; a report says nothing about the user's
- * language, so for it the language is the one they last wrote in. Only the request changes: the turn that is stored
- * and shown is the user's words as they sent them.
+ * Say in which language to answer, beside the message being answered (`language.ts`). The language the person chose in their channel
+ * (`/lang zh|en`, sent as `channel_context.reply_language`) when they chose one, whatever their message is written in; else the one
+ * read from what they wrote. The message the turn starts with is the user's own, or a worker's report that woke the assistant; a
+ * report says nothing about the user's language, so for it the language is their choice as of their latest message, or the one they
+ * last wrote in. Only the request changes: the turn that is stored and shown is the user's words as they sent them.
  */
-async function replyLanguageOf(task: Record<string, unknown>, sessionId: string): Promise<string | null> {
+async function replyLanguageOf(task: Record<string, unknown>, sessionId: string, messageId: string): Promise<string | null> {
   const prompt = stringField(task, "prompt");
   if (!prompt) return null;
-  return languageToAnswerIn(prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, () => earlierUserMessages(sessionId));
+  const report = prompt.startsWith(WORK_EVENT_PREFIX);
+  const chosen = await chosenReplyLanguage((t, p) => db.query(t, p), sessionId, report ? null : messageId);
+  return replyLanguageFor(chosen, report ? null : prompt, () => earlierUserMessages(sessionId));
 }
 
 /** The line `replyLanguageOf` worked out, put beside the message. */
@@ -341,7 +344,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
     // The language this turn answers in (`language.ts`), worked out once: beside the message, and in every command the turn's state
     // tells the router the user can type back (`typed-commands.ts`), so that a hint repeated to the user is in their language.
-    const replyLanguage = await replyLanguageOf(task, sessionId);
+    const replyLanguage = await replyLanguageOf(task, sessionId, messageId);
     const commands = commandLanguage(replyLanguage);
     const asked = await askedOfOthersManifest(role.userId);
     const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];

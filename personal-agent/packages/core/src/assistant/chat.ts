@@ -13,6 +13,7 @@ import { errorName } from "../errors.js";
 import type { Lang } from "../locales/lang.js";
 import { assistantChatText } from "../locales/assistant-chat.js";
 import { commandText } from "../locales/commands.js";
+import { replyLanguageContext } from "../language/chosen.js";
 import { answerLang } from "../language/detect.js";
 import type { ClawAssistantPort, ClawSessionsPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
@@ -142,6 +143,11 @@ export class AssistantChat {
     return assistantChatText.in(lang).filesOnly;
   }
 
+  /** The language the person chose to be answered in, as the message's `channel_context` carries it (none: nothing is sent). */
+  private chosenLanguage(userId: string): { reply_language?: Lang } {
+    return replyLanguageContext(this.o.store.prefs.getPrefs(userId));
+  }
+
   private langOf(userId: string, text: string): Lang {
     return answerLang(this.o.store.prefs.getPrefs(userId).lang, this.o.clientLocale?.() ?? "", text);
   }
@@ -173,12 +179,13 @@ export class AssistantChat {
     const sent = await this.handTo(handing, async (sessionId, ready) => {
       const folderId =
         typeof request.context["channel_message_id"] === "string" ? request.context["channel_message_id"] : "";
-      const context = request.files.length
-        ? {
-            ...request.context,
-            files: await this.handOverFiles(handing, sessionId, folderId || this.o.random.hexId(), request.files),
-          }
-        : request.context;
+      const context = {
+        ...request.context,
+        ...(request.files.length
+          ? { files: await this.handOverFiles(handing, sessionId, folderId || this.o.random.hexId(), request.files) }
+          : {}),
+        ...this.chosenLanguage(request.userId),
+      };
       await ready();
       return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
         ...(request.modelKey ? { modelKey: request.modelKey } : {}),
@@ -271,7 +278,7 @@ export class AssistantChat {
           ? { files: await this.handOverFiles(handing, sessionId, this.o.random.hexId(), request.files) }
           : {};
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
-        const context = { ...files, ...attached };
+        const context = { ...files, ...attached, ...this.chosenLanguage(request.userId) };
         await ready();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),

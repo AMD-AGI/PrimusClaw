@@ -14,14 +14,18 @@
  *   L5  the line is the same every time and is added once
  *   L6  only the start and the end of a long message are read, and a paste between them does not decide
  *   L7  what it costs does not grow with what was sent: not by the length of the message, nor by how its characters are arranged
+ *   L8  a language the user chose in their channel decides over what they wrote; none chosen (an old client, `/lang auto`) changes nothing;
+ *       the channel's choice is read as `zh` or `en` only; and a message asking for an answer in a named language says which
  */
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import {
-  detectLanguage, detectLanguageOfAll, languageToAnswerIn, readLanguage, replyLanguageLine, withReplyLanguage, READ_CHARS, REPLY_LANGUAGE_LABEL,
+  detectLanguage, detectLanguageOfAll, isChosenLanguage, languageToAnswerIn, readLanguage, replyLanguageFor, replyLanguageLine, requestedTextLanguage,
+  withReplyLanguage, READ_CHARS, REPLY_LANGUAGE_LABEL,
 } from "../src/assistant/language.js";
+import { parseChannelContext } from "../src/assistant/inbound.js";
 import { WORK_EVENT_PREFIX } from "../src/assistant/prompts.js";
 import { CASES } from "./e2e/assistant-router-eval-cases.js";
 
@@ -354,4 +358,40 @@ test("L7 the cost of reading a message does not grow with its length", () => {
   const read = fastest(15, again(cut));
   const took = fastest(15, again(poisoned));
   assert.ok(took <= BOUND * read, `five messages of ${bodyLimit} characters: ${took.toFixed(3)} ms, cut to what is read ${read.toFixed(3)} ms`);
+});
+
+test("L8 the language the user chose decides over what they wrote, and none chosen changes nothing", async () => {
+  const none = () => [] as const;
+  assert.equal(await replyLanguageFor("en", "帮我看一下 staging 为什么一直重启", none), "English");
+  assert.equal(await replyLanguageFor("zh", "Can you check why the nightly build is red?", none), "Chinese");
+  assert.equal(await replyLanguageFor("zh", null, () => ["Please keep going"]), "Chinese", "a worker's report, after English words");
+  let asked = 0;
+  await replyLanguageFor("en", "ok", () => { asked++; return ["帮我把 CI 修好"]; });
+  assert.equal(asked, 0, "a choice needs no earlier message");
+  // No choice: exactly what the words say, as before there was one.
+  for (const [message, earlier] of [
+    ["帮我看一下 staging 为什么一直重启", []], ["Can you check why the nightly build is red?", []], ["ok", ["帮我把 CI 修好"]], ["Bonjour, peux-tu corriger le build ?", []],
+  ] as const) {
+    assert.equal(await replyLanguageFor(null, message, () => earlier), await languageToAnswerIn(message, () => earlier), message);
+  }
+  // What the channel sends: zh or en, nothing else.
+  for (const v of ["zh", "en"]) assert.equal(isChosenLanguage(v), true, v);
+  for (const v of ["auto", "", "ZH", "fr", null, undefined, 1, ["zh"]]) assert.equal(isChosenLanguage(v), false, String(v));
+  assert.equal(parseChannelContext({ reply_language: "en" }).reply_language, "en");
+  assert.equal(parseChannelContext({ reply_language: "zh", channel: "teams" }).reply_language, "zh");
+  for (const v of ["auto", "fr", 3, null]) assert.equal("reply_language" in parseChannelContext({ reply_language: v }), false, String(v));
+  assert.equal("reply_language" in parseChannelContext({}), false, "an old client sends none");
+  // A message that asks for an answer in a named language says which, as a translation does; a word asked about does too, which say only lets through.
+  for (const [message, language] of [
+    ["Please answer in English: why is the build red?", "English"],
+    ["Reply in Chinese, please: what changed in #12?", "Chinese"],
+    ["用英文回复：构建为什么挂了？", "English"],
+    ["请给我一个英文回复，感谢 Bob 的评审", "English"],
+    ["Write an English reply to Bob thanking him for the review.", "English"],
+    ["给 Bob 写个中文回答", "Chinese"],
+    ["把这句翻成英文：明天开会", "English"],
+  ] as const) assert.equal(requestedTextLanguage(message), language, message);
+  for (const message of ["帮我看一下 staging 为什么一直重启", "Why is the build red?", "Reply to Bob that the build is green."]) {
+    assert.equal(requestedTextLanguage(message), null, message);
+  }
 });
