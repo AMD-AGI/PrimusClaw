@@ -12,7 +12,8 @@
  *   G3  the person who asked cannot send a turn into the reviewer's session
  *   P1  the review profile on a turn: the fixed list, only the review tools' server, none of the owner's belongings, the turn budget;
  *       the owner's own review of their account keeps what it had
- *   P2  skill selection is skipped for such a review (both entries ask `skipsSkillSelection`)
+ *   P2  such a review, and the owner's own review of their account, are not told of the owner's personal skills
+ *       (`userSkillsServe`, which both entries ask); the owner's own chat is
  *   U1  who asked, and whose profile it is, read from a stored config; the requester's note quoted as untrusted
  */
 import assert from "node:assert/strict";
@@ -25,6 +26,7 @@ process.env.CLAW_GITHUB_REVIEW_MCP_URL = "http://api.internal.example:8200/v1/in
 process.env.CLAW_ASSISTANT_ENABLED = "true";
 process.env.CLAW_ASSISTANT_REVIEW_ITEMS = "true";
 process.env.SANDBOX_CPU_NAMESPACE = "global-cpu";
+process.env.CLAW_USER_SKILLS_ENABLED = "true";
 
 type Mod<T> = T extends Promise<infer U> ? U : never;
 let h: Mod<ReturnType<typeof import("./scenario-harness.js").startHarness>>;
@@ -142,15 +144,14 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   if (claims.ok) assert.deepEqual([claims.claims.requesterUserId, claims.claims.actorUserId], ["u-alice", "u-bob"]);
 });
 
-test("P2 skill selection is skipped for a requested review, and not for the owner's own review", async () => {
+test("P2 a requested review and the owner's own review are not told of the owner's skills; the owner's own chat is", async () => {
   await seed("s-req", "u-bob", REQUESTED);
   await seed("s-own", "u-bob", { acting_as: "u-bob" });
-  // The assistant's tables, which this harness does not make: the owner's own review is asked whether it is a router's turn.
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_assistants (user_id TEXT PRIMARY KEY, session_id TEXT)");
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_work_items (item_id TEXT, user_id TEXT, seq INT, title TEXT, worker_session_id TEXT, kind TEXT)");
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_assistant_scopes (user_id TEXT, scope TEXT, session_id TEXT)");
-  assert.equal(await role.skipsSkillSelection("s-req"), true);
-  assert.equal(await role.skipsSkillSelection("s-own"), false);
+  await seed("s-chat", "u-bob", {});
+  const { userSkillsServe } = await import("../src/sessions/user-skills.js");
+  assert.equal(await userSkillsServe("s-req", "u-bob"), false);
+  assert.equal(await userSkillsServe("s-own", "u-bob"), false);
+  assert.equal(await userSkillsServe("s-chat", "u-bob"), true);
 });
 
 test("U1 who asked and whose profile it is, read from a stored config; the requester's note quoted as untrusted", () => {

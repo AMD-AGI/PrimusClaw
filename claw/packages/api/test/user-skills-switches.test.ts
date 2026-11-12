@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 import test, { after, before } from "node:test";
 
 const config = await import("../src/config.js");
-const { selectSkillsForTask } = await import("../src/marketplace/skill-service.js");
+const { userSkillsForTurn } = await import("../src/sessions/user-skills.js");
 const { consumeEventDelivery, tombstoneReader, completionPorts } = await import("../src/events/consumer.js");
 const { db } = await import("../src/infra/db.js");
 const { sc } = await import("../src/infra/nats.js");
@@ -100,16 +100,16 @@ after(async () => {
 test("W2 auto-evolution alone: no skill reaches a turn and a turn's saves are dropped; its own steps still run", async () => {
   assert.deepEqual([config.CLAW_USER_SKILLS_ENABLED, config.CLAW_SKILL_AUTO_EVOLUTION_ENABLED], [false, true], "the premise");
 
-  // No skill is selected, and the database is not even asked.
+  // No skill is listed and the turn keeps none, and the database is not even asked.
   const statements: string[] = [];
   const query = db.query;
   db.query = (async (text: string, ...rest: unknown[]) => { statements.push(text); return (query as any)(text, ...rest); }) as typeof db.query;
   try {
-    assert.deepEqual(await selectSkillsForTask("u-1", "write my weekly report"), {});
+    assert.deepEqual(await userSkillsForTurn(SESSION, "u-1"), { enabled: false });
   } finally {
     db.query = query;
   }
-  assert.equal(statements.some((s) => /claw_skills/.test(s)), false);
+  assert.deepEqual(statements, []);
 
   await seedSession(h, SESSION);
   await seedRun(h, "run-1", SESSION, { status: "running", messageId: "m-1" });

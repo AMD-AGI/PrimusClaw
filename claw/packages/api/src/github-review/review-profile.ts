@@ -39,7 +39,7 @@ export function reviewSandboxAvailable(): boolean {
 }
 
 /** Fields of a task that carry the owner's own choices or belongings, none of which a requested review gets. */
-const OWNER_FIELDS = ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"] as const;
+const OWNER_FIELDS = ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"] as const;
 
 /**
  * A turn of a requested review that has no turn left: it is not sent. Brain reads `max_turns` 0 (or none) as no limit at all, so a review

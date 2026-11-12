@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 import { createHash } from "node:crypto";
+import type { UserSkillManifestEntry } from "@claw/protocol";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { scanInjection, scanSecrets } from "../memory/gates.js";
 import {
-  EVOLVE_EVIDENCE_GOOD_COUNT, EVOLVE_EVIDENCE_BAD_COUNT, MAX_SELECTED_SKILLS,
-  CLAW_USER_SKILLS_ENABLED,
+  EVOLVE_EVIDENCE_GOOD_COUNT, EVOLVE_EVIDENCE_BAD_COUNT,
 } from "../config.js";
 import pino from "pino";
 
@@ -239,108 +239,124 @@ export interface SkillBundle {
   files?: Array<{ path: string; content: string; is_binary: boolean }>;
 }
 
-export async function getUserActiveSkills(userId: string): Promise<Record<string, SkillBundle>> {
-  // Include 'probation' status so the skill can be field-tested.
-  // Version is selected here too — callers need it for skills_used attribution
-  // and it's the same row, so fetching it separately via getActiveSkillVersions
-  // would be a redundant round-trip (that function is now a thin wrapper kept
-  // for backward compat).
-  const rows = (await db.query(`
-    SELECT DISTINCT ON (skill_name) skill_name, content, description, version, id
-    FROM claw_skills
-    WHERE user_id = $1 AND status IN ('active', 'probation') AND deleted_at IS NULL AND enabled
-    ORDER BY skill_name, version DESC
-  `, [userId])).rows;
+// ===== What a turn is told of the user's skills =====
 
-  if (!rows.length) return {};
+/** A personal skill as a turn is told of it (`request.user_skills`): enough to list it and to ask for it, not its text. */
+export type { UserSkillManifestEntry };
 
-  const ids = rows.map((r: any) => r.id);
-  // Increment inject_count async (don't block dispatch on it)
-  db.query(
-    "UPDATE claw_skills SET inject_count = inject_count + 1, last_accessed = NOW() WHERE id = ANY($1)",
-    [ids]
-  ).catch(() => {});
+/**
+ * The current row of each of a user's skills that a turn may use: per name, the highest version that is active and not
+ * deleted (a probation row is never one), kept only when that row is enabled -- an older enabled row never stands in
+ * for a newer disabled one. Most recently read first, then by name. `$2`, when given, narrows it to one name.
+ */
+const CURRENT_USER_SKILLS_SQL = `
+  SELECT id, skill_name, version, description, invocation, origin, content_sha, last_used_at
+    FROM (SELECT DISTINCT ON (skill_name) id, skill_name, version, description, invocation, origin, content_sha, enabled, last_used_at
+            FROM claw_skills
+           WHERE user_id = $1 AND status = 'active' AND deleted_at IS NULL AND ($2::text IS NULL OR skill_name = $2)
+           ORDER BY skill_name, version DESC) cur
+   WHERE enabled
+   ORDER BY last_used_at DESC NULLS LAST, skill_name
+   LIMIT ${USER_SKILL_MAX}`;
 
-  const fileRows = (await db.query(
-    "SELECT skill_id, file_path, content, is_binary FROM claw_skill_files WHERE skill_id = ANY($1)",
-    [ids]
-  )).rows;
-  const filesBySkillId: Record<number, Array<{ path: string; content: string; is_binary: boolean }>> = {};
-  for (const f of fileRows) {
-    (filesBySkillId[f.skill_id] = filesBySkillId[f.skill_id] || []).push({
-      path: f.file_path, content: f.content, is_binary: !!f.is_binary,
-    });
-  }
-
-  const skills: Record<string, SkillBundle> = {};
-  for (const row of rows) {
-    skills[row.skill_name] = {
-      content: row.content,
-      description: row.description || "",
-      version: row.version,
-      files: filesBySkillId[row.id] || [],
-    };
-  }
-  return skills;
+interface CurrentSkillRow {
+  id: number; skill_name: string; version: number; description: string | null; invocation: string | null;
+  origin: string | null; content_sha: string | null;
 }
 
-const SKILL_SELECT_PROMPT = `You are a skill selector. Given the user's task and available skills, return the most relevant skill names (0 to {max_skills}).
+function manifestEntry(row: CurrentSkillRow, sha: string): UserSkillManifestEntry {
+  return {
+    name: row.skill_name,
+    version: Number(row.version),
+    description: [...String(row.description ?? "")].slice(0, SKILL_DESCRIPTION_MAX_CHARS).join(""),
+    invocation: row.invocation === "manual" ? "manual" : "auto",
+    content_sha: sha,
+    origin: (row.origin as SkillOrigin | null) ?? null,
+  };
+}
 
-User's task:
-{task}
+/** The row's fingerprint, computed and stored now for a row written before the column was kept up to date. */
+async function rowContentSha(q: Querier, row: CurrentSkillRow): Promise<string | null> {
+  if (row.content_sha) return row.content_sha;
+  const snap = await readSkillSnapshot(q, row.id);
+  if (!snap) return null;
+  await q("UPDATE claw_skills SET content_sha = $1 WHERE id = $2 AND content_sha IS NULL", [snap.sha, row.id]);
+  return snap.sha;
+}
 
-Available skills:
-{candidates}
-
-Rules:
-1. Only select skills that are clearly relevant to the task
-2. Return [] if no skill is relevant
-3. Never invent skill names — only use names from the list above
-4. Prefer fewer, more targeted skills over loading everything
-
-Return JSON: { "skills": ["name1", "name2"] }`;
-
-export async function selectSkillsForTask(
-  userId: string,
-  taskPrompt: string,
-  maxSkills: number = MAX_SELECTED_SKILLS,
-): Promise<Record<string, SkillBundle>> {
-  // Feature flag: empty selection short-circuits all callers (sessions route +
-  // event-consumer pending branch) without touching their loops.
-  if (!CLAW_USER_SKILLS_ENABLED) return {};
-  const all = await getUserActiveSkills(userId);
-  const names = Object.keys(all);
-  if (names.length <= maxSkills) return all;
-
-  const candidates = names.map(n => ({
-    name: n, description: all[n].description || "(no description)",
-  }));
-
-  try {
-    const result = await callMemoryLLM<{ skills: string[] }>(
-      userId,
-      SKILL_SELECT_PROMPT,
-      {
-        task: taskPrompt.slice(0, 1000),
-        candidates: JSON.stringify(candidates),
-        max_skills: String(maxSkills),
-      },
-      { temperature: 0 },
-    );
-
-    const selected: Record<string, SkillBundle> = {};
-    for (const name of (result.skills || []).slice(0, maxSkills)) {
-      if (all[name]) selected[name] = all[name];
-    }
-    if (Object.keys(selected).length) {
-      logger.info({ userId, total: names.length, selected: Object.keys(selected) }, "skill.selection");
-      return selected;
-    }
-    return all;
-  } catch (err) {
-    logger.warn({ err: (err as Error)?.message, userId }, "skill.selection_failed_fallback_all");
-    return all;
+/**
+ * The user's skills a turn is told of (`request.user_skills`): name, version, description, invocation, fingerprint and
+ * origin of every current, active, enabled skill, and none of their text -- the model reads a skill only when it uses
+ * it (`readUserSkill`). Calls no LLM. Whether a turn gets it at all is the caller's (`sessions/user-skills.ts`).
+ */
+export async function userSkillManifest(userId: string, q: Querier = db.query): Promise<UserSkillManifestEntry[]> {
+  const rows = (await q(CURRENT_USER_SKILLS_SQL, [userId, null])).rows as CurrentSkillRow[];
+  const out: UserSkillManifestEntry[] = [];
+  for (const row of rows) {
+    const sha = await rowContentSha(q, row);
+    if (sha) out.push(manifestEntry(row, sha));
   }
+  return out;
+}
+
+/** What `readUserSkill` and `readUserSkillFile` answer. */
+export type UserSkillRead<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: "not_found" }
+  /** The caller read a different version than the current one (`expectSha`): it is told what is current, and given nothing. */
+  | { ok: false; error: "changed"; version: number; content_sha: string };
+
+export interface UserSkillDocument extends UserSkillManifestEntry {
+  content: string;
+  files: Array<{ path: string; size_bytes: number; is_binary: boolean }>;
+}
+
+async function currentUserSkill(q: Querier, userId: string, name: string, expectSha: string | undefined) {
+  const row = (await q(CURRENT_USER_SKILLS_SQL, [userId, name])).rows[0] as CurrentSkillRow | undefined;
+  if (!row) return { ok: false as const, error: "not_found" as const };
+  const snap = await readSkillSnapshot(q, row.id);
+  if (!snap) return { ok: false as const, error: "not_found" as const };
+  if (expectSha && expectSha !== snap.sha) {
+    return { ok: false as const, error: "changed" as const, version: Number(row.version), content_sha: snap.sha };
+  }
+  return { ok: true as const, row, snap };
+}
+
+/**
+ * One of the user's current skills, SKILL.md and the list of its files, as a turn reads it: only a skill the manifest
+ * would list (active, enabled, not deleted), manual ones included. A read is a use: `last_used_at` is set.
+ */
+export async function readUserSkill(
+  userId: string, name: string, opts: { expectSha?: string } = {}, q: Querier = db.query,
+): Promise<UserSkillRead<UserSkillDocument>> {
+  const cur = await currentUserSkill(q, userId, name, opts.expectSha);
+  if (!cur.ok) return cur;
+  await q("UPDATE claw_skills SET last_used_at = NOW() WHERE id = $1", [cur.row.id]);
+  return {
+    ok: true,
+    value: {
+      ...manifestEntry(cur.row, cur.snap.sha),
+      content: cur.snap.content,
+      files: cur.snap.files.map((f) => ({ path: f.path, size_bytes: f.size_bytes, is_binary: f.is_binary })),
+    },
+  };
+}
+
+/** One supporting file of one of the user's current skills, under the same rule as `readUserSkill`. */
+export async function readUserSkillFile(
+  userId: string, name: string, path: string, opts: { expectSha?: string } = {}, q: Querier = db.query,
+): Promise<UserSkillRead<{ name: string; version: number; content_sha: string; path: string; content: string; is_binary: boolean; size_bytes: number }>> {
+  const cur = await currentUserSkill(q, userId, name, opts.expectSha);
+  if (!cur.ok) return cur;
+  const file = cur.snap.files.find((f) => f.path === path);
+  if (!file) return { ok: false, error: "not_found" };
+  return {
+    ok: true,
+    value: {
+      name: cur.row.skill_name, version: Number(cur.row.version), content_sha: cur.snap.sha,
+      path: file.path, content: file.content, is_binary: file.is_binary, size_bytes: file.size_bytes,
+    },
+  };
 }
 
 export async function getUserSkillNames(userId: string): Promise<string[]> {
@@ -375,9 +391,8 @@ export async function getActiveSkillContent(skillName: string, userId: string): 
 /**
  * Get active version numbers for a set of skill names (for skillsUsed tracking).
  *
- * @deprecated Prefer `getUserActiveSkills(userId)` — it now returns `version`
- * on each SkillBundle, so there's no reason to make a second round-trip just
- * for versions. Kept for backward compat (e2e tests + any external callers).
+ * @deprecated A turn is told each skill's version in `request.user_skills` (`userSkillManifest`). Kept for backward
+ * compat (e2e tests + any external callers).
  */
 export async function getActiveSkillVersions(userId: string, skillNames: string[]): Promise<Record<string, number>> {
   if (!skillNames.length) return {};

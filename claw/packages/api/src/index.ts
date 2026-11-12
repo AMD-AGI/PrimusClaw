@@ -68,6 +68,7 @@ import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
 import { registerInternalMemoryRoutes } from "./routes/internal-memory.js";
+import { registerInternalSkillRoutes } from "./routes/internal-skills.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
@@ -405,6 +406,7 @@ async function main() {
   await registerInternalAppRoutes(app);
   await registerInternalWorkspaceRoutes(app);
   await registerInternalMemoryRoutes(app);
+  await registerInternalSkillRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
   await registerRunRoutes(app);

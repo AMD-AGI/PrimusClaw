@@ -12,7 +12,7 @@
  *   A4  a worker turn gets its prompt, its item and the generation it started under, and keeps what the request brought
  *   A5  a session that is not an assistant's gets the working guideline and nothing else, whatever route its turn takes
  *   A6  a server named assistant in a request cannot stand in for ours, and a router drops every other server
- *   A7  a router turn does not select skills; a worker's and an ordinary session's do
+ *   A7  a router turn is not told of the user's skills and keeps none it saves; a worker's and an ordinary session's are
  *   A8  a turn whose profile cannot be applied does not run
  *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
  *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
@@ -50,7 +50,7 @@ describe("assistant role profile", { skip }, () => {
   const user = (id: string) => ({ userId: id, userName: id, roles: ["default"], platformKey: `pk-${id}`, virtualKey: `vk-${id}` });
 
   before(async () => {
-    w = await startWorld({ CLAW_USER_SKILLS_ENABLED: "true", MAX_SELECTED_SKILLS: "1", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
+    w = await startWorld({ CLAW_USER_SKILLS_ENABLED: "true", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
     dispatch = await import("../src/sessions/dispatch.js");
     ({ TURN_STATE_HEADER, UNTRUSTED_CLOSE } = await import("../src/assistant/prompts.js"));
   });
@@ -302,27 +302,28 @@ describe("assistant role profile", { skip }, () => {
     assert.doesNotMatch(JSON.stringify(worker), /evil\.example/);
   });
 
-  test("A7 a router turn does not select skills; a worker's and an ordinary session's do", async () => {
+  test("A7 a router turn is not told of the user's skills; a worker's and an ordinary session's are", async () => {
     await w.q(
       `INSERT INTO claw_skills (user_id, skill_name, version, content, status)
        VALUES ('alice', 'skill-a', 1, 'c', 'active'), ('alice', 'skill-b', 1, 'c', 'active')`,
     );
-    const realQuery = w.h.app.db.db.query.bind(w.h.app.db.db);
-    const seen: string[] = [];
-    (w.h.app.db.db as any).query = async (text: string, params?: unknown[]) => { seen.push(text); return realQuery(text, params); };
-    const asked = async (sessionId: string) => {
-      seen.length = 0;
-      await send(sessionId, "alice", { doorbell: false });
-      return seen.some((s) => /FROM claw_skills/.test(s));
+    const told = async (sessionId: string) => {
+      const task = JSON.parse((await send(sessionId, "alice", { doorbell: false })).published[0]);
+      assert.equal(task.skills, undefined, "no skill is inlined");
+      return [(task.user_skills ?? []).map((s: { name: string }) => s.name), task.user_skills_enabled];
     };
-    try {
-      assert.equal(await asked(alice.routerSid), false, "the router never asks for skills");
-      assert.equal(await asked(item.workerSid), true);
-      assert.equal(await asked("plain"), true);
-    } finally { (w.h.app.db.db as any).query = realQuery; }
-    assert.equal(await w.mod.role.skipsSkillSelection(alice.routerSid), true);
-    assert.equal(await w.mod.role.skipsSkillSelection(item.workerSid), false);
-    assert.equal(await w.mod.role.skipsSkillSelection("plain"), false);
+    assert.deepEqual(await told(alice.routerSid), [[], false], "the router");
+    assert.deepEqual(await told(item.workerSid), [["skill-a", "skill-b"], true]);
+    assert.deepEqual(await told("plain"), [["skill-a", "skill-b"], true]);
+    // A doorbell turn: the router's profile, applied at the claim, takes the list off whatever the row holds.
+    await send(alice.routerSid, "alice", { doorbell: true });
+    const claimed = await claim();
+    assert.deepEqual([claimed.user_skills, claimed.user_skills_enabled], [undefined, false]);
+    // And an ordinary session's doorbell turn keeps what its dispatch put on the row.
+    await w.q("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL");
+    await send("plain", "alice", { doorbell: true });
+    const plain = await claim();
+    assert.deepEqual([plain.user_skills.map((s: { name: string }) => s.name), plain.user_skills_enabled], [["skill-a", "skill-b"], true]);
   });
 
   test("A7b the queue's drain makes the same choice for a message that waited", async () => {
@@ -330,6 +331,7 @@ describe("assistant role profile", { skip }, () => {
       `INSERT INTO claw_skills (user_id, skill_name, version, content, status)
        VALUES ('alice', 'skill-a', 1, 'c', 'active'), ('alice', 'skill-b', 1, 'c', 'active')`,
     );
+    await w.q("INSERT INTO claw_sessions (session_id, name, user_id, mode, config) VALUES ('group', 'a group', 'alice', 'claw', '{\"memory\":\"off\"}')");
     const { drainOldestPendingMessage } = await import("../src/events/consumer.js");
     const drained = async (sessionId: string) => {
       await w.q("DELETE FROM claw_pending_messages");
@@ -339,13 +341,16 @@ describe("assistant role profile", { skip }, () => {
       );
       const stub = await stubPending();
       try { await drainOldestPendingMessage(sessionId, "alice"); } finally { stub.restore(); }
-      return { askedForSkills: stub.statements.some((s) => /FROM claw_skills/.test(s)), published: stub.published.map((p) => JSON.parse(p)) };
+      assert.equal(stub.published.length, 1);
+      return JSON.parse(stub.published[0]);
     };
     const router = await drained(alice.routerSid);
-    assert.equal(router.askedForSkills, false);
-    assert.equal(router.published.length, 1);
-    assert.deepEqual(router.published[0].tools_allowlist, ROUTER_TOOLS);
-    assert.equal((await drained("plain")).askedForSkills, true);
+    assert.deepEqual(router.tools_allowlist, ROUTER_TOOLS);
+    assert.deepEqual([router.user_skills, router.user_skills_enabled, router.skills], [undefined, false, undefined]);
+    const plain = await drained("plain");
+    assert.deepEqual([plain.user_skills.map((s: { name: string }) => s.name), plain.user_skills_enabled, plain.skills], [["skill-a", "skill-b"], true, undefined]);
+    const group = await drained("group");
+    assert.deepEqual([group.user_skills, group.user_skills_enabled], [undefined, false], "a group chat is told nothing of them");
   });
 
   test("A9 the router's message carries the reply-language line on every route, and what is stored is the user's words", async () => {

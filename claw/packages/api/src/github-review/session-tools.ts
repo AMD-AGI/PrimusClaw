@@ -106,6 +106,9 @@ export async function applySandboxKeyPolicyToTask(task: Record<string, unknown>,
   if (!(await sessionWithholdsSandboxKeys(sessionId))) return;
   task.withhold_sandbox_keys = true;
   delete task.user_env;
+  // Nor the owner's personal skills: they are the owner's instructions, and this session's model reads strangers' text.
+  delete task.user_skills;
+  task.user_skills_enabled = false;
   Object.assign(task, actingSessionTurnFields());
   // A review someone asked of the owner runs with the fixed review profile, last, so that nothing applied before it widens it.
   const profiled = await reviewProfileSession(sessionId);
