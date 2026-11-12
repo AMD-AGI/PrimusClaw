@@ -257,6 +257,28 @@ export async function languageToAnswerIn(
   return null;
 }
 
+/**
+ * The languages a user can choose to be answered in, in their channel (Clawy's `/lang zh|en`), as the channel sends the choice
+ * (`channel_context.reply_language`), and the name the reply-language line gives each. `auto` is no choice: nothing is sent, and the
+ * language is read from what the user writes, as above.
+ */
+export const CHOSEN_LANGUAGES = { zh: "Chinese", en: "English" } as const;
+export type ChosenLanguage = keyof typeof CHOSEN_LANGUAGES;
+
+export const isChosenLanguage = (v: unknown): v is ChosenLanguage => v === "zh" || v === "en";
+
+/**
+ * The language to answer in, when the user may have chosen one: their choice wins over what they wrote, every turn, whatever language the
+ * message (or a worker's report) is in; without one it is read from their words (`languageToAnswerIn`), as before there was a choice. What
+ * they ask for in a language they name (a translation, or an answer: 用英文回复, answer in English) is still written in that language: the
+ * prompt says so, and say lets it through (`replyLanguageMismatch`'s `asked`), so the choice is the language of everything else.
+ */
+export async function replyLanguageFor(
+  chosen: ChosenLanguage | null, message: string | null, earlier: () => Promise<readonly string[]> | readonly string[],
+): Promise<string | null> {
+  return chosen ? CHOSEN_LANGUAGES[chosen] : languageToAnswerIn(message, earlier);
+}
+
 /** The names a request gives the four languages, in the user's words: Chinese, English, and what a model writes for them. */
 const LANGUAGE_NAMES: ReadonlyArray<[string, string]> = [
   ["英文", "English"], ["英语", "English"], ["english", "English"],
@@ -267,16 +289,17 @@ const LANGUAGE_NAMES: ReadonlyArray<[string, string]> = [
 const NAME_ALTERNATIVES = LANGUAGE_NAMES.map(([n]) => n).join("|");
 
 /**
- * How a message asks for a text in a named language: 翻成英文, 翻译为英语, 译成日文, 写成英文, 用英文写, 英文版, 英文翻译, translate … into
- * English, in English. Each captures the name. Bounded: a name follows its verb within a few characters, and `translate` looks at most
+ * How a message asks for a text in a named language: 翻成英文, 翻译为英语, 译成日文, 写成英文, 用英文写, 用英文回复, 英文版, 英文翻译, 英文回复,
+ * translate … into English, (answer) in English, an English reply. Each captures the name. Bounded: a name follows its verb within a few characters, and `translate` looks at most
  * 200 characters ahead for its `into`.
  */
 const ASKED_IN = [
   new RegExp(`(?:翻译|翻|译|转换|转|写|改写|改)\\s*(?:成|为|作|到)\\s*(${NAME_ALTERNATIVES})`, "iu"),
   new RegExp(`用\\s*(${NAME_ALTERNATIVES})\\s*(?:写|回|说|发|表达|翻|讲|总结|概括)`, "iu"),
-  new RegExp(`(${NAME_ALTERNATIVES})\\s*(?:版本|版|翻译|译文)`, "iu"),
+  new RegExp(`(${NAME_ALTERNATIVES})\\s*(?:版本|版|翻译|译文|回复|回答)`, "iu"),
   new RegExp(`\\btranslat\\w*\\b[^\\n]{0,200}?\\b(?:in)?to\\s+(english|chinese|japanese|korean)\\b`, "iu"),
   new RegExp(`\\bin\\s+(english|chinese|japanese|korean)\\b`, "iu"),
+  new RegExp(`\\b(english|chinese|japanese|korean)\\s+(?:reply|replies|answer|response|version|translation)\\b`, "iu"),
 ];
 
 /**

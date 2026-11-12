@@ -20,7 +20,7 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { gateNamesEndedTurnSql } from "../tasks/chat-run.js";
-import { identityRefused, markIdentityRefused, markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
+import { chosenReplyLanguage, identityRefused, markIdentityRefused, markUntrustedRead, turnMessage, type AttendedVia, type ChannelFile, type TurnMessage } from "./inbound.js";
 import { earlierFilesOf, handFilesToWorker, workerFilesNote } from "./files.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordAssistantSay, recordSystemNotice, SayOutcomeUnknown, SayRefused, turnHandedOffReview, type SayDeps } from "./outbound.js";
@@ -31,7 +31,7 @@ import { suggestedReplies } from "./suggested.js";
 import { metrics } from "../infra/metrics.js";
 import { bareItemNumbers, internalTextIn, userWordsOf } from "./internal-text.js";
 import { parseItemRef } from "./item-ref.js";
-import { detectLanguage, languageToAnswerIn, replyLanguageLine, replyLanguageMismatch, requestedTextLanguage } from "./language.js";
+import { detectLanguage, replyLanguageFor, replyLanguageLine, replyLanguageMismatch, requestedTextLanguage } from "./language.js";
 import { answerEventItemOf, earlierConversationItemOf, WORK_EVENT_PREFIX } from "./prompts.js";
 import { redactCommandSecrets } from "../notifications/approval-target.js";
 import { assistantPluginId } from "./read-tools.js";
@@ -183,10 +183,13 @@ const LANGUAGE_LOOKBACK = 5;
 
 /**
  * The language a router turn answers in: the one `role-profile.ts` put beside its message as `[Reply language: X]`, worked out the same
- * way from the same words (the message the turn answers, else the user's earlier messages, newest first). Null when it cannot be told.
+ * way from the same words (the language the person chose in their channel, else the message the turn answers, else the user's earlier
+ * messages, newest first). Null when it cannot be told. `messageId`: the message the turn answers (the token's `mid`).
  */
-export async function turnReplyLanguage(sessionId: string, prompt: string): Promise<string | null> {
-  return languageToAnswerIn(prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, async () => (await db.query(
+export async function turnReplyLanguage(sessionId: string, messageId: string, prompt: string): Promise<string | null> {
+  const report = prompt.startsWith(WORK_EVENT_PREFIX);
+  const chosen = await chosenReplyLanguage((t, p) => db.query(t, p), sessionId, report ? null : messageId);
+  return replyLanguageFor(chosen, report ? null : prompt, async () => (await db.query(
     `SELECT content FROM claw_conversation_turns
       WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL AND NOT starts_with(content, $2)
       ORDER BY turn_index DESC LIMIT $3`,
@@ -215,7 +218,7 @@ async function assertSayReadable(
       `the message names ${bare.map((i) => `#${i.seq}`).join(", ")} by number alone, which the user cannot recognise: write each item as its number and title (${named}) and call say again`,
     );
   }
-  const expected = await turnReplyLanguage(claims.sid, prompt);
+  const expected = await turnReplyLanguage(claims.sid, claims.mid, prompt);
   // A text the user asked for in a named language (a translation) is said in that language, and not refused for it.
   const asked = prompt.startsWith(WORK_EVENT_PREFIX) ? null : requestedTextLanguage(prompt);
   const found = expected ? replyLanguageMismatch(text, expected, items.map((i) => i.title), asked) : null;
@@ -418,7 +421,7 @@ async function announceStarted(
   try {
     const prompt = ((await db.query("SELECT prompt FROM claw_tasks WHERE task_id = $1", [claims.task_id])).rows[0]?.prompt as string | null) ?? "";
     if (!prompt.trim() || prompt.startsWith(WORK_EVENT_PREFIX)) return false;
-    const language = (await turnReplyLanguage(claims.sid, prompt)) ?? detectLanguage(prompt);
+    const language = (await turnReplyLanguage(claims.sid, claims.mid, prompt)) ?? detectLanguage(prompt);
     const text = startedNotice(item, language);
     if (!text) return false;
     // A turn that handed a review to the person's channel says nothing more: the channel answers that message (as say is refused).

@@ -39,7 +39,7 @@ import {
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
 import type { ItemRefError } from "./item-ref.js";
-import { detectLanguage, languageToAnswerIn } from "./language.js";
+import { detectLanguage, isChosenLanguage, replyLanguageFor } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
 import { requestedByOfItem } from "./requester-view.js";
 import { reviewQuestionZh } from "./review-questions.js";
@@ -749,13 +749,18 @@ function needsYouText(item: ItemRow, zh = false, review = false): string {
 /** How many of the person's latest messages to their assistant say which language they write in. */
 const PERSON_LANGUAGE_LOOKBACK = 5;
 
-/** The language of `userId`'s latest messages to their assistant, newest first, as the router's reply language is worked out; null when they tell none. */
+/**
+ * The language of `userId`'s latest messages to their assistant, newest first, as the router's reply language is worked out: the one they
+ * chose in their channel as of their latest message (`channel_context.reply_language`), else the one they write in; null when they tell none.
+ */
 async function messagesLanguage(q: Querier, userId: string): Promise<string | null> {
-  return languageToAnswerIn(null, async () => ((await q(
-    `SELECT m.content FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id
+  const rows = (await q(
+    `SELECT m.content, m.channel_context->>'reply_language' AS chosen FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id
       WHERE a.user_id = $1 ORDER BY m.received_at DESC LIMIT $2`,
     [userId, PERSON_LANGUAGE_LOOKBACK],
-  )).rows as Array<{ content: string }>).map((r) => r.content));
+  )).rows as Array<{ content: string; chosen: unknown }>;
+  const chosen = rows[0]?.chosen;
+  return replyLanguageFor(isChosenLanguage(chosen) ? chosen : null, null, () => rows.map((r) => r.content));
 }
 
 /**

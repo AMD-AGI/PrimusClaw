@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { errorName } from "../errors.js";
+import { chosenLang } from "../language/chosen.js";
 import type { Lang } from "../locales/lang.js";
 import type { Logger } from "../ports/logger.js";
 import type { InboundFile } from "../ports/surface.js";
@@ -273,10 +274,18 @@ export class TurnStarter {
       sent: request.sent ?? "",
       files: request.files ?? [],
       lang: review?.lang ?? chat.lang(),
+      ...this.replyLang(request),
       ownThumbs: this.ownThumbs(request),
       notifies: this.ctx.deps.subscriptions !== undefined && store.notifySubs.getNotifySub(chat.sender.id) !== null,
       review: review?.fields,
     };
+  }
+
+  /** The language the sender chose to be answered in, for a chat turn (a review's answer follows its request's language). */
+  private replyLang(request: StartTurn): { replyLang?: Lang } {
+    if (request.review !== undefined) return {};
+    const lang = chosenLang(this.ctx.deps.store.prefs.getPrefs(request.chat.sender.id));
+    return lang === undefined ? {} : { replyLang: lang };
   }
 
   private hooks(request: StartTurn, run: TurnRun, turn: ActiveTurn, turnId: string): TurnHooks {

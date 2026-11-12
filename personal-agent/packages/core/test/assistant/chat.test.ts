@@ -27,12 +27,13 @@ const ALICE = "aad-a";
 class Store {
   now = 1_700_000_000;
   lang = "";
+  langSet = false;
   userIds = new Map([[ALICE, "u-a"]]);
   sessions = new Map<string, string>();
   slices(): ChatStore {
     return {
       now: () => this.now,
-      prefs: { getPrefs: () => ({ lang: this.lang }) as Prefs } as unknown as ChatStore["prefs"],
+      prefs: { getPrefs: () => ({ lang: this.lang, langSet: this.langSet }) as Prefs } as unknown as ChatStore["prefs"],
       sessions: { getSession: (u: string) => this.sessions.get(u) ?? null } as unknown as ChatStore["sessions"],
       remoteState: { getRemote: () => null } as unknown as ChatStore["remoteState"],
       links: { clawUserIdOf: (u: string) => this.userIds.get(u) ?? null },
@@ -142,6 +143,28 @@ it("the plugin id and the attached session ride on the message", async () => {
   assert.equal(w.claw.heard.at(0)?.plugin, 7);
   await route(w, "again", { attached: null });
   assert.deepEqual(w.claw.heard[1]?.context, { attached: null });
+});
+
+it("the language the person chose rides on the message, whatever it is written in; none chosen sends nothing", async () => {
+  const w = world();
+  // /lang en, a message in Chinese: the assistant is told to answer in English.
+  w.store.lang = "en";
+  w.store.langSet = true;
+  await route(w, "看看 SaFE 节点");
+  assert.deepEqual(w.claw.heard[0]?.context, { reply_language: "en" });
+  // /lang zh, a message in English, beside the attached session.
+  w.store.lang = "zh";
+  await route(w, "check the nodes", { attached: null });
+  assert.deepEqual(w.claw.heard[1]?.context, { attached: null, reply_language: "zh" });
+  // /lang auto (a language learnt from what they write is no choice): nothing is sent, and Claw reads the message as before.
+  w.store.langSet = false;
+  await route(w, "看看 SaFE 节点");
+  assert.equal(w.claw.heard[2]?.context, undefined);
+  // A choice of a language the agent does not speak is none.
+  w.store.lang = "fr";
+  w.store.langSet = true;
+  await route(w, "regarde les nœuds");
+  assert.equal(w.claw.heard[3]?.context, undefined);
 });
 
 it("a claw without the assistant keeps the old path and is not asked again for a minute", async () => {
@@ -284,6 +307,12 @@ it("a person the assistant understands sends with their token and model key and 
     [w.claw.heard[0]?.key, w.claw.heard[0]?.modelKey, w.claw.heard[0]?.context],
     ["idt-token", "ak-alice", { channel_message_id: "m-1" }],
   );
+  // The language they chose goes beside the chat's context.
+  w.store.lang = "zh";
+  w.store.langSet = true;
+  assert.equal(await w.chat.understand({ ...request, prompt: "review #12 please" }), true);
+  assert.deepEqual(w.claw.heard[1]?.context, { channel_message_id: "m-1", reply_language: "zh" });
+  w.store.langSet = false;
   w.claw.fail.set("send", new ClawError(403));
   assert.equal(await w.chat.understand({ ...request, credential: "ak-alice", modelKey: "" }), false);
   assert.ok(said(w.surface.outbox).at(-1)?.includes("PrimusClaw rejected your linked key"));

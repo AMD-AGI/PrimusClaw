@@ -17,6 +17,8 @@
  *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
  *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
  *   A10 a worker's report that wakes the router carries the language the user last wrote in, and nothing when none is known
+ *   A10b a language the user chose in their channel (`channel_context.reply_language`) is the line's, whatever the message is in; a
+ *        report follows the choice of their latest message; a channel that sends none (an old client, `/lang auto`) changes nothing
  *   A11 the router's item list names each item by its id and its number, and a report's header does as well
  *
  * With the working guideline on (`CLAW_AGENT_GUIDELINE_ENABLED`): a worker's system text starts with it and a
@@ -74,7 +76,7 @@ describe("assistant role profile", { skip }, () => {
   };
 
   const pristineDispatch = (() => { let p: any = null; return () => (p ??= { ...dispatch.sessionDispatchPorts }); })();
-  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>>; toolIds?: number[]; content?: string }) {
+  async function send(sessionId: string, userId: string, opts: { doorbell: boolean; mcpServers?: Record<string, Record<string, unknown>>; toolIds?: number[]; content?: string; messageId?: string }) {
     const p = dispatch.sessionDispatchPorts as any;
     Object.assign(p, pristineDispatch());
     p.doorbellDispatch = opts.doorbell ? () => ({ release() {} }) : () => null;
@@ -87,6 +89,7 @@ describe("assistant role profile", { skip }, () => {
       sessionId, userId, user: user(userId), content: opts.content ?? "hello", messageType: "text", toolIds: opts.toolIds ?? [], pluginId: undefined,
       requestImage: undefined, requestResource: undefined, requestTimeout: undefined, workspaceId: undefined,
       mcpServers: opts.mcpServers, capturedUserEnvSnapshot: {}, capturedSessionEnv: {},
+      ...(opts.messageId ? { messageId: opts.messageId } : {}),
     } as never, async () => {});
     assert.equal(result.kind, "dispatched", JSON.stringify(result));
     return { result: result as { runId: string }, published };
@@ -459,6 +462,38 @@ describe("assistant role profile", { skip }, () => {
       const sent = JSON.parse((await send(sessionId, "alice", { doorbell: false, content: "Can you check why the nightly build is red?" })).published[0]);
       assert.equal(sent.prompt, "Can you check why the nightly build is red?", sessionId);
     }
+  });
+
+  test("A10b the language the user chose in their channel names the line, whatever their message is in; without one, nothing changes", async () => {
+    let at = 0;
+    /** The message as the route records it (`recordAssistantMessage`), with what the channel sent beside it, then its turn. */
+    const sent = async (content: string, context: Record<string, unknown>) => {
+      const messageId = `claw-chosen-${++at}`;
+      await w.q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context, received_at)
+         VALUES ($1, $2, 'alice', $3, $4::jsonb, NOW() + make_interval(secs => $5))`,
+        [alice.routerSid, messageId, content, JSON.stringify(context), at],
+      );
+      return words(JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content, messageId })).published[0]).prompt);
+    };
+    const chinese = "帮我看一下 staging 为什么一直重启";
+    const english = "Can you check why the nightly build is red?";
+    assert.equal(await sent(chinese, { reply_language: "en" }), `${chinese}\n\n[Reply language: English]`, "/lang en, a Chinese message");
+    assert.equal(await sent(english, { reply_language: "zh" }), `${english}\n\n[Reply language: Chinese]`, "/lang zh, an English message");
+    assert.equal(await sent("ok", { reply_language: "en" }), "ok\n\n[Reply language: English]", "a message with no words of its own");
+    // An old client sends nothing, and /lang auto is no choice: the message's own language, as before.
+    assert.equal(await sent(chinese, {}), `${chinese}\n\n[Reply language: Chinese]`, "no choice sent");
+    assert.equal(await sent(english, { reply_language: "auto" }), `${english}\n\n[Reply language: English]`, "a value that is no choice");
+    assert.equal(await sent(chinese, { reply_language: "fr" }), `${chinese}\n\n[Reply language: Chinese]`, "a language that cannot be chosen");
+    // A worker's report follows the choice the user's latest message carried.
+    const report = `[work_event] #1 (item_id: ${item.itemId}) ready v1: Opened PR 12 for the build, and it is ready to review`;
+    await sent(english, { reply_language: "zh" });
+    assert.equal(words(JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt),
+      `${report}\n\n[Reply language: Chinese]`, "the report is English, the user chose Chinese");
+    // The one time the choice is not the line: none was sent with the latest message (an old client, /lang auto).
+    await sent("帮我把 CI 修好", {});
+    assert.equal(words(JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt),
+      report, "no choice now, and the conversation's own turns hold none of the user's words: no line, as before");
   });
 
   test("A10 a report that wakes the router carries the language the user last wrote in", async () => {

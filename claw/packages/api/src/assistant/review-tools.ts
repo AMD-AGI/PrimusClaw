@@ -943,7 +943,7 @@ export async function confirmationAnswer(
     const pending = await pendingConfirmationsFor(q, userId);
     if (!pending.length) throw new ToolRefused("no_pending_confirmation", "nothing waits for the user's answer");
     // (each command in the language of the user's message, as the router repeats it to them: `typed-commands.ts`)
-    const lang = await commandLanguageOf(message.content);
+    const lang = await commandLanguageOf(message.content, undefined, message.context.reply_language ?? null);
     const replies = pending.map((c) => `${typedCommand("approve", confirmationRef(c.id), lang)} for ${c.repo}#${c.pr}`).join("; ");
     let pick: PendingConfirmation | undefined;
     if (args.decision === "allow") {

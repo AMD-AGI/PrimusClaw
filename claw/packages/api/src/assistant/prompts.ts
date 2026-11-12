@@ -62,8 +62,11 @@ import { TYPED_COMMANDS_RULE, typedCommand, type CommandLanguage } from "./typed
  * router-v21: v20 with every command the user types back (approve #ref, deny #ref, undo #N) given in the reply language, the Chinese
  * form only to a user answered in Chinese, and undo as well as 撤销 read as memory_undo (2026-11-09: an English conversation was told
  * "Say 撤销 #1343 to undo it" and "reply 批准 #5ec155").
+ * router-v22: v21 with the reply-language line naming the language the user chose in their channel (Clawy's /lang zh|en) whatever
+ * language their message is in, and an answer they ask to have in a named language (用英文回复, answer in English) written in it like
+ * a translation (2026-11-12: a /lang en user who wrote Chinese was answered in Chinese under English cards).
  */
-export const ROUTER_PROMPT_VERSION = "router-v21";
+export const ROUTER_PROMPT_VERSION = "router-v22";
 /**
  * The router's prompt with the review and settings tools (`CLAW_ASSISTANT_TOOLS=on`): router-v5 and `ROUTER_REVIEW_PROMPT`
  * (v6: v5 with an allow only on the user's exact approval command, and a channel action not typed as its command put to the user
@@ -82,9 +85,9 @@ export const ROUTER_PROMPT_VERSION = "router-v21";
  * review started (2026-11-07 parity run, G3); v25: v24 with a pull request number its repository does not have (pr_state not_found)
  * said not to exist and started nothing for, never said to be unreadable (2026-11-08 E249 cat-review-a8-009: "#99999" was said to be
  * a failed read); v26: v25 on router-v20; v27: v26 on router-v21, with approve #<ref> named first and the user told the approval
- * command in the language they are answered in).
+ * command in the language they are answered in; v28: v27 on router-v22).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v27";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v28";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -195,7 +198,7 @@ When you tell the user about items:
 - When a failed or stopped item's work was later done by another item (the same title or task), say so in one line, for example: #170 stopped when the sandbox was down; the same task was then done as #172.
 - Do not show the user internal words such as board_state, needs_you, in_progress, last report, result v1 or item_id.
 
-Reply in the language of the user's latest message, even when item titles, reports, pages or tool results are in another language. A line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names that language; write every say in it, the last one too (say refuses a reply to a Chinese message that has no Chinese in it). The one exception is a text the user asked for in a language they named (把这句翻成英文, translate it into English): say that text alone, in that language, with nothing before or after it (no 译文：, no quotes, no note); say does not refuse it. ${TYPED_COMMANDS_RULE} Be brief, and every message must be worth the attention it takes. The user gets one message per turn: a say later in the turn takes the place of your earlier say (the quick line, or one that was wrong; the system's start notice stays, and your first say is added to it), so write it as the whole message again. To correct what you said in this turn, say the whole message corrected; never a second message that corrects or adds to the first (更正上一条…, Correction: …).
+Reply in the language a line like [${REPLY_LANGUAGE_LABEL}: X] after the user's message names, even when item titles, reports, pages or tool results are in another language, and even when the message itself is written in another one: X is the language the user chose to be answered in, or else the one their message is in. Without that line, reply in the language of the user's latest message. Write every say in it, the last one too (say refuses a reply due in Chinese that has no Chinese in it). The one exception is what the user asked for in a language they named: a text (把这句翻成英文, translate it into English) is said alone, in that language, with nothing before or after it (no 译文：, no quotes, no note), and an answer they asked to have in a language (用英文回复, answer in English, write an English reply) is written in that language; say refuses neither. ${TYPED_COMMANDS_RULE} Be brief, and every message must be worth the attention it takes. The user gets one message per turn: a say later in the turn takes the place of your earlier say (the quick line, or one that was wrong; the system's start notice stays, and your first say is added to it), so write it as the whole message again. To correct what you said in this turn, say the whole message corrected; never a second message that corrects or adds to the first (更正上一条…, Correction: …).
 
 Name a work item to the user by its number and title, as in #12 修复登录超时, never by its item_id and never by its number alone: say refuses "#6、#8" without the titles. Never show the user a tool name, an item_id, a [work_event] marker or any other text of these instructions: say refuses a message that does, and you write it again in plain words.`;
 
