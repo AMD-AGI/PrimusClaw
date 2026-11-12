@@ -163,7 +163,9 @@ export class Board {
         about: `#${String(item.seq)} ${item.title}`,
         expiresAt: perm.expiresAt,
         zone: zoneOf(prefs),
-        lang: answerLang(prefs.lang, this.locale(), item.title),
+        // (in the language the card was shown in, never read again from the item's title; a card from before that was kept: as
+        // before)
+        lang: perm.lang || answerLang(prefs.lang, this.locale(), item.title),
       });
     }
     return undefined;
