@@ -443,7 +443,7 @@ test("a request whose card cannot be built is forgotten and its resend gets the 
   }));
 
 /** The request on screen made a terminal's question (a connector's approval hooks): its row keeps the whole ask. */
-function asTerminalQuestion(w: RemoteWorld, sid: string, whole = true): void {
+function asTerminalQuestion(w: RemoteWorld, sid: string, whole = true, lang?: "zh" | "en"): void {
   const row = perm(w, sid);
   assert.ok(row !== null);
   w.test.store.remotePermissions.forgetRemotePermission(sid, "act-1");
@@ -454,6 +454,7 @@ function asTerminalQuestion(w: RemoteWorld, sid: string, whole = true): void {
     tool: row.tool,
     options: row.options,
     expiresAt: row.expiresAt,
+    ...(lang ? { lang } : {}),
     ask: {
       action_id: "act-1",
       origin: "terminal",
@@ -480,6 +481,31 @@ test("a terminal's question Claw says is answered was answered at the terminal, 
     await w.click(button(card, "allow_once"));
     assert.equal(w.last(), "This request was answered in the terminal.");
     assert.equal(w.server.commandsOf("decision").length, 0);
+  });
+});
+
+test("a click on a terminal's card is answered in the language the card was shown in, not the person's unset one", async () => {
+  // (Claw's push drew the card in Chinese from its own words; the person never chose a language, so theirs reads as English)
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid, true, "zh");
+    w.test.store.remotePermissions.closeRemotePermission(sid, "act-1", "terminal");
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "这个请求已在终端里回答。");
+  });
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid, true, "zh");
+    w.server.failOn("POST", "/decisions", 409);
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "这个请求已在终端里回答。");
+  });
+  await remoteWorld(async (w) => {
+    const { sid, card } = await asked(w, CODEX_OPTIONS);
+    asTerminalQuestion(w, sid, true, "zh");
+    w.test.store.remotePermissions.closeRemotePermission(sid, "act-1", "decided");
+    await w.click(button(card, "allow_once"));
+    assert.equal(w.last(), "这个审批已经答复过，或者已经过期了。");
   });
 });
 
