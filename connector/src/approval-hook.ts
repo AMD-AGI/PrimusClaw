@@ -6,8 +6,9 @@
  *   `approval-hook.js ask|settled --dir <Claude config dir> --socket <connector socket> --managed-by claw-connector`
  *
  * `ask` (the `PermissionRequest` hook) hands the request to the running connector and prints the owner's decision, if one
- * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session in a
- * terminal is handed on (`CLAUDE_CODE_ENTRYPOINT=cli`): one the connector itself runs already asks through its own cards.
+ * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session with a
+ * person at its terminal is handed on (approval-skip.ts): not `claude -p`, not one the connector itself runs (it already asks
+ * through its own cards), not a question asked in bypass mode, and nothing at all with `CLAW_APPROVAL_HOOKS=off`.
  *
  * It imports nothing of the connector and never gets in the way: no connector, a connector that does not answer, anything
  * unexpected, and it prints nothing and exits 0, which leaves the question to the terminal, where Claude Code shows it all the
@@ -15,6 +16,7 @@
  * close and withdraws the card.
  */
 import net from "node:net";
+import { skipReason } from "./approval-skip.js";
 
 const CONNECT_MS = 300;
 const STDIN_MS = 2000;
@@ -45,12 +47,14 @@ async function main(): Promise<void> {
     process.stderr.write("usage: approval-hook ask|settled --dir <Claude config dir> --socket <path>\n");
     return;
   }
-  if (process.env.CLAUDE_CODE_ENTRYPOINT !== "cli") return;
+  // Decided from the environment before stdin is read, where it can be: an unattended session costs nothing.
+  if (skipReason(process.env, null, mode) !== null) return;
   const text = await readStdin();
   if (text.length >= MAX_STDIN) return;
   let event: unknown;
   try { event = JSON.parse(text); } catch { return; }
-  if (typeof event !== "object" || event === null) return;
+  if (typeof event !== "object" || event === null || Array.isArray(event)) return;
+  if (skipReason(process.env, event as Record<string, unknown>, mode) !== null) return;
 
   const reply = await new Promise<string>((resolve) => {
     let buf = "";
