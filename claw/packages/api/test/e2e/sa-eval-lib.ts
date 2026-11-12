@@ -1479,7 +1479,8 @@ export function asksUser(text: string, choices = 0): boolean {
 }
 /** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
 const CLOSING_OFFER = new RegExp([
-  String.raw`^(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
+  String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?(有|需要)(任何|其他|别的|更多|什么)?(问题|疑问|需要|帮助|事|其他|别的)`,
+  String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?有(任何|其他|别的|更多)`,
   String.raw`^(如|若)?有(任何|其他|别的)?(问题|需要|疑问)`,
   String.raw`^(有)?需要的话`,
   // A bare "tell me" with nothing to tell, whatever courtesy leads it: the second half of "如果有任何问题，欢迎随时告诉我" / "If you
@@ -1490,14 +1491,21 @@ const CLOSING_OFFER = new RegExp([
   String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
   String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,
   String.raw`^if (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
-  String.raw`^(let me know|tell me) if\b`,
+  String.raw`^(please |just |do |feel free to )*(let me know|tell me) if\b`,
   String.raw`^(feel free|anything else|any (other |more |further )?questions?|is there anything else|do you have any (other |more |further )?questions?|hope this helps)\b`,
 ].join("|"), "i");
 /** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
 const ASKS: readonly RegExp[] = [
   /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|给我|发给我|发我|回复|指明|明确|描述|选择|选一)/,
   // Asked of the person ("需要你补充一下"), not the assistant saying what it does next ("我确认一下", "先简单说明一下").
-  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认)|告诉我|发给我|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
+  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认|发|给)|告诉我|发给我|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
+  // "把仓库名发我", "请把…发我", "需要你提供…", "我需要知道…" / "我需要仓库名" (not "我需要先查一下": what the assistant does next).
+  /把.{1,30}(发|告诉|给|发给)(我|我们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
+  /我(还|们)?需要(知道|了解|你的|您的)|我(还|们)?需要[^，,。]{0,16}(名|名称|名字|地址|链接|编号|ID|id|路径|题目|主题|信息|细节|内容)/,
+  // An imperative that opens the clause ("说一下要做什么", "给我题目和要求"), and a question without its mark ("你想开哪个题",
+  // "具体是哪个仓库呢").
+  /^(请)?(再)?(说|讲)(一下|一声|说)|^(请)?(给|发)我[^\p{P}\s]/u,
+  /((你|您)[^。\n]{0,20}(哪个|哪些|哪一|哪里|哪儿|什么(?!都|也)|多少)|是哪(个|些|一))[^，,。\n]{0,12}[呢吗呀]?[。.!！]?$|(哪个|哪些|什么)[^。\n]{0,12}(呢|吗)[。.!！]?$/,
   /(你|您)(是)?(指|想|要|希望|说的是)[^。\n]{0,40}还是/,
   /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
   /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,

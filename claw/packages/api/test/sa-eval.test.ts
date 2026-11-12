@@ -1413,6 +1413,9 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "随时告诉我你想开哪个题。",
     "把题目告诉我。",
     "如有需要，请告诉我仓库名。",
+    // Chinese requests without 请 before the verb, and questions without their mark.
+    "把仓库名发我。", "麻烦发我仓库名。", "请把仓库名和测试名发我。", "需要你提供仓库名和测试名。", "还需要你提供仓库和测试名称。",
+    "我需要仓库名和测试名。", "我需要知道仓库和测试名称才能继续。", "说一下要做什么", "你想开哪个题", "具体是哪个仓库呢", "您要查哪个集群",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
@@ -1446,6 +1449,10 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "提前开题就是提前做开题报告。如果有任何问题，欢迎随时告诉我。",
     "提前开题就是提前做开题报告。有需要的话，可以随时联系我。",
     "I opened the issue. If anything comes up, feel free to let me know.",
+    "Please let me know if you need anything else.", "Please let me know if anything else comes up.", "Please tell me if you need anything.",
+    "如果还有问题随时告诉我。", "如果有问题随时告诉我。", "如果需要帮助就告诉我。", "如果有需要请告诉我。", "如果还有疑问可以告诉我。",
+    "有任何问题欢迎随时联系我。", "Is there anything else I can help with?", "Hope this helps!", "Feel free to reach out.",
+    "我需要先查一下。", "你的开题报告需要包含哪些内容，一般由导师决定。", "这个仓库是哪个团队的我也不清楚，但测试已经修好了。",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
