@@ -3,13 +3,14 @@
 
 // JSON text as Python writes it, typed column reads, and the stored-secret keys.
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Fernet, StoreSecrets, tokenHex, tokenUrlsafe, drawCode } from "@primusclaw/personal-agent-runtime";
 
-import { col } from "../../src/sqlite/database.js";
+import { col, Database } from "../../src/sqlite/database.js";
 import { jsonFlags, jsonList, jsonStrings, parseJson, pyJsonDumps, storedObject } from "../../src/sqlite/py-json.js";
-import { SeededRandom } from "../../../../test-support/index.js";
+import { SeededRandom, tempDir } from "../../../../test-support/index.js";
 
 test("JSON text is Python's json.dumps default: spaced separators, non-ASCII escaped", () => {
   assert.equal(
@@ -78,4 +79,16 @@ test("random ids are Python's token_urlsafe / token_hex shapes, codes come from 
   assert.match(tokenUrlsafe(random, 9), /^[A-Za-z0-9_-]{12}$/);
   assert.match(tokenHex(random, 8), /^[0-9a-f]{16}$/);
   assert.match(drawCode(random, "AB", 8), /^[AB]{8}$/);
+});
+
+test("a new database is WAL with synchronous=NORMAL: no fsync per commit", () => {
+  const dir = tempDir();
+  const db = new Database(join(dir.path, "s.db"));
+  try {
+    assert.equal(col.str(db.get("PRAGMA journal_mode") ?? {}, "journal_mode"), "wal");
+    assert.equal(col.num(db.get("PRAGMA synchronous") ?? {}, "synchronous"), 1);
+  } finally {
+    db.close();
+    dir.remove();
+  }
 });
