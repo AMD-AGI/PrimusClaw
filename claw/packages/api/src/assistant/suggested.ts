@@ -3,8 +3,8 @@
 
 /**
  * The replies a `say` suggests (`CLAW_ASSISTANT_SUGGESTED_REPLIES`): what the user is likely to send next, which a channel shows as
- * buttons that send it as their message (Teams' suggested replies). The model writes them; they are checked here and never refuse
- * the say: one that does not fit is left out, and the message goes without it.
+ * buttons that send it as their message (Teams' suggested replies, another chat app's buttons). The model writes them; they are
+ * checked here and never refuse the say: one that does not fit is left out, and the message goes without it.
  *
  *  - at most `SUGGESTED_MAX` of them, each one line of at most `SUGGESTED_MAX_CHARS` code points, none twice;
  *  - nothing internal (`internalTextIn`: a tool name, an id, a marker), no address, no markup, no slash command: a button sends its
@@ -13,7 +13,10 @@
 import { CLAW_ASSISTANT_SUGGESTED_REPLIES } from "../config.js";
 import { internalTextIn } from "./internal-text.js";
 
-/** The most replies one message suggests (Teams shows three). */
+/**
+ * The most replies one message suggests, whatever chat app shows it: a channel that shows fewer keeps its first ones (the personal
+ * agent's `SurfaceCaps.suggestionsMax`; Teams shows three).
+ */
 export const SUGGESTED_MAX = 3;
 /** The longest suggested reply, in code points: a few words that fit a button. */
 export const SUGGESTED_MAX_CHARS = 30;

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * How the assistant itself has been running (`claw_self_status`), and who it is: in Teams the person talks to it as Clawy, and
+ * How the assistant itself has been running (`claw_self_status`), and who it is: in the chat (Teams) the person talks to it as Clawy, and
  * "clawy最近运行如何" was answered by searching Dispatron and GitHub for the name and then asking the person what Clawy is.
  *
  * Counts only, over the whole deployment, from Claw's own tables: messages received, how soon the first reply came, how many got
@@ -16,6 +16,7 @@
 import { readFileSync } from "node:fs";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SELF_STATUS, CLAW_BUILD } from "../config.js";
 import { inTransaction, type Querier } from "../infra/db.js";
+import { chatSurface } from "./chat-surface.js";
 
 export function selfStatusOn(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_SELF_STATUS;
@@ -24,11 +25,14 @@ export function selfStatusOn(): boolean {
 /** router-self-v1: Clawy is the assistant itself, with claw_self_status; counts answered from a result's counts, never by counting a cut list. */
 export const ROUTER_SELF_PROMPT_VERSION = "router-self-v1";
 
-/** What the router is told about itself, and about counting what a lookup returned. After the rest of the system prompt. */
-export function renderRouterSelfSection(selfStatus: boolean): string {
+/**
+ * What the router is told about itself, and about counting what a lookup returned. After the rest of the system prompt. `where`:
+ * where the user talks to it (`ChatSurface.where`, "in Teams").
+ */
+export function renderRouterSelfSection(selfStatus: boolean, where: string = chatSurface(undefined).where): string {
   const lines = [
     "Who you are",
-    "In Teams people call you Clawy: Clawy is you, PrimusClaw's (Claw's) assistant in Teams. It is not a job, a plan, a repository or a board to look up, and a question about Clawy, about you or about Claw itself is about you.",
+    `${where.charAt(0).toUpperCase()}${where.slice(1)} people call you Clawy: Clawy is you, PrimusClaw's (Claw's) assistant ${where}. It is not a job, a plan, a repository or a board to look up, and a question about Clawy, about you or about Claw itself is about you.`,
   ];
   if (selfStatus) {
     lines.push(

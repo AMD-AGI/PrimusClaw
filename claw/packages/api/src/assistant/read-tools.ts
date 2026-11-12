@@ -10,7 +10,8 @@
  * (Brain enforces `tools_allowlist` on both). The servers come only from the deployment's assistant plugin
  * (`CLAW_ASSISTANT_PLUGIN_ID`), never from a plugin a message names: a name says nothing about where a server is, so the list
  * holds only for servers the operator chose. Of that plugin only its `mcp` rows, and of them only the servers listed here, so a
- * router turn neither connects to a server it may not call nor is shown the plugin's skills; of its rules, only ROUTER_RULES.
+ * router turn neither connects to a server it may not call nor is shown the plugin's skills; of its rules, only the reply-style rule
+ * of the chat app the message came through (`chat-surface.ts`).
  *
  * Besides the plugin's: the reads of the API's own GitHub server (`github-mcp/`), as the user, for a user who keeps a GitHub
  * token, the same entry a worker's turn is given; the user's scheduled tasks (`trigger_list` of the API's own `schedules` server,
@@ -18,13 +19,14 @@
  *
  * Of the plugin's reads, the ones that return a log (ROUTER_LOG_READS) are bounded and filtered by Brain (`ExecuteRequest.log_reads`):
  * a router turn asks for the last ROUTER_LOG_LINES lines or entries, and credential-shaped text in the answer is masked before the
- * model sees it. And of the plugin's rules, the ones named in ROUTER_RULES are the router's too: how a reply is written.
+ * model sees it. And of the plugin's rules, the chat app's reply-style rule is the router's too: how a reply is written.
  */
 import { GITHUB_MCP_SERVER, TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
 import { CLAW_ASSISTANT_PLUGIN_ID, INTERNAL_BACKEND_URL } from "../config.js";
 import { githubMcpServers } from "../github-mcp/mcp.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { verifyTriggerToken } from "../triggers/token.js";
+import { chatSurface, type ChatSurface } from "./chat-surface.js";
 import { routerReadsByServer } from "./tool-classes.js";
 
 /**
@@ -53,11 +55,14 @@ export const ROUTER_LOG_LINES = 40;
 /** What of a plain-text log answer a router turn keeps, from its end. */
 export const ROUTER_LOG_CHARS = 6000;
 
-/** The plugin's rules a router turn is given, by name: how a reply is written, which is the router's to do. */
-export const ROUTER_RULES: readonly string[] = ["teams-reply-style"];
+/**
+ * The plugin's rules a router turn is given, by name: how a reply is written, which is the router's to do. Which ones depends on the
+ * chat app the message came through (`ChatSurface.replyRules`); these are a message's from a client that names none (Teams).
+ */
+export const ROUTER_RULES: readonly string[] = chatSurface(undefined).replyRules;
 
 /**
- * The heading a router turn reads such a rule under (Brain puts a rule's description before its text). The rule is written for a Teams
+ * The heading a router turn reads such a rule under (Brain puts a rule's description before its text). The rule is written for a
  * chat's own sessions, where what the model writes between tool calls is shown as progress ("Between tool calls, say in one short line
  * what you are doing next"); a router did that with `say`, each call a message of the turn (2026-11-06). So the heading keeps the rule
  * to how a say's text looks, and leaves when to say to the router's own prompt.
@@ -169,12 +174,13 @@ export function routerLogReads(servers: readonly string[]): RouterLookups["logRe
 /**
  * A router turn's lookups: the plugin's read tools, the user's GitHub, the user's scheduled tasks, and the web. `turn` is what the
  * request already carries: its MCP servers (where `applyTriggerToolsToTask` put the turn's `schedules` server), its message id,
- * and the trigger tools' key.
+ * and the trigger tools' key; and the chat app the turn answers on (`surface`, whose reply-style rule it is given).
  */
 export async function routerLookups(
-  userId: string, sessionId: string, turn: { mcpServers?: unknown; messageId?: string; taskId?: string; triggerKey?: string } = {},
+  userId: string, sessionId: string,
+  turn: { mcpServers?: unknown; messageId?: string; taskId?: string; triggerKey?: string; surface?: ChatSurface } = {},
 ): Promise<RouterLookups> {
-  const plugin = await routerReadTools(userId);
+  const plugin = await routerReadTools(userId, turn.surface?.replyRules);
   const githubServers = await githubMcpServers(sessionId);
   const githubTools = Object.hasOwn(githubServers, GITHUB_MCP_SERVER) ? ROUTER_GITHUB_READ_TOOLS : [];
   const schedules = turn.messageId && turn.taskId && turn.triggerKey
@@ -189,7 +195,7 @@ export async function routerLookups(
 
 export interface RouterReadTools {
   pluginId: number;
-  /** The plugin's `mcp` rows, each cut to the servers that have read tools here, and its rules named in ROUTER_RULES. */
+  /** The plugin's `mcp` rows, each cut to the servers that have read tools here, and its rules of the chat app's reply style. */
   pluginTools: unknown[];
   /** The servers the turn connects to, in the order the plugin lists them. */
   servers: string[];
@@ -207,8 +213,11 @@ export function assistantPluginId(named: unknown): number | null {
   return positiveInt(named) ?? positiveInt(CLAW_ASSISTANT_PLUGIN_ID);
 }
 
-/** Cut a plugin's tools to its MCP servers that have read tools, and its rules named in ROUTER_RULES. Pure, for the tests. */
-export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[]): RouterReadTools {
+/**
+ * Cut a plugin's tools to its MCP servers that have read tools, and its rules named in `rules` (the chat app's reply style,
+ * `ChatSurface.replyRules`; by default ROUTER_RULES). Pure, for the tests.
+ */
+export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[], rules: readonly string[] = ROUTER_RULES): RouterReadTools {
   const pluginTools: unknown[] = [];
   const servers: string[] = [];
   for (const tool of tools) {
@@ -217,7 +226,7 @@ export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[]): 
     const type = String(row.type ?? "").toLowerCase();
     // A rule is text Brain adds to the prompt (its file, by `config.s3_key`), under its description as a heading: carried as the plugin
     // has it, under ROUTER_RULE_HEADING.
-    if (type === "rule" && typeof row.name === "string" && ROUTER_RULES.includes(row.name)) {
+    if (type === "rule" && typeof row.name === "string" && rules.includes(row.name)) {
       pluginTools.push({ ...row, description: ROUTER_RULE_HEADING });
       continue;
     }
@@ -237,11 +246,11 @@ export function readToolsOfPlugin(pluginId: number, tools: readonly unknown[]): 
  * The read tools of a router turn, or null when it has none: no assistant plugin configured, one the user may not see, or one
  * with no server listed here. Read from the plugin as the user sees it now (`resolveTaskPlugin`), whatever the request carried.
  */
-export async function routerReadTools(userId: string): Promise<RouterReadTools | null> {
+export async function routerReadTools(userId: string, rules: readonly string[] = ROUTER_RULES): Promise<RouterReadTools | null> {
   const pluginId = positiveInt(CLAW_ASSISTANT_PLUGIN_ID);
   if (pluginId === null) return null;
   const plugin = await resolveTaskPlugin(pluginId, userId, false);
   if (!plugin.tools) return null;
-  const read = readToolsOfPlugin(pluginId, plugin.tools);
+  const read = readToolsOfPlugin(pluginId, plugin.tools, rules);
   return read.servers.length ? read : null;
 }

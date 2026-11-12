@@ -53,6 +53,7 @@ import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./wri
 import { devenvToolsOn } from "./devenv-tools.js";
 import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
+import { turnChatSurface } from "./chat-surface.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { commandLanguage } from "./typed-commands.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -297,7 +298,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
     // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
     // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
-    const lookups = await routerLookups(role.userId, sessionId, { mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key });
+    // The chat app the turn answers on (`chat-surface.ts`): which reply-style rule it is given, and where it is told it is talked to.
+    const surface = await turnChatSurface((t, p) => db.query(t, p), sessionId, messageId);
+    const lookups = await routerLookups(role.userId, sessionId, {
+      mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key, surface,
+    });
     const read = lookups.plugin;
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
@@ -335,7 +340,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // The routing discipline (`discipline.ts`): per user while it is a canary, so the prompt stays the same from turn to turn for each.
     const discipline = disciplineOn(role.userId);
     withSystemAppend(task, renderRouterPrompt(
-      { servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding }, { discipline },
+      {
+        servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding,
+        where: surface.where,
+      },
+      { discipline },
     ));
     // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
     withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
@@ -389,7 +398,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
     const self = selfStatusOn();
-    withSystemAppend(task, renderRouterSelfSection(self));
+    withSystemAppend(task, renderRouterSelfSection(self, surface.where));
     const proactive = {
       schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled(),
       jobKinds: jobHttpSources().map((k) => ({ kind: k.kind, description: k.description })),
