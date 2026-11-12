@@ -90,6 +90,8 @@ export class StatusMessage<S> {
   private opening: Task<void> | undefined;
   private expiry: Task<unknown> | undefined;
   private again: Task<unknown> | undefined;
+  /** The stream being closed because a card waits for the person (`awaitingChoice`). */
+  private choice: Task<unknown> | undefined;
   private preparingTimer: Task<void> | undefined;
   private lastText = "";
   private lastAt = 0;
@@ -173,16 +175,40 @@ export class StatusMessage<S> {
     const live = this.live;
     if (!live) return;
     await sleepSeconds(this.clock, Math.max(STREAM_CLOSE_SECONDS - live.age(), 0), signal);
-    if (this.closed || !live.closable) return;
+    await this.closeEarly(live, turnText.in(this.lang).stillWorking, "before the chat's limit", signal);
+  }
+
+  /**
+   * Close the open stream with `line` (after the agent's words in the bubble) while the turn goes on; the answer, whenever it comes, is
+   * a message of its own. Nothing more is sent to the stream once this has begun.
+   */
+  private async closeEarly(live: StreamHandle, line: string, why: string, signal: AbortSignal): Promise<void> {
+    if (this.closed || !live.closable || this.streamOver || this.expiring) return;
     this.expiring = true;
     if (this.stream && this.flusher && !this.flusher.done) await unlessAborted(this.flusher.settled(), signal);
     this.streamOver = true;
-    const line = turnText.in(this.lang).stillWorking;
-    const closed = await live.final(plainMessage(live.streamed ? `${live.streamed}\n\n${line}` : line));
-    if (!closed.ok)
-      this.log.warn("the turn's stream could not be closed before the chat's limit; the answer follows as a message");
+    const words = this.streamable() || live.streamed; // (the agent's words not yet streamed go into the bubble too)
+    const closed = await live.final(plainMessage(words ? `${words}\n\n${line}` : line));
+    if (!closed.ok) this.log.warn(`the turn's stream could not be closed ${why}; the answer follows as a message`);
     this.log.info("the turn's stream was closed; the answer follows as a message of its own", {
+      why,
       age: Math.round(live.age()),
+    });
+  }
+
+  /**
+   * A card now waits for the person (a question of the agent): it is their turn, so the floating status must not go on
+   * saying "Thinking…" until the chat's limit. An open stream is closed at once with AWAITING_CHOICE, and the answer comes
+   * as a message of its own, as after the limit. Without a stream (the progress message) nothing changes: it has no
+   * spinner. Never fails the turn.
+   */
+  awaitingChoice(): void {
+    const live = this.live;
+    if (this.closed || !live || this.streamOver || this.expiring || this.choice) return;
+    this.choice = detach(async (signal) => {
+      if (this.opening && !this.opening.done) await unlessAborted(this.opening.settled(), signal);
+      if (!this.expiring) this.expiry?.cancel(); // (its close at the limit is not needed any more)
+      await this.closeEarly(live, turnText.in(this.lang).awaitingChoice, "while a card waits for the person", signal);
     });
   }
 
@@ -343,8 +369,7 @@ export class StatusMessage<S> {
     this.hard = this.hard || hard;
     this.stopPreparingTimer();
     if (this.flusher && !this.flusher.done && (hard || !this.sending)) this.flusher.cancel();
-    if (hard) this.again?.cancel();
-    if (hard) this.expiry?.cancel();
+    if (hard) for (const task of [this.again, this.expiry, this.choice]) task?.cancel();
     if (hard && this.live?.closable && !this.streamOver) {
       this.streamOver = true;
       const live = this.live;
@@ -381,7 +406,7 @@ export class StatusMessage<S> {
   private async quiesce(): Promise<void> {
     this.close();
     if (this.expiry && !this.expiry.done && !this.expiring) this.expiry.cancel();
-    for (const task of [this.opening, this.flusher, this.expiring ? this.expiry : undefined]) {
+    for (const task of [this.opening, this.flusher, this.expiring ? this.expiry : undefined, this.choice]) {
       if (task) await task.settled();
     }
   }

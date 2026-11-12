@@ -177,6 +177,8 @@ async function take(ctx: TurnContext, args: ConsumeArgs, step: Step): Promise<Re
   args.status.progress(step);
   if (truthy(step.approval) || truthy(step.question)) {
     await ask(ctx, args.sessionId, step);
+    // (the card is out, or was already shown for it: the person chooses now, so the stream stops saying "Thinking…")
+    if (!truthy(step.approval)) args.status.awaitingChoice();
     return undefined;
   }
   if (!step.finished) return undefined;

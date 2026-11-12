@@ -123,6 +123,66 @@ it("a stream still open at the chat's limit is closed with Still working, and th
   assert.ok(refused.log.lines.some((l) => l.message.startsWith("the turn's stream could not be closed before")));
 });
 
+it("a card waiting for the person closes the stream at once, even before it opened, and never again at the limit", async () => {
+  const { clock, bus, log, status } = streaming({}, "zh");
+  status.begin();
+  status.awaitingChoice(); // (the stream is still opening)
+  status.awaitingChoice();
+  await clock.advanceTo(clock.start + 1);
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + STREAM_CLOSE_SECONDS + 5);
+  assert.deepEqual(
+    bus.streamOps.map((o) => [o.op, o.text]),
+    [
+      ["open", "思考中…"],
+      ["finish", "请在卡片里选择，选好后我接着做。"],
+    ],
+  );
+  assert.ok(
+    log.lines.some(
+      (l) =>
+        l.message.startsWith("the turn's stream was closed") && l.fields["why"] === "while a card waits for the person",
+    ),
+  );
+  await clock.pump(status.finish(["答案"]));
+  assert.deepEqual(bus.texts, ["答案"]);
+  assert.equal(bus.streamOps.length, 2);
+  // a refused close is only logged, and the answer still comes as a message
+  const refused = streaming({ stream: { refuse: (op) => (op.op === "finish" ? 500 : undefined) } });
+  refused.status.begin();
+  await refused.clock.advanceTo(refused.clock.start + 0.5);
+  refused.status.awaitingChoice();
+  await refused.clock.advanceTo(refused.clock.start + 2);
+  assert.ok(refused.log.lines.some((l) => l.message.startsWith("the turn's stream could not be closed while a card")));
+  await refused.clock.pump(refused.status.finish(["the answer"]));
+  assert.deepEqual(refused.bus.texts, ["the answer"]);
+  // a cancel before the close is sent closes it with Interrupted instead
+  const cancelled = streaming();
+  cancelled.status.begin();
+  cancelled.status.awaitingChoice();
+  cancelled.status.close(true);
+  await cancelled.clock.drain();
+  assert.deepEqual(
+    cancelled.bus.streamOps.map((o) => [o.op, o.text]),
+    [
+      ["open", "Thinking…"],
+      ["finish", "Interrupted."],
+    ],
+  );
+});
+
+it("a card waiting for the person changes nothing on a progress message (it has no spinner)", async () => {
+  const clock = new Timeline();
+  const bus = new Bus(clock);
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger() });
+  status.begin();
+  status.awaitingChoice();
+  await clock.advanceTo(clock.start + 2);
+  await clock.pump(status.finish(["the answer"]));
+  assert.deepEqual(bus.streamOps, []);
+  assert.deepEqual(bus.texts, ["the answer"]);
+});
+
 it("a progress message whose post failed is never edited, and the answer still comes", async () => {
   const clock = new Timeline();
   const bus = new Bus(clock, { fail: (s) => Boolean(s.ack) });

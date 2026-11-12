@@ -144,6 +144,59 @@ it("test_a_long_turn_closes_its_stream_before_teams_limit_and_the_answer_follows
   assert.deepEqual(run.told, ["started", "delivered"]);
 });
 
+it("a question card closes the stream with Waiting for your choice at once, and the answer comes as a message", async () => {
+  const question = ev("userQuestion", "m1", {
+    actionId: "act-9",
+    questions: [{ id: "q1", question: "火锅还是烧烤？", options: [{ id: "a", label: "火锅" }] }],
+  });
+  const run = await turn(
+    [
+      [0.2, said("我来弹个选项。")],
+      [1.0, question],
+      [300.0, tool("bash", "start")],
+      [301.0, tool("bash", "success")],
+      [302.0, said("你选了火锅。")],
+      [302.5, end()],
+    ],
+    { request: { lang: "zh" } },
+  );
+  const [final] = finals(run);
+  assert.ok(final && finals(run).length === 1, `one final, not ${String(finals(run).length)}`);
+  assert.equal(final.text, "请在卡片里选择，选好后我接着做。");
+  assert.equal(final.text, turnText.in("zh").awaitingChoice);
+  assert.ok(final.at >= 1.0 && final.at <= 3.0, String(final.at)); // closed when the card went out, not at the limit
+  assert.ok(run.ops.every((o) => o.at <= 3.0)); // no "Thinking…" or step is sent to the stream while the person chooses
+  const cards = run.bus.sent.filter((s) => s.message?.body.type === "view" && s.message.body.view.name === "question");
+  assert.equal(cards.length, 1);
+  const [answer, ...more] = plainMessages(run).filter((m) => m.body.type !== "view");
+  assert.ok(
+    answer && more.length === 0 && textOf(answer).includes("你选了火锅。"),
+    plainMessages(run).map(textOf).join(" | "),
+  );
+  const stream = await turn(
+    [
+      [0.2, said("Let me ask.")],
+      [1.0, question],
+      [5.0, said("Got it.")],
+      [5.5, end()],
+    ],
+    {
+      style: { streamText: true },
+    },
+  );
+  // what was streamed into the bubble stays; the waiting line follows it
+  assert.equal(
+    textOf(finalOf(stream)),
+    "Let me ask.\n\nWaiting for your choice in the card; I will continue once you pick.",
+  );
+  const approval = await turn([
+    [1.0, ev("permissionRequest", "m1", { tool: "bash" })],
+    [5.0, said("ok")],
+    [5.5, end()],
+  ]);
+  assert.ok(textOf(finalOf(approval)).includes("ok")); // an approval keeps the stream as before
+});
+
 it("test_a_stream_teams_refuses_falls_back_to_the_progress_message_and_the_answer_still_comes", async () => {
   // a refused opening: 403 ContentStreamNotAllowed, 429, a 2xx without the stream's id, 500
   for (const status of [403, 429, 200, 500]) {
