@@ -105,6 +105,8 @@ interface RunForegroundOptions {
    * and the agent, told the call failed, will usually run it again beside it.
    */
   signal?: AbortSignal;
+  /** Each piece of output as it arrives, in order, besides the capped buffers the result is read from. */
+  onOutput?: (stream: "stdout" | "stderr", chunk: Buffer) => void;
 }
 
 /** Write a compact structured lifecycle log to stdout. */
@@ -256,6 +258,11 @@ export async function runForegroundShell(
     owner: options.owner,
     run: options.run,
   });
+  if (options.onOutput) {
+    const onOutput = options.onOutput;
+    shell.process.stdout?.on("data", (chunk: Buffer) => onOutput("stdout", chunk));
+    shell.process.stderr?.on("data", (chunk: Buffer) => onOutput("stderr", chunk));
+  }
   const terminateGraceMs = options.terminateGraceMs ?? 5_000;
   let abandoned = false;
   const forceResolveMs = options.forceResolveMs ?? 10_000;

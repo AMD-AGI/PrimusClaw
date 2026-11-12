@@ -6,6 +6,13 @@ import { spawnBackground } from "./bg-manager.js";
 import { currentCallSignal, currentOwner, currentRun } from "../../runtime/owner-context.js";
 import { runForegroundShell } from "./process-runner.js";
 import { BG_SHELL_ENABLED } from "../../config.js";
+import { OutputProgress } from "./output-progress.js";
+
+/** What the MCP server hands a tool besides its arguments: the call's `_meta` and a way to notify its caller. */
+interface CallExtra {
+  _meta?: { progressToken?: string | number };
+  sendNotification?: (notification: { method: "notifications/progress"; params: Record<string, unknown> }) => Promise<void>;
+}
 
 const MAX_OUTPUT_BYTES = parseInt(process.env.BASH_OUTPUT_BYTES || `${10 * 1024 * 1024}`, 10);
 /**
@@ -82,7 +89,7 @@ export const bash = {
   execute: async (args: {
     command: string; timeout?: number;
     run_in_background?: boolean; shell_id?: string; background_kind?: "background" | "monitor";
-  }) => {
+  }, extra?: CallExtra) => {
     if (args.run_in_background) {
       try {
         const start = spawnBackground(
@@ -123,13 +130,22 @@ export const bash = {
     const grantedSec = Math.min(requestedSec, MAX_TIMEOUT_SEC);
 
     const timeoutMs = grantedSec * 1000;
+    // A caller that sent a progress token is sent the output as it is written (`notifications/progress`, the output since the
+    // last one as `message`), on the reply stream of this call, before the result.
+    const token = extra?._meta?.progressToken;
+    const notify = extra?.sendNotification;
+    const progress = token !== undefined && notify
+      ? new OutputProgress((message, n) => notify({ method: "notifications/progress", params: { progressToken: token, progress: n, message } }))
+      : undefined;
     const result = await runForegroundShell(args.command, {
       timeoutMs,
       bufferBytes: MAX_OUTPUT_BYTES,
       owner: currentOwner(),
       run: currentRun(),
       signal: currentCallSignal(),
+      ...(progress ? { onOutput: (stream: "stdout" | "stderr", chunk: Buffer) => progress.write(stream, chunk) } : {}),
     });
+    await progress?.end();
 
     if (result.abandoned) {
       // Written to a closed request, so nobody reads this; it is here so the

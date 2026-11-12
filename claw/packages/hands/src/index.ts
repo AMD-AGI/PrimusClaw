@@ -191,6 +191,14 @@ function sendScopeFailure(
   );
 }
 
+/** A JSON-RPC `tools/call` (alone, not in a batch) that carries a progress token. */
+export function wantsProgress(body: unknown): boolean {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+  const msg = body as { method?: unknown; params?: { _meta?: { progressToken?: unknown } } };
+  const token = msg.method === "tools/call" ? msg.params?._meta?.progressToken : undefined;
+  return typeof token === "string" || typeof token === "number";
+}
+
 app.all("/mcp", async (req, reply) => {
   const denied = authFailure(req);
   if (denied) return reply.status(denied.status).send({ error: denied.error });
@@ -203,11 +211,16 @@ app.all("/mcp", async (req, reply) => {
   // StreamableHTTPClientTransport already accepts `application/json` responses
   // (see sdk/client/streamableHttp.js handlePostResponse), so this is a server-
   // side-only switch.
+  // The one exception: a tool call that asks for progress (`_meta.progressToken`, a foreground `bash` whose output Brain shows as
+  // it is written) is answered as an SSE stream, the only way its notifications reach the caller before the result. Fastify is
+  // told the reply is not its own (`hijack`), so nothing but the transport writes or ends it.
+  const streamed = wantsProgress(req.body);
   const mcp = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined as any,
-    enableJsonResponse: true,
+    enableJsonResponse: !streamed,
   });
+  if (streamed) reply.hijack();
   await mcp.connect(transport);
   // `enableJsonResponse` makes handleRequest await every tool result, so tools
   // run inside this async context and can read who is calling without being
