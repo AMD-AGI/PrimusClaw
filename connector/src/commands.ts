@@ -17,7 +17,10 @@ import {
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
-import { approvalHooksStatus, HooksError, hooksStatus, installApprovalHooks, installHooks, settingsFile, uninstallApprovalHooks, uninstallHooks } from "./hooks.js";
+import {
+  approvalHooksStatus, codexApprovalHooksStatus, codexHooksFile, HooksError, hooksStatus, installApprovalHooks, installCodexApprovalHooks, installHooks, settingsFile,
+  uninstallApprovalHooks, uninstallCodexApprovalHooks, uninstallHooks,
+} from "./hooks.js";
 import { approvalSocketFile } from "./approvals.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
@@ -119,13 +122,17 @@ terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
     run: (rest, ctx) => cmdInit(rest, ctx),
   },
   hooks: {
-    usage: "hooks install|uninstall|status [--approvals] [--config-dir DIR]",
+    usage: "hooks install|uninstall|status [--approvals | --codex] [--config-dir DIR]",
     about: `the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
 in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
 directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed.
 --approvals also adds the approval hooks: a question Claude Code asks in a terminal (run a command,
 edit a file, approve a plan, a multiple-choice question) is also put to you in the chat, and the
-first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those`,
+first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those.
+--codex does the same for the Codex CLI, in DIR/hooks.json (default: the codex agents' CODEX_HOME,
+else $CODEX_HOME or ~/.codex): a command, patch or MCP tool Codex asks about in a terminal nobody
+has typed in for 30 s goes to the chat; typing in the terminal takes it back. Codex asks you to
+trust the hook the next time it starts`,
     run: (rest, ctx) => cmdHooks(rest, ctx),
   },
   pair: {
@@ -427,10 +434,52 @@ function installApprovalsOne(ctx: Ctx, dir: string) {
 const describeInstall = (dir: string, changed: boolean): string =>
   changed ? `installed the Claude Code session hooks in ${settingsFile(dir)}` : `the Claude Code session hooks are already in ${settingsFile(dir)}`;
 
+const defaultCodexDir = (ctx: Ctx): string => path.resolve(ctx.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"));
+
+/** The CODEX_HOME directories the connector looks at: those of its codex agents, else the default one. */
+function codexDirs(ctx: Ctx, flag: string | undefined): string[] {
+  if (flag !== undefined) return [path.resolve(flag)];
+  let dirs: string[] = [];
+  try {
+    dirs = loadCfg(ctx).agents.filter((a) => a.kind === "codex").map((a) => path.resolve(a.env.CODEX_HOME ?? (ctx.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"))));
+  } catch { /* no usable agents.toml yet: the default directory */ }
+  return dirs.length ? [...new Set(dirs)] : [defaultCodexDir(ctx)];
+}
+
+/** `hooks ... --codex`: the Codex approval hook only (Codex has no session hooks of ours). */
+function cmdCodexHooks(sub: "install" | "uninstall" | "status", flag: string | undefined, json: boolean, ctx: Ctx): number {
+  let code: number = EXIT.ok;
+  const report: Array<Record<string, unknown>> = [];
+  for (const dir of codexDirs(ctx, flag)) {
+    try {
+      if (sub === "install") {
+        if (flag === undefined && !fs.existsSync(dir)) { ctx.err(`no Codex directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
+        const r = installCodexApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state));
+        ctx.out(r.changed
+          ? `installed the Codex approval hook in ${codexHooksFile(dir)}: a question Codex asks in a terminal nobody is typing in also goes to your chat. Codex runs it only once you trust it: it asks the next time it starts (or review it under /hooks)`
+          : `the Codex approval hook is already in ${codexHooksFile(dir)}`);
+      } else if (sub === "uninstall") {
+        ctx.out(uninstallCodexApprovalHooks(dir).changed ? `removed the Codex approval hook from ${codexHooksFile(dir)}` : `no Codex approval hook of ours in ${codexHooksFile(dir)}`);
+      } else {
+        const st = codexApprovalHooksStatus(dir);
+        report.push({ dir, codex: true, approvals: st });
+        const say = st.installed ? (st.healthy ? "installed (Codex runs it once trusted: /hooks)" : "installed, but broken") : st.events.length ? `partly installed (${st.events.join(", ")})` : "not installed";
+        if (!json) ctx.out(`${dir}: codex approvals: ${say}${st.problem ? `; ${st.problem}` : ""}`);
+      }
+    } catch (e) {
+      ctx.err(e instanceof HooksError ? e.message : `error: ${errMessage(e)}`);
+      code = EXIT.failure;
+    }
+  }
+  if (sub === "status" && json) ctx.out(JSON.stringify(report, null, 2));
+  return code;
+}
+
 function cmdHooks(args: string[], ctx: Ctx): number {
   const [sub, ...rest] = args;
-  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--config-dir DIR]"); return EXIT.usage; }
-  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" } } });
+  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--approvals | --codex] [--config-dir DIR]"); return EXIT.usage; }
+  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" }, codex: { type: "boolean" } } });
+  if (values.codex) return cmdCodexHooks(sub, values["config-dir"], !!values.json, ctx);
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
   let code: number = EXIT.ok;

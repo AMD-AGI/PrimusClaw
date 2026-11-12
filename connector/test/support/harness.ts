@@ -50,6 +50,8 @@ export interface HarnessOptions {
   /** The agent's `approval` setting, and the mode its sessions start in (default: "default", which asks). */
   approval?: "ask" | "never";
   askMode?: string;
+  /** The first agent's kind (default "example"; an attach agent takes its preset's). */
+  kind?: string;
   /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
   preset?: string;
   safeModes?: string[];
@@ -108,7 +110,7 @@ export class Harness {
     const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
 id = ${JSON.stringify(id)}
-${o.attach && id === "fake" ? "" : 'kind = "example"'}
+${o.attach && id === "fake" ? "" : `kind = ${JSON.stringify(id === "fake" && o.kind ? o.kind : "example")}`}
 name = "Fake agent"
 ${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]

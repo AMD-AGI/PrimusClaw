@@ -23,7 +23,7 @@ import { resolveCwd } from "./roots.js";
 import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox } from "./outbox.js";
-import { ApprovalBroker, serveApprovals } from "./approvals.js";
+import { ApprovalBroker, serveApprovals, type HookAgent } from "./approvals.js";
 import {
   childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
 } from "./paths.js";
@@ -426,14 +426,18 @@ export class Connector {
 
   /**
    * The Claw session for a terminal conversation's approvals, or why there is none: this machine is paused or not connected,
-   * the owner turned approvals off, no agent reads that Claude config directory, or the folder is outside the agent's roots.
+   * the owner turned approvals off, no agent reads that Claude config directory (or CODEX_HOME), or the folder is outside the agent's roots.
    */
-  private async openTerminalSession(p: { configDir: string; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }> {
+  private async openTerminalSession(p: { configDir: string; agent: HookAgent; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }> {
     if (this.paused) return { refused: "paused" };
     if (!this.cid || this.revoked) return { refused: "not_connected" };
     if (Date.now() < this.approvalsOffUntil) return { refused: "approvals_off" };
     const dir = path.resolve(p.configDir);
-    const agent = this.d.config.agents.find((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
+    // A Codex terminal's question belongs to the `codex` agent that reads the same CODEX_HOME; a Claude Code one to the
+    // claude-attach agent that reads the same Claude config directory.
+    const agent = p.agent === "codex"
+      ? this.d.config.agents.find((a) => a.kind === "codex" && path.resolve(a.env.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex")) === dir)
+      : this.d.config.agents.find((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
     if (!agent) return { refused: "no_agent_for_config_dir" };
     const where = await resolveCwd(p.cwd, agent.roots, { home: agent.env.HOME?.trim() || os.homedir(), timeoutMs: this.timing.rootCheckMs });
     if (!where.ok) return { refused: `cwd_${where.reason}` };
