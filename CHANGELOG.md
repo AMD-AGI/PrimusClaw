@@ -131,6 +131,11 @@ release version, and its `appVersion` stays `latest`.
   ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
   the word crossing them whole, and the title runs past 40. An item an older Claw titled is renamed on its next request, as
   before. No schema change, no new setting.
+- A sandbox's workspace is restored from object storage in batches Hands accepts (100 files, at most 256 KiB of file
+  list, a call), as the upload has long been sent, instead of in one call: a session past about a thousand files was
+  refused with 413 and its workspace came back empty (measured on a 3,632-file clone). A batch that fails is retried
+  alone; an unreachable sandbox still stops the restore at once. The uploads given to a reused sandbox go in the same
+  batches. No schema change, no new setting (#805).
 
 ## [0.3.1] - 2026-11-12
 
