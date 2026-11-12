@@ -9,11 +9,13 @@
  *      name wins when both are set
  *   W2 with only auto-evolution on (as a deployment that kept the old setting has it): no skill reaches a turn, and
  *      what a worker's turn saves is dropped, while the auto-evolution steps of a completion still run
+ *   W3 and Brain's read of a skill is refused in a live turn of the user's own chat, with nothing of the skill
  *
  * The flags are read when the modules load, so W2 sets them first, and W1 reads them in child processes.
  */
 
 process.env.CLAW_SKILL_EVOLUTION_ENABLED = "true";
+process.env.AUTH_INTERNAL_TOKEN = "switches-internal-token";
 delete process.env.CLAW_SKILL_AUTO_EVOLUTION_ENABLED;
 delete process.env.CLAW_USER_SKILLS_ENABLED;
 
@@ -130,4 +132,22 @@ test("W2 auto-evolution alone: no skill reaches a turn and a turn's saves are dr
   assert.ok(!calls.includes("saveUserSkill"), "a turn's save is kept with the user's skills off");
   assert.ok(calls.includes("recordSkillFeedback"), "auto-evolution's feedback step did not run: this test proves nothing");
   assert.ok(calls.includes("enqueueEvolutionJob"));
+});
+
+test("W3 with the user's skills off, Brain's read of one is refused in a live turn of the user's own chat", async () => {
+  await seedSession(h, "skill-switches-read");
+  await seedRun(h, "run-read", "skill-switches-read", { status: "running", messageId: "m-read" });
+  await h.sql("INSERT INTO claw_skills (user_id, skill_name, version, status) VALUES ('u-1', 'read-me', 1, 'active')");
+  const Fastify = (await import("fastify")).default;
+  const app = Fastify();
+  await (await import("../src/routes/internal-skills.js")).registerInternalSkillRoutes(app);
+  try {
+    const res = await app.inject({
+      method: "POST", url: "/v1/internal/skills/read", headers: { authorization: "Bearer switches-internal-token" },
+      payload: { session_id: "skill-switches-read", message_id: "m-read", name: "read-me" },
+    });
+    assert.deepEqual([res.statusCode, res.json().error], [403, "not_served"]);
+  } finally {
+    await app.close();
+  }
 });
