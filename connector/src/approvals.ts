@@ -395,6 +395,8 @@ export class ApprovalBroker {
       this.d.emit(sid, "permissionRequest", {
         actionId: c.actionId, tool: c.spec.tool, kind: c.spec.kind, input: c.spec.input, toolCallId: null, options: c.spec.options,
         timeout_ms: q.waitMs, origin: "terminal_hook", cwd: q.cwd,
+        // Cursor asks at the terminal only once the card is answered or its time is up (cursor-approvals.ts), not meanwhile.
+        ...(q.agent === "cursor" ? { terminal_asks: "after_card" } : {}),
         ...(c.spec.questionCount ? { question_index: c.spec.questionIndex, question_count: c.spec.questionCount } : {}),
       });
     }

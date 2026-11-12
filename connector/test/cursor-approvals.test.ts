@@ -178,6 +178,7 @@ describe("the broker, for Cursor", () => {
     assert.deepEqual([started.origin, started.agent, started.ref], ["terminal_hook", "cursor", CONV]);
     const card = r.cards()[0]!.data;
     assert.equal(card.timeout_ms, 60_000);
+    assert.equal(card.terminal_asks, "after_card");
     assert.equal(r.broker.decide(String(card.actionId), "deny", null), true);
     assert.deepEqual(r.replies, [{ v: 1, decision: { permission: "deny", user_message: "Declined from your phone (Claw).", agent_message: CURSOR_DENIED_AGENT } }]);
   });

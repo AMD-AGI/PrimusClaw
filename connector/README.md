@@ -602,6 +602,8 @@ never approve one. So for Cursor the phone goes first and the terminal second:
 - A call Cursor would not ask about is neither put on the phone nor held. That is judged from those files: a command line this
   cannot split for sure (`$(...)`, backticks) counts as asked about, and Cursor's own extra checks (a recursive delete outside the
   sandbox, an administrator's list) are not seen, so such a call is asked about at the terminal only.
+- A Cursor session keeps the hooks it started with: install, uninstall or a new `--hold` takes effect in the next one.
+- Claw and the chat still say "the first answer counts" on these cards; the card's event says `terminal_asks: "after_card"`.
 - Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
   editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
 
