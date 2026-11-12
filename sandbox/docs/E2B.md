@@ -71,6 +71,8 @@ Quotas apply per person, across all templates. The built-in defaults are below; 
 | `system-admin` | unlimited            | unlimited       | 3 days                   |
 
 - The create timeout and every extension stay within the max lifetime.
+- The timeout and the max lifetime count from the time the sandbox is running. Time spent queued or pending is not part of either.
+- The wait for a sandbox to run is the pending timeout: metadata `agent-sandbox.io/pending-timeout` in seconds (1 to 86400) when set, else the template `pendingTimeoutSec`, else 15 minutes. A sandbox not running by then is removed and the create, and any replay of its idempotency key, reports `pending_timeout` with the limit and the last queue state.
 - An expired sandbox is reclaimed. Kill releases the quota at once.
 - A user lists and operates only their own sandboxes. Another user's sandbox returns `404`.
 - A `system-admin` operates every sandbox, including Claw grant sandboxes. An extension stays within both the caller's max lifetime and that of the sandbox's owner.
@@ -150,6 +152,8 @@ from e2b import Sandbox
 | 403    | `user_not_in_workspace` | Caller is not a member of the workspace           |
 | 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
+| 410    | `idempotency_key_spent` | Key already ended; the detail carries the reason  |
+| 503    | `pending_timeout`       | Sandbox was not running within the pending timeout |
 | 503    | `identity_unavailable`  | Identity or the user record cannot be read        |
 
 A create that waits for a free GPU stays pending until the Workload is scheduled; a larger `request_timeout` keeps the call open while it waits.

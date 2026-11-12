@@ -24,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -45,6 +46,8 @@ type fakeRunner struct {
 	failure   string
 	node      string
 	adopted   []time.Duration
+	// onCancel runs when a held create is cancelled, before it returns.
+	onCancel func()
 }
 
 func (f *fakeRunner) Adopt(_ context.Context, _ string, _ CreateResult, timeout time.Duration) error {
@@ -61,6 +64,9 @@ func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResul
 		select {
 		case <-f.hold:
 		case <-ctx.Done():
+			if f.onCancel != nil {
+				f.onCancel()
+			}
 			return CreateResult{}, ctx.Err()
 		}
 	}
@@ -245,6 +251,41 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 				t.Fatalf("replay=%v", err)
 			}
 		})
+	}
+}
+
+// A replay that reads the Workload while the expired create deletes it reports
+// the pending timeout, not the deletion it observed.
+func TestPendingTimeoutReplayDuringDeleteReportsPendingTimeout(t *testing.T) {
+	svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	var replayErr error
+	runner.onCancel = func() {
+		runner.observed = WorkloadFinished
+		runner.failure = "workload sbx-1 is being deleted: phase NotReady: In queue"
+		_, _, replayErr = svc.Create(context.Background(), keys["measurement"], body)
+	}
+	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+	var oe *grant.OpError
+	if !errors.As(replayErr, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, ": pending_timeout") || strings.Contains(oe.Detail, "being deleted") {
+		t.Fatalf("replay=%v", replayErr)
+	}
+	if !errors.As(err, &oe) || oe.Reason != "pending_timeout" || !strings.Contains(oe.Detail, "pendingTimeoutSec=1") {
+		t.Fatalf("create=%v", err)
+	}
+}
+
+// endAt counts the sandbox timeout from the time it was first running.
+func TestDetailEndAtCountsFromRunning(t *testing.T) {
+	svc, _, _ := testPlane(t, 600, []int32{1}, 1)
+	created := time.Date(2026, 11, 9, 3, 14, 0, 0, time.UTC)
+	ref := runtimev1alpha1.GrantSandboxRef{
+		ID: "sbx-1", StartedAt: metav1.NewTime(created), RunningAt: metav1.NewTime(created.Add(20 * time.Minute)), TimeoutSec: 600,
+	}
+	got := svc.detail(context.Background(), "gr-01jb7m9k2x", ref)
+	if want := created.Add(30 * time.Minute).Format(time.RFC3339); got.EndAt != want || got.StartedAt != created.Add(20*time.Minute).Format(time.RFC3339) {
+		t.Fatalf("startedAt=%s endAt=%s want endAt %s", got.StartedAt, got.EndAt, want)
 	}
 }
 

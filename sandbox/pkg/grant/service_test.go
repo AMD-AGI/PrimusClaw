@@ -901,6 +901,37 @@ func TestTimeoutCannotOutliveGrant(t *testing.T) {
 	}
 }
 
+// The lifetime cap of a timeout change counts from the time the sandbox was first running.
+func TestTimeoutCapCountsFromRunning(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(2 * time.Hour))
+	req.MaxSandboxSeconds = 600
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(400 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{SandboxName: "sbx-1"}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(500 * time.Second)
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 500); err != nil {
+		t.Fatalf("timeout within the cap from running: %v", err)
+	}
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 501); !IsReason(err, "timeout_not_allowed") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	clock := now

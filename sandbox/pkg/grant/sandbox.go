@@ -278,7 +278,7 @@ func (s *Service) setSandboxTimeout(ctx context.Context, grantID, sandboxID stri
 			if ref.State == runtimev1alpha1.SandboxEnded {
 				return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 			}
-			if maxSec > 0 && !timeoutWithinLifetime(ref.StartedAt.Time, s.now(), timeoutSec, maxSec) {
+			if maxSec > 0 && !timeoutWithinLifetime(lifetimeStart(ref), s.now(), timeoutSec, maxSec) {
 				return opErr(http.StatusForbidden, "timeout_not_allowed",
 					fmtDetail("%d > %d", timeoutSec, maxSec))
 			}
@@ -288,6 +288,15 @@ func (s *Service) setSandboxTimeout(ctx context.Context, grantID, sandboxID stri
 		}
 		return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 	})
+}
+
+// lifetimeStart is the time a sandbox lifetime counts from: first running,
+// else its create time.
+func lifetimeStart(ref runtimev1alpha1.GrantSandboxRef) time.Time {
+	if !ref.RunningAt.IsZero() {
+		return ref.RunningAt.Time
+	}
+	return ref.StartedAt.Time
 }
 
 // timeoutWithinLifetime reports whether now plus timeoutSec is still within
