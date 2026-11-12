@@ -38,8 +38,10 @@ const HELD = [
   "git push origin main", "git push origin HEAD:master", "git push -u origin HEAD", "git push", "git push origin :", "git push origin 'refs/heads/*:refs/heads/*'",
   "gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"x\"}) { thread { id } } }'",
   "curl -X POST https://api.github.com/repos/o/r/issues -d '{}'", "gh secret set X --body y", "gh run rerun 9",
-  // The worker prompt (api prompts.ts, worker-v10/v11) tells a worker to make a GitHub write no tool covers in these forms, held for a card.
+  // The worker prompt (api prompts.ts, worker-v10 and later) tells a worker to make a GitHub write no tool covers in these forms, held for a card.
   "gh api -X PUT user/starred/vllm-project/vllm", "gh api --method PUT /user/starred/o/r", "gh label create triage -R o/r", "gh release create v1.0.0 -R o/r",
+  // worker-v12/v13 make a star, a watch or a label added first, with no read before it: each must still be held.
+  "gh api -X DELETE user/starred/o/r", "gh api -X PUT repos/o/r/subscription", "gh issue edit 3 --add-label bug -R o/r", "gh pr edit 4 --add-label bug -R o/r",
 ];
 const RUNS = [
   "gh pr view 12", "git push origin feat/x", "ls -la",
