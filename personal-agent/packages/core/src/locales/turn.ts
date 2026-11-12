@@ -25,7 +25,7 @@ export const turnText = defineCatalog({
     /** A turn still running when its stream has to close: the answer follows as a message of its own. */
     stillWorking: "Still working on it; the result will follow as a new message.",
     /** A turn whose stream is closed because a card now waits for the person's choice. */
-    awaitingChoice: "Waiting for your choice in the card; I will continue once you pick.",
+    awaitingChoice: "Waiting for your choice in the card, or reply here; I will continue once you answer.",
     interrupted: "Interrupted.",
     /** What a turn the person stopped ends with. */
     stopped: "Stopped.",
@@ -50,7 +50,7 @@ export const turnText = defineCatalog({
     planMore: (p) => `……另有 ${String(p.n)} 项（${String(p.done)} 项已完成，${String(p.todo)} 项待办）`,
     thinking: "思考中…",
     stillWorking: "仍在处理，完成后另发结果。",
-    awaitingChoice: "请在卡片里选择，选好后我接着做。",
+    awaitingChoice: "请在卡片里选择，或直接回复，答好后我接着做。",
     interrupted: "已中断。",
     stopped: "已停止。",
     doneShort: "完成。",

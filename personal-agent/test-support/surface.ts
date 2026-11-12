@@ -161,8 +161,8 @@ class FakeConversation implements Conversation {
     return { operation: "send", conversation: this.ref.id, message: JSON.parse(JSON.stringify(message)) as Envelope };
   }
 
-  /** Records a delivered envelope as the send it stands for. */
-  deliver(envelope: Envelope): Promise<void> {
+  /** Records a delivered envelope as the send it stands for (as a queued send: no id). */
+  deliver(envelope: Envelope): Promise<MessageId | undefined> {
     if (envelope["operation"] !== "send" || envelope["conversation"] !== this.ref.id) {
       return Promise.reject(new Error("FakeConversation.deliver: not an envelope of this conversation"));
     }
@@ -171,7 +171,7 @@ class FakeConversation implements Conversation {
       conversation: this.ref.id,
       message: envelope["message"] as unknown as OutMessage,
     });
-    return Promise.resolve();
+    return Promise.resolve(undefined);
   }
 
   /**

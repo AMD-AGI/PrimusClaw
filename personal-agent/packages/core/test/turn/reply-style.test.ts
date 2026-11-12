@@ -162,7 +162,7 @@ it("a question card closes the stream with Waiting for your choice at once, and 
   );
   const [final] = finals(run);
   assert.ok(final && finals(run).length === 1, `one final, not ${String(finals(run).length)}`);
-  assert.equal(final.text, "请在卡片里选择，选好后我接着做。");
+  assert.equal(final.text, "请在卡片里选择，或直接回复，答好后我接着做。");
   assert.equal(final.text, turnText.in("zh").awaitingChoice);
   assert.ok(final.at >= 1.0 && final.at <= 3.0, String(final.at)); // closed when the card went out, not at the limit
   assert.ok(run.ops.every((o) => o.at <= 3.0)); // no "Thinking…" or step is sent to the stream while the person chooses
@@ -187,7 +187,7 @@ it("a question card closes the stream with Waiting for your choice at once, and 
   // what was streamed into the bubble stays; the waiting line follows it
   assert.equal(
     textOf(finalOf(stream)),
-    "Let me ask.\n\nWaiting for your choice in the card; I will continue once you pick.",
+    "Let me ask.\n\nWaiting for your choice in the card, or reply here; I will continue once you answer.",
   );
   const approval = await turn([
     [1.0, ev("permissionRequest", "m1", { tool: "bash" })],

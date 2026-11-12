@@ -53,6 +53,45 @@ test("one approval is one card: recorded once, in flight until sent, taken back 
   assert.equal(approvals.getApproval("s9", "t9"), null);
 });
 
+test("a question card waits with its questions and its card's id until it is answered, runs out or is closed", () => {
+  const { store, clock } = openTestStore();
+  const approvals = store.approvals;
+  const at = store.now() + 600;
+  const questions = [{ id: "q1", question: "Which?", options: [{ id: "a", label: "A" }], allow_multiple: false }];
+  const question = (toolUseId: string, withQuestions = true) => ({
+    ...approval(toolUseId, at),
+    tool: "ask_user_question",
+    ...(withQuestions ? { questions } : {}),
+  });
+  approvals.saveApproval(question("q-old"));
+  approvals.approvalSent("s1", "q-old", "card-old");
+  advanceSeconds(clock, 1);
+  approvals.saveApproval(question("q-new"));
+  assert.equal(approvals.pendingQuestion("s1", "aad-a")?.toolUseId, "q-old"); // (the newer is not in the chat yet)
+  approvals.approvalSent("s1", "q-new", "card-new");
+  approvals.saveApproval(approval("t-bash", at)); // an approval is not a question
+  approvals.approvalSent("s1", "t-bash", "card-bash");
+  assert.deepEqual(approvals.pendingQuestion("s1", "aad-a"), {
+    sessionId: "s1",
+    toolUseId: "q-new",
+    userId: "aad-a",
+    expiresAt: at,
+    questions,
+    cardId: "card-new",
+  });
+  assert.equal(approvals.pendingQuestion("s1", "aad-b"), null); // someone else's
+  assert.equal(approvals.pendingQuestion("s2", "aad-a"), null);
+  assert.equal(approvals.closeApproval("s1", "q-new", "decided"), true);
+  assert.equal(approvals.pendingQuestion("s1", "aad-a")?.toolUseId, "q-old");
+  advanceSeconds(clock, 600);
+  assert.equal(approvals.pendingQuestion("s1", "aad-a"), null); // ran out
+  // one recorded without its questions (a work item's, pushed) is not answered from a typed message
+  const fresh = openTestStore().store.approvals;
+  fresh.saveApproval(question("q-bare", false));
+  fresh.approvalSent("s1", "q-bare", "card");
+  assert.equal(fresh.pendingQuestion("s1", "aad-a"), null);
+});
+
 test("a click closes an approval once; a closed one is not taken back", () => {
   const { store } = openTestStore();
   const approvals = store.approvals;

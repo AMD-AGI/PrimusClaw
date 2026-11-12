@@ -38,8 +38,9 @@ export interface TurnApprovals {
     tool: string,
     expiresIn: number | undefined,
     envelope: Envelope,
+    questions?: unknown,
   ): boolean;
-  sent(sessionId: string, toolUseId: string): void;
+  sent(sessionId: string, toolUseId: string, cardId?: string): void;
   unsent(sessionId: string, toolUseId: string): void;
 }
 
@@ -183,10 +184,10 @@ export class TurnEngine implements TurnRunner {
     const review = run.review?.turn;
     return {
       ...(run.provider ? { keyProvider: run.provider } : {}),
-      onApproval: (sid, toolUseId, tool, expiresIn, envelope) =>
-        approvals.record(run.userId, sid, toolUseId, tool, expiresIn, envelope),
-      onApprovalSent: (sid, toolUseId) => {
-        approvals.sent(sid, toolUseId);
+      onApproval: (sid, toolUseId, tool, expiresIn, envelope, questions) =>
+        approvals.record(run.userId, sid, toolUseId, tool, expiresIn, envelope, questions),
+      onApprovalSent: (sid, toolUseId, cardId) => {
+        approvals.sent(sid, toolUseId, cardId);
       },
       onApprovalUnsent: (sid, toolUseId) => {
         approvals.unsent(sid, toolUseId);

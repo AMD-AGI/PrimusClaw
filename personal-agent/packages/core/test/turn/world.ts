@@ -190,8 +190,10 @@ export class Bus implements TurnSurface {
     return { operation: "send", message: JSON.parse(JSON.stringify(message)) as JsonObject };
   }
 
-  deliver(envelope: Envelope): Promise<void> {
-    return this.send(envelope["message"] as unknown as OutMessage);
+  /** As a direct send does: the id of the posted message when it arrived at once. */
+  async deliver(envelope: Envelope): Promise<string | undefined> {
+    const message = envelope["message"] as unknown as OutMessage;
+    return (await this.publish({ operation: "send", kind: "message", message })) || undefined;
   }
 
   openStream(_replyTo: string, status: string): Promise<Result<LiveStream, StreamRefused>> {

@@ -70,6 +70,7 @@ export type RouterStore = Pick<
   | "assistantMessages"
   | "notifySubs"
   | "reviewDelegation"
+  | "approvals"
   | "now"
 >;
 

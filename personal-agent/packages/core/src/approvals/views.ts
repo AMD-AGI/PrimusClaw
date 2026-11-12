@@ -6,6 +6,7 @@
  * channel adapter renders them; `approvalView` (approval-view.ts) is what an approval card says.
  */
 import type { JsonObject } from "../json.js";
+import type { Lang } from "../locales/lang.js";
 import type { CardQuestion } from "./questions.js";
 
 /** An approval card: the arguments of the Python worker's `render.permission_card`, one for one. */
@@ -32,6 +33,11 @@ export interface QuestionCardModel {
   readonly ownerName: string;
   /** A line under the header: which task asks, or what happened when the card comes back after a click ("" when none). */
   readonly note: string;
+  /**
+   * The card says it can also be answered by a message in the chat: a turn's question, which a typed message answers
+   * (`routing/question-reply.ts`). A work item's question is answered on its card only.
+   */
+  readonly typedReply?: boolean;
 }
 
 /** What replaces an approval card once it was answered (render.decided_card). */
@@ -55,6 +61,8 @@ export interface QuestionAnsweredModel {
   readonly answers: readonly (readonly [string, string])[];
   readonly when: number;
   readonly zone: string;
+  /** Answered by a message typed in the chat (not on the card), in this language: the card says "Answered: <answer>". */
+  readonly replied?: Lang;
 }
 
 /** An approval card put back after a press that did not go through: the note, then Approve and Deny again. */

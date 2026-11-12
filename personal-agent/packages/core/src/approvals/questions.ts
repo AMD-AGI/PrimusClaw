@@ -119,3 +119,32 @@ export function answersOf(data: Readonly<Record<string, unknown>>): Answers {
   });
   return { answers, skipped };
 }
+
+/** The option `token` names: its label (any case) or its number on the card, from 1. */
+function optionNamed(options: readonly QuestionOption[], token: string): QuestionOption | undefined {
+  const wanted = token.toLowerCase();
+  const byLabel = options.find((o) => o.label.toLowerCase() === wanted || o.id.toLowerCase() === wanted);
+  if (byLabel !== undefined || !/^\d{1,2}$/.test(token)) return byLabel;
+  return options[Number(token) - 1];
+}
+
+/**
+ * A message the person typed in the chat while a question card waited, taken as the card's answer. With one question, a
+ * reply that names its options (by label or by number, several of them for a multiple choice) answers with their labels,
+ * as a press on the card would; any other reply is the free answer the card's text box takes. With several questions the
+ * whole reply answers each of them: the agent reads which part answers which. Nothing is skipped.
+ */
+export function typedAnswers(questions: readonly CardQuestion[], typed: string): Answers {
+  const reply = cpHead(pyStrip(typed), ANSWER_MAX);
+  const answers = new Map<string, string>();
+  const only = questions.length === 1 ? questions[0] : undefined;
+  if (only !== undefined) {
+    const tokens = only.allowMultiple ? reply.split(/\s*[,，、;；]\s*/u).filter(Boolean) : [reply];
+    const named = tokens.flatMap((t) => optionNamed(only.options, t) ?? []);
+    const labels = named.length > 0 && named.length === tokens.length ? named.map((o) => o.label) : [];
+    answers.set(only.id, labels.length ? labels.join(", ") : reply);
+  } else {
+    for (const q of questions) answers.set(q.id, reply);
+  }
+  return { answers, skipped: [] };
+}

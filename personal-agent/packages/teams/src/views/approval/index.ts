@@ -135,6 +135,7 @@ function questionCard(model: QuestionCardModel) {
     header(t.questionTitle, { tone: "accent", subtitle: model.note, emoji: "question" }),
     ...model.questions.flatMap((q, i) => questionInputs(q, i, t)),
   ];
+  if (model.typedReply === true) body.push(note(t.questionReply));
   if (model.group) body.push(note(t.questionOnly({ who: model.ownerName || t.questionAsker })));
   return message(body, [answerButton(model.sessionId, model.toolUseId, model.questions)]);
 }
@@ -162,10 +163,21 @@ function approvalExpired(model: ApprovalExpiredModel): TeamsMessage {
 
 /** What replaces a question card once it was answered: when, and each answer. */
 function questionAnswered(model: QuestionAnsweredModel): TeamsMessage {
+  if (model.replied !== undefined) return questionReplied(model, model.replied);
   const said = proactiveText.in("en").answered({ at: clockText(model.when, model.zone) });
   return message([
     header(said, { tone: "good", emoji: "good" }),
     ...model.answers.map(([, answer]) => text(clip(answer, ANSWER_SHOWN_MAX))),
+  ]);
+}
+
+/** A question card answered by a message typed in the chat: "Answered: <the answer>", and when. */
+function questionReplied(model: QuestionAnsweredModel, lang: "zh" | "en"): TeamsMessage {
+  const t = approvalText.in(lang);
+  const answer = [...new Set(model.answers.map(([, a]) => a))].join(" / "); // (a reply that answers several says it once)
+  return message([
+    header(t.questionReplied({ answer: clip(answer, TITLE_MAX) }), { tone: "good", emoji: "good" }),
+    note(t.questionRepliedAt({ at: clockText(model.when, model.zone) })),
   ]);
 }
 

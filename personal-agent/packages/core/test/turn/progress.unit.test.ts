@@ -135,7 +135,7 @@ it("a card waiting for the person closes the stream at once, even before it open
     bus.streamOps.map((o) => [o.op, o.text]),
     [
       ["open", "思考中…"],
-      ["finish", "请在卡片里选择，选好后我接着做。"],
+      ["finish", "请在卡片里选择，或直接回复，答好后我接着做。"],
     ],
   );
   assert.ok(

@@ -35,7 +35,7 @@
     "type": "table",
     "name": "approvals",
     "tbl_name": "approvals",
-    "sql": "CREATE TABLE approvals (\n  session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  card_sent INTEGER NOT NULL DEFAULT 1, card_json TEXT,\n  PRIMARY KEY (session_id, tool_use_id))"
+    "sql": "CREATE TABLE approvals (\n  session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  card_sent INTEGER NOT NULL DEFAULT 1, card_json TEXT, card_id TEXT NOT NULL DEFAULT '', questions_json TEXT NOT NULL DEFAULT '',\n  PRIMARY KEY (session_id, tool_use_id))"
    },
    {
     "type": "table",
@@ -433,6 +433,22 @@
       "type": "TEXT",
       "notnull": 0,
       "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 9,
+      "name": "card_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 10,
+      "name": "questions_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
       "pk": 0
      }
     ],
@@ -3009,7 +3025,7 @@
     "type": "table",
     "name": "approvals",
     "tbl_name": "approvals",
-    "sql": "CREATE TABLE approvals (\n  session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  card_sent INTEGER NOT NULL DEFAULT 1, card_json TEXT,\n  PRIMARY KEY (session_id, tool_use_id))"
+    "sql": "CREATE TABLE approvals (\n  session_id TEXT NOT NULL, tool_use_id TEXT NOT NULL, aad_id TEXT NOT NULL, tool TEXT NOT NULL,\n  expires_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,\n  card_sent INTEGER NOT NULL DEFAULT 1, card_json TEXT, card_id TEXT NOT NULL DEFAULT '', questions_json TEXT NOT NULL DEFAULT '',\n  PRIMARY KEY (session_id, tool_use_id))"
    },
    {
     "type": "table",
@@ -3407,6 +3423,22 @@
       "type": "TEXT",
       "notnull": 0,
       "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 9,
+      "name": "card_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 10,
+      "name": "questions_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
       "pk": 0
      }
     ],

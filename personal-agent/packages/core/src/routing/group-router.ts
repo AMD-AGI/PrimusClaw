@@ -146,6 +146,7 @@ export class GroupRouter {
         quote: this.withHistory(message, words.quote),
         sent: words.sent,
         files,
+        typed: true,
       });
     }
   }

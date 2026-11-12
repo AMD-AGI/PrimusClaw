@@ -179,7 +179,7 @@ it("an approval is recorded before its card goes, and marked sent; one already s
   const shown = await go({ script });
   assert.deepEqual(shown.recorded.approvals, [
     ["record", "aad-run", "sess-ak-run", "tu-1", "bash", 90],
-    ["sent", "sess-ak-run", "tu-1"],
+    ["sent", "sess-ak-run", "tu-1", "teams-3"],
   ]);
   assert.equal(shown.chat.sent.filter((s) => s.message?.body.type === "view").length, 1);
   const elsewhere = await go({ script, take: false });

@@ -8,7 +8,9 @@
  * recorded WITH the card, so that a worker that dies before the send leaves it to the next (`resendUnsent`).
  */
 import type { Conversation, Envelope, OutMessage } from "../ports/surface.js";
+import type { JsonObject } from "../json.js";
 import type { ApprovalRepository, StorePort } from "../ports/store/index.js";
+import { cardQuestions, questionWire } from "./questions.js";
 
 export type ApprovalRecordStore = Pick<StorePort, "now"> & {
   readonly approvals: Pick<ApprovalRepository, "saveApproval" | "approvalSent" | "forgetApproval">;
@@ -64,15 +66,16 @@ export interface TurnApprovalRecords {
     tool: string,
     expiresIn: number | undefined,
     envelope: Envelope,
+    questions?: unknown,
   ): boolean;
-  sent(sessionId: string, toolUseId: string): void;
+  sent(sessionId: string, toolUseId: string, cardId?: string): void;
   unsent(sessionId: string, toolUseId: string): void;
 }
 
 /** The records of the approvals a turn shows (the Python `on_approval`, `on_approval_sent`, `on_approval_unsent`). */
 export function turnApprovals(store: ApprovalRecordStore): TurnApprovalRecords {
   return {
-    record: (userId, sessionId, toolUseId, tool, expiresIn, envelope) =>
+    record: (userId, sessionId, toolUseId, tool, expiresIn, envelope, questions) =>
       store.approvals.saveApproval({
         userId,
         sessionId,
@@ -80,9 +83,13 @@ export function turnApprovals(store: ApprovalRecordStore): TurnApprovalRecords {
         tool,
         expiresAt: store.now() + (expiresIn || TURN_DEADLINE_SECONDS),
         envelope,
+        // (a question's, as its card shows them: what a typed answer is matched against)
+        ...(questions === undefined
+          ? {}
+          : { questions: cardQuestions(questions).map((q) => questionWire(q) as JsonObject) }),
       }),
-    sent: (sessionId, toolUseId) => {
-      store.approvals.approvalSent(sessionId, toolUseId);
+    sent: (sessionId, toolUseId, cardId) => {
+      store.approvals.approvalSent(sessionId, toolUseId, cardId);
     },
     unsent: (sessionId, toolUseId) => {
       store.approvals.forgetApproval(sessionId, toolUseId);

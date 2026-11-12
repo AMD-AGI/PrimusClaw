@@ -276,12 +276,13 @@ it("the turn's approval and question cards are the ones the turn engine drew its
     group: false,
     ownerName: "",
     note: "",
+    typedReply: true, // (a turn's question: a message typed in the chat answers it too)
   };
   assert.deepEqual(question, {
     body: { type: "view", view: { name: "question", model }, fallbackText: "ask_user_question" },
   });
   assert.ok(question.body.type === "view" && question.body.view.name === "question");
-  assert.deepEqual(renderView(RENDERERS, question.body.view), catalogCard("question"));
+  assert.deepEqual(renderView(RENDERERS, question.body.view), catalogCard("question_typed_reply"));
   // Brain's questions are read here (Python card_questions): what is malformed is dropped, not shown.
   const bad = approvalTurnCards.question({
     questions: "x",
@@ -299,3 +300,49 @@ function catalogCard(id: string): JsonObject {
   assert.ok(entry, id);
   return entry.build();
 }
+
+it("a turn's question card says a message in the chat answers it too, in the card's language; a work item's does not", () => {
+  const ask = (question: string, typedReply?: boolean) =>
+    JSON.stringify(
+      approvalRenderers.question({
+        questions: cardQuestions([{ id: "q1", question, options: [{ id: "a", label: "A" }] }]),
+        sessionId: SID,
+        toolUseId: "tu-1",
+        group: false,
+        ownerName: "",
+        note: "",
+        ...(typedReply === undefined ? {} : { typedReply }),
+      }),
+    );
+  assert.ok(ask("Which one?", true).includes("You can also just reply in the chat with your choice."));
+  assert.ok(ask("选哪个？", true).includes("也可以直接在聊天里回复选项。"));
+  assert.ok(!ask("Which one?").includes("reply in the chat"));
+  const turnCard = approvalTurnCards.question({
+    questions: [],
+    sessionId: SID,
+    toolUseId: "t",
+    group: false,
+    ownerName: "",
+  });
+  assert.equal(
+    turnCard.body.type === "view" && turnCard.body.view.name === "question" && turnCard.body.view.model.typedReply,
+    true,
+  );
+});
+
+it("a question answered in the chat says so on its card: the answer, then when", () => {
+  const shown = JSON.stringify(
+    approvalRenderers.questionAnswered({
+      answers: [
+        ["q1", "main"],
+        ["q2", "main"],
+      ],
+      when: 0,
+      zone: "UTC",
+      replied: "en",
+    }),
+  );
+  assert.ok(shown.includes("Answered: main"));
+  assert.ok(!shown.includes("main / main")); // (one reply that answered both is said once)
+  assert.ok(shown.includes("Replied in the chat, "));
+});

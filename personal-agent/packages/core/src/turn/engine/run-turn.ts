@@ -16,12 +16,13 @@ import { sleepSeconds } from "../ports.js";
 import { plainMessage } from "../progress/answer-messages.js";
 import { type StatusMessage, turnStatusMessage } from "../progress/status-message.js";
 import type { Step } from "../step.js";
-import { detach, Task } from "../task.js";
+import { detach, Task, unlessAborted } from "../task.js";
 import { TurnState } from "../turn-state.js";
 import { ClawError, ClawUnreachable, errorKind } from "../../claw/errors.js";
 import { splitErrorTail } from "../../public-error/classify.js";
 import { consume, noteRunning, StreamKeptDropping } from "./consume.js";
-import { langOf, type TurnContext } from "./context.js";
+import { credential, langOf, type TurnContext } from "./context.js";
+import { isClawFailure } from "./claw-errors.js";
 import { offerChanges, offerDeliveries, offerReport, offerThumbs } from "./extras.js";
 import { rerunOnFallback } from "./fallback.js";
 import { clawFailure, endingParts, resultLead, stillRunningText, TURN_DEADLINE_SECONDS } from "./outcome.js";
@@ -126,7 +127,9 @@ class TurnRun {
     state.writes = ctx.record.wrote; // (written as the events arrive: a stream that drops afterwards loses none of it)
     this.state = state;
     noteRunning(ctx, state, this.running);
-    if (messageId === undefined && !ctx.request.attach) {
+    // Queued behind a turn Claw is still running (Claw gave no id, or the id of the queued message): said, so the wait is not
+    // taken for a hang.
+    if ((messageId === undefined || behind !== undefined) && !ctx.request.attach) {
       await ctx.deps.surface.send(plainMessage(turnText.in(langOf(ctx)).queuedNotice));
     }
     return consume(ctx, { sessionId, state, status: this.status, running: this.running, signal });
@@ -299,9 +302,27 @@ class TurnRun {
   }
 }
 
+/**
+ * Claw is running a turn on the chat's session already, so this message will wait behind it. Best effort: false when it
+ * cannot be read.
+ */
+async function turnAhead(ctx: TurnContext, signal?: AbortSignal): Promise<boolean> {
+  const sessionId = ctx.record.sessionId;
+  if (!sessionId || ctx.request.attach) return false;
+  try {
+    return (await unlessAborted(ctx.deps.claw.turn(await credential(ctx), sessionId), signal)).running;
+  } catch (err) {
+    if (!isClawFailure(err) && !signal?.aborted) throw err;
+    return false; // (a stop meanwhile is the turn's to answer, as it answers one at any other moment)
+  }
+}
+
 /** Runs the turn and always leaves the user a message; `controls.onSession` records the session id. */
 export async function runTurn(ctx: TurnContext, controls: TurnControls): Promise<void> {
-  const replyTo = streamReplyTo(ctx);
+  // A message that will wait behind a running turn opens no live stream: a "Thinking…" that spins for the whole wait
+  // says nothing true. It is shown by the progress message, under the queued notice.
+  const live = streamReplyTo(ctx);
+  const replyTo = live && !(await turnAhead(ctx, controls.signal)) ? live : undefined;
   if (!replyTo) detach(() => typing(ctx)); // (a stream shows its own status at once: no bare typing indicator before it)
   const status = turnStatusMessage(ctx.deps.surface, {
     clock: ctx.deps.clock,

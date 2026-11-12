@@ -89,8 +89,9 @@ export function proactiveParts(
   const deps = {
     store,
     conversationFor: conversationFor(base),
-    deliverStored: (envelope: JsonObject) =>
-      surface.conversation(refOf((envelope["reference"] ?? {}) as JsonObject)).deliver(envelope),
+    deliverStored: async (envelope: JsonObject) => {
+      await surface.conversation(refOf((envelope["reference"] ?? {}) as JsonObject)).deliver(envelope);
+    },
     messageIds: surface.caps.messageIds,
     say: new SayPlanner({
       store,

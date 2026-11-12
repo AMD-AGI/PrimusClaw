@@ -164,7 +164,7 @@ export class ReceiptConversation implements Conversation {
     return this.inner.outgoing(message);
   }
 
-  deliver(envelope: Envelope): Promise<void> {
+  deliver(envelope: Envelope): Promise<MessageId | undefined> {
     return this.inner.deliver(envelope);
   }
 

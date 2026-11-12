@@ -355,8 +355,11 @@ export interface Conversation {
   delete(id: MessageId): Promise<Result<void, DeleteUnsupported>>;
   /** The envelope `send` would publish for `message` (masked in a group), built without sending it. */
   outgoing(message: OutMessage): Envelope;
-  /** Publish an envelope `outgoing` built (possibly in another process, from storage). */
-  deliver(envelope: Envelope): Promise<void>;
+  /**
+   * Publish an envelope `outgoing` built (possibly in another process, from storage). The id of the posted message when the
+   * channel said it at once (a direct send); undefined otherwise (a queued send: the message cannot be edited by id).
+   */
+  deliver(envelope: Envelope): Promise<MessageId | undefined>;
   /**
    * A live stream that answers `replyTo` (the person's message), showing `status` as its first informative update.
    * Success means that first update has been sent and the channel took it; refused when the channel cannot stream here

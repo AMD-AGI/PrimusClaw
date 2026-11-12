@@ -5,16 +5,32 @@
  * what outlives a crash is the `card_sent` column: a card recorded and not marked sent is sent by the next process. */
 import {
   APPROVAL_TTL_SECONDS,
+  QUESTION_TOOL,
   type Approval,
   type ApprovalRepository,
   type ApprovalState,
   type NewApproval,
+  type PendingQuestion,
   type UnsentCard,
+  type JsonObject,
 } from "@primusclaw/personal-agent";
 
 import type { StoreContext } from "./context.js";
 import { col } from "./database.js";
 import { pyJsonDumps, storedObject } from "./py-json.js";
+
+/** The questions a question card was recorded with ([] when none, or unreadable). */
+function storedQuestions(text: string): JsonObject[] {
+  if (!text) return [];
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed)
+      ? parsed.filter((q): q is JsonObject => typeof q === "object" && q !== null && !Array.isArray(q))
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 const key = (sessionId: string, toolUseId: string): string => JSON.stringify([sessionId, toolUseId]);
 
@@ -29,7 +45,7 @@ export class SqliteApprovalRepository implements ApprovalRepository {
     const recorded =
       this.ctx.db.run(
         "INSERT OR IGNORE INTO approvals (session_id, tool_use_id, aad_id, tool, expires_at, created_at, " +
-          "card_sent, card_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+          "card_sent, card_json, questions_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
         approval.sessionId,
         approval.toolUseId,
         approval.userId,
@@ -37,15 +53,17 @@ export class SqliteApprovalRepository implements ApprovalRepository {
         approval.expiresAt,
         now,
         approval.envelope === undefined || approval.envelope === null ? null : pyJsonDumps(approval.envelope),
+        approval.questions?.length ? JSON.stringify(approval.questions) : "",
       ) === 1;
     if (recorded) this.#sending.add(key(approval.sessionId, approval.toolUseId));
     return recorded;
   }
 
-  approvalSent(sessionId: string, toolUseId: string): void {
+  approvalSent(sessionId: string, toolUseId: string, cardId = ""): void {
     this.#sending.delete(key(sessionId, toolUseId));
     this.ctx.db.run(
-      "UPDATE approvals SET card_sent = 1, card_json = NULL WHERE session_id = ? AND tool_use_id = ?",
+      "UPDATE approvals SET card_sent = 1, card_json = NULL, card_id = ? WHERE session_id = ? AND tool_use_id = ?",
+      cardId,
       sessionId,
       toolUseId,
     );
@@ -110,6 +128,29 @@ export class SqliteApprovalRepository implements ApprovalRepository {
       tool: col.str(row, "tool"),
       expiresAt: col.num(row, "expires_at"),
       state: col.str(row, "state"),
+    };
+  }
+
+  pendingQuestion(sessionId: string, userId: string): PendingQuestion | null {
+    const row = this.ctx.db.get(
+      "SELECT tool_use_id, expires_at, questions_json, card_id FROM approvals WHERE session_id = ? AND aad_id = ? " +
+        "AND tool = ? AND state = 'pending' AND card_sent = 1 AND expires_at > ? AND questions_json != '' " +
+        "ORDER BY created_at DESC LIMIT 1",
+      sessionId,
+      userId,
+      QUESTION_TOOL,
+      this.ctx.now(),
+    );
+    if (!row) return null;
+    const questions = storedQuestions(col.str(row, "questions_json"));
+    if (questions.length === 0) return null;
+    return {
+      sessionId,
+      toolUseId: col.str(row, "tool_use_id"),
+      userId,
+      expiresAt: col.num(row, "expires_at"),
+      questions,
+      cardId: col.str(row, "card_id"),
     };
   }
 

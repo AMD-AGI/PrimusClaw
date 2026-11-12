@@ -110,18 +110,20 @@ async function ask(ctx: TurnContext, sessionId: string, step: Step): Promise<voi
       : questionOf(ctx, sessionId, step.question ?? {});
   const { tool, toolUseId, request, envelope } = asked;
   const hooks = ctx.hooks;
+  const questions = tool === QUESTION_TOOL ? request["questions"] : undefined;
   if (
     toolUseId &&
-    hooks.onApproval?.(sessionId, toolUseId, tool, waitSeconds(request["timeout_ms"]), envelope) === false
+    hooks.onApproval?.(sessionId, toolUseId, tool, waitSeconds(request["timeout_ms"]), envelope, questions) === false
   )
     return;
+  let cardId: string | undefined;
   try {
-    await ctx.deps.surface.deliver(envelope);
+    cardId = await ctx.deps.surface.deliver(envelope);
   } catch (err) {
     if (toolUseId) hooks.onApprovalUnsent?.(sessionId, toolUseId); // nobody saw it: a replay or the notification may
     throw err;
   }
-  if (toolUseId) hooks.onApprovalSent?.(sessionId, toolUseId);
+  if (toolUseId) hooks.onApprovalSent?.(sessionId, toolUseId, cardId);
 }
 
 /** Where a connection reads from, and what the history marker said about this Claw. */
