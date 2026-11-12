@@ -19,6 +19,7 @@ import { toolsOfClass } from "./tool-classes.js";
 import type { ChannelAttached } from "./inbound.js";
 import { BODY_MAX } from "../memory/gates.js";
 import { TYPED_COMMANDS_RULE, typedCommand, type CommandLanguage } from "./typed-commands.js";
+import { chatSurface } from "./chat-surface.js";
 
 /**
  * router-v4: router-v2 with the item list inside an untrusted-data block (what workers and models wrote is quoted data).
@@ -277,6 +278,8 @@ export interface RouterLookupsShown {
   cite?: boolean;
   /** A GitHub account bound with `/github bind` gives the user these tools (`CLAW_GITHUB_MCP_BINDING_ENABLED`). */
   githubBinding?: boolean;
+  /** Where the user talks to Clawy (`ChatSurface.where`: "in Teams", "in the chat"); absent: a client that names no channel's, Teams. */
+  where?: string;
 }
 
 /** How say cites what a lookup returned, with citing on. */
@@ -304,9 +307,9 @@ export const ROUTER_PARTIAL_READ_RULE = "- A lookup that is not all of what the 
 const GITHUB_SEARCH = "mcp__github__issue_search finds pull requests and issues anywhere with GitHub search syntax (is:pr is:open author:@me is the user's open pull requests; add repo:owner/name or org:name to narrow; total_count is the number, by_repo the count in each repository, refs_by_repo every match as owner/repo#number grouped by repository).";
 
 /** The GitHub line of the read section: the reads the turn has, by their full names. */
-function githubLookups(tools: readonly string[], binding = false): string {
+function githubLookups(tools: readonly string[], binding = false, where: string = chatSurface(undefined).where): string {
   if (!tools.length && binding) {
-    return "- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet, or their connection could not be read just now. For a question about their GitHub, say in one line that their GitHub is not connected here or could not be read just now, and that if they have not connected it they do so once by sending /github bind to Clawy in Teams (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.";
+    return `- GitHub: no GitHub tools in this conversation: the user has not connected GitHub yet, or their connection could not be read just now. For a question about their GitHub, say in one line that their GitHub is not connected here or could not be read just now, and that if they have not connected it they do so once by sending /github bind to Clawy ${where} (or by keeping a GH_TOKEN in their Claw settings) and then ask again; never that you cannot use GitHub. A public page can still be read with web_fetch.`;
   }
   if (!tools.length) {
     return "- GitHub: no GitHub tools in this conversation (the user may not have linked a GitHub token in their Claw settings). For a question about their GitHub, say that in one line; a public page can still be read with web_fetch.";
@@ -342,7 +345,7 @@ When the user asks what you can do, or whether you can do something, answer from
 /** What the router is told about its lookups: what each reaches, and that a question they answer is answered here, now. */
 export function renderRouterReadSection(lookups: RouterLookupsShown): string {
   const reach = [
-    githubLookups(lookups.github, lookups.githubBinding),
+    githubLookups(lookups.github, lookups.githubBinding, lookups.where),
     "- The web: web_search for current facts and news, web_fetch to read one page, whenever they are in your tool list.",
     ...(lookups.servers.length
       ? [`- The read tools of these servers: ${lookups.servers.map((s) => oneLine(s)).join(", ")}, called by their full name (mcp__<server>__<tool>).`]

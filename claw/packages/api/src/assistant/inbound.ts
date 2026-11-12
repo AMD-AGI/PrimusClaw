@@ -217,19 +217,31 @@ export function parseChannelContext(raw: unknown): ChannelContext {
 }
 
 /**
- * The language the person chose to be answered in, as of the turn answering `messageId`: what that message's channel said
- * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included). A turn that answers no message of theirs (a
- * worker's report woke the assistant) follows their latest message to it. Null: no choice, and the language is read from their words.
+ * What the channel told of the chat, as of the turn answering `messageId`: the language the person chose to be answered in
+ * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included) and the channel the message came through
+ * (`ChannelContext.channel`; undefined when it names none). Both from that message's row; a turn that answers no message of theirs
+ * (a worker's report woke the assistant), or whose message has no row, follows their latest message to it.
  */
-export async function chosenReplyLanguage(q: Querier, sessionId: string, messageId: string | null): Promise<ChosenLanguage | null> {
-  const select = "SELECT channel_context->>'reply_language' AS chosen FROM claw_assistant_messages WHERE session_id = $1";
-  type Row = { chosen: unknown };
+export async function turnChannelTold(
+  q: Querier, sessionId: string, messageId: string | null,
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined }> {
+  const select = "SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel FROM claw_assistant_messages WHERE session_id = $1";
+  type Row = { chosen: unknown; channel: unknown };
   let row: Row | undefined = messageId
     ? (await q(`${select} AND message_id = $2`, [sessionId, messageId])).rows[0] as Row | undefined
     : undefined;
   row ??= (await q(`${select} ORDER BY received_at DESC LIMIT 1`, [sessionId])).rows[0] as Row | undefined;
   const chosen = row?.chosen;
-  return isChosenLanguage(chosen) ? chosen : null;
+  const channel = row?.channel;
+  return { chosen: isChosenLanguage(chosen) ? chosen : null, channel: typeof channel === "string" && channel ? channel : undefined };
+}
+
+/**
+ * The language the person chose to be answered in, as of the turn answering `messageId` (`turnChannelTold`). Null: no choice, and
+ * the language is read from their words.
+ */
+export async function chosenReplyLanguage(q: Querier, sessionId: string, messageId: string | null): Promise<ChosenLanguage | null> {
+  return (await turnChannelTold(q, sessionId, messageId)).chosen;
 }
 
 /**

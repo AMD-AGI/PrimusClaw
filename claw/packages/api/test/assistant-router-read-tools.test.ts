@@ -21,6 +21,8 @@
  *       `log_reads` (bounded to their last lines, masked); the board's notifications and milestones are offered too
  *   RT10 a router turn keeps the turn's own scheduled-tasks server and may only list with it; a `schedules` entry the request carried
  *       otherwise (another address, a bearer for another turn) is dropped
+ *   RT11 a router turn on a chat app other than Teams is given the generic reply-style rule, not Teams', and is told it is talked to
+ *       in the chat; a message that names no channel is Teams', as before
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -38,6 +40,7 @@ const TOOL_ROWS: Array<{ id: number; type: string; name: string; config: Record<
   { id: 8, type: "skill", name: "autopilot", config: { s3_key: "plugins/8/", is_prefix: true } },
   { id: 17, type: "rule", name: "teams-reply-style", config: { s3_key: "plugins/17/", is_prefix: true } },
   { id: 21, type: "rule", name: "some-other-rule", config: { s3_key: "plugins/21/", is_prefix: true } },
+  { id: 22, type: "rule", name: "chat-reply-style", config: { s3_key: "plugins/22/", is_prefix: true } },
   { id: 3, type: "mcp", name: "safe-mcp", config: { mcpServers: { safe: { type: "http", url: "https://safe.example/mcp", token: "<SAFE_API_KEY>", requires_approval: ["node_cordon"] } } } },
   { id: 26, type: "mcp", name: "autopilot-mcp", config: { mcpServers: { autopilot: { type: "http", url: "https://autopilot.example/mcp", token: "<SAFE_API_KEY>", auto_approve: ["get_*"], requires_approval: true } } } },
   { id: 18, type: "mcp", name: "dispatron-mcp", config: { mcpServers: { dispatron: { type: "http", url: "https://dispatron.example/mcp", token: "<SAFE_API_KEY>" } } } },
@@ -153,6 +156,25 @@ describe("assistant router read tools", { skip }, () => {
       assert.ok(!text.includes("SKILL.md") && !text.includes("Platform Skills"), "no skill is named to the router");
     }
     assert.ok(task.prompt.startsWith(`${QUESTION}\n\n`), "the user's words first");
+  });
+
+  test("RT11 the reply-style rule and where the router is talked to follow the chat app the person writes from", async () => {
+    const teams = await send(alice.routerSid, QUESTION);
+    assert.deepEqual(teams.plugin_tools.map((t: any) => t.id), [17, 3, 26, 18], "no channel named: Teams' rule");
+    assert.match(teams.system_append, /In Teams people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in Teams\./);
+    // The person's latest message names the channel it came through. This turn's message has no row here (the test dispatches it
+    // directly), so it follows that one, as a worker's report does; a message whose row names no channel stays Teams' (CS4).
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context)
+       VALUES ($1, 'from-chatapp', 'alice', 'hi', '{"channel": "chatapp"}'::jsonb)`,
+      [alice.routerSid],
+    );
+    try {
+      const other = await send(alice.routerSid, QUESTION);
+      assert.deepEqual(other.plugin_tools.map((t: any) => t.id), [22, 3, 26, 18], "the generic rule, not Teams'");
+      assert.match(other.system_append, /In the chat people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in the chat\./);
+      assert.doesNotMatch(other.system_append, /in Teams|In Teams/);
+    } finally { await w.q("DELETE FROM claw_assistant_messages WHERE message_id = 'from-chatapp'"); }
   });
 
   test("RT3 the system prompt and the history are the same on two turns; the item list goes with the message", async () => {

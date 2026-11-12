@@ -38,6 +38,11 @@ test("S1 the router is told it is Clawy, with the tool when it is on, and how to
   const off = renderRouterSelfSection(false);
   assert.match(off, /Clawy is you/);
   assert.doesNotMatch(off, /call claw_self_status/);
+  // Where the person talks to it: Teams for a client that names no channel, as it was said before; the chat for another channel.
+  assert.match(on, /^Who you are\nIn Teams people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in Teams\. /);
+  const other = renderRouterSelfSection(true, "in the chat");
+  assert.match(other, /^Who you are\nIn the chat people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in the chat\. /);
+  assert.doesNotMatch(other, /Teams/);
 });
 
 test("S3 a ULID's time floor sorts between the ids made before it and the ids made from it on", () => {
