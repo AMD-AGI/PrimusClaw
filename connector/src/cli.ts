@@ -23,15 +23,23 @@ setLogLine(err);
 
 let connector: Connector | null = null;
 
-/** A yes/no question at the terminal; only offered when both ends are one (a script or a pipe gets the default, no). */
+/**
+ * A yes/no question at the terminal; only offered when both ends are one (a script or a pipe is never asked). An empty answer
+ * (just Enter) is the question's default, `dflt`; anything but a yes or that default is a no.
+ */
 const ask = process.stdin.isTTY && process.stdout.isTTY
-  ? async (question: string): Promise<boolean> => {
+  ? async (question: string, dflt = false): Promise<boolean> => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     // Ctrl-D or Ctrl-C at the question is a no, not a crash. readline takes Ctrl-C as a keystroke (SIGINT on the
     // interface, not the process): without this the question would never settle and init would end silently.
     const ac = new AbortController();
     rl.on("SIGINT", () => { process.stdout.write("\n"); ac.abort(); });
-    try { return /^\s*y(es)?\s*$/i.test(await rl.question(question, { signal: ac.signal })); } catch { return false; } finally { rl.close(); }
+    // Ctrl-D (or stdin ending) closes the interface without settling the question, which would end init silently.
+    rl.on("close", () => ac.abort());
+    try {
+      const a = await rl.question(question, { signal: ac.signal });
+      return a.trim() === "" ? dflt : /^\s*y(es)?\s*$/i.test(a);
+    } catch { return false; } finally { rl.close(); }
   }
   : undefined;
 let stopping = false;

@@ -813,58 +813,115 @@ describe("init and hooks: the Claude Code session hooks", () => {
     return Object.values<any>(doc.hooks ?? {}).flatMap((groups) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command as string)));
   };
 
+  const standApproval = (): string => { const f = path.join(tmpdir("cc-hookbin-"), "approval-hook.js"); fs.writeFileSync(f, "// stand-in\n"); return f; };
+  const sessionCmds = (dir: string) => hookCommands(dir).filter((c) => c.includes("terminal-hook.js") && c.includes(`--dir '${dir}'`));
+  const approvalCmds = (dir: string) => hookCommands(dir).filter((c) => c.includes("approval-hook.js") && c.includes(`--dir '${dir}'`));
+  const mineSettings = () => JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2);
+
   test("init with nobody to ask leaves Claude Code's settings alone and prints the command that would add the hooks", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
-    const mine = JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2);
+    const mine = mineSettings();
     fs.writeFileSync(settings(dir), mine);
-    const a = ctx(home, { hookScript: stand() });
+    const a = ctx(home, { hookScript: stand(), approvalHookScript: standApproval() });
     assert.equal(await main(["init"], a.c), EXIT.ok);
     assert.ok(fs.existsSync(path.join(home, "config", "agents.toml")), "the sample is still written");
     assert.equal(fs.readFileSync(settings(dir), "utf8"), mine, "settings.json byte for byte as it was");
-    assert.match(a.text(), /left .*settings\.json alone \(no terminal to ask in\).*claw-connector hooks install/);
+    assert.match(a.text(), /did not add the Claude Code hooks to .*settings\.json \(no terminal to ask in\).*claw-connector hooks install --approvals/);
+    assert.doesNotMatch(a.text(), /Add them\?|approval hooks:/, "nothing is offered to nobody");
     const bare = tmpdir();
     const bareDir = claudeDir(bare);
-    assert.equal(await main(["init"], ctx(bare, { hookScript: stand() }).c), EXIT.ok);
+    assert.equal(await main(["init"], ctx(bare, { hookScript: stand(), approvalHookScript: standApproval() }).c), EXIT.ok);
     assert.equal(fs.existsSync(settings(bareDir)), false, "and no settings.json is created where there was none");
   });
 
-  test("init at a terminal asks first: no leaves the settings alone, yes installs the hooks once; run again it neither asks nor changes anything", async () => {
+  test("init at a terminal asks once, default yes: no leaves the settings alone, Enter installs the session and approval hooks; run again it neither asks nor changes anything", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
-    fs.writeFileSync(settings(dir), JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2));
+    fs.writeFileSync(settings(dir), mineSettings());
     const before = fs.readFileSync(settings(dir), "utf8");
     const script = stand();
-    const asked: string[] = [];
-    const no = ctx(home, { hookScript: script, ask: async (q) => { asked.push(q); return false; } });
+    const approvalScript = standApproval();
+    const asked: Array<[string, boolean | undefined]> = [];
+    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
     assert.equal(await main(["init"], no.c), EXIT.ok);
     assert.equal(asked.length, 1);
-    assert.match(asked[0]!, /settings\.json.*\[y\/N\]/);
+    assert.deepEqual(asked[0], ["Add them? [Y/n] ", true], "one question, and Enter means yes");
+    assert.match(no.text(), /session hooks \(SessionStart, SessionEnd\)/);
+    assert.match(no.text(), /approval hooks: a question Claude Code asks in a terminal .* also comes to your chat; the terminal keeps asking and the first answer wins/);
     assert.equal(fs.readFileSync(settings(dir), "utf8"), before);
-    assert.match(no.text(), /left .*settings\.json alone\. .*claw-connector hooks install/);
-    const yes = ctx(home, { hookScript: script, ask: async (q) => { asked.push(q); return true; } });
-    assert.equal(await main(["init"], yes.c), EXIT.ok);
+    assert.match(no.text(), /did not add the Claude Code hooks to .*settings\.json\. .*claw-connector hooks install --approvals/);
+    // Enter: the stand-in answers with the question's default.
+    const enter = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return d ?? false; } });
+    assert.equal(await main(["init"], enter.c), EXIT.ok);
     assert.equal(asked.length, 2);
-    assert.match(yes.text(), /installed the Claude Code session hooks in .*settings\.json/);
-    const cmds = hookCommands(dir);
-    assert.equal(cmds.filter((c) => c.includes("terminal-hook.js") && c.includes(`--dir '${dir}'`)).length, 2);
-    assert.ok(cmds.includes("mine.sh"), "the user's own hook is still there");
+    assert.match(enter.text(), /installed the Claude Code session hooks in .*settings\.json/);
+    assert.match(enter.text(), /installed the approval hooks in .*settings\.json: questions Claude Code asks in a terminal also go to your chat/);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SessionEnd");
+    assert.ok(approvalCmds(dir).every((c) => c.includes(`--socket '${path.join(enter.c.dirs.state, "approvals.sock")}'`)), "they talk to this connector's socket");
+    assert.ok(hookCommands(dir).includes("mine.sh"), "the user's own hook is still there");
     assert.equal(JSON.parse(fs.readFileSync(settings(dir), "utf8")).model, "opus");
     const bytes = fs.readFileSync(settings(dir), "utf8");
-    const again = ctx(home, { hookScript: script, ask: async (q) => { asked.push(q); return false; } });
+    const again = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
     assert.equal(await main(["init"], again.c), EXIT.ok);
     assert.equal(asked.length, 2, "hooks of ours already there are not asked about again");
     assert.match(again.text(), /session hooks are already in/);
+    assert.match(again.text(), /approval hooks are already in/);
     assert.equal(fs.readFileSync(settings(dir), "utf8"), bytes);
   });
 
-  test("init --hooks installs without asking; --hooks with --no-hooks is a usage error", async () => {
+  test("a setup from before, with the session hooks only: kept up to date, the approval hooks offered alone at a terminal and never added without one", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
-    const a = ctx(home, { hookScript: stand(), ask: async () => assert.fail("--hooks must not ask") });
+    fs.writeFileSync(settings(dir), mineSettings());
+    const script = stand();
+    const approvalScript = standApproval();
+    assert.equal(await main(["hooks", "install"], ctx(home, { hookScript: script }).c), EXIT.ok);
+    const sessionOnly = fs.readFileSync(settings(dir), "utf8");
+    // No terminal: nothing new is added, and it says how.
+    const quiet = ctx(home, { hookScript: script, approvalHookScript: approvalScript });
+    assert.equal(await main(["init"], quiet.c), EXIT.ok);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly, "settings.json as it was");
+    assert.match(quiet.text(), /did not add the approval hooks to .*\(no terminal to ask in\)\. Without them, a question it asks waits for you at that terminal only; to add them: claw-connector hooks install --approvals/);
+    assert.match(quiet.text(), /session hooks are already in/);
+    // A terminal: only the approval hooks are offered.
+    const asked: string[] = [];
+    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q) => { asked.push(q); return false; } });
+    assert.equal(await main(["init"], no.c), EXIT.ok);
+    assert.equal(asked.length, 1);
+    assert.doesNotMatch(no.text(), /session hooks \(SessionStart/, "what is there already is not offered again");
+    assert.match(no.text(), /approval hooks: a question/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly);
+    const yes = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async () => true });
+    assert.equal(await main(["init"], yes.c), EXIT.ok);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6);
+    assert.ok(hookCommands(dir).includes("mine.sh"));
+  });
+
+  test("init --hooks installs both sets without asking; --no-approval-hooks leaves the approval hooks out; --hooks with --no-hooks is a usage error", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    const a = ctx(home, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => assert.fail("--hooks must not ask") });
     assert.equal(await main(["init", "--hooks"], a.c), EXIT.ok);
     assert.match(a.text(), /installed the Claude Code session hooks/);
-    assert.equal(hookCommands(dir).filter((c) => c.includes("terminal-hook.js")).length, 2);
+    assert.match(a.text(), /installed the approval hooks/);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6);
+    const only = tmpdir();
+    const onlyDir = claudeDir(only);
+    const o = ctx(only, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => assert.fail("--hooks must not ask") });
+    assert.equal(await main(["init", "--hooks", "--no-approval-hooks"], o.c), EXIT.ok);
+    assert.equal(sessionCmds(onlyDir).length, 2);
+    assert.equal(approvalCmds(onlyDir).length, 0);
+    const asked = tmpdir();
+    const askedDir = claudeDir(asked);
+    const q = ctx(asked, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => true });
+    assert.equal(await main(["init", "--no-approval-hooks"], q.c), EXIT.ok);
+    assert.doesNotMatch(q.text(), /approval hooks/, "--no-approval-hooks: they are not even offered");
+    assert.equal(sessionCmds(askedDir).length, 2);
+    assert.equal(approvalCmds(askedDir).length, 0);
     const both = ctx(tmpdir(), { hookScript: stand() });
     assert.equal(await main(["init", "--hooks", "--no-hooks"], both.c), EXIT.usage);
     assert.match(both.errText(), /contradict/);
