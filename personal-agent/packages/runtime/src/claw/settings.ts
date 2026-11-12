@@ -130,11 +130,13 @@ export class HttpNotifications implements ClawNotificationsPort {
     url: string,
     eventTypes: readonly string[] = [],
     sources: readonly string[] = [],
+    surface = "",
   ): Promise<ClawSubscription> {
     const body = {
       url,
       ...(eventTypes.length === 0 ? {} : { event_types: eventTypes }),
       ...(sources.length === 0 ? {} : { sources }),
+      ...(surface === "" ? {} : { surface }),
     };
     const path = "/v1/notification-subscriptions";
     return dataOf(await this.http.json({ method: "POST", path, key, body }), "a subscription");
@@ -144,12 +146,13 @@ export class HttpNotifications implements ClawNotificationsPort {
     key: ClawCredential,
     subscriptionId: string,
     eventTypes: readonly string[],
-    options: { enable?: boolean; sources?: readonly string[] } = {},
+    options: { enable?: boolean; sources?: readonly string[]; surface?: string } = {},
   ): Promise<ClawSubscription> {
-    const { enable = false, sources = [] } = options;
+    const { enable = false, sources = [], surface = "" } = options;
     const body = {
       event_types: eventTypes,
       ...(sources.length === 0 ? {} : { sources }),
+      ...(surface === "" ? {} : { surface }),
       ...(enable ? { enabled: true } : {}),
     };
     const path = `/v1/notification-subscriptions/${segment(subscriptionId)}`;

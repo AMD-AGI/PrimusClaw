@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.1 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.7.1 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.7.2 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -101,6 +101,19 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+### Changed
+
+- An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
+  a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
+  (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,
+  a scheduled or long run's end) to the surface they wrote from last. A surface with no subscription that takes the event
+  falls back to the next most recent one; a person who never wrote, or whose subscriptions all name one surface, gets it
+  on each, as before. A subscription names its surface with the new `surface` field (`POST`/`PATCH
+  /v1/notification-subscriptions`, a lowercase label; absent is `teams`); the Teams worker of the personal agent sends
+  `teams`, and an older worker, which names none, is `teams` too. Outbox, signing, retries, redelivery and the say caps
+  are unchanged. Schema: `claw_notification_subscriptions.surface` (default `'teams'`) and the new table
+  `claw_assistant_surfaces`, both added at start-up; no new setting (#787).
 
 ### Fixed
 

@@ -17,6 +17,8 @@ interface Row {
   event_types: string[];
   sources: string[];
   enabled: boolean;
+  /** As a Claw with the label answers: `teams` when the subscriber named none. */
+  surface: string;
 }
 
 /** Claw's notification subscriptions, owned by key; unknown types or sources are refused with 400 (as Claw does). */
@@ -43,9 +45,18 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
     return values === undefined || (values.length > 0 && values.every((v) => known.has(v)));
   }
 
-  create(key: string, url: string, types?: readonly string[], sources?: readonly string[]): Promise<ClawSubscription> {
+  create(
+    key: string,
+    url: string,
+    types?: readonly string[],
+    sources?: readonly string[],
+    surface?: string,
+  ): Promise<ClawSubscription> {
     this.calls.push(`create ${key}`);
     this.check();
+    // (empty lists are Claw's defaults, as the port says)
+    if (types?.length === 0) types = undefined;
+    if (sources?.length === 0) sources = undefined;
     if (!this.known(types, this.knownTypes) || !this.known(sources, this.knownSources))
       return Promise.reject(new ClawStatusError(400));
     this.n += 1;
@@ -57,6 +68,7 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
       event_types: types ? [...types] : ["run.completed", "run.failed"],
       sources: sources ? [...sources] : ["trigger", "long_run"],
       enabled: true,
+      surface: surface || "teams",
     };
     this.rows.set(row.subscription_id, row);
     return Promise.resolve({ subscription_id: row.subscription_id, secret: row.secret });
@@ -72,7 +84,7 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
     key: string,
     subscriptionId: string,
     types: readonly string[],
-    options: { enable?: boolean; sources?: readonly string[] } = {},
+    options: { enable?: boolean; sources?: readonly string[]; surface?: string } = {},
   ): Promise<ClawSubscription> {
     this.calls.push(`patch ${key}`);
     this.check();
@@ -85,6 +97,7 @@ export class FakeClawSubscriptions implements ClawSubscriptions {
     row.event_types = [...types];
     if (options.sources) row.sources = [...options.sources];
     if (options.enable) row.enabled = true;
+    if (options.surface) row.surface = options.surface;
     return Promise.resolve({});
   }
 

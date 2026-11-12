@@ -185,6 +185,39 @@ it("a subscription claw turned off is turned on again and one claw deleted is ma
   assert.equal(store.subs.get("aad-a")?.subscriptionId, claw.of("ak-alice")[0]?.subscription_id);
 });
 
+it("the subscription names the worker's surface, teams unless the worker says, and one of another surface is changed", async () => {
+  const teams = world({ assistant: true });
+  teams.store.link("aad-a", "ak-alice");
+  await teams.subs.ensure("aad-a");
+  assert.equal(teams.claw.of("ak-alice")[0]?.surface, "teams");
+
+  const slack = world({ assistant: true, surface: "slack" });
+  slack.store.link("aad-a", "ak-alice");
+  await slack.subs.ensure("aad-a");
+  const [row] = slack.claw.of("ak-alice");
+  assert.ok(row);
+  assert.equal(row.surface, "slack");
+  // (Claw lists it with the label it was made with: looked at again, nothing is changed)
+  slack.store.now += UPGRADE_RETRY_SECONDS + 1;
+  slack.claw.calls.length = 0;
+  await slack.subs.ensure("aad-a");
+  assert.deepEqual(slack.claw.calls, ["list ak-alice"]);
+  // A row Claw lists with another surface (made before the worker said its own) is changed to this worker's, types kept.
+  row.surface = "teams";
+  slack.store.now += UPGRADE_RETRY_SECONDS + 1;
+  await slack.subs.ensure("aad-a");
+  assert.equal(row.surface, "slack");
+  assert.equal(slack.store.subs.get("aad-a")?.typesVersion, APPROVALS_TYPES_VERSION);
+});
+
+it("a worker with the assistant off still names its surface", async () => {
+  const { store, claw, subs } = world({ surface: "slack" });
+  store.link("aad-a", "ak-alice");
+  await subs.ensure("aad-a");
+  assert.equal(claw.of("ak-alice")[0]?.surface, "slack");
+  assert.deepEqual(claw.of("ak-alice")[0]?.event_types, ["run.completed", "run.failed"]);
+});
+
 it("a claw that refuses every rung takes the person back to sessions", async () => {
   const { store, claw, subs } = world({ assistant: true });
   store.link("aad-a", "ak-alice");

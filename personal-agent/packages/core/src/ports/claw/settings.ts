@@ -29,19 +29,24 @@ export type ClawSubscription = Partial<NotificationSubscription> & { readonly se
 /** Notification subscriptions (`/v1/notification-subscriptions`). ClawError(404): notifications are off on Claw. */
 export interface ClawNotificationsPort {
   list(key: ClawCredential): Promise<ClawSubscription[]>;
-  /** Subscribes the key's owner at `url`; the reply carries the signing secret, once. Empty lists: Claw's defaults. */
+  /**
+   * Subscribes the key's owner at `url`; the reply carries the signing secret, once. Empty lists: Claw's defaults. `surface`: the
+   * chat surface the subscription delivers to (`teams`, `slack`, ...), which Claw routes the assistant's messages by; absent, Claw's
+   * default (Teams). A Claw from before the label ignores it.
+   */
   create(
     key: ClawCredential,
     url: string,
     eventTypes?: readonly string[],
     sources?: readonly string[],
+    surface?: string,
   ): Promise<ClawSubscription>;
-  /** Changes which events (and, given, which sources) a subscription gets; `enable` turns it on again. */
+  /** Changes which events (and, given, which sources and surface) a subscription gets; `enable` turns it on again. */
   updateTypes(
     key: ClawCredential,
     subscriptionId: string,
     eventTypes: readonly string[],
-    options?: { enable?: boolean; sources?: readonly string[] },
+    options?: { enable?: boolean; sources?: readonly string[]; surface?: string },
   ): Promise<ClawSubscription>;
   delete(key: ClawCredential, subscriptionId: string): Promise<void>;
 }

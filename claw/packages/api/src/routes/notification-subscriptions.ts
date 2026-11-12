@@ -25,8 +25,11 @@ import { resendUnreachedSays } from "../assistant/outbound.js";
 import { getUser } from "../auth/middleware.js";
 import { encryptUserEnvValue } from "../crypto/user-env.js";
 import { db } from "../infra/db.js";
-import { NOTIFICATION_SOURCES, NOTIFICATION_SUBSCRIPTION_EVENT_TYPES, type NotificationSubscription } from "@claw/protocol";
+import {
+  NOTIFICATION_SOURCES, NOTIFICATION_SUBSCRIPTION_EVENT_TYPES, NOTIFICATION_SURFACE_DEFAULT, type NotificationSubscription,
+} from "@claw/protocol";
 import { adoptOrphanedRows, newSubscriptionId } from "../notifications/outbox.js";
+import { surfaceLabel } from "../notifications/surfaces.js";
 import { guardWebhookUrl, parseAllowedHosts } from "../notifications/url-guard.js";
 
 const MAX_SUBSCRIPTIONS_PER_USER = 5;
@@ -39,6 +42,7 @@ const MAX_SUBSCRIPTIONS_PER_USER = 5;
 const EVENT_TYPES: string[] = [...NOTIFICATION_SUBSCRIPTION_EVENT_TYPES];
 const SOURCES: string[] = [...NOTIFICATION_SOURCES];
 const logger = pino({ name: "notification-subscriptions" });
+const SURFACE_REFUSAL = "surface must be a lowercase label: a letter, then up to 31 letters, digits, '-' or '_'";
 /** The assistant's events a say goes out as. */
 const SAY_TYPES = ["assistant.say", "work_item.needs_you"];
 
@@ -77,6 +81,16 @@ function requireRealUser(req: FastifyRequest, reply: FastifyReply): string | nul
   return userId;
 }
 
+/**
+ * The chat surface a subscription delivers to (`surface`, e.g. `teams`, `slack`): absent is `undefined` (Teams on a new one, unchanged
+ * on a change), and anything but a label (`NOTIFICATION_SURFACE_PATTERN`) is `null`, refused. Which of a person's surfaces an assistant
+ * message goes to is `notifications/surfaces.ts`'s.
+ */
+function pickSurface(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  return surfaceLabel(value);
+}
+
 function pickList(value: unknown, allowed: string[]): string[] | null | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || !value.length) return null;
@@ -90,6 +104,7 @@ const view = (r: Record<string, unknown>): NotificationSubscription<Date> => ({
   url: r.url as string,
   event_types: r.event_types as string[],
   sources: r.sources as string[],
+  surface: (r.surface as string | undefined) ?? NOTIFICATION_SURFACE_DEFAULT,
   enabled: r.enabled as boolean,
   consecutive_failures: r.consecutive_failures as number,
   created_at: r.created_at as Date,
@@ -110,6 +125,8 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
     const sources = pickList(body.sources, SOURCES);
     if (types === null) return reply.status(400).send({ ok: false, error: `event_types must be a non-empty subset of ${EVENT_TYPES.join(", ")}` });
     if (sources === null) return reply.status(400).send({ ok: false, error: `sources must be a non-empty subset of ${SOURCES.join(", ")}` });
+    const surface = pickSurface(body.surface);
+    if (surface === null) return reply.status(400).send({ ok: false, error: SURFACE_REFUSAL });
     const guard = await guardWebhookUrl(body.url, allowedHosts);
     if (!guard.ok) return reply.status(400).send({ ok: false, error: "url_refused", reason: guard.reason });
     const count = Number((await db.query(
@@ -122,12 +139,13 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
     const id = newSubscriptionId();
     const row = (await db.query(
       `INSERT INTO claw_notification_subscriptions
-         (subscription_id, owner_user_id, url, secret_enc, event_types, sources)
+         (subscription_id, owner_user_id, url, secret_enc, event_types, sources, surface)
        VALUES ($1, $2, $3, $4,
                COALESCE($5::text[], ARRAY['run.completed','run.failed']),
-               COALESCE($6::text[], ARRAY['trigger','long_run']))
+               COALESCE($6::text[], ARRAY['trigger','long_run']),
+               $7)
        RETURNING *`,
-      [id, userId, guard.url.toString(), encryptUserEnvValue(secret), types ?? null, sources ?? null],
+      [id, userId, guard.url.toString(), encryptUserEnvValue(secret), types ?? null, sources ?? null, surface ?? NOTIFICATION_SURFACE_DEFAULT],
     )).rows[0];
     await resendAfterSubscribing(userId, row);
     // The only time the secret leaves the server.
@@ -152,6 +170,8 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
     const types = pickList(body.event_types, EVENT_TYPES);
     const sources = pickList(body.sources, SOURCES);
     if (types === null || sources === null) return reply.status(400).send({ ok: false, error: "invalid_filter" });
+    const surface = pickSurface(body.surface);
+    if (surface === null) return reply.status(400).send({ ok: false, error: SURFACE_REFUSAL });
     if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
       return reply.status(400).send({ ok: false, error: "enabled must be a boolean" });
     }
@@ -159,6 +179,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
       `UPDATE claw_notification_subscriptions
           SET event_types = COALESCE($3::text[], event_types),
               sources = COALESCE($4::text[], sources),
+              surface = COALESCE($6::text, surface),
               enabled = COALESCE($5::boolean, enabled),
               auto_disabled = CASE WHEN $5::boolean IS NULL THEN auto_disabled ELSE FALSE END,
               consecutive_failures = CASE WHEN $5::boolean IS TRUE THEN 0 ELSE consecutive_failures END,
@@ -166,7 +187,7 @@ export async function registerNotificationSubscriptionRoutes(app: FastifyInstanc
               updated_at = NOW()
         WHERE subscription_id = $1 AND owner_user_id = $2
         RETURNING *`,
-      [id, userId, types ?? null, sources ?? null, body.enabled ?? null],
+      [id, userId, types ?? null, sources ?? null, body.enabled ?? null, surface ?? null],
     )).rows[0];
     if (!row) return reply.status(404).send({ ok: false, error: "not_found" });
     await resendAfterSubscribing(userId, row);

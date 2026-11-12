@@ -56,6 +56,7 @@ import { modelChoiceOn } from "./model-choice.js";
 import { voidStreamedSay } from "./router-speed.js";
 import { dropHeldSays } from "./say-hold.js";
 import { pullStates, type PullState } from "./pr-state.js";
+import { routeToSurface } from "../notifications/surfaces.js";
 
 export { confirmationRef };
 
@@ -719,6 +720,21 @@ export async function reviewStart(
 }
 
 /**
+ * The person's subscriptions that run a channel's actions, on the surface the turn's message came from (`routeToSurface`): an
+ * action names that message (`channel_message_id`), which only the channel it came from can act on.
+ */
+async function actionSubscriptions(
+  q: Querier, userId: string, claims: Pick<AssistantTokenClaims, "sid" | "mid">,
+): Promise<Array<{ subscription_id: string }>> {
+  const subs = (await q(
+    `SELECT subscription_id, surface FROM claw_notification_subscriptions
+      WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
+    [userId],
+  )).rows as Array<{ subscription_id: string; surface: string }>;
+  return routeToSurface(q, userId, subs, { sessionId: claims.sid, messageId: claims.mid });
+}
+
+/**
  * Hand a review asked of someone else to the channel that carried the person's message (`assistant.action` with `review`), when that
  * message declared it can be handed one (`channel_context.handoffs`) and one of the person's channels takes actions. The grounding is
  * done by the caller, against the recorded message (the reviewer is someone the channel listed and the message names, each pull request
@@ -740,11 +756,7 @@ async function handOffReview(
     const { userId, message } = await attendedTurn(q, claims);
     const channelMessageId = message.context.channel_message_id;
     if (!message.context.handoffs.includes("review_for_other") || !channelMessageId) return null;
-    const subs = (await q(
-      `SELECT subscription_id FROM claw_notification_subscriptions
-        WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
-      [userId],
-    )).rows as Array<{ subscription_id: string }>;
+    const subs = await actionSubscriptions(q, userId, claims);
     if (!subs.length) return null;
     // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
     const key = [reviewer.userId, merge ? "merge" : "review", ...prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
@@ -1089,11 +1101,7 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: message.context.channel_message_id, action: { name, args: actionArgs },
     };
-    const subs = (await q(
-      `SELECT subscription_id FROM claw_notification_subscriptions
-        WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
-      [userId],
-    )).rows as Array<{ subscription_id: string }>;
+    const subs = await actionSubscriptions(q, userId, claims);
     if (!subs.length) throw new ToolRefused("no_channel", "no channel of the user runs actions now: tell them the setting cannot be changed from here");
     await enqueue(eventId, subs, payload, q);
     return { eventId };

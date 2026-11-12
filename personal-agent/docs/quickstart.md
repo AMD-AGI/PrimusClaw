@@ -10,9 +10,9 @@ Teams bot that people talk to, and finally with a developer machine connected th
 
 | Artifact                                      | Version | Where                                                                                                                                                                                                                                                                       |
 | --------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The Teams worker, as npm packages             | 0.7.1   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
-| The Teams worker, as an image                 | 0.7.1   | [`docker.io/primussafe/personal-agent-teams:0.7.1`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
-| The Teams ingress, as an Azure Function       | 0.7.1   | `personal-agent-teams-ingress-0.7.1.zip` on the GitHub Release `personal-agent-v0.7.1` ([step 4](#4-the-ingress))                                                                                                                                                           |
+| The Teams worker, as npm packages             | 0.7.2   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
+| The Teams worker, as an image                 | 0.7.2   | [`docker.io/primussafe/personal-agent-teams:0.7.2`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
+| The Teams ingress, as an Azure Function       | 0.7.2   | `personal-agent-teams-ingress-0.7.2.zip` on the GitHub Release `personal-agent-v0.7.2` ([step 4](#4-the-ingress))                                                                                                                                                           |
 | claw-connector, for a developer's own machine | 0.1.23  | [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector)                                                                                                                                                                                              |
 
 The worker holds no model and no sandbox: every answer comes from a [Claw](../../claw/README.md) deployment, which runs
@@ -50,7 +50,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
    ```bash
    mkdir personal-agent-try && cd personal-agent-try
    npm init -y >/dev/null
-   npm install @primusclaw/personal-agent-teams@0.7.1
+   npm install @primusclaw/personal-agent-teams@0.7.2
    base=https://raw.githubusercontent.com/AMD-AGI/PrimusClaw/main/personal-agent/examples/local-taste
    curl -fsSL --remote-name-all "$base/stand-in-connector.mjs" "$base/message.json" "$base/try.env.example"
    ```
@@ -80,7 +80,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
 
    ```bash
    curl -fsS http://127.0.0.1:8080/healthz; echo                      # ok
-   curl -fsS http://127.0.0.1:9090/metrics | grep build_info           # personal_agent_build_info{version="0.7.1",...} 1
+   curl -fsS http://127.0.0.1:9090/metrics | grep build_info           # personal_agent_build_info{version="0.7.2",...} 1
    say() { n=$((n + 1)); sed "s|__ID__|$(date +%s)-$n|; s|__TEXT__|$1|" message.json |
      curl -fsS -H 'content-type: application/json' --data @- http://127.0.0.1:8080/gate/v1/activity; echo; }
    say hello                                                           # {"status":"handled"}
@@ -110,7 +110,7 @@ otherwise. The answer to a message arrives in the stand-in connector's terminal 
 the host's network; the stand-in connector runs on the host as above):
 
 ```bash
-docker run --rm --network host --env-file try.env docker.io/primussafe/personal-agent-teams:0.7.1
+docker run --rm --network host --env-file try.env docker.io/primussafe/personal-agent-teams:0.7.2
 ```
 
 **Claw's tool layer, without a cluster.** To see the part of Claw that edits files and runs commands for an agent, clone
@@ -285,7 +285,7 @@ Deploy the release's zip, after checking it is the one the release names. A Flex
 through One Deploy as `application/zip`:
 
 ```bash
-v=0.7.1
+v=0.7.2
 gh release download "personal-agent-v$v" -R AMD-AGI/PrimusClaw -p "personal-agent-teams-ingress-$v.zip*"
 sha256sum -c "personal-agent-teams-ingress-$v.zip.sha256"
 gh attestation verify "personal-agent-teams-ingress-$v.zip" --repo AMD-AGI/PrimusClaw
@@ -362,14 +362,14 @@ With plain Docker:
 ```bash
 docker run -d --name personal-agent --env-file .env -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
   -v personal-agent-data:/data -v "$PWD/assertion-key.pem:/run/secrets/assertion-key.pem:ro" \
-  docker.io/primussafe/personal-agent-teams:0.7.1
+  docker.io/primussafe/personal-agent-teams:0.7.2
 ```
 
 From npm (Node 26), with the store in a directory the user running it can write (SQLite creates the file, not the
 directory):
 
 ```bash
-npm install @primusclaw/personal-agent-teams@0.7.1
+npm install @primusclaw/personal-agent-teams@0.7.2
 mkdir -p "$HOME/personal-agent"
 TEAMS_DB_PATH="$HOME/personal-agent/state.db" \
   node --env-file=.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
@@ -388,7 +388,7 @@ exits.
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz                    # ok
-curl -fsS http://127.0.0.1:9090/metrics | grep build_info   # personal_agent_build_info{version="0.7.1",node="v26..."} 1
+curl -fsS http://127.0.0.1:9090/metrics | grep build_info   # personal_agent_build_info{version="0.7.2",node="v26..."} 1
 ```
 
 `/healthz` says the process is up, not that it reaches anything. Read the start of the log too: it names the outbound
