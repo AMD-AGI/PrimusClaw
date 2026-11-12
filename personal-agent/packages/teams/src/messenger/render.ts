@@ -12,6 +12,7 @@ import type { JsonObject } from "../cards/json.js";
 import type { Style } from "../config/style.js";
 import { withAiLabel, withCitationEntities, withSuggestedReplies } from "../activity/decorations.js";
 import { withFeedbackLoop } from "../activity/feedback-loop.js";
+import { withLineBreaks } from "../activity/line-breaks.js";
 import { textActivity, withMention } from "../activity/outbound.js";
 import { richTextActivity, unescapeMarkdown } from "../richtext/index.js";
 import { renderView, type Renderers } from "../views/registry.js";
@@ -44,14 +45,16 @@ export function richActivity(markdown: string, lead: boolean, masker: Masker | u
     const html = activity["text"];
     if (activity["textFormat"] !== "xml" || typeof html !== "string" || !masker.text(html).hit) return activity;
   }
-  return textActivity(first ?? "");
+  return textActivity(withLineBreaks(first ?? ""));
 }
 
 function bodyActivity(message: OutMessage, context: RenderContext): JsonObject {
   const body = message.body;
   switch (body.type) {
     case "text":
-      return textActivity(body.text);
+      // (Teams' markdown joins lines a single "\n" separates. A group chat's masking runs on the activity after this: it
+      // only adds a "\n" next to a "\n", and every credential shape the masking knows reads any run of whitespace alike)
+      return textActivity(withLineBreaks(body.text));
     case "rich":
       return richActivity(body.markdown, body.lead, context.masker);
     case "view":
