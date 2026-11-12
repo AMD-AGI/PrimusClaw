@@ -15,6 +15,19 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.7.2
+
+A patch release: one fix (#785). No plugin port (core's `src/plugins/`) and no store change; works with any Claw.
+
+### Fixed
+
+- `@primusclaw/personal-agent`: in a group with no language set, or set to "follow the asker", each @-message now
+  carries its own words' language as the `[Reply language: ...]` line, so the group session's history no longer decides:
+  after `/lang auto` in a group that had talked English, the first Chinese question was answered in English. A message
+  with no words of its own (`ok`, `#3`, a link) follows the language of the sender's last message with words in that
+  group (kept in memory, so after a restart such a message gets no line until its sender writes one). An explicit group
+  setting still wins. The English "follow the asker" announcement no longer reads "asked in in this group" (#785).
+
 ## 0.7.1
 
 A patch release: one fix (#779). No plugin port (core's `src/plugins/`) and no store change.
