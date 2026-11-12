@@ -1835,6 +1835,54 @@ export async function initDb(): Promise<void> {
     await client.query("ALTER TABLE claw_skills ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_skills_user ON claw_skills(user_id, status)");
     await client.query("CREATE INDEX IF NOT EXISTS idx_skills_name ON claw_skills(skill_name, user_id, version DESC)");
+    // Personal skills (marketplace/skill-service.ts). enabled: a disabled skill is kept and not used. origin: where
+    // the skill came from (chat, worker, api, import, auto), for audit and trust; `source` stays the evolution
+    // logic's. content_sha: SKILL.md and every supporting file, what a cached copy is keyed by. last_used_at: the
+    // last time a turn read the skill (last_accessed is when it was offered). invocation: auto, listed to the model;
+    // manual, used only when the user names it.
+    for (const ddl of [
+      "ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+      "ADD COLUMN IF NOT EXISTS origin TEXT CHECK (origin IN ('chat', 'worker', 'api', 'import', 'auto'))",
+      "ADD COLUMN IF NOT EXISTS content_sha TEXT",
+      "ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ",
+      "ADD COLUMN IF NOT EXISTS invocation TEXT NOT NULL DEFAULT 'auto' CHECK (invocation IN ('auto', 'manual'))",
+    ]) {
+      await client.query(`ALTER TABLE claw_skills ${ddl}`);
+    }
+    // What happened to each personal skill, for audit: who (actor), in which session, which version. A refused write
+    // records why and where (file, line, kind), never what it carried.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_events (
+        id          BIGSERIAL PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        skill_name  TEXT NOT NULL,
+        version     INT,
+        op          TEXT NOT NULL CHECK (op IN ('draft', 'create', 'update', 'disable', 'enable', 'delete', 'restore', 'rollback', 'refused')),
+        actor       TEXT NOT NULL CHECK (actor IN ('user_cmd', 'model_confirmed', 'model', 'api', 'import', 'auto')),
+        session_id  TEXT,
+        detail      JSONB NOT NULL DEFAULT '{}',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_events_skill ON claw_skill_events(user_id, skill_name, created_at)");
+    // A skill drafted from a conversation, waiting for the user to confirm it. Not a claw_skills row: a name there has
+    // one row whose version moves in place, so a pending row would collide with it. Deleted after 24 hours.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_drafts (
+        id             TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        skill_name     TEXT NOT NULL,
+        description    TEXT NOT NULL DEFAULT '',
+        content        TEXT NOT NULL,
+        files          JSONB NOT NULL DEFAULT '[]',
+        replaces       TEXT,
+        request_quote  TEXT,
+        origin         TEXT NOT NULL CHECK (origin IN ('chat', 'worker', 'api', 'import', 'auto')),
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_user ON claw_skill_drafts(user_id, created_at)");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_created ON claw_skill_drafts(created_at)");
 
     // Soft-delete support
     const addDeleted = async (table: string) => {

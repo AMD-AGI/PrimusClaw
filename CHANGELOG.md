@@ -113,6 +113,25 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Personal skills have their own switch, `CLAW_USER_SKILLS_ENABLED` (off by default): a user's skills reaching their
+  turns and the skills a turn saves (`save_skill`, `*_skill_file`). Skills the platform writes on its own (pattern
+  promotion, evolution, feedback, probation) are `CLAW_SKILL_AUTO_EVOLUTION_ENABLED` (off by default); the old name
+  `CLAW_SKILL_EVOLUTION_ENABLED` still sets that one, and only that one, while the new name is unset. A deployment that
+  had `CLAW_SKILL_EVOLUTION_ENABLED=true` keeps auto-evolution and loses the user's own skills until it sets
+  `CLAW_USER_SKILLS_ENABLED=true`. Brain offers the skill-writing tools by the new request field `user_skills_enabled`
+  (from an older API, by `skill_evolution_enabled` as before), and never in a session that acts as a user; tasks, DAG
+  nodes, application runs and A2A turns are sent `false`. Every save of a user's skill, from the routes or a
+  turn, now passes one set of checks: a new name is kebab-case (`^[a-z0-9][a-z0-9-]{0,63}$`; a name stored before
+  keeps working), at most 50 skills per user and a save past that is refused (409 on the routes) instead of deleting
+  the least used one, SKILL.md at most 20000 characters (was 2000 on the routes, 5000 from a turn), a description 300,
+  a file 64 KB (was 10 KB), 20 files and 256 KB per skill (was 50 KB), no credential (the answer names the file and
+  line, never the text) and no instruction to override the agent (`scanInjection`, Chinese included). The platform's own saves are refused when full as
+  well (and past five unproven ones, where the oldest unproven skill used to be deleted), checked for length,
+  credentials and injection, kept within the per-skill limits, and audited. A refused route
+  write answers with `reason` and, for a secret or injection, `at: {file, line, kind}` beside `error`. Schema, added
+  at start-up: `claw_skills.enabled`, `origin`, `content_sha`, `last_used_at`, `invocation`, and the tables
+  `claw_skill_events` (every save, refusal, file change, rollback and delete) and `claw_skill_drafts` (unused until
+  saving from a conversation is confirmed by the user; drafts older than 24 hours are deleted daily) (#801).
 - An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
   a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
   (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,

@@ -4,12 +4,26 @@
 import type { FastifyInstance } from "fastify";
 import { getUser } from "../auth/middleware.js";
 import {
-  getAllUserSkills, getSkillDetails, saveSkill, deleteSkill,
+  getAllUserSkills, getSkillDetails, saveUserSkill, deleteSkill,
   manualRollback, getSkillStats,
   addSkillFile, updateSkillFile, removeSkillFile, getSkillFiles, getSkillFile,
+  type SkillWriteRefusal, type SkillWriteRefused,
 } from "../marketplace/skill-service.js";
-import { scanMemoryContent } from "../memory/gates.js";
-import { db } from "../infra/db.js";
+
+/** The HTTP status of each refusal a skill write can meet. */
+const REFUSAL_STATUS: Record<SkillWriteRefusal, number> = {
+  invalid_name: 400, invalid: 400, too_large: 400, too_many_files: 400, secret: 400, injection: 400,
+  full: 409, not_found: 404,
+};
+
+/** A refusal as the routes answer it: `error` is the message, as it always was; `reason` and `at` say which and where. */
+function refusalBody(r: SkillWriteRefused): Record<string, unknown> {
+  return { ok: false, error: r.message, reason: r.error, ...(r.at ? { at: r.at } : {}) };
+}
+
+function fileRefusalBody(r: { error?: string; refusal?: SkillWriteRefusal }): Record<string, unknown> {
+  return { ok: false, error: r.error, ...(r.refusal ? { reason: r.refusal } : {}) };
+}
 
 export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
 
@@ -45,21 +59,19 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
     const userId = resolveUserId(req, reply);
     if (!userId) return;
 
-    const body = req.body as Record<string, unknown>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const skillName = body.skill_name as string;
     const content = body.content as string;
 
-    if (!skillName || !content) {
+    if (!skillName || !content || typeof skillName !== "string" || typeof content !== "string") {
       return reply.status(400).send({ ok: false, error: "skill_name and content required" });
     }
 
-    const blocked = scanMemoryContent(content);
-    if (blocked) {
-      return reply.status(400).send({ ok: false, error: blocked });
-    }
-
-    await saveSkill(skillName, userId, content, "manual");
-    return { ok: true };
+    const saved = await saveUserSkill(userId, {
+      name: skillName, content, description: typeof body.description === "string" ? body.description : "",
+    }, { origin: "api", actor: "api" });
+    if (!saved.ok) return reply.status(REFUSAL_STATUS[saved.error]).send(refusalBody(saved));
+    return { ok: true, version: saved.version };
   });
 
   // Edit skill — routes through saveSkill (in-place + probation-aware) for v3.0+
@@ -69,14 +81,10 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
     const userId = resolveUserId(req, reply);
     if (!userId) return;
 
-    const body = req.body as Record<string, unknown>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const content = body.content as string;
-    if (!content) {
+    if (!content || typeof content !== "string") {
       return reply.status(400).send({ ok: false, error: "content required" });
-    }
-    const blocked = scanMemoryContent(content);
-    if (blocked) {
-      return reply.status(400).send({ ok: false, error: blocked });
     }
 
     const skillName = req.params.name;
@@ -87,15 +95,10 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
 
     // saveSkill's Case 1 (visible row exists) updates in place AND, when source='manual',
     // graduates probation rows to active — exactly what a user-initiated edit should do.
-    const description = (body.description as string) ?? existing[0]?.description ?? "";
-    await saveSkill(skillName, userId, content, "manual", undefined, description);
-
-    // Re-fetch current version for response (may have been bumped by prior evolutions)
-    const refreshed = (await db.query(
-      "SELECT version FROM claw_skills WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NULL ORDER BY version DESC LIMIT 1",
-      [skillName, userId]
-    )).rows[0];
-    return { ok: true, version: refreshed?.version ?? 1 };
+    const description = typeof body.description === "string" ? body.description : (existing[0]?.description ?? "");
+    const saved = await saveUserSkill(userId, { name: skillName, content, description }, { origin: "api", actor: "api" });
+    if (!saved.ok) return reply.status(REFUSAL_STATUS[saved.error]).send(refusalBody(saved));
+    return { ok: true, version: saved.version };
   });
 
   app.delete<{ Params: { userId: string; name: string } }>("/v1/users/:userId/skills/:name", async (req, reply) => {
@@ -158,7 +161,7 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
       content: body.content as string,
       is_binary: body.is_binary as boolean | undefined,
     });
-    if (!result.ok) return reply.status(400).send(result);
+    if (!result.ok) return reply.status(result.refusal ? REFUSAL_STATUS[result.refusal] : 400).send(fileRefusalBody(result));
     return { ok: true };
   });
 
@@ -175,8 +178,8 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
       is_binary: body.is_binary as boolean | undefined,
     });
     if (!result.ok) {
-      const status = result.error?.includes("not found") ? 404 : 400;
-      return reply.status(status).send(result);
+      const status = result.refusal ? REFUSAL_STATUS[result.refusal] : 400;
+      return reply.status(status).send(fileRefusalBody(result));
     }
     return { ok: true };
   });
@@ -188,8 +191,8 @@ export async function registerSkillRoutes(app: FastifyInstance): Promise<void> {
     if (!filePath) return reply.status(400).send({ ok: false, error: "file path required" });
     const result = await removeSkillFile(userId, req.params.name, filePath);
     if (!result.ok) {
-      const status = result.error?.includes("not found") ? 404 : 400;
-      return reply.status(status).send(result);
+      const status = result.refusal ? REFUSAL_STATUS[result.refusal] : 400;
+      return reply.status(status).send(fileRefusalBody(result));
     }
     return { ok: true };
   });

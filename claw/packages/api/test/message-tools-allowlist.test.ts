@@ -12,7 +12,7 @@
  *   A3 a value that is not a list of strings is refused with 400 and nothing is sent
  *   A4 a message queued behind a running turn keeps its list, on the queue row and
  *      when the queue is drained
- *   A5 every turn carries skill_evolution_enabled, false by default
+ *   A5 every turn carries skill_evolution_enabled and user_skills_enabled, false by default
  */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -171,12 +171,14 @@ test("A4 a message queued behind a running turn keeps its list", async () => {
     assert.equal(drained.length, 1, "the queued message was not sent on");
     assert.deepEqual(drained[0].tools_allowlist, ["grep"]);
     assert.equal(drained[0].skill_evolution_enabled, false);
+    assert.equal(drained[0].user_skills_enabled, false);
   });
 });
 
-test("A5 every turn says whether skill self-evolution is on (off by default)", async () => {
+test("A5 every turn says whether skill self-evolution and saving skills are on (both off by default)", async () => {
   await withApp(async (app, sid) => {
     assert.equal((await send(app, sid, {})).statusCode, 200);
     assert.equal(published[0].skill_evolution_enabled, false);
+    assert.equal(published[0].user_skills_enabled, false);
   });
 });

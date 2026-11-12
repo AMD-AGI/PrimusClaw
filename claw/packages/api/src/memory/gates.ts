@@ -139,15 +139,6 @@ const THREAT_PATTERNS: Array<{ pattern: RegExp; id: string }> = [
   { pattern: /curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD)/i, id: "exfil" },
 ];
 
-/** The check skill content gets (the save_skill tool, the skill routes, evolution): threat patterns and a length cap. */
-export function scanMemoryContent(content: string, maxLength = 2000): string | null {
-  for (const { pattern, id } of THREAT_PATTERNS) {
-    if (pattern.test(content)) return `Blocked: threat pattern '${id}'`;
-  }
-  if (content.length > maxLength) return `Blocked: content too long (max ${maxLength} chars)`;
-  return null;
-}
-
 const INJECTION_PATTERNS: Array<{ pattern: RegExp; id: string }> = [
   ...THREAT_PATTERNS,
   { pattern: /(忽略|无视|忘掉|忘记)(掉)?(之前|以上|上面|前面|先前|所有|全部|你的)?(的)?(所有|全部)?(指令|指示|说明|提示|规则|要求)/, id: "prompt_injection" },

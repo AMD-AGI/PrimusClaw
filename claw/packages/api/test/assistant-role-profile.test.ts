@@ -50,7 +50,7 @@ describe("assistant role profile", { skip }, () => {
   const user = (id: string) => ({ userId: id, userName: id, roles: ["default"], platformKey: `pk-${id}`, virtualKey: `vk-${id}` });
 
   before(async () => {
-    w = await startWorld({ CLAW_SKILL_EVOLUTION_ENABLED: "true", MAX_SELECTED_SKILLS: "1", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
+    w = await startWorld({ CLAW_USER_SKILLS_ENABLED: "true", MAX_SELECTED_SKILLS: "1", CLAW_AGENT_GUIDELINE_ENABLED: "true" });
     dispatch = await import("../src/sessions/dispatch.js");
     ({ TURN_STATE_HEADER, UNTRUSTED_CLOSE } = await import("../src/assistant/prompts.js"));
   });

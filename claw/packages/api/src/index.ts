@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
@@ -83,7 +83,7 @@ import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
-import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
+import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
 import pino from "pino";
@@ -413,7 +413,7 @@ async function main() {
   // SKIP LOCKED makes it safe across multiple API replicas.
   // Gated: when skill evolution is OFF, no jobs are enqueued so the worker
   // would just poll an empty queue forever. Skip the empty polling loop.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
+  if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
     startEvolveWorker();
   } else {
     logger.info("evolve_worker.skipped_flag_off");
@@ -439,8 +439,8 @@ async function main() {
   startJobWatch();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
-  // Skill cleanups gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data
-  // is fully frozen so toggling the flag back ON restores prior state without
+  // Skill cleanups gated by the skill switches — when both are OFF, old data
+  // is fully frozen so toggling a flag back ON restores prior state without
   // value loss. Memory has none: nothing about it changes on a timer.
   const runMaintenance = () => {
     // Archive first, then retention: a session archived today is days away from
@@ -458,12 +458,17 @@ async function main() {
         lockRetryDelayMs: SESSION_RETENTION_LOCK_RETRY_MIN * 60 * 1000,
       }))
       .catch(err => logger.error({ err }, "session_retention.failed"));
-    if (CLAW_SKILL_EVOLUTION_ENABLED) {
+    if (CLAW_USER_SKILLS_ENABLED || CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
+    }
+    if (CLAW_USER_SKILLS_ENABLED) {
+      cleanupExpiredSkillDrafts().catch(err => logger.error({ err }, "skill_drafts.cleanup_failed"));
+    }
+    if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
+  if (CLAW_USER_SKILLS_ENABLED || CLAW_SKILL_AUTO_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
     || SESSION_RETENTION_DAYS > 0 || SESSION_PURGE_DAYS > 0) {
     setTimeout(() => {
       runMaintenance();

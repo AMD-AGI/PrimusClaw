@@ -120,7 +120,7 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   await seed("s-own", "u-bob", { acting_as: "u-bob" });
   const loaded = () => ({
     session_id: "", skills: { s: { content: "x" } }, tool_ids: [1], plugin_id: 3, plugin_tools: [], user_env: { GH_TOKEN: "x" }, workspace_id: "gpu-ws",
-    topology: { nodes: 2 }, agent_hooks: { pre: [] }, rules_text: "be nice", memory_enabled: true, skill_evolution_enabled: true, tools_allowlist: ["*"],
+    topology: { nodes: 2 }, agent_hooks: { pre: [] }, rules_text: "be nice", memory_enabled: true, skill_evolution_enabled: true, user_skills_enabled: true, tools_allowlist: ["*"],
     mcp_servers: { mine: { type: "http", url: "http://x" }, github_review: { type: "http", url: "http://stale" } },
   });
   const task: Record<string, unknown> = loaded();
@@ -130,7 +130,7 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"]) {
     assert.equal(field in task, false, field);
   }
-  assert.deepEqual([task.memory_enabled, task.skill_evolution_enabled, task.sandbox_profile, task.withhold_sandbox_keys, task.max_turns], [false, false, "review", true, 200]);
+  assert.deepEqual([task.memory_enabled, task.skill_evolution_enabled, task.user_skills_enabled, task.sandbox_profile, task.withhold_sandbox_keys, task.max_turns], [false, false, false, "review", true, 200]);
   const own: Record<string, unknown> = loaded();
   await tools.applySandboxKeyPolicyToTask(own, "s-own");
   assert.deepEqual([own.sandbox_profile, own.tools_allowlist, own.max_turns, own.memory_enabled, "skills" in own, "user_env" in own],
