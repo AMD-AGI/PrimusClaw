@@ -276,6 +276,34 @@ func TestPendingTimeoutReplayDuringDeleteReportsPendingTimeout(t *testing.T) {
 	}
 }
 
+// A sandbox a replay adopted as running before the pending deadline is not
+// ended or deleted when the deadline passes.
+func TestPendingDeadlineKeepsAdoptedRunningSandbox(t *testing.T) {
+	svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	awaitStarted(t, runner.started, done)
+	runner.observed = WorkloadRunning
+	if _, status, err := svc.Create(context.Background(), keys["measurement"], body); err != nil || status != http.StatusCreated {
+		t.Fatalf("replay status=%d err=%v", status, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
+	if err != nil || len(refs) != 1 || refs[0].State != runtimev1alpha1.SandboxRunning {
+		t.Fatalf("refs=%+v err=%v", refs, err)
+	}
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatalf("create=%v", err)
+	}
+}
+
 // endAt counts the sandbox timeout from the time it was first running.
 func TestDetailEndAtCountsFromRunning(t *testing.T) {
 	svc, _, _ := testPlane(t, 600, []int32{1}, 1)

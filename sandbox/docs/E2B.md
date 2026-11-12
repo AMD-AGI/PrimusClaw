@@ -72,7 +72,7 @@ Quotas apply per person, across all templates. The built-in defaults are below; 
 
 - The create timeout and every extension stay within the max lifetime.
 - The timeout and the max lifetime count from the time the sandbox is running. Time spent queued or pending is not part of either.
-- The wait for a sandbox to run is the pending timeout: metadata `agent-sandbox.io/pending-timeout` in seconds (1 to 86400) when set, else the template `pendingTimeoutSec`, else 15 minutes. A sandbox not running by then is removed and the create, and any replay of its idempotency key, reports `pending_timeout` with the limit and the last queue state.
+- The wait for a sandbox to run is the pending timeout: metadata `agent-sandbox.io/pending-timeout` in seconds (1 to 86400) when set, else the template `pendingTimeoutSec`, else 15 minutes. A sandbox not running by then is removed. The create returns `503 pending_timeout` with the limit and the last queue state; a replay of its idempotency key returns `410 idempotency_key_spent` with that `pending_timeout` reason in the detail.
 - An expired sandbox is reclaimed. Kill releases the quota at once.
 - A user lists and operates only their own sandboxes. Another user's sandbox returns `404`.
 - A `system-admin` operates every sandbox, including Claw grant sandboxes. An extension stays within both the caller's max lifetime and that of the sandbox's owner.

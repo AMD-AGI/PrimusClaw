@@ -194,20 +194,46 @@ const createFailedReason = "create_failed"
 // A ref already ended as a create failure takes reason, since the create call knows the cause.
 func (s *Service) FailSandbox(ctx context.Context, grantID, sandboxID, reason string) error {
 	return s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
+		return s.failRef(g, sandboxID, reason)
+	})
+}
+
+// ExpirePending ends a sandbox that is not running yet, as FailSandbox does.
+// It reports false and leaves the ref unchanged when the sandbox is already running.
+func (s *Service) ExpirePending(ctx context.Context, grantID, sandboxID, reason string) (bool, error) {
+	expired := false
+	err := s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
 		ref, idx := findSandbox(g, sandboxID)
-		if idx >= 0 && ref.State == runtimev1alpha1.SandboxEnded {
-			if isCreateFailure(ref.EndReason) {
-				g.Status.Sandboxes[idx].EndReason = capReason(reason)
-			}
+		expired = idx < 0 || ref.State != runtimev1alpha1.SandboxRunning
+		if !expired {
 			return nil
 		}
-		now := s.now()
-		if err := endOne(g, sandboxID, reason, now); err != nil {
-			return err
-		}
-		compactEndedRefs(g, now)
-		return nil
+		return s.failRef(g, sandboxID, reason)
 	})
+	return expired, err
+}
+
+// failRef ends sandboxID with reason. An ended create failure takes the new
+// reason, except that a pending_timeout is only replaced by another one.
+func (s *Service) failRef(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string) error {
+	ref, idx := findSandbox(g, sandboxID)
+	if idx >= 0 && ref.State == runtimev1alpha1.SandboxEnded {
+		if isCreateFailure(ref.EndReason) && (!isPendingTimeout(ref.EndReason) || isPendingTimeout(reason)) {
+			g.Status.Sandboxes[idx].EndReason = capReason(reason)
+		}
+		return nil
+	}
+	now := s.now()
+	if err := endOne(g, sandboxID, reason, now); err != nil {
+		return err
+	}
+	compactEndedRefs(g, now)
+	return nil
+}
+
+// isPendingTimeout reports whether an end reason records a pending deadline.
+func isPendingTimeout(reason string) bool {
+	return strings.HasPrefix(reason, "pending_timeout")
 }
 
 // isCreateFailure reports whether an end reason records a failed create.

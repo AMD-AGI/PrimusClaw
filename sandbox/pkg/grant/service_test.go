@@ -1184,6 +1184,36 @@ func TestIssueRejectsReservedAppRunID(t *testing.T) {
 	}
 }
 
+// A Workload deletion observed after the pending deadline does not replace
+// the pending_timeout reason.
+func TestFailSandboxKeepsPendingTimeout(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{
+		"pending_timeout: not running after 1s (pendingTimeoutSec=1)",
+		"sandbox_create_failed: workload sbx-1 is being deleted: phase NotReady: In queue",
+	} {
+		if err := svc.FailSandbox(context.Background(), req.GrantID, "sbx-1", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil || len(view.Sandboxes) != 1 || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout: ") {
+		t.Fatalf("sandboxes=%+v err=%v", view.Sandboxes, err)
+	}
+}
+
 func TestFailSandboxKeepsTheCreateReason(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
