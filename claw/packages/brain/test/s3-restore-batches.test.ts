@@ -60,6 +60,8 @@ class FakeHands {
   calls = 0;
   /** When set, decides per call whether to throw it instead. */
   refuse: ((call: number) => Error | undefined) | undefined;
+  /** When set, sees every call's file list first; the call answers once it settles. */
+  inspect: ((files: Array<{ presigned_url: string }>) => Promise<void>) | undefined;
   readonly client = {
     generation: "http://sandbox.test/mcp",
     callTool: async (tool: string, args: Record<string, unknown>): Promise<string> => {
@@ -73,6 +75,7 @@ class FakeHands {
         throw new Error('Streamable HTTP error: Error POSTing to endpoint (HTTP 413): {"statusCode":413,'
           + '"code":"FST_ERR_CTP_BODY_TOO_LARGE","error":"Payload Too Large","message":"Request body is too large"}');
       }
+      await this.inspect?.(args.files as Array<{ presigned_url: string }>);
       const refused = this.refuse?.(call);
       if (refused) throw refused;
       const files = (args.files as Array<{ local_path: string }>).map((f) => f.local_path);
@@ -140,4 +143,58 @@ test("B5 batches keep order and both bounds, and an entry over the byte bound go
   const big = { x: "y".repeat(100) };
   assert.deepEqual(chunkForHands([items[0], big, items[1]], 100, 50), [[items[0]], [big], [items[1]]]);
   assert.deepEqual(chunkForHands([], 100, 50), []);
+});
+
+/** When a presigned URL was signed, from its X-Amz-Date (yyyymmddThhmmssZ). */
+function signedAt(url: string): number {
+  const d = new URL(url).searchParams.get("X-Amz-Date") ?? "";
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(d);
+  assert.ok(m, `no X-Amz-Date in ${url}`);
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+}
+
+/**
+ * A sandbox slow enough that a whole session takes far longer than a URL lives:
+ * every call takes three minutes of the clock, and every URL it is handed must
+ * have been signed for it, not minutes before. The clock moves when a call
+ * finishes, after the calls in flight beside it have started, as it would with
+ * calls that run side by side.
+ */
+function slowHands(t: { mock: { timers: { enable: (o: object) => void; tick: (ms: number) => void } } }): FakeHands {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 12) });
+  const hands = new FakeHands();
+  hands.inspect = async (files) => {
+    for (const f of files) {
+      const age = Date.now() - signedAt(f.presigned_url);
+      assert.ok(age >= 0 && age < 60_000, `a URL signed ${age / 1000}s before its call`);
+    }
+    await new Promise<void>((r) => setImmediate(r));
+    t.mock.timers.tick(180_000);
+  };
+  return hands;
+}
+
+test("B6 every restore call carries URLs signed for it, however long the restore runs", async (t) => {
+  const keys = cloneKeys(PREFIX, 1500);
+  serveListing(t, keys);
+  const hands = slowHands(t);
+  assert.equal(await syncWorkspaceFromS3(hands.client, SESSION, USER), keys.length);
+  assert.equal(hands.restored.size, keys.length);
+});
+
+test("B7 every uploads call carries URLs signed for it too", async (t) => {
+  const keys = cloneKeys(`${PREFIX}.uploads/`, 1500);
+  serveListing(t, keys, true);
+  const hands = slowHands(t);
+  assert.equal(await syncUploadsFromS3(hands.client, SESSION, USER), keys.length);
+  assert.equal(hands.restored.size, keys.length);
+});
+
+test("B8 an unreachable sandbox ends the uploads offer at the first call", async (t) => {
+  const keys = cloneKeys(`${PREFIX}.uploads/`);
+  serveListing(t, keys, true);
+  const hands = new FakeHands();
+  hands.refuse = () => Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+  await assert.rejects(() => syncUploadsFromS3(hands.client, SESSION, USER), /fetch failed/);
+  assert.equal(hands.calls, 1);
 });

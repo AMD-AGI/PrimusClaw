@@ -1156,50 +1156,58 @@ export async function syncUploadsFromS3(
 ): Promise<number> {
   const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
   const s3 = getS3Client();
-  const files: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+  const objects: Array<{ key: string; size: number }> = [];
   let continuationToken: string | undefined;
   do {
     const resp = await s3.send(new ListObjectsV2Command({
       Bucket: S3_BUCKET, Prefix: `${s3Prefix}.uploads/`, ContinuationToken: continuationToken,
     }));
     for (const obj of resp.Contents || []) {
-      if (!obj.Key) continue;
-      files.push({
-        local_path: `/workspace/${obj.Key.slice(s3Prefix.length)}`,
-        presigned_url: await presignGet(obj.Key),
-        size: obj.Size ?? 0,
-      });
+      if (obj.Key) objects.push({ key: obj.Key, size: obj.Size ?? 0 });
     }
     continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (continuationToken);
-  if (!files.length) return 0;
-  // In batches Hands accepts, as the workspace restore sends them; a batch that is
-  // refused or answers in a shape that does not parse is reported like the whole
-  // offer used to be, without keeping the other batches from landing.
+  if (!objects.length) return 0;
+  // In batches Hands accepts, each slice signed just before it is sent, as the
+  // workspace restore sends them (downloadRound). A batch refused on its own, or
+  // answered in a shape that does not parse, is reported like the whole offer used
+  // to be without keeping the other batches from landing; a sandbox that cannot be
+  // reached, or does not answer, ends the offer as the single call did.
   let failed: DownloadBatchResult["failed"] | null = [];
-  for (const batch of chunkForHands(files, DOWNLOAD_BATCH_SIZE, DOWNLOAD_BATCH_MAX_BYTES)) {
-    let parsed: DownloadBatchResult | null = null;
-    try {
-      parsed = JSON.parse(await hands.callTool("download_from_s3", { files: batch })) as DownloadBatchResult;
-    } catch (e: unknown) {
-      logger.warn({ sessionId, offered: batch.length, err: (e as { message?: string })?.message ?? String(e) },
-        "s3.uploads_sync.batch_failed");
+  for (let i = 0; i < objects.length; i += DOWNLOAD_BATCH_SIZE) {
+    const signed: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+    for (const o of objects.slice(i, i + DOWNLOAD_BATCH_SIZE)) {
+      signed.push({
+        local_path: `/workspace/${o.key.slice(s3Prefix.length)}`,
+        presigned_url: await presignGet(o.key),
+        size: o.size,
+      });
     }
-    if (parsed && Array.isArray(parsed.failed)) {
-      failed?.push(...parsed.failed);
-    } else {
-      failed = null;
+    for (const batch of chunkForHands(signed, DOWNLOAD_BATCH_SIZE, DOWNLOAD_BATCH_MAX_BYTES)) {
+      let parsed: DownloadBatchResult | null = null;
+      try {
+        parsed = JSON.parse(await hands.callTool("download_from_s3", { files: batch })) as DownloadBatchResult;
+      } catch (e: unknown) {
+        if (isHandsNetworkError(e) || isHandsToolTimeout(e)) throw e;
+        logger.warn({ sessionId, offered: batch.length, err: (e as { message?: string })?.message ?? String(e) },
+          "s3.uploads_sync.batch_failed");
+      }
+      if (parsed && Array.isArray(parsed.failed)) {
+        failed?.push(...parsed.failed);
+      } else {
+        failed = null;
+      }
     }
   }
   if (failed === null) {
-    logger.warn({ sessionId, offered: files.length }, "s3.uploads_sync.unparseable");
+    logger.warn({ sessionId, offered: objects.length }, "s3.uploads_sync.unparseable");
   } else if (failed.length) {
-    logger.warn({ sessionId, offered: files.length, failed: failed.length, sample: failed.slice(0, 3) },
+    logger.warn({ sessionId, offered: objects.length, failed: failed.length, sample: failed.slice(0, 3) },
       "s3.uploads_sync.failed");
   } else {
-    logger.info({ sessionId, offered: files.length }, "s3.uploads_synced");
+    logger.info({ sessionId, offered: objects.length }, "s3.uploads_synced");
   }
-  return files.length;
+  return objects.length;
 }
 
 /**
