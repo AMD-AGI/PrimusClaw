@@ -259,7 +259,7 @@ In short:
   (`ASSISTANT_ENABLED`), remote agents (`REMOTE_AGENTS_ENABLED`), the token exchange (`PA_EXCHANGE_ENABLED`), review
   for a colleague (`PA_GITHUB_REVIEW_ENABLED`) and more.
 - **Setting names.** The worker's own settings, the ones every chat surface shares (the store, the encryption keys, the
-  exchange, review, the per-person limits and the like), carry the `PA_` prefix (personal agent). Releases up to 0.7
+  exchange, review, the per-person limits and the like), carry the `PA_` prefix (personal agent). Releases up to 0.8.0
   named them `TEAMS_` (`TEAMS_ENCRYPTION_KEYS`, `TEAMS_USER_MESSAGE_LIMIT`, ...); those names are still read, so an
   existing deployment needs no change. When both are set the `PA_` name wins, and a worker that reads a `TEAMS_` name
   logs one warning at start naming its `PA_` replacement. A surface's own settings keep the surface's prefix

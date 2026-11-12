@@ -12,7 +12,7 @@ are checked only where this page says so (`KEYVAULT_URL`, `SERVICEBUS_NAMESPACE`
 `TEAMS_INSTALL_HINT_URL`); a wrong `CLAW_API_URL`, say, shows at the first request. **Not every switch is strict**,
 either; see "How switches read" below, and check the spelling of the lenient ones.
 
-The worker's own settings carry the `PA_` prefix; before 0.8.0 they carried `TEAMS_`, and those names still work (see
+The worker's own settings carry the `PA_` prefix; before 0.8.1 they carried `TEAMS_`, and those names still work (see
 "Setting names" at the end). A surface's own settings keep the surface's prefix (`TEAMS_STREAMING`).
 
 [`../examples/worker.env.example`](../examples/worker.env.example) has every setting below with placeholder values,
@@ -236,8 +236,8 @@ value of `TEAMS_GATE_ENTRY` stops the worker.
 
 The settings every chat surface shares are read under the `PA_` prefix (personal agent). `PA_` and not `WORKER_`:
 `WORKER_IDENTITY_*` and `WORKER_IMAGE_TAG` are already Teams and feedback settings, and the prefix should say whose a
-setting is, as `TEAMS_STREAMING` says it is Teams'. Releases up to 0.7 read the names below with the `TEAMS_` prefix
-only; from 0.8.0 each is read under either name, so a deployment written for an older release starts unchanged:
+setting is, as `TEAMS_STREAMING` says it is Teams'. Releases up to 0.8.0 read the names below with the `TEAMS_` prefix
+only; from 0.8.1 each is read under either name, so a deployment written for an older release starts unchanged:
 
 - The `PA_` name is read when it is set and not blank; otherwise the `TEAMS_` name, when it is set; otherwise the `PA_`
   name as it is (unset takes the default; a blank value reads as that setting reads a blank one).
