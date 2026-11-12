@@ -14,6 +14,8 @@
  *   S6 a person who never wrote, or whose subscriptions are all of one surface, gets it on each, as before
  *   S7 a surface label is a lowercase word: refused otherwise, kept on the subscription, changed by PATCH
  *   S8 delivery is unchanged: the slack receiver is posted the signed event, the teams one nothing
+ *   S9 what a turn's tool says in the system's words (a delivered file) goes back to the turn's surface, after a later message
+ *      from another surface
  *
  * Skipped without DATABASE_URL, and a skip is not a pass.
  */
@@ -197,6 +199,25 @@ describe("return to source", { skip }, () => {
     assert.equal(kept.json().data.surface, "mattermost", "a change that names no surface keeps it");
     const refused = await app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${id}`, payload: { surface: "Matter most" } });
     assert.equal(refused.statusCode, 400);
+  });
+
+  test("S9 a file a Slack turn delivers goes to Slack, though a Teams message came in while it ran", async () => {
+    const td = await import("../src/assistant/text-delivery.js");
+    td.textDeliveryPorts.put = async () => {};
+    td.textDeliveryPorts.sayDeps = w.sayDeps;
+    await subscribe(TEAMS_URL, "teams");
+    const slack = await subscribe(SLACK_URL, "slack");
+    const fromSlack = await write("write me a summary as a file", "slack");
+    await write("unrelated, from my phone", "teams"); // Teams is now the surface used last
+    // The Slack message's turn runs (the drain opened its run under the message's id).
+    await w.q("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE session_id = $1", [alice.routerSid]);
+    const run = await w.openRun(alice.routerSid, { messageId: fromSlack });
+    const claims = { sid: alice.routerSid, role: "router" as const, mid: fromSlack, task_id: run.taskId, exp: Math.floor(Date.now() / 1000) + 600 };
+    await td.deliverText(claims as never, { name: "summary.md", text: "# Summary\n\nAll green." });
+    const rows = await w.q(
+      "SELECT o.subscription_id FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id WHERE s.text LIKE '%summary.md%'",
+    );
+    assert.deepEqual(rows.map((r) => r.subscription_id), [slack]);
   });
 
   test("S8 the slack receiver is posted the signed event and the teams one nothing", async () => {

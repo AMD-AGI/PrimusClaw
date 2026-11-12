@@ -449,6 +449,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     // Once per turn: a redelivered completion finds the notice it stored.
     const stored = await recordSystemNotice({
       userId: router.user_id, sessionId: end.sessionId, text, key: `turn_lost:${[...end.runIds].sort().join(",")}`,
+      ...(end.messageId ? { sourceTurn: end.messageId } : {}),
     }, deps);
     if (stored) {
       logger.warn({ sessionId: end.sessionId, runIds: end.runIds, why: lost ? why : "leaked" }, "assistant.turn_lost_notice_delivered");

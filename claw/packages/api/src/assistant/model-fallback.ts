@@ -177,6 +177,8 @@ export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Prom
   if (router) {
     await recordSystemNotice({
       userId: whose.ownerId, sessionId: router, text: notice(whose, refusal, run.model, to, queued.words), key: `model_fallback:${end.sessionId}:${messageId}`,
+      // A router turn's notice goes back to the surface of the message it was answering; a worker's is not the person's turn.
+      ...(whose.kind === "router" && messageId ? { sourceTurn: messageId } : {}),
     }, deps).catch((err) => logger.warn({ err, sessionId: end.sessionId }, "assistant.model_fallback_notice_failed"));
   }
   logger.warn({ sessionId: end.sessionId, kind: whose.kind, from: run.model, to }, "assistant.model_fallback_rerun");

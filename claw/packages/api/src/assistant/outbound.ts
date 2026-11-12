@@ -1057,6 +1057,11 @@ export async function recordSystemNotice(
     userId: string; sessionId: string; text: string; key: string;
     /** The item it is about, attached as a say's is; and the message of the turn it answers, as on a say's event. */
     itemId?: string; turnMessageId?: string;
+    /**
+     * The person's message whose turn it is said in, when that is not `turnMessageId` (which also makes it the turn's notice,
+     * `turnAnnouncedStart`): it only routes the notice back to that message's surface (`routeToSurface`).
+     */
+    sourceTurn?: string;
     /** Files the user gets with it (a worker's deliveries, `deliveries.ts`). */
     files?: AssistantFile[];
     /** A development environment session's own message: which session, and which kind (`remote-items.ts`). */
@@ -1090,6 +1095,7 @@ export async function recordSystemNotice(
       userId: input.userId, sessionId: input.sessionId, text: input.text,
       ...(input.files?.length ? { files: input.files } : {}),
       ...(input.turnMessageId ? { noticeOfTurn: input.turnMessageId } : {}),
+      ...(input.sourceTurn ? { sourceTurn: input.sourceTurn } : {}),
       ...(input.remote ? { remote: input.remote } : {}),
       ...replaced,
     });

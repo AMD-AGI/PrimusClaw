@@ -132,6 +132,7 @@ export async function deliverText(
   const line = textDeliveryLine(name, body.length, language);
   const told = await recordSystemNotice({
     userId, sessionId: claims.sid, key: `text_delivery:${id}`, text: caption ? `${line}\n${caption}` : line, files: [file],
+    sourceTurn: claims.mid,
   }, deps);
   if (!told) throw new ToolRefused("not_delivered", "the file was stored but its message could not be recorded; call deliver_text once more");
   return {
