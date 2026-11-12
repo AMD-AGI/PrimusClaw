@@ -160,3 +160,25 @@ test("with several questions the whole reply answers each of them", async () => 
   await w.router.handle(message("火锅，七点"));
   assert.deepEqual(w.claw.answers, [["ak", SESSION, "tu-q", { q1: "火锅，七点", q2: "火锅，七点" }, []]]);
 });
+
+test("in a group chat, the asker's reply that @mentions the bot answers their question card there", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak");
+  w.store.sessions.setSession(ALICE.id, { sessionId: "sess-g", shared: true }, "g-1");
+  w.claw.busy.set("sess-g", true);
+  w.store.approvals.saveApproval({
+    userId: ALICE.id,
+    sessionId: "sess-g",
+    toolUseId: "tu-g",
+    tool: "ask_user_question",
+    expiresAt: w.store.now() + 600,
+    envelope: {},
+    questions: [QUESTION] as never,
+  });
+  w.store.approvals.approvalSent("sess-g", "tu-g", "card-g");
+  await w.router.handle(message("火锅", { kind: "group", conversation: "g-1" }));
+  await w.router.settled();
+  assert.deepEqual(w.claw.answers, [["ak", "sess-g", "tu-g", { q1: "火锅" }, []]]);
+  assert.deepEqual(w.turns.calls, []);
+  assert.ok(w.surface.outbox.some((r) => r.op === "update" && r.id === "card-g"));
+});

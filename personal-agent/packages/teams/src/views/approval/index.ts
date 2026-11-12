@@ -135,7 +135,7 @@ function questionCard(model: QuestionCardModel) {
     header(t.questionTitle, { tone: "accent", subtitle: model.note, emoji: "question" }),
     ...model.questions.flatMap((q, i) => questionInputs(q, i, t)),
   ];
-  if (model.typedReply === true) body.push(note(t.questionReply));
+  if (model.typedReply === true) body.push(note(model.group ? t.questionReplyGroup : t.questionReply));
   if (model.group) body.push(note(t.questionOnly({ who: model.ownerName || t.questionAsker })));
   return message(body, [answerButton(model.sessionId, model.toolUseId, model.questions)]);
 }

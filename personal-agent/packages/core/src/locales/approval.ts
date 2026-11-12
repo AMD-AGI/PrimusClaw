@@ -30,6 +30,8 @@ export const approvalText = defineCatalog({
     send: "Send answer",
     /** Under a question card's questions: a client that does not show the card can still answer. */
     questionReply: "You can also just reply in the chat with your choice.",
+    /** The same in a group chat, where only a message that @mentions the bot reaches it. */
+    questionReplyGroup: "You can also just reply in the chat with your choice, @mentioning me.",
     /** A question card once a message typed in the chat answered it. */
     questionReplied: (p: { answer: string }) => `Answered: ${p.answer}`,
     questionRepliedAt: (p: { at: string }) => `Replied in the chat, ${p.at}`,
@@ -57,6 +59,7 @@ export const approvalText = defineCatalog({
     questionAsker: "发起人",
     send: "发送回答",
     questionReply: "也可以直接在聊天里回复选项。",
+    questionReplyGroup: "也可以在聊天里 @我 直接回复选项。",
     questionReplied: (p) => `已回答：${p.answer}`,
     questionRepliedAt: (p) => `在聊天里回复，${p.at}`,
   },

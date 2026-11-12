@@ -302,13 +302,13 @@ function catalogCard(id: string): JsonObject {
 }
 
 it("a turn's question card says a message in the chat answers it too, in the card's language; a work item's does not", () => {
-  const ask = (question: string, typedReply?: boolean) =>
+  const ask = (question: string, typedReply?: boolean, group = false) =>
     JSON.stringify(
       approvalRenderers.question({
         questions: cardQuestions([{ id: "q1", question, options: [{ id: "a", label: "A" }] }]),
         sessionId: SID,
         toolUseId: "tu-1",
-        group: false,
+        group,
         ownerName: "",
         note: "",
         ...(typedReply === undefined ? {} : { typedReply }),
@@ -317,6 +317,9 @@ it("a turn's question card says a message in the chat answers it too, in the car
   assert.ok(ask("Which one?", true).includes("You can also just reply in the chat with your choice."));
   assert.ok(ask("选哪个？", true).includes("也可以直接在聊天里回复选项。"));
   assert.ok(!ask("Which one?").includes("reply in the chat"));
+  // in a group only a message that @mentions the bot reaches it: the card says so
+  assert.ok(ask("选哪个？", true, true).includes("也可以在聊天里 @我 直接回复选项。"));
+  assert.ok(ask("Which one?", true, true).includes("reply in the chat with your choice, @mentioning me."));
   const turnCard = approvalTurnCards.question({
     questions: [],
     sessionId: SID,
