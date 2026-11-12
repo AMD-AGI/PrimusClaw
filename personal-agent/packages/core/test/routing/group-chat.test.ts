@@ -208,8 +208,8 @@ test("a group turn carries no member's own language: with none set for the group
   assert.deepEqual(
     w.turns.runs.map((r) => [r.replyLang, r.lang]),
     [
-      [undefined, "zh"],
-      [undefined, "en"],
+      ["zh", "zh"],
+      ["en", "en"],
     ],
-  );
+  ); // (the message's own language goes as the reply-language line: the group's session history does not decide)
 });

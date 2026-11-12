@@ -70,7 +70,7 @@ test("rule 1: @bot /lang en|zh|auto sets the group's language, anyone may change
   assert.equal(w.store.groupLanguage.groupLanguage(CONV), "auto");
   assert.equal(
     inGroup(w).at(-1),
-    "已改为跟随提问者的语言回复，由 Alice 设置。\nI answer in the language each question is asked in in this group from now on (set by Alice).",
+    "已改为跟随提问者的语言回复，由 Alice 设置。\nI answer in the language of each question in this group from now on (set by Alice).",
   );
   assert.deepEqual(w.turns.calls, []); // (none of it went to the agent)
   assert.equal(w.store.prefs.getPrefs(ALICE.id).langSet, false); // (her own language is not touched)
@@ -166,7 +166,7 @@ test("rule 2: a group set to Chinese asks for Chinese answers and says its own t
 
 // --- 3. with no setting (or "follow the asker"), the language of the @-message --------------------------------------------------
 
-test("rule 3: with no setting, each message is answered in its own language and nobody's choice is sent", async () => {
+test("rule 3: with no setting, each message is answered in its own language, sent as the line; nobody's choice is sent", async () => {
   for (const setting of [undefined, "auto"] as const) {
     const w = asked();
     link(w, ALICE.id, "ak-alice");
@@ -179,15 +179,81 @@ test("rule 3: with no setting, each message is answered in its own language and 
     assert.deepEqual(
       w.turns.runs.map((r) => [r.replyLang, r.lang]),
       [
-        [undefined, "zh"],
-        [undefined, "en"],
+        ["zh", "zh"],
+        ["en", "en"],
       ],
       String(setting),
     );
+    // (the words go as they are; the engine puts `[Reply language: …]` after them, engine.unit.test.ts)
     assert.deepEqual(
       w.turns.calls.map((c) => c.at(-1)),
       ["帮我看看这个 PR", "please check the build again"],
-    ); // (no reply-language line)
+    );
+  }
+});
+
+test("rule 3: after /lang auto in a group that talked English, the first Chinese question is answered in Chinese", async () => {
+  const w = asked();
+  link(w, ALICE.id, "ak-alice");
+  link(w, BOB.id, "ak-bob");
+  w.store.groupLanguage.setGroupLanguage(CONV, "en");
+  await w.router.handle(gmsg("what changed in the build this week", { user: BOB }));
+  await w.router.settled();
+  await w.router.handle(gmsg("/lang auto"));
+  assert.equal(w.store.groupLanguage.groupLanguage(CONV), "auto");
+  await w.router.handle(gmsg("推荐一种适合夏天喝的饮料，一句话回答。"));
+  await w.router.settled();
+  await w.router.handle(gmsg("Recommend one cold drink for summer, in one sentence.", { user: BOB }));
+  await w.router.settled();
+  // (the group's session holds the English history: the line, not the history, decides)
+  assert.deepEqual(
+    w.turns.runs.map((r) => r.replyLang),
+    ["en", "zh", "en"],
+  );
+});
+
+test("rule 3: a message with no words of its own follows the asker's last one in this group, else carries no line", async () => {
+  for (const setting of [undefined, "auto"] as const) {
+    const w = asked();
+    link(w, ALICE.id, "ak-alice");
+    link(w, BOB.id, "ak-bob");
+    if (setting !== undefined) w.store.groupLanguage.setGroupLanguage(CONV, setting);
+    await w.router.handle(gmsg("ok #3", { user: BOB })); // (Bob has asked nothing here yet)
+    await w.router.settled();
+    await w.router.handle(gmsg("帮我看看这个 PR"));
+    await w.router.settled();
+    await w.router.handle(gmsg("please check the build again", { user: BOB }));
+    await w.router.settled();
+    await w.router.handle(gmsg("ok #3")); // (Alice's last here was Chinese; Bob's English is not hers)
+    await w.router.settled();
+    await w.router.handle(gmsg("ok", { user: BOB }));
+    await w.router.settled();
+    await w.router.handle(gmsg("ok", { conversation: "g-2" })); // (another group: nothing of hers there)
+    await w.router.settled();
+    assert.deepEqual(
+      w.turns.runs.map((r) => r.replyLang),
+      [undefined, "zh", "en", "zh", "en", undefined],
+      String(setting),
+    );
+  }
+});
+
+test("rule 3: a group's own language still wins over the words of the message", async () => {
+  for (const [setting, text, want] of [
+    ["en", "推荐一种适合夏天喝的饮料", "en"],
+    ["zh", "please check the build again", "zh"],
+    ["en", "ok", "en"],
+  ] as const) {
+    const w = asked();
+    link(w, ALICE.id, "ak-alice");
+    w.store.groupLanguage.setGroupLanguage(CONV, setting);
+    await w.router.handle(gmsg(text));
+    await w.router.settled();
+    assert.deepEqual(
+      w.turns.runs.map((r) => r.replyLang),
+      [want],
+      text,
+    );
   }
 });
 
