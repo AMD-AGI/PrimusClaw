@@ -15,6 +15,35 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.5.0
+
+A minor release: it adds a route to the turn-start log line (#756) and lets a typed message answer a waiting question card
+(#762), and fixes two things around question cards and thumbs (#760, #761). No plugin port (core's `src/plugins/`)
+changed, and the worker needs nothing new from Claw. The runtime's SQLite store gains two columns on `approvals`
+(`questions_json`, `card_id`), added in place at start; nothing to do for a deployment.
+
+### Added
+
+- `@primusclaw/personal-agent`: the worker's `turn started from Teams client` line says which route a message took,
+  `route=assistant`, `route=legacy` (a plain Claw session of the person's own) or `route=review` (a review's turn), and is
+  now written for a 1:1 message handed to the assistant too: one line per turn, still with no message text and no user,
+  conversation or session id (#756).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: a message the person types while a turn's question
+  card waits for them, in the same chat and in time, answers that question (Claw's answer call) instead of starting a turn
+  that Claw would queue behind the waiting one until the question timed out. The card says it can be answered in the chat
+  ("也可以直接在聊天里回复选项。"; in a group, by @mentioning the bot). A message Claw does queue no longer shows "Thinking…"
+  while it waits: its stream closes at once with a queued notice, and the answer comes as a message of its own (#762).
+
+### Fixed
+
+- `@primusclaw/personal-agent`: a question card no longer leaves "Thinking…" up while the person chooses (until the chat's
+  nine-minute limit): the stream closes once the card is out, with "请在卡片里选择，选好后我接着做。" / "Waiting for your
+  choice in the card; I will continue once you pick.", and the answer comes as a message of its own (#761).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a thumb from a person bound at the identity service
+  but with no linked key is recorded as their vote in Claw: the vote uses the credential the person's chats run on (the
+  exchanged token when bound, else the linked key), on the same session as their turns. Before, it was filed as a report
+  only (#760).
+
 ## 0.4.0
 
 A minor release: it adds the Teams ingress as a released part (#739; its deployable package runs on Node 24 by #745, and
