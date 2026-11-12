@@ -442,7 +442,7 @@ async function storeCapNotice(input: SayInput, text: string, deps: SayDeps): Pro
     return storeOne({
       type: "assistant.say", fallback: true, item: null, sayId: id(hour),
       userId: input.userId, sessionId: input.sessionId, text: sayCapNotice(text),
-      ...(input.turnMessageId ? { sourceTurn: input.turnMessageId } : {}),
+      ...((input.sourceTurn ?? input.turnMessageId) ? { sourceTurn: input.sourceTurn ?? input.turnMessageId } : {}),
     });
   }, (stored) => announce(stored, deps));
 }
