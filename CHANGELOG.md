@@ -117,7 +117,7 @@ Image `docker.io/primussafe/claw:202611130054` (commit cf083e95). A MINOR releas
 and a new storage and audit model, assistant messages return to the chat surface they came from (a new `surface` field on
 notification subscriptions), and the API gains `CLAW_API_BACKGROUND`. Schema, all additive and added at start-up:
 `claw_notification_subscriptions.surface`, `claw_assistant_surfaces`, five `claw_skills` columns, `claw_skill_events`
-and `claw_skill_drafts`. Connector requirements unchanged from 0.1.0.
+and `claw_skill_drafts`. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
 
 Data-loss fixes: a workspace restore that failed can no longer make the next save delete the session's saved files
 (#804), and a workspace past about a thousand files is restored in batches instead of coming back empty (#805). Prompt
