@@ -12,7 +12,8 @@
  *   A4  a worker turn gets its prompt, its item and the generation it started under, and keeps what the request brought
  *   A5  a session that is not an assistant's gets the working guideline and nothing else, whatever route its turn takes
  *   A6  a server named assistant in a request cannot stand in for ours, and a router drops every other server
- *   A7  a router turn is not told of the user's skills and keeps none it saves; a worker's and an ordinary session's are
+ *   A7  a router turn is not given the worker's list of the user's skills (`user_skills`) and keeps none it saves; a worker's and an
+ *       ordinary session's are (the router's own list goes with its message: `assistant-user-skills.test.ts`)
  *   A8  a turn whose profile cannot be applied does not run
  *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
  *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
@@ -302,7 +303,7 @@ describe("assistant role profile", { skip }, () => {
     assert.doesNotMatch(JSON.stringify(worker), /evil\.example/);
   });
 
-  test("A7 a router turn is not told of the user's skills; a worker's and an ordinary session's are", async () => {
+  test("A7 a router turn is not given the worker's list of the user's skills; a worker's and an ordinary session's are", async () => {
     await w.q(
       `INSERT INTO claw_skills (user_id, skill_name, version, content, status)
        VALUES ('alice', 'skill-a', 1, 'c', 'active'), ('alice', 'skill-b', 1, 'c', 'active')`,
