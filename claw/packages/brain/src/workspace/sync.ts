@@ -40,6 +40,7 @@ import {
   type GitDecision,
   type GitReport,
 } from "./git-dirs.js";
+import { RESTORE_HOLD_PATH } from "./sync-delta.js";
 import pino from "pino";
 
 // Map a thrown error to the workspace_sync_failures_total{reason} enum
@@ -66,6 +67,14 @@ export function classifySyncFailure(err: unknown):
 }
 
 const logger = pino({ name: "workspace-sync" });
+
+/**
+ * Shell that ends the command, before anything is written, in a sandbox holding
+ * a restore hold: its output then does not end in `OK`, and the sync fails.
+ */
+export function restoreHeldGuard(): string {
+  return `if test -e '${RESTORE_HOLD_PATH}'; then echo "workspace_sync_held: this sandbox's restore failed" >&2; exit 3; fi; `;
+}
 
 // ── ID safety guard ─────────────────────────────────────────────────────
 //
@@ -413,7 +422,10 @@ export async function syncWorkspace(
     const out = await withHandsTimeout<string>(
       hands,
       "bash",
-      { command: buildSyncCommand(base, turn, SANDBOX_WORKSPACE, WORKSPACE_PERSIST_BASE, git) },
+      // A sandbox whose restore failed (RESTORE_HOLD_PATH) is refused by the same
+      // command that would snapshot it, so no failure to ask first can let an
+      // incomplete /workspace become the snapshot the next sandbox is filled from.
+      { command: `${restoreHeldGuard()}${buildSyncCommand(base, turn, SANDBOX_WORKSPACE, WORKSPACE_PERSIST_BASE, git)}` },
       HANDS_CALL_RSYNC_TIMEOUT_MS,
       opts.signal,
     );

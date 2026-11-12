@@ -788,8 +788,26 @@ export class HandsClient {
     );
   }
 
+  /**
+   * Connect once, however many callers ask at the same time.
+   *
+   * `connected` is only set after the MCP initialize round trip, and the SDK's
+   * `connect` refuses a second transport while the first is still starting
+   * ("Already connected to a transport"), so concurrent first calls on a fresh
+   * client -- the restore's parallel download batches -- used to fail every one
+   * but the first. They now share the connect in flight. A connect that fails is
+   * forgotten, so the next call tries again.
+   */
   async connect(): Promise<void> {
     if (this.connected) return;
+    this.connecting ??= this.openTransport().finally(() => { this.connecting = null; });
+    return this.connecting;
+  }
+
+  /** The connect in flight, shared by every caller that arrives while it runs. */
+  private connecting: Promise<void> | null = null;
+
+  private async openTransport(): Promise<void> {
     const transport = new StreamableHTTPClientTransport(
       new URL(this.url),
       {

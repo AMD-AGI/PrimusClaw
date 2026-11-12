@@ -316,7 +316,7 @@ describe("the router writes itself, and a worker's words reach the user", { skip
     // N13 (2026-11-08): what an earlier answer named and this turn's lookups no longer return was said again as "no new activity".
     assert.match(read, /What changed is said from what this turn's lookups show \(#447 merged, read now\); something an earlier answer named that they no longer return or support is left out, never said again as unchanged, quiet or without news\./);
     assert.match(prompts.WORKER_PROMPT, /deliver_text/);
-    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v10");
+    assert.equal(prompts.WORKER_PROMPT_VERSION, "worker-v12");
     // M2 (2026-11-06): 678.7 from the rounded figures where the unrounded ones give 678.6.
     assert.match(prompts.WORKER_PROMPT, /compute a difference, ratio or percentage from the unrounded values, and round only the figure you report[^\n]*never from figures you already rounded/);
     assert.match(prompts.WORKER_PROMPT, /Before a write the user approves \(a comment, a review, a merge, a push, an issue, a message to someone\), when the task also asked you to find things out[^\n]*first report\(kind="progress", summary\) with everything you found that answers what was asked, with the numbers, then make the write/);

@@ -20,6 +20,7 @@ import {
   type RunLeaseTiming,
 } from "@claw/protocol";
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readApiBackground } from "./startup/background.js";
 
 /**
  * Read a setting, treating blank the same as unset.
@@ -104,6 +105,11 @@ function routerEffortSetting(raw: string): ReasoningEffort | null {
 }
 
 export const API_PORT = envInt("API_PORT", 8000);
+/**
+ * CLAW_API_BACKGROUND: `on` (default) or `off`. Off, the process answers HTTP and starts no background loop
+ * (`startup/background.ts` names them). Any other value is refused at startup (`index.ts`).
+ */
+export const CLAW_API_BACKGROUND = readApiBackground(process.env.CLAW_API_BACKGROUND);
 export const APP_ENV = env("APP_ENV", "production");
 
 /**
@@ -969,7 +975,7 @@ export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWE
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
 // review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
 export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
-// `on` turns on the routing and result discipline (`assistant/discipline.ts`, router-discipline-v2 and worker-v11) for every user: a
+// `on` turns on the routing and result discipline (`assistant/discipline.ts`, router-discipline-v2 and worker-v13) for every user: a
 // reply to a result already given is acknowledged and acts on nothing, a request to read ~/.ssh, keys or credentials is declined in
 // chat and work_create refuses it, and a worker whose task changed nothing outside reports what it delivered as an answer, with no
 // Accept. Off (the default), only the users named in CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS (Claw user ids, comma-separated) get it: the

@@ -14,10 +14,19 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT, S3_SANDBOX_ENDPOINT,
   S3_PRUNE_MAX_OBJECTS,
 } from "../config.js";
-import { HandsClient } from "../clients/hands.js";
+import { HandsClient, isHandsNetworkError, isHandsToolTimeout } from "../clients/hands.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { s3Excludes, findExcludeArgs } from "./excludes.js";
-import { TRUNCATED_FOOTER, invalidateSyncManifest, planUploadDelta, seedSyncManifest } from "./sync-delta.js";
+import {
+  TRUNCATED_FOOTER,
+  holdAfterFailedRestore,
+  invalidateSyncManifest,
+  isRestoreHeld,
+  planUploadDelta,
+  releaseRestoreHold,
+  seedSyncManifest,
+  withoutAddresses,
+} from "./sync-delta.js";
 import {
   configuredGitLimits,
   enforceListedGit,
@@ -43,6 +52,21 @@ const MAX_UPLOAD_ROUNDS = 3;
  *  Hands' fastify body limit (~1MB) even when /workspace has hundreds of files
  *  and presigned URLs are ~700B each. Empirically 100 paths × ~800B ≈ 80KB. */
 const UPLOAD_BATCH_SIZE = 100;
+/**
+ * Bounds on one `download_from_s3` call: files, and bytes of the file list as
+ * sent. Hands takes a request body of 1 MiB at most (Fastify's default) and
+ * answers anything larger with 413. Each file costs its workspace path plus a
+ * presigned URL -- the object key again and a few hundred bytes of signature
+ * query -- so the restore of a 3,632-file clone, sent as one call, never reached
+ * the sandbox. The file bound is the upload's, and keeps one call's sequential
+ * fetches short enough that its URLs, signed just before it is sent, do not
+ * expire on the way (PRESIGN_EXPIRES_SEC); the byte bound keeps a call under the
+ * limit however long its paths are.
+ */
+const DOWNLOAD_BATCH_SIZE = 100;
+const DOWNLOAD_BATCH_MAX_BYTES = 256 * 1024;
+/** Download sub-batches in flight at once; as UPLOAD_BATCH_CONCURRENCY. */
+const DOWNLOAD_BATCH_CONCURRENCY = 4;
 /** Sub-batches in flight at once. Hands uploads the files of one batch one after
  *  another, so a round of N batches took N times a batch; running a few side by
  *  side keeps that from growing with the workspace without opening more than a
@@ -165,6 +189,14 @@ export interface SyncWorkspaceResult {
    * sentence the user is shown.
    */
   git?: GitReport;
+  /**
+   * Set when a restore into this sandbox failed (`holdAfterFailedRestore`), so
+   * the sync deleted nothing and uploaded only files the prefix did not have:
+   * how many listed files it left out because an object of that name is already
+   * saved. `uploaded + unchanged + failedCount + withheld` is `totalFiles`.
+   * Absent otherwise.
+   */
+  withheld?: number;
 }
 
 /**
@@ -790,12 +822,47 @@ export async function syncWorkspaceToS3(
   // A doubtful listing also takes the record away before anything is uploaded:
   // the upload puts objects under the prefix the record does not name, and a
   // later prune by that record would never delete them.
-  if (!listing.trusted) await invalidateSyncManifest(hands, s3Prefix);
-  const delta = listing.trusted
+  //
+  // A sandbox whose restore failed holds part of what the prefix has, beside what
+  // it started with (a fresh clone, say) under the same names, and its listing is
+  // complete for the sandbox and wrong about the session. Its save only adds:
+  // files the prefix has no object for go up, nothing is replaced, and the prune
+  // below does not run -- run, it deleted every file the restore had not brought
+  // back. It keeps no record either, since what it leaves out is not in S3 as it
+  // is here. See RESTORE_HOLD_PATH.
+  const restoreHeld = await isRestoreHeld(hands, sessionId);
+  if (!listing.trusted || restoreHeld) await invalidateSyncManifest(hands, s3Prefix);
+  const delta = listing.trusted && !restoreHeld
     ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
     : null;
   let pending = delta ? delta.pending : files;
   const unchanged = delta?.unchanged ?? 0;
+  let withheld = 0;
+  if (restoreHeld) {
+    // Nothing the session has saved may be replaced. Into the session's own
+    // prefix, that means only files it has no object for, and a prefix that cannot
+    // be listed gets nothing. Into any other -- the in-flight checkpoint's -- it
+    // means nothing at all: a failed terminal save copies that whole prefix over
+    // the session's (`copyS3Prefix`), objects an earlier attempt left there
+    // included. What that costs is the new files of a held sandbox whose terminal
+    // save then fails as well; the held terminal save is what keeps them.
+    const sessionPrefix = `users/${userId}/sessions/${sessionId}/`;
+    let saved: Set<string> | null = null;
+    if (s3Prefix === sessionPrefix) {
+      saved = await listPrefixKeys(s3Prefix).catch((e: unknown) => {
+        logger.warn({ sessionId, s3Prefix, err: (e as { message?: string })?.message ?? String(e) },
+          "s3.sync.held_listing_failed");
+        return null;
+      });
+    }
+    pending = saved ? files.filter((f) => !saved.has(localPathToS3Key(f, s3Prefix))) : [];
+    withheld = files.length - pending.length;
+    logger.warn(
+      { sessionId, s3Prefix, listed: files.length, adding: pending.length, withheld },
+      "s3.sync.held_restore_incomplete",
+    );
+  }
+  const heldResult: Pick<SyncWorkspaceResult, "withheld"> = restoreHeld ? { withheld } : {};
   let uploaded = 0;
   let lastFailures: UploadBatchResult["failed"] = [];
 
@@ -803,15 +870,18 @@ export async function syncWorkspaceToS3(
   // nothing pending, where deleted files still have to be pruned.
   const finishSynced = async (round: number): Promise<SyncWorkspaceResult> => {
     // Only once every file is up. A prune after a partial upload would be
-    // deleting the old copy of something whose new copy did not arrive.
-    const prune = await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
-      .catch((e: unknown) => {
-      logger.warn(
-        { sessionId, err: (e as { message?: string })?.message ?? String(e) },
-        "s3.prune.failed",
-      );
-      return { deleted: 0, complete: false };
-    });
+    // deleting the old copy of something whose new copy did not arrive. Never
+    // from a held sandbox (above).
+    const prune = restoreHeld
+      ? { deleted: 0, complete: false }
+      : await pruneRemovedObjects(sessionId, s3Prefix, listing, pruneExempt, delta?.recorded ?? null)
+        .catch((e: unknown) => {
+          logger.warn(
+            { sessionId, err: (e as { message?: string })?.message ?? String(e) },
+            "s3.prune.failed",
+          );
+          return { deleted: 0, complete: false };
+        });
     const pruned = prune.deleted;
     // After the prune, so a sync that dies in it leaves no manifest rather than
     // one claiming a state S3 was not left in. A repository left out of the
@@ -826,6 +896,7 @@ export async function syncWorkspaceToS3(
       uploaded, totalFiles: files.length, failedCount: 0, exhausted: false, empty: false,
       ...(delta ? { unchanged } : {}),
       ...gitResult,
+      ...heldResult,
     };
   };
 
@@ -874,6 +945,7 @@ export async function syncWorkspaceToS3(
     empty: false,
     ...(delta ? { unchanged } : {}),
     ...gitResult,
+    ...heldResult,
   };
 }
 
@@ -931,6 +1003,21 @@ export function isRestoreSkipped(rel: string): boolean {
   return isArchiveRelPath(rel) || isInternalRelPath(rel);
 }
 
+/** Every object key under `prefix`, paginated. */
+async function listPrefixKeys(prefix: string): Promise<Set<string>> {
+  const s3 = getS3Client();
+  const keys = new Set<string>();
+  let continuationToken: string | undefined;
+  do {
+    const resp = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: continuationToken,
+    }));
+    for (const obj of resp.Contents || []) if (obj.Key) keys.add(obj.Key);
+    continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
+}
+
 /** List all object keys under prefix, paginated, minus everything that belongs
  *  to another lifecycle. */
 /** The keys to restore, and every path under the prefix a prune could delete. */
@@ -956,31 +1043,131 @@ async function listCurrentWorkspaceKeys(s3Prefix: string): Promise<{ keys: strin
   return { keys, prunable };
 }
 
-async function buildDownloadList(keys: string[], s3Prefix: string) {
-  const list: Array<{ local_path: string; presigned_url: string }> = [];
-  for (const k of keys) {
-    const rel = k.slice(s3Prefix.length);
-    list.push({ local_path: `/workspace/${rel}`, presigned_url: await presignGet(k) });
+/** What an entry adds to a batch's body: its JSON and the comma before it. */
+const entryBytes = (e: unknown): number => Buffer.byteLength(JSON.stringify(e)) + 1;
+
+/**
+ * Split `items` into consecutive batches of at most `maxItems` entries and at
+ * most `maxBytes` of their JSON, in order. An entry larger than `maxBytes` on
+ * its own still goes, alone: refusing it here would only move the 413 from
+ * Hands to this function, and the caller reports it as that one file's failure.
+ */
+export function chunkForHands<T>(items: readonly T[], maxItems: number, maxBytes: number): T[][] {
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let bytes = 0;
+  for (const item of items) {
+    const size = entryBytes(item);
+    if (batch.length > 0 && (batch.length >= maxItems || bytes + size > maxBytes)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(item);
+    bytes += size;
   }
-  return list;
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
+type DownloadEntry = { local_path: string; presigned_url: string };
+
+/** One `download_from_s3` call over entries already signed. */
+async function downloadSubBatch(hands: HandsClient, files: DownloadEntry[]): Promise<DownloadBatchResult> {
+  const failAll = (error: string): DownloadBatchResult => ({
+    ok: [],
+    failed: files.map((f) => ({ path: f.local_path, status: -1, error: error.slice(0, 200) })),
+    total: files.length,
+  });
+  let raw: string;
+  try {
+    raw = await hands.callTool("download_from_s3", { files });
+  } catch (e: unknown) {
+    // A sandbox that cannot be reached, or does not answer, will not take the
+    // next batch either: the restore stops here, as it did when it was one call.
+    if (isHandsNetworkError(e) || isHandsToolTimeout(e)) throw e;
+    // A batch refused on its own (a 413 after all, a tool error): its files are
+    // the round's failures, which the next round sends again with fresh URLs.
+    return failAll((e as { message?: string })?.message ?? String(e));
+  }
+  try {
+    const parsed = JSON.parse(raw) as DownloadBatchResult;
+    if (Array.isArray(parsed.ok) && Array.isArray(parsed.failed)) return parsed;
+  } catch { /* fall through */ }
+  return failAll("unparseable response");
+}
+
+/**
+ * One download round: the keys in slices of DOWNLOAD_BATCH_SIZE, a few slices in
+ * flight at once, each slice's URLs signed just before it is sent -- so no URL
+ * waits behind the slices ahead of it long enough to expire -- and sent in as
+ * many calls as keep each under DOWNLOAD_BATCH_MAX_BYTES (one, unless its paths
+ * are very long). A call that fails fails only its own files, which the next
+ * round sends again; every other call's files are restored.
+ */
 async function downloadRound(
   hands: HandsClient,
   keys: string[],
   s3Prefix: string,
 ): Promise<DownloadBatchResult> {
-  const files = await buildDownloadList(keys, s3Prefix);
-  const raw = await hands.callTool("download_from_s3", { files });
-  try {
-    const parsed = JSON.parse(raw) as DownloadBatchResult;
-    if (Array.isArray(parsed.ok) && Array.isArray(parsed.failed)) return parsed;
-  } catch { /* fall through */ }
-  return {
-    ok: [],
-    failed: keys.map(k => ({ path: `/workspace/${k.slice(s3Prefix.length)}`, status: -1, error: "unparseable response" })),
-    total: keys.length,
+  const slices: string[][] = [];
+  for (let i = 0; i < keys.length; i += DOWNLOAD_BATCH_SIZE) {
+    slices.push(keys.slice(i, i + DOWNLOAD_BATCH_SIZE));
+  }
+  // One slot per slice, so the order of `ok` and `failed` does not depend on
+  // which slice finished first.
+  const results: DownloadBatchResult[][] = slices.map(() => []);
+  let next = 0;
+  // Set by the first call that throws; no worker sends anything after it.
+  let stopped: { err: unknown } | null = null;
+  const worker = async (): Promise<void> => {
+    try {
+      while (!stopped && next < slices.length) {
+        const idx = next++;
+        const files: DownloadEntry[] = [];
+        for (const k of slices[idx]) {
+          files.push({ local_path: `/workspace/${k.slice(s3Prefix.length)}`, presigned_url: await presignGet(k) });
+        }
+        for (const batch of chunkForHands(files, DOWNLOAD_BATCH_SIZE, DOWNLOAD_BATCH_MAX_BYTES)) {
+          if (stopped) return;
+          results[idx].push(await downloadSubBatch(hands, batch));
+        }
+      }
+    } catch (err: unknown) {
+      stopped ??= { err };
+    }
   };
+  // Connected before the workers start, so they do not all open the session at
+  // once (HandsClient.connect shares one in flight anyway). A sandbox that cannot
+  // be reached stops the restore here, as the first call would have.
+  // (A stand-in without `connect` is already connected.)
+  if (slices.length > 1) await (hands as Partial<Pick<HandsClient, "connect">>).connect?.();
+  await Promise.all(
+    Array.from({ length: Math.min(DOWNLOAD_BATCH_CONCURRENCY, slices.length) }, worker),
+  );
+  if (stopped) throw (stopped as { err: unknown }).err;
+  const ok: string[] = [];
+  const failed: DownloadBatchResult["failed"] = [];
+  for (const r of results.flat()) {
+    ok.push(...r.ok);
+    failed.push(...r.failed);
+  }
+  return { ok, failed, total: keys.length };
+}
+
+/**
+ * A restore that ran out of retries with files still missing. Thrown, like any
+ * other restore failure, so the caller tells the user: the files that did not
+ * come back are in S3 and not in /workspace. The message carries the first
+ * failure's error (a 413, say), which is what the caller's reason is read from,
+ * without the addresses in it (`withoutAddresses`).
+ */
+export class WorkspaceRestoreIncomplete extends Error {
+  constructor(readonly restored: number, readonly total: number, readonly failed: number, firstError = "") {
+    const first = withoutAddresses(firstError).slice(0, 200);
+    super(`workspace restore incomplete: restored=${restored}/${total}, failed=${failed}${first ? `; first: ${first}` : ""}`);
+    this.name = "WorkspaceRestoreIncomplete";
+  }
 }
 
 /**
@@ -988,8 +1175,33 @@ async function downloadRound(
  * (top-level files, excluding historical claw-<mid> archive subdirs). Called
  * after ensureHands creates a new workload; skipped when reusing an existing
  * one. Failures are retried up to MAX_UPLOAD_ROUNDS with freshly signed URLs.
+ *
+ * Throws when the workspace was not restored in full: the listing failed, a
+ * download call failed (a 413 from Hands, an unreachable sandbox), or files were
+ * still missing after the last round (WorkspaceRestoreIncomplete). Before it
+ * throws, the sandbox is held (`holdAfterFailedRestore`), so no later save
+ * from it deletes the files that are in S3 and not in /workspace.
  */
 export async function syncWorkspaceFromS3(
+  hands: HandsClient,
+  sessionId: string,
+  userId: string,
+  options?: { s3PrefixOverride?: string },
+): Promise<number> {
+  let restored: number;
+  try {
+    restored = await restoreWorkspaceFromS3(hands, sessionId, userId, options);
+  } catch (e) {
+    const message = (e as { message?: string })?.message ?? String(e);
+    await holdAfterFailedRestore(hands, sessionId, message);
+    logger.error({ sessionId, err: message.slice(0, 500) }, "s3.restore.failed_prune_held");
+    throw e;
+  }
+  releaseRestoreHold(hands, sessionId);
+  return restored;
+}
+
+async function restoreWorkspaceFromS3(
   hands: HandsClient,
   sessionId: string,
   userId: string,
@@ -1040,7 +1252,7 @@ export async function syncWorkspaceFromS3(
     "s3.restore.exhausted",
   );
   await putBackGitDirs();
-  return downloaded;
+  throw new WorkspaceRestoreIncomplete(downloaded, keys.length, lastFailures.length, lastFailures[0]?.error);
 }
 
 /**
@@ -1061,38 +1273,58 @@ export async function syncUploadsFromS3(
 ): Promise<number> {
   const s3Prefix = `users/${userId}/sessions/${sessionId}/`;
   const s3 = getS3Client();
-  const files: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+  const objects: Array<{ key: string; size: number }> = [];
   let continuationToken: string | undefined;
   do {
     const resp = await s3.send(new ListObjectsV2Command({
       Bucket: S3_BUCKET, Prefix: `${s3Prefix}.uploads/`, ContinuationToken: continuationToken,
     }));
     for (const obj of resp.Contents || []) {
-      if (!obj.Key) continue;
-      files.push({
-        local_path: `/workspace/${obj.Key.slice(s3Prefix.length)}`,
-        presigned_url: await presignGet(obj.Key),
-        size: obj.Size ?? 0,
-      });
+      if (obj.Key) objects.push({ key: obj.Key, size: obj.Size ?? 0 });
     }
     continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (continuationToken);
-  if (!files.length) return 0;
-  const raw = await hands.callTool("download_from_s3", { files });
-  let failed: DownloadBatchResult["failed"] | null = null;
-  try {
-    const parsed = JSON.parse(raw) as DownloadBatchResult;
-    if (Array.isArray(parsed.failed)) failed = parsed.failed;
-  } catch { /* reported below */ }
+  if (!objects.length) return 0;
+  // In batches Hands accepts, each slice signed just before it is sent, as the
+  // workspace restore sends them (downloadRound). A batch refused on its own, or
+  // answered in a shape that does not parse, is reported like the whole offer used
+  // to be without keeping the other batches from landing; a sandbox that cannot be
+  // reached, or does not answer, ends the offer as the single call did.
+  let failed: DownloadBatchResult["failed"] | null = [];
+  for (let i = 0; i < objects.length; i += DOWNLOAD_BATCH_SIZE) {
+    const signed: Array<{ local_path: string; presigned_url: string; size: number }> = [];
+    for (const o of objects.slice(i, i + DOWNLOAD_BATCH_SIZE)) {
+      signed.push({
+        local_path: `/workspace/${o.key.slice(s3Prefix.length)}`,
+        presigned_url: await presignGet(o.key),
+        size: o.size,
+      });
+    }
+    for (const batch of chunkForHands(signed, DOWNLOAD_BATCH_SIZE, DOWNLOAD_BATCH_MAX_BYTES)) {
+      let parsed: DownloadBatchResult | null = null;
+      try {
+        parsed = JSON.parse(await hands.callTool("download_from_s3", { files: batch })) as DownloadBatchResult;
+      } catch (e: unknown) {
+        if (isHandsNetworkError(e) || isHandsToolTimeout(e)) throw e;
+        logger.warn({ sessionId, offered: batch.length, err: (e as { message?: string })?.message ?? String(e) },
+          "s3.uploads_sync.batch_failed");
+      }
+      if (parsed && Array.isArray(parsed.failed)) {
+        failed?.push(...parsed.failed);
+      } else {
+        failed = null;
+      }
+    }
+  }
   if (failed === null) {
-    logger.warn({ sessionId, offered: files.length }, "s3.uploads_sync.unparseable");
+    logger.warn({ sessionId, offered: objects.length }, "s3.uploads_sync.unparseable");
   } else if (failed.length) {
-    logger.warn({ sessionId, offered: files.length, failed: failed.length, sample: failed.slice(0, 3) },
+    logger.warn({ sessionId, offered: objects.length, failed: failed.length, sample: failed.slice(0, 3) },
       "s3.uploads_sync.failed");
   } else {
-    logger.info({ sessionId, offered: files.length }, "s3.uploads_synced");
+    logger.info({ sessionId, offered: objects.length }, "s3.uploads_synced");
   }
-  return files.length;
+  return objects.length;
 }
 
 /**
