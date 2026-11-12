@@ -28,6 +28,7 @@
  *   K14 the same save twice (a completion handled again) writes and records once
  *   K15 a longer SKILL.md that, with the files the skill already has, passes 256 KB is refused
  *   K16 a rollback undoes the last change of the skill as it read it; a save made after that read is not overwritten
+ *   K17 a rollback to a stored earlier version (one row per version, from before) that is over the limits is refused
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -412,6 +413,23 @@ describe("personal skills: save", { skip }, () => {
     assert.equal(status, 400);
     [row] = await skills();
     assert.deepEqual([row.content, row.version], ["the user's newer text", 3]);
+  });
+
+  test("K17 a rollback to an earlier version row over the limits is refused; one within them is made", async () => {
+    const seed = async (files: number) => {
+      await q("TRUNCATE claw_skills, claw_skill_files, claw_skill_events RESTART IDENTITY");
+      await q(`INSERT INTO claw_skills (skill_name, user_id, version, content, source, status) VALUES
+               ('legacy', 'alice', 1, 'v1', 'manual', 'archived'), ('legacy', 'alice', 2, 'v2', 'manual', 'active')`);
+      await q(`INSERT INTO claw_skill_files (skill_id, user_id, file_path, content, size_bytes)
+               SELECT 1, 'alice', 'references/f' || i || '.md', 'x', 1 FROM generate_series(1, $1::int) AS i`, [files]);
+    };
+    await seed(svc.SKILL_FILES_MAX + 1);
+    assert.equal((await rest("POST", "/v1/users/me/skills/legacy/rollback")).status, 400);
+    assert.deepEqual((await q("SELECT version, status FROM claw_skills ORDER BY version")).map((r) => [r.version, r.status]), [[1, "archived"], [2, "active"]]);
+
+    await seed(svc.SKILL_FILES_MAX);
+    assert.equal((await rest("POST", "/v1/users/me/skills/legacy/rollback")).status, 200);
+    assert.deepEqual((await q("SELECT version, status FROM claw_skills ORDER BY version")).map((r) => [r.version, r.status]), [[1, "active"], [2, "rolled_back"]]);
   });
 
   test("another user's skills are not reachable", async () => {

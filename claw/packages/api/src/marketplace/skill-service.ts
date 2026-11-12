@@ -130,13 +130,17 @@ export function skillContentSha(content: string, files: Array<{ path: string; co
   return h.digest("hex");
 }
 
-/** A skill row's SKILL.md and its fingerprint (with its files) as stored now, or null when the row is gone. */
-async function readSkillSnapshot(q: Querier, skillId: number): Promise<{ content: string; sha: string } | null> {
-  const row = (await q("SELECT content FROM claw_skills WHERE id = $1", [skillId])).rows[0];
+/**
+ * A skill row as stored now, or null when the row is gone: SKILL.md, its fingerprint (with its files), and a stamp
+ * that also covers the description and the version, for telling whether anything changed since.
+ */
+async function readSkillSnapshot(q: Querier, skillId: number): Promise<{ content: string; sha: string; stamp: string } | null> {
+  const row = (await q("SELECT content, description, version FROM claw_skills WHERE id = $1", [skillId])).rows[0];
   if (!row) return null;
   const files = (await q("SELECT file_path, content, is_binary FROM claw_skill_files WHERE skill_id = $1", [skillId])).rows
     .map((f: any) => ({ path: f.file_path, content: f.content, is_binary: !!f.is_binary }));
-  return { content: row.content || "", sha: skillContentSha(row.content || "", files) };
+  const sha = skillContentSha(row.content || "", files);
+  return { content: row.content || "", sha, stamp: `${sha}\0${row.version}\0${row.description ?? ""}` };
 }
 
 async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
@@ -148,10 +152,10 @@ async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
  * A change computed from what a skill was when read (an evolution's LLM call, a rollback's history walk) applies only
  * if the skill is still exactly that: checked under the user's lock, so a save made meanwhile is never overwritten.
  */
-async function assertUnchangedSince(q: Querier, skillId: number, sha: string): Promise<void> {
+async function assertUnchangedSince(q: Querier, skillId: number, stamp: string): Promise<void> {
   const now = (await q("SELECT 1 FROM claw_skills WHERE id = $1 AND deleted_at IS NULL", [skillId])).rows[0]
     ? await readSkillSnapshot(q, skillId) : null;
-  if (!now || now.sha !== sha) throw new StaleSkillError();
+  if (!now || now.stamp !== stamp) throw new StaleSkillError();
 }
 
 class StaleSkillError extends Error {
@@ -1877,7 +1881,7 @@ export async function maybeEvolveSkill(sessionId: string, userId: string, event:
         existing_skills: existingSkillNames.filter(n => n !== skillName).join(", ") || "(none)",
       });
 
-      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision, snapshot.sha);
+      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision, snapshot.stamp);
     } catch (err) {
       logger.error({ err, skillName, sessionId }, "skill.evolution_failed");
     }
@@ -2004,8 +2008,8 @@ async function applyEvolveBatch(
   currentContent: string,
   activeId: number,
   decision: EvolveDecision,
-  /** The skill's fingerprint when the LLM read it: a skill changed since then is left alone. */
-  readSha: string,
+  /** The skill's snapshot stamp when the LLM read it: a skill changed since then is left alone. */
+  readStamp: string,
 ): Promise<void> {
   const mutations = decision.mutations || [];
   if (!mutations.length) {
@@ -2136,7 +2140,7 @@ async function applyEvolveBatch(
     // Under the user's skill lock, as every other write: the limit check before COMMIT holds only if no other write
     // to the skill can commit in between.
     await lockUserSkills((text, params) => client.query(text, params), userId);
-    await assertUnchangedSince((text, params) => client.query(text, params), activeId, readSha);
+    await assertUnchangedSince((text, params) => client.query(text, params), activeId, readStamp);
     let bumpVersion = false;
     const changeReasons: string[] = [];
 
@@ -2306,14 +2310,27 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
       [skillName, userId, current.version - 1]
     )).rows[0];
     if (legacyPrev) {
-      await db.query(
-        "UPDATE claw_skills SET status = 'rolled_back' WHERE skill_name = $1 AND user_id = $2 AND version = $3",
-        [skillName, userId, current.version]
-      );
-      await db.query(
-        "UPDATE claw_skills SET status = 'active' WHERE skill_name = $1 AND user_id = $2 AND version = $3",
-        [skillName, userId, current.version - 1]
-      );
+      // Under the user's lock, against the skill as read, and only to a version that fits the limits.
+      try {
+        await inTransaction(async (q) => {
+          await lockUserSkills(q, userId);
+          await assertUnchangedSince(q, current.id, readSnapshot.stamp);
+          const over = await skillCapacityProblem(q, legacyPrev.id);
+          if (over) throw new Error(`rollback refused: ${over.message}`);
+          await q(
+            "UPDATE claw_skills SET status = 'rolled_back' WHERE skill_name = $1 AND user_id = $2 AND version = $3",
+            [skillName, userId, current.version]
+          );
+          await q(
+            "UPDATE claw_skills SET status = 'active' WHERE skill_name = $1 AND user_id = $2 AND version = $3",
+            [skillName, userId, current.version - 1]
+          );
+          await refreshContentSha(q, legacyPrev.id);
+        });
+      } catch (err) {
+        logger.warn({ err: (err as Error)?.message, skillName }, "skill.manual_rollback_failed");
+        return false;
+      }
       logger.info({ skillName, mode: "legacy", rolledBackFrom: current.version }, "skill.manual_rollback");
       return true;
     }
@@ -2366,7 +2383,7 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
       await client.query("BEGIN");
       const tq: Querier = (text, params) => client.query(text, params);
       await lockUserSkills(tq, userId);
-      await assertUnchangedSince(tq, current.id, readSnapshot.sha);
+      await assertUnchangedSince(tq, current.id, readSnapshot.stamp);
       let needVersionDecrement = false;
       for (const m of [...muts].reverse()) {
         if (m.type === "improve_skill" && m.previous_content) {
@@ -2456,7 +2473,7 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
   try {
     const done = await inTransaction(async (q) => {
       await lockUserSkills(q, userId);
-      await assertUnchangedSince(q, current.id, readSnapshot.sha);
+      await assertUnchangedSince(q, current.id, readSnapshot.stamp);
       if (last.action === "improve_skill") {
         const restored = last.previous_content || last.previous_content_snippet;
         if (!restored) return false;
