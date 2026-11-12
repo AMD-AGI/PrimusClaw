@@ -127,10 +127,11 @@ class TurnRun {
     state.writes = ctx.record.wrote; // (written as the events arrive: a stream that drops afterwards loses none of it)
     this.state = state;
     noteRunning(ctx, state, this.running);
-    // Queued behind a turn Claw is still running (Claw gave no id, or the id of the queued message): said, so the wait is not
-    // taken for a hang.
-    if ((messageId === undefined || behind !== undefined) && !ctx.request.attach) {
-      await ctx.deps.surface.send(plainMessage(turnText.in(langOf(ctx)).queuedNotice));
+    // Queued behind a turn Claw is still running: said, so the wait is not taken for a hang. A stream opened before Claw
+    // queued it is closed with the notice; otherwise the notice is a message.
+    if (queuedByClaw(messageId) && !ctx.request.attach) {
+      const notice = turnText.in(langOf(ctx)).queuedNotice;
+      if (!this.status.queued(notice)) await ctx.deps.surface.send(plainMessage(notice));
     }
     return consume(ctx, { sessionId, state, status: this.status, running: this.running, signal });
   }
@@ -300,6 +301,14 @@ class TurnRun {
     await this.status.finish([lead + turnEnglish.lostConnection + link]);
     await offerReport(ctx);
   }
+}
+
+/** The id Claw gives a message it queued behind a running turn (`queuedMessageId`, claw/packages/api/src/tasks/chat-run.ts). */
+export const QUEUED_MESSAGE_PREFIX = "claw-pending-";
+
+/** Claw's own word on the send: it queued the message (no id, or the id of a queued message), not a look taken before. */
+function queuedByClaw(messageId: string | undefined): boolean {
+  return messageId === undefined || messageId.startsWith(QUEUED_MESSAGE_PREFIX);
 }
 
 /**
