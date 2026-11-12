@@ -37,6 +37,13 @@ with any Claw: it rides on the `[Reply language: ...]` line a plain session read
   own language. A request for one answer in a language ("answer in English", a translation) is not a setting. A person's
   1:1 chat keeps their own `/lang` (#775).
 
+### Changed
+
+- `@primusclaw/personal-agent`: the core's exported `StorePort` gains a required `groupLanguage` repository
+  (`GroupLanguageRepository`: `groupLanguage`, `setGroupLanguage` and the asked-once marks of the first-@ card). The
+  runtime's SQLite store implements it, so a deployment of the published packages has nothing to do; a store of one's own
+  must add it (#775).
+
 ### Fixed
 
 - `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the card of a question a terminal asks no longer
