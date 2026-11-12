@@ -6,7 +6,16 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { THUMB_COMMENT_MAX, voteMessageId, type InboundVote, type RouteBase } from "@primusclaw/personal-agent";
+import {
+  chatCredentialOf,
+  err,
+  ok,
+  THUMB_COMMENT_MAX,
+  voteMessageId,
+  type InboundVote,
+  type RouteBase,
+  type TokenExchange,
+} from "@primusclaw/personal-agent";
 
 import { CONV, SECRET, USER_A, clickRoute, linkedWorld, makeWorld, offerOf, texts, type World } from "./world.js";
 
@@ -366,5 +375,67 @@ test("a vote's message id is the python voted message id: prefixed, hashed when 
         "no message to vote on",
       );
     }
+  }
+});
+
+/** An exchange that binds `bound` (each to its token) and answers not_bound for anyone else. */
+function exchangeOf(bound: Readonly<Record<string, string>>): TokenExchange {
+  const tokens = new Map(Object.entries(bound));
+  return {
+    enabled: true,
+    tokenFor: (userId) => {
+      const token = tokens.get(userId);
+      return Promise.resolve(token === undefined ? err({ kind: "not_bound" as const }) : ok(token));
+    },
+    bindingRequest: () => Promise.resolve(err({ kind: "exchange_unavailable" as const })),
+    invalidate: () => undefined,
+  };
+}
+
+test("a person bound but never linked votes on their plain session with the token their chats run on", async () => {
+  // No key: their turns run on the exchanged token, in the chat's own session (not the assistant's).
+  const world = makeWorld({ exchange: exchangeOf({ [USER_A.id]: "xt-alice" }) });
+  world.store.sessions.setSession(USER_A.id, { sessionId: "sess-plain" });
+  vote(world, "dislike", "", "", "1730880000777");
+  await world.thumbs.settled();
+  assert.deepEqual(world.claw.votes, [["xt-alice", "sess-plain", "teams:1730880000777", "down", undefined]]);
+  const line = world.log.lines.find((l) => l.message === "feedback vote");
+  assert.deepEqual(line?.fields, { reaction: "dislike", chat: "1:1", outcome: "recorded" });
+  assert.equal(world.issues.issues.length, 1); // still filed as a report too
+});
+
+test("with chats on the exchange, a linked person who is not bound votes with their key", async () => {
+  const world = linkedWorld({ exchange: exchangeOf({}) });
+  vote(world, "like", "", "", "teams-9");
+  await world.thumbs.settled();
+  assert.deepEqual(world.claw.votes, [["ak-alice", "sess-1", "teams:teams-9", "up", undefined]]);
+});
+
+test("neither bound nor linked: no vote, logged as not linked", async () => {
+  const world = makeWorld({ exchange: exchangeOf({}) });
+  world.store.sessions.setSession(USER_A.id, { sessionId: "sess-plain" });
+  vote(world, "dislike", "", "", "teams-9");
+  await world.thumbs.settled();
+  assert.deepEqual(world.claw.votes, []);
+  const line = world.log.lines.find((l) => l.message === "feedback vote");
+  assert.deepEqual(line?.fields, { reaction: "dislike", chat: "1:1", outcome: "not linked" });
+});
+
+test("chatCredentialOf: the exchanged token first, the key when not bound or the exchange is off, else nothing", async () => {
+  const links = { getKey: (id: string) => (id === "has-key" ? "ak-1" : null) };
+  const ex = exchangeOf({ "has-key": "xt-1", bound: "xt-2" });
+  const off = { ...ex, enabled: false };
+  const cases: readonly (readonly [TokenExchange | undefined, string, string | undefined])[] = [
+    [ex, "has-key", "xt-1"],
+    [ex, "bound", "xt-2"],
+    [ex, "nobody", undefined],
+    [undefined, "has-key", "ak-1"],
+    [undefined, "bound", undefined],
+    [off, "bound", undefined],
+    [off, "has-key", "ak-1"],
+  ];
+  for (const [exchange, id, want] of cases) {
+    const got = await chatCredentialOf(links, exchange)({ ...USER_A, id });
+    assert.equal(got, want, `${id} exchange=${exchange === undefined ? "none" : String(exchange.enabled)}`);
   }
 });

@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { OutMessage } from "../ports/surface.js";
+import type { LinkRepository } from "../ports/store/link.js";
+import type { OutMessage, UserRef } from "../ports/surface.js";
 import type { Lang } from "../locales/lang.js";
 import { AI_NOTICE } from "../locales/transparency.js";
 import { linkText } from "../locales/link.js";
@@ -23,6 +24,23 @@ export const IDENTITY_CARD_INTERVAL_SECONDS = 24 * 3600;
 export const IDENTITY_CARD_NOTICE = "identity_card";
 
 type CredentialDeps = Pick<RouterDeps, "store" | "exchange" | "config" | "logger">;
+
+/**
+ * What an action of the person's outside a turn (a thumb on an answer) calls Claw with: what their chats run on, so it acts
+ * on the same session as the same Claw user. With chats on the exchange (`exchange` given), the person's exchanged token,
+ * else their linked key; without, the linked key. Undefined when they have neither. Never asks or tells them anything.
+ */
+export function chatCredentialOf(
+  links: Pick<LinkRepository, "getKey">,
+  exchange: TokenExchange | undefined,
+): (sender: UserRef) => Promise<string | undefined> {
+  return async (sender) => {
+    const key = links.getKey(sender.id) ?? undefined;
+    if (exchange === undefined || !exchange.enabled) return key;
+    const token = await exchange.tokenFor(sender.id);
+    return token.ok ? token.value : key;
+  };
+}
 
 /**
  * What Claw is called with for a person, and what a person who has none is told (the Python `Agent._credential`,
