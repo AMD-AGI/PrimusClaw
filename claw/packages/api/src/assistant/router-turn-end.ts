@@ -315,6 +315,11 @@ export async function turnMadeLookup(sessionId: string, messageIds: ReadonlySet<
   return rows.some((r) => !!r.tool && isLookup(r.tool));
 }
 
+/** The message the turn answered: as the completion names it, or as its runs were started for it (a sweeper's completion may not say). */
+function turnMessageOf(end: RouterTurnEnd, runs: ReadonlyArray<{ message_id: string | null }>): string | undefined {
+  return end.messageId || runs.find((r) => r.message_id)?.message_id || undefined;
+}
+
 /**
  * A turn that answers the person, looked something up, and ended with neither a say of its own nor any text: it is told so, once, in
  * the system's words (`silentTurnNotice`). Not when the turn started an item (its start notice is the reply) or handed a review over.
@@ -325,6 +330,7 @@ async function sayLookedButSilent(
   const text = silentTurnNotice(prompts);
   if (!text) return "skipped";
   const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  const turnId = turnMessageOf(end, runs);
   const began = new Date(Math.min(...runs.map((r) => new Date(r.began).getTime())));
   const spoke = await db.query("SELECT 1 FROM claw_assistant_says WHERE user_id = $1 AND NOT fallback AND created_at >= $2 LIMIT 1", [userId, began]);
   if (spoke.rowCount) return "skipped";
@@ -337,6 +343,7 @@ async function sayLookedButSilent(
   const stored = await recordSystemNotice({
     userId, sessionId: end.sessionId, text, key: `turn_silent:${[...end.runIds].sort().join(",")}`,
     ...(end.messageId ? { turnMessageId: end.messageId } : {}),
+    ...(turnId ? { sourceTurn: turnId } : {}),
   }, deps);
   if (stored) {
     logger.warn({ sessionId: end.sessionId, runIds: end.runIds }, "assistant.silent_turn_notice_delivered");
@@ -388,6 +395,8 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
   }
   // The message the turn answered, as the completion names it, or as its runs were started for it (a sweeper's completion may not say).
   const answered = new Set([end.messageId, ...runs.map((r) => r.message_id)].filter((m): m is string => !!m));
+  // Where what is said now goes back to: that message's surface (`routeToSurface`).
+  const turnId = turnMessageOf(end, runs);
   for (const messageId of answered) {
     if (await turnHandedOffReview((t, p) => db.query(t, p), router.user_id, messageId)) {
       logger.info({ sessionId: end.sessionId, runIds: end.runIds, lost }, "assistant.unsaid_answer_handed_off");
@@ -449,6 +458,7 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     // Once per turn: a redelivered completion finds the notice it stored.
     const stored = await recordSystemNotice({
       userId: router.user_id, sessionId: end.sessionId, text, key: `turn_lost:${[...end.runIds].sort().join(",")}`,
+      ...(turnId ? { sourceTurn: turnId } : {}),
     }, deps);
     if (stored) {
       logger.warn({ sessionId: end.sessionId, runIds: end.runIds, why: lost ? why : "leaked" }, "assistant.turn_lost_notice_delivered");
@@ -457,7 +467,9 @@ async function deliverUnsaid(end: RouterTurnEnd, deps: SayDeps): Promise<"said" 
     return stored ? "said" : "skipped";
   }
   try {
-    await recordAssistantSay({ userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId, turnBegan: began }, deps);
+    await recordAssistantSay({
+      userId: router.user_id, sessionId: end.sessionId, text, turnMessageId: end.messageId, turnBegan: began, ...(turnId ? { sourceTurn: turnId } : {}),
+    }, deps);
   } catch (err) {
     // A refusal (the hourly cap) is the same answer the model's own say would have had, and the user was told of the cap
     // when it first refused them (`recordAssistantSay`); only a fault is worth a retry, and it is thrown for the caller's.

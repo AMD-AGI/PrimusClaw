@@ -61,6 +61,8 @@ function keeper(base: AssemblyBase, notifyUrl: string): SubscriptionKeeper | und
     understood: (aadId) => assistant.understandingUsers.has(aadId.toLowerCase()),
     assistantFor: (aadId) => assistant.users.size === 0 || assistant.users.has(aadId.toLowerCase()),
     userIdOf: async (key) => pyStrip((await base.plugins.identityLookup.ownerOfKey(key))?.id ?? "") || undefined,
+    // The surface Claw routes this person's assistant messages by (a reply goes back to the surface the message came from).
+    surface: "teams",
   });
 }
 

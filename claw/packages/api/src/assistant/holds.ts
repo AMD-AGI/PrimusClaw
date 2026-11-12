@@ -39,6 +39,7 @@ import {
   clipSummary, deterministicEventId, enqueue, kickDelivery, onDelivered, waitWindow,
   type HeldQuestion, type NotificationPayload,
 } from "../notifications/outbox.js";
+import { routeToSurface } from "../notifications/surfaces.js";
 import { personWritesChinese, recordNeedsYouFallback, storeSystemNotice } from "./outbound.js";
 import { quoted, toldNote, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from "./prompts.js";
 import { toldNeedAt, toldNeeds } from "./told.js";
@@ -332,13 +333,17 @@ async function storeFindings(
   return storeSystemNotice(q, { userId: item.user_id, sessionId, text, key: `hold_findings:${item.item_id}:${f.id}` });
 }
 
-/** The owner's subscriptions that draw an item's requests as cards: they list the type and the source. */
+/**
+ * The owner's subscriptions that draw an item's requests as cards: they list the type and the source. Of those, the ones on the
+ * surface the owner wrote from last (`routeToSurface`): no message of theirs started the request.
+ */
 async function cardSubscriptions(q: Querier, userId: string): Promise<Array<{ subscription_id: string }>> {
-  return (await q(
-    `SELECT subscription_id FROM claw_notification_subscriptions
+  const subs = (await q(
+    `SELECT subscription_id, surface FROM claw_notification_subscriptions
       WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND $2 = ANY(sources)`,
     [userId, HOLD_SOURCE],
-  )).rows as Array<{ subscription_id: string }>;
+  )).rows as Array<{ subscription_id: string; surface: string }>;
+  return routeToSurface(q, userId, subs);
 }
 
 /**

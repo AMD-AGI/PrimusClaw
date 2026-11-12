@@ -15,9 +15,9 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.0 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.0 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.7.1 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.1 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.7.2 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -102,6 +102,33 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Changed
+
+- An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
+  a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
+  (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,
+  a scheduled or long run's end) to the surface they wrote from last. A surface with no subscription that takes the event
+  falls back to the next most recent one; a person who never wrote, or whose subscriptions all name one surface, gets it
+  on each, as before. A subscription names its surface with the new `surface` field (`POST`/`PATCH
+  /v1/notification-subscriptions`, a lowercase label; absent is `teams`); the Teams worker of the personal agent sends
+  `teams`, and an older worker, which names none, is `teams` too. Outbox, signing, retries, redelivery and the say caps
+  are unchanged. Schema: `claw_notification_subscriptions.surface` (default `'teams'`) and the new table
+  `claw_assistant_surfaces`, both added at start-up; no new setting (#787).
+
+## [0.3.1] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611121517` (commit e7255a96). No schema change, no new setting. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- A question a terminal asks names the tool that asked ("Claude Code", "Codex", "Cursor", from the connector's
+  `session_started.agent`, sent by connector 0.2.0) in the work item's title, the ask message and the "many are waiting"
+  message, instead of the connector's agent id (`claude-sessions`); items opened before keep working and are renamed on
+  their next request. The notice carries it as `remote.tool` (protocol `AssistantRemoteNotice.tool`), which personal
+  agent 0.7.1 shows on the card; an older worker keeps the agent id there. The one-minute "waiting in a terminal" notice
+  says "Claude Code", not "Claude Code (existing sessions)" (#779).
+
 ## [0.3.0] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611121326` (commit 86eeb027). A minor release; no schema change; new setting
@@ -130,15 +157,6 @@ Connector requirements otherwise unchanged from 0.1.0.
   `on_input` for Codex, sent by connector 0.2.0); Claude Code's wording is unchanged (#773).
 - The `claw` image no longer contains npm or npx (it never ran them; the image scan found six HIGH findings in the base
   image's bundled npm) nor `packages/*/test` (#774).
-
-### Fixed
-
-- A question asked in a terminal and put to the user (the connector's approval hooks) names the tool that asked, "Claude
-  Code", "Codex" or "Cursor", instead of the connector's id for its agent (`claude-sessions`): in the item's title, the
-  message, and the one that says many are waiting. Claw reads it from the `agent` the connector (0.2.0 and later) puts
-  on the session's `session_started`, and passes it on as `remote.tool` for a channel's card; a session that does not
-  say keeps the agent's id, as before; an item already open learns it on its next request. The one-minute "waiting in a
-  terminal" notice says "Claude Code", not "Claude Code (existing sessions)". No schema change, no new setting (#779).
 
 ## [0.2.1] - 2026-11-12
 

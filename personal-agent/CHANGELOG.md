@@ -5,43 +5,28 @@ SPDX-License-Identifier: MIT
 
 # Changelog
 
-The five packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
-`@primusclaw/personal-agent-worker`, `@primusclaw/personal-agent-teams`, `@primusclaw/personal-agent-teams-ingress`; the
-worker from the release after 0.7.1 on), the Teams ingress's Function package (`personal-agent-teams-ingress-X.Y.Z.zip`)
-and the `personal-agent-teams` image are released together at one version. The first four are published to npm; the ingress is deployed from the Function package on the GitHub Release, and its
+The four packages (`@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`,
+`@primusclaw/personal-agent-teams`, `@primusclaw/personal-agent-teams-ingress`), the Teams ingress's Function package
+(`personal-agent-teams-ingress-X.Y.Z.zip`) and the `personal-agent-teams` image are released together at one version.
+The first three are published to npm; the ingress is deployed from the Function package on the GitHub Release, and its
 npm package is not published (its tarball is attached to the release). Each
 release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub Release's notes (README.md,
 "Releasing"): a version without a section is not released. Which number a release moves, and what its notes must say
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.7.2
 
-A minor release (0.8.0): the worker process moves out of the Teams package into a new surface-neutral package, so
-another chat app can run the same worker as a package of its own without touching Teams. The Teams worker behaves as
-before. No plugin port (core's `src/plugins/`), setting or store change.
+A patch release: one fix (#785). No plugin port (core's `src/plugins/`) and no store change; works with any Claw.
 
-**Release:** `@primusclaw/personal-agent-worker` is new on npm. Before the first tagged release that carries it, a
-maintainer publishes it once by hand at the version its merged `package.json` names and gives it its Trusted Publisher
-(README.md, "Releasing", one-time setup steps 3 and 4); otherwise publish-npm stops at it after core and runtime.
+### Fixed
 
-### Added
-
-- `@primusclaw/personal-agent-worker`: the worker process on any surface: the features behind the router, the store
-  and the Claw client from the environment, the HTTP endpoints, `/metrics` and the background loops
-  (`assembleWorker`, `runMain`), and the `SurfaceAdapter` interface a surface package implements to run it (its
-  settings, its `Surface`, how a stored conversation reference is read back, where its inbound events come from). It
-  depends on core and runtime only, and needs no Service Bus, Bot Connector or Azure setting.
-- The layering (`npm run depcruise`) refuses a surface package importing another surface's (a Slack package importing
-  Teams), and the worker importing any surface package or an npm package of its own.
-
-### Changed
-
-- `@primusclaw/personal-agent-teams` depends on the worker package and keeps only what is Teams' own: its settings,
-  Azure Key Vault, the queues and the Bot Connector, `TeamsSurface` and its renderers, the inbound consumer and the
-  release gate's test entry, as `teamsSurface()`. `buildWorker`, `main` and the types `BuildWorker`, `PluginFactory`,
-  `Worker`, `WorkerEnv`, `WorkerOptions` and `WorkerServices` are still exported from it, unchanged, so a deployment's
-  own entry keeps its imports.
+- `@primusclaw/personal-agent`: in a group with no language set, or set to "follow the asker", each @-message now
+  carries its own words' language as the `[Reply language: ...]` line, so the group session's history no longer decides:
+  after `/lang auto` in a group that had talked English, the first Chinese question was answered in English. A message
+  with no words of its own (`ok`, `#3`, a link) follows the language of the sender's last message with words in that
+  group (kept in memory, so after a restart such a message gets no line until its sender writes one). An explicit group
+  setting still wins. The English "follow the asker" announcement no longer reads "asked in in this group" (#785).
 
 ## 0.7.1
 

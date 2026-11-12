@@ -1,7 +1,7 @@
 {
   "name": "@primusclaw/personal-agent-teams",
-  "version": "0.7.1",
-  "description": "The personal agent on Microsoft Teams: activities, Adaptive Cards, streams, Bot Connector, inbound queue, and the worker's Teams surface.",
+  "version": "0.7.2",
+  "description": "The personal agent on Microsoft Teams: activities, Adaptive Cards, streams, Bot Connector, inbound queue, process assembly.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -35,9 +35,8 @@
   "dependencies": {
     "@azure/core-auth": "^1.11.0",
     "@azure/service-bus": "^7.10.0",
-    "@primusclaw/personal-agent": "0.7.1",
-    "@primusclaw/personal-agent-runtime": "0.7.1",
-    "@primusclaw/personal-agent-worker": "0.7.1",
+    "@primusclaw/personal-agent": "0.7.2",
+    "@primusclaw/personal-agent-runtime": "0.7.2",
     "zod": "^4.6.7"
   },
   "devDependencies": {
