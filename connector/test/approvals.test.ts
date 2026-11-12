@@ -23,6 +23,8 @@ import { tmpdir } from "./support/tmp.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, "..", "src", "approval-hook.ts");
 const REF = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+/** A person's terminal session, whatever the environment the tests run in (an agent's `claude -p` exports `0`). */
+const TERMINAL_ENV = { CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ATTENDED: "1", CLAW_APPROVAL_HOOKS: "" };
 
 /** What Claude Code 2.1.322 hands a PermissionRequest hook (measured), for `tool` with `input`. */
 const req = (tool: string, input: Record<string, unknown>, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -271,7 +273,7 @@ describe("the broker: each request settled exactly once", () => {
 });
 
 /** Run the hook program as Claude Code does: JSON on stdin, decision (if any) on stdout. */
-function runHook(mode: "ask" | "settled", socket: string, stdin: Record<string, unknown>, env: Record<string, string> = { CLAUDE_CODE_ENTRYPOINT: "cli" }) {
+function runHook(mode: "ask" | "settled", socket: string, stdin: Record<string, unknown>, env: Record<string, string> = TERMINAL_ENV) {
   const child = spawn(process.execPath, ["--import", "tsx", HOOK, mode, "--dir", "/cfg", "--socket", socket, "--managed-by", "claw-connector"], {
     env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"],
   });
@@ -413,7 +415,7 @@ describe("through a running connector and Claw", () => {
     const sock = approvalSocketFile(h.dirs.state);
     await until(() => fs.existsSync(sock));
     const hook = spawn(process.execPath, ["--import", "tsx", HOOK, "ask", "--dir", h.attachDir, "--socket", sock, "--managed-by", "claw-connector"], {
-      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "cli" }, stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...TERMINAL_ENV }, stdio: ["pipe", "pipe", "pipe"],
     });
     let out = "";
     hook.stdout.on("data", (c) => { out += c; });
@@ -449,7 +451,7 @@ describe("through a running connector and Claw", () => {
     await until(() => fs.existsSync(sock));
     const run = async (cwd: string) => {
       const c = spawn(process.execPath, ["--import", "tsx", HOOK, "ask", "--dir", h.attachDir, "--socket", sock, "--managed-by", "claw-connector"], {
-        env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "cli" }, stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...TERMINAL_ENV }, stdio: ["pipe", "pipe", "pipe"],
       });
       let o = "";
       c.stdout.on("data", (x) => { o += x; });

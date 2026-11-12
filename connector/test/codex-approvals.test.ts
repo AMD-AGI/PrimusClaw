@@ -18,6 +18,7 @@ import {
   ApprovalBroker, approvalSocketFile, CARD_INPUT_MAX, DENIED_MESSAGE, mapCodexRequest, parsePermissionEvent, patchFiles, serveApprovals,
   type BrokerDeps, type ConnectorReply, type PermissionEvent,
 } from "../src/approvals.js";
+import { skipReason } from "../src/approval-skip.js";
 import { codexTuiTranscript, lastInputMs, terminalOf } from "../src/codex-terminal.js";
 import {
   CODEX_APPROVAL_HOOKED, codexApprovalHooksStatus, codexHooksFile, installCodexApprovalHooks, uninstallCodexApprovalHooks,
@@ -109,6 +110,15 @@ describe("the broker, for a Codex conversation", () => {
     assert.deepEqual(replies, [{ v: 1, decision: { behavior: "allow" } }]);
   });
 
+  test("a question in bypass mode (approval policy never) puts no card out and leaves Codex alone", async () => {
+    const r = rig();
+    const replies: ConnectorReply[] = [];
+    await r.broker.ask(req("Bash", { command: "ls" }, { permission_mode: "bypassPermissions" }), "/c", (x) => replies.push(x), "codex");
+    assert.deepEqual(replies, [{ v: 1, decision: null, why: "unattended_mode" }]);
+    assert.equal(r.cards().length, 0);
+    assert.deepEqual(r.opened, []);
+  });
+
   test("Codex's SessionEnd closes the conversation's Claw session", async () => {
     const r = rig();
     await r.broker.ask(req("Bash", { command: "ls" }), "/c", () => {}, "codex");
@@ -118,6 +128,18 @@ describe("the broker, for a Codex conversation", () => {
 });
 
 describe("which Codex sessions are handed on", () => {
+  test("the opt-out and the bypass mode hold for Codex; Claude Code's own variables do not (Codex sets neither)", () => {
+    const ask = req("Bash", { command: "ls" });
+    assert.equal(skipReason({}, ask, "ask", "codex"), null);
+    assert.equal(skipReason({ CLAUDE_CODE_ENTRYPOINT: "sdk-cli", CLAUDE_CODE_SESSION_ATTENDED: "0" }, ask, "ask", "codex"), null);
+    assert.equal(skipReason({ CLAW_APPROVAL_HOOKS: "off" }, ask, "ask", "codex"), "opted_out");
+    assert.equal(skipReason({ CLAW_APPROVAL_HOOKS: "off" }, null, "settled", "codex"), "opted_out");
+    assert.equal(skipReason({}, req("Bash", { command: "ls" }, { permission_mode: "bypassPermissions" }), "ask", "codex"), "unattended_mode");
+    assert.equal(skipReason({}, { session_id: REF, hook_event_name: "PostToolUse", permission_mode: "bypassPermissions" }, "settled", "codex"), null);
+    // Without the agent, the same environment is Claude Code's and is left alone.
+    assert.equal(skipReason({}, ask, "ask"), "not_a_terminal");
+  });
+
   test("only the TUI: a transcript from codex-tui, not codex_exec, not a missing or foreign file", () => {
     assert.equal(codexTuiTranscript(transcript("codex-tui")), true);
     assert.equal(codexTuiTranscript(transcript("codex_exec")), false);
@@ -159,10 +181,10 @@ const until = async (cond: () => boolean, ms = 15_000) => {
 const haveScript = (() => { try { execFileSync("script", ["--version"], { stdio: "ignore" }); return fs.existsSync("/proc/self/fd"); } catch { return false; } })();
 
 /** The fake Codex TUI under a real pseudo-terminal; `go()` makes it run the hook, `type()` types into its terminal. */
-async function underPty(socket: string, event: Record<string, unknown>) {
+async function underPty(socket: string, event: Record<string, unknown>, env: Record<string, string> = {}) {
   const hook = [process.execPath, "--import", "tsx", HOOK, "ask", "--dir", "/c", "--socket", socket, "--agent", "codex", "--idle", "30", "--managed-by", "claw-connector"];
   const cmd = [process.execPath, FAKE_CODEX, "--", ...hook].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
-  const child = spawn("script", ["-qfec", cmd, "/dev/null"], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, FAKE_CODEX_EVENT: JSON.stringify(event) } });
+  const child = spawn("script", ["-qfec", cmd, "/dev/null"], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, ...env, FAKE_CODEX_EVENT: JSON.stringify(event) } });
   let out = "";
   child.stdout.on("data", (c) => { out += c; });
   await until(() => /READY \S+ \d+/.test(out));
@@ -250,6 +272,28 @@ describe("the Codex hook program over the real socket", () => {
         exec.go();
         assert.deepEqual(await exec.result(), { code: 0, out: "" });
       } finally { await exec.close(); }
+      assert.equal(r.cards().length, 0);
+    } finally { await close(); }
+  });
+
+  test("an idle TUI in bypass mode, or started with CLAW_APPROVAL_HOOKS=off: left to the terminal at once, no card", { skip: !haveScript && "needs script(1) and /proc" }, async () => {
+    const state = tmpdir("cc-cx-");
+    const r = rig();
+    const close = await serveApprovals(state, r.broker, (m) => String(m.dir), () => {});
+    try {
+      const runs: Array<[Record<string, unknown>, Record<string, string>]> = [
+        [{ transcript_path: transcript("codex-tui"), permission_mode: "bypassPermissions" }, {}],
+        [{ transcript_path: transcript("codex-tui") }, { CLAW_APPROVAL_HOOKS: "off" }],
+      ];
+      for (const [extra, env] of runs) {
+        const t = await underPty(approvalSocketFile(state), req("Bash", { command: "ls" }, extra), env);
+        try {
+          const old = new Date(Date.now() - 120_000);
+          fs.utimesSync(t.tty, old, fs.statSync(t.tty).mtime);
+          t.go();
+          assert.deepEqual(await t.result(), { code: 0, out: "" });
+        } finally { await t.close(); }
+      }
       assert.equal(r.cards().length, 0);
     } finally { await close(); }
   });

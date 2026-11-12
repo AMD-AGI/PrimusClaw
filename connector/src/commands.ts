@@ -22,6 +22,7 @@ import {
   uninstallApprovalHooks, uninstallCodexApprovalHooks, uninstallHooks,
 } from "./hooks.js";
 import { approvalSocketFile } from "./approvals.js";
+import { offerAfter, offerApprovalHooks } from "./approval-offer.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
@@ -281,7 +282,12 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
     const command = COMMANDS[cmd];
     if (asksForHelp(rest)) { ctx.out(commandHelp(cmd)); return EXIT.ok; }
     if (command.noArgs && rest.length > 0) { ctx.err(`${cmd} takes no arguments, not ${JSON.stringify(rest[0])}\n\n${commandHelp(cmd)}`); return EXIT.usage; }
-    return await command.run(rest, ctx);
+    const code = await command.run(rest, ctx);
+    // Once per Claude config directory, at a terminal: a setup with the session hooks only is offered the approval hooks.
+    if (code === EXIT.ok && !command.hidden && offerAfter(cmd, rest)) {
+      await offerApprovalHooks({ dirs: ctx.dirs, env: ctx.env, out: ctx.out, ask: ctx.ask, claudeDirs: () => claudeDirs(ctx, undefined), install: (dir) => installApprovalsOne(ctx, dir) });
+    }
+    return code;
   } catch (e) {
     // A command's own option parser (node:util parseArgs, strict) refused the arguments: a usage error, with that command's help.
     const code = (e as { code?: unknown } | null)?.code;

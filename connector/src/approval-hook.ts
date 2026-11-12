@@ -6,10 +6,12 @@
  *   `approval-hook.js ask|settled --dir <config dir> --socket <connector socket> [--agent codex [--idle <s>]] --managed-by claw-connector`
  *
  * `ask` (the `PermissionRequest` hook) hands the request to the running connector and prints the owner's decision, if one
- * comes; `settled` (the events that follow an answer, run in the background) only tells the connector.
+ * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session with a
+ * person at its terminal is handed on (approval-skip.ts): not `claude -p`, not one the connector itself runs (it already asks
+ * through its own cards), not a question asked in bypass mode, and nothing at all with `CLAW_APPROVAL_HOOKS=off`
+ * (the opt-out and the bypass mode hold for Codex too).
  *
- * Claude Code (the default): only a session in a terminal is handed on (`CLAUDE_CODE_ENTRYPOINT=cli`): one the connector itself
- * runs already asks through its own cards. Claude Code shows its own dialog while this waits.
+ * Claude Code (the default): Claude Code shows its own dialog while this waits.
  *
  * Codex (`--agent codex`, measured on 0.153.4): Codex runs this before it shows its own prompt, and shows that prompt only once
  * this has exited without a decision. So the question goes to the phone only when the session is the `codex` TUI (the
@@ -18,11 +20,13 @@
  * kernel moves on input, at most 8 s late, as `w` reads it). While the card waits, typing anything in that terminal gives the
  * question back to it: this exits without a decision and Codex shows its prompt. Esc stops the turn, and Codex kills this.
  *
- * It imports nothing of the connector but the small helpers in codex-terminal.ts, and never gets in the way: no connector, a connector that does not answer, no terminal
+ * It imports nothing of the connector but the small helpers in approval-skip.ts and codex-terminal.ts, and never gets in the
+ * way: no connector, a connector that does not answer, no terminal
  * to watch, anything unexpected, and it prints nothing and exits 0, which leaves the question to the terminal. When it goes
  * away (stopped by Claude Code or Codex, or given back to the terminal) the connector sees the socket close and withdraws the card.
  */
 import net from "node:net";
+import { skipReason } from "./approval-skip.js";
 import { codexTuiTranscript, lastInputMs, terminalOf } from "./codex-terminal.js";
 
 const CONNECT_MS = 300;
@@ -57,12 +61,14 @@ async function main(): Promise<void> {
     process.stderr.write("usage: approval-hook ask|settled --dir <config dir> --socket <path> [--agent codex [--idle <s>]]\n");
     return;
   }
-  if (agent === "claude" && process.env.CLAUDE_CODE_ENTRYPOINT !== "cli") return;
+  // Decided from the environment before stdin is read, where it can be: an unattended session costs nothing.
+  if (skipReason(process.env, null, mode, agent) !== null) return;
   const text = await readStdin();
   if (text.length >= MAX_STDIN) return;
   let event: unknown;
   try { event = JSON.parse(text); } catch { return; }
-  if (typeof event !== "object" || event === null) return;
+  if (typeof event !== "object" || event === null || Array.isArray(event)) return;
+  if (skipReason(process.env, event as Record<string, unknown>, mode, agent) !== null) return;
 
   // Codex: only the TUI, only a terminal nobody is typing in, and only until someone does.
   let tty: string | null = null;
