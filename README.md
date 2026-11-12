@@ -133,6 +133,9 @@ only a deployment's own plugins read), and
 [`personal-agent/docs/configuration.md`](personal-agent/docs/configuration.md)
 describes each one. Keep the filled-in file outside any repository.
 
+To put the personal agent on another chat app than Teams, see
+[`personal-agent/docs/adding-a-surface.md`](personal-agent/docs/adding-a-surface.md).
+
 From the image published with release 0.1.1 (it runs as uid 65534; the state
 volume must be writable by it):
 
