@@ -200,11 +200,20 @@ describe("the broker, for Cursor", () => {
     assert.deepEqual(r.replies, [{ v: 1, decision: null, why: "phone" }]);
   });
 
+  test("a hold outside 5 s to an hour (from the socket, not from an entry install wrote) is the default one", async () => {
+    for (const hold of [NaN, 0, 4_999, 3_600_001, Infinity]) {
+      const r = rig();
+      await r.ask(shell("npm publish"), hold);
+      assert.equal(r.cards()[0]!.data.timeout_ms, 60_000, String(hold));
+      r.broker.stopAll();
+    }
+  });
+
   test("the hold runs out: the card is withdrawn and Cursor asks at the terminal", async () => {
     const r = rig();
-    await r.ask(shell("npm publish"), 1_000);
-    assert.equal(r.cards()[0]!.data.timeout_ms, 1_000);
-    await until(() => r.replies.length === 1, 5_000);
+    await r.ask(shell("npm publish"), 5_000);
+    assert.equal(r.cards()[0]!.data.timeout_ms, 5_000);
+    await until(() => r.replies.length === 1, 10_000);
     assert.deepEqual(r.replies, [{ v: 1, decision: null, why: "timeout" }]);
     assert.deepEqual(r.emitted.at(-1)!.data, { actionId: r.cards()[0]!.data.actionId, optionId: null, outcome: "cancelled", by: "timeout" });
   });
@@ -379,6 +388,27 @@ describe("through a running connector and Claw", () => {
     assert.equal(await exited, 0);
     assert.equal(JSON.parse(out).permission, "deny");
     await h.claw.until("the answer to be recorded", () => h.claw.eventsOf(sid, "permission_resolved").length === 1);
+  });
+
+  test("two cursor agents read one Cursor directory with different roots: the one whose roots hold the folder takes it", async () => {
+    const { Harness } = await import("./support/harness.js");
+    const cursorDir = tmpdir("cc-cursor-");
+    const other = tmpdir("cc-other-work-");
+    const h = await Harness.create({ kind: "cursor", env: { CURSOR_CONFIG_DIR: cursorDir }, secondToml: "", secondRoots: [other] });
+    await h.online();
+    const sock = approvalSocketFile(h.dirs.state);
+    await until(() => fs.existsSync(sock));
+    const child = spawn(process.execPath, ["--import", "tsx", HOOK, "ask", "--agent", "cursor", "--hold", "30", "--dir", cursorDir, "--socket", sock, "--managed-by", "claw-connector"], {
+      env: { ...process.env, CURSOR_INVOKED_AS: "agent" }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    const exited = new Promise<number | null>((res) => child.on("exit", res));
+    child.stdin.end(JSON.stringify({ ...shell("npm publish"), cwd: other, workspace_roots: [other] }));
+    await h.claw.until("the terminal session to be opened", () => h.claw.terminalOpens.length === 1);
+    assert.equal(h.claw.terminalOpens[0].agent_id, "fake2");
+    const sid = h.claw.terminalSessions.get(CONV)!;
+    const card = await h.permission(sid);
+    h.decide(sid, String(card.data.actionId), "terminal");
+    assert.equal(await exited, 0);
   });
 
   test("no cursor agent reads that Cursor directory: no card, no decision", async () => {

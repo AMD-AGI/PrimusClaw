@@ -436,11 +436,18 @@ export class Connector {
     const dir = path.resolve(p.configDir);
     // Claude Code: the claude-attach agent that reads that Claude config directory. Cursor: a `cursor` agent whose Cursor
     // configuration directory (as the CLI resolves it in that agent's environment) is the one the hooks were installed in.
-    const agent = p.agent === "cursor"
-      ? this.d.config.agents.find((a) => a.kind === "cursor" && cursorConfigDir({ ...process.env, ...a.env }, a.env.HOME?.trim() || os.homedir()) === dir)
-      : this.d.config.agents.find((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
-    if (!agent) return { refused: "no_agent_for_config_dir" };
-    const where = await resolveCwd(p.cwd, agent.roots, { home: agent.env.HOME?.trim() || os.homedir(), timeoutMs: this.timing.rootCheckMs });
+    const agents = p.agent === "cursor"
+      ? this.d.config.agents.filter((a) => a.kind === "cursor" && cursorConfigDir({ ...process.env, ...a.env }, a.env.HOME?.trim() || os.homedir()) === dir)
+      : this.d.config.agents.filter((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
+    if (agents.length === 0) return { refused: "no_agent_for_config_dir" };
+    // Several agents may read one directory with different roots: the first whose roots hold the folder takes it.
+    let agent = agents[0]!;
+    let where = await resolveCwd(p.cwd, agent.roots, { home: agent.env.HOME?.trim() || os.homedir(), timeoutMs: this.timing.rootCheckMs });
+    for (const other of agents.slice(1)) {
+      if (where.ok) break;
+      const w = await resolveCwd(p.cwd, other.roots, { home: other.env.HOME?.trim() || os.homedir(), timeoutMs: this.timing.rootCheckMs });
+      if (w.ok) { agent = other; where = w; }
+    }
     if (!where.ok) return { refused: `cwd_${where.reason}` };
     try {
       return { sessionId: await this.d.client.openTerminalSession(this.cid, { agent_id: agent.id, ref: p.ref, cwd: where.real, title: p.title }) };

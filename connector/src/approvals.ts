@@ -26,7 +26,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { type CursorDecision, type CursorRules, cursorWouldAsk, loadCursorRules, mapCursorRequest, parseCursorEvent } from "./cursor-approvals.js";
+import {
+  CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, type CursorDecision, type CursorRules, cursorWouldAsk, loadCursorRules, mapCursorRequest,
+  parseCursorEvent,
+} from "./cursor-approvals.js";
 import { boundedInput, type OfferedOption } from "./permissions.js";
 import { redactDeep } from "./redact.js";
 
@@ -357,7 +360,10 @@ export class ApprovalBroker {
     const mapping = mapCursorRequest(e);
     const tool = e.event === "beforeShellExecution" ? "Shell" : `MCP:${e.tool}`;
     const input = canon(e.event === "beforeShellExecution" ? e.command : e.args);
-    const waitMs = Math.min(Math.max(Number.isFinite(holdMs) ? holdMs : 0, 1_000), this.d.ttlMs);
+    // The hold the hook's entry names, within the bounds `hooks install --hold` takes (a value from the socket is never trusted further).
+    const waitMs = holdMs >= CURSOR_HOLD_MIN_S * 1000 && holdMs <= CURSOR_HOLD_MAX_S * 1000
+      ? Math.min(Math.round(holdMs), this.d.ttlMs)
+      : Math.min(CURSOR_HOLD_DEFAULT_S * 1000, this.d.ttlMs);
     return this.put({ agent: "cursor", configDir, ref: e.ref, cwd: e.cwd, tool, input, toolUseId: e.toolUseId, mapping, waitMs }, once, () => done);
   }
 
