@@ -23,7 +23,7 @@ import {
   syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
   TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
-import { invalidateSyncManifest, withoutAddresses } from "../workspace/sync-delta.js";
+import { invalidateSyncManifest, releaseRestoreHold, withoutAddresses } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import { cutDrainedCalls } from "../agent/drain-shield.js";
@@ -2213,6 +2213,9 @@ class TaskRunner {
     // most recent file state that exists anywhere, so it has to be promoted
     // first. No-ops when no snapshot was ever written.
     await this.recoverInflightCheckpoint("sandbox_rebuild");
+    // A new sandbox, whatever address it was given: a hold this process kept for
+    // an earlier one at that address is not this one's (see resolveResumeState).
+    releaseRestoreHold(newHands, this.sessionId);
     // Always rehydrate after a rebuild: the new sandbox is empty regardless
     // of whether ensureHands reused a (concurrently-revived) KV entry.
     await this.restoreWorkspaceFromS3(newHands, this.request.user_id || "default", "after_rebuild");
@@ -3293,6 +3296,13 @@ class TaskRunner {
    * for dev-path sessions (no hex user id) or a failed workspace restore.
    */
   private async resolveResumeState(ckpt: TaskCheckpoint | null, created: boolean): Promise<void> {
+    // A sandbox just created starts with nothing held, whatever address it was
+    // given: pod IPs are reused, and a hold this process kept for an earlier
+    // sandbox of this session at the same address is not this one's. Released
+    // before any restore, so it holds only if its own restore fails -- by any
+    // route, the shared-filesystem one included, which never reaches the S3
+    // restore that would otherwise release it.
+    if (created && this.hands) releaseRestoreHold(this.hands, this.sessionId);
     // A script run taken over part-way is continued in the sandbox it was
     // running in, because that is where its earlier steps' work is -- a
     // background job still running, files a later step reads. A new sandbox

@@ -18,6 +18,7 @@ import { activeAbort } from "../src/tasks/abort-registry.js";
 
 const SESSION = "sess-restore-failed";
 const MESSAGE = "msg-restore-failed";
+const HANDS_URL = "http://10.0.0.9:9100/mcp";
 
 function fakeKv(): KV {
   const store = new Map<string, Uint8Array>();
@@ -58,7 +59,7 @@ async function runOnNewSandbox(restore: () => Promise<number>) {
     return Promise.resolve(value) as never;
   };
   const sideEffects = {
-    ensureHands: (() => Promise.resolve({ handsUrl: "http://hands.test", created: true, token: "t" })) as never,
+    ensureHands: (() => Promise.resolve({ handsUrl: HANDS_URL, created: true, token: "t" })) as never,
     destroyHands: record("destroyHands"),
     reapPendingHands: record("reapPendingHands"),
     unregisterSandbox: (() => {}) as never,
@@ -77,7 +78,7 @@ async function runOnNewSandbox(restore: () => Promise<number>) {
     refreshTaskLock: record("refreshTaskLock"),
     releaseTaskLock: record("releaseTaskLock"),
     flushTranscript: record("flushTranscript"),
-    makeHandsClient: (() => ({ close: async () => {} })) as never,
+    makeHandsClient: (() => ({ generation: HANDS_URL, close: async () => {} })) as never,
   } as unknown as TaskRunnerSideEffects;
 
   const msg = {
@@ -161,4 +162,23 @@ test("a restore that succeeded says nothing", async () => {
   const { restoreFailed, verdicts } = await runOnNewSandbox(() => Promise.resolve(534));
   assert.equal(restoreFailed.length, 0);
   assert.deepEqual(verdicts, ["ack"]);
+});
+
+test("a sandbox just created is not held by a hold this process kept for an earlier one at its address", async () => {
+  // Pod IPs are reused. A hold left from an earlier sandbox of this session at the
+  // same address must not survive into a new one -- whichever way the new one is
+  // filled (here a restore the run does not route through syncWorkspaceFromS3's
+  // own release, as the shared-filesystem restore does not).
+  const { holdAfterFailedRestore, isRestoreHeld } = await import("../src/workspace/sync-delta.js");
+  const earlier = {
+    generation: HANDS_URL,
+    // The sandbox's own note says "clear": only the in-memory hold is under test.
+    callTool: async (tool: string) => (tool === "write" ? "Written to x" : "clear\n__claw_sync_done__"),
+  } as unknown as import("../src/clients/hands.js").HandsClient;
+  await holdAfterFailedRestore(earlier, SESSION, "Request failed with status code 413");
+  assert.equal(await isRestoreHeld(earlier, SESSION), true, "held before the new sandbox");
+
+  const { verdicts } = await runOnNewSandbox(() => Promise.resolve(534));
+  assert.deepEqual(verdicts, ["ack"]);
+  assert.equal(await isRestoreHeld(earlier, SESSION), false, "a new sandbox at that address starts unheld");
 });
