@@ -17,7 +17,7 @@ import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
 import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { wholeLinesOf } from "../src/session.js";
-import { Harness, onCleanup, tmpdir } from "./support/harness.js";
+import { Harness, onCleanup, onExitSync, tmpdir } from "./support/harness.js";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const FAKE_TERMINAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "support", "fake-terminal.mjs");
@@ -151,8 +151,13 @@ const hs: Harness[] = [];
 onCleanup(async () => {
   for (const h of hs) { try { await h.close(); } catch { /* the servers below still go */ } }
   // Only the servers this file started, by their own sockets.
-  for (const s of servers) { try { execFileSync("tmux", ["-S", s, "kill-server"], { stdio: "ignore" }); } catch { /* gone */ } }
+  killServers();
 });
+// And when the file ends without its hooks (a crash, or an interrupted run whose cleanup ran out of time).
+onExitSync(killServers);
+function killServers(): void {
+  for (const s of servers.splice(0)) { try { execFileSync("tmux", ["-S", s, "kill-server"], { stdio: "ignore", timeout: 5_000 }); } catch { /* gone */ } }
+}
 
 /** A tmux server on a socket of its own, with the stand-in interface in its one pane, working in `work`. */
 function terminal(work: string, claudeDir: string, workMs = 300, extraEnv: Record<string, string> = {}, asClaude = false): {

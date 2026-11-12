@@ -6,7 +6,8 @@
  * recorded; the file's `after` hook first runs what `onCleanup` registered (a connector to stop, a stand-in Claw to
  * close), newest first, then kills the adapters still recorded in a children.json under them (they run detached and
  * would outlive the file), so nothing is still writing, and then removes the directories. A file that dies before its
- * hooks run (an uncaught error, `process.exit`) does the same, synchronously, on the process's `exit`.
+ * hooks run (an uncaught error, `process.exit`) does the same, synchronously, on the process's `exit`; one interrupted by
+ * SIGINT, SIGTERM or SIGHUP runs the whole cleanup first and then ends by that signal.
  *
  * Only the test files' own processes import this: it registers a hook with node:test, which a helper process a
  * test spawns must not do (support/run-fast.ts imports support/timing.ts, not the harness, for that reason).
@@ -29,6 +30,17 @@ export const tmpdir = (prefix = "cc-"): string => {
 
 /** Run `close` when the test file ends, before its temporary directories are removed. */
 export const onCleanup = (close: () => unknown): void => { closers.push(close); };
+
+const exitSync: Array<() => void> = [];
+/**
+ * Run `stop`, synchronously, when the file ends without its `after` hook having run (it crashed, called `process.exit`,
+ * or an interrupted cleanup ran out of time), before the directories are removed: for what must not outlive them, such
+ * as a tmux server whose socket is in one. It must be safe to run after `onCleanup`'s closers.
+ */
+export const onExitSync = (stop: () => void): void => { exitSync.push(stop); };
+function runExitSync(): void {
+  for (const stop of [...exitSync].reverse()) { try { stop(); } catch { /* the directories go regardless */ } }
+}
 
 /** The directories made and not yet removed. */
 export const liveTmpdirs = (): string[] => [...made].filter((d) => fs.existsSync(d));
@@ -106,6 +118,48 @@ after(cleanupTmp);
 // A crash, or a process.exit before the hooks ran. A directory a late writer recreates after `after` is not looked at
 // again: it is left for the CI step to report, as something still writing after its test has ended.
 process.on("exit", () => {
+  runExitSync();
   try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
   removeAll();
 });
+
+/** How long an interrupted file waits for what `onCleanup` registered before it removes the directories regardless. */
+const SIGNAL_CLEANUP_MS = 10_000;
+const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+let interrupted: (typeof SIGNALS)[number] | null = null;
+/**
+ * An interrupted run: `timeout`, Ctrl-C, a closed terminal, or the runner told to stop. A signal's default action ends
+ * the process without `after` or `exit`, which left every directory and every tmux server a file had made. The file
+ * runs its cleanup (the closers too, which stop what children.json does not name, such as a tmux server), bounded by
+ * SIGNAL_CLEANUP_MS, and then ends as the first signal would have ended it. Signals that arrive meanwhile (the runner
+ * passes on the one its process group already got) are absorbed: the deadline, not a second signal, bounds the wait.
+ */
+function onSignal(sig: (typeof SIGNALS)[number]): void {
+  if (interrupted) return;
+  interrupted = sig;
+  let ended = false;
+  const end = (): void => {
+    if (ended) return;
+    ended = true;
+    runExitSync();
+    try { killRecordedAdapters(); } catch { /* the directories go regardless */ }
+    removeAll();
+    for (const s of SIGNALS) process.removeListener(s, onSignal);
+    // Another listener (none of ours) keeps the process alive after a re-raise: exit with the code the signal would give.
+    if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+    process.exit(128 + os.constants.signals[sig]);
+  };
+  setTimeout(end, SIGNAL_CLEANUP_MS);
+  void cleanupTmp().finally(end);
+}
+for (const sig of SIGNALS) process.on(sig, onSignal);
+// The runner reads the file's report through a pipe, and it leaves first when it is interrupted: a report written after
+// that fails with EPIPE, which node:test's own handler cannot report either, so the process ended (exit code 7) with
+// neither `after` nor `exit` run, before the signal sent with the interruption was handled. A file whose runner is gone
+// has no one left to report to: it cleans up as if interrupted.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", (e: NodeJS.ErrnoException) => {
+    if (e.code === "EPIPE") onSignal("SIGTERM");
+    else throw e;
+  });
+}
