@@ -134,13 +134,27 @@ export function skillContentSha(content: string, files: Array<{ path: string; co
  * A skill row as stored now, or null when the row is gone: SKILL.md, its fingerprint (with its files), and a stamp
  * that also covers the description and the version, for telling whether anything changed since.
  */
-async function readSkillSnapshot(q: Querier, skillId: number): Promise<{ content: string; sha: string; stamp: string } | null> {
-  const row = (await q("SELECT content, description, version FROM claw_skills WHERE id = $1", [skillId])).rows[0];
+async function readSkillSnapshot(q: Querier, skillId: number): Promise<SkillSnapshot | null> {
+  // One statement, so the row and its files are one consistent read.
+  const row = (await q(
+    `SELECT s.content, s.description, s.version,
+            COALESCE((SELECT json_agg(json_build_object('path', f.file_path, 'content', f.content, 'is_binary', f.is_binary,
+                                                        'size_bytes', f.size_bytes) ORDER BY f.file_path)
+                        FROM claw_skill_files f WHERE f.skill_id = s.id), '[]'::json) AS files
+       FROM claw_skills s WHERE s.id = $1`,
+    [skillId],
+  )).rows[0];
   if (!row) return null;
-  const files = (await q("SELECT file_path, content, is_binary FROM claw_skill_files WHERE skill_id = $1", [skillId])).rows
-    .map((f: any) => ({ path: f.file_path, content: f.content, is_binary: !!f.is_binary }));
+  const files = (row.files as any[]).map((f) => ({ path: f.path, content: f.content, is_binary: !!f.is_binary, size_bytes: Number(f.size_bytes) }));
   const sha = skillContentSha(row.content || "", files);
-  return { content: row.content || "", sha, stamp: `${sha}\0${row.version}\0${row.description ?? ""}` };
+  return { content: row.content || "", files, sha, stamp: `${sha}\0${row.version}\0${row.description ?? ""}` };
+}
+
+interface SkillSnapshot {
+  content: string;
+  files: Array<{ path: string; content: string; is_binary: boolean; size_bytes: number }>;
+  sha: string;
+  stamp: string;
 }
 
 async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
@@ -396,13 +410,24 @@ async function hasProbationRoom(userId: string, q: Querier = db.query): Promise<
  */
 async function skillCapacityProblem(q: Querier, skillId: number): Promise<SkillWriteRefused | null> {
   const row = (await q(
-    `SELECT octet_length(s.content) AS main,
+    `SELECT octet_length(s.content) AS main, char_length(s.content) AS main_chars,
+            char_length(COALESCE(s.description, '')) AS desc_chars,
             (SELECT COALESCE(SUM(size_bytes), 0) FROM claw_skill_files f WHERE f.skill_id = s.id) AS files,
+            (SELECT COALESCE(MAX(size_bytes), 0) FROM claw_skill_files f WHERE f.skill_id = s.id) AS largest,
             (SELECT COUNT(*) FROM claw_skill_files f WHERE f.skill_id = s.id) AS n
        FROM claw_skills s WHERE s.id = $1`,
     [skillId]
   )).rows[0];
   if (!row) return null;
+  if (Number(row.main_chars) > SKILL_MD_MAX_CHARS) {
+    return { ok: false, error: "too_large", message: `SKILL.md is too long (max ${SKILL_MD_MAX_CHARS} characters)` };
+  }
+  if (Number(row.desc_chars) > SKILL_DESCRIPTION_MAX_CHARS) {
+    return { ok: false, error: "too_large", message: `description is too long (max ${SKILL_DESCRIPTION_MAX_CHARS} characters)` };
+  }
+  if (Number(row.largest) > SKILL_FILE_MAX_BYTES) {
+    return { ok: false, error: "too_large", message: `a file is over ${SKILL_FILE_MAX_BYTES} bytes` };
+  }
   const total = Number(row.main) + Number(row.files);
   if (total > SKILL_TOTAL_MAX_BYTES) {
     return { ok: false, error: "too_large", message: `skill total size would be ${total} bytes, over ${SKILL_TOTAL_MAX_BYTES} (SKILL.md and its files together)` };
@@ -1810,15 +1835,12 @@ async function getEvolveEvidence(
 }
 
 /** Render sub-files list for the evolve prompt. */
-async function renderSubFilesForPrompt(skillId: number): Promise<string> {
-  const rows = (await db.query(
-    "SELECT file_path, size_bytes, content FROM claw_skill_files WHERE skill_id = $1 ORDER BY file_path",
-    [skillId]
-  )).rows;
-  if (!rows.length) return "(none)";
-  return rows.map((r: any) => {
+/** The supporting files as the evolution prompt shows them, from the snapshot the batch is later checked against. */
+function renderSubFilesForPrompt(files: SkillSnapshot["files"]): string {
+  if (!files.length) return "(none)";
+  return files.map((r) => {
     const preview = (r.content || "").slice(0, 600);
-    return `- ${r.file_path} (${r.size_bytes} bytes)\n\`\`\`\n${preview}\n\`\`\``;
+    return `- ${r.path} (${r.size_bytes} bytes)\n\`\`\`\n${preview}\n\`\`\``;
   }).join("\n");
 }
 
@@ -1867,7 +1889,7 @@ export async function maybeEvolveSkill(sessionId: string, userId: string, event:
     // from a prior version that already evolved away from the failures.
     const stats = await getSkillStats(skillName, userId, 7, activeSkill.version);
     const evidence = await getEvolveEvidence(skillName, userId, activeSkill.version);
-    const subFiles = await renderSubFilesForPrompt(activeSkill.id);
+    const subFiles = renderSubFilesForPrompt(snapshot.files);
     const existingSkillNames = await getUserSkillNames(userId);
 
     try {
@@ -1881,7 +1903,7 @@ export async function maybeEvolveSkill(sessionId: string, userId: string, event:
         existing_skills: existingSkillNames.filter(n => n !== skillName).join(", ") || "(none)",
       });
 
-      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision, snapshot.stamp);
+      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision, snapshot);
     } catch (err) {
       logger.error({ err, skillName, sessionId }, "skill.evolution_failed");
     }
@@ -1915,9 +1937,9 @@ interface MutationValidation {
  */
 async function validateMutation(
   m: Mutation,
-  userId: string,
   skillName: string,
   currentContent: string,
+  fileAsRead: (path: string) => { content: string } | null,
 ): Promise<{ ok: true; validation: MutationValidation } | { ok: false; error: string }> {
   if (m.type === "optimize_description") {
     if (!m.new_description) return { ok: false, error: "optimize_description missing new_description" };
@@ -1944,7 +1966,7 @@ async function validateMutation(
     if (Buffer.byteLength(m.new_content, "utf8") > SKILL_FILE_MAX_BYTES) return { ok: false, error: "improve_file too large" };
     const blocked = autoSkillBlocked(m.new_content, SKILL_FILE_MAX_BYTES);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
-    const existing = await getSkillFile(userId, skillName, m.file_path);
+    const existing = fileAsRead(m.file_path);
     if (!existing) return { ok: false, error: `improve_file: '${m.file_path}' not found` };
     return { ok: true, validation: {
       mutation: m, previousContent: existing.content,
@@ -1960,7 +1982,7 @@ async function validateMutation(
     }
     const blocked = autoSkillBlocked(m.content, SKILL_FILE_MAX_BYTES);
     if (blocked) return { ok: false, error: `safety scan blocked: ${blocked}` };
-    const existing = await getSkillFile(userId, skillName, m.file_path);
+    const existing = fileAsRead(m.file_path);
     if (existing) return { ok: false, error: `add_file: '${m.file_path}' already exists; use improve_file` };
     return { ok: true, validation: {
       mutation: m, previousContent: null,
@@ -1973,7 +1995,7 @@ async function validateMutation(
     if (currentContent.includes(m.file_path)) {
       return { ok: false, error: `delete_file: '${m.file_path}' is referenced by SKILL.md` };
     }
-    const existing = await getSkillFile(userId, skillName, m.file_path);
+    const existing = fileAsRead(m.file_path);
     if (!existing) return { ok: false, error: `delete_file: '${m.file_path}' not found` };
     return { ok: true, validation: {
       mutation: m, previousContent: existing.content,
@@ -2008,9 +2030,12 @@ async function applyEvolveBatch(
   currentContent: string,
   activeId: number,
   decision: EvolveDecision,
-  /** The skill's snapshot stamp when the LLM read it: a skill changed since then is left alone. */
-  readStamp: string,
+  /** The skill as the LLM read it: a skill changed since then is left alone, and every file read is from this. */
+  snapshot: SkillSnapshot,
 ): Promise<void> {
+  const readStamp = snapshot.stamp;
+  const snapFiles = new Map(snapshot.files.map((f) => [f.path, f.content]));
+  const fileAsRead = (path: string): { content: string } | null => (snapFiles.has(path) ? { content: snapFiles.get(path)! } : null);
   const mutations = decision.mutations || [];
   if (!mutations.length) {
     logger.info({ skillName, reason: decision.reason }, "skill.evolution_skipped");
@@ -2042,11 +2067,11 @@ async function applyEvolveBatch(
   for (const m of mutations) {
     if (m.type === "add_file") cumulativeDelta += Buffer.byteLength(m.content, "utf8");
     if (m.type === "delete_file") {
-      const ex = await getSkillFile(userId, skillName, m.file_path);
+      const ex = fileAsRead(m.file_path);
       if (ex) cumulativeDelta -= Buffer.byteLength(ex.content, "utf8");
     }
     if (m.type === "improve_file") {
-      const ex = await getSkillFile(userId, skillName, m.file_path);
+      const ex = fileAsRead(m.file_path);
       if (ex) cumulativeDelta += (Buffer.byteLength(m.new_content, "utf8") - Buffer.byteLength(ex.content, "utf8"));
     }
   }
@@ -2065,7 +2090,7 @@ async function applyEvolveBatch(
   // === Validate pass (no LLM, just data checks + baseline gathering) ===
   const validations: MutationValidation[] = [];
   for (let i = 0; i < mutations.length; i++) {
-    const r = await validateMutation(mutations[i], userId, skillName, currentContent);
+    const r = await validateMutation(mutations[i], skillName, currentContent, fileAsRead);
     if (!r.ok) {
       logger.warn({ skillName, idx: i, err: r.error }, "skill.evolution_batch_rejected_validate");
       return; // all-or-nothing: any reject kills the batch
@@ -2456,6 +2481,7 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
       }
       const over = await skillCapacityProblem(tq, current.id);
       if (over) throw new Error(`rollback refused: ${over.message}`);
+      await refreshContentSha(tq, current.id);
       await client.query("COMMIT");
       logger.info({ skillName, undone: undoneCount, mode: "batch" }, "skill.manual_rollback");
       return true;
@@ -2541,6 +2567,7 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
       );
       const over = await skillCapacityProblem(q, current.id);
       if (over) throw new Error(`rollback refused: ${over.message}`);
+      await refreshContentSha(q, current.id);
       return true;
     });
     if (!done) return false;

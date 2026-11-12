@@ -397,7 +397,8 @@ describe("personal skills: save", { skip }, () => {
     let raced = false;
     (dbm.db as any).query = async (text: string, params?: unknown[]) => {
       const out = await (realQuery as any)(text, params);
-      if (!raced && /FROM claw_skill_files WHERE skill_id/.test(text)) {
+      // The rollback's read of the skill (its snapshot, SKILL.md with the files in one statement).
+      if (!raced && /json_agg/.test(text) && /FROM claw_skill_files f/.test(text)) {
         raced = true;
         await realQuery("UPDATE claw_skills SET content = 'the user''s newer text', version = 3 WHERE skill_name = 'rb'");
       }
@@ -424,6 +425,12 @@ describe("personal skills: save", { skip }, () => {
                SELECT 1, 'alice', 'references/f' || i || '.md', 'x', 1 FROM generate_series(1, $1::int) AS i`, [files]);
     };
     await seed(svc.SKILL_FILES_MAX + 1);
+    assert.equal((await rest("POST", "/v1/users/me/skills/legacy/rollback")).status, 400);
+    assert.deepEqual((await q("SELECT version, status FROM claw_skills ORDER BY version")).map((r) => [r.version, r.status]), [[1, "archived"], [2, "active"]]);
+
+    // Every limit, not only the count: an earlier SKILL.md one character too long is refused as well.
+    await seed(0);
+    await q("UPDATE claw_skills SET content = repeat('x', $1::int) WHERE version = 1", [svc.SKILL_MD_MAX_CHARS + 1]);
     assert.equal((await rest("POST", "/v1/users/me/skills/legacy/rollback")).status, 400);
     assert.deepEqual((await q("SELECT version, status FROM claw_skills ORDER BY version")).map((r) => [r.version, r.status]), [[1, "archived"], [2, "active"]]);
 
