@@ -91,7 +91,7 @@ export function withoutRule(text: string): string {
  */
 export function messageContent(text: string, rule: string, withRuleTool: boolean, channel: string): string {
   const sections = [
-    ...(withRuleTool ? [changeSection(channel).replace(/^\n+|\n+$/g, "")] : []),
+    ...(withRuleTool ? [`${changeHeading(channel)}\n\n${CHANGE_SUMMARY_RULE}`] : []),
     ...(rule === "" ? [] : [`${ruleHeading(channel)}\n\n${rule}`]),
   ];
   return [text, ...sections].join("\n\n");
