@@ -111,6 +111,18 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611130054` (commit cf083e95). A MINOR release: personal skills get their own switch
+and a new storage and audit model, assistant messages return to the chat surface they came from (a new `surface` field on
+notification subscriptions), and the API gains `CLAW_API_BACKGROUND`. Schema, all additive and added at start-up:
+`claw_notification_subscriptions.surface`, `claw_assistant_surfaces`, five `claw_skills` columns, `claw_skill_events`
+and `claw_skill_drafts`. Connector requirements unchanged from 0.1.0.
+
+Data-loss fixes: a workspace restore that failed can no longer make the next save delete the session's saved files
+(#804), and a workspace past about a thousand files is restored in batches instead of coming back empty (#805). Prompt
+change: the assistant's worker prompt is now `worker-v12` (`worker-v13` with the discipline switch on) (#813).
+
 ### Added
 
 - `CLAW_API_BACKGROUND` (`on` by default, or `off`): off, the API answers HTTP and starts no background loop -- no
@@ -161,6 +173,18 @@ release version, and its `appVersion` stays `latest`.
   `teams`, and an older worker, which names none, is `teams` too. Outbox, signing, retries, redelivery and the say caps
   are unchanged. Schema: `claw_notification_subscriptions.surface` (default `'teams'`) and the new table
   `claw_assistant_surfaces`, both added at start-up; no new setting (#787).
+- A router turn picks the assistant plugin's reply-style rule and its own wording by the chat app the message came
+  through (`channel_context.channel`): `teams-reply-style` and "In Teams people call you Clawy" for Teams, the generic
+  `chat-reply-style` and "in the chat" for any other channel. A message that names no channel (a Teams worker from
+  before it did) keeps Teams' rule and words, so nothing changes for Teams. Before a chat app other than Teams goes
+  live, add a `chat-reply-style` rule to the assistant plugin (`CLAW_ASSISTANT_PLUGIN_ID`); without it such a turn gets
+  no reply-style rule. No schema change, no new setting (#790).
+- The assistant's worker prompt (`worker-v12`; `worker-v13` with the discipline switch on) makes a GitHub write that
+  leaves the same state however often it runs (a star or unstar, a watch, a label) the first command when the task
+  asks only for it, with no read of the current state before it, and checks after the write; such a request's card
+  came at 8.5-17.7 s instead of 2.5-3.9 s. The router's `work_create` tool says its `repo` is cloned into the worker's
+  workspace first, so it is passed only when the work reads or changes that repository's files, not for API-only
+  actions (a clone took 27.8-32.3 s before the worker's first step). No schema change, no new setting (#813).
 
 ### Fixed
 
@@ -175,7 +199,7 @@ release version, and its `appVersion` stays `latest`.
   word, ending in "…" (never inside an emoji or a combined character), instead of cutting the whole line at 40 characters
   ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
   the word crossing them whole, and the title runs past 40. An item an older Claw titled is renamed on its next request, as
-  before. No schema change, no new setting.
+  before. No schema change, no new setting (#792).
 - A sandbox's workspace is restored from object storage in batches Hands accepts (100 files, at most 256 KiB of file
   list, a call), as the upload has long been sent, instead of in one call: a session past about a thousand files was
   refused with 413 and its workspace came back empty (measured on a 3,632-file clone). A batch that fails is retried
