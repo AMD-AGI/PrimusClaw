@@ -239,7 +239,8 @@ The settings every chat surface shares are read under the `PA_` prefix (personal
 setting is, as `TEAMS_STREAMING` says it is Teams'. Releases up to 0.7 read the names below with the `TEAMS_` prefix
 only; from 0.8.0 each is read under either name, so a deployment written for an older release starts unchanged:
 
-- The `PA_` name is read when it is set and not blank; otherwise the `TEAMS_` name; otherwise the default.
+- The `PA_` name is read when it is set and not blank; otherwise the `TEAMS_` name, when it is set; otherwise the `PA_`
+  name as it is (unset takes the default; a blank value reads as that setting reads a blank one).
 - A `TEAMS_` name in use is named in one warning at start, with its `PA_` replacement (`deprecated setting names:
 TEAMS_DB_PATH (now PA_DB_PATH), ...`); a `TEAMS_` name set beside its `PA_` name gets a warning that it is ignored.
   No value is ever logged.

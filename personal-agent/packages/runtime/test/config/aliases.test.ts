@@ -99,6 +99,11 @@ describe("the worker's setting names", () => {
     assert.equal(settingSource({ TEAMS_DB_PATH: "" }, "PA_DB_PATH"), "TEAMS_DB_PATH");
     assert.equal(settingSource({}, "TEAMS_DB_PATH"), "PA_DB_PATH");
     assert.equal(readSettings({ ...BASE, PA_ENCRYPTION_KEYS: "k" }).dbPath, "/data/state.db");
+    // (with neither TEAMS_ name set, a blank PA_ value reads as the same blank TEAMS_ value always did)
+    assert.equal(
+      readSettings({ ...BASE, PA_ENCRYPTION_KEYS: "k", PA_DB_PATH: "" }).dbPath,
+      readSettings({ ...BASE, PA_ENCRYPTION_KEYS: "k", TEAMS_DB_PATH: "" }).dbPath,
+    );
   });
 });
 
