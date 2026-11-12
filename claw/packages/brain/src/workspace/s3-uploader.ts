@@ -24,6 +24,7 @@ import {
   isRestoreHeld,
   planUploadDelta,
   seedSyncManifest,
+  withoutAddresses,
 } from "./sync-delta.js";
 import {
   configuredGitLimits,
@@ -822,26 +823,23 @@ export async function syncWorkspaceToS3(
   const unchanged = delta?.unchanged ?? 0;
   let withheld = 0;
   if (restoreHeld) {
-    // Nothing the session has saved may be replaced: not in the prefix written
-    // here, and not in the session's own prefix either when this is another one --
-    // the in-flight checkpoint's, which a failed terminal save copies over the
-    // session's (`copyS3Prefix`), so a file it took from the new sandbox would
-    // replace the session's there. A prefix that cannot be listed gets nothing.
+    // Nothing the session has saved may be replaced. Into the session's own
+    // prefix, that means only files it has no object for, and a prefix that cannot
+    // be listed gets nothing. Into any other -- the in-flight checkpoint's -- it
+    // means nothing at all: a failed terminal save copies that whole prefix over
+    // the session's (`copyS3Prefix`), objects an earlier attempt left there
+    // included. What that costs is the new files of a held sandbox whose terminal
+    // save then fails as well; the held terminal save is what keeps them.
     const sessionPrefix = `users/${userId}/sessions/${sessionId}/`;
-    const prefixes = s3Prefix === sessionPrefix ? [s3Prefix] : [s3Prefix, sessionPrefix];
-    const saved = new Set<string>();
-    let listed = true;
-    for (const prefix of prefixes) {
-      try {
-        for (const k of await listPrefixKeys(prefix)) saved.add(k.slice(prefix.length));
-      } catch (e: unknown) {
-        logger.warn({ sessionId, prefix, err: (e as { message?: string })?.message ?? String(e) },
+    let saved: Set<string> | null = null;
+    if (s3Prefix === sessionPrefix) {
+      saved = await listPrefixKeys(s3Prefix).catch((e: unknown) => {
+        logger.warn({ sessionId, s3Prefix, err: (e as { message?: string })?.message ?? String(e) },
           "s3.sync.held_listing_failed");
-        listed = false;
-        break;
-      }
+        return null;
+      });
     }
-    pending = listed ? files.filter((f) => !saved.has(localPathToS3Key(f, ""))) : [];
+    pending = saved ? files.filter((f) => !saved.has(localPathToS3Key(f, s3Prefix))) : [];
     withheld = files.length - pending.length;
     logger.warn(
       { sessionId, s3Prefix, listed: files.length, adding: pending.length, withheld },
@@ -1060,12 +1058,12 @@ async function downloadRound(
  * A restore that ran out of retries with files still missing. Thrown, like any
  * other restore failure, so the caller tells the user: the files that did not
  * come back are in S3 and not in /workspace. The message carries the first
- * failure's error (a 413, say), which is what the caller's reason is read from;
- * any URL in it is cut out, since a presigned one is a credential.
+ * failure's error (a 413, say), which is what the caller's reason is read from,
+ * without the addresses in it (`withoutAddresses`).
  */
 export class WorkspaceRestoreIncomplete extends Error {
   constructor(readonly restored: number, readonly total: number, readonly failed: number, firstError = "") {
-    const first = firstError.replace(/https?:\/\/\S+/g, "<url>").slice(0, 200);
+    const first = withoutAddresses(firstError).slice(0, 200);
     super(`workspace restore incomplete: restored=${restored}/${total}, failed=${failed}${first ? `; first: ${first}` : ""}`);
     this.name = "WorkspaceRestoreIncomplete";
   }

@@ -1297,20 +1297,22 @@ test("R5 a sandbox whose restore succeeded still prunes what its user deleted", 
   assert.equal(saved.filter((k) => store.objects.has(k)).length, 533);
 });
 
-test("R7 a held in-flight checkpoint does not take a file the session has saved, so its recovery copy cannot replace it", async () => {
-  // A failed terminal save copies the in-flight checkpoint over the session prefix
-  // (copyS3Prefix), so a checkpoint that took the new sandbox's f1.txt would put it
-  // over the session's.
+test("R7 a held sandbox puts nothing into the in-flight checkpoint, whose recovery copy would replace the session's files", async () => {
+  // A failed terminal save copies the in-flight checkpoint prefix over the session
+  // prefix (copyS3Prefix) -- whatever the prefix holds, including objects an
+  // earlier attempt of the same message left there. A held sandbox's checkpoint
+  // would be the new sandbox's f1.txt, or the cue that copies a stale one.
   const saved = savedSession();
   const sb = freshSandbox();
   sb.downloadThrows = "Request failed with status code 413";
   await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"));
-  const ckpt = "users/user-1/checkpoints/sess-1/msg-1/";
+  const ckpt = "users/user-1/checkpoints/sess-1/msg-1/inflight/";
+  store.objects.add(`${ckpt}f2.txt`); // left by an earlier attempt
   const r = await sb.sync(ckpt);
-  assert.equal(r.withheld, 1, "f1.txt is the session's, though the checkpoint prefix has never seen it");
-  assert.ok(!sb.uploaded.includes("/workspace/f1.txt"));
-  assert.ok(!store.objects.has(`${ckpt}f1.txt`));
-  assert.ok(store.objects.has(`${ckpt}clone/c0.txt`), "what is new still goes into the checkpoint");
+  assert.equal(r.withheld, 52, "every file is withheld from a checkpoint");
+  assert.deepEqual(sb.uploaded, []);
+  assert.equal(syncLeftSnapshot(r), false, "so the run has no checkpoint to recover from");
+  assert.deepEqual([...store.objects].filter((k) => k.startsWith(ckpt)), [`${ckpt}f2.txt`]);
   for (const k of saved) assert.ok(store.objects.has(k));
 });
 

@@ -138,11 +138,12 @@ test("a restore that came back incomplete is reported under its own reason", asy
 test("the event names no address: not the sandbox's, not a presigned URL", async () => {
   const { WorkspaceRestoreIncomplete } = await import("../src/workspace/s3-uploader.js");
   const { restoreFailed } = await runOnNewSandbox(() => Promise.reject(new Error(
-    "fetch failed for http://10.0.0.7:8080/mcp while fetching https://s3.example/b/k?X-Amz-Signature=abc",
+    "fetch failed for http://10.0.0.7:8080/mcp while fetching https://s3.example/b/k?X-Amz-Signature=abc; "
+    + "connect ECONNREFUSED 10.0.0.8:9000 via hands-abc.claw-sandboxes.svc.cluster.local:8080",
   )));
   assert.equal(restoreFailed.length, 1);
-  assert.doesNotMatch(String(restoreFailed[0].message), /10\.0\.0\.7|X-Amz-Signature|https?:/);
-  assert.match(String(restoreFailed[0].message), /fetch failed for <url>/);
+  assert.doesNotMatch(String(restoreFailed[0].message), /10\.0\.0\.[78]|X-Amz-Signature|https?:|\.svc/);
+  assert.match(String(restoreFailed[0].message), /fetch failed for <url>.*ECONNREFUSED <address> via <address>/);
 
   const incomplete = new WorkspaceRestoreIncomplete(0, 3, 3, "HTTP 413 from https://s3.example/b/k?X-Amz-Signature=abc");
   assert.match(incomplete.message, /failed=3; first: HTTP 413 from <url>/);

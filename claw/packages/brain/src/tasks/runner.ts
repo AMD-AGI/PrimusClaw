@@ -23,7 +23,7 @@ import {
   syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
   TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
-import { invalidateSyncManifest } from "../workspace/sync-delta.js";
+import { invalidateSyncManifest, withoutAddresses } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
 import { cutDrainedCalls } from "../agent/drain-shield.js";
@@ -3262,7 +3262,7 @@ class TaskRunner {
       const reason = workspaceTransferFailureReason(e, errMsg);
       // The user is told what went wrong, never where: a sandbox's address is
       // internal and a presigned URL is a credential.
-      const shown = errMsg.replace(/https?:\/\/\S+/g, "<url>");
+      const shown = withoutAddresses(errMsg);
       metrics.onWorkspaceRestore("failed");
       logger.warn({ err: e, sessionId: this.sessionId, site, reason }, "s3.restore_failed");
       await this.onEvent({

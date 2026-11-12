@@ -389,6 +389,19 @@ function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): 
  */
 export const RESTORE_HOLD_PATH = `${SYNC_STATE_DIR}/restore-incomplete`;
 
+/**
+ * An error's text with the addresses in it cut out, for anything a user or the
+ * sandbox is shown: a URL (a presigned one is a credential), an IP address with
+ * or without its port, and a cluster service name -- a sandbox's address is
+ * internal.
+ */
+export function withoutAddresses(text: string): string {
+  return text
+    .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "<address>")
+    .replace(/\b[\w.-]+\.svc(?:\.cluster\.local)?(?::\d+)?\b/g, "<address>");
+}
+
 const RESTORE_HELD_MAX_SANDBOXES = 1024;
 /** Sandboxes (by `HandsClient.generation`) this process saw fail a restore; bounded like `unneutralised`. */
 const restoreHeld = new Set<string>();
@@ -408,7 +421,7 @@ export async function holdAfterFailedRestore(hands: HandsClient, reason: string)
     const out = await withHandsTimeout<string>(
       hands,
       "write",
-      { path: RESTORE_HOLD_PATH, contents: `${JSON.stringify({ reason: reason.slice(0, 200), at: Date.now() })}\n` },
+      { path: RESTORE_HOLD_PATH, contents: `${JSON.stringify({ reason: withoutAddresses(reason).slice(0, 200), at: Date.now() })}\n` },
       (STATE_TIMEOUT_SEC + 5) * 1000,
     );
     // `write` reports a failure as text rather than by throwing.
