@@ -53,7 +53,11 @@ it("no reply style rides on the message and no plugin without claw plugin id", a
   const w = await AssistantWorld.start();
   await w.say("hello");
   const [heard] = w.claw.heard;
-  assert.deepEqual([heard?.text, heard?.context, heard?.plugin, heard?.modelKey], ["hello", undefined, undefined, ""]);
+  // (the context names only the surface the message came from)
+  assert.deepEqual(
+    [heard?.text, heard?.context, heard?.plugin, heard?.modelKey],
+    ["hello", { channel: "teams" }, undefined, ""],
+  );
 });
 
 it("each user talks to their own assistant with their own key", async () => {

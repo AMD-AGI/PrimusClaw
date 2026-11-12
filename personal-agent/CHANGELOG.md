@@ -43,6 +43,14 @@ port (core's `src/plugins/`), setting or store change; works with any Claw.
 - The notification subscription's `surface` (#787) is the worker's surface's own id (`SurfaceShape.surfaceId`, Teams'
   `teams`), no longer a fixed `teams` in the worker.
 
+### Fixed
+
+- `@primusclaw/personal-agent`: every message to the assistant names the surface it came from
+  (`channel_context.channel`, the surface's `SurfaceCaps.channel`), not only a message the assistant reads first
+  (`TEAMS_ASSISTANT_UNDERSTANDING`). Claw sends a turn's replies back to that surface (#787); without it a message from a
+  second surface was taken as Teams', so a person on both got the reply in Teams. On Teams nothing changes: Claw already
+  read a message that names no surface as Teams'.
+
 ## 0.7.2
 
 A patch release: one fix (#785). No plugin port (core's `src/plugins/`) and no store change; works with any Claw.
