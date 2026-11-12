@@ -465,6 +465,8 @@ export class ApprovalBroker {
         timeout_ms: q.waitMs, origin: "terminal_hook", cwd: q.cwd,
         // Cursor asks at the terminal only once the card is answered or its time is up (cursor-approvals.ts), not meanwhile.
         ...(q.agent === "cursor" ? { terminal_asks: "after_card" } : {}),
+        // Codex shows its own prompt once the owner types at the terminal (approval-hook.ts), not as soon as it asks.
+        ...(q.agent === "codex" ? { terminal_asks: "on_input" } : {}),
         ...(c.spec.questionCount ? { question_index: c.spec.questionIndex, question_count: c.spec.questionCount } : {}),
       });
     }

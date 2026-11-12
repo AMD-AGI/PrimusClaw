@@ -112,6 +112,16 @@ describe("the broker, for a Codex conversation", () => {
     assert.deepEqual(replies, [{ v: 1, decision: { behavior: "allow" } }]);
   });
 
+  test("Codex's card says the terminal asks once the owner types there; Claude Code's card says nothing of it", async () => {
+    const codex = rig();
+    await codex.broker.ask(req("Bash", { command: "ls /root" }), "/home/u/.codex", () => {}, "codex");
+    assert.equal(codex.cards()[0]!.data.terminal_asks, "on_input");
+    const claude = rig();
+    await claude.broker.ask(req("Bash", { command: "ls /root" }), "/home/u/.claude", () => {});
+    assert.equal(claude.cards().length, 1);
+    assert.equal("terminal_asks" in claude.cards()[0]!.data, false);
+  });
+
   test("a question in bypass mode (approval policy never) puts no card out and leaves Codex alone", async () => {
     const r = rig();
     const replies: ConnectorReply[] = [];

@@ -349,7 +349,7 @@ export function uninstallCodexApprovalHooks(codexHome: string): InstallResult {
 }
 
 export function codexApprovalHooksStatus(codexHome: string): HooksStatus {
-  return approvalEntriesStatus(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => h.event), codexHome, "hooks install --codex");
+  return approvalEntriesStatus(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => h.event), codexHome, "hooks install --agent codex");
 }
 
 // --- Cursor's approval hooks (cursor-approvals.ts) ---------------------------------------
