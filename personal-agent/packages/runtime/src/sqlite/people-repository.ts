@@ -157,12 +157,15 @@ export class SqliteHeldEventRepository implements HeldEventRepository {
     const { db } = this.ctx;
     const now = this.ctx.now();
     db.run("DELETE FROM held_events WHERE held_at < ?", now - HELD_TTL_SECONDS);
-    db.run(
-      "INSERT OR IGNORE INTO held_events (event_id, aad_id, event_json, held_at) VALUES (?, ?, ?, ?)",
-      pyStr(event["event_id"]),
-      userId,
-      pyJsonDumps(event),
-      now,
+    // (synced: the event endpoint answers Claw that a held event was taken, and Claw never sends it again)
+    db.durably(() =>
+      db.run(
+        "INSERT OR IGNORE INTO held_events (event_id, aad_id, event_json, held_at) VALUES (?, ?, ?, ?)",
+        pyStr(event["event_id"]),
+        userId,
+        pyJsonDumps(event),
+        now,
+      ),
     );
     db.run(
       "DELETE FROM held_events WHERE aad_id = ? AND event_id NOT IN " +
