@@ -442,15 +442,23 @@ test("P13 a skill changed between its SKILL.md and its files is refused whole, n
   }
 });
 
-test("P14 where the sandbox's shell cannot remove the copy, the write goes on and the run empties every file it wrote", async () => {
+test("P14 where the sandbox's shell cannot remove the copy, the write goes on, and every file under .personal-skills is emptied, an earlier run's too", async () => {
   resetStore();
   const h = fakeHands();
+  const ROOT = "/workspace/.skills/.personal-skills";
+  // What an interrupted earlier run left: a file the current version no longer has, and a skill since deleted.
+  const leftover = [`${ROOT}/weekly-report/old-notes.md`, `${ROOT}/gone-skill/SKILL.md`];
   const denied = {
     ...h,
     async callTool(name: string, args: Record<string, unknown>) {
       h.calls.push({ name, args });
-      // A shell under a per-run identity: what the sandbox's own `write` created is not its to remove.
-      if (name === "bash" && String(args.command).startsWith("rm -rf")) return "exit 1\nstdout: \nstderr: rm: cannot remove '/workspace/.skills/.personal-skills/weekly-report/SKILL.md': Permission denied";
+      const cmd = String(args.command ?? "");
+      // A shell under a per-run identity: what the sandbox's own `write` created is not its to remove, but it can list it.
+      if (name === "bash" && cmd.startsWith("rm -rf")) return "exit 1\nstdout: \nstderr: rm: cannot remove: Permission denied";
+      if (name === "bash" && cmd.includes("CLAW_LS_BEGIN")) {
+        const dir = cmd.match(/find '([^']+)'/)![1];
+        return `CLAW_LS_BEGIN\n${leftover.filter((f) => f.startsWith(`${dir}/`)).join("\n")}\nCLAW_LS_END\n`;
+      }
       return "ok";
     },
   };
@@ -458,13 +466,19 @@ test("P14 where the sandbox's shell cannot remove the copy, the write goes on an
     { tool: "bash", input: { command: "bash /workspace/.skills/.personal-skills/weekly-report/scripts/collect.sh" } },
     { text: "done" },
   ], denied as never);
-  const script = r.calls.findIndex((c) => c.name === "bash" && String(c.args.command).includes("collect.sh") && !String(c.args.command).startsWith("rm"));
-  assert.ok(script >= 0, "the command ran: a copy that could not be cleaned first does not fail it");
-  const emptied = r.calls.map((c, at) => ({ c, at })).filter(({ c }) => c.name === "write" && c.args.contents === "");
-  assert.deepEqual(emptied.map(({ c }) => String(c.args.path)).sort(), [
-    ".skills/.personal-skills/weekly-report/SKILL.md",
-    ".skills/.personal-skills/weekly-report/assets/logo.png",
-    ".skills/.personal-skills/weekly-report/scripts/collect.sh",
-  ], "every file the run wrote is emptied");
-  assert.ok(emptied.every(({ at }) => at > script), "when the run ends");
+  const calls = r.calls.map((c, at) => ({ c, at }));
+  const script = calls.find(({ c }) => c.name === "bash" && String(c.args.command).includes("collect.sh") && !String(c.args.command).startsWith("rm"))!.at;
+  const uploads = calls.filter(({ c }) => c.name === "write" && c.args.contents !== "");
+  const emptied = calls.filter(({ c }) => c.name === "write" && c.args.contents === "");
+  assert.ok(script > 0, "the command ran: a copy that could not be removed first does not fail it");
+  const before = emptied.filter(({ at }) => at < uploads[0].at).map(({ c }) => String(c.args.path));
+  assert.deepEqual(before, [`${ROOT}/weekly-report/old-notes.md`], "before the write: the older version's file is emptied");
+  const after = emptied.filter(({ at }) => at > script).map(({ c }) => String(c.args.path)).sort();
+  assert.deepEqual(after, [
+    `${ROOT}/gone-skill/SKILL.md`,
+    `${ROOT}/weekly-report/SKILL.md`,
+    `${ROOT}/weekly-report/assets/logo.png`,
+    `${ROOT}/weekly-report/old-notes.md`,
+    `${ROOT}/weekly-report/scripts/collect.sh`,
+  ], "when the run ends: every file there, this run's and an earlier one's");
 });

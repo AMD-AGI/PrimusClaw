@@ -92,3 +92,27 @@ test("L7 the hint: personal ones after the platform's under their own heading, w
   assert.match(noLoad, /when the user names one, read \/workspace\/\.skills\/\.personal-skills\/<name>\/SKILL\.md\)/);
   assert.equal(buildProgressiveSkillHint(platform(2, 20), "/workspace").includes("Personal Skills"), false, "none: no heading");
 });
+
+test("L8 the emptying fallback, with a real shell: every file under the directory, at any depth, is emptied through write", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { tmpDir } = await import("../../utils/test/tmp-dirs.js");
+  const { emptySandboxFiles } = await import("../src/agent/platform-defaults.js");
+  const root = path.join(tmpDir("personal-empty-"), "it's .personal-skills");
+  const files = ["a/SKILL.md", "a/scripts/run.sh", "b c/SKILL.md"].map((f) => path.join(root, f));
+  for (const f of files) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, "SECRET-TEXT"); }
+  const outside = path.join(path.dirname(root), "keep.md");
+  fs.writeFileSync(outside, "KEEP");
+  const hands = {
+    async callTool(name: string, args: Record<string, unknown>) {
+      if (name === "bash") return spawnSync("bash", ["-c", String(args.command)], { encoding: "utf8" }).stdout;
+      if (name === "write") { fs.writeFileSync(String(args.path), String(args.contents)); return `Written to ${String(args.path)}`; }
+      return "";
+    },
+  };
+  const failed = await emptySandboxFiles(hands as never, root, []);
+  assert.equal(failed, 0);
+  for (const f of files) assert.equal(fs.readFileSync(f, "utf8"), "", `${f} emptied`);
+  assert.equal(fs.readFileSync(outside, "utf8"), "KEEP", "nothing outside the directory");
+});

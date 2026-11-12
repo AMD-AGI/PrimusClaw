@@ -473,8 +473,9 @@ export class LazyDefaultSkills {
    * The next turn that needs one writes it again. Best effort; never throws.
    *
    * Removed with bash. Where the sandbox runs the model's commands under an identity of their own
-   * (HANDS_CHILD_UID_MIN/MAX), that identity cannot remove what the sandbox's `write` created; then each file this run
-   * wrote is overwritten with nothing through `write`, which can, so no text of a skill is left either way.
+   * (HANDS_CHILD_UID_MIN/MAX), that identity cannot remove what the sandbox's `write` created; then every file under
+   * `.personal-skills` (as the shell lists them, which it can, and every one this run wrote) is overwritten with nothing
+   * through `write`, which can, so no text of a skill is left either way, an earlier run's included.
    */
   async removePersonal(): Promise<void> {
     const dir = path.posix.join(this.sessionDir, ".skills", PERSONAL_SKILLS_DIR);
@@ -485,15 +486,8 @@ export class LazyDefaultSkills {
       } catch (err) {
         logger.info({ err: (err as Error).message }, "skill.user_remove_by_shell_failed");
       }
-      let failed = 0;
-      for (const file of files) {
-        try {
-          await writeFileToSandbox(hands, file, "");
-        } catch {
-          failed++;
-        }
-      }
-      if (failed) logger.warn({ failed, files: files.size }, "skill.user_empty_failed");
+      const failed = await emptySandboxFiles(hands, dir, [...files].map((f) => path.posix.isAbsolute(f) ? f : path.posix.join("/workspace", f)));
+      if (failed) logger.warn({ failed }, "skill.user_empty_failed");
       else logger.info({ files: files.size }, "skill.user_emptied_in_sandbox");
     }
     this.personalWritten.clear();
@@ -515,10 +509,14 @@ export class LazyDefaultSkills {
         // before it could take it out) can hold a file this version no longer has. Where it cannot (see
         // `removePersonal`), the write goes on over what is there.
         if (!this.personalWritten.has(hands)) this.personalWritten.set(hands, new Set());
+        const skillDir = path.posix.join(this.sessionDir, sub);
         try {
-          await removeSandboxDir(hands, path.posix.join(this.sessionDir, sub));
+          await removeSandboxDir(hands, skillDir);
         } catch (err) {
+          // What cannot be removed is emptied: no file of an older version keeps its text.
           logger.info({ name: s.name, err: (err as Error).message }, "skill.user_clean_before_write_failed");
+          const failed = await emptySandboxFiles(hands, skillDir, []);
+          if (failed) logger.warn({ name: s.name, failed }, "skill.user_empty_failed");
         }
       }
       const attempt = async () => {
@@ -577,4 +575,35 @@ async function removeSandboxDir(hands: HandsClient, dir: string): Promise<void> 
   const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
   const out = await hands.callTool("bash", { command: `rm -rf -- ${quoted} && echo CLAW_RM_OK`, timeout: 30 });
   if (!String(out).includes("CLAW_RM_OK")) throw new Error(`could not remove ${dir}`);
+}
+
+/**
+ * Overwrite with nothing every file under `dir` in the sandbox (as its shell lists them) and every path in `known`
+ * (absolute), through the sandbox's `write`; a write that fails is tried once more. Returns how many could not be
+ * emptied. A listing that fails leaves `known`.
+ */
+export async function emptySandboxFiles(hands: HandsClient, dir: string, known: string[]): Promise<number> {
+  const targets = new Set(known);
+  const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
+  try {
+    const out = String(await hands.callTool("bash", { command: `echo CLAW_LS_BEGIN; find ${quoted} -type f 2>/dev/null; echo CLAW_LS_END`, timeout: 30 }));
+    const begin = out.indexOf("CLAW_LS_BEGIN\n");
+    const end = out.lastIndexOf("CLAW_LS_END");
+    if (begin >= 0 && end > begin) {
+      for (const line of out.slice(begin + "CLAW_LS_BEGIN\n".length, end).split("\n")) {
+        if (line.startsWith(`${dir}/`)) targets.add(line);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "skill.user_list_failed");
+  }
+  let failed = 0;
+  for (const file of targets) {
+    try {
+      await writeFileToSandbox(hands, file, "");
+    } catch {
+      try { await writeFileToSandbox(hands, file, ""); } catch { failed++; }
+    }
+  }
+  return failed;
 }
