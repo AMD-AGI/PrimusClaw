@@ -126,11 +126,11 @@ export class GroupRouter {
       return true;
     }
     if (github !== undefined && word === "/github") {
-      await chat.say(groupText.in(groupChosenLang(this.ctx.deps.store, chat.scope) ?? "en").githubOneToOne);
+      await chat.say(groupText.in(chat.lang()).githubOneToOne);
       return true;
     }
     if (!this.oneToOneOnly(word, words.text, remote.enabled)) return false;
-    await chat.say(groupText.in(groupChosenLang(this.ctx.deps.store, chat.scope) ?? "en").oneToOneOnly({ word }));
+    await chat.say(groupText.in(chat.lang()).oneToOneOnly({ word }));
     return true;
   }
 

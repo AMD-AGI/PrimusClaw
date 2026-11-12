@@ -191,6 +191,17 @@ test("rule 3: with no setting, each message is answered in its own language and 
   }
 });
 
+test("rule 3: a 1:1 chat's command said in a group is refused in the language it was written in, or the group's", async () => {
+  const w = asked();
+  await w.router.handle(gmsg("/timezone Asia/Shanghai 请帮我设置"));
+  assert.equal(inGroup(w).at(-1), "`/timezone` 只能在 1:1 聊天里用，请在和我的 1:1 聊天里操作。");
+  await w.router.handle(gmsg("/timezone Asia/Shanghai"));
+  assert.equal(inGroup(w).at(-1), "`/timezone` works only in a 1:1 chat. Please do this in a 1:1 chat with me.");
+  w.store.groupLanguage.setGroupLanguage(CONV, "en");
+  await w.router.handle(gmsg("/timezone Asia/Shanghai 请帮我设置"));
+  assert.equal(inGroup(w).at(-1), "`/timezone` works only in a 1:1 chat. Please do this in a 1:1 chat with me.");
+});
+
 // --- 4. the first @mention with no setting puts the card once; a pick by anyone stores it -----------------------------------
 
 test("rule 4: the first @mention puts the language card once, and a pick by any member sets it and is announced", async () => {

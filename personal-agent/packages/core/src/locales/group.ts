@@ -3,7 +3,7 @@
 
 import { defineCatalog } from "./catalog.js";
 
-/** What a group chat is told. Most of it is English only, as in the Python worker. */
+/** What a group chat is told, in the group's language (`Chat.lang`). */
 export const groupText = defineCatalog({
   en: {
     githubOneToOne: "`/github` works only in a 1:1 chat. Please do this in a 1:1 chat with me.",
@@ -23,8 +23,8 @@ export const groupText = defineCatalog({
       `#${String(p.number)}: more than one repository has it; write it as owner/repo#${String(p.number)}.`,
   },
   zh: {
-    githubOneToOne: "`/github` works only in a 1:1 chat. Please do this in a 1:1 chat with me.",
-    oneToOneOnly: (p) => `\`${p.word}\` works only in a 1:1 chat. Please do this in a 1:1 chat with me.`,
+    githubOneToOne: "`/github` 只能在 1:1 聊天里用，请在和我的 1:1 聊天里操作。",
+    oneToOneOnly: (p) => `\`${p.word}\` 只能在 1:1 聊天里用，请在和我的 1:1 聊天里操作。`,
     agentInGroup: "`/agent` 在群里只能用 attach 和 detach，其余请在 1:1 聊天里用。",
     whoami: (p) => `${p.name || "你"} 已连接到 SaFE 用户 ${p.who}。`,
     whoamiUnknown: "你已连接，但 SaFE 没告诉我是谁的账号。",
