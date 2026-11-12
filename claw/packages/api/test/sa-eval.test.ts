@@ -57,8 +57,9 @@
  *       expect_memory substring held by one of them (title or body, case-insensitive), no expect_no_memory substring held by any;
  *       entries not read (a recording graded offline) leave the check unverified, never passed
  *   S39 route=clarify: the final reply asks, by a question mark, a request for what is missing (Chinese or English, as routers
- *       write it since say took choices) or a choice put to the person; a reply that answers, or only ends with a generic offer,
- *       does not; an item or a card is no clarification however it asks
+ *       write it since say took choices) or a choice put to the person; request words inside a sign-off or a "no need" clause do
+ *       not count, so an answer ending in "如果有任何问题，请告诉我" does not ask (any question mark still does, as before); an item
+ *       or a card is no clarification however it asks
  *   S35 the signed-in token is sent only with the person's text message (its words, type and channel context, nothing else), a card's
  *       `deny` and the check of whose it is: an allow, an answer, a decision or a message with more in it, or any other route is refused; a turn's channel_context is sent beside its files, and a
  *       case may name only what a channel sends
