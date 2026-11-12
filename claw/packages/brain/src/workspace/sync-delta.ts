@@ -369,6 +369,79 @@ function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): 
 }
 
 /**
+ * Where a sandbox records that its /workspace was not restored in full.
+ *
+ * A restore that fails leaves /workspace holding only what the new sandbox
+ * started with (often a fresh clone), and every save mirrors /workspace into the
+ * session prefix: whatever the listing does not have is deleted. So the first save
+ * after a failed restore deleted the saved copy of every file the restore did not
+ * bring back -- a 534-file snapshot came out of one such save as 52 files, with
+ * the save reported as a success. While this note stands, a save only adds:
+ * it deletes nothing, and it does not upload over an object the prefix already
+ * has, since the sandbox's file of that name may be what it started with rather
+ * than the session's (`isRestoreHeld`).
+ *
+ * It belongs to the sandbox, not to the run: the next run reuses the sandbox and
+ * its incomplete /workspace without restoring again, and must not prune either. A
+ * rebuilt sandbox starts without it and restores from the prefix the hold kept
+ * whole. Brain keeps the same note in memory (`restoreHeld`), because the sandbox
+ * that could not be restored may not be able to take the write either.
+ */
+export const RESTORE_HOLD_PATH = `${SYNC_STATE_DIR}/restore-incomplete`;
+
+const RESTORE_HELD_MAX_SANDBOXES = 1024;
+/** Sandboxes (by `HandsClient.generation`) this process saw fail a restore; bounded like `unneutralised`. */
+const restoreHeld = new Set<string>();
+
+/**
+ * Record that this sandbox's restore did not complete, so no save from it
+ * deletes or replaces anything. Never throws: the in-memory note is set first, and a sandbox
+ * that refuses the write is still held by this process.
+ */
+export async function holdAfterFailedRestore(hands: HandsClient, reason: string): Promise<void> {
+  restoreHeld.delete(hands.generation);
+  restoreHeld.add(hands.generation);
+  while (restoreHeld.size > RESTORE_HELD_MAX_SANDBOXES) {
+    restoreHeld.delete(restoreHeld.values().next().value as string);
+  }
+  try {
+    const out = await withHandsTimeout<string>(
+      hands,
+      "write",
+      { path: RESTORE_HOLD_PATH, contents: `${JSON.stringify({ reason: reason.slice(0, 200), at: Date.now() })}\n` },
+      (STATE_TIMEOUT_SEC + 5) * 1000,
+    );
+    // `write` reports a failure as text rather than by throwing.
+    if (!/^Written to /.test(out)) {
+      logger.warn({ answer: out.slice(0, 200) }, "s3.restore_hold.write_refused");
+    }
+  } catch (e) {
+    logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.restore_hold.write_failed");
+  }
+}
+
+/**
+ * Whether a save from this sandbox must leave every object in place: true when a
+ * restore into it failed, and also when the sandbox cannot say. A held save
+ * deletes and replaces nothing, and what it leaves out is still there for the
+ * next save that can tell, so the doubtful case costs a deferred save at most.
+ */
+export async function isRestoreHeld(hands: HandsClient): Promise<boolean> {
+  if (restoreHeld.has(hands.generation)) return true;
+  let raw: string | null;
+  try {
+    raw = finishedOutput(await bash(
+      hands,
+      `if test -e ${RESTORE_HOLD_PATH}; then echo held; else echo clear; fi; echo ${DONE}`,
+      STATE_TIMEOUT_SEC,
+    ));
+  } catch {
+    return true;
+  }
+  return raw?.trim() !== "clear";
+}
+
+/**
  * Make this prefix's manifest unusable. True only when the sandbox confirmed it.
  *
  * Exported for the paths that rewrite the S3 prefix behind the sync's back (the
