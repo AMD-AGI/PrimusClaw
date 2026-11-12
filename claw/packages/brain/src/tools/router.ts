@@ -33,6 +33,7 @@ import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
 import { TOOL_RESULTS_DIR } from "../workspace/excludes.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "tool-router" });
 
@@ -198,7 +199,7 @@ export const INHERIT_MODEL = "inherit";
 function loadSkillSchema(): ToolSchema {
   return {
     name: LOAD_SKILL_TOOL,
-    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
+    description: "Load a skill listed under 'Platform Skills' or 'Personal Skills' in the prompt, or a personal skill the user names: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
     input_schema: {
       type: "object", properties: {
         name: { type: "string", description: "The skill's name, as listed in the prompt" },
@@ -391,7 +392,8 @@ export class ToolRouter {
 
   /** Parse a file path for `.skills/{name}/SKILL.md` and record the skill name. */
   private trackSkillRead(path: string): void {
-    const m = path.match(/\.skills\/([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
+    // A personal skill's SKILL.md is one directory further down: `.skills/.personal-skills/<name>/SKILL.md`.
+    const m = path.match(/\.skills\/(?:\.personal-skills\/)?([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
     if (m) this.skillsRead.add(m[1]);
   }
 
@@ -729,6 +731,12 @@ export class ToolRouter {
       const skillName = typeof input.name === "string" ? input.name : "";
       const file = typeof input.file === "string" ? input.file : undefined;
       const loaded = await this.skillStore.load(skillName, file, input.offset);
+      const wholeSkill = file === undefined || file === "" || file === "SKILL.md";
+      if (wholeSkill && this.skillStore.get(skillName)?.source === "user") {
+        // Whether a personal skill was really used: the signal that loading without being named happens at all.
+        if (loaded.ok) metrics.onUserSkillRead("worker", "ok");
+        else if (loaded.reason) metrics.onUserSkillRead("worker", loaded.reason === "failed" ? "failed" : "not_found");
+      }
       if (!loaded.ok) return refuse(outcome, loaded.error);
       // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
       if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);

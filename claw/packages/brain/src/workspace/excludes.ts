@@ -48,14 +48,23 @@ export { TOOL_RESULTS_DIR, WORKSPACE_EXCLUDES } from "@claw/protocol";
  */
 export const SKILLS_DIR = ".skills";
 
+/**
+ * Where a user's personal skills are written in the sandbox: `.skills/.personal-skills/<name>/`. Left out of every
+ * destination, the S3 archive included. A personal skill is the user's own text, served to their own turns only; the
+ * archive is a copy of the session, and what a copy of a session carries (sharing, copying, forking it) must not be
+ * where the user's skills reach someone else. Its source is the API, so nothing is lost: the next turn that needs one
+ * writes it again.
+ */
+export const PERSONAL_SKILLS_DIR = ".personal-skills";
+
 /** Exclusions for the shared-filesystem snapshot, which is restored onto an image. */
 export function sharedDiskExcludes(): string[] {
-  return [...WORKSPACE_EXCLUDES, SKILLS_DIR];
+  return [...WORKSPACE_EXCLUDES, SKILLS_DIR, PERSONAL_SKILLS_DIR];
 }
 
-/** Exclusions for the S3 archive, which keeps per-session skill state. */
+/** Exclusions for the S3 archive, which keeps per-session skill state (but not the user's personal skills). */
 export function s3Excludes(): string[] {
-  return [...WORKSPACE_EXCLUDES];
+  return [...WORKSPACE_EXCLUDES, PERSONAL_SKILLS_DIR];
 }
 
 /** `rsync --exclude` arguments. A trailing slash would stop a pattern matching files. */

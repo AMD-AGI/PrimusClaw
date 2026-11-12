@@ -12,6 +12,7 @@ import { downloadSkill } from "../tools/resolve.js";
 import { lookupTool, type LookupFailure } from "../tools/lookup.js";
 export { platformToolsBase } from "../tools/lookup.js";
 import { uploadDirToSandbox } from "../sandbox/write.js";
+import { PERSONAL_SKILLS_DIR } from "../workspace/excludes.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import { ENV_PLACEHOLDER_NAME_RE } from "../clients/mcp-config.js";
 import type { HandsClient } from "../clients/hands.js";
@@ -48,8 +49,21 @@ export interface DefaultSkill {
   /**
    * A skill that came with the request's plugin rather than from the platform
    * defaults. Its write must not fail quietly: see `LazyDefaultSkills.ensure`.
+   * `user`: one of the user's personal skills (`agent/user-skills.ts`), staged from the API when first used and
+   * written to `.skills/.personal-skills/<name>/`; its write must not fail quietly either.
    */
-  source?: "plugin" | "repo";
+  source?: "plugin" | "repo" | "user";
+  /** A personal skill's identity as the turn was told it (`request.user_skills`). */
+  user?: {
+    version: number;
+    contentSha: string;
+    /** Imported from somewhere else (`origin: import`): marked as third-party text wherever the model sees it. */
+    imported: boolean;
+    /** Use only when the user names it: never listed. */
+    manual: boolean;
+    /** What of the same name it replaces in this turn, said in the list. */
+    shadows?: "platform" | "repository";
+  };
   /**
    * Where the skill's files already are in the sandbox, for a skill that came with the bound
    * repository: its scripts run from there, and it is never written to `.skills/`.
@@ -423,7 +437,9 @@ export class LazyDefaultSkills {
     if (!pending.length) return;
     const named = pending.filter((s) => text.includes(s.name));
     const namesAWrittenSkill = this.skills.some((s) => this.written.has(s.name) && text.includes(s.name));
-    const todo = named.length ? named : namesAWrittenSkill ? [] : pending;
+    // A personal skill is written only when a call names it: a bare `ls .skills` must not fetch and write every skill
+    // the user has.
+    const todo = named.length ? named : namesAWrittenSkill ? [] : pending.filter((s) => s.source !== "user");
     const failedPlugin: string[] = [];
     for (const s of todo) {
       let write = this.writing.get(s.name);
@@ -434,11 +450,12 @@ export class LazyDefaultSkills {
         const clear = () => { if (this.writing.get(s.name) === settled) this.writing.delete(s.name); };
         void settled.then(clear, clear);
       }
-      if (!(await write) && s.source === "plugin") failedPlugin.push(s.name);
+      if (!(await write) && (s.source === "plugin" || s.source === "user")) failedPlugin.push(s.name);
     }
     if (failedPlugin.length) {
+      const kind = todo.some((s) => s.source === "plugin" && failedPlugin.includes(s.name)) ? "plugin" : "personal";
       throw new Error(
-        `Failed to write plugin skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
+        `Failed to write ${kind} skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
         + `this call was not run. Repeat it to retry the write.`,
       );
     }
@@ -449,8 +466,12 @@ export class LazyDefaultSkills {
     const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
     const t0 = Date.now();
     const plugin = s.source === "plugin";
+    const user = s.source === "user";
     try {
-      const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
+      const sub = user ? path.posix.join(".skills", PERSONAL_SKILLS_DIR, s.name) : path.posix.join(".skills", s.name);
+      const base = rel ? path.posix.join(rel, sub) : sub;
+      // A personal skill is staged from the API on first use; the first write may be that use.
+      if (user && !fs.existsSync(s.localDir) && s.restage) s.localDir = await s.restage();
       const attempt = async () => {
         const up = await uploadDirToSandbox(hands, s.localDir, base);
         const shippable = up.total - up.skipped;
@@ -470,9 +491,19 @@ export class LazyDefaultSkills {
       // Plugin skills are not platform defaults: they stay out of the
       // platform-default metrics, as they stay out of its events below.
       if (plugin) logger.info({ name: s.name, toolId: s.toolId, elapsedMs: Date.now() - t0 }, "skill.plugin_written_to_sandbox");
-      else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
+      else if (user) {
+        logger.info({ name: s.name, elapsedMs: Date.now() - t0 }, "skill.user_written_to_sandbox");
+        metrics.onUserSkillStaged("written");
+      } else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
       return true;
     } catch (err) {
+      if (user) {
+        // The name and the reason only: never what the skill says.
+        logger.warn({ name: s.name, err: (err as Error).message }, "skill.user_write_failed");
+        metrics.onUserSkillStaged("write_failed");
+        await this.onEvent?.({ type: "toolUsed", tool: "load_skill", actionId: `user_skill_write_${s.name}`, status: "error", brief: `Failed to write personal skill: ${s.name}` });
+        return false;
+      }
       if (plugin) {
         logger.warn({ name: s.name, toolId: s.toolId, err: (err as Error).message }, "skill.plugin_write_failed");
         await this.onEvent?.({ type: "toolUsed", tool: "download_skill", actionId: `plugin_skill_${s.toolId}`, status: "error", brief: `Failed to write plugin skill: ${s.name}` });

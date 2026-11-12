@@ -92,6 +92,39 @@ const platformSkillReadTotal = new Counter({
   labelNames: ["skill"] as const,
   registers: [registry],
 });
+// A user's personal skills (`agent/user-skills.ts`). Names only in logs, never in labels: a label per user's skill
+// name would be a series per user. `role` is `worker` here; the API counts the router's own list.
+const userSkillListedChars = new Histogram({
+  name: "claw_user_skill_listed_chars",
+  help: "Characters of the personal-skill list placed in a turn's prompt.",
+  labelNames: ["role"] as const,
+  buckets: [100, 500, 1000, 2000, 3000, 5000, 8000],
+  registers: [registry],
+});
+const userSkillListedTotal = new Counter({
+  name: "claw_user_skill_listed_total",
+  help: "Personal skills listed to the model by name and description.",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillTruncatedTotal = new Counter({
+  name: "claw_user_skill_truncated_total",
+  help: "Personal skills the list had no room for (still loadable by name).",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillReadTotal = new Counter({
+  name: "claw_user_skill_read_total",
+  help: "Reads of a personal skill's SKILL.md by the model, by outcome.",
+  labelNames: ["role", "outcome"] as const,
+  registers: [registry],
+});
+const userSkillStagedTotal = new Counter({
+  name: "claw_user_skill_staged_total",
+  help: "Personal skills fetched from the API onto Brain, or written into a sandbox, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
 const platformSkillLazyWriteTotal = new Counter({
   name: "claw_platform_skill_lazy_write_total",
   help: "Lazy writes of platform-default skills into a sandbox, by outcome and whether the sandbox was started for it.",
@@ -834,6 +867,20 @@ export const metrics = {
   /** The agent read a platform-default skill's SKILL.md. */
   onPlatformSkillRead(skill: string): void {
     platformSkillReadTotal.inc({ skill });
+  },
+  /** A turn whose prompt lists personal skills: how long the list is, how many it holds and how many it left out. */
+  onUserSkillList(role: "worker", listChars: number, listed: number, truncated: number): void {
+    userSkillListedChars.observe({ role }, listChars);
+    userSkillListedTotal.inc({ role }, listed);
+    if (truncated > 0) userSkillTruncatedTotal.inc({ role }, truncated);
+  },
+  /** The model read a personal skill's SKILL.md (`ok`), or asked for one that is gone or changed (`not_found`) or could not be had (`failed`). */
+  onUserSkillRead(role: "worker", outcome: "ok" | "not_found" | "failed"): void {
+    userSkillReadTotal.inc({ role, outcome });
+  },
+  /** One personal skill fetched from the API (`fetched`, `changed`, `not_found`, `failed`) or written into a sandbox (`written`, `write_failed`). */
+  onUserSkillStaged(outcome: "fetched" | "changed" | "not_found" | "failed" | "written" | "write_failed"): void {
+    userSkillStagedTotal.inc({ outcome });
   },
   /** One lazy write of platform-default skills into a sandbox. */
   onPlatformSkillLazyWrite(outcome: "ok" | "failed", elapsedSec: number, coldSandbox: boolean): void {

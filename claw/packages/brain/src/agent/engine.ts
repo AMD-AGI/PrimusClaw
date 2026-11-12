@@ -32,6 +32,7 @@ import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProg
 import { loadPromptImages, promptContent } from "./prompt-images.js";
 import { readObjectBounded } from "../workspace/s3-uploader.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
+import { userSkillsOf } from "./user-skills.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
 import { createAnthropicClient } from "../llm/anthropic-provider.js";
@@ -269,16 +270,36 @@ export class AgentEngine {
       skillSources[name] = "marketplace";
     }
 
+    // The user's personal skills (`user-skills.ts`), when the API sent them for this turn. Which skill a name means:
+    // what the request itself carries (its plugin, a skill the caller passed, a marketplace tool of this turn: what
+    // this turn was explicitly given) > the user's personal skill > the bound repository's > the platform's default.
+    // The one that loses is not listed and not served. Listed or not, every personal skill can be loaded by name: a
+    // `manual` one is never listed (the user names it), and the list's share for them can run out.
+    const userSkills = userSkillsOf(request, pluginWorkRoot).filter((s) => {
+      if (!allSkills[s.name]) return true;
+      logger.info({ skillName: s.name, by: skillSources[s.name] }, "skill.user_overridden_by_request");
+      return false;
+    });
+    const userByName = new Map(userSkills.map((s) => [s.name, s]));
+
     // Default skills: described in the prompt, written to the sandbox only when
     // read. Anything the request already supplies under the same name wins and
-    // stays inlined.
+    // stays inlined; a personal skill of the same name wins too.
     const defaultProgressive = defaults && PROGRESSIVE_SKILLS_ENABLED && defaults.skills.length
       ? (await resolveDefaultSkills(defaults, platformKey, onEvent)).filter((s) => {
+          const mine = userByName.get(s.name);
+          if (mine) {
+            mine.user!.shadows = "platform";
+            logger.info({ skillName: s.name }, "skill.platform_default_overridden_by_user");
+            return false;
+          }
           if (!allSkills[s.name]) return true;
           logger.info({ skillName: s.name }, "skill.platform_default_overridden");
           return false;
         })
       : [];
+    // The personal skills the list offers, most recently used first (the API's order).
+    const userProgressive = userSkills.filter((s) => !s.user!.manual);
 
     // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
     // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
@@ -312,7 +333,7 @@ export class AgentEngine {
     // contains is one the agent cannot know to use.
     const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
       ? (() => {
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...userProgressive, ...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
@@ -339,13 +360,17 @@ export class AgentEngine {
     // checkout, and a listed skill is one the model is told to use.
     const repoProgressive = binding && !request.withhold_sandbox_keys && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
       ? (() => {
-          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
+          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name), ...userByName.keys()]);
+          for (const r of binding.skills) {
+            const mine = userByName.get(r.name);
+            if (mine && !allSkills[r.name]) mine.user!.shadows ??= "repository";
+          }
           const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...userProgressive, ...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return candidates.filter((s) => fits.has(s.name));
         })()
       : [];
-    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive];
+    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive, ...userProgressive];
     const listedPlugin = new Set(pluginProgressive.map((s) => s.name));
     const inlineSkills = listedPlugin.size
       ? Object.fromEntries(Object.entries(allSkills).filter(([name]) => !listedPlugin.has(name)))
@@ -354,10 +379,15 @@ export class AgentEngine {
     // and the plugin skills of a plugin with no hooks tool. A hooks plugin has a
     // sandbox for its scripts regardless, and keeps writing its skills up front
     // (below), so it is not also handed to the lazy writer.
-    const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills)];
+    // And every personal skill, listed or not: one is written only when a call names it (see `ensure`).
+    const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills), ...userSkills];
     const lazySkills = lazySkillList.length ? new LazyDefaultSkills(lazySkillList, onEvent, sessionDir) : undefined;
     if (defaultProgressive.length) {
       metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir, loadSkillAllowed).length);
+    }
+    if (userProgressive.length) {
+      const { personal } = listProgressiveSkills(progressiveSkills, sessionDir, loadSkillAllowed);
+      metrics.onUserSkillList("worker", personal.lines.length, personal.listed.length, personal.omitted);
     }
 
     const repoBlock = binding ? renderRepoBlock(binding, repoProgressive.length) : "";
@@ -393,6 +423,7 @@ export class AgentEngine {
       skillCount: Object.keys(allSkills).length,
       inlineSkillCount: Object.keys(inlineSkills).length,
       progressiveSkillCount: progressiveSkills.length,
+      userSkillCount: userSkills.length,
       mcpServerCount: Object.keys(mergedMcp).length,
       promptLen: fullPrompt.length,
       hintsInSystem,
@@ -495,7 +526,10 @@ export class AgentEngine {
       }, sandbox);
       router.lazySkillWriter = lazySkills;
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
-      if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
+      // Personal skills are all served, the ones the list has no room for and the `manual` ones included.
+      if (progressiveSkills.length || userSkills.length) {
+        router.skillStore = new SkillStore([...progressiveSkills.filter((s) => s.source !== "user"), ...userSkills], `${sessionDir}/.skills`);
+      }
       // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
       // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
       // stranger's text made it write, and every later session of the requester would read it.
@@ -730,6 +764,9 @@ export class AgentEngine {
       //     skills that were merely loaded into context but ignored by the Agent.
       const skillsUsed: Record<string, number> = {};
       for (const name of router.skillsRead) {
+        // A personal skill, at the version the turn was told: the API's record of which of the user's skills a turn used.
+        const mine = userByName.get(name);
+        if (mine) { skillsUsed[name] = mine.user!.version; continue; }
         if (!allSkills[name]) {
           if (lazySkills?.names.includes(name)) metrics.onPlatformSkillRead(name);
           continue; // skill read but unknown — ignore

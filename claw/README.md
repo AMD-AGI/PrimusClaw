@@ -211,6 +211,7 @@ next sandbox and will not be there when the session is rehydrated:
 | `.transcripts/` | Per-run transcripts Brain writes straight to object storage |
 | `.tool-results/` | Whole tool outputs too long for the conversation, kept for the agent to page through |
 | `.deliveries/` | Copies of the files the agent handed you with `deliver_file` |
+| `.skills/.personal-skills/` | Your personal skills, written for the run that uses them and kept out of every snapshot; any directory named `.personal-skills` is dropped |
 | `.hands-binary` | Bootstrap artefact from older releases |
 | `hands.log` | The agent runtime's own log, truncated at every launch |
 

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { A2A_CLIENT_ENABLED, RULES_DIR, SAFETY_PREAMBLE_ENABLED } from "../config.js";
 import { LOAD_SKILL_TOOL } from "./skill-store.js";
+import { PERSONAL_SKILLS_DIR } from "../workspace/excludes.js";
 
 const SAFETY_PREAMBLE_FILE = path.join(RULES_DIR, "safety-preamble.txt");
 const EXECUTION_POLICY_FILE = path.join(RULES_DIR, "execution-policy.txt");
@@ -43,11 +44,35 @@ function getExecutionPolicy(): string {
 /** Per-skill inline SKILL.md cap — prevents token blowups for large skills. */
 const SKILL_INLINE_MAX = 20_000;
 
-/** A platform-default skill listed by name and description only. */
-export interface ProgressiveSkill { name: string; description: string }
+/**
+ * A skill listed by name and description only. `source: "user"` is one of the user's personal skills: listed in its
+ * own section, with its own share of the list (see listProgressiveSkills); `user.shadows` says what of the same name it
+ * replaces in this turn.
+ */
+export interface ProgressiveSkill {
+  name: string;
+  description: string;
+  source?: string;
+  user?: { imported?: boolean; shadows?: "platform" | "repository" };
+}
 
 const PROGRESSIVE_MAX_ENTRIES = 50;
 const PROGRESSIVE_MAX_CHARS = 8000;
+/** The share of the list kept for personal skills; what they leave is the others', and what the others leave is theirs. */
+const PERSONAL_RESERVE_CHARS = 3000;
+const PERSONAL_RESERVE_ENTRIES = 20;
+
+/** The directory a listed skill is read from in the sandbox, for a run without `load_skill`. */
+function sandboxSkillDir(s: ProgressiveSkill, skillBase: string): string {
+  return s.source === "user" ? `${skillBase}/${PERSONAL_SKILLS_DIR}/${s.name}` : `${skillBase}/${s.name}`;
+}
+
+function listLine(s: ProgressiveSkill, skillBase: string, loadSkill: boolean): string {
+  const label = s.source === "user" && s.user?.imported ? `${s.name} (imported)` : s.name;
+  return loadSkill
+    ? `\n  - ${label}: ${s.description}`
+    : `\n  - ${label}: ${s.description}   [read ${sandboxSkillDir(s, skillBase)}/SKILL.md]`;
+}
 
 /**
  * The skills the on-demand list has room for, in order, and how many it leaves
@@ -60,24 +85,56 @@ const PROGRESSIVE_MAX_CHARS = 8000;
  * can only be opened by path, so each line carries the path to read and counts
  * against the cap; the engine asks with the same flag the prompt is built with,
  * so what it decides fits is what the prompt lists.
+ *
+ * Personal skills (`source: "user"`, most recently used first) are fitted separately: they have the first
+ * PERSONAL_RESERVE_CHARS (and PERSONAL_RESERVE_ENTRIES) of the list to themselves, the other skills fit in what that
+ * leaves, and personal skills that did not fit their share then take what the others left. So a user with many skills
+ * cannot push the platform's out of the list, a platform with many cannot push the user's out, and neither share is
+ * wasted. Each kind stays a prefix of its own order, and the others are fitted before the personal ones' second pass,
+ * so which of the others fit does not depend on how many personal skills there are beyond their share. `listed`,
+ * `omitted` and `lines` are the other skills'; `personal` is the personal ones'.
  */
 export function listProgressiveSkills(
   skills: ProgressiveSkill[],
   sessionDir = "",
   loadSkill = true,
-): { listed: ProgressiveSkill[]; omitted: number; lines: string } {
+): {
+  listed: ProgressiveSkill[]; omitted: number; lines: string;
+  personal: { listed: ProgressiveSkill[]; omitted: number; lines: string };
+} {
   const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
+  const mine = skills.filter((s) => s.source === "user");
+  const others = skills.filter((s) => s.source !== "user");
+  let chars = 0;
+  let entries = 0;
+  const personal = { listed: [] as ProgressiveSkill[], lines: "" };
+  let i = 0;
+  const takePersonal = (maxChars: number, maxEntries: number) => {
+    for (; i < mine.length; i++) {
+      const line = listLine(mine[i], skillBase, loadSkill);
+      if (personal.listed.length >= maxEntries || entries >= PROGRESSIVE_MAX_ENTRIES || personal.lines.length + line.length > maxChars || chars + line.length > PROGRESSIVE_MAX_CHARS) break;
+      personal.lines += line;
+      personal.listed.push(mine[i]);
+      chars += line.length;
+      entries++;
+    }
+  };
+  takePersonal(PERSONAL_RESERVE_CHARS, PERSONAL_RESERVE_ENTRIES);
   let lines = "";
   const listed: ProgressiveSkill[] = [];
-  for (const s of skills) {
-    const line = loadSkill
-      ? `\n  - ${s.name}: ${s.description}`
-      : `\n  - ${s.name}: ${s.description}   [read ${skillBase}/${s.name}/SKILL.md]`;
-    if (listed.length >= PROGRESSIVE_MAX_ENTRIES || lines.length + line.length > PROGRESSIVE_MAX_CHARS) break;
+  for (const s of others) {
+    const line = listLine(s, skillBase, loadSkill);
+    if (entries >= PROGRESSIVE_MAX_ENTRIES || chars + line.length > PROGRESSIVE_MAX_CHARS) break;
     lines += line;
     listed.push(s);
+    chars += line.length;
+    entries++;
   }
-  return { listed, omitted: skills.length - listed.length, lines };
+  takePersonal(PROGRESSIVE_MAX_CHARS, PROGRESSIVE_MAX_ENTRIES);
+  return {
+    listed, omitted: others.length - listed.length, lines,
+    personal: { listed: personal.listed, omitted: mine.length - personal.listed.length, lines: personal.lines },
+  };
 }
 
 /**
@@ -93,13 +150,29 @@ export function listProgressiveSkills(
  * to it, and forbids the `read` it does have, leaves its skills unusable. For
  * such a run (`loadSkill` false) the hint is the one from before the tool: read
  * SKILL.md with `read`, from the path on each line.
+ *
+ * The user's personal skills come after the platform's, under their own heading, with what they replace and how
+ * many the list had no room for; one left out is still loaded by name.
  */
 export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir = "", loadSkill = true): string {
   if (!skills.length) return "";
-  const { omitted, lines } = listProgressiveSkills(skills, sessionDir, loadSkill);
+  const { listed, omitted, lines, personal } = listProgressiveSkills(skills, sessionDir, loadSkill);
   const skillBase = sessionDir ? `${sessionDir}/.skills` : ".skills";
-  let hint = `\n- Platform Skills (load on demand):${lines}`;
-  if (omitted > 0) hint += `\n  - (${omitted} more skills not listed)`;
+  let hint = "";
+  if (listed.length || omitted) {
+    hint += `\n- Platform Skills (load on demand):${lines}`;
+    if (omitted > 0) hint += `\n  - (${omitted} more skills not listed)`;
+  }
+  if (personal.listed.length || personal.omitted) {
+    hint += `\n- Personal Skills (the user's own, saved by them; use one the same way when its description matches):${personal.lines}`;
+    if (personal.omitted > 0) {
+      hint += `\n  - (${personal.omitted} more of the user's personal skills not listed; when the user names one, `
+        + (loadSkill ? `load it with ${LOAD_SKILL_TOOL} by that name)` : `read ${skillBase}/${PERSONAL_SKILLS_DIR}/<name>/SKILL.md)`);
+    }
+    for (const s of personal.listed) {
+      if (s.user?.shadows) hint += `\n  - Note: personal skill '${s.name}' replaces the ${s.user.shadows} skill of the same name in this conversation.`;
+    }
+  }
   if (!loadSkill) {
     hint += `\nBefore starting a task, if a skill's description matches, read its SKILL.md with the read tool and follow it. `;
     hint += `Supporting files live next to SKILL.md in the same directory; read them only when SKILL.md points to them.`;
@@ -109,7 +182,9 @@ export function buildProgressiveSkillHint(skills: ProgressiveSkill[], sessionDir
   hint += `Loading a skill needs no sandbox: do not read or cat its files for that. Other files of a skill are listed at the end of its SKILL.md; `;
   hint += `load one with ${LOAD_SKILL_TOOL} (name and file) only when SKILL.md points to it. `;
   hint += `A long file comes in parts: when a result says it is not the whole file, call ${LOAD_SKILL_TOOL} again with the offset it gives, until the end. `;
-  hint += `A skill's scripts run in the sandbox with bash, from ${skillBase}/<name>/.`;
+  hint += personal.listed.length || personal.omitted
+    ? `A skill's scripts run in the sandbox with bash, from ${skillBase}/<name>/ (a personal skill's from ${skillBase}/${PERSONAL_SKILLS_DIR}/<name>/).`
+    : `A skill's scripts run in the sandbox with bash, from ${skillBase}/<name>/.`;
   return hint;
 }
 
