@@ -121,6 +121,18 @@ release version, and its `appVersion` stays `latest`.
   source, so a router that read a skill can still start the work. Never for an observer, a worker or a session marked
   `config.memory: "off"`. New metrics `claw_user_skill_listed_chars`, `claw_user_skill_truncated_total` and
   `claw_user_skill_read_total` (#809).
+- Brain uses a turn's personal skills the way it uses the platform's: listed by name and description under their own
+  heading (most recently used first; `manual` ones never listed; imported ones marked and, when loaded, wrapped as
+  a third party's text), read with `load_skill` from `POST /v1/internal/skills/read` at the fingerprint the turn was
+  told, and written into the sandbox at `.skills/.personal-skills/<name>/` only when a command names one. Of the
+  on-demand list's 8000 characters, personal skills have 3000 (and 20 entries) to themselves, the other skills fit
+  in what that leaves, and personal skills then take what the others left; one the list has no room for is still
+  loaded by name. A name means, in order: what the request itself carries (plugin, a caller's skill, a marketplace
+  tool of the turn), the personal skill, the bound repository's, the platform's default. `.personal-skills` is left
+  out of every workspace snapshot, the S3 archive included (a reserved name). A use is reported in `skills_used` at
+  the turn's version. Metrics `claw_user_skill_{listed_chars,listed_total,truncated_total,read_total,staged_total}`.
+  Not when the request lacks `user_skills_enabled`, acts as a user, or is a router's or observer's turn; off while
+  `CLAW_USER_SKILLS_ENABLED` is (#PR3).
 
 ## [0.4.0] - 2026-11-12
 
