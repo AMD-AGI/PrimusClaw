@@ -30,12 +30,13 @@ only) and shows the say's text, which names the options, so the person answers b
 ### Added
 
 - `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`, `@primusclaw/personal-agent-teams`: an
-  `assistant.say` with `choices` (from claw-v0.3.0) is drawn as a card: "请选择一项 / Pick one" with radio buttons, or
-  "可多选 / Pick any that apply" with check boxes, the words when they fit, a note that the person can also just reply in
-  the chat, and one Send. Send is the person's next message, the picked options joined in the card's order, and goes the
-  whole typed path (rate limit, attached agent, assistant); a second press or two at once send once, and only the person
-  the card was for can press it. A pick is an answer, never a command: an option that is a menu word or a phrase help
-  teaches ("New", "重新开始", "Stop", "停止", "Help", ...) is sent as those words, not as /new, /stop or /help (#765).
+  `assistant.say` with `choices` (from claw-v0.3.0) is drawn as a card: "请选择一项 / Pick one" with radio buttons, or "可多选 /
+  Pick any that apply" with check boxes, the words when they fit, a note that the person can also just reply in the
+  chat, and one Send. Send is the person's next message, the picked options joined in the card's order, and goes the
+  whole typed path (rate limit, attached agent, assistant); a second press or two at once send once. In a 1:1 chat only
+  its person can press it; in a group chat whoever presses it answers, as whoever types there does. A pick is an answer,
+  never a command: an option that is a menu word or a phrase help teaches ("New", "重新开始", "Stop", "停止", "Help", ...) is
+  sent as those words, not as /new, /stop or /help (#765).
 - `@primusclaw/personal-agent`: a language chosen with `/lang zh` or `/lang en` is sent with each message, so Claw
   answers in it too, not only the agent's own texts: to the assistant as `channel_context.reply_language`, to a plain
   session's turn (a group's, or a 1:1 chat without the assistant) as the `[Reply language: ...]` line after the message
