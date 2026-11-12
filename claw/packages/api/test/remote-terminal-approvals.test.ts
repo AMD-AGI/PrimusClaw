@@ -22,6 +22,9 @@
  *   T7 a terminal's request goes whole on its card (kind, input, which question): one too large keeps only the options that refuse,
  *      and one with nothing left to choose is said in words, to the terminal
  *   T8 turned off, an open session puts nothing more to the user
+ *   T9 how the terminal asks too, as the request's `terminal_asks` says, in each language: Claude Code (absent) alongside the card,
+ *      the first answer counting; Cursor (`after_card`) only after the card, which offers to decline or hand it back; Codex
+ *      (`on_input`) once someone types there; the field goes on with the card, and a value no channel knows is read as absent
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -73,10 +76,12 @@ describe("approvals from terminals", { skip }, () => {
   }
   const post = (user: string, path: string, body: unknown) => call(user, "POST", path, body);
   const CLAUDE = { agent_id: "claude", kind: "claude", name: "Claude Code", capabilities: { roots: ["/home/u"] } };
-  async function machine(owner: string, name: string): Promise<string> {
+  const CURSOR = { agent_id: "cursor", kind: "cursor", name: "Cursor", capabilities: { roots: ["/home/u"] } };
+  const CODEX = { agent_id: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/home/u"] } };
+  async function machine(owner: string, name: string, agents: Recorded[] = [CLAUDE]): Promise<string> {
     const row = await store.registerConnector(owner, name, "0.1.23", null, 10);
     assert.ok(row);
-    await store.recordHeartbeat(row.connector_id, owner, { version: "0.1.23", cmdCursor: null, agents: [CLAUDE] as never });
+    await store.recordHeartbeat(row.connector_id, owner, { version: "0.1.23", cmdCursor: null, agents: agents as never });
     await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [row.connector_id]);
     return String(row.connector_id);
   }
@@ -264,6 +269,68 @@ describe("approvals from terminals", { skip }, () => {
     // Nothing left that may be chosen: said in words, to the terminal.
     assert.equal(a4.ask, undefined);
     assert.match(got[3].text, /Write big\.txt。这个请求没法在这里完整显示，请到终端里回答。$/);
+  });
+
+  test("T9 what the terminal does meanwhile is said per agent, in the user's language, and goes on with the card", async () => {
+    const cases: Array<{ agent: string; asks?: string; zh: string; en: string; zhCut: string; enCut: string }> = [
+      {
+        agent: "claude",
+        zh: "在下面选，或直接在终端里回答，先答的算数。",
+        en: "Choose below, or answer in the terminal; whichever comes first counts.",
+        zhCut: "这个请求没法在这里完整显示，请到终端里回答。",
+        enCut: "It cannot be shown here in full: answer it in the terminal.",
+      },
+      {
+        agent: "cursor", asks: "after_card",
+        zh: "可以在下面拒绝，或交回终端：终端要等这里答完（或等待时间到了）才会问，批准请在终端里。",
+        en: "Decline it below, or hand it back to the terminal: the terminal asks only after that (or once this wait is over), and you approve it there.",
+        zhCut: "这个请求没法在这里完整显示：终端等手机的时间一过就会问你，请到终端里回答。",
+        enCut: "It cannot be shown here in full: the terminal asks once its wait for the phone is over; answer it there.",
+      },
+      {
+        agent: "codex", asks: "on_input",
+        zh: "在下面选；想改在终端里回答，就在终端里随便输入点什么，问题就回到终端。",
+        en: "Choose below; to answer in the terminal instead, type anything there, and the question goes back to it.",
+        zhCut: "这个请求没法在这里完整显示：在终端里随便输入点什么，它就会在终端里问你。",
+        enCut: "It cannot be shown here in full: type anything in the terminal, and it asks you there.",
+      },
+    ];
+    const DECLINE = [
+      { optionId: "deny", name: "No", kind: "reject_once" }, { optionId: "terminal", name: "Ask me at the terminal", kind: "allow_once" },
+    ];
+    for (const [owner, title, zh] of [["alice", "修 CI", true], ["bob", "fix CI", false]] as const) {
+      const user = await w.user(owner);
+      await w.subscribe(user.userId);
+      const cid = await machine(owner, "laptop", [CLAUDE, CURSOR, CODEX]);
+      for (const c of cases) {
+        const ref = `${c.agent}-conv`;
+        const sid = (await open(owner, cid, ref, { agent_id: c.agent, title })).body.data.session_id as string;
+        const asks = c.asks ? { terminal_asks: c.asks } : {};
+        await events(owner, cid, sid, [
+          ["session_started", { origin: "terminal_hook", ref, title, agent: c.agent, cwd: "/home/u/work/claw" }],
+          ["permissionRequest", { ...ask("act-1", "Run: make test")[1], kind: "execute", input: { command: "make test" }, options: DECLINE, ...asks }],
+          // Nothing left that may be chosen: said in words, to the terminal.
+          ["permissionRequest", { ...ask("act-2", "Run: big")[1], kind: "execute", input: { command: "y".repeat(20_000) }, options: [DECLINE[1]], ...asks }],
+        ]);
+        const got = await pushed((await remoteItem(sid)).item_id);
+        assert.equal(got.length, 2, JSON.stringify(got.map((g) => g.text)));
+        const where = zh ? `laptop 上终端里的 ${c.agent}（${title}，work/claw）在等你回答：` : `${c.agent} in a terminal on laptop (${title}, work/claw) is waiting for you: `;
+        const stop = zh ? "。" : ". ";
+        assert.equal(got[0].text, `${where}Run: make test${stop}${zh ? c.zh : c.en}`, `${c.agent} ${owner}`);
+        assert.equal(got[1].text, `${where}Run: big${stop}${zh ? c.zhCut : c.enCut}`, `${c.agent} ${owner} cut`);
+        assert.equal(got[0].remote.ask.terminal_asks, c.asks, "the card is told how the terminal asks too");
+        assert.equal(got[1].remote.ask, undefined);
+      }
+    }
+    // A value no channel knows is read as absent: said, and carried, as Claude Code's.
+    const carol = await w.user("carol");
+    await w.subscribe(carol.userId);
+    const cid = await machine("carol", "box");
+    const sid = (await open("carol", cid, "conv-x")).body.data.session_id as string;
+    await events("carol", cid, sid, [started, ["permissionRequest", { ...ask("act-1")[1], terminal_asks: "whenever" }]]);
+    const [got] = await pushed((await remoteItem(sid)).item_id);
+    assert.match(got.text, /先答的算数。$/);
+    assert.equal("terminal_asks" in got.remote.ask, false);
   });
 
   test("T8 with the approvals turned off, an open session puts nothing more to the user", async () => {

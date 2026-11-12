@@ -222,6 +222,7 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
         ...(r.ask.input !== undefined ? { input: redactPublicJson(r.ask.input) } : {}),
         ...(r.ask.question_index !== undefined ? { question_index: r.ask.question_index } : {}),
         ...(r.ask.question_count !== undefined ? { question_count: r.ask.question_count } : {}),
+        ...(r.ask.terminal_asks ? { terminal_asks: r.ask.terminal_asks } : {}),
       },
     } : {}),
     ...(r.resolved ? { resolved: { action_id: r.resolved.action_id, by: r.resolved.by } } : {}),

@@ -4,7 +4,9 @@
 /**
  * The card of a question a terminal asks: a coding agent its person started in their own terminal wants to run a command, change
  * a file, start on a plan or have a multiple-choice question answered, and the connector's approval hooks put it here too
- * (`remote.ask` with `origin: "terminal"`). The terminal keeps asking: the first answer counts.
+ * (`remote.ask` with `origin: "terminal"`). The terminal asks too, as the request's `terminal_asks` says (`terminalAsksOf`): alongside
+ * the card, the first answer counting (Claude Code); only once the card is answered or its wait is over (Cursor); or once someone
+ * types in that terminal, which takes the question back from the card (Codex). The card says which.
  *
  * Nothing is approved unseen. The card shows the request whole (the connector and Claw carry it whole, credentials masked); a
  * request whose content did not come (Claw leaves it out past its size), or that is longer than a card shows, keeps only the
@@ -13,6 +15,7 @@
  */
 import type { Lang } from "../locales/lang.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
+import { TERMINAL_ASKS, type TerminalAsks } from "../protocol.js";
 import type { DecisionButton } from "../remote/actions.js";
 import { breakLinks, lit, masked, neutral } from "../remote/inert.js";
 import { type PermissionOption, shownOptions } from "../remote/options.js";
@@ -73,6 +76,16 @@ export interface TerminalAsk {
   readonly agent: string;
 }
 
+/**
+ * When the terminal asks a request that is also on a card (`remote.ask`'s `terminal_asks`, from the connector through Claw):
+ * `after_card`, only once the card is answered or its wait is over, and the card offers only to decline or hand it back (Cursor);
+ * `on_input`, only once someone types in that terminal, which withdraws the card (Codex); undefined (absent, or a value this
+ * client does not know), alongside the card, the first answer counting (Claude Code).
+ */
+export function terminalAsksOf(ask: Reported): TerminalAsks | undefined {
+  return TERMINAL_ASKS.find((t) => t === ask["terminal_asks"]);
+}
+
 /** Whether `remote.ask` is a question a terminal asks (a connector's approval hooks), not one an agent Claw started asks. */
 export function isTerminalAsk(ask: Reported | undefined): boolean {
   return ask !== undefined && ask["origin"] === "terminal";
@@ -124,6 +137,7 @@ function optionTitle(option: PermissionOption, lang: Lang): string | undefined {
     ["deny-stop", words.optionNoStop],
     ["plan-approve", words.optionPlanApprove],
     ["plan-keep", words.optionPlanKeep],
+    ["terminal", words.optionToTerminal],
   ]);
   return titles.get(option.optionId);
 }
@@ -296,12 +310,18 @@ function notesOf(ask: Reported, complete: boolean, options: readonly PermissionO
   const index = Number(ask["question_index"]);
   if (Number.isInteger(total) && total > 1 && Number.isInteger(index))
     notes.push(words.questionOf({ n: index + 1, of: total }));
-  if (!complete) notes.push(words.tooLong);
+  const asks = terminalAsksOf(ask);
+  if (!complete)
+    notes.push(
+      asks === "after_card" ? words.tooLongAfterCard : asks === "on_input" ? words.tooLongOnInput : words.tooLong,
+    );
   // (a button shows 40 characters: what an "always" option grants is written out whole here, or the option is not offered)
   // (only the options shown as buttons, at most four: their notes stay within what the card's byte budget leaves room for)
   for (const o of shownOptions(options))
     if (o.kind === "allow_always") notes.push(words.alwaysOption({ name: lit(o.name, OPTION_NAME_MAX) }));
-  notes.push(words.firstAnswerWins);
+  // (how the terminal asks too; a card cut short already said it, with only the options that turn the request down)
+  if (asks === undefined) notes.push(words.firstAnswerWins);
+  else if (complete) notes.push(asks === "after_card" ? words.afterCard : words.onInput);
   return notes;
 }
 
