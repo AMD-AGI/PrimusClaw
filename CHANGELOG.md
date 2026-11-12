@@ -108,7 +108,7 @@ release version, and its `appVersion` stays `latest`.
   whether several may be picked, and the tool tells the model to use it whenever it asks the user to pick among options.
   `assistant.say` and the session's `AssistantSay` event carry it as `choices`; a channel shows it as a card whose Send
   sends what was picked as the user's next message. A choice that does not fit is left out whole and the message still
-  goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change.
+  goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change (#765).
 
 ## [0.2.1] - 2026-11-12
 
