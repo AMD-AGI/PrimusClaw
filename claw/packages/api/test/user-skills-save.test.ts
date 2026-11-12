@@ -27,6 +27,7 @@
  *       the probation limit; a new one never overwrites a skill of the user's with that name
  *   K14 the same save twice (a completion handled again) writes and records once
  *   K15 a longer SKILL.md that, with the files the skill already has, passes 256 KB is refused
+ *   K16 a rollback undoes the last change of the skill as it read it; a save made after that read is not overwritten
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -375,6 +376,42 @@ describe("personal skills: save", { skip }, () => {
     assert.deepEqual([r.ok, (r as any).error], [false, "too_large"]);
     const [row] = await skills();
     assert.deepEqual([row.content, row.version], ["short", 1], "the skill is as it was");
+  });
+
+  test("K16 a rollback applies to the skill as it read it, never over a save made since", async () => {
+    const history = (prev: string) => JSON.stringify({ history: [{ action: "improve_skill", previous_content: prev }] });
+    await q(`INSERT INTO claw_skills (skill_name, user_id, version, content, source, status, analysis)
+             VALUES ('rb', 'alice', 2, 'v2 text', 'manual', 'active', $1::jsonb)`, [history("v1 text")]);
+    assert.equal((await rest("POST", "/v1/users/me/skills/rb/rollback")).status, 200);
+    let [row] = await skills();
+    assert.deepEqual([row.content, row.version], ["v1 text", 1]);
+    assert.equal(row.content_sha, svc.skillContentSha("v1 text", []));
+    assert.deepEqual((await events()).map((e) => e.op), ["rollback"]);
+
+    // The user saves between the rollback's read and its write: the rollback is refused and the save stands.
+    await q("TRUNCATE claw_skills, claw_skill_events");
+    await q(`INSERT INTO claw_skills (skill_name, user_id, version, content, source, status, analysis)
+             VALUES ('rb', 'alice', 2, 'v2 text', 'manual', 'active', $1::jsonb)`, [history("v1 text")]);
+    const realQuery = dbm.db.query;
+    let raced = false;
+    (dbm.db as any).query = async (text: string, params?: unknown[]) => {
+      const out = await (realQuery as any)(text, params);
+      if (!raced && /FROM claw_skill_files WHERE skill_id/.test(text)) {
+        raced = true;
+        await realQuery("UPDATE claw_skills SET content = 'the user''s newer text', version = 3 WHERE skill_name = 'rb'");
+      }
+      return out;
+    };
+    let status: number;
+    try {
+      status = (await rest("POST", "/v1/users/me/skills/rb/rollback")).status;
+    } finally {
+      (dbm.db as any).query = realQuery;
+    }
+    assert.ok(raced, "the race was not staged: this proves nothing");
+    assert.equal(status, 400);
+    [row] = await skills();
+    assert.deepEqual([row.content, row.version], ["the user's newer text", 3]);
   });
 
   test("another user's skills are not reachable", async () => {

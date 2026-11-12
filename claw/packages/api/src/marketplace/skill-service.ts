@@ -130,12 +130,32 @@ export function skillContentSha(content: string, files: Array<{ path: string; co
   return h.digest("hex");
 }
 
-async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
+/** A skill row's SKILL.md and its fingerprint (with its files) as stored now, or null when the row is gone. */
+async function readSkillSnapshot(q: Querier, skillId: number): Promise<{ content: string; sha: string } | null> {
   const row = (await q("SELECT content FROM claw_skills WHERE id = $1", [skillId])).rows[0];
-  if (!row) return;
+  if (!row) return null;
   const files = (await q("SELECT file_path, content, is_binary FROM claw_skill_files WHERE skill_id = $1", [skillId])).rows
     .map((f: any) => ({ path: f.file_path, content: f.content, is_binary: !!f.is_binary }));
-  await q("UPDATE claw_skills SET content_sha = $1 WHERE id = $2", [skillContentSha(row.content || "", files), skillId]);
+  return { content: row.content || "", sha: skillContentSha(row.content || "", files) };
+}
+
+async function refreshContentSha(q: Querier, skillId: number): Promise<void> {
+  const snap = await readSkillSnapshot(q, skillId);
+  if (snap) await q("UPDATE claw_skills SET content_sha = $1 WHERE id = $2", [snap.sha, skillId]);
+}
+
+/**
+ * A change computed from what a skill was when read (an evolution's LLM call, a rollback's history walk) applies only
+ * if the skill is still exactly that: checked under the user's lock, so a save made meanwhile is never overwritten.
+ */
+async function assertUnchangedSince(q: Querier, skillId: number, sha: string): Promise<void> {
+  const now = (await q("SELECT 1 FROM claw_skills WHERE id = $1 AND deleted_at IS NULL", [skillId])).rows[0]
+    ? await readSkillSnapshot(q, skillId) : null;
+  if (!now || now.sha !== sha) throw new StaleSkillError();
+}
+
+class StaleSkillError extends Error {
+  constructor() { super("the skill changed since it was read"); }
 }
 
 /** One writer per user at a time, so a count and the insert that follows it hold together. Inside a transaction. */
@@ -443,10 +463,12 @@ export async function checkProbationGraduation(userId: string, skillName: string
   if (total < PROBATION_MIN_RUNS) return;
 
   if (row.effectiveness >= PROBATION_GRADUATE_THRESHOLD) {
-    await db.query("UPDATE claw_skills SET status = 'active' WHERE id = $1", [row.id]);
+    await db.query("UPDATE claw_skills SET status = 'active' WHERE id = $1 AND status = 'probation' AND deleted_at IS NULL", [row.id]);
     logger.info({ skillName, userId, total, eff: row.effectiveness }, "skill.probation_graduated");
   } else {
-    await db.query("UPDATE claw_skills SET deleted_at = NOW() WHERE id = $1", [row.id]);
+    // Only while it is still unproven: a skill the user saved meanwhile (which makes it active) is theirs, not demoted.
+    const demoted = await db.query("UPDATE claw_skills SET deleted_at = NOW() WHERE id = $1 AND status = 'probation' AND deleted_at IS NULL", [row.id]);
+    if (!demoted.rowCount) return;
     logger.info({ skillName, userId, total, eff: row.effectiveness }, "skill.probation_demoted");
   }
 }
@@ -549,6 +571,10 @@ export async function saveSkill(
       [skillName, userId]
     )).rows[0];
 
+    if (softDeletedRow && opts.createOnly) {
+      // A skill the user deleted is not brought back by the platform.
+      return { ok: false, error: "invalid", message: `skill '${skillName}' was deleted; nothing was saved` };
+    }
     if (softDeletedRow) {
       const row = (await q(
         `UPDATE claw_skills
@@ -1828,8 +1854,10 @@ export async function maybeEvolveSkill(sessionId: string, userId: string, event:
 
     if (!(await shouldEvolveSkill(skillName, userId, activeSkill.version))) continue;
 
-    const currentContent = await getActiveSkillContent(skillName, userId);
-    if (!currentContent) continue;
+    // What the LLM is shown, and its fingerprint (with the files), so the batch it returns applies only to this.
+    const snapshot = await readSkillSnapshot(db.query, activeSkill.id);
+    const currentContent = snapshot?.content;
+    if (!snapshot || !currentContent) continue;
 
     // v3.5 #7: scope stats to the active version so the LLM doesn't see stale data
     // from a prior version that already evolved away from the failures.
@@ -1849,7 +1877,7 @@ export async function maybeEvolveSkill(sessionId: string, userId: string, event:
         existing_skills: existingSkillNames.filter(n => n !== skillName).join(", ") || "(none)",
       });
 
-      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision);
+      await applyEvolveBatch(sessionId, userId, skillName, currentContent, activeSkill.id, decision, snapshot.sha);
     } catch (err) {
       logger.error({ err, skillName, sessionId }, "skill.evolution_failed");
     }
@@ -1976,6 +2004,8 @@ async function applyEvolveBatch(
   currentContent: string,
   activeId: number,
   decision: EvolveDecision,
+  /** The skill's fingerprint when the LLM read it: a skill changed since then is left alone. */
+  readSha: string,
 ): Promise<void> {
   const mutations = decision.mutations || [];
   if (!mutations.length) {
@@ -2106,6 +2136,7 @@ async function applyEvolveBatch(
     // Under the user's skill lock, as every other write: the limit check before COMMIT holds only if no other write
     // to the skill can commit in between.
     await lockUserSkills((text, params) => client.query(text, params), userId);
+    await assertUnchangedSince((text, params) => client.query(text, params), activeId, readSha);
     let bumpVersion = false;
     const changeReasons: string[] = [];
 
@@ -2258,6 +2289,9 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
     [skillName, userId]
   )).rows[0];
   if (!current) return false;
+  // The skill as this walk reads it: the undo below applies only if it is still this under the user's lock.
+  const readSnapshot = await readSkillSnapshot(db.query, current.id);
+  if (!readSnapshot) return false;
 
   // v3.5 #4: previously this returned false when version<=1, blocking rollback for
   // skills whose only mutations were file-level / description-level (which don't
@@ -2330,7 +2364,9 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
     let undoneCount = 0;
     try {
       await client.query("BEGIN");
-      await lockUserSkills((text, params) => client.query(text, params), userId);
+      const tq: Querier = (text, params) => client.query(text, params);
+      await lockUserSkills(tq, userId);
+      await assertUnchangedSince(tq, current.id, readSnapshot.sha);
       let needVersionDecrement = false;
       for (const m of [...muts].reverse()) {
         if (m.type === "improve_skill" && m.previous_content) {
@@ -2401,6 +2437,8 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
           ]
         );
       }
+      const over = await skillCapacityProblem(tq, current.id);
+      if (over) throw new Error(`rollback refused: ${over.message}`);
       await client.query("COMMIT");
       logger.info({ skillName, undone: undoneCount, mode: "batch" }, "skill.manual_rollback");
       return true;
@@ -2413,71 +2451,86 @@ async function manualRollbackInner(skillName: string, userId: string): Promise<b
     }
   }
 
-  if (last.action === "improve_skill") {
-    const restored = last.previous_content || last.previous_content_snippet;
-    if (!restored) return false;
-    // GREATEST guards against decrementing below 1 (defense in depth: should never
-    // happen because improve_skill always bumps version, but if history was
-    // hand-edited or migrated from a different lineage we don't want negative versions)
-    await db.query(
-      `UPDATE claw_skills
-       SET content = $1, version = GREATEST(1, version - 1),
-           change_reason = $2,
-           analysis = jsonb_set(analysis, '{latest}', $3::jsonb, true)
-       WHERE id = $4`,
-      [restored, `[manual rollback] restored to pre-v${current.version} SKILL.md`,
-       JSON.stringify({ action: "rollback", rolled_back_from: current.version, applied_at: new Date().toISOString() }),
-       current.id]
-    );
-  } else if (last.action === "improve_file") {
-    if (!last.file_path || !last.previous_content) return false;
-    await updateSkillFile(userId, skillName, { file_path: last.file_path, content: last.previous_content });
-    await db.query(
-      `UPDATE claw_skills SET change_reason = $1,
-         analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
-       WHERE id = $3`,
-      [`[manual rollback] restored ${last.file_path}`,
-       JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
-       current.id]
-    );
-  } else if (last.action === "add_file") {
-    if (!last.file_path) return false;
-    await removeSkillFile(userId, skillName, last.file_path);
-    await db.query(
-      `UPDATE claw_skills SET change_reason = $1,
-         analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
-       WHERE id = $3`,
-      [`[manual rollback] removed added file ${last.file_path}`,
-       JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
-       current.id]
-    );
-  } else if (last.action === "delete_file") {
-    if (!last.file_path || !last.previous_content) return false;
-    await addSkillFile(userId, skillName, { file_path: last.file_path, content: last.previous_content });
-    await db.query(
-      `UPDATE claw_skills SET change_reason = $1,
-         analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
-       WHERE id = $3`,
-      [`[manual rollback] restored deleted file ${last.file_path}`,
-       JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
-       current.id]
-    );
-  }
+  // One transaction under the user's lock, against the skill as read: a save made since is never overwritten, and the
+  // restored skill must still fit the limits.
+  try {
+    const done = await inTransaction(async (q) => {
+      await lockUserSkills(q, userId);
+      await assertUnchangedSince(q, current.id, readSnapshot.sha);
+      if (last.action === "improve_skill") {
+        const restored = last.previous_content || last.previous_content_snippet;
+        if (!restored) return false;
+        // GREATEST guards against decrementing below 1 (defense in depth: should never
+        // happen because improve_skill always bumps version, but if history was
+        // hand-edited or migrated from a different lineage we don't want negative versions)
+        await q(
+          `UPDATE claw_skills
+           SET content = $1, version = GREATEST(1, version - 1),
+               change_reason = $2,
+               analysis = jsonb_set(analysis, '{latest}', $3::jsonb, true)
+           WHERE id = $4`,
+          [restored, `[manual rollback] restored to pre-v${current.version} SKILL.md`,
+           JSON.stringify({ action: "rollback", rolled_back_from: current.version, applied_at: new Date().toISOString() }),
+           current.id]
+        );
+      } else if (last.action === "improve_file") {
+        if (!last.file_path || !last.previous_content) return false;
+        if (!(await updateSkillFile(userId, skillName, { file_path: last.file_path, content: last.previous_content }, { query: q })).ok) return false;
+        await q(
+          `UPDATE claw_skills SET change_reason = $1,
+             analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
+           WHERE id = $3`,
+          [`[manual rollback] restored ${last.file_path}`,
+           JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
+           current.id]
+        );
+      } else if (last.action === "add_file") {
+        if (!last.file_path) return false;
+        if (!(await removeSkillFile(userId, skillName, last.file_path, { query: q })).ok) return false;
+        await q(
+          `UPDATE claw_skills SET change_reason = $1,
+             analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
+           WHERE id = $3`,
+          [`[manual rollback] removed added file ${last.file_path}`,
+           JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
+           current.id]
+        );
+      } else if (last.action === "delete_file") {
+        if (!last.file_path || !last.previous_content) return false;
+        if (!(await addSkillFile(userId, skillName, { file_path: last.file_path, content: last.previous_content }, { query: q })).ok) return false;
+        await q(
+          `UPDATE claw_skills SET change_reason = $1,
+             analysis = jsonb_set(analysis, '{latest}', $2::jsonb, true)
+           WHERE id = $3`,
+          [`[manual rollback] restored deleted file ${last.file_path}`,
+           JSON.stringify({ action: "rollback", file_path: last.file_path, applied_at: new Date().toISOString() }),
+           current.id]
+        );
+      }
 
-  // N3: mark this history entry as consumed for idempotent repeat calls.
-  const marker = {
-    action: "rollback_marker",
-    rolled_back_action: last.action,
-    file_path: last.file_path,
-    applied_at: new Date().toISOString(),
-  };
-  await db.query(
-    `UPDATE claw_skills SET analysis = jsonb_set(
-       analysis, '{history}',
-       COALESCE(analysis->'history','[]'::jsonb) || $1::jsonb, true)
-     WHERE id = $2`,
-    [JSON.stringify(marker), current.id]
-  );
+      // N3: mark this history entry as consumed for idempotent repeat calls.
+      const marker = {
+        action: "rollback_marker",
+        rolled_back_action: last.action,
+        file_path: last.file_path,
+        applied_at: new Date().toISOString(),
+      };
+      await q(
+        `UPDATE claw_skills SET analysis = jsonb_set(
+           analysis, '{history}',
+           COALESCE(analysis->'history','[]'::jsonb) || $1::jsonb, true)
+         WHERE id = $2`,
+        [JSON.stringify(marker), current.id]
+      );
+      const over = await skillCapacityProblem(q, current.id);
+      if (over) throw new Error(`rollback refused: ${over.message}`);
+      return true;
+    });
+    if (!done) return false;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, skillName }, "skill.manual_rollback_failed");
+    return false;
+  }
 
   logger.info({ skillName, mode: "in_place", action: last.action }, "skill.manual_rollback");
   return true;
