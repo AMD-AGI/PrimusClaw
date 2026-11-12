@@ -1189,7 +1189,7 @@ test("L7 a restore that did not bring everything back fails, leaves no record, a
 
 // ===== a failed restore holds the prune =====
 
-/** The session as saved: 534 files, the size of the one measured losing 482 of them. */
+/** The session as saved: 534 files, the size of the one measured coming out of a save with 52. */
 function savedSession(): string[] {
   for (const k of [...store.objects]) if (k.startsWith(PREFIX)) store.objects.delete(k);
   const keys: string[] = [];
@@ -1214,7 +1214,9 @@ test("R1 a restore Hands refused with 413 is followed by a save that deletes not
   // The measured failure: the session had 534 files saved, the restore into the
   // new sandbox died on Hands' body limit, the turn ran on the 52 files the
   // sandbox started with, and the save after it mirrored those 52 into S3 --
-  // deleting the other 482 and reporting `synced`.
+  // deleting every saved file it did not have and reporting `synced`. (Here the
+  // sandbox shares one name with the session, so the base code deletes 533 and
+  // leaves 52.)
   const saved = savedSession();
   const sb = freshSandbox();
   sb.downloadThrows = "MCP error -32603: Request failed with status code 413 Payload Too Large";
@@ -1293,6 +1295,23 @@ test("R5 a sandbox whose restore succeeded still prunes what its user deleted", 
   assert.equal(r.withheld, undefined);
   assert.deepEqual(store.deletes, [`${PREFIX}f0.txt`]);
   assert.equal(saved.filter((k) => store.objects.has(k)).length, 533);
+});
+
+test("R7 a held in-flight checkpoint does not take a file the session has saved, so its recovery copy cannot replace it", async () => {
+  // A failed terminal save copies the in-flight checkpoint over the session prefix
+  // (copyS3Prefix), so a checkpoint that took the new sandbox's f1.txt would put it
+  // over the session's.
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.downloadThrows = "Request failed with status code 413";
+  await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"));
+  const ckpt = "users/user-1/checkpoints/sess-1/msg-1/";
+  const r = await sb.sync(ckpt);
+  assert.equal(r.withheld, 1, "f1.txt is the session's, though the checkpoint prefix has never seen it");
+  assert.ok(!sb.uploaded.includes("/workspace/f1.txt"));
+  assert.ok(!store.objects.has(`${ckpt}f1.txt`));
+  assert.ok(store.objects.has(`${ckpt}clone/c0.txt`), "what is new still goes into the checkpoint");
+  for (const k of saved) assert.ok(store.objects.has(k));
 });
 
 test("R6 a restore whose listing failed holds the sandbox too", async () => {

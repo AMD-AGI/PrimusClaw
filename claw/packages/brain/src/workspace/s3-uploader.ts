@@ -822,14 +822,26 @@ export async function syncWorkspaceToS3(
   const unchanged = delta?.unchanged ?? 0;
   let withheld = 0;
   if (restoreHeld) {
-    // Nothing the prefix holds may be replaced, so a prefix that cannot be listed
-    // gets nothing at all.
-    const saved = await listPrefixKeys(s3Prefix).catch((e: unknown) => {
-      logger.warn({ sessionId, s3Prefix, err: (e as { message?: string })?.message ?? String(e) },
-        "s3.sync.held_listing_failed");
-      return null;
-    });
-    pending = saved ? files.filter((f) => !saved.has(localPathToS3Key(f, s3Prefix))) : [];
+    // Nothing the session has saved may be replaced: not in the prefix written
+    // here, and not in the session's own prefix either when this is another one --
+    // the in-flight checkpoint's, which a failed terminal save copies over the
+    // session's (`copyS3Prefix`), so a file it took from the new sandbox would
+    // replace the session's there. A prefix that cannot be listed gets nothing.
+    const sessionPrefix = `users/${userId}/sessions/${sessionId}/`;
+    const prefixes = s3Prefix === sessionPrefix ? [s3Prefix] : [s3Prefix, sessionPrefix];
+    const saved = new Set<string>();
+    let listed = true;
+    for (const prefix of prefixes) {
+      try {
+        for (const k of await listPrefixKeys(prefix)) saved.add(k.slice(prefix.length));
+      } catch (e: unknown) {
+        logger.warn({ sessionId, prefix, err: (e as { message?: string })?.message ?? String(e) },
+          "s3.sync.held_listing_failed");
+        listed = false;
+        break;
+      }
+    }
+    pending = listed ? files.filter((f) => !saved.has(localPathToS3Key(f, ""))) : [];
     withheld = files.length - pending.length;
     logger.warn(
       { sessionId, s3Prefix, listed: files.length, adding: pending.length, withheld },
