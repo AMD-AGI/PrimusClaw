@@ -12,7 +12,7 @@ import { defineCatalog } from "./catalog.js";
 const NAMES: Readonly<Record<GroupLanguage, readonly [string, string]>> = {
   zh: ["中文", "Chinese"],
   en: ["英文", "English"],
-  auto: ["跟随提问者的语言", "the language each question is asked in"],
+  auto: ["跟随提问者的语言", "the language of each question"],
 };
 
 /** The announcement, in the chat, of a change of its language by `name` ("" when the channel gave none). */

@@ -9,7 +9,7 @@
  * choice, nothing is sent, and Claw reads the language from the message as before. To the assistant the choice goes in the
  * message's `channel_context` (`reply_language`); to a plain session (a 1:1 chat without the assistant) as the line Claw's
  * assistant uses for it, after the message (`replyLanguageLine`). A group's turn carries the group's language in that line
- * instead (`groupChosenLang`): in a group a person's own choice is not read.
+ * instead (`groupChosenLang`), or with none set the language the asker writes in: in a group a person's own choice is not read.
  */
 
 import type { Lang } from "../locales/lang.js";
