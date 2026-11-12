@@ -1480,7 +1480,10 @@ export function asksUser(text: string, choices = 0): boolean {
 /** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
 const CLOSING_OFFER = new RegExp([
   String.raw`^(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
-  String.raw`^有(任何|其他|别的)?(问题|需要|疑问)`,
+  String.raw`^(如|若)?有(任何|其他|别的)?(问题|需要|疑问)`,
+  // A bare "tell me" with nothing to tell: the second half of "如果有任何问题，请告诉我" / "If you have questions, please let me know".
+  String.raw`^(请)?(随时)?(告诉|联系|找|问)(我|我们)[。！!.~～]*$`,
+  String.raw`^(please )?(just )?(let me know|tell me|reach out|ask( me)?)[.!]*$`,
   String.raw`^随时(告诉|找|问|联系)(我|我们)?[。！!.?？~～]*$`,
   String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
   String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,

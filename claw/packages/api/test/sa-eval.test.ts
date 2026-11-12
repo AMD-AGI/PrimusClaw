@@ -1438,6 +1438,9 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "已经处理好了。还有其他问题吗？",
     "提前开题就是提前做开题报告。还需要我做什么吗？",
     "I opened it. Anything else I can help with?",
+    "提前开题就是提前做开题报告。如果有任何问题，请告诉我。",
+    "提前开题就是提前做开题报告。如有问题，请随时告诉我。",
+    "I opened the issue. If you have any questions, please let me know.",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
