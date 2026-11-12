@@ -132,7 +132,7 @@ release version, and its `appVersion` stays `latest`.
   out of every workspace snapshot, the S3 archive included (a reserved name). A use is reported in `skills_used` at
   the turn's version. Metrics `claw_user_skill_{listed_chars,listed_total,truncated_total,read_total,staged_total}`.
   Not when the request lacks `user_skills_enabled`, acts as a user, or is a router's or observer's turn; off while
-  `CLAW_USER_SKILLS_ENABLED` is (#PR3).
+  `CLAW_USER_SKILLS_ENABLED` is (#810).
 
 ## [0.4.0] - 2026-11-12
 
