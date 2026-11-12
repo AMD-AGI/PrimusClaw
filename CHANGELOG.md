@@ -140,7 +140,7 @@ change: the assistant's worker prompt is now `worker-v12` (`worker-v13` with the
   conversations get the list, and only they keep what a turn saves: not a group chat (`config.memory: "off"`), a
   session that acts as a user or runs a review, an assistant router's or observer's turn, an application's run, or a
   session that carried an A2A, task or DAG run. Brain does not use the list yet. Off while `CLAW_USER_SKILLS_ENABLED`
-  is (#806).
+  is off, the default (#806).
 
 ### Changed
 
