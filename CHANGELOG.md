@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.2.1 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.0 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.0 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.6.0 |
 
@@ -102,6 +102,12 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611121326` (commit 86eeb027). A minor release; no schema change; new setting
+`CLAW_ASSISTANT_CHOICES` (on by default). Choice cards and the chosen reply language need personal agent 0.6.0 or later;
+the per-agent notice needs connector 0.2.0. Connector requirements otherwise unchanged from 0.1.0.
+
 ### Added
 
 - The assistant's `say` can put a choice to the user: `choices` carries the options (2 to 10, one plain line each) and
@@ -109,6 +115,19 @@ release version, and its `appVersion` stays `latest`.
   `assistant.say` and the session's `AssistantSay` event carry it as `choices`; a channel shows it as a card whose Send
   sends what was picked as the user's next message. A choice that does not fit is left out whole and the message still
   goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change (#765).
+- A reply language a person chose (personal agent 0.6.0+ sends it as `channel_context.reply_language`, `zh`/`en`) governs
+  the assistant's answers: the reply-language line, say's mismatch refusal, the start notice and the system's own notices
+  follow it; without a choice, the language is still read from each message. `/lang en` now also refuses an answer that is
+  Chinese with no English of its own. A message that asks for a text in a named language ("answer in English",
+  "用英文回复", a translation) still gets it (#771).
+
+### Changed
+
+- The needs-you notice of a question a terminal asks says how that agent's terminal asks, read from the connector's
+  `terminal_asks` (protocol `AssistantRemoteAsk.terminal_asks`: absent for Claude Code, `after_card` for Cursor,
+  `on_input` for Codex, sent by connector 0.2.0); Claude Code's wording is unchanged (#773).
+- The `claw` image no longer contains npm or npx (it never ran them; the image scan found six HIGH findings in the base
+  image's bundled npm) nor `packages/*/test` (#774).
 
 ## [0.2.1] - 2026-11-12
 
