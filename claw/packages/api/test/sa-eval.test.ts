@@ -56,6 +56,9 @@
  *   S37 expect_memory / expect_no_memory: lists of 1 to 10 non-empty substrings; graded on the entries the attempt made: each
  *       expect_memory substring held by one of them (title or body, case-insensitive), no expect_no_memory substring held by any;
  *       entries not read (a recording graded offline) leave the check unverified, never passed
+ *   S39 route=clarify: the final reply asks, by a question mark, a request for what is missing (Chinese or English, as routers
+ *       write it since say took choices) or a choice put to the person; a reply that answers, or only ends with a generic offer,
+ *       does not; an item or a card is no clarification however it asks
  *   S35 the signed-in token is sent only with the person's text message (its words, type and channel context, nothing else), a card's
  *       `deny` and the check of whose it is: an allow, an answer, a decision or a message with more in it, or any other route is refused; a turn's channel_context is sent beside its files, and a
  *       case may name only what a channel sends
@@ -76,7 +79,7 @@ import {
   apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
-  ownSays, SYSTEM_TURN_NOTICES,
+  ownSays, SYSTEM_TURN_NOTICES, asksUser,
   bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
   cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards, memoryRows, memoriesMatching, newMemoryIds,
   TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody,
@@ -1375,4 +1378,55 @@ test("S38 an id the person gave in their own message is not a leak when the repl
   // A number the person wrote for something else ("过去 3 天") does not excuse it.
   const days = caseOf({ turns: [{ user: "过去 3 天做完了哪些事？" }], style: { no_ids: true } });
   assert.deepEqual(failed(days, observed({ shown: ["做完了 #3。"], final: "做完了 #3。" })), ["items named by title"]);
+});
+
+test("S39 route=clarify: a question, a request for what is missing, or a choice", () => {
+  const clarify = caseOf({ route: "clarify", turns: [{ user: "提前开题" }] });
+  const graded = (final: string, over: Partial<Observed> = {}): string[] => failed(clarify, observed({ final, shown: [final], ...over }));
+  // Replies of real-general-cl-022 ("提前开题") in the release gate's G0 runs of 2026-11-12, after the router took `choices`: the judge
+  // passed each; the old check (a question mark only) failed the three without one.
+  const asked = [
+    "**❓ 需要你补充一下：“提前开题”具体指什么？**\n\n我没法确定你想让我做什么，所以先不启动任何事项。可能的意思：\n- 提前开一个新的工作事项（请告诉我要做什么）\n"
+      + "- 提前创建某个定时任务或提醒（请告诉我内容和时间）\n- 学术上的“开题”（开题报告/开题材料），需要我帮你写\n\n📌 请告诉我主题和你想要的产出，我马上处理。",
+    "**⚠️ \"提前开题\"没说清要开什么题**\n\n我没法判断你想提前开的是哪项任务（新建工作事项），所以先没有创建任何事项。\n\n- 请告诉我题目内容，比如要做什么、涉及哪个仓库或系统。\n"
+      + "- 如果是想重新开之前的某项（比如 #815 调研近一年开源大模型推理框架对比），说一声，我就按它的内容重新开一个。\n\n📌 回复具体题目即可，我马上创建。",
+    "**⚠️ 没看懂“提前开题”要做什么**\n\n请说明一下具体想提前开哪个题或事项：比如要新建哪项任务、针对哪个仓库或模型，以及想要的结果。\n\n📌 给我题目和要求，我就立刻为你创建事项。",
+    "**⚠️ 没看懂\"提前开题\"具体指什么**\n\n请说明一下你想提前开始的是哪件事，例如：\n- 提前启动某个调研或任务（请给出主题）\n- 提前执行某个定时任务（如晨报、PR 提醒）\n- 其他\n\n"
+      + "📌 告诉我具体内容，我就立刻开事项。",
+    // public-github-miss-003's second turn ("Go ahead and file it.") in the same runs: asked for the repository and the test.
+    "**⚠️ I still can't file it: I don't know which repository or which test.**\n\n- Repository (owner/name) where the issue should go\n"
+      + "- The name of the flaky test, or a CI run link\n\n📌 Reply with those two and I'll start it right away.",
+    "**⚠️ I can't file it yet because I don't know which repo or which test.**\n\n- **Repository:** owner/name where the issue should go.\n"
+      + "- **Test:** the name or path of the flaky test.\n\n📌 Send those two and I'll file it right away. Failure details, CI links and logs are optional.",
+    "Could you tell me which cluster you mean",
+    "你是想重新开之前的调研，还是新建一个事项",
+  ];
+  for (const final of asked) {
+    assert.ok(asksUser(final), final);
+    assert.deepEqual(graded(final), [], final);
+  }
+  assert.ok(!asksUser("**⚠️ 没看懂“提前开题”要做什么**", 0));
+  // A choice put to the person (`choices` on the say) asks, whatever the text; one option is no choice.
+  assert.deepEqual(graded("**⚠️ 没看懂“提前开题”要做什么**", { finalChoices: 2 }), []);
+  assert.deepEqual(graded("**⚠️ 没看懂“提前开题”要做什么**", { finalChoices: 1 }), ["route=clarify"]);
+  assert.equal(saysOf([say(1, "m1", "选一个", { choices: { options: ["新建事项", "写开题报告", 3] } })])[0]!.choices.length, 2);
+  // Replies that answer, guess or act without asking still fail, a generic closing offer included.
+  for (const final of [
+    "好的",
+    "提前开题是指在正式开题时间之前完成开题报告并参加答辩。",
+    "已经帮你提前开题了，开题材料放在事项里。",
+    "提前开题指的是在规定时间前开题。如果还有其他问题，随时告诉我。",
+    "提前开题一般需要导师同意。有任何需要随时告诉我！",
+    "I opened the issue for the flaky test. Let me know if you need anything else.",
+    "Cancelled your training job. Feel free to ask if there is anything else.",
+    "I'll send the report when it is ready.",
+    "我先确认一下状态，稍后回复你。",
+  ]) {
+    assert.ok(!asksUser(final), final);
+    assert.deepEqual(graded(final), ["route=clarify"], final);
+  }
+  assert.equal(grade(clarify, observed({ final: "好的" })).find((x) => x.name === "route=clarify")?.detail, "answered without asking");
+  // However it asks, a reply that started an item or put a card is no clarification.
+  assert.deepEqual(graded("请说明一下要开哪个题", { route: "item" }), ["route=clarify"]);
+  assert.deepEqual(graded("请说明一下要开哪个题", { route: "confirm" }), ["route=clarify"]);
 });

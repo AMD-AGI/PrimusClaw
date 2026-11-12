@@ -18,7 +18,9 @@
  *                    session, named in channel_context.files); fixture is a path relative to the cases directory.
  *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?}) is sent
  *                    with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through `files`)
- *   route            answer | item | review | confirm | clarify         expected handling of the last turn
+ *   route            answer | item | review | confirm | clarify         expected handling of the last turn; clarify: answered in the
+ *                    chat with a final reply that asks the person (`asksUser`: a question mark, a request for what is missing, or a
+ *                    choice put to them)
  *   tools_must       tool names the last turn must each call; `*` matches anything, `a|b` either
  *   tools_must_not   tool names the last turn must not call (read-only questions list work_create)
  *   said             true: the last turn must have answered with a message of its own: a say of the router's, or the plain text it
@@ -939,6 +941,8 @@ export interface Say {
   fallback: boolean;
   /** The files the message hands the user (a worker's deliveries), with the item whose worker delivered each. */
   files: SaidFile[];
+  /** The options of the choice the message puts to the user (its `choices`), in order; empty when it puts none. */
+  choices: string[];
 }
 
 export const saysOf = (events: readonly LiveEvent[]): Say[] => events
@@ -955,6 +959,7 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     files: (Array.isArray(e.data.files) ? e.data.files : []).filter((f: any) => f && typeof f.name === "string").map((f: any) => ({
       name: String(f.name), content_type: String(f.content_type ?? ""), item_id: typeof f.item_id === "string" ? f.item_id : null,
     })),
+    choices: (Array.isArray(e.data.choices?.options) ? e.data.choices.options : []).filter((o: unknown) => typeof o === "string"),
   }));
 
 /** The files the user was handed by these items' messages, in order. */
@@ -1309,6 +1314,8 @@ export interface Observed {
   /** Every text the user was shown in the case (in baseline: the session's answers). */
   shown: string[];
   final: string;
+  /** The options of the choice the final answer put to the user (assistant mode; absent in baseline and in older recordings). */
+  finalChoices?: number;
   firstReplyMs: number | null;
   finalMs: number | null;
   /** Per turn: when its own first reply arrived, from when it was sent. */
@@ -1448,6 +1455,38 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
   return { applies: true, pass: lang === "zh" ? ratio >= 0.2 : ratio < 0.05, detail: `cjk ${ratio.toFixed(2)}` };
 }
 
+/**
+ * Whether a reply asks the person for what is missing, the check of `route: clarify`: it has a question mark; or it puts a choice to
+ * them (`choices`: two options or more); or it asks in so many words, in Chinese or English ("请说明一下…", "请告诉我…", "Send me the
+ * repository", "Could you tell me…"), which a router often writes instead of a question. A generic closing offer ("如果还有其他问题，
+ * 随时告诉我", "Let me know if you need anything else") asks for nothing, so a reply that only answers and ends with one does not ask.
+ */
+export function asksUser(text: string, choices = 0): boolean {
+  if (choices >= 2 || /[?？]/.test(text)) return true;
+  // The sentences of the reply (a list item or a line is one), less the generic offers that end an answer.
+  const sentences = text.split(/[。！!；;\n]+|(?<=[.])\s+/).filter((t) => t.trim() && !CLOSING_OFFER.test(t));
+  return sentences.some((t) => ASKS.some((re) => re.test(t.trim())));
+}
+/** A closing offer that asks for nothing: "if there is anything else, tell me", "feel free to ask". */
+const CLOSING_OFFER = new RegExp([
+  String.raw`(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
+  String.raw`随时(告诉|找|问|联系)`,
+  String.raw`\bif (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
+  String.raw`\b(feel free|anything else|any (other|more|further) questions?)\b`,
+].join("|"), "i");
+/** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
+const ASKS: readonly RegExp[] = [
+  /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|给我|发给我|发我|回复|指明|明确|描述|选择|选一)/,
+  // "我确认一下" is the assistant saying what it does next, not asking.
+  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认)|告诉我|发给我|(?<![我来先去])(说明|补充|确认|明确)一下/,
+  /(你|您)(是)?(指|想|要|希望|说的是)[^。\n]{0,40}还是/,
+  /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
+  /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
+  /\b(let me know|tell me) (which|what|where|who|when|how|whether)\b/i,
+  // Only as the sentence's own request ("Send me the repo", "If it is elsewhere, send me its name"), not "I'll send the report".
+  /(^|[,:]\s*)[^\p{L}\p{N}]*(reply|respond) with\b|(^|[,:]\s*)[^\p{L}\p{N}]*send (me|those|these|them|the|it|its|their)\b|\bdo you mean\b/iu,
+];
+
 /** The deterministic checks of a case. Checks that do not apply in a mode are listed as skipped, never as passed silently. */
 export function grade(c: EvalCase, o: Observed): Check[] {
   const out: Check[] = [];
@@ -1456,7 +1495,11 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   if (c.route) {
     const name = `route=${c.route}`;
     if (o.mode === "baseline") skip(name);
-    else if (c.route === "clarify") out.push({ name, pass: o.route === "answer" && /[?？]/.test(o.final), detail: `was ${o.route}` });
+    // Asked in the chat: no item, no card, and a reply that asks (a question, a request for what is missing, or a choice).
+    else if (c.route === "clarify") {
+      const asks = asksUser(o.final, o.finalChoices ?? 0);
+      out.push({ name, pass: o.route === "answer" && asks, detail: o.route === "answer" && !asks ? "answered without asking" : `was ${o.route}` });
+    }
     else out.push({ name, pass: o.route === c.route, detail: `was ${o.route}` });
   }
   // A question answered in the chat starts no work, whatever the case lists.
