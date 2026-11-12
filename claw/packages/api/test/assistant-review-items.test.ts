@@ -49,7 +49,12 @@
  *       nothing new to post; a head nobody reviewed, or reviewed by another account, is still the reviewer's to look at (N25, #532)
  *   RS6 the same re-review that tried a write which was refused or failed, with any code the review tools can answer (an expired
  *       credential, a GitHub error, the say withdrawn, CI not green, ...), or one still unfinished, is judged as before: the reviewer is
- *       asked, the requester is never told "no new commits", and no re-run is allowed
+ *       asked, the requester is never told "no new commits", and no re-run is allowed (a merge refused for the missing `workflow` scope
+ *       on someone else's request waits for the author instead, AW1)
+ *   AW1 a merge asked by someone else that GitHub refused on a conflict (DIRTY), on the branch's rules (BLOCKED) or for the missing
+ *       `workflow` scope waits for the author: the item stays in progress and says so, the reviewer is not woken, the one who asked is
+ *       told, and the sweep closes the item once the pull request is merged; any other refusal, and the owner's own review, still need
+ *       the reviewer (2026-11-12: PrimusClaw#770, #784, #806)
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -83,6 +88,7 @@ describe("assistant review items", { skip }, () => {
   let app: FastifyInstance;
   let ri: typeof import("../src/assistant/review-items.js");
   let reviewResultsSettled: () => Promise<void>;
+  let conflictChecksSettled: () => Promise<void>;
   let readTrustedSessionCredentials: typeof import("../src/auth/sealed-session-credentials.js").readTrustedSessionCredentials;
   let checks: Array<{ actor: Record<string, unknown>; pr: Record<string, unknown> }>;
   let checkAnswer: (pr: { owner: string; repo: string; number: number }) => { isError: boolean; body: Record<string, unknown> };
@@ -105,6 +111,7 @@ describe("assistant review items", { skip }, () => {
     });
     ri = await import("../src/assistant/review-items.js");
     ({ reviewResultsSettled } = await import("../src/assistant/review-result.js"));
+    ({ conflictChecksSettled } = await import("../src/assistant/review-conflict.js"));
     ({ readTrustedSessionCredentials } = await import("../src/auth/sealed-session-credentials.js"));
     const { registerAssistantRoutes } = await import("../src/routes/assistant.js");
     const { registerGithubReviewRoutes } = await import("../src/github-review/mcp.js");
@@ -2023,11 +2030,80 @@ describe("assistant review items", { skip }, () => {
       assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 0, `${tool} ${result} ${detail}: not unchanged`);
       assert.equal(await proofForReviewAfterGreenCi({ query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never, sid, words), null, `${tool} ${result} ${detail}: no re-run`);
       await ri.syncReviewItem(it.item_id);
-      assert.equal((await w.item(it.item_id)).board_state, "needs_you", `${tool} ${result} ${detail}`);
+      // (the missing `workflow` scope on a merge alice asked for is the author's to get past, not bob's: AW1)
+      const authorWaits = tool === "gh_pr_merge" && detail === "github_workflow_scope_missing";
+      assert.equal((await w.item(it.item_id)).board_state, authorWaits ? "in_progress" : "needs_you", `${tool} ${result} ${detail}`);
     }
     // The control: with no write tried, the same session is the unchanged re-review (RS5), and the re-run proof is its once CI is green.
     await w.q("DELETE FROM claw_github_audit WHERE id = $1", [write]);
     assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 1);
     assert.notEqual(await proofForReviewAfterGreenCi({ query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never, sid, words), null);
+  });
+
+  test("AW1 a merge someone else asked for that GitHub refused on a conflict, branch rules or the workflow scope waits for the author: the reviewer is not woken, the sweep closes it once merged", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    await turnRan(sid);
+    // bob's review was posted, then his merge was refused on DIRTY, as the review service records it.
+    await audit(sid, "gh_review_submit", "ok", "submitted", "bob");
+    const merge = (await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail, merge_state)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_pr_merge', 'refused', 'merge_state_not_clean', 'DIRTY') RETURNING id`,
+      [sid, "a".repeat(40)],
+    ))[0].id as number;
+    const pr = "AMD-AGI/PrimusClaw#254";
+    const cases: Array<[string, string | null, string, string, string]> = [
+      ["merge_state_not_clean", "DIRTY", "conflict", "conflicts", `Waiting for the author to resolve the conflicts of ${pr}`],
+      ["merge_state_not_clean", "BLOCKED", "branch_rules", "branch rules", `Waiting for the author or CI to meet the branch rules of ${pr}`],
+      ["github_workflow_scope_missing", null, "workflow_scope", "workflow scope", `Waiting for ${pr} to be merged by hand on GitHub`],
+    ];
+    for (const [detail, mergeState, why, summary, question] of cases) {
+      await w.q("UPDATE claw_github_audit SET detail = $2, merge_state = $3 WHERE id = $1", [merge, detail, mergeState]);
+      await ri.sweepReviewItems();
+      await conflictChecksSettled();
+      const item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.last_report_kind, item.summary, item.pending_question, item.params.author_waiting],
+        ["in_progress", "progress", `the merge of ${pr} waits for the author (${summary})`, question, why], `${detail} ${mergeState}`);
+      assert.equal(item.attention_seq, it.attention_seq, `${detail} ${mergeState}: nothing for bob to look at`);
+      assert.equal((await w.pending(bob.routerSid)).length, 0, `${detail} ${mergeState}: bob is not woken`);
+    }
+    // alice, who asked, is told of each, once per head commit and kind.
+    const told = await toldTo("alice");
+    assert.equal(told.filter((t) => t.includes(pr)).length, 3, JSON.stringify(told));
+    // Any other refusal is still bob's to look at, and wakes him; the mark goes.
+    await w.q("UPDATE claw_github_audit SET detail = 'merge_state_not_clean', merge_state = 'BEHIND' WHERE id = $1", [merge]);
+    await ri.syncReviewItem(it.item_id);
+    let item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.last_report_kind, item.params.author_waiting], ["needs_you", "blocked", undefined]);
+    assert.equal((await w.pending(bob.routerSid)).length, 1, "bob is woken for a refusal that is his");
+    // Back to the conflict: the author resolves it and the pull request is merged; the sweep's look on GitHub closes the item.
+    await w.q("UPDATE claw_github_audit SET merge_state = 'DIRTY' WHERE id = $1", [merge]);
+    await ri.syncReviewItem(it.item_id);
+    assert.equal((await w.item(it.item_id)).board_state, "in_progress");
+    const seen = await followed(async () => ({ status: "already_merged" }));
+    try {
+      assert.equal(await ri.followReviewItems(), 1);
+      assert.deepEqual(seen.map((f) => f.sessionId), [sid]);
+      item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "accepted", `${pr} was merged on GitHub`]);
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    // The owner's own review refused on a conflict has no one else to wait on: it is bob's to look at, as before.
+    const own = await start("bob", { prs: [PR(255)], review_only: false });
+    assert.equal(own.status, 200, JSON.stringify(own.body));
+    const ownItem = await w.item(own.body.data.items[0].item_id);
+    await turnRan(ownItem.worker_session_id);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail, merge_state)
+       VALUES ('bob', 'bob', $1, 'AMD-AGI/PrimusClaw', 255, $2, 'gh_pr_merge', 'refused', 'merge_state_not_clean', 'DIRTY')`,
+      [ownItem.worker_session_id, "a".repeat(40)],
+    );
+    await ri.syncReviewItem(ownItem.item_id);
+    assert.deepEqual([(await w.item(ownItem.item_id)).board_state, (await w.item(ownItem.item_id)).last_report_kind], ["needs_you", "blocked"]);
   });
 });

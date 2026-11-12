@@ -26,7 +26,7 @@ import { SEALED_CREDENTIALS_FIELD } from "../auth/sealed-session-credentials.js"
 import { checkSessionCreate, proofForFirstMessageAgain, proofForQueuedFirstMessage, proofForReviewAfterGreenCi, type AttendedProof } from "../github-review/acting-session.js";
 import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { StartedReview, StartedReviewForRequester } from "@claw/protocol";
-import type { FollowRequest, ReviewActor, ReviewContinuation, ToolOutcome } from "../github-review/service.js";
+import { WORKFLOW_SCOPE_REFUSAL, type FollowRequest, type ReviewActor, type ReviewContinuation, type ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import { REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
@@ -914,6 +914,7 @@ export async function restartReview(
   // (nor that the old one stopped waiting for CI: the new one is a review of its own)
   const { halted: _halted, queued: _queued, request_batch: _batch, request_message: _message, ci_wait_ended: _ciWaitEnded, ...kept } = was;
   delete (kept as Record<string, unknown>).ci_waiting;
+  delete (kept as Record<string, unknown>).author_waiting;
   const plan: Planned = {
     pr: was.pr, sessionId: randomUUID(), attended: checked.attended,
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
@@ -1096,8 +1097,11 @@ export interface ReviewFacts {
   pr: PrRef;
   /** Every confirmation of the session; a pending one that ran out is `expired`. `at` is when it was last decided, or opened. */
   confirmations: Array<{ status: string; kind: string; at: number }>;
-  /** The session's review and merge calls: `result` ok or refused, `detail` the status or the refusal. */
-  writes: Array<{ tool: string; result: string; detail: string; at: number }>;
+  /**
+   * The session's review and merge calls: `result` ok or refused, `detail` the status or the refusal, `mergeState` GitHub's merge state a
+   * merge was refused on (`merge_state_not_clean`), else null or unset.
+   */
+  writes: Array<{ tool: string; result: string; detail: string; at: number; mergeState?: string | null }>;
   /** `running`: a turn is open or queued. `none`: no turn ever ran. */
   turn: "running" | "failed" | "finished" | "none";
   /** Why the server stopped running a review someone asked of the owner (`haltRequestedReviews`), or null. */
@@ -1106,6 +1110,8 @@ export interface ReviewFacts {
   queued?: boolean;
   /** Nobody else asked for it: the owner's own review, started by their assistant (no `requested_by`). */
   ownReview?: boolean;
+  /** Who asked for it (`requested_by`), or null for the owner's own review. */
+  requestedBy?: string | null;
   /** How many turns the review's session has had. */
   turns?: number;
   /** The last review the session posted: its head, its event (the verdict), how many inline findings it had, and when. */
@@ -1167,8 +1173,32 @@ const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_m
  */
 export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged";
 
+/**
+ * Why a merge done on someone else's request waits for the pull request's author (`params.author_waiting`): GitHub refused it on a
+ * conflict (merge state DIRTY), on the branch's rules (BLOCKED), or because it changes a CI workflow file and the reviewer's authorization
+ * has no `workflow` scope. None of these is the reviewer's to resolve, so the item stays in progress rather than waking the reviewer
+ * (2026-11-12: PrimusClaw#770, #784 and #806 woke the reviewer as blocked; each time the author fixed it, it merged, and the reviewer had
+ * nothing to do). The one who asked is told (`review-conflict.ts`), and the sweep (`followReviewItems`) closes the item once it is merged.
+ */
+export type AuthorWait = "conflict" | "branch_rules" | "workflow_scope";
+
+/** The author wait of a refused merge (`AuthorWait`), or null when the refusal is the reviewer's to look at. */
+export function authorWaitOf(merge: { detail: string; mergeState?: string | null }): AuthorWait | null {
+  if (merge.detail === WORKFLOW_SCOPE_REFUSAL) return "workflow_scope";
+  if (merge.detail !== "merge_state_not_clean") return null;
+  if (merge.mergeState === "DIRTY") return "conflict";
+  if (merge.mergeState === "BLOCKED") return "branch_rules";
+  return null;
+}
+
+/** Why, short: the item's summary is one line of at most 80 characters. */
+const AUTHOR_WAIT_SUMMARY: Record<AuthorWait, string> = { conflict: "conflicts", branch_rules: "branch rules", workflow_scope: "workflow scope" };
+const AUTHOR_WAIT_QUESTION: Record<AuthorWait, (pr: string) => string> = {
+  conflict: RQ.waitingForAuthorConflict.en, branch_rules: RQ.waitingForAuthorRules.en, workflow_scope: RQ.waitingForManualMerge.en,
+};
+
 export type ReviewState =
-  | { boardState: "in_progress"; summary: string; question: string | null; result?: ReviewResult }
+  | { boardState: "in_progress"; summary: string; question: string | null; result?: ReviewResult; authorWait?: AuthorWait }
   | { boardState: "needs_you"; reportKind: "blocked" | "failed"; summary: string; question: string }
   | { boardState: "done"; outcome: Extract<Outcome, "accepted" | "stopped">; summary: string; result?: ReviewResult };
 
@@ -1230,6 +1260,15 @@ export function reviewState(f: ReviewFacts): ReviewState {
   }
   const mergeRefused = latest(f.writes.filter((w) => w.tool === "gh_pr_merge" && w.result === "refused"));
   if (!f.reviewOnly && mergeRefused && (!submitted || mergeRefused.at >= submitted.at)) {
+    // Refused for a reason only the author (or a person on GitHub) can clear, on a merge someone else asked for: in progress, waiting for
+    // the author, and the one who asked is told (`AuthorWait`). The owner's own review is theirs to look at, as before.
+    const authorWait = f.requestedBy && f.requestedBy !== f.ownerUserId ? authorWaitOf(mergeRefused) : null;
+    if (authorWait) {
+      return {
+        boardState: "in_progress", summary: `the merge of ${pr} waits for the author (${AUTHOR_WAIT_SUMMARY[authorWait]})`,
+        question: AUTHOR_WAIT_QUESTION[authorWait](pr), authorWait,
+      };
+    }
     return { boardState: "needs_you", reportKind: "blocked", summary: `the merge of ${pr} was refused: ${mergeRefused.detail}`, question: RQ.lookAt.en(pr) };
   }
   if (submitted) {
@@ -1267,10 +1306,10 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     [sessionId],
   )).rows as Array<{ status: string; kind: string; at: unknown }>;
   const writes = (await q.query(
-    `SELECT tool, result, detail, at FROM claw_github_audit
+    `SELECT tool, result, detail, at, merge_state FROM claw_github_audit
       WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit', '${FOLLOW_TOOL}') AND result <> 'started'`,
     [sessionId],
-  )).rows as Array<{ tool: string; result: string; detail: string; at: unknown }>;
+  )).rows as Array<{ tool: string; result: string; detail: string; at: unknown; merge_state: string | null }>;
   const turn = (await q.query(
     `SELECT (EXISTS (SELECT 1 FROM claw_tasks WHERE session_id = $1 AND origin = 'chat' AND status = ANY($2::text[]))
              OR EXISTS (SELECT 1 FROM claw_pending_messages WHERE session_id = $1)) AS busy,
@@ -1296,11 +1335,12 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
     confirmations: confirmations.map((c) => ({ status: c.status, kind: c.kind, at: ms(c.at) })),
-    writes: writes.map((w) => ({ tool: w.tool, result: w.result, detail: w.detail, at: ms(w.at) })),
+    writes: writes.map((w) => ({ tool: w.tool, result: w.result, detail: w.detail, at: ms(w.at), mergeState: w.merge_state ?? null })),
     turn: turn.busy ? "running" : turn.last === null ? "none" : turn.last === "failed" || turn.last === "cancelled" ? "failed" : "finished",
     halted: row.params.halted ?? null,
     queued: row.params.queued !== undefined,
     ownReview: row.params.requested_by === undefined,
+    requestedBy: row.params.requested_by ?? null,
     turns: Number(turn.turns ?? 0),
     lastPosted: posted ? { headSha: String(posted.head_sha).toLowerCase(), event: String(posted.event), findings: Number(posted.findings), at: ms(posted.at) } : null,
     ciRefusal: ci ? { headSha: String(ci.head_sha).toLowerCase(), ...ciNamesOf(ci.risk_reasons) } : null,
@@ -1334,9 +1374,11 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   // Whether the item needs its owner after this sync, written or not: a review someone else asked for that is blocked on a conflict is
   // told to the one who asked too (`review-conflict.ts`, once per head commit), and a new head that still conflicts reads as the same state.
   let needsYou = false;
+  let authorWaiting = false;
   let told: ReviewResult | null = null;
   const woke = await inTransaction(async (query) => {
     needsYou = false;
+    authorWaiting = false;
     told = null;
     const q = { query };
     const row = (await query(
@@ -1351,6 +1393,16 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
     const question = state.boardState === "done" ? null : state.question;
     const summary = clipOneLine(state.summary, 80);
     needsYou = state.boardState === "needs_you";
+    // A merge that waits for its author is marked on the item (`author_waiting`): the one who asked is told of it as of a block.
+    const authorWait = state.boardState === "in_progress" ? state.authorWait ?? null : null;
+    authorWaiting = authorWait !== null;
+    if (authorWait !== ((row.params as Record<string, unknown> | null)?.author_waiting ?? null)) {
+      await query(
+        authorWait ? "UPDATE claw_work_items SET params = params || jsonb_build_object('author_waiting', $2::text) WHERE item_id = $1"
+          : "UPDATE claw_work_items SET params = params - 'author_waiting' WHERE item_id = $1",
+        authorWait ? [itemId, authorWait] : [itemId],
+      );
+    }
     // What the review has posted so far, kept on the item for whoever reads the board; a re-review reads it again from the facts.
     const record = await reviewRecord(q, row.worker_session_id as string, params);
     const recordChanged = JSON.stringify(record) !== JSON.stringify((row.params as Record<string, unknown> | null)?.record ?? null);
@@ -1393,8 +1445,9 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   if (woke?.status === "queued") await drainSessionIfIdle(woke.sessionId, woke.userId);
   else if (woke?.status === "refused") await tellUnwoken(itemId);
   // Where a review's "blocked" is written: its session reports nothing itself (no worker report reaches `ingestReport`), so the check
-  // there never ran for one (2026-11-08, N5: four reviews refused on DIRTY, none told). Not waited for, as there.
-  if (needsYou) checkConflictLater(itemId);
+  // there never ran for one (2026-11-08, N5: four reviews refused on DIRTY, none told). Not waited for, as there. A merge that waits for
+  // its author does not need the owner, but the one who asked is told of it the same way.
+  if (needsYou || authorWaiting) checkConflictLater(itemId);
   // A review that ended without an approval, or waits for CI before it is run again, is told to its owner by the server, in their language
   // (2026-11-11: #195 posted a comment-only review because codecov/patch was red, the item closed as done, and nobody was told anything).
   if (told) tellReviewResultLater(itemId, told);

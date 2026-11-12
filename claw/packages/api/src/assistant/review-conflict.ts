@@ -22,7 +22,9 @@
  * session itself (no summary, question or session id).
  *
  * Started where a review item comes to need its owner: `syncReviewItem` (`review-items.ts`), which writes a review's "blocked" from the
- * facts of its session (a review session sends no worker report), and `ingestReport` for an item that does report. Both start it after
+ * facts of its session (a review session sends no worker report), and `ingestReport` for an item that does report. A merge someone else
+ * asked for that GitHub refused for one of these reasons no longer needs the reviewer (2026-11-12): `syncReviewItem` keeps the item in
+ * progress, waiting for the author (`params.author_waiting`), and starts this check from that state too. Both start it after
  * their commit and do not wait for it (`checkConflictLater`), so a slow read or notice never delays either.
  */
 import pino from "pino";
@@ -118,7 +120,9 @@ export async function tellRequesterOfConflict(itemId: string): Promise<boolean> 
     } | undefined;
     if (!item) return skipped("no_item");
     if (item.kind !== "review") return skipped("not_a_review");
-    if (item.board_state !== "needs_you") return skipped("not_needs_you", { boardState: item.board_state });
+    // A merge that waits for its author (`author_waiting`, `review-items.ts`) is in progress for the reviewer, and told to the one who asked.
+    const waitsForAuthor = item.board_state === "in_progress" && typeof item.params?.author_waiting === "string";
+    if (item.board_state !== "needs_you" && !waitsForAuthor) return skipped("not_needs_you", { boardState: item.board_state });
     if (String(item.params?.review_only ?? "false") === "true") return skipped("review_only");
     const requester = requestedByOfItem(item.params);
     if (!requester) return skipped("no_requested_by");
