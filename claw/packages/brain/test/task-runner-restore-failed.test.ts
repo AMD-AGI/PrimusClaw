@@ -145,6 +145,13 @@ test("the event names no address: not the sandbox's, not a presigned URL", async
   assert.doesNotMatch(String(restoreFailed[0].message), /10\.0\.0\.[78]|X-Amz-Signature|https?:|\.svc/);
   assert.match(String(restoreFailed[0].message), /fetch failed for <url>.*ECONNREFUSED <address> via <address>/);
 
+  const { withoutAddresses } = await import("../src/workspace/sync-delta.js");
+  assert.equal(
+    withoutAddresses("connect to [fd00::4]:9000 or fd00::4 or fe80::1:2 or ::1 or 2001:db8:0:0:0:0:0:1 failed at 12:34:56"),
+    "connect to <address> or <address> or <address> or <address> or <address> failed at 12:34:56",
+  );
+  assert.equal(withoutAddresses("Error:: retry; std::string"), "Error:: retry; std::string");
+
   const incomplete = new WorkspaceRestoreIncomplete(0, 3, 3, "HTTP 413 from https://s3.example/b/k?X-Amz-Signature=abc");
   assert.match(incomplete.message, /failed=3; first: HTTP 413 from <url>/);
   assert.doesNotMatch(incomplete.message, /X-Amz-Signature/);

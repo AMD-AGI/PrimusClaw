@@ -386,18 +386,31 @@ function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): 
  * rebuilt sandbox starts without it and restores from the prefix the hold kept
  * whole. Brain keeps the same note in memory (`restoreHeld`), because the sandbox
  * that could not be restored may not be able to take the write either.
+ *
+ * The note guards against Brain's own failure, not against the sandbox: a command
+ * in the sandbox that removes it gains nothing it did not have, since the same
+ * command can delete the files in /workspace and the next save then deletes
+ * their saved copies, as it should. What removing it does is let a Brain process
+ * that never saw the failure (one restarted since) prune by this sandbox again --
+ * the outcome of that command deleting the files themselves.
  */
 export const RESTORE_HOLD_PATH = `${SYNC_STATE_DIR}/restore-incomplete`;
 
 /**
  * An error's text with the addresses in it cut out, for anything a user or the
- * sandbox is shown: a URL (a presigned one is a credential), an IP address with
- * or without its port, and a cluster service name -- a sandbox's address is
- * internal.
+ * sandbox is shown: a URL (a presigned one is a credential), an IPv4 or IPv6
+ * address with or without its port, and a cluster service name -- a sandbox's
+ * address is internal.
  */
 export function withoutAddresses(text: string): string {
+  const hex = "[0-9a-fA-F]{1,4}";
   return text
     .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\](?::\d+)?/g, "<address>")
+    // Compressed IPv6 (`fd00::4`, `::1`), then the full form of four groups or
+    // more, so a clock time (`12:34:56`) is left alone.
+    .replace(new RegExp(`(?<![\\w:])(?:${hex}(?::${hex})*)?::(?:${hex}(?::${hex})*)?(?![\\w:])`, "g"), "<address>")
+    .replace(new RegExp(`(?<![\\w:])(?:${hex}:){3,7}${hex}(?![\\w:])`, "g"), "<address>")
     .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "<address>")
     .replace(/\b[\w.-]+\.svc(?:\.cluster\.local)?(?::\d+)?\b/g, "<address>");
 }
