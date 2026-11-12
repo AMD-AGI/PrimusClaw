@@ -126,6 +126,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
+- A sandbox whose workspace could not be restored from object storage (Hands refused the download with 413, the listing
+  failed, or files were still missing after the retries) no longer lets the save after the turn delete the session's
+  saved files: such a save only adds files the saved copy does not have, and replaces and deletes nothing, for as long
+  as the sandbox lives. Before, it pruned every saved file the restore had not brought back (534 files down to 52) and
+  reported success. The failed restore is reported to the session as `sandboxStatus` `workspace_restore_failed` (reason
+  `payload_too_large`, `sandbox_unreachable` or the error class), and counted in
+  `claw_brain_workspace_restore_total{result}`. No schema change, no new setting (#804).
 - A terminal's work item title keeps the machine's and the tool's names whole and cuts what was asked after its last whole
   word, ending in "…" (never inside an emoji or a combined character), instead of cutting the whole line at 40 characters
   ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
