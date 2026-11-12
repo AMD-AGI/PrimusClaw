@@ -110,9 +110,10 @@ Step by step:
 
 1. **`prepare(env)`**: before anything else is read. Refuse here what the surface cannot run with at all (Teams reads
    its release-gate test entry first, so a typo in it never picks a path silently).
-2. **`loadSecrets(names, deps)`** (optional): the secrets core's settings need (`TEAMS_ENCRYPTION_KEYS`, and
-   `TEAMS_EXCHANGE_CLIENT_SECRET` with the exchange). Without it the worker reads them from the environment and requires
-   `SECRETS_SOURCE=env` ([`envSecrets`](../packages/runtime/src/worker/assemble.ts)). Teams reads Azure Key Vault here.
+2. **`loadSecrets(names, deps)`** (optional): the secrets named in `names`, which are what core's settings need
+   (`TEAMS_ENCRYPTION_KEYS` always; `TEAMS_EXCHANGE_CLIENT_SECRET` with the exchange; `FEEDBACK_GITHUB_APP_KEY` with the
+   feedback plugin's GitHub App). Without it the worker reads them from the environment, and `SECRETS_SOURCE` must be
+   unset or `env` ([`envSecrets`](../packages/runtime/src/worker/assemble.ts)). Teams reads Azure Key Vault here.
 3. **`configure(settings)`**: after core's settings, before the store opens. Read and check the surface's own settings
    (its tokens, its endpoints, its reply style) and return:
    - `host`: `"0.0.0.0"` in production, the loopback for a test entry;
@@ -287,12 +288,12 @@ one of two credentials:
 
 ## Claw interactions
 
-| What                       | How the surface takes part                                                                                                                                                                                                                                                                                                                                                                                |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Assistant messages         | Every message to a person's assistant carries `channel_context.channel` = `SurfaceCaps.channel`. Claw records it with the message and sends that turn's replies back to that surface ("return to source").                                                                                                                                                                                                |
-| On-behalf messages         | A deployment's on-behalf route (`TEAMS_ON_BEHALF_USERS`, a plugin's route) posts words into a person's own chat and hands them to the router as typed (`typedEvent`, `provenance: "on_behalf"`); the message to the assistant then says `channel_context.via: "on_behalf"`.                                                                                                                               |
-| Notification subscriptions | With `PROACTIVE_ENABLED=1` the worker keeps one subscription per person, created with their credential, whose `surface` is `SurfaceShape.surfaceId` and whose URL is `NOTIFY_WEBHOOK_URL/<route>`. Claw signs each event with that subscription's secret; the worker checks the signature, the timestamp and that the event is that person's, then posts it into their stored 1:1 conversation reference. |
-| Return to source           | A reply of a turn goes to the surface that turn's message came from; a proactive message (a finished run, an approval, a needs-you) to the surface the person wrote from last; when that surface has no subscription that takes the event, the next one. A person whose subscriptions all name one surface gets everything there.                                                                         |
+| What                       | How the surface takes part                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Assistant messages         | Every message to a person's assistant carries `channel_context.channel` = `SurfaceCaps.channel`. Claw records it with the message and sends that turn's replies back to that surface ("return to source").                                                                                                                                                                                                                                                                    |
+| On-behalf messages         | A deployment's on-behalf route (`TEAMS_ON_BEHALF_USERS`, a plugin's route) posts words into a person's own chat and hands them to the router as typed (`typedEvent`, `provenance: "on_behalf"`); the message to the assistant then says `channel_context.via: "on_behalf"`.                                                                                                                                                                                                   |
+| Notification subscriptions | With `PROACTIVE_ENABLED=1` the worker keeps one subscription per person, created with their credential, whose `surface` is `SurfaceShape.surfaceId` and whose URL is `NOTIFY_WEBHOOK_URL/<route>`. Claw signs each event with that subscription's secret; the worker checks the signature, the timestamp and that the event is that person's, then posts it into their stored 1:1 conversation reference.                                                                     |
+| Return to source           | Where Claw's assistant is on (`CLAW_ASSISTANT_ENABLED` on Claw): a reply of a turn goes to the surface that turn's message came from; a proactive message (a finished run, an approval, a needs-you) to the surface the person wrote from last; when that surface has no subscription that takes the event, the next one. A person whose subscriptions all name one surface gets everything there. With Claw's assistant off, every subscription that takes an event gets it. |
 
 So a surface gets Claw's side right by naming itself consistently (`caps.channel` = `shape.surfaceId`), storing a
 reference for each person's 1:1 chat (core does this when they write), and drawing what arrives.
@@ -417,8 +418,9 @@ over HTTP and a store in a temporary directory serves every test, and each test 
 | caps             | Across every test above, what the caps say the surface cannot do never appeared: no stream without `streaming`, no edit without `edit`, no button without `views`.                                   |
 | stop             | The worker (which answered `/healthz` before the first test) stops: `stop` and `run` return within a second.                                                                                         |
 
-The echo surface runs the kit twice, once with every cap and once without streaming, edits, deletes or message ids, so
-the degraded paths are exercised too.
+The echo surface runs the kit twice: once with streaming, edits, deletes and message ids, and once without them, so a
+surface that cannot stream or edit is exercised too (citations and suggested replies are off in both runs, and no test
+yet deletes a message or depends on a message's id).
 
 ### Acceptance on the product path
 
