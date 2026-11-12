@@ -214,7 +214,11 @@ export function matchesMcpRule(rule: string, server: string, tool: string): bool
 export function cursorWouldAsk(e: CursorEvent, rules: CursorRules): boolean {
   if (rules.approvalMode === "unrestricted") return false;
   if (e.event === "beforeMCPExecution") {
-    return !rules.allow.some((r) => matchesMcpRule(r, e.server ?? "", e.tool ?? ""));
+    const server = e.server ?? "";
+    const tool = e.tool ?? "";
+    // A deny rule: Cursor refuses it itself, without asking.
+    if (rules.deny.some((r) => matchesMcpRule(r, server, tool))) return false;
+    return !rules.allow.some((r) => matchesMcpRule(r, server, tool));
   }
   if (e.sandbox) return false;
   const parts = simpleCommands(e.command ?? "");
@@ -232,8 +236,10 @@ export const CURSOR_TERMINAL_OPTION = "terminal";
 export function mapCursorRequest(e: CursorEvent): Mapping<CursorDecision> {
   const shell = e.event === "beforeShellExecution";
   const input = shell ? { command: e.command, cwd: e.cwd } : { server: e.server, tool: e.tool, arguments: e.args ?? null };
-  const shown = shownInput(redactDeep(input));
-  const title = shell ? `Run: ${oneLine(e.command, 160)}` : `MCP tool ${oneLine(e.server, 60)} / ${oneLine(e.tool, 60)}`;
+  const masked = redactDeep(input) as Record<string, unknown>;
+  const shown = shownInput(masked);
+  // The title is built from the masked request too: a credential typed into a command never reaches Claw in it.
+  const title = shell ? `Run: ${oneLine(masked.command, 160)}` : `MCP tool ${oneLine(masked.server, 60)} / ${oneLine(masked.tool, 60)}`;
   const card: CardSpec = {
     tool: oneLine(title, 200),
     kind: shell ? "execute" : "mcp",

@@ -87,6 +87,8 @@ describe("whether Cursor would ask", () => {
     assert.equal(cursorWouldAsk(ev(mcp("github", "create_issue", {})), rules()), true);
     assert.equal(cursorWouldAsk(ev(mcp("github", "create_issue", {})), rules({ allow: ["Mcp(github:*)"] })), false);
     assert.equal(cursorWouldAsk(ev(mcp("github", "create_issue", {})), rules({ allow: ["Mcp(github:list_*)"] })), true);
+    // A deny rule: Cursor refuses it itself, so it is neither carded nor held.
+    assert.equal(cursorWouldAsk(ev(mcp("github", "delete_issue", {})), rules({ deny: ["Mcp(github:delete_issue)"] })), false);
   });
 
   test("the rules come from the user's cli-config.json and each workspace root's .cursor/cli.json", () => {
@@ -117,6 +119,14 @@ describe("the card and what a choice prints", () => {
     assert.deepEqual(m.cards[0]!.options.map((o) => [o.optionId, o.kind]), [["deny", "reject_once"], ["terminal", "allow_once"]]);
     assert.deepEqual(m.decide(["deny"]), { permission: "deny", user_message: "Declined from your phone (Claw).", agent_message: CURSOR_DENIED_AGENT });
     assert.equal(m.decide(["terminal"]), null);
+  });
+
+  test("a credential typed into a command is masked in the card's title as well as in its input", () => {
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const m = mapCursorRequest(ev(shell(`curl -H "Authorization: token ${token}" https://api.github.com/user`)));
+    assert.ok(!m.cards[0]!.tool.includes(token), m.cards[0]!.tool);
+    assert.ok(!JSON.stringify(m.cards[0]!.input).includes(token));
+    assert.match(m.cards[0]!.tool, /^Run: curl /);
   });
 
   test("an MCP call shows its server, tool and arguments; a credential is masked", () => {
