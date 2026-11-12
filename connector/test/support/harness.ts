@@ -50,11 +50,13 @@ export interface HarnessOptions {
   /** The agent's `approval` setting, and the mode its sessions start in (default: "default", which asks). */
   approval?: "ask" | "never";
   askMode?: string;
-  /** The first agent's kind (default "example"; an attach agent takes its preset's). */
-  kind?: string;
   /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
   preset?: string;
   safeModes?: string[];
+  /** The kind of the agents (default "example"; "cursor" makes them agents Cursor's approval hooks are filed under). */
+  kind?: string;
+  /** The second agent's root (default: the same work directory as the first). */
+  secondRoots?: [string];
   /** A second agent, "fake2", on the same stand-in adapter; this is the rest of its table (for example `approval = "never"`). */
   secondToml?: string;
   timing?: Partial<ConnectorTiming>;
@@ -110,13 +112,13 @@ export class Harness {
     const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
 id = ${JSON.stringify(id)}
-${o.attach && id === "fake" ? "" : `kind = ${JSON.stringify(id === "fake" && o.kind ? o.kind : "example")}`}
+${o.attach && id === "fake" ? "" : `kind = ${JSON.stringify(o.kind ?? "example")}`}
 name = "Fake agent"
 ${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 ask_mode = ${JSON.stringify(askMode)}
 safe_modes = ${JSON.stringify(id === "fake" && o.safeModes ? o.safeModes : ["default", "plan"])}
-roots = [${JSON.stringify(h.work)}]
+roots = [${JSON.stringify(id === "fake2" && o.secondRoots ? o.secondRoots[0] : h.work)}]
 ${id === "fake" ? attachToml : ""}
 ${extra}
 [agents.env]

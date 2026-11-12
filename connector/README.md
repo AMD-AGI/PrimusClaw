@@ -605,7 +605,7 @@ A Codex CLI session started in a terminal (`codex`, measured on 0.153.4) asks be
 MCP tool. With its approval hook installed, that question can go to the chat too:
 
 ```sh
-claw-connector hooks install --codex           # into $CODEX_HOME/hooks.json; "hooks uninstall --codex" takes it out
+claw-connector hooks install --agent codex     # into $CODEX_HOME/hooks.json; "hooks uninstall --agent codex" takes it out (--codex is the same)
 ```
 
 Codex runs a hook only once you have trusted it: the next time it starts it says "Hooks need review"; choose *Trust all* (or
@@ -625,12 +625,46 @@ the hook is done. So:
   sessions this connector runs through codex-acp are left alone. The folder must be inside the roots of a `codex` agent whose
   `CODEX_HOME` is the one the hook was installed in. Codex's own multiple-choice questions (`request_user_input`, plan mode)
   reach no hook and stay in the terminal.
-- **Left alone, as for Claude Code**: a session started with `CLAW_APPROVAL_HOOKS=off` (`CLAW_APPROVAL_HOOKS=off codex`), and a
-  question asked in bypass mode (`permission_mode: bypassPermissions`, which Codex reports under approval policy `never` or
-  `--dangerously-bypass-approvals-and-sandbox`). Claude Code's `claude -p` signals have no Codex counterpart; `codex exec` is
-  left out by the TUI rule above.
+- **Left alone, as for Claude Code**: a session started with `CLAW_APPROVAL_HOOKS=off` (`CLAW_APPROVAL_HOOKS=off codex`), a session this connector runs
+  (`CLAW_CONNECTOR_AGENT` in its environment), and a question asked in bypass mode (`permission_mode: bypassPermissions`, which Codex
+  reports under approval policy `never` or `--dangerously-bypass-approvals-and-sandbox`). Claude Code's `claude -p` signals have no
+  Codex counterpart; `codex exec` is left out by the TUI rule above.
 - Everything else is as above: a session of its own at Claw (`origin: "terminal_hook"`, agent `codex`), `/approvals off`, the
   one-hour limit, and the audit log.
+
+### Cursor
+
+```sh
+claw-connector hooks install --approvals --agent cursor [--hold 60]   # "hooks uninstall --agent cursor" takes them out
+```
+
+This adds `beforeShellExecution` and `beforeMCPExecution` hooks, plus `afterShellExecution`, `afterMCPExecution`,
+`postToolUseFailure`, `beforeSubmitPrompt`, `stop` and `sessionEnd`, to the user-level `hooks.json` of the Cursor configuration
+directory (`$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`; `--config-dir` names another), merged the same way
+(marked `--managed-by claw-connector`). Their questions are filed under a `cursor` agent of `agents.toml` whose Cursor directory that is,
+and only for folders inside its roots.
+
+Cursor's hooks can do less than Claude Code's (measured on the Cursor Agent CLI 2026.11.11): a hook runs *before* Cursor decides
+whether to ask, Cursor shows its own question only after the hook has returned, and a hook can turn a call down or let Cursor ask, but
+never approve one. So for Cursor the phone goes first and the terminal second:
+
+- A shell command or MCP call that Cursor would ask about (not on the allow lists of `cli-config.json` or the project's
+  `.cursor/cli.json`, not run in the sandbox, Run Everything off) is put on your phone, and Cursor waits up to `--hold` seconds
+  (default 60, 5 to 3600) while it is there. The terminal shows "Working" meanwhile.
+- **No** on the phone blocks it (the agent is told you declined it from your phone). **Ask me at the terminal**, or no answer
+  within the hold, lets Cursor go on as it would have: it asks at the terminal, where you approve it. There is no **Yes** on the
+  phone, because Cursor would still ask at the terminal.
+- Ctrl-C at the terminal, a new prompt or the end of the conversation withdraws the card at once.
+- A call Cursor would not ask about is neither put on the phone nor held. That is judged from those files: a command line this
+  cannot split for sure (`$(...)`, backticks) counts as asked about, and Cursor's own extra checks (a recursive delete outside the
+  sandbox, an administrator's list) are not seen, so such a call is asked about at the terminal only.
+- `agent --force` (`--yolo`) turns Run Everything on for one run without writing it to `cli-config.json`, and a hook cannot see
+  it: such a run still holds every command that is not on an allow list for the phone first (then runs it, as `--force` says).
+- A Cursor session keeps the hooks it started with: install, uninstall or a new `--hold` takes effect in the next one.
+- Claw and the chat still say "the first answer counts" on these cards; the card's event says `terminal_asks: "after_card"`.
+- `CLAW_APPROVAL_HOOKS=off` in the environment of `agent` leaves its questions in the terminal, as for Claude Code.
+- Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
+  editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
 
 ## Commands
 
@@ -638,7 +672,7 @@ the hook is done. So:
 |---|---|
 | `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks] [--no-approval-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks once (`[Y/n]`, Enter is yes) before adding the Claude Code hooks to Claude's `settings.json`: the session hooks and the approval hooks (only those not there yet are offered); `--hooks` adds them without asking, `--no-hooks` skips them, `--no-approval-hooks` leaves the approval hooks out, and with nobody to answer (a script, a pipe) nothing is added and the `hooks install --approvals` command is printed instead. |
 | `pair CODE --server URL [--name HOST] [--no-start] [--hooks \| --no-hooks] [--no-approval-hooks]` | Connect this machine with the one-time code from the chat (see [Fastest](#fastest-pair-from-the-chat-one-command)); offers the Claude Code hooks as `init` does, then starts the service. |
-| `hooks install\|uninstall\|status [--approvals \| --codex]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). With `--codex`, the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). |
+| `hooks install\|uninstall\|status [--approvals] [--agent claude\|codex\|cursor] [--hold SECONDS]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). `--agent codex` (or `--codex`): the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). `--agent cursor`: Cursor's approval hooks instead (see [Cursor](#cursor)), in the Cursor directory of each `cursor` agent; `--hold` is how long Cursor waits for the phone. |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |

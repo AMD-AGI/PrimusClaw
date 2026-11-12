@@ -16,6 +16,10 @@
  *   Q8 what the router can do is told from the tool catalog: each write of its servers, done by an item that asks first, never "read-only"
  *   Q9 a text the user asked for in a language they named (a translation) is said in it at once, not refused and rewritten with a label
  *      before it (2026-11-06 parity run, S2); any other message in that language to a Chinese user still is
+ *   Q10 say follows the language the user chose in their channel (`channel_context.reply_language`), not the one their message is in:
+ *      an English answer to a Chinese message of a /lang en user goes through; one to an English message of a /lang zh user is refused,
+ *      unless the message asked for English by name (translate, answer in English, an English reply); a Chinese answer to a /lang en user
+ *      is refused unless they asked for Chinese; an old client's turn is as before
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -98,6 +102,52 @@ describe("router quality, through the tools", { skip }, () => {
     // Asked in other words (翻译成), the same.
     const ja = await turnFor("把这句翻译成英文：明天开会");
     assert.equal((await w.mod.tools.say(ja as never, { text: "The meeting is tomorrow." }, w.sayDeps)).ok, true);
+  });
+
+  test("Q10 say refuses by the language the user chose, and lets through what they asked for in a language they named", async () => {
+    /** A turn answering `prompt`, whose message the channel sent with `context` (as the route records it). */
+    const chosenTurn = async (prompt: string, context: Record<string, unknown>) => {
+      const turn = await turnFor(prompt);
+      await w.q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, $3, $4, $5::jsonb)`,
+        [alice.routerSid, turn.mid, alice.userId, prompt, JSON.stringify(context)],
+      );
+      return turn;
+    };
+    const say = async (turn: unknown, text: string) => w.mod.tools.say(turn as never, { text }, w.sayDeps);
+    const refused = (err: any) => err.code === "reply_language" && /answered in Chinese \(\[Reply language: Chinese\]\)/.test(err.message);
+
+    // /lang en, a message in Chinese: an answer in Chinese is refused, and the English one, naming a Chinese title, is the one asked for.
+    const en = await chosenTurn("帮我看看 main 上的构建为什么挂了", { reply_language: "en" });
+    await assert.rejects(say(en, "main 上的构建挂在一个不稳定的测试上，重跑已经通过。"), (err: any) =>
+      err.code === "reply_language" && /the message is in Chinese, but this user is answered in English \(\[Reply language: English\]\)/.test(err.message));
+    assert.equal((await say(en, "The build on main failed on a flaky test (修复构建); a rerun is green.")).ok, true);
+    // Unless they asked for Chinese by name.
+    const zhAsked = await chosenTurn("用中文回复：构建为什么挂了？", { reply_language: "en" });
+    assert.equal((await say(zhAsked, "构建挂在一个不稳定的测试上。")).ok, true);
+
+    // /lang zh, a message in English: an English answer is refused as one to a Chinese user, and the Chinese one goes through.
+    const zh = await chosenTurn("Why is the build on main red?", { reply_language: "zh" });
+    await assert.rejects(say(zh, "The build on main failed on a flaky test."), refused);
+    assert.equal((await say(zh, "main 上的构建挂在一个不稳定的测试上。")).ok, true);
+
+    // Unless the message asked for that language by name: a translation, an answer in English, an English reply.
+    for (const asked of [
+      "Translate this into English: 明天下午三点开会",
+      "Please answer in English: why is the build on main red?",
+      "用英文回复：main 上的构建为什么挂了？",
+      "Write an English reply to Bob thanking him for the review.",
+    ]) {
+      const turn = await chosenTurn(asked, { reply_language: "zh" });
+      assert.equal((await say(turn, "Thanks for the review, Bob. The build on main is green again.")).ok, true, asked);
+    }
+
+    // An old client sends no choice: the language of the message decides, as before.
+    const old = await chosenTurn("帮我看看构建", {});
+    await assert.rejects(say(old, "The build failed on a flaky test."), refused);
+    const oldEn = await chosenTurn("Why is the build red?", {});
+    assert.equal((await say(oldEn, "The build failed on a flaky test.")).ok, true);
+    assert.equal((await say(oldEn, "构建挂在一个不稳定的测试上。")).ok, true, "a Chinese answer to an English message is not refused without a choice, as before");
   });
 
   test("Q4 work_create tells the user at once that it started, once, in their language, only when answering them", async () => {
@@ -308,6 +358,19 @@ describe("router quality, pure", () => {
     assert.deepEqual(bare("Taken on as #6, and #8 is next.", 6), [8]);
   });
 
+  test("Q2c an answer due in English the user chose is refused only when it is Chinese with no English word of its own", async () => {
+    const { replyLanguageMismatch } = await import("../src/assistant/language.js");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], null, true), "Chinese");
+    assert.equal(replyLanguageMismatch("构建在 CI 上挂了，PR #12 需要 rebase。", "English", [], null, true), "Chinese");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], null, false), null, "no choice: never refused, as before");
+    assert.equal(replyLanguageMismatch("构建没问题。", "English", [], "Chinese", true), null, "Chinese asked for by name");
+    assert.equal(replyLanguageMismatch("The PR 修复登录超时 is merged.", "English", [], null, true), null, "English that names a Chinese title");
+    assert.equal(replyLanguageMismatch("#6 修复登录超时", "English", ["修复登录超时"], null, true), null, "an item title alone");
+    assert.equal(replyLanguageMismatch("Done: “构建没问题”", "English", [], null, true), null, "a quotation");
+    assert.equal(replyLanguageMismatch("ビルドは問題ありません。", "English", [], null, true), null, "not Chinese");
+    assert.equal(replyLanguageMismatch("All good.", "English", [], null, true), null);
+  });
+
   test("Q2b the language a message asks a text in is read from the user's own words, and only that one is let through", async () => {
     const { replyLanguageMismatch, requestedTextLanguage } = await import("../src/assistant/language.js");
     for (const [message, asked] of [
@@ -347,15 +410,15 @@ describe("router quality, the prompt", () => {
     const p = await import("../src/assistant/prompts.js");
     // router-v16 (this rule set, a long answer said whole, a say after the start notice added to it, one message a turn, progress read
     // live, a follow-up with the earlier files, progress from what the job wrote now with its age, a derived number from the unrounded
-    // values; router-v17: a translation said alone, in the language asked for; router-v18: the tool for a worker's report, a request to
+    // values; router-v17: a translation said alone, in the language asked for; router-v22: the line names the language the user chose; router-v18: the tool for a worker's report, a request to
     // remember and a channel setting named outright; router-v19: the quick line before deliver_text, trigger_create, review_mode_set and
     // devenv_; router-v20: a question asked again compared from this turn's lookups alone); its review prompt is router-v26 (v25: a pull
     // request pr_state says is not_found said not to exist; v26: v25 on router-v20); router-read-v9 adds
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
-    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v21");
+    assert.equal(p.ROUTER_PROMPT_VERSION, "router-v22");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v16");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v27");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v28");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],
@@ -401,8 +464,11 @@ describe("router quality, the prompt", () => {
       ["work_recall for how far an item got", /call work_recall\(item, "live"\) for each item asked about, all in one step/],
       ["memory and channel tools", /the memory tools of the Memory section[\s\S]*channel_action, whether the user typed its command or said it in words/],
       ["a declined request in a line", /A request you will not carry out[^\n]*say so in one short line/],
-      ["every say in the reply language", /write every say in it, the last one too \(say refuses a reply to a Chinese message that has no Chinese in it\)/],
-      ["a translation said alone, in its language", /a text the user asked for in a language they named \(把这句翻成英文, translate it into English\): say that text alone, in that language, with nothing before or after it \(no 译文：, no quotes, no note\)/],
+      ["every say in the reply language", /Write every say in it, the last one too \(say refuses a reply due in Chinese that has no Chinese in it, and a reply all in Chinese to a user who chose English\)/],
+      // router-v22: the line names the language the user chose, whatever their message is in, and an answer asked for in a named language is in it.
+      ["the line names the chosen language", /Reply in the language a line like \[Reply language: X\] after the user's message names[^\n]*even when the message itself is written in another one: X is the language the user chose to be answered in, or else the one their message is in\. Without that line, reply in the language of the user's latest message\./],
+      ["a translation said alone, in its language", /a text \(把这句翻成英文, translate it into English\) is said alone, in that language, with nothing before or after it \(no 译文：, no quotes, no note\)/],
+      ["an answer asked for in a named language", /an answer they asked to have in a language \(用英文回复, answer in English, write an English reply\) is written in that language; say refuses neither\./],
       ["how many is answered with the list", /"How many pull requests \(issues\) do I have open" is answered with the total \(total_count\) and then the list itself, never the number alone[^\n]*refs_by_repo/],
       ["a pull request that does not exist is said so", /When a GitHub read answers no_such_pull_request, the pull request does not exist[^\n]*Never say it might be private or a permission problem/],
       // N13 (2026-11-08 03:12Z on router-v19): brief no longer listed the release-gate fixture #381, and the answer still said

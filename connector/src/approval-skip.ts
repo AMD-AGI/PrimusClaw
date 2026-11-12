@@ -21,9 +21,10 @@
  * What cannot be told apart from a person (a script that drives an interactive `claude` in tmux, for one) is left out with
  * `CLAW_APPROVAL_HOOKS=off` in its environment; the hooks inherit it from the `claude` they run under.
  *
- * Codex (`--agent codex`, measured on 0.153.4) sets neither variable, so for Codex only the opt-out and the permission mode apply
- * here: its events carry `permission_mode` too (`bypassPermissions` under `--dangerously-bypass-approvals-and-sandbox` or
- * approval policy `never`, `default` otherwise). That Codex has a person at its terminal is told by the hook itself
+ * Codex (`--agent codex`, measured on 0.153.4) sets neither variable, so for Codex the opt-out, the permission mode and
+ * `CLAW_CONNECTOR_AGENT` apply here: its events carry `permission_mode` too (`bypassPermissions` under
+ * `--dangerously-bypass-approvals-and-sandbox` or approval policy `never`, `default` otherwise), and a session the connector runs
+ * (codex-acp) has `CLAW_CONNECTOR_AGENT` in its environment (adapter.ts). That Codex has a person at its terminal is told by the hook itself
  * (approval-hook.ts): only the TUI (`originator: "codex-tui"`, so never `codex exec` or codex-acp), only a terminal device.
  *
  * Imports nothing: the hook program is a bundle of its own that Claude Code waits for.
@@ -51,6 +52,7 @@ export function skipReason(
   if (optedOut(env)) return "opted_out";
   if (agent === "claude" && env.CLAUDE_CODE_ENTRYPOINT !== "cli") return "not_a_terminal";
   if (agent === "claude" && env.CLAUDE_CODE_SESSION_ATTENDED === "0") return "unattended";
+  if (agent === "codex" && env.CLAW_CONNECTOR_AGENT) return "connector_session";
   if (mode === "ask" && event && typeof event.permission_mode === "string" && UNATTENDED_MODES.has(event.permission_mode)) return "unattended_mode";
   return null;
 }

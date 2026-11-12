@@ -298,6 +298,22 @@ it("Claw is sent the quote, then the words with their links, then where the file
   assert.equal(messageOf(bare.ctx), "[files]");
 });
 
+it("the language the person chose goes after everything Claw is sent, and nothing goes when they chose none", () => {
+  const chosen = setUpWorld([], { request: { text: "帮我看看构建", quote: "> earlier", replyLang: "en" } });
+  chosen.ctx.record.filesNote = "[files]";
+  assert.equal(messageOf(chosen.ctx), "> earlier\n\n帮我看看构建\n\n[files]\n\n[Reply language: English]");
+  assert.equal(
+    messageOf(setUpWorld([], { request: { text: "check the build", replyLang: "zh" } }).ctx),
+    "check the build\n\n[Reply language: Chinese]",
+  );
+  assert.equal(messageOf(setUpWorld([], { request: { text: "check the build" } }).ctx), "check the build");
+  assert.equal(
+    messageOf(setUpWorld([], { request: { text: "", replyLang: "en" } }).ctx),
+    "",
+    "nothing to send, no line alone",
+  );
+});
+
 function withFiles(fetched: boolean): Parameters<typeof setUpWorld>[1] {
   const file = { name: "a.png", type: "png", handle: {} };
   return {

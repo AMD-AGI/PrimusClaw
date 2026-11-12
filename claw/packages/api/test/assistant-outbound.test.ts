@@ -666,6 +666,28 @@ describe("assistant outbound", { skip }, () => {
       assert.equal((await saysRows()).at(-1).text, `#${itemNo} 看一下风险 卡住了，需要你回复：Look at the risk report and suggest next steps`);
     });
 
+    test("is in the language the person chose in their channel, whatever they write in; with no choice, in the one they write in", async () => {
+      await subscribe("u2");
+      const assistants = await import("../src/assistant/assistant.js");
+      const { sessionId } = await assistants.getOrCreateAssistant("u2");
+      let at = 0;
+      const write = async (content: string, context: Record<string, unknown>) => q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context, received_at)
+         VALUES ($1, $2, 'u2', $3, $4::jsonb, NOW() + make_interval(secs => $5))`,
+        [sessionId, `m-u2-${++at}`, content, JSON.stringify(context), at],
+      );
+      const notice = async () => {
+        await outbound.recordNeedsYouFallback({ itemId: await seedItem({ user_id: "u2", title: "看一下风险", last_report_kind: "blocked", pending_question: "Which org?" }) }, deps());
+        return (await saysRows()).at(-1).text as string;
+      };
+      await write("好的，我看一下", { reply_language: "en" });
+      assert.equal(await notice(), `#${itemNo} "看一下风险" is blocked and needs your answer: Which org?`, "/lang en, Chinese words");
+      await write("Please keep going", { reply_language: "zh" });
+      assert.equal(await notice(), `#${itemNo} 看一下风险 卡住了，需要你回复：Which org?`, "/lang zh, English words");
+      await write("Please keep going", {});
+      assert.equal(await notice(), `#${itemNo} "看一下风险" is blocked and needs your answer: Which org?`, "no choice now: the words decide, as before");
+    });
+
     test("belongs to the item's owner, not to whoever asked", async () => {
       await subscribe("u2");
       const out = await outbound.recordNeedsYouFallback({ itemId: await seedItem({ user_id: "u2" }) }, deps());

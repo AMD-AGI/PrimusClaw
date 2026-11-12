@@ -19,6 +19,8 @@ import {
   type BrokerDeps, type ConnectorReply, type PermissionEvent,
 } from "../src/approvals.js";
 import { skipReason } from "../src/approval-skip.js";
+import { EXIT, main, type Ctx } from "../src/commands.js";
+import { resolveDirs } from "../src/paths.js";
 import { codexTuiTranscript, lastInputMs, terminalOf } from "../src/codex-terminal.js";
 import {
   CODEX_APPROVAL_HOOKED, codexApprovalHooksStatus, codexHooksFile, installCodexApprovalHooks, uninstallCodexApprovalHooks,
@@ -136,6 +138,8 @@ describe("which Codex sessions are handed on", () => {
     assert.equal(skipReason({ CLAW_APPROVAL_HOOKS: "off" }, null, "settled", "codex"), "opted_out");
     assert.equal(skipReason({}, req("Bash", { command: "ls" }, { permission_mode: "bypassPermissions" }), "ask", "codex"), "unattended_mode");
     assert.equal(skipReason({}, { session_id: REF, hook_event_name: "PostToolUse", permission_mode: "bypassPermissions" }, "settled", "codex"), null);
+    // A session the connector itself runs (codex-acp, which has CLAW_CONNECTOR_AGENT from adapter.ts) is left alone too.
+    assert.equal(skipReason({ CLAW_CONNECTOR_AGENT: "codex" }, ask, "ask", "codex"), "connector_session");
     // Without the agent, the same environment is Claude Code's and is left alone.
     assert.equal(skipReason({}, ask, "ask"), "not_a_terminal");
   });
@@ -325,6 +329,28 @@ describe("installing the Codex approval hook", () => {
     assert.equal(uninstallCodexApprovalHooks(dir).changed, true);
     assert.deepEqual(read(dir), { hooks: { PermissionRequest: [{ matcher: "Bash", hooks: [mine] }] } });
     assert.equal(codexApprovalHooksStatus(dir).events.length, 0);
+  });
+
+  test("hooks install|status|uninstall --agent codex (or --codex) works on DIR/hooks.json; --codex with another --agent is refused", async () => {
+    const dir = tmpdir("cc-codex-");
+    const home = tmpdir("cc-codex-cli-");
+    const script = path.join(home, "approval-hook.js");
+    fs.writeFileSync(script, "// stand-in\n");
+    const out: string[] = [];
+    const errs: string[] = [];
+    const ctx: Ctx = {
+      dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { CODEX_HOME: dir },
+      out: (l) => out.push(l), err: (l) => errs.push(l), hostname: "box", hookScript: script, approvalHookScript: script, node: NODE,
+    };
+    assert.equal(await main(["hooks", "install", "--agent", "codex", "--config-dir", dir], ctx), EXIT.ok);
+    assert.equal(codexApprovalHooksStatus(dir).installed, true);
+    assert.equal(await main(["hooks", "status", "--codex", "--config-dir", dir], ctx), EXIT.ok);
+    assert.match(out.join("\n"), /codex approvals: installed/);
+    assert.equal(await main(["hooks", "install", "--codex", "--agent", "cursor", "--config-dir", dir], ctx), EXIT.usage);
+    assert.equal(await main(["hooks", "install", "--agent", "codex", "--hold", "30", "--config-dir", dir], ctx), EXIT.usage);
+    assert.equal(await main(["hooks", "uninstall", "--agent", "codex", "--config-dir", dir], ctx), EXIT.ok);
+    assert.equal(codexApprovalHooksStatus(dir).events.length, 0);
+    assert.equal(fs.existsSync(path.join(dir, "settings.json")), false);
   });
 
   test("a hooks.json that is not JSON is left as it is", () => {

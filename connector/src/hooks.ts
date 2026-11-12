@@ -351,3 +351,131 @@ export function uninstallCodexApprovalHooks(codexHome: string): InstallResult {
 export function codexApprovalHooksStatus(codexHome: string): HooksStatus {
   return approvalEntriesStatus(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => h.event), codexHome, "hooks install --codex");
 }
+
+// --- Cursor's approval hooks (cursor-approvals.ts) ---------------------------------------
+
+/**
+ * The Cursor hooks (`hooks install --approvals --agent cursor`), in the user-level `hooks.json` of the Cursor configuration
+ * directory. The before-hooks hold the call while it is on the phone (Cursor waits for them; their `timeout` is the hold plus a
+ * margin, and a hook Cursor stops at its timeout changes nothing); the others only tell the connector what happened and take
+ * a few milliseconds. Cursor runs every hook of every source, so ours sit next to the user's own entries.
+ */
+export const CURSOR_APPROVAL_HOOKED = [
+  { event: "beforeShellExecution", arg: "ask" },
+  { event: "beforeMCPExecution", arg: "ask" },
+  { event: "afterShellExecution", arg: "settled" },
+  { event: "afterMCPExecution", arg: "settled" },
+  { event: "postToolUseFailure", arg: "settled" },
+  { event: "beforeSubmitPrompt", arg: "settled" },
+  { event: "stop", arg: "settled" },
+  { event: "sessionEnd", arg: "settled" },
+] as const;
+/** How much longer than the hold Cursor may wait for an `ask` hook, and how long for the others. */
+const CURSOR_ASK_MARGIN_S = 30;
+const CURSOR_SETTLED_TIMEOUT_S = 5;
+
+export const cursorHooksFile = (cursorDir: string): string => path.join(cursorDir, "hooks.json");
+
+const CURSOR_RE = /approval-hook\.(?:js|ts)["']?\s+(?:ask|settled)\s+--agent\s+cursor\s/;
+const isOursCursor = (h: unknown): boolean =>
+  isObject(h) && typeof h.command === "string" && h.command.endsWith(` ${MANAGED_MARK}`) && CURSOR_RE.test(h.command) && (h.type === undefined || h.type === "command");
+
+export function cursorHookCommand(node: string, script: string, arg: "ask" | "settled", cursorDir: string, socket: string, holdS: number): string {
+  return `${shellQuote(node)} ${shellQuote(script)} ${arg} --agent cursor${arg === "ask" ? ` --hold ${holdS}` : ""} --dir ${shellQuote(cursorDir)} --socket ${shellQuote(socket)} ${MANAGED_MARK}`;
+}
+
+/** Cursor's `hooks.json` as it is now: a missing file is a new one; one that is not `{"version": 1, ...}` is an error, never overwritten. */
+function loadCursor(cursorDir: string): Loaded {
+  const given = cursorHooksFile(cursorDir);
+  let file = given;
+  try { file = fs.realpathSync(given); } catch { /* not there yet */ }
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { doc: { version: 1, hooks: {} }, text: null, file };
+    throw new HooksError(`cannot read ${given}: ${(e as Error).message}`);
+  }
+  if (text.trim() === "") return { doc: { version: 1, hooks: {} }, text, file };
+  let doc: unknown;
+  try { doc = JSON.parse(text); } catch (e) { throw new HooksError(`${given} is not valid JSON (${(e as Error).message.split("\n")[0]}); left untouched`); }
+  if (!isObject(doc)) throw new HooksError(`${given} is not a JSON object; left untouched`);
+  if (doc.version !== undefined && doc.version !== 1) throw new HooksError(`${given} has version ${JSON.stringify(doc.version)}, not 1; left untouched`);
+  return { doc, text, file };
+}
+
+/** Add (or bring up to date) the Cursor approval hooks; every other entry in the file is carried over as it was. */
+export function installCursorApprovalHooks(cursorDir: string, node: string, script: string, socket: string, holdS: number): InstallResult {
+  const l = loadCursor(cursorDir);
+  const where = cursorHooksFile(cursorDir);
+  const before = JSON.stringify(l.doc);
+  const doc: Json = JSON.parse(before);
+  doc.version ??= 1;
+  const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
+  for (const h of CURSOR_APPROVAL_HOOKED) {
+    const entry: Json = {
+      command: cursorHookCommand(node, script, h.arg, cursorDir, socket, holdS),
+      timeout: h.arg === "ask" ? holdS + CURSOR_ASK_MARGIN_S : CURSOR_SETTLED_TIMEOUT_S,
+    };
+    const list = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
+    let seen = false;
+    for (let i = 0; i < list.length; i++) {
+      if (!isOursCursor(list[i])) continue;
+      if (seen) { list.splice(i, 1); i--; continue; } // a second copy of ours (a hand edit) is dropped
+      seen = true;
+      list[i] = { ...(list[i] as Json), ...entry };
+    }
+    if (!seen) list.push(entry);
+  }
+  const changed = JSON.stringify(doc) !== before || l.text === null;
+  if (changed) save(l, doc);
+  return { changed, file: l.file };
+}
+
+/** Remove the Cursor approval hooks, and only the lists that removing them left empty. */
+export function uninstallCursorApprovalHooks(cursorDir: string): InstallResult {
+  if (!fs.existsSync(cursorHooksFile(cursorDir))) return { changed: false, file: cursorHooksFile(cursorDir) };
+  const l = loadCursor(cursorDir);
+  const where = cursorHooksFile(cursorDir);
+  const doc: Json = JSON.parse(JSON.stringify(l.doc));
+  const hooks = hooksOf(doc, where);
+  let touchedAny = false;
+  if (hooks) {
+    for (const event of new Set(CURSOR_APPROVAL_HOOKED.map((h) => h.event))) {
+      const list = groupsOf(hooks, event, where);
+      if (!list) continue;
+      const rest = list.filter((x) => !isOursCursor(x));
+      if (rest.length === list.length) continue;
+      touchedAny = true;
+      if (rest.length === 0) delete hooks[event]; else hooks[event] = rest;
+    }
+  }
+  if (touchedAny) save(l, doc);
+  return { changed: touchedAny, file: l.file };
+}
+
+/** Whether the Cursor approval hooks are all in place, and whether what they run still exists; never throws. */
+export function cursorApprovalHooksStatus(cursorDir: string): HooksStatus & { holdS: number | null } {
+  let l: Loaded;
+  try { l = loadCursor(cursorDir); } catch (e) { return { installed: false, events: [], healthy: false, problem: (e as Error).message, holdS: null }; }
+  const events: string[] = [];
+  let healthy = true;
+  let problem: string | null = null;
+  let holdS: number | null = null;
+  const hooks = isObject(l.doc.hooks) ? l.doc.hooks : {};
+  for (const h of CURSOR_APPROVAL_HOOKED) {
+    const mine = (Array.isArray(hooks[h.event]) ? (hooks[h.event] as unknown[]) : []).filter(isOursCursor) as Json[];
+    if (mine.length === 0) continue;
+    events.push(h.event);
+    for (const x of mine) {
+      const hold = / --hold (\d+) /.exec(String(x.command));
+      if (hold) holdS = Number(hold[1]);
+      const m = /^'((?:[^']|'\\'')*)' '((?:[^']|'\\'')*)' /.exec(String(x.command));
+      if (!m) continue;
+      for (const f of [m[1]!, m[2]!].map((s) => s.replace(/'\\''/g, "'"))) {
+        if (!fs.existsSync(f)) { healthy = false; problem ??= `${f} (named by the ${h.event} hook) does not exist; run: claw-connector hooks install --approvals --agent cursor`; }
+      }
+    }
+  }
+  return { installed: events.length === CURSOR_APPROVAL_HOOKED.length, events, healthy, problem, holdS };
+}

@@ -250,3 +250,21 @@ test("test_a_message_is_not_queued_behind_a_review_for_a_colleague", async () =>
   ]);
   assert.equal(w.store.sessions.getSession(ALICE.id), "sess-ak"); // (the review's session is not the chat's)
 });
+
+test("a queued message goes with the language its sender had chosen when they sent it", async () => {
+  const w = world();
+  link(w, ALICE.id, "ak");
+  const first = gate();
+  w.turns.hold = first.promise;
+  w.turns.answers = ["first answer", "second answer"];
+  w.store.prefs.setLang(ALICE.id, "en");
+  await w.router.handle(message("first"));
+  await w.router.handle(message("second")); // (queued under /lang en)
+  w.store.prefs.setLang(ALICE.id, "zh"); // (/lang zh before it goes)
+  first.open();
+  await w.router.settled();
+  assert.deepEqual(
+    w.turns.runs.map((r) => r.replyLang),
+    ["en", "en"],
+  );
+});

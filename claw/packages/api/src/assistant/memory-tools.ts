@@ -34,6 +34,7 @@ import {
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import type { ChosenLanguage } from "./language.js";
 import { commandLanguageOf, typedCommand, type CommandLanguage } from "./typed-commands.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
@@ -54,6 +55,8 @@ export interface AttendedMessage {
   userId: string;
   content: string;
   receivedAt: Date;
+  /** The language the person chose in their channel (`ChannelContext.reply_language`), when they chose one. */
+  replyLanguage?: ChosenLanguage;
 }
 
 /** The ways out of this module, so a test can stand in for one turn's answer. */
@@ -65,7 +68,10 @@ export const memoryToolPorts = {
    */
   attended: async (q: Querier, claims: AssistantTokenClaims): Promise<AttendedMessage> => {
     const turn = await attendedTurn(q, claims);
-    return { userId: turn.userId, content: turn.message.content, receivedAt: new Date(turn.message.receivedAt) };
+    return {
+      userId: turn.userId, content: turn.message.content, receivedAt: new Date(turn.message.receivedAt),
+      ...(turn.message.context.reply_language ? { replyLanguage: turn.message.context.reply_language } : {}),
+    };
   },
 };
 
@@ -246,7 +252,7 @@ export async function memorySave(claims: AssistantTokenClaims, args: Record<stri
   const r = await writeMemory(userId, args, actorOf(claims, message, args.evidence_quote), { workItemId, guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r, await commandLanguageOf(message.content));
+  return written(r, await commandLanguageOf(message.content, undefined, message.replyLanguage ?? null));
 }
 
 export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -256,7 +262,7 @@ export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<st
   const r = await updateMemory(userId, id, args, actorOf(claims, message, args.evidence_quote), { guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r, await commandLanguageOf(message.content));
+  return written(r, await commandLanguageOf(message.content, undefined, message.replyLanguage ?? null));
 }
 
 export async function memoryForget(claims: AssistantTokenClaims, args: { id?: unknown }): Promise<Record<string, unknown>> {

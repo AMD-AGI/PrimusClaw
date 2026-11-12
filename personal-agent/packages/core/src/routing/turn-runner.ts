@@ -46,6 +46,11 @@ export interface TurnRun {
   readonly sent: string;
   readonly files: readonly InboundFile[];
   readonly lang: Lang;
+  /**
+   * The language the person chose to be answered in (`/lang zh|en`, `chosenLang`), told to Claw after the message; undefined: they
+   * chose none, and the answer is in the language of what they wrote. A chat turn's only: a group's is the sender's.
+   */
+  readonly replyLang?: Lang;
   /** The answer gets thumbs of the worker's own (a phone, whose own thumbs never reach the worker). */
   readonly ownThumbs: boolean;
   /** Claw pushes this person a run's end and its approvals. */

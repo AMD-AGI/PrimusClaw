@@ -59,7 +59,9 @@ export class AdapterProcess {
     // The log is written as a stream (off the event loop): it sits in the state directory, which may be a network disk
     // that stalls, and an adapter's stderr must not freeze the connector. Past 1 MiB waiting for the disk, lines are dropped.
     await fsp.mkdir(path.dirname(o.logFile), { recursive: true, mode: 0o700 });
-    const env = { ...process.env, ...o.cfg.env };
+    // `CLAW_CONNECTOR_AGENT` marks a session this connector runs: the approval hooks leave its questions alone (they already reach
+    // the phone through the adapter), as `CLAUDE_CODE_ENTRYPOINT` does for Claude Code (approval-hook.ts).
+    const env = { ...process.env, ...o.cfg.env, CLAW_CONNECTOR_AGENT: o.cfg.id };
     // A pinned preset runs from the copy installed in the connector's directory, never through npx in the session's
     // folder (adapter-install.ts). The session's folder reaches the adapter in session/new either way.
     const run = (await adapterStore()?.launch(o.cfg, o.cwd, env)) ?? { command: o.cfg.command, args: o.cfg.args, cwd: o.cwd };

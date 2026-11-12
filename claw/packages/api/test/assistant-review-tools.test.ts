@@ -263,6 +263,9 @@ describe("assistant review tools", { skip }, () => {
     const viaToken = await post("identity_token", undefined, { content: "审 254", channel_context: { channel_message_id: "t-1", via: "on_behalf", people: [{ name: "Wei", user_id: "u-w" }] } });
     const viaKey = await post("api_key", undefined, { content: "审 254", attended: true, attended_via: { kind: "person" } });
     const viaCookie = await post("cookie", undefined, { content: "审 254", channel_context: { via: "admin" } });
+    // The language the person chose in their channel (`/lang en`), which the turn answering the message reads (`chosenReplyLanguage`).
+    const chosen = await post("identity_token", undefined, { content: "审 254", channel_context: { channel_message_id: "t-2", reply_language: "en" } });
+    const auto = await post("identity_token", undefined, { content: "审 254", channel_context: { channel_message_id: "t-3", reply_language: "auto" } });
     const rows = await w.q("SELECT message_id, attended_via, channel_context FROM claw_assistant_messages WHERE session_id = $1 AND message_id <> 'claw-user-turn' ORDER BY received_at, message_id", [alice.routerSid]);
     const byId = new Map(rows.map((r) => [r.message_id, r]));
     assert.deepEqual(byId.get(viaToken.message_id)?.attended_via, PERSON);
@@ -272,7 +275,11 @@ describe("assistant review tools", { skip }, () => {
     assert.ok(!("via" in byId.get(viaCookie.message_id)!.channel_context), "a value outside the closed set is not stored");
     assert.equal(byId.get(viaKey.message_id)?.attended_via, null, "what the body says about attendance is not read");
     assert.equal(byId.get(viaCookie.message_id)?.attended_via, null);
-    assert.equal(rows.length, 3);
+    assert.equal(byId.get(chosen.message_id)?.channel_context.reply_language, "en");
+    assert.ok(!("reply_language" in byId.get(auto.message_id)!.channel_context), "no choice is not stored as one");
+    assert.ok(!("reply_language" in byId.get(viaToken.message_id)!.channel_context), "a channel that sends none (an old client)");
+    assert.equal(await inbound.chosenReplyLanguage((t, p) => w.h.app.db.db.query(t, p), alice.routerSid, chosen.message_id), "en");
+    assert.equal(rows.length, 5);
     // The running turn answers the user, so none of these stopped it.
     assert.equal((await w.q("SELECT status FROM claw_tasks WHERE session_id = $1", [alice.routerSid]))[0].status, "running");
   });
