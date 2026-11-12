@@ -91,6 +91,8 @@ export interface NodeListRoleTopology {
  */
 export interface MultiNodeNodeList {
   framework: "sglang" | "atom";
+  /** The router the router pod runs. */
+  frontend: "sglang-router" | "atomesh";
   model: string;
   /** Router Service URL the client and accuracy eval target. */
   service_url: string;

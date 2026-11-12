@@ -95,12 +95,16 @@ function nodeListOf(env: Record<string, string>): MultiNodeNodeList {
 }
 
 test("sglangrouter and atomesh hand the cluster over as one node list", () => {
-  for (const [backend, framework] of [["sglangrouter", "sglang"], ["atomesh", "atom"]] as const) {
+  for (const [backend, framework, frontend] of [
+    ["sglangrouter", "sglang", "sglang-router"],
+    ["atomesh", "atom", "atomesh"],
+  ] as const) {
     const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
     applyMultiNodeExternalEnv(env, { ...PD_CTX, backend });
     assert.equal(env.SAFE_API_URL, undefined);
     assert.deepEqual(nodeListOf(env), {
       framework,
+      frontend,
       model: "/models/DeepSeek-R1",
       service_url: PD_CTX.serviceUrl,
       prefill_url: PD_CTX.prefillUrl,

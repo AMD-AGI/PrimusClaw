@@ -219,6 +219,8 @@ export const MN_NODE_LIST_ENV = "HYPERLOOM_MN_NODE_LIST";
 const PD_SSH_USER = "root";
 const DEFAULT_SSH_PORT = 22;
 const NODE_LIST_FRAMEWORK = { atomesh: "atom", sglangrouter: "sglang" } as const;
+/** The router image each PD backend's router pod runs. */
+const NODE_LIST_FRONTEND = { atomesh: "atomesh", sglangrouter: "sglang-router" } as const;
 
 /** atomesh and sglangrouter: the whole cluster hand-off is the node list. */
 function applyPdClusterEnv(env: Record<string, string>, ctx: MultiNodeContext): void {
@@ -249,6 +251,7 @@ export function buildNodeList(ctx: MultiNodeContext): MultiNodeNodeList | undefi
   if (!pd || !router || !ctx.prefillIps?.length || !ctx.decodeIps?.length) return undefined;
   const nodeList: MultiNodeNodeList = {
     framework: NODE_LIST_FRAMEWORK[ctx.backend],
+    frontend: NODE_LIST_FRONTEND[ctx.backend],
     model: pd.model,
     service_url: ctx.serviceUrl,
     router: { host: router },
