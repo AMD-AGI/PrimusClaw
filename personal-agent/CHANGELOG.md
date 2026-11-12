@@ -73,7 +73,7 @@ this release needs a newer Claw.
   answered at the terminal, timed out or ended stayed Chinese only by chance and could turn English ("answered at the
   terminal" in the tool name's language); a click answered in the person's set language, English when unset. The card's
   language is stored with it (`remote_permissions.lang`); a card stored before falls back to the person's language
-  (#794).
+  (#794). `/board` redraws such a card in the same stored language, not in the item title's (#796).
 
 ## 0.7.2
 
