@@ -32,6 +32,14 @@ const GOLDEN: readonly (readonly [string, string, string])[] = [
     "Results:\n| job | state |\n| --- | --- |\n| lint | ok |\n| test | ok |",
   ],
   ["a line after a table", "| a |\n| - |\n| 1 |\nTotal: 1", "| a |\n| - |\n| 1 |\n\nTotal: 1"],
+  ["a list item's indented line", "- first\n  continuation\n- second", "- first\n  continuation\n- second"],
+  ["a sentence after a list item's indented line", "- a\n  more\nAfter.", "- a\n  more\n\nAfter."],
+  [
+    "a table without outer pipes",
+    "Results:\nhost | state\n--- | :---:\nci | ok\ncd | ok\nDone.",
+    "Results:\n\nhost | state\n--- | :---:\nci | ok\ncd | ok\n\nDone.",
+  ],
+  ["a pipe in a sentence", "a | b\nc", "a | b\n\nc"],
   ["paragraphs", "One.\n\nTwo.\n\n\nThree.", "One.\n\nTwo.\n\n\nThree."],
   ["a heading, a quote", "# Title\nbody\n> quoted", "# Title\n\nbody\n> quoted"],
   ["a bold label line", "**Status**\nall green", "**Status**\n\nall green"],
@@ -49,7 +57,8 @@ for (const [name, text, shown] of GOLDEN) {
 
 test("a streamed text holds back only a last line that may still start a list, a fence or a heading", () => {
   assert.equal(streamedLineBreaks("Steps:\n-"), "Steps:");
-  assert.equal(streamedLineBreaks("Steps:\n- "), "Steps:\n- ");
+  assert.equal(streamedLineBreaks("Steps:\n- "), "Steps:"); // (may still be a delimiter row, "- | -")
+  assert.equal(streamedLineBreaks("Steps:\n- b"), "Steps:\n- b");
   assert.equal(streamedLineBreaks("Steps:\n-x"), "Steps:\n\n-x");
   assert.equal(streamedLineBreaks("Run:\n``"), "Run:");
   assert.equal(streamedLineBreaks("Run:\n```"), "Run:\n```");
@@ -60,6 +69,9 @@ test("a streamed text holds back only a last line that may still start a list, a
   assert.equal(streamedLineBreaks("a\nh"), "a\n\nh");
   assert.equal(streamedLineBreaks("```\ncode\n-"), "```\ncode\n-"); // (code is never held)
   assert.equal(streamedLineBreaks("a\n\n-"), "a\n\n-"); // (after a blank line nothing changes)
+  assert.equal(streamedLineBreaks("h | v\n--"), "h | v"); // (may still be a delimiter row)
+  assert.equal(streamedLineBreaks("h | v\n--- | ---\nci"), "h | v\n--- | ---"); // (a row, until a pipe or its end)
+  assert.equal(streamedLineBreaks("h | v\n--- | ---\nci |"), "h | v\n--- | ---\nci |");
 });
 
 /** Whether `shown` is `text` with only "\n" added, each right after a "\n" of `text`. */
@@ -98,7 +110,21 @@ test("longer texts, streamed a character at a time, never take back what was str
     seed = (seed * 1103515245 + 12345) % 2147483648;
     return seed % n;
   };
-  const pieces = [...ALPHABET, "```", "~~~", "- ", "1. ", "| x |", "# ", "https://x.test/1", "中文"];
+  const pieces = [
+    ...ALPHABET,
+    "```",
+    "~~~",
+    "- ",
+    "1. ",
+    "| x |",
+    "# ",
+    "https://x.test/1",
+    "中文",
+    "--- | ---",
+    "a | b",
+    ":",
+    "  ",
+  ];
   for (let round = 0; round < 3000; round += 1) {
     let text = "";
     const parts = 1 + next(24);

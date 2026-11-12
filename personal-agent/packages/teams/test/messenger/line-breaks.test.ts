@@ -13,6 +13,7 @@ import { NOTE, redactText, richMessage, textMessage } from "@primusclaw/personal
 
 import { flushMicrotasks } from "../../../../test-support/clock.js";
 import { teamsMasker } from "../../src/activity/redact-activity.js";
+import { richActivity } from "../../src/messenger/render.js";
 import { RecordingDirect, RecordingQueue } from "../helpers/outboxes.js";
 import { build, ref } from "./fixtures.js";
 
@@ -79,4 +80,13 @@ test("a streamed reply grows with its line breaks, and its final message starts 
   });
   assert.equal(texts.at(-1), TWO_PRS_SHOWN);
   assert.equal(direct.streamed.at(-1)?.activity["textFormat"], "markdown");
+});
+
+test("a rich answer sent as markdown, because its HTML still held a credential shape, keeps its lines too", () => {
+  const masker = {
+    text: (text: string) => ({ text, hit: text.includes("<br>") }),
+    activity: (a: never) => a,
+    note: "",
+  };
+  assert.deepEqual(richActivity("A\nB", false, masker), { type: "message", text: "A\n\nB", textFormat: "markdown" });
 });
