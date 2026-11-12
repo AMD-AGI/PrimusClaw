@@ -3,7 +3,8 @@
 
 /**
  * The one SQLite connection a store works on, with typed statement helpers. Opened as the Python worker opens it:
- * autocommit (`isolation_level=None`), WAL, and a 5 s busy timeout (`sqlite3.connect`'s default).
+ * autocommit (`isolation_level=None`), WAL, and a 5 s busy timeout (`sqlite3.connect`'s default). Unlike it, a commit is not
+ * fsynced on its own (`synchronous=NORMAL`, below).
  */
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { own } from "@primusclaw/personal-agent";
@@ -19,6 +20,25 @@ export class Database {
   constructor(path: string) {
     this.#db = new DatabaseSync(path, { timeout: 5000 });
     this.#db.exec("PRAGMA journal_mode=WAL");
+    // No fsync per commit (only at checkpoints): under WAL a commit stays atomic and the database consistent; a power loss may
+    // drop the last commits. A per-commit fsync blocks the event loop for as long as a congested disk takes, and the worker's
+    // event endpoint must answer within Claw's 5 s delivery timeout. A write that is acknowledged to someone as kept goes
+    // through `durably`.
+    this.#db.exec("PRAGMA synchronous=NORMAL");
+  }
+
+  /**
+   * `write` with each commit synced to disk (`synchronous=FULL`): for what is acknowledged as kept before it is used. Inside an
+   * open transaction SQLite refuses to change the setting, so there `write` just runs and its commit is the transaction's.
+   */
+  durably<T>(write: () => T): T {
+    if (this.#db.isTransaction) return write();
+    this.#db.exec("PRAGMA synchronous=FULL");
+    try {
+      return write();
+    } finally {
+      this.#db.exec("PRAGMA synchronous=NORMAL");
+    }
   }
 
   /** Several statements, no parameters (DDL). */

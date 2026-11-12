@@ -3,13 +3,16 @@
 
 // JSON text as Python writes it, typed column reads, and the stored-secret keys.
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { Fernet, StoreSecrets, tokenHex, tokenUrlsafe, drawCode } from "@primusclaw/personal-agent-runtime";
 
-import { col } from "../../src/sqlite/database.js";
+import { col, Database, type SqlValue } from "../../src/sqlite/database.js";
+import { migrate } from "../../src/sqlite/migrations.js";
+import { SqliteHeldEventRepository } from "../../src/sqlite/people-repository.js";
 import { jsonFlags, jsonList, jsonStrings, parseJson, pyJsonDumps, storedObject } from "../../src/sqlite/py-json.js";
-import { SeededRandom } from "../../../../test-support/index.js";
+import { SeededRandom, tempDir } from "../../../../test-support/index.js";
 
 test("JSON text is Python's json.dumps default: spaced separators, non-ASCII escaped", () => {
   assert.equal(
@@ -78,4 +81,63 @@ test("random ids are Python's token_urlsafe / token_hex shapes, codes come from 
   assert.match(tokenUrlsafe(random, 9), /^[A-Za-z0-9_-]{12}$/);
   assert.match(tokenHex(random, 8), /^[0-9a-f]{16}$/);
   assert.match(drawCode(random, "AB", 8), /^[AB]{8}$/);
+});
+
+const synchronous = (db: Database): number => col.num(db.get("PRAGMA synchronous") ?? {}, "synchronous");
+
+test("a new database is WAL with synchronous=NORMAL: no fsync per commit", () => {
+  const dir = tempDir();
+  const db = new Database(join(dir.path, "s.db"));
+  try {
+    assert.equal(col.str(db.get("PRAGMA journal_mode") ?? {}, "journal_mode"), "wal");
+    assert.equal(synchronous(db), 1);
+    assert.equal(
+      db.durably(() => synchronous(db)),
+      2,
+    );
+    assert.equal(synchronous(db), 1);
+    assert.throws(() => db.durably(() => db.run("INSERT INTO no_such_table VALUES (1)")));
+    assert.equal(synchronous(db), 1, "back to NORMAL after a write that failed");
+    db.exec("CREATE TABLE t (x INTEGER); BEGIN");
+    assert.equal(
+      db.durably(() => db.run("INSERT INTO t VALUES (1)")),
+      1,
+      "inside a transaction the write runs as it is",
+    );
+    db.exec("COMMIT");
+    assert.equal(synchronous(db), 1);
+  } finally {
+    db.close();
+    dir.remove();
+  }
+});
+
+/** Records the connection's `synchronous` at each INSERT. */
+class Watched extends Database {
+  readonly inserts: number[] = [];
+  override run(sql: string, ...params: readonly SqlValue[]): number {
+    if (sql.startsWith("INSERT")) this.inserts.push(synchronous(this));
+    return super.run(sql, ...params);
+  }
+}
+
+test("a held event, which the event endpoint acknowledges as taken, is written with synchronous=FULL", () => {
+  const dir = tempDir();
+  const db = new Watched(join(dir.path, "s.db"));
+  try {
+    migrate(db);
+    const held = new SqliteHeldEventRepository({
+      db,
+      now: () => 1_800_000_000,
+      random: new SeededRandom(1),
+      secrets: new StoreSecrets([Fernet.generateKey()]),
+    });
+    held.holdEvent("aad-a", { event_id: "e1" });
+    assert.deepEqual(db.inserts, [2]);
+    assert.equal(synchronous(db), 1);
+    assert.deepEqual(held.takeHeld("aad-a"), [{ event_id: "e1" }]);
+  } finally {
+    db.close();
+    dir.remove();
+  }
 });
