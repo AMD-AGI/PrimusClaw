@@ -24,7 +24,15 @@ export const approvalTurnCards: Pick<TurnCards, "approval" | "question"> = {
     return viewMessage(
       {
         name: "question",
-        model: { questions: cardQuestions(ask.questions), sessionId, toolUseId, group, ownerName, note: "" },
+        model: {
+          questions: cardQuestions(ask.questions),
+          sessionId,
+          toolUseId,
+          group,
+          ownerName,
+          note: "",
+          typedReply: true,
+        },
       },
       QUESTION_TOOL,
     );

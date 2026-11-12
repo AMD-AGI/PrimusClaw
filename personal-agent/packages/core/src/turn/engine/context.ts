@@ -77,6 +77,7 @@ export interface TurnHooks {
   /**
    * An approval or question is about to be shown, as `envelope`: false when a card for it is already in a chat (the
    * notification got there first), and the turn then shows none. `expiresIn`: the seconds Brain waits for the answer.
+   * `questions`: a question's questions, as its event carried them (undefined for an approval).
    */
   readonly onApproval?: (
     sessionId: string,
@@ -84,8 +85,10 @@ export interface TurnHooks {
     tool: string,
     expiresIn: number | undefined,
     envelope: Envelope,
+    questions?: unknown,
   ) => boolean | undefined;
-  readonly onApprovalSent?: (sessionId: string, toolUseId: string) => void;
+  /** The card is in the chat; `cardId`: the chat's id of it, when the chat said it. */
+  readonly onApprovalSent?: (sessionId: string, toolUseId: string, cardId?: string) => void;
   readonly onApprovalUnsent?: (sessionId: string, toolUseId: string) => void;
   /** (session, "started" | "delivered" | "failed", Claw message id or ''). */
   readonly onTurn?: (sessionId: string, what: "started" | "delivered" | "failed", messageId: string) => void;

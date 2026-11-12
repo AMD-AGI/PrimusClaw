@@ -56,6 +56,10 @@ export class FakeClaw {
   memoryWrites: boolean[] = [];
   interruptFails: number | undefined;
   github: { readsWith: string; login: string; missing: string; bindingReads: boolean } | null | number = null;
+  /** The answers to question cards Claw was sent: (key, session, tool use id, answers, skipped). */
+  readonly answers: unknown[][] = [];
+  /** Answering a question card fails with this status. */
+  answerFails: number | undefined;
 
   port(): ClawPort {
     const sessions = {
@@ -64,6 +68,18 @@ export class FakeClaw {
         const busy = this.busy.get(sessionId);
         if (typeof busy === "number") return Promise.reject(new ClawError(busy));
         return Promise.resolve({ running: busy === true, messageId: busy === true ? "claw-1" : null });
+      },
+      answer: (
+        key: string,
+        sessionId: string,
+        toolUseId: string,
+        answers: Readonly<Record<string, string>>,
+        skipped: readonly string[],
+      ) => {
+        this.calls.push(["answer", key, sessionId, toolUseId]);
+        if (this.answerFails !== undefined) return Promise.reject(new ClawError(this.answerFails));
+        this.answers.push([key, sessionId, toolUseId, { ...answers }, [...skipped]]);
+        return Promise.resolve();
       },
       interrupt: (key: string, sessionId: string) => {
         this.calls.push(["interrupt", key, sessionId]);

@@ -65,6 +65,8 @@ export const ADDED_COLUMNS: readonly (readonly [string, readonly (readonly [stri
     [
       ["card_sent", "INTEGER NOT NULL DEFAULT 1"],
       ["card_json", "TEXT"],
+      ["card_id", "TEXT NOT NULL DEFAULT ''"], // '' = the channel never said the card's id
+      ["questions_json", "TEXT NOT NULL DEFAULT ''"], // '' = not a turn's question card
     ],
   ],
   ["notify_subs", [["types_version", "INTEGER NOT NULL DEFAULT 0"]]],

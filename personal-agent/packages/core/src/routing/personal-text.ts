@@ -179,6 +179,7 @@ export class PersonalText {
       quote: said.quote,
       sent: said.sent,
       files: said.files,
+      typed: true,
     });
   }
 

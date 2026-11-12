@@ -10,6 +10,7 @@ import { routingText } from "../locales/routing.js";
 import { cpHead, squashSpaces } from "../text/py-text.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
+import { answerWaitingQuestion } from "./question-reply.js";
 import { ActiveTurn, chatTurnKey, QUEUED_TURNS_MAX, reviewTurnKey, type TurnKey } from "./turn-registry.js";
 import type { ReviewRunFields, TurnHooks, TurnOutcome, TurnRun } from "./turn-runner.js";
 
@@ -75,6 +76,11 @@ export interface StartTurn {
   readonly sent?: string;
   readonly files?: readonly InboundFile[];
   readonly review?: ReviewTurnStart;
+  /**
+   * The person typed it in the chat (not a button, not a review): while the agent waits on a question card in this chat's
+   * session, it is the answer to that question and starts no turn.
+   */
+  readonly typed?: boolean;
 }
 
 /**
@@ -96,6 +102,7 @@ export class TurnStarter {
   /** The turn that runs (its end is `done`), or undefined when none was started (the person was told why). */
   async start(request: StartTurn): Promise<RunningTurn | undefined> {
     const { chat, review } = request;
+    if (await this.answersQuestion(request)) return undefined;
     const key = review
       ? reviewTurnKey(chat.sender.id, chat.scope, review.itemId, review.pull)
       : chatTurnKey(chat.sender.id, chat.scope);
@@ -108,6 +115,17 @@ export class TurnStarter {
       if (queued === "waiting") return this.track(this.afterFront(request, key, turn));
     }
     return this.launch(request, key, turn);
+  }
+
+  /** A typed message the waiting question card of the chat's session took as its answer (`question-reply.ts`). */
+  private async answersQuestion(request: StartTurn): Promise<boolean> {
+    if (!request.typed || request.review !== undefined || (request.files?.length ?? 0) > 0) return false;
+    const provider = this.providerOf(request);
+    return answerWaitingQuestion(this.ctx, {
+      chat: request.chat,
+      text: request.text,
+      credential: provider ?? (() => Promise.resolve(request.credential)),
+    });
   }
 
   private track(task: Promise<void>): RunningTurn {

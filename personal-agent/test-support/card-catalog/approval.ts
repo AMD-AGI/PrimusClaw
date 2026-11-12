@@ -6,7 +6,7 @@ import type { ApprovalCardModel, QuestionCardModel } from "@primusclaw/personal-
 import { cardQuestions } from "@primusclaw/personal-agent";
 
 import { approvalRenderers } from "../../packages/teams/src/views/approval/index.js";
-import { SID, entries } from "./catalog.js";
+import { NOW, SID, TZ, entries } from "./catalog.js";
 
 const PERM_EVENT = {
   summary: "删除 /workspace/PrimusClaw/build 下的旧产物",
@@ -56,4 +56,10 @@ export const APPROVAL_CARDS = entries(
   ["approval_turn", () => approval({ input: { command: "rm -rf /workspace/PrimusClaw/build && make clean" } })],
   ["approval_group", () => approval({ input: { command: "make deploy" }, group: true, ownerName: "Robin Lang" })],
   ["question", () => question({})],
+  // (a turn's question: it says a message in the chat answers it too)
+  ["question_typed_reply", () => question({ typedReply: true })],
+  [
+    "answered_in_chat",
+    () => approvalRenderers.questionAnswered({ answers: [["q1", "release/1.4"]], when: NOW, zone: TZ, replied: "zh" }),
+  ],
 );

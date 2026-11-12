@@ -32,13 +32,31 @@ export interface NewApproval {
   readonly expiresAt: number;
   /** The card as it will be published, kept until `approvalSent` so a worker that dies before the send leaves it to the next. */
   readonly envelope?: JsonObject | null;
+  /**
+   * A question card of a turn: its questions as the card's button carries them. Kept so that what the person types next in
+   * the chat can be taken as the answer (`pendingQuestion`).
+   */
+  readonly questions?: readonly JsonObject[] | null;
+}
+
+/** A question card still waiting for its answer, with what it takes to answer it from a typed message. */
+export interface PendingQuestion {
+  readonly sessionId: string;
+  readonly toolUseId: string;
+  readonly userId: string;
+  /** When it runs out, epoch seconds. */
+  readonly expiresAt: number;
+  /** The questions as recorded with the card (`NewApproval.questions`). */
+  readonly questions: readonly JsonObject[];
+  /** The chat's id of the card ("" when the channel never said it: the card cannot be edited). */
+  readonly cardId: string;
 }
 
 export interface ApprovalRepository {
   /** True when this call recorded it; false when a card for the same approval was recorded before. */
   saveApproval(approval: NewApproval): boolean;
-  /** The card reached the chat: nothing is left to send. */
-  approvalSent(sessionId: string, toolUseId: string): void;
+  /** The card reached the chat: nothing is left to send. `cardId`: the chat's id of the card, when it said it. */
+  approvalSent(sessionId: string, toolUseId: string, cardId?: string): void;
   /** Its card is being sent right now by this process and may still fail. */
   approvalInFlight(sessionId: string, toolUseId: string): boolean;
   /** The card never reached the chat: take the record back (a row answered meanwhile stays). */
@@ -48,6 +66,11 @@ export interface ApprovalRepository {
   /** A claimed card could not be sent: the next sweep tries again. */
   approvalSendFailed(sessionId: string, toolUseId: string): void;
   getApproval(sessionId: string, toolUseId: string): Approval | null;
+  /**
+   * The newest question card of `userId` in `sessionId` that is still pending, in time, and was recorded with its questions;
+   * null when there is none.
+   */
+  pendingQuestion(sessionId: string, userId: string): PendingQuestion | null;
   /** Move an approval to `state`; true if this call did it (only from 'pending' unless `onlyIfPending` is false). */
   closeApproval(
     sessionId: string,

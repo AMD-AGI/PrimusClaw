@@ -65,16 +65,25 @@ it("a question of the agent is a question card recorded under the question tool 
     {
       request: { group: true, ownerName: "Alice" },
       hooks: {
-        onApproval: (sid, tuid, tool, expires) => {
-          asked.push([sid, tuid, tool, expires]);
+        onApproval: (sid, tuid, tool, expires, _envelope, questions) => {
+          asked.push([sid, tuid, tool, expires, questions]);
           return true;
         },
         onApprovalSent: (...args) => sent.push(args),
       },
     },
   );
-  assert.deepEqual(asked, [["sess-ak", "act-9", "ask_user_question", undefined]]);
-  assert.deepEqual(sent, [["sess-ak", "act-9"]]);
+  assert.deepEqual(asked, [
+    [
+      "sess-ak",
+      "act-9",
+      "ask_user_question",
+      undefined,
+      [{ id: "q1", question: "Which branch?", options: [{ id: "a", label: "main" }] }],
+    ],
+  ]);
+  // (with the card's id, which a typed answer edits)
+  assert.deepEqual(sent, [["sess-ak", "act-9", "teams-3"]]);
   const [model] = views(run, "question") as Array<{
     questions: Array<{ id: string }>;
     group: boolean;

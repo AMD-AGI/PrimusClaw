@@ -212,6 +212,26 @@ export class StatusMessage<S> {
     });
   }
 
+  /**
+   * Claw queued the message behind a turn it is still running: `notice` closes the stream at once, so it does not say
+   * "Thinking…" for the whole wait. The answer comes as a message of its own, as after the limit. When the stream did not open
+   * after all, `notice` is said as a message. False when there is no stream: the caller says it. Never fails the turn.
+   */
+  queued(notice: string): boolean {
+    const live = this.live;
+    if (this.closed || !live || this.streamOver || this.expiring || this.choice) return false;
+    this.choice = detach(async (signal) => {
+      if (this.opening && !this.opening.done) await unlessAborted(this.opening.settled(), signal);
+      if (this.closed || !live.closable || this.streamOver || this.expiring) {
+        await this.surface.send(plainMessage(notice)); // (refused or already closing: the notice goes on its own)
+        return;
+      }
+      this.expiry?.cancel(); // (its close at the limit is not needed any more)
+      await this.closeEarly(live, notice, "while the message waits behind another turn", signal);
+    });
+    return true;
+  }
+
   /** The chat's id of the posted message; undefined when the post failed or its id never came (nothing is edited then). */
   private async messageId(signal?: AbortSignal): Promise<string | undefined> {
     if (!this.posted) return undefined;

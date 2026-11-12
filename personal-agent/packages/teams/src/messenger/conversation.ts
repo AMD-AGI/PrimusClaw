@@ -128,8 +128,9 @@ export class TeamsConversation implements Conversation {
     return envelope("send", reference(this.ref), this.prepare(activityOf(message, this.parts.render)));
   }
 
-  async deliver(stored: Envelope): Promise<void> {
-    await this.publish(asEnvelope(stored));
+  async deliver(stored: Envelope): Promise<MessageId | undefined> {
+    const delivered = await this.publish(asEnvelope(stored));
+    return delivered?.activityId || undefined;
   }
 
   async send(message: OutMessage): Promise<void> {

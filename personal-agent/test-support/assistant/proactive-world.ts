@@ -79,9 +79,9 @@ export function world(
   const deps: ProactiveDeps = {
     store,
     conversationFor,
-    deliverStored: (envelope) => {
+    deliverStored: async (envelope) => {
       const id = envelope["conversation"];
-      return surface
+      await surface
         .conversation({ id: typeof id === "string" ? id : "", kind: "personal", tenantId: "", wire: {} })
         .deliver(envelope);
     },

@@ -85,8 +85,8 @@ class QueueAndTeams implements TurnSurface {
     return { text: textOf(message) };
   }
 
-  deliver(): Promise<void> {
-    return Promise.resolve();
+  deliver(): Promise<string | undefined> {
+    return Promise.resolve(undefined);
   }
 
   openStream(): ReturnType<TurnSurface["openStream"]> {
