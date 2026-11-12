@@ -7,9 +7,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
-import { main, EXIT, type Ctx } from "../src/commands.js";
+import { main, EXIT, setupHooks, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
-import { alternateName, defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
+import { alternateName, cmdPair, defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
 import { credentialsFile, identityFile, identityKeepFile, resolveDirs } from "../src/paths.js";
 import { saveCredentials } from "../src/credentials.js";
 import { FakeClaw } from "./support/fake-claw.js";
@@ -209,6 +209,81 @@ describe("claw-connector pair", () => {
       assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), expected, a.errText());
       assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), expected === EXIT.ok, server);
     }
+  });
+
+  describe("the Claude Code hooks, offered as init offers them", () => {
+    const stand = (name: string): string => { const f = path.join(tmpdir("pair-hookbin-"), name); fs.writeFileSync(f, "// stand-in\n"); return f; };
+    const scripts = () => ({ hookScript: stand("terminal-hook.js"), approvalHookScript: stand("approval-hook.js") });
+    const commands = (dir: string): string[] => {
+      const doc = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
+      return Object.values<any>(doc.hooks ?? {}).flatMap((groups) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command as string)));
+    };
+    const granted = () => claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), []);
+    const setup = (home: string) => {
+      const cc = path.join(home, "cc");
+      fs.mkdirSync(cc, { recursive: true });
+      fs.writeFileSync(path.join(cc, "settings.json"), JSON.stringify({ model: "opus" }, null, 2));
+      return cc;
+    };
+
+    test("at a terminal, Enter installs the session and approval hooks after the pairing and before the connector starts", async () => {
+      const home = tmpdir();
+      const cc = setup(home);
+      const order: string[] = [];
+      const asked: Array<[string, boolean | undefined]> = [];
+      const a = ctx(home, {
+        fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(),
+        ask: async (q, d) => { asked.push([q, d]); order.push("asked"); return d ?? false; },
+      });
+      const rc = await cmdPair(["ABCD-EFGH-JKMN", "--server", "https://claw.example/api"], a.c, {
+        runningPid: () => null, stop: async () => undefined, hooks: setupHooks,
+        start: async () => { order.push("started"); return 0; },
+      });
+      assert.equal(rc, 0, a.errText());
+      assert.deepEqual(order, ["asked", "started"]);
+      assert.deepEqual(asked, [["Add them? [Y/n] ", true]]);
+      const cmds = commands(cc);
+      assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
+      assert.equal(cmds.filter((c) => c.includes("approval-hook.js") && c.includes(path.join(a.c.dirs.state, "approvals.sock"))).length, 6);
+      assert.equal(JSON.parse(fs.readFileSync(path.join(cc, "settings.json"), "utf8")).model, "opus");
+      assert.match(a.text(), /paired "box"[\s\S]*installed the approval hooks[\s\S]*is coming online/);
+    });
+
+    test("a no, nobody to ask, or --no-hooks leaves Claude Code's settings alone and the pairing goes on; --hooks with --no-hooks is refused before the code is spent", async () => {
+      for (const [how, args, ask] of [
+        ["no", [], async () => false],
+        ["no terminal", [], undefined],
+        ["--no-hooks", ["--no-hooks"], async () => assert.fail("--no-hooks must not ask")],
+      ] as const) {
+        const home = tmpdir();
+        const cc = setup(home);
+        const before = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
+        const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(), ...(ask ? { ask } : {}) });
+        assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start", ...args], a.c), EXIT.ok, `${how}: ${a.errText()}`);
+        assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), before, how);
+        assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), `${how}: still paired`);
+        if (how !== "--no-hooks") assert.match(a.text(), /did not add the Claude Code hooks .*claw-connector hooks install --approvals/, how);
+        if (how === "no terminal") assert.match(a.text(), /no terminal to ask in/);
+      }
+      const spent: any[] = [];
+      const both = ctx(tmpdir(), { fetch: claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), spent) });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--hooks", "--no-hooks"], both.c), EXIT.usage);
+      assert.match(both.errText(), /contradict/);
+      assert.deepEqual(spent, []);
+    });
+
+    test("paired again on a machine that has the hooks: nothing asked, nothing changed", async () => {
+      const home = tmpdir();
+      const cc = setup(home);
+      const s = scripts();
+      const first = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...s, ask: async () => true });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], first.c), EXIT.ok, first.errText());
+      const bytes = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
+      const again = ctx(home, { fetch: granted(), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...s, ask: async () => assert.fail("asked again") });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], again.c), EXIT.ok, again.errText());
+      assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), bytes);
+      assert.match(again.text(), /approval hooks are already in/);
+    });
   });
 
   test("what pair writes and where agents may work", () => {
