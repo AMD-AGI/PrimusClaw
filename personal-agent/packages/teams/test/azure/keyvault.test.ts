@@ -487,3 +487,24 @@ test("the wanted secrets follow the exchange switch and the feedback app", () =>
     ["TEAMS_ENCRYPTION_KEYS", "FEEDBACK_GITHUB_APP_KEY"],
   );
 });
+
+test("the exchange switch is read under its PA_ name first, its TEAMS_ name still read", () => {
+  assert.deepEqual(wanted({ PA_EXCHANGE_ENABLED: "1" }), ["TEAMS_ENCRYPTION_KEYS", "TEAMS_EXCHANGE_CLIENT_SECRET"]);
+  assert.deepEqual(wanted({ PA_EXCHANGE_ENABLED: "off", TEAMS_EXCHANGE_ENABLED: "on" }), ["TEAMS_ENCRYPTION_KEYS"]);
+  assert.deepEqual(wanted({ PA_EXCHANGE_ENABLED: " ", TEAMS_EXCHANGE_ENABLED: "on" }), [
+    "TEAMS_ENCRYPTION_KEYS",
+    "TEAMS_EXCHANGE_CLIENT_SECRET",
+  ]);
+});
+
+test("with keyvault an environment secret under either name is said to be ignored", async () => {
+  const logger = new RecordingLogger();
+  await load(new FakeAzure(), vaultEnv({ PA_ENCRYPTION_KEYS: "STALE-a", TEAMS_ENCRYPTION_KEYS: "STALE-b" }), {
+    logger,
+  });
+  assert.deepEqual(
+    logger.lines.filter((l) => l.level === "warn").map((l) => l.message),
+    ["secrets: SECRETS_SOURCE=keyvault, so PA_ENCRYPTION_KEYS, TEAMS_ENCRYPTION_KEYS from the environment are ignored"],
+  );
+  assert.ok(!logger.dump().includes("STALE"));
+});

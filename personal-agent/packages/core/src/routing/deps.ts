@@ -45,7 +45,7 @@ export interface RouterConfig {
   readonly reviewModel: string;
   /** A turn refused for want of a gateway key runs again on this model ("" never). */
   readonly fallbackModel: string;
-  /** Ordinary chats run on exchanged tokens (TEAMS_EXCHANGE_FOR_CHAT) instead of the linked key. */
+  /** Ordinary chats run on exchanged tokens (PA_EXCHANGE_FOR_CHAT) instead of the linked key. */
   readonly exchangeForChat: boolean;
   /** The parts of help that need Claw switches this worker cannot read. */
   readonly briefEnabled: boolean;

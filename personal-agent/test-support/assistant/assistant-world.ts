@@ -51,7 +51,7 @@ export interface AssistantWorldOptions {
   readonly assistant?: boolean;
   /** ASSISTANT_USERS, lower case (empty: everybody). */
   readonly users?: readonly string[];
-  /** TEAMS_ASSISTANT_UNDERSTANDING_USERS, lower case. */
+  /** PA_ASSISTANT_UNDERSTANDING_USERS, lower case. */
   readonly understanding?: readonly string[];
   readonly pluginId?: number;
   /** Alice is linked (with her Claw user id) before the test starts (default yes). */

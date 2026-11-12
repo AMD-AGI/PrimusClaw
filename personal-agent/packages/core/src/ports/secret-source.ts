@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Where the worker's secrets come from. The names are the settings they replace; how a source finds each one (an
- * environment variable, a mounted file, a vault entry) is that source's business.
+ * Where the worker's secrets come from. The names are the settings they first replaced, kept as stable ids; how a source
+ * finds each one (an environment variable, now under its `PA_` name, a mounted file, a vault entry) is that source's
+ * business.
  */
 export const SECRET_NAMES = [
   "TEAMS_ENCRYPTION_KEYS",

@@ -40,7 +40,7 @@ export interface SubscriptionsOptions {
   readonly baseUrl: string;
   /** ASSISTANT_ENABLED: subscriptions also get the assistant's event types. */
   readonly assistant?: boolean;
-  /** TEAMS_ASSISTANT_UNDERSTANDING_USERS: whose subscription also asks for `assistant.action`. */
+  /** PA_ASSISTANT_UNDERSTANDING_USERS: whose subscription also asks for `assistant.action`. */
   readonly understood?: (aadId: string) => boolean;
   /** ASSISTANT_USERS: whose subscription gets the assistant's types (an empty list: everybody's). */
   readonly assistantFor?: (aadId: string) => boolean;

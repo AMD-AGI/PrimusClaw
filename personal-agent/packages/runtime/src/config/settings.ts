@@ -8,6 +8,7 @@ import {
   DEFAULT_MESSAGE_WINDOW_SECONDS,
   DEFAULT_GROUP_CONTEXT,
   decimalBigInt,
+  LIMIT_ENV_PREFIX,
   parseLimits,
   type AssistantSettings,
   type ExchangeSettings,
@@ -19,13 +20,13 @@ import {
 } from "@primusclaw/personal-agent";
 import { DEFAULT_CLIENT_LABEL } from "../claw/client.js";
 import { type Env, EnvReader, pyRepr, withoutTrailingSlash } from "./env.js";
-import { secretsSourceOf } from "./secrets.js";
+import { SECRET_SETTING_NAMES, secretsSourceOf } from "./secrets.js";
 
 /** The public client id of the GitHub CLI: an OAuth app most organizations already allow; its device flow needs no secret. */
 export const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 /** The default of ASSISTANT_REPLY_WINDOW_SECONDS. */
 export const ASSISTANT_REPLY_WINDOW_SECONDS = 30 * 60;
-/** The most messages TEAMS_GROUP_CONTEXT_MESSAGES may keep per group chat. */
+/** The most messages PA_GROUP_CONTEXT_MESSAGES may keep per group chat. */
 export const MAX_GROUP_CONTEXT_MESSAGES = 200;
 
 /** What a setting reads its secrets from: the values a source loaded, and which source that was. */
@@ -51,7 +52,7 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
     throw new ConfigError(`METRICS_PORT must differ from PORT (${String(listenPort)})`);
   }
   return {
-    dbPath: read.raw("TEAMS_DB_PATH", "/data/state.db"),
+    dbPath: read.raw("PA_DB_PATH", "/data/state.db"),
     encryptionKeys: secret(read, store, "TEAMS_ENCRYPTION_KEYS")
       .split(",")
       .map((k) => k.trim())
@@ -74,21 +75,21 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
     },
     githubReview: githubReviewSettings(read, publicBaseUrl),
     assistant: assistantSettings(read),
-    clawEventsGone: read.isOn("TEAMS_CLAW_EVENTS_GONE"),
+    clawEventsGone: read.isOn("PA_CLAW_EVENTS_GONE"),
     directChat: directChat(read),
-    onBehalfUsers: new Set(read.list("TEAMS_ON_BEHALF_USERS")),
-    observeUsers: new Set(read.list("TEAMS_OBSERVE_USERS", true)),
+    onBehalfUsers: new Set(read.list("PA_ON_BEHALF_USERS")),
+    observeUsers: new Set(read.list("PA_OBSERVE_USERS", true)),
     groupContext: groupContextSettings(read),
     sensitiveLimits: limitsOf(read),
     linkLimits: {
-      perUser: read.positiveInt("TEAMS_LINK_MAX_FAILURES_PER_USER", 5),
-      global: read.positiveInt("TEAMS_LINK_MAX_FAILURES_GLOBAL", 100),
-      windowSeconds: read.positiveInt("TEAMS_LINK_ATTEMPT_WINDOW_SECONDS", 600),
+      perUser: read.positiveInt("PA_LINK_MAX_FAILURES_PER_USER", 5),
+      global: read.positiveInt("PA_LINK_MAX_FAILURES_GLOBAL", 100),
+      windowSeconds: read.positiveInt("PA_LINK_ATTEMPT_WINDOW_SECONDS", 600),
     },
     userLimits: {
-      messageLimit: read.positiveInt("TEAMS_USER_MESSAGE_LIMIT", DEFAULT_MESSAGE_LIMIT),
-      messageWindowSeconds: read.positiveInt("TEAMS_USER_MESSAGE_WINDOW_SECONDS", DEFAULT_MESSAGE_WINDOW_SECONDS),
-      maxConcurrentTasks: read.positiveInt("TEAMS_USER_MAX_CONCURRENT_TASKS", DEFAULT_MAX_CONCURRENT_TASKS),
+      messageLimit: read.positiveInt("PA_USER_MESSAGE_LIMIT", DEFAULT_MESSAGE_LIMIT),
+      messageWindowSeconds: read.positiveInt("PA_USER_MESSAGE_WINDOW_SECONDS", DEFAULT_MESSAGE_WINDOW_SECONDS),
+      maxConcurrentTasks: read.positiveInt("PA_USER_MAX_CONCURRENT_TASKS", DEFAULT_MAX_CONCURRENT_TASKS),
     },
     secretsSource: store.source,
   };
@@ -96,17 +97,17 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
 
 /** The recent messages of a group chat kept as background (0 messages: off). */
 function groupContextSettings(read: EnvReader): GroupContextSettings {
-  const messages = read.int("TEAMS_GROUP_CONTEXT_MESSAGES", String(DEFAULT_GROUP_CONTEXT.messages));
+  const messages = read.int("PA_GROUP_CONTEXT_MESSAGES", String(DEFAULT_GROUP_CONTEXT.messages));
   if (messages < 0 || messages > MAX_GROUP_CONTEXT_MESSAGES) {
     throw new ConfigError(
-      `TEAMS_GROUP_CONTEXT_MESSAGES must be between 0 and ${String(MAX_GROUP_CONTEXT_MESSAGES)}, not ${String(messages)}`,
+      `${read.source("PA_GROUP_CONTEXT_MESSAGES")} must be between 0 and ${String(MAX_GROUP_CONTEXT_MESSAGES)}, not ${String(messages)}`,
     );
   }
   return {
     messages,
-    maxAgeSeconds: read.positiveInt("TEAMS_GROUP_CONTEXT_HOURS", DEFAULT_GROUP_CONTEXT.maxAgeSeconds / 3600) * 3600,
-    messageChars: read.positiveInt("TEAMS_GROUP_CONTEXT_CHARS", DEFAULT_GROUP_CONTEXT.messageChars),
-    granted: read.raw("TEAMS_GROUP_CONTEXT_GRANTED") === "1",
+    maxAgeSeconds: read.positiveInt("PA_GROUP_CONTEXT_HOURS", DEFAULT_GROUP_CONTEXT.maxAgeSeconds / 3600) * 3600,
+    messageChars: read.positiveInt("PA_GROUP_CONTEXT_CHARS", DEFAULT_GROUP_CONTEXT.messageChars),
+    granted: read.raw("PA_GROUP_CONTEXT_GRANTED") === "1",
   };
 }
 
@@ -118,26 +119,28 @@ function secret(read: EnvReader, store: Secrets, name: SecretName): string {
     // never the environment's value: it may be the stale one the vault replaced
     throw new ConfigError(`SECRETS_SOURCE=keyvault but ${name} was not read from the vault`);
   }
-  return read.required(name);
+  return read.required(SECRET_SETTING_NAMES[name]);
 }
 
 function exchangeSettings(read: EnvReader, store: Secrets, publicBaseUrl: string): ExchangeSettings {
-  const enabled = read.isOn("TEAMS_EXCHANGE_ENABLED");
-  const forChat = read.isOn("TEAMS_EXCHANGE_FOR_CHAT");
-  if (read.isOn("TEAMS_GITHUB_REVIEW_ENABLED") && !enabled) {
-    throw new ConfigError("TEAMS_GITHUB_REVIEW_ENABLED needs TEAMS_EXCHANGE_ENABLED");
+  const enabled = read.isOn("PA_EXCHANGE_ENABLED");
+  const forChat = read.isOn("PA_EXCHANGE_FOR_CHAT");
+  if (read.isOn("PA_GITHUB_REVIEW_ENABLED") && !enabled) {
+    throw new ConfigError(`${read.source("PA_GITHUB_REVIEW_ENABLED")} needs ${read.source("PA_EXCHANGE_ENABLED")}`);
   }
-  if (forChat && !enabled) throw new ConfigError("TEAMS_EXCHANGE_FOR_CHAT needs TEAMS_EXCHANGE_ENABLED");
+  if (forChat && !enabled) {
+    throw new ConfigError(`${read.source("PA_EXCHANGE_FOR_CHAT")} needs ${read.source("PA_EXCHANGE_ENABLED")}`);
+  }
   return {
     enabled,
-    tokenUrl: enabled ? read.raw("TEAMS_EXCHANGE_TOKEN_URL", `${publicBaseUrl}/oauth/token`) : "",
-    clientId: enabled ? read.required("TEAMS_EXCHANGE_CLIENT_ID") : "",
+    tokenUrl: enabled ? read.raw("PA_EXCHANGE_TOKEN_URL", `${publicBaseUrl}/oauth/token`) : "",
+    clientId: enabled ? read.required("PA_EXCHANGE_CLIENT_ID") : "",
     clientSecret: enabled ? secret(read, store, "TEAMS_EXCHANGE_CLIENT_SECRET") : "",
-    issuer: read.raw("TEAMS_EXCHANGE_ISSUER", "teams.microsoft.com"),
-    audience: read.raw("TEAMS_EXCHANGE_AUDIENCE", "claw-api"),
-    scope: read.raw("TEAMS_EXCHANGE_SCOPE", "claw.api"),
+    issuer: read.raw("PA_EXCHANGE_ISSUER", "teams.microsoft.com"),
+    audience: read.raw("PA_EXCHANGE_AUDIENCE", "claw-api"),
+    scope: read.raw("PA_EXCHANGE_SCOPE", "claw.api"),
     bindingRequestUrl: enabled
-      ? read.raw("TEAMS_EXCHANGE_BINDING_REQUEST_URL", `${publicBaseUrl}/oauth/binding-requests`)
+      ? read.raw("PA_EXCHANGE_BINDING_REQUEST_URL", `${publicBaseUrl}/oauth/binding-requests`)
       : "",
     forChat,
   };
@@ -145,21 +148,21 @@ function exchangeSettings(read: EnvReader, store: Secrets, publicBaseUrl: string
 
 /** The review for a colleague; the exchange's own check refuses it without the exchange. */
 function githubReviewSettings(read: EnvReader, publicBaseUrl: string): GithubReviewSettings {
-  const enabled = read.isOn("TEAMS_GITHUB_REVIEW_ENABLED");
-  const owners = read.list("TEAMS_GITHUB_REVIEW_OWNERS");
+  const enabled = read.isOn("PA_GITHUB_REVIEW_ENABLED");
+  const owners = read.list("PA_GITHUB_REVIEW_OWNERS");
   if (enabled && owners.length === 0) {
     throw new ConfigError(
-      "TEAMS_GITHUB_REVIEW_ENABLED needs TEAMS_GITHUB_REVIEW_OWNERS (the GitHub owners whose pull requests are taken)",
+      `${read.source("PA_GITHUB_REVIEW_ENABLED")} needs ${read.source("PA_GITHUB_REVIEW_OWNERS")} (the GitHub owners whose pull requests are taken)`,
     );
   }
   return {
     enabled,
     owners,
-    intentModel: enabled ? read.text("TEAMS_REVIEW_INTENT_MODEL") || read.text("CLAWY_MODEL") : "",
+    intentModel: enabled ? read.text("PA_REVIEW_INTENT_MODEL") || read.text("CLAWY_MODEL") : "",
     credentialUrl: enabled
-      ? withoutTrailingSlash(read.raw("TEAMS_GITHUB_CREDENTIAL_URL", `${publicBaseUrl}/oauth/external-credentials`))
+      ? withoutTrailingSlash(read.raw("PA_GITHUB_CREDENTIAL_URL", `${publicBaseUrl}/oauth/external-credentials`))
       : "",
-    clientId: read.text("TEAMS_GITHUB_CLIENT_ID", GITHUB_CLI_CLIENT_ID) || GITHUB_CLI_CLIENT_ID,
+    clientId: read.text("PA_GITHUB_CLIENT_ID", GITHUB_CLI_CLIENT_ID) || GITHUB_CLI_CLIENT_ID,
   };
 }
 
@@ -171,20 +174,22 @@ function assistantSettings(read: EnvReader): AssistantSettings {
     throw new ConfigError(`ASSISTANT_REPLY_WINDOW_SECONDS must be a positive number of seconds, not ${pyRepr(window)}`);
   }
   const enabled = read.isOn("ASSISTANT_ENABLED");
-  const understanding = read.switch("TEAMS_ASSISTANT_UNDERSTANDING", false);
+  const understanding = read.switch("PA_ASSISTANT_UNDERSTANDING", false);
   const users = new Set(read.list("ASSISTANT_USERS", true));
-  const listed = new Set(read.list("TEAMS_ASSISTANT_UNDERSTANDING_USERS", true));
+  const listed = new Set(read.list("PA_ASSISTANT_UNDERSTANDING_USERS", true));
   const understandingUsers = understanding ? (listed.size > 0 ? listed : users) : new Set<string>();
   if (understanding && understandingUsers.size === 0) {
     throw new ConfigError(
-      "TEAMS_ASSISTANT_UNDERSTANDING is on but TEAMS_ASSISTANT_UNDERSTANDING_USERS names nobody (and ASSISTANT_USERS is empty)",
+      `${read.source("PA_ASSISTANT_UNDERSTANDING")} is on but ${read.source("PA_ASSISTANT_UNDERSTANDING_USERS")} names nobody (and ASSISTANT_USERS is empty)`,
     );
   }
   if (understandingUsers.size > 0 && !enabled) {
-    throw new ConfigError("TEAMS_ASSISTANT_UNDERSTANDING needs ASSISTANT_ENABLED");
+    throw new ConfigError(`${read.source("PA_ASSISTANT_UNDERSTANDING")} needs ASSISTANT_ENABLED`);
   }
   if (users.size > 0 && [...understandingUsers].some((u) => !users.has(u))) {
-    throw new ConfigError("TEAMS_ASSISTANT_UNDERSTANDING_USERS names people who are not in ASSISTANT_USERS");
+    throw new ConfigError(
+      `${read.source("PA_ASSISTANT_UNDERSTANDING_USERS")} names people who are not in ASSISTANT_USERS`,
+    );
   }
   return {
     enabled,
@@ -196,15 +201,18 @@ function assistantSettings(read: EnvReader): AssistantSettings {
 
 function directChat(read: EnvReader): Settings["directChat"] {
   return {
-    enabled: read.switch("TEAMS_DIRECT_CHAT", false),
-    users: new Set(read.list("TEAMS_DIRECT_CHAT_USERS", true)),
+    enabled: read.switch("PA_DIRECT_CHAT", false),
+    users: new Set(read.list("PA_DIRECT_CHAT_USERS", true)),
   };
 }
 
-/** TEAMS_LIMIT_<OPERATION>; a malformed one stops the worker with the message the guardrails give. */
+/** PA_LIMIT_<OPERATION> (or the older TEAMS_LIMIT_<OPERATION>); a malformed one stops the worker with the message the guardrails give. */
 function limitsOf(read: EnvReader): Settings["sensitiveLimits"] {
   try {
-    return parseLimits((name) => read.raw(name));
+    return parseLimits((name) => read.raw(name), {
+      prefix: LIMIT_ENV_PREFIX,
+      source: (name) => read.source(name),
+    });
   } catch (err) {
     if (err instanceof ConfigError) throw err;
     throw new ConfigError(err instanceof Error ? err.message : String(err));

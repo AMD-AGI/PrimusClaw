@@ -14,7 +14,7 @@ export type SecurityEventFields = Readonly<Record<string, string | number | unde
 export type SecurityEventSink = (event: "link_attempt" | "link_lockout", fields: SecurityEventFields) => void;
 
 /**
- * The keys of TEAMS_ENCRYPTION_KEYS: the first encrypts and hashes new link codes, every one decrypts and finds a code
+ * The keys of PA_ENCRYPTION_KEYS: the first encrypts and hashes new link codes, every one decrypts and finds a code
  * (adding a key at the head does not void the codes of the last 10 minutes).
  */
 export class StoreSecrets {

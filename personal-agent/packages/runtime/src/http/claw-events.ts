@@ -45,7 +45,7 @@ export interface ClawEventsDeps {
   readonly claims: Pick<IdempotencyRepository, "claimEvent" | "finishEvent" | "releaseEvent">;
   readonly deliver: EventSink;
   readonly clock: Clock;
-  /** TEAMS_CLAW_EVENTS_GONE: an event for a person with no chat here is answered 410 (else 200 "dropped", for an older Claw). */
+  /** PA_CLAW_EVENTS_GONE: an event for a person with no chat here is answered 410 (else 200 "dropped", for an older Claw). */
   readonly gone: boolean;
   readonly metrics?: Pick<MetricsPort, "eventDelivered">;
   readonly logger?: Logger;

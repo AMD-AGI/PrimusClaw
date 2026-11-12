@@ -66,7 +66,7 @@ export interface AssistantChatOptions {
   readonly enabled: boolean;
   /** ASSISTANT_USERS, lower case (empty: everybody the switch is on for). */
   readonly users: ReadonlySet<string>;
-  /** TEAMS_ASSISTANT_UNDERSTANDING_USERS, lower case (empty: nobody). */
+  /** PA_ASSISTANT_UNDERSTANDING_USERS, lower case (empty: nobody). */
   readonly understanding: ReadonlySet<string>;
   /** CLAW_PLUGIN_ID: named on each message; undefined for none. */
   readonly pluginId: number | undefined;

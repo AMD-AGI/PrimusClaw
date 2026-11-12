@@ -62,7 +62,7 @@ export const REMOTE_LINE: Phrase = {
 
 /**
  * How much of a group chat's recent messages the deployment keeps as background for an @mention (core's
- * `GroupContext`, TEAMS_GROUP_CONTEXT_*), when that is on: the newest `messages`, none older than `hours`.
+ * `GroupContext`, PA_GROUP_CONTEXT_*), when that is on: the newest `messages`, none older than `hours`.
  */
 export interface GroupContextKept {
   readonly messages: number;

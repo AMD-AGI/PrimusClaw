@@ -7,6 +7,7 @@
  * setting each one replaces (`ENV_NAMES`, named in a warning when it is set anyway).
  */
 import { pyRstrip, type SecretName, SecretsUnavailable, pyStrip, own } from "@primusclaw/personal-agent";
+import { SETTING_ALIASES, settingValue } from "@primusclaw/personal-agent-runtime";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -20,10 +21,13 @@ export const VAULT_NAMES: Readonly<Record<SecretName, string>> = {
   FEEDBACK_GITHUB_APP_KEY: "clawy-feedback-github-app-key",
 };
 
-/** What the environment holds for each secret with SECRETS_SOURCE=env (the GitHub App key is a mounted file). */
+/**
+ * What the environment holds for each secret with SECRETS_SOURCE=env (the GitHub App key is a mounted file); the older
+ * `TEAMS_` name of a `PA_` one is read too.
+ */
 export const ENV_NAMES: Readonly<Record<SecretName, string>> = {
-  TEAMS_ENCRYPTION_KEYS: "TEAMS_ENCRYPTION_KEYS",
-  TEAMS_EXCHANGE_CLIENT_SECRET: "TEAMS_EXCHANGE_CLIENT_SECRET",
+  TEAMS_ENCRYPTION_KEYS: "PA_ENCRYPTION_KEYS",
+  TEAMS_EXCHANGE_CLIENT_SECRET: "PA_EXCHANGE_CLIENT_SECRET",
   FEEDBACK_GITHUB_APP_KEY: "FEEDBACK_GITHUB_KEY_FILE",
 };
 
@@ -41,16 +45,22 @@ function on(raw: string): boolean {
  */
 export function wanted(env: Env): SecretName[] {
   const names: SecretName[] = ["TEAMS_ENCRYPTION_KEYS"];
-  if (on(get(env, "TEAMS_EXCHANGE_ENABLED"))) names.push("TEAMS_EXCHANGE_CLIENT_SECRET");
+  if (on(settingValue(env, "PA_EXCHANGE_ENABLED") ?? "")) names.push("TEAMS_EXCHANGE_CLIENT_SECRET");
   if (get(env, "FEEDBACK_GITHUB_APP_ID") && get(env, "FEEDBACK_GITHUB_INSTALLATION_ID")) {
     names.push("FEEDBACK_GITHUB_APP_KEY");
   }
   return names;
 }
 
-/** The environment settings `names` replace that are set anyway: with keyvault they are ignored. */
+/** The environment settings `names` replace that are set anyway (either name of a pair): with keyvault they are ignored. */
 export function shadowedSettings(env: Env, names: readonly SecretName[]): string[] {
-  return names.map((name) => ENV_NAMES[name]).filter((setting) => get(env, setting));
+  return names
+    .flatMap((name) => {
+      const setting = ENV_NAMES[name];
+      const legacy = SETTING_ALIASES.get(setting);
+      return legacy === undefined ? [setting] : [setting, legacy];
+    })
+    .filter((setting) => get(env, setting));
 }
 
 /** Python's `urlsplit`, the parts this check needs: scheme (lower case), host name (lower case), path and query. */

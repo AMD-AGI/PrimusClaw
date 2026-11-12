@@ -111,7 +111,7 @@ Step by step:
 1. **`prepare(env)`**: before anything else is read. Refuse here what the surface cannot run with at all (Teams reads
    its release-gate test entry first, so a typo in it never picks a path silently).
 2. **`loadSecrets(names, deps)`** (optional): the secrets named in `names`, which are what core's settings need
-   (`TEAMS_ENCRYPTION_KEYS` always; `TEAMS_EXCHANGE_CLIENT_SECRET` with the exchange; `FEEDBACK_GITHUB_APP_KEY` with the
+   (`PA_ENCRYPTION_KEYS` always; `PA_EXCHANGE_CLIENT_SECRET` with the exchange; `FEEDBACK_GITHUB_APP_KEY` with the
    feedback plugin's GitHub App). Without it the worker reads them from the environment, and `SECRETS_SOURCE` must be
    unset or `env` ([`envSecrets`](../packages/runtime/src/worker/assemble.ts)). Teams reads Azure Key Vault here.
 3. **`configure(settings)`**: after core's settings, before the store opens. Read and check the surface's own settings
@@ -224,7 +224,7 @@ Rules a surface must keep:
 
 - **Route every group message**, mentioned or not, with `mentioned` set truthfully. Core answers only when the bot is
   mentioned (or the message is targeted at it); the others feed the group's recent context
-  (`TEAMS_GROUP_CONTEXT_MESSAGES`), never stored and never answered.
+  (`PA_GROUP_CONTEXT_MESSAGES`), never stored and never answered.
 - **`wire` is the stored reference.** It must be JSON, carry what posting there later needs (the conversation, and for a
   1:1 chat who the person is, so `typedEvent` can name them), and read back through `SurfaceShape.restoreRef`.
 - **A press carries its inputs.** A card with a pick list sends the picked values beside the button's data (the echo
@@ -279,19 +279,19 @@ one of two credentials:
   to the worker's `POST /primus-claw-agent/link` and shows them a one-time code; they type `/link CODE` in a 1:1 chat.
   The code only ever travels from the console to the chat, so a chat identity can never be tied to a key by a link
   someone else sent. A person who has not linked is answered with how to connect, and nothing is sent to Claw for them.
-- **An exchanged token** (`TEAMS_EXCHANGE_ENABLED`, [configuration](configuration.md)). The worker trades its own client
+- **An exchanged token** (`PA_EXCHANGE_ENABLED`, [configuration](configuration.md)). The worker trades its own client
   credentials for a token of the person with the identity service (RFC 8693): the subject is
-  `external:<issuer>|<UserRef.id>`, where the issuer is `TEAMS_EXCHANGE_ISSUER` (default `teams.microsoft.com`). A new
+  `external:<issuer>|<UserRef.id>`, where the issuer is `PA_EXCHANGE_ISSUER` (default `teams.microsoft.com`). A new
   surface sets the issuer to its own platform's (for example `slack.com`), and the identity service must trust that
   issuer. A person who has not confirmed their binding gets a card with the identity service's confirmation link
-  (`binding`); with `TEAMS_EXCHANGE_FOR_CHAT` off, chats keep using the linked key.
+  (`binding`); with `PA_EXCHANGE_FOR_CHAT` off, chats keep using the linked key.
 
 ## Claw interactions
 
 | What                       | How the surface takes part                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Assistant messages         | Every message to a person's assistant carries `channel_context.channel` = `SurfaceCaps.channel`. Claw records it with the message and sends that turn's replies back to that surface ("return to source").                                                                                                                                                                                                                                                                    |
-| On-behalf messages         | A deployment's on-behalf route (`TEAMS_ON_BEHALF_USERS`, a plugin's route) posts words into a person's own chat and hands them to the router as typed (`typedEvent`, `provenance: "on_behalf"`); the message to the assistant then says `channel_context.via: "on_behalf"`.                                                                                                                                                                                                   |
+| On-behalf messages         | A deployment's on-behalf route (`PA_ON_BEHALF_USERS`, a plugin's route) posts words into a person's own chat and hands them to the router as typed (`typedEvent`, `provenance: "on_behalf"`); the message to the assistant then says `channel_context.via: "on_behalf"`.                                                                                                                                                                                                      |
 | Notification subscriptions | With `PROACTIVE_ENABLED=1` the worker keeps one subscription per person, created with their credential, whose `surface` is `SurfaceShape.surfaceId` and whose URL is `NOTIFY_WEBHOOK_URL/<route>`. Claw signs each event with that subscription's secret; the worker checks the signature, the timestamp and that the event is that person's, then posts it into their stored 1:1 conversation reference.                                                                     |
 | Return to source           | Where Claw's assistant is on (`CLAW_ASSISTANT_ENABLED` on Claw): a reply of a turn goes to the surface that turn's message came from; a proactive message (a finished run, an approval, a needs-you) to the surface the person wrote from last; when that surface has no subscription that takes the event, the next one. A person whose subscriptions all name one surface gets everything there. With Claw's assistant off, every subscription that takes an event gets it. |
 
@@ -300,10 +300,11 @@ reference for each person's 1:1 chat (core does this when they write), and drawi
 
 ## Configuration
 
-Core's settings ([configuration.md](configuration.md)) apply to every surface. Many still carry the `TEAMS_` prefix from
-when Teams was the only surface (`TEAMS_DB_PATH`, `TEAMS_ENCRYPTION_KEYS`, `TEAMS_EXCHANGE_*`, `TEAMS_GROUP_CONTEXT_*`);
-on another surface they mean the same thing. A surface's own settings (its tokens, its endpoints, its reply style) are
-read in `configure` (or `prepare`, for what must be refused first) and get a name of their own (`SLACK_*`), with:
+Core's settings ([configuration.md](configuration.md)) apply to every surface. The worker's own ones carry the `PA_`
+prefix (`PA_DB_PATH`, `PA_ENCRYPTION_KEYS`, `PA_EXCHANGE_*`, `PA_GROUP_CONTEXT_*`); their older `TEAMS_` names, from
+when Teams was the only surface, are still read, and on another surface they mean the same thing. A surface's own
+settings (its tokens, its endpoints, its reply style) are read in `configure` (or `prepare`, for what must be refused
+first) and get a name of their own (`SLACK_*`), with:
 
 - a strict reading where a typo must not pick a path silently (unknown words stop the start);
 - secrets read through `loadSecrets`, never logged;
@@ -372,7 +373,7 @@ person through `/primus-claw-agent/link` and `/link CODE`, and drives it through
 - [ ] Outbound: every view in `ViewMap` drawn, with core's click protocol on its buttons; inputs merged into a press's
       data; streams that only grow and close before `streamSeconds`; envelopes self-contained; groups masked.
 - [ ] Caps true to the platform, and enforced at the port.
-- [ ] Identity: `/link` works in a 1:1 chat; with the exchange, `TEAMS_EXCHANGE_ISSUER` set to the platform's issuer
+- [ ] Identity: `/link` works in a 1:1 chat; with the exchange, `PA_EXCHANGE_ISSUER` set to the platform's issuer
       and trusted by the identity service.
 - [ ] A driver for the conformance kit, and the kit passing in CI (below).
 - [ ] Packaging: workspace, coverage floor, build entries, check-pack, release workflow, CHANGELOG, configuration docs.

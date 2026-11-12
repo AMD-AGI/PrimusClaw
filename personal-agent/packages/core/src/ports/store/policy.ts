@@ -15,11 +15,11 @@ export const LINK_CODE_TTL_SECONDS = 10 * MINUTE;
 export const CODE_LENGTH = 8;
 /** The alphabet a link code is drawn from: no 0/O/1/I. */
 export const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-/** Wrong codes per user in the window (TEAMS_LINK_MAX_FAILURES_PER_USER). */
+/** Wrong codes per user in the window (PA_LINK_MAX_FAILURES_PER_USER). */
 export const MAX_FAILED_ATTEMPTS = 5;
-/** Wrong codes of all users together in the window (TEAMS_LINK_MAX_FAILURES_GLOBAL). */
+/** Wrong codes of all users together in the window (PA_LINK_MAX_FAILURES_GLOBAL). */
 export const MAX_FAILED_ATTEMPTS_GLOBAL = 100;
-/** TEAMS_LINK_ATTEMPT_WINDOW_SECONDS. */
+/** PA_LINK_ATTEMPT_WINDOW_SECONDS. */
 export const ATTEMPT_WINDOW_SECONDS = 10 * MINUTE;
 /** An action is carried out for an assistant message this young, at most. */
 export const ASSISTANT_MESSAGE_KEEP_SECONDS = DAY;

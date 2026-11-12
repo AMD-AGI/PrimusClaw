@@ -26,7 +26,7 @@ export interface WorkerRoutesParts {
   readonly plugins: Plugins;
   /** PROACTIVE_ENABLED: Claw's notifications are taken at /claw-events. */
   readonly proactive: boolean;
-  /** TEAMS_CLAW_EVENTS_GONE. */
+  /** PA_CLAW_EVENTS_GONE. */
   readonly gone: boolean;
   readonly deliverEvent: (userId: string, reference: JsonObject, event: JsonObject) => Promise<string>;
 }

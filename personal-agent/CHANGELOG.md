@@ -15,6 +15,34 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+A patch release (0.8.1): the worker's own settings get surface-neutral `PA_` names, and the older `TEAMS_` names still
+work, so no deployment needs a change. No new npm package, no plugin port (core's `src/plugins/`) or store change;
+works with any Claw.
+
+### Changed
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`, `@primusclaw/personal-agent-teams`: the worker's
+  own settings, the ones every surface shares, are read under the `PA_` prefix: `PA_DB_PATH`, `PA_ENCRYPTION_KEYS`,
+  `PA_EXCHANGE_*`, `PA_GITHUB_REVIEW_*`, `PA_USER_*`, `PA_LINK_*`, `PA_LIMIT_<OPERATION>`, `PA_GROUP_CONTEXT_*`,
+  `PA_DIRECT_CHAT(_USERS)` and the rest listed in docs/configuration.md, "Setting names". A surface's own settings keep
+  its prefix (`TEAMS_STREAMING`, `TEAMS_AI_LABEL`, `TEAMS_GATE_*`). Runtime adds `SECRET_SETTING_NAMES` (the `PA_`
+  variable of each secret), which the worker reads. Core adds `LIMIT_ENV_PREFIX` (`PA_LIMIT_`) and an optional second
+  argument to `parseLimits` (`{ prefix, source }`: the prefix to read, and the variable a value was read from for its
+  message); called as before it reads the `TEAMS_LIMIT_` names as before. The secret ids (`SecretName`) and the Key Vault entries are unchanged.
+- `@primusclaw/personal-agent-runtime`: the channel context reads the people a message @mentions from
+  `message.mentions` as the surface gave them, no longer rebuilt in Teams' mention shape.
+
+### Deprecated
+
+- `@primusclaw/personal-agent`: `ENV_PREFIX` (still `TEAMS_LIMIT_`, the prefix `parseLimits` reads when given none);
+  use `LIMIT_ENV_PREFIX`.
+- `@primusclaw/personal-agent-runtime`: `ENV_NAMES` (its values still the `TEAMS_` names); use `SECRET_SETTING_NAMES`.
+- The `TEAMS_` names of those settings. Each is still read when its `PA_` name is unset or blank; when both are set the
+  `PA_` name wins and the worker warns that the `TEAMS_` one is ignored. A worker that reads any of them logs one warning
+  at start naming each with its replacement (never a value). They are removed only in a release whose notes say so.
+
 ## 0.8.0
 
 A minor release, because its exported API changes incompatibly (#788, #789: listed under Changed): a worker names its

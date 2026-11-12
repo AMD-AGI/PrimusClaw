@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Moving every stored secret to the first encryption key, so an older key can be removed from TEAMS_ENCRYPTION_KEYS.
+ * Moving every stored secret to the first encryption key, so an older key can be removed from PA_ENCRYPTION_KEYS.
  * A row is rewritten only if it still holds the token that was read (a concurrent write is never overwritten), and each
  * row is its own write: an interrupted run leaves every row readable and the next run finishes the rest.
  */

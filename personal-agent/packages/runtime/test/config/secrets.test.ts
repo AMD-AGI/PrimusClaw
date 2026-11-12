@@ -4,7 +4,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ConfigError, SecretsUnavailable, type SecretName } from "@primusclaw/personal-agent";
-import { EnvSecretSource, pyRepr, readSettings, secretsSourceOf, wantedSecrets, type Env } from "../../src/index.js";
+import {
+  ENV_NAMES,
+  EnvSecretSource,
+  SECRET_SETTING_NAMES,
+  pyRepr,
+  readSettings,
+  secretsSourceOf,
+  wantedSecrets,
+  type Env,
+} from "../../src/index.js";
 
 const BASE: Env = {
   CLAW_API_URL: "https://claw.example.com/claw-api",
@@ -46,7 +55,7 @@ describe("where the secrets come from", () => {
   it("a secret the environment does not hold fails, naming it and never a value", async () => {
     await assert.rejects(new EnvSecretSource({}).load(["TEAMS_ENCRYPTION_KEYS"]), {
       name: "SecretsUnavailable",
-      message: "environment variable TEAMS_ENCRYPTION_KEYS is required",
+      message: "environment variable PA_ENCRYPTION_KEYS is required",
     });
     const unreadable = new EnvSecretSource({ FEEDBACK_GITHUB_KEY_FILE: "/missing.pem" }, () => {
       throw new Error("ENOENT");
@@ -114,5 +123,26 @@ describe("pyRepr", () => {
       "'back\\\\slash'",
       "'both \\' and \"'",
     ]);
+  });
+});
+
+describe("the 0.8.0 export keeps its values", () => {
+  it("ENV_NAMES maps each secret to the variable 0.8.0 named; the worker reads SECRET_SETTING_NAMES", () => {
+    // Copied from personal-agent-v0.8.0:personal-agent/packages/runtime/src/config/secrets.ts, not derived from the code.
+    const released: Record<SecretName, string> = {
+      TEAMS_ENCRYPTION_KEYS: "TEAMS_ENCRYPTION_KEYS",
+      TEAMS_EXCHANGE_CLIENT_SECRET: "TEAMS_EXCHANGE_CLIENT_SECRET",
+      FEEDBACK_GITHUB_APP_KEY: "FEEDBACK_GITHUB_KEY_FILE",
+    };
+    // eslint-disable-next-line @typescript-eslint/no-deprecated -- the deprecated export is what this test pins
+    assert.deepEqual({ ...ENV_NAMES }, released);
+    assert.deepEqual(
+      { ...SECRET_SETTING_NAMES },
+      {
+        TEAMS_ENCRYPTION_KEYS: "PA_ENCRYPTION_KEYS",
+        TEAMS_EXCHANGE_CLIENT_SECRET: "PA_EXCHANGE_CLIENT_SECRET",
+        FEEDBACK_GITHUB_APP_KEY: "FEEDBACK_GITHUB_KEY_FILE",
+      },
+    );
   });
 });

@@ -423,7 +423,7 @@ describe("the platform services", () => {
     const settings = { onBehalfUsers: new Set(["u-coordinator"]) };
     assert.throws(
       () => assembled({}, new RecordingLogger(), { settings }),
-      (error: unknown) => error instanceof StartupError && /TEAMS_ON_BEHALF_USERS/.test(error.message),
+      (error: unknown) => error instanceof StartupError && /PA_ON_BEHALF_USERS/.test(error.message),
     );
     const route = {
       method: "POST" as const,
@@ -435,7 +435,7 @@ describe("the platform services", () => {
     const get = { ...route, method: "GET" as const };
     assert.throws(
       () => assembled({}, new RecordingLogger(), { settings, plugins: neutralPlugins({ routeExtensions: [get] }) }),
-      /TEAMS_ON_BEHALF_USERS/,
+      /PA_ON_BEHALF_USERS/,
     );
   });
 });

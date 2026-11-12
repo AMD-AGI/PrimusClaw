@@ -10,8 +10,8 @@ import type { Clock, LinkLimits, Logger, Random } from "@primusclaw/personal-age
 import type { SecurityEventSink } from "./context.js";
 import { SqliteStore } from "./store.js";
 
-/** The settings the store is opened with; the configuration's own fields (TEAMS_DB_PATH, TEAMS_ENCRYPTION_KEYS, the
- * TEAMS_LINK_* limits), so a worker's settings object is passed as it is. */
+/** The settings the store is opened with; the configuration's own fields (PA_DB_PATH, PA_ENCRYPTION_KEYS, the
+ * PA_LINK_* limits), so a worker's settings object is passed as it is. */
 export interface WorkerStoreSettings {
   readonly dbPath: string;
   readonly encryptionKeys: readonly string[];

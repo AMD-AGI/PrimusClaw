@@ -105,7 +105,7 @@ export interface RemoteContext {
   digestHex(algorithm: "sha1" | "sha256", text: string): string;
   /** The language a person is answered in. */
   langOf(person: string): Lang;
-  /** TEAMS_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */
+  /** PA_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */
   readonly directChat: DirectChat;
 }
 

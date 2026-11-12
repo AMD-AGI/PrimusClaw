@@ -55,9 +55,9 @@ export const DEFAULT_LINK_LIMITS: LinkLimits = {
 };
 
 export interface SqliteStoreOptions {
-  /** The database file (`TEAMS_DB_PATH`), or ":memory:". */
+  /** The database file (`PA_DB_PATH`), or ":memory:". */
   readonly path: string;
-  /** TEAMS_ENCRYPTION_KEYS: the first encrypts, all decrypt. At least one. */
+  /** PA_ENCRYPTION_KEYS: the first encrypts, all decrypt. At least one. */
   readonly encryptionKeys: readonly string[];
   readonly clock?: Clock;
   readonly random?: Random;
