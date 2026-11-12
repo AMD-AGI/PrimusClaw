@@ -34,7 +34,8 @@ import { getAuthMethod } from "../auth/request-credential.js";
 import { CONNECTOR_TOKEN_METHOD, tokenExpired, tokenRevoked } from "../auth/connector-token.js";
 import { CONNECTOR_GRANT_METHOD, grantOf } from "../auth/connector-grant.js";
 import { notifyPaired } from "../remote-agents/pairing.js";
-import { registerPairingRoutes, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
+import { registerPairingRoutes, startPairingPrune, type PairingRouteOptions } from "../remote-agents/pairing-routes.js";
+import { startBackgroundLoops, type BackgroundLoop, type RemoteAgentBackgroundLoopName } from "../startup/background.js";
 import { CONNECTOR_SIDE_ROUTES } from "../remote-agents/connector-routes.js";
 import { db, dedicatedClient, inTransaction } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
@@ -90,6 +91,11 @@ export interface RemoteAgentOptions {
   undeliveredSweepMs?: number;
   /** Terminal-hook sessions one user may open per minute (`TERMINAL_SESSION_LIMITS.opensPerMinute`). */
   terminalSessionsPerMinute?: number;
+  /**
+   * CLAW_API_BACKGROUND (`startup/background.ts`). False starts none of the loops this module runs -- the wake relay and
+   * every sweep -- whatever the settings above say; the routes are the same. Defaults to true.
+   */
+  background?: boolean;
 }
 
 /**
@@ -245,11 +251,17 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
-  if (opts.crossReplicaWake) {
-    const relay = startWakeRelay(waker, { client: dedicatedClient, query: (text, params) => db.query(text, params) });
-    app.addHook("onClose", async () => relay.stop());
-    await relay.ready;
-  }
+  // Every loop below is started through `startBackgroundLoops`, so CLAW_API_BACKGROUND=off starts none of them.
+  const loops: BackgroundLoop<RemoteAgentBackgroundLoopName>[] = [];
+  loops.push({
+    name: "remote_agents.wake_relay",
+    when: opts.crossReplicaWake === true,
+    start: async () => {
+      const relay = startWakeRelay(waker, { client: dedicatedClient, query: (text, params) => db.query(text, params) });
+      app.addHook("onClose", async () => relay.stop());
+      await relay.ready;
+    },
+  });
   // Commands the assistant issues for the user (`devenv_send`) wake this replica's command streams as a route's do.
   store.setCommandWaker((connectorId) => waker.wake(`c:${connectorId}`));
   store.setSessionWaker((sessionId) => waker.wake(`s:${sessionId}`));
@@ -268,60 +280,79 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   // the process alive nor outlives the server.
   const retentionDays = opts.retentionDays ?? CLAW_REMOTE_AGENTS_RETENTION_DAYS;
   const sweepMs = opts.retentionSweepMs ?? RETENTION_SWEEP_MS;
-  if (retentionDays > 0) {
-    let timer: NodeJS.Timeout | undefined;
-    let stopped = false;
-    const schedule = (ms: number) => {
-      if (stopped) return;
-      timer = setTimeout(async () => {
-        try {
-          const n = await store.pruneClosedSessions(retentionDays);
-          const t = await prunePresenceHistory(retentionDays);
-          if (n > 0 || t > 0) logger.info({ sessions: n, presenceTransitions: t, retentionDays }, "remote_agents.retention_swept");
-        } catch (err) {
-          logger.warn({ err: (err as Error)?.message }, "remote_agents.retention_sweep_failed");
-        }
-        schedule(sweepMs);
-      }, ms);
-      timer.unref();
-    };
-    schedule(Math.min(sweepMs, 60_000));
-    app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
-  }
+  loops.push({
+    name: "remote_agents.retention_sweep",
+    when: retentionDays > 0,
+    start: () => {
+      let timer: NodeJS.Timeout | undefined;
+      let stopped = false;
+      const schedule = (ms: number) => {
+        if (stopped) return;
+        timer = setTimeout(async () => {
+          try {
+            const n = await store.pruneClosedSessions(retentionDays);
+            const t = await prunePresenceHistory(retentionDays);
+            if (n > 0 || t > 0) logger.info({ sessions: n, presenceTransitions: t, retentionDays }, "remote_agents.retention_swept");
+          } catch (err) {
+            logger.warn({ err: (err as Error)?.message }, "remote_agents.retention_sweep_failed");
+          }
+          schedule(sweepMs);
+        }, ms);
+        timer.unref();
+      };
+      schedule(Math.min(sweepMs, 60_000));
+      app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
+    },
+  });
   // Presence over time, and telling an owner when a connector has gone (and come back). Every replica runs it; a lock
   // makes each sweep one replica's. Stops with the server.
   const presenceSweepMs = opts.presenceSweepMs ?? PRESENCE_SWEEP_MS;
-  if (presenceSweepMs > 0) {
-    const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
-    app.addHook("onClose", async () => stop());
-  }
+  loops.push({
+    name: "remote_agents.presence_sweep",
+    when: presenceSweepMs > 0,
+    start: () => {
+      const stop = startPresenceSweep({ onlineWindowMs, noticeAfterMs: opts.offlineNoticeMs ?? OFFLINE_NOTICE_MS, sweepMs: presenceSweepMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
   // A conversation open in a terminal that has waited a minute for its person: told once (`remote-agents/terminal-waits.ts`). On the
   // presence sweep's schedule; a lock makes each sweep one replica's.
-  if (presenceSweepMs > 0) {
-    const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
-    app.addHook("onClose", async () => stop());
-  }
+  loops.push({
+    name: "remote_agents.terminal_wait_sweep",
+    when: presenceSweepMs > 0,
+    start: () => {
+      const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
   // A command accepted while its machine still looked online (a laptop closed within the online window) and never collected:
   // every replica looks as often as presence is swept, whether or not the machine ever comes back; a delete hands each to one.
   const undeliveredSweepMs = opts.undeliveredSweepMs ?? PRESENCE_SWEEP_MS;
-  if (undeliveredSweepMs > 0) {
-    let timer: NodeJS.Timeout | undefined;
-    let stopped = false;
-    const tick = async () => {
-      try {
-        await sayUndelivered(await inTransaction((q) => store.expireUndelivered(q)), (sid) => waker.wake(`s:${sid}`));
-      } catch (err) {
-        logger.warn({ err: (err as Error)?.message }, "remote_agents.undelivered_sweep_failed");
-      }
-      if (stopped) return;
+  loops.push({
+    name: "remote_agents.undelivered_sweep",
+    when: undeliveredSweepMs > 0,
+    start: () => {
+      let timer: NodeJS.Timeout | undefined;
+      let stopped = false;
+      const tick = async () => {
+        try {
+          await sayUndelivered(await inTransaction((q) => store.expireUndelivered(q)), (sid) => waker.wake(`s:${sid}`));
+        } catch (err) {
+          logger.warn({ err: (err as Error)?.message }, "remote_agents.undelivered_sweep_failed");
+        }
+        if (stopped) return;
+        timer = setTimeout(tick, undeliveredSweepMs);
+        timer.unref();
+      };
       timer = setTimeout(tick, undeliveredSweepMs);
       timer.unref();
-    };
-    timer = setTimeout(tick, undeliveredSweepMs);
-    timer.unref();
-    app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
-  }
-  await registerPairingRoutes(app, opts.pairing);
+      app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
+    },
+  });
+  // Claimed codes that never registered, and old codes (`remote-agents/pairing-routes.ts`).
+  loops.push({ name: "remote_agents.pairing_prune", start: () => startPairingPrune(app) });
+  await startBackgroundLoops(opts.background ?? true, loops, logger);
+  await registerPairingRoutes(app, { ...opts.pairing, pruneUnboundGrants: false });
   // A reader's stream polls the database, so one user cannot hold an unbounded number open.
   const openReaders = new Map<string, number>();
 

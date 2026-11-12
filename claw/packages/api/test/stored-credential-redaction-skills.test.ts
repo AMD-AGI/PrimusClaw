@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import test, { after, before } from "node:test";
 
-process.env.CLAW_SKILL_EVOLUTION_ENABLED = "true";
+process.env.CLAW_SKILL_AUTO_EVOLUTION_ENABLED = "true";
 const { consumeEventDelivery, tombstoneReader, completionPorts } = await import("../src/events/consumer.js");
 const { db } = await import("../src/infra/db.js");
 const { sc } = await import("../src/infra/nats.js");

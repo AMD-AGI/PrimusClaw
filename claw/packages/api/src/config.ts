@@ -20,6 +20,7 @@ import {
   type RunLeaseTiming,
 } from "@claw/protocol";
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readApiBackground } from "./startup/background.js";
 
 /**
  * Read a setting, treating blank the same as unset.
@@ -104,6 +105,11 @@ function routerEffortSetting(raw: string): ReasoningEffort | null {
 }
 
 export const API_PORT = envInt("API_PORT", 8000);
+/**
+ * CLAW_API_BACKGROUND: `on` (default) or `off`. Off, the process answers HTTP and starts no background loop
+ * (`startup/background.ts` names them). Any other value is refused at startup (`index.ts`).
+ */
+export const CLAW_API_BACKGROUND = readApiBackground(process.env.CLAW_API_BACKGROUND);
 export const APP_ENV = env("APP_ENV", "production");
 
 /**
@@ -548,9 +554,19 @@ export const CLAW_MEMORY_CATALOGUE_MAX_TOKENS = envInt("CLAW_MEMORY_CATALOGUE_MA
 // Days after which a project / reference entry leaves the catalogue until the user confirms it again.
 export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIEW_DAYS", 30, { min: 1 });
 export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
-// When false: skill selection, save, mutation, feedback, evolution, pattern
-// recording, evolve worker, and skill-files cleanup are all short-circuited.
-export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
+// Personal skills, two switches.
+// CLAW_USER_SKILLS_ENABLED: a user's own skills reach their turns, and what a turn saves (the save_skill tool and
+// the *_skill_file tools) is kept. Off: no skill is selected for a turn, Brain neither offers nor runs the
+// skill-writing tools, and what a worker sends to save is dropped. The skill routes (/v1/users/:id/skills) work
+// either way, as before: they are the user's own explicit writes, under the same checks.
+export const CLAW_USER_SKILLS_ENABLED = envBool("CLAW_USER_SKILLS_ENABLED", false);
+// CLAW_SKILL_AUTO_EVOLUTION_ENABLED: skills the platform writes on its own -- pattern promotion, the evolution
+// worker, per-run feedback and probation graduation, and their cleanups. Independent of the switch above.
+// CLAW_SKILL_EVOLUTION_ENABLED is the name it had while it also gated the user's own skills; it is read only when
+// the new name is unset, for one release.
+export const CLAW_SKILL_AUTO_EVOLUTION_ENABLED = envBool(
+  "CLAW_SKILL_AUTO_EVOLUTION_ENABLED", envBool("CLAW_SKILL_EVOLUTION_ENABLED", false),
+);
 
 // When true: every turn that does the user's work (not an assistant Router turn) carries the
 // general working guideline (sessions/agent-guideline.ts) in its system message.

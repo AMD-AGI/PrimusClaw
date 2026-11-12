@@ -70,6 +70,7 @@ export function applyReviewProfile(task: Record<string, unknown>, maxTurns: numb
   for (const field of OWNER_FIELDS) delete task[field];
   task.memory_enabled = false;
   task.skill_evolution_enabled = false;
+  task.user_skills_enabled = false;
   task.sandbox_profile = "review";
   task.max_turns = maxTurns;
 }

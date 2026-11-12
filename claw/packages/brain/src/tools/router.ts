@@ -124,6 +124,9 @@ export const SPILL_MAX_CHARS = 4 * 1024 * 1024;
 
 /** The tools that write skills, which the API keeps only when skill self-evolution is on. */
 export const SKILL_WRITE_TOOLS = new Set(["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]);
+/** The API's personal-skill limits (`api/src/marketplace/skill-service.ts`), so a write refused there is refused here first. */
+export const SKILL_MD_MAX_CHARS = 20_000;
+export const SKILL_FILE_MAX_BYTES = 64 * 1024;
 
 const BRAIN_NETWORK_TOOLS = new Set(["web_search", "web_fetch"]);
 
@@ -265,7 +268,7 @@ export class ToolRouter {
   memoryTurn: { sessionId?: string; messageId?: string } = {};
 
   /**
-   * True only when the API said skill self-evolution is on. Off, the API drops
+   * True only when the API said it keeps the skills this turn saves (`user_skills_enabled`). Off, the API drops
    * every saved skill, so the skill-writing tools are withheld and refused.
    */
   skillEvolutionEnabled = false;
@@ -672,7 +675,7 @@ export class ToolRouter {
     if (name === "save_skill") {
       const content = input.content as string || "";
       const skillName = input.skill_name as string || "";
-      const blocked = scanContent(content, 5000);
+      const blocked = scanContent(content, SKILL_MD_MAX_CHARS);
       if (blocked) {
         return refuse(outcome, `Error: skill '${skillName}' not saved — blocked by safety check (${blocked}).`);
       }
@@ -689,7 +692,7 @@ export class ToolRouter {
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
       if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
-      const blocked = scanContent(content, 10 * 1024);
+      const blocked = scanContent(content, SKILL_FILE_MAX_BYTES);
       if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "add", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
@@ -702,7 +705,7 @@ export class ToolRouter {
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
       if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
-      const blocked = scanContent(content, 10 * 1024);
+      const blocked = scanContent(content, SKILL_FILE_MAX_BYTES);
       if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "update", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
@@ -830,14 +833,14 @@ export class ToolRouter {
         type: "object", properties: {
           skill_name: { type: "string", description: "Short kebab-case English slug, e.g. 'react-scaffold' (name is always English for consistency, content/description follow user language)" },
           description: { type: "string", description: "2-4 sentences: what the skill does, when to use it, when NOT to use it" },
-          content: { type: "string", description: "Full SKILL.md text with ## Goal, ## Steps, ## Notes (max 5000 chars)" },
+          content: { type: "string", description: `Full SKILL.md text with ## Goal, ## Steps, ## Notes (max ${SKILL_MD_MAX_CHARS} chars)` },
         }, required: ["skill_name", "content", "description"],
       }},
       { name: "add_skill_file", description: "Attach a supporting file to an existing skill (script, template, reference doc). Use after save_skill when the skill needs accompanying assets the Agent can later read or execute. file_path must start with one of: references/, templates/, scripts/, assets/", input_schema: {
         type: "object", properties: {
           skill_name: { type: "string", description: "Name of an existing skill" },
           file_path: { type: "string", description: "Relative path under the skill dir, e.g. 'scripts/deploy.sh' (whitelist: references/, templates/, scripts/, assets/)" },
-          content: { type: "string", description: "File contents (max 10 KB)" },
+          content: { type: "string", description: `File contents (max ${SKILL_FILE_MAX_BYTES / 1024} KB)` },
           is_binary: { type: "boolean", description: "Set true if content is base64-encoded binary; default false" },
         }, required: ["skill_name", "file_path", "content"],
       }},
@@ -845,7 +848,7 @@ export class ToolRouter {
         type: "object", properties: {
           skill_name: { type: "string" },
           file_path: { type: "string" },
-          content: { type: "string", description: "New file contents (max 10 KB)" },
+          content: { type: "string", description: `New file contents (max ${SKILL_FILE_MAX_BYTES / 1024} KB)` },
           is_binary: { type: "boolean" },
         }, required: ["skill_name", "file_path", "content"],
       }},

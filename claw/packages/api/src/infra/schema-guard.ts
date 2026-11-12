@@ -224,6 +224,24 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["id", "user_id", "entry_id", "op", "actor", "session_id", "reason", "title", "evidence_quote", "created_at"],
   },
   {
+    table: "claw_skills",
+    // Every skill save and every turn's skill selection names these (marketplace/skill-service.ts): absent, saving and
+    // using a personal skill fail.
+    columns: [
+      "id", "skill_name", "user_id", "version", "content", "description", "source", "status", "deleted_at",
+      "enabled", "origin", "content_sha", "last_used_at", "invocation",
+    ],
+  },
+  {
+    table: "claw_skill_events",
+    // Every personal-skill save records here in the same transaction: absent, each one fails.
+    columns: ["id", "user_id", "skill_name", "version", "op", "actor", "session_id", "detail", "created_at"],
+  },
+  {
+    table: "claw_skill_drafts",
+    columns: ["id", "user_id", "skill_name", "description", "content", "files", "replaces", "request_quote", "origin", "created_at"],
+  },
+  {
     table: "claw_memory_links",
     // An entry's citations (memory/links.ts), kept with every memory write and read by the router's turn recall.
     columns: ["user_id", "from_id", "rel", "name", "to_kind", "to_id", "created_by", "created_at"],
