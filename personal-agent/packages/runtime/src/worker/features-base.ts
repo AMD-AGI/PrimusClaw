@@ -7,7 +7,10 @@
  */
 import type {
   ClawPort,
+  ConversationKind,
+  ConversationRef,
   InboundMessage,
+  JsonObject,
   Clock,
   Logger,
   MetricsPort,
@@ -21,15 +24,61 @@ import type {
 } from "@primusclaw/personal-agent";
 import type { ChatLog, SqliteStore } from "@primusclaw/personal-agent-runtime";
 
-import type { TeamsSettings } from "../config/env.js";
+/**
+ * How replies look on the surface: the switches of its reply style that the features read (the surface reads the rest,
+ * such as Teams' AI label, itself). Each is the surface's own setting; a surface that has no such thing turns it off.
+ */
+export interface ReplyStyle {
+  /** The agent's visible text is streamed into the answer while a turn runs. */
+  readonly streamText: boolean;
+  /** The assistant's receipt, its live steps and its streamed words. */
+  readonly assistantReceipt: boolean;
+  readonly assistantProgress: boolean;
+  readonly assistantStreamSay: boolean;
+  /** An answer carries the worker's own thumbs on phones (the router's `ownThumbsMobile`). */
+  readonly ownThumbsMobile: boolean;
+  readonly suggestedReplies: boolean;
+  readonly citations: boolean;
+  /** Whether a turn shows the surface's live status in this kind of chat. */
+  streamsIn(kind: ConversationKind): boolean;
+}
+
+/** What the features read of the surface besides its port: its reply style, how a stored reference is read back, its words. */
+export interface SurfaceShape {
+  readonly style: ReplyStyle;
+  /**
+   * Where a person who has not added the bot yet can add it (a link the surface's people can open; "" for none): what a
+   * colleague asked to review is pointed at.
+   */
+  readonly installHintUrl: string;
+  /** A stored conversation reference back as core's `ConversationRef`; undefined when it names none. Never throws. */
+  restoreRef(stored: JsonObject): ConversationRef | undefined;
+  /** A stored reference as the surface posts to it: one that names no conversation still gets one (its send then fails). */
+  refOf(stored: JsonObject): ConversationRef;
+  /**
+   * The surface's fields a followed review keeps to open the reviewer's chat again after a restart, from the chat the
+   * review was asked in (Teams: service_url, tenant, bot_id).
+   */
+  followWire(asked: ConversationRef): Readonly<Record<string, string>>;
+  /**
+   * The surface's id on the Claw wire ("teams", "slack"): sent as the person's notification subscription's `surface`, so
+   * Claw sends an assistant reply back to the surface the message came from.
+   */
+  readonly surfaceId: string;
+  /** The surface's name as people know it ("Teams"): what a report's words and an unreadable file's line call it. */
+  readonly channelName: string;
+  /** The build the worker runs (the surface package's version): what a report names. */
+  readonly version: string;
+}
 
 export interface AssemblyBase {
   /** Core's settings (`readSettings`). */
   readonly settings: Settings;
-  readonly teams: TeamsSettings;
+  /** What the features read of the surface besides its port (`SurfaceShape`). */
+  readonly shape: SurfaceShape;
   readonly store: SqliteStore;
   readonly claw: ClawPort;
-  /** The channel (the worker's `TeamsSurface`; a test's fake surface). */
+  /** The channel (the worker's surface, such as Teams'; a test's fake surface). */
   readonly surface: Surface;
   readonly clock: Clock;
   readonly random: Random;
@@ -66,9 +115,3 @@ export interface RouterHooks {
 
 type SenderOf = Parameters<import("@primusclaw/personal-agent").Router["chat"]>[0];
 type ConversationOf = Parameters<import("@primusclaw/personal-agent").Router["chat"]>[1];
-
-/** The Teams style's reading of a conversation kind (`style.streams_in`'s conversation types). */
-export function conversationTypeOf(kind: string): string {
-  if (kind === "personal") return "personal";
-  return kind === "group" ? "groupChat" : "channel";
-}

@@ -10,7 +10,7 @@ import { PrometheusMetrics } from "@primusclaw/personal-agent-runtime";
 
 import { FakeClock } from "../../../../test-support/clock.js";
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
-import { withInboundStats } from "../../src/assembly/worker.js";
+import { withInboundStats } from "../../src/worker/assemble.js";
 
 it("a minute of handled messages and refusals is one inbound_stats line, and each is counted in /metrics too", async () => {
   const clock = new FakeClock();

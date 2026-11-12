@@ -5,7 +5,10 @@
     "declaration": true,
     "emitDeclarationOnly": true,
     "rootDir": "../../..",
-    "paths": { "@primusclaw/personal-agent": ["../core/dist/types/index.d.ts"] }
+    "paths": {
+      "@primusclaw/personal-agent": ["../core/dist/types/index.d.ts"],
+      "@primusclaw/personal-agent-runtime": ["./src/index.ts"]
+    }
   },
   "include": ["src"]
 }

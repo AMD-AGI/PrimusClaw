@@ -36,24 +36,37 @@ import {
   TerminalApprovalsCommand,
 } from "@primusclaw/personal-agent";
 
-import type { GateSubscriptions } from "../gate/routes.js";
-import { StartupError } from "./outbound.js";
+import { StartupError } from "./startup-error.js";
 import { assistantParts, type AssistantParts } from "./features-assistant.js";
 import type { AssemblyBase, RouterHooks } from "./features-base.js";
-import { proactiveHold, proactiveParts, followReach, refOf, type ProactiveParts } from "./features-proactive.js";
+import { proactiveHold, proactiveParts, followReach, type ProactiveParts } from "./features-proactive.js";
 import { remoteAgents } from "./features-remote.js";
 import { REVIEW_CARD_SWEEP_MS, reviewParts, type ReviewParts } from "./features-review.js";
 import { featureSwitches, type FeatureSwitches } from "./features-switches.js";
-import { channelContextBuilder, messageText, noteFactory, routerLimits, whoamiConnections } from "./features-text.js";
+import {
+  channelContextBuilder,
+  messageTextFor,
+  noteFactory,
+  routerLimits,
+  whoamiConnections,
+} from "./features-text.js";
 import { approvalClicks, stopCards, turnRunner } from "./features-turns.js";
 import { w8Parts, type W8Parts } from "./features-w8.js";
 
-export type { AssemblyBase } from "./features-base.js";
+export type { AssemblyBase, ReplyStyle, SurfaceShape } from "./features-base.js";
 
 /** The background loops' period (Python `main.SWEEP_SECONDS`). */
 export const SWEEP_MS = 60_000;
 /** Claw's event type that asks the chat to carry out a command (Python `claw.ASSISTANT_ACTION`). */
 export const ASSISTANT_ACTION = "assistant.action";
+
+/** The person's notification subscription, as the assistant feature keeps it (what a surface's test entry reads). */
+export interface GateSubscriptions {
+  ensure(userId: string): Promise<void>;
+  remove(userId: string): Promise<void>;
+  /** Whether the subscription carries the assistant's event types. */
+  hasAssistantTypes(userId: string): boolean;
+}
 
 export interface FeatureTimer {
   readonly name: string;
@@ -174,7 +187,7 @@ interface Built {
 }
 
 function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): RouterDeps {
-  const { settings, store, clock, plugins, securityLog, teams } = base;
+  const { settings, store, clock, plugins, securityLog, shape } = base;
   const { switches, assistant, proactive, remote, w8 } = built;
   const subs = assistant.subs;
   return {
@@ -189,10 +202,10 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
       briefEnabled: switches.brief,
       schedulesEnabled: switches.schedules,
       jobWatchEnabled: switches.jobWatch,
-      ownThumbsMobile: teams.style.ownThumbsMobile,
+      ownThumbsMobile: shape.style.ownThumbsMobile,
     },
     surface: base.surface,
-    channel: { refOf: (stored) => refOf(stored) },
+    channel: { refOf: (stored) => shape.refOf(stored) },
     store,
     claw: base.claw,
     clock,
@@ -209,7 +222,7 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
     limits: routerLimits(settings.userLimits, clock),
     assistant: assistant.chat,
     remote,
-    turns: turnRunner(base, { style: teams.style, errors, integrations: plugins.integrations }),
+    turns: turnRunner(base, { style: shape.style, errors, integrations: plugins.integrations }),
     stopCards: stopCards(base),
     proactive: proactiveHold(proactive),
     observing: w8.observer,
@@ -223,7 +236,7 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
         ? []
         : pendingOf(store.githubConfirmations.pendingGithubConfirmations(userId).map(held)),
     ),
-    messageText,
+    messageText: messageTextFor(shape.channelName),
     connectionsText: whoamiConnections(plugins.integrations),
     reportView: (userId, scope) => w8.reportView(userId, scope),
     note: noteFactory,
@@ -317,7 +330,7 @@ function deliverer(base: AssemblyBase, built: Built, get: () => Router): Feature
       channelUserId: store.members.channelIdOf(userId) ?? "",
     };
     const router = get();
-    const conversation = surface.conversation(refOf(reference));
+    const conversation = surface.conversation(base.shape.refOf(reference));
     return built.assistant.actions.runAction(userId, event, (text) =>
       router.runCommand(text, router.chat(sender, conversation)),
     );
@@ -342,7 +355,7 @@ export function buildFeatures(given: AssemblyBase): Features {
   refuseMissing(given);
   const made: string[] = [];
   const base: AssemblyBase = { ...given, claw: recordingClaw(given.claw, made) };
-  const { settings, clock, securityLog, teams } = base;
+  const { settings, clock, securityLog, shape } = base;
   const late: { router?: Router } = {};
   const get = (): Router => {
     if (late.router === undefined) throw new Error("a feature called the router before it was built");
@@ -353,13 +366,13 @@ export function buildFeatures(given: AssemblyBase): Features {
   const errors = new PublicErrorLog(base.logger, base.random);
   const guard = new Guardrails(clock, (event, fields) => securityLog.event(event, fields), settings.sensitiveLimits);
   const assistant = assistantParts(base, {
-    style: teams.style,
+    style: shape.style,
     integrations: base.plugins.integrations,
     notifyUrl: switches.notifyUrl,
     hooks,
     reviewHandoff: (userId, event) => lateReview.handoff?.take(userId, event) ?? "dropped",
   });
-  const proactive = proactiveParts(base, teams.style, assistant, errors, get);
+  const proactive = proactiveParts(base, shape.style, assistant, errors, get);
   const reach = followReach(proactive, base);
   const remote = remoteAgents(base, { switches, guard, reach, errors, directChat: assistant.directChat, hooks });
   const w8 = w8Parts(base, { briefEnabled: switches.brief, assistantOn: (userId) => assistant.chat.on(userId) });

@@ -4,7 +4,8 @@
 /**
  * Builds the four packages into what npm publishes (from personal-agent/: `npm run build`):
  *
- *   packages/<pkg>/dist/index.js        one ES module per package, bundled by esbuild (teams also dist/main.js, the
+ *   packages/<pkg>/dist/index.js        one ES module per package, bundled by esbuild (runtime also dist/worker.js, the
+ *                                       surface-neutral worker process; teams also dist/main.js, the
  *                                       program, and dist/connector-hosts.js; teams-ingress also dist/main.js, the
  *                                       Function app's entry)
  *   packages/<pkg>/dist/types/**.d.ts   the declarations, by tsc
@@ -48,7 +49,7 @@ export interface PackageSpec {
 /** The packages in dependency order: each one's declarations are built against the ones before it. */
 export const PACKAGES: readonly PackageSpec[] = [
   { dir: "core", name: "@primusclaw/personal-agent", entries: ["index"] },
-  { dir: "runtime", name: "@primusclaw/personal-agent-runtime", entries: ["index"] },
+  { dir: "runtime", name: "@primusclaw/personal-agent-runtime", entries: ["index", "worker"] },
   { dir: "teams", name: "@primusclaw/personal-agent-teams", entries: ["index", "main", "connector-hosts"] },
   { dir: "teams-ingress", name: "@primusclaw/personal-agent-teams-ingress", entries: ["index", "main"] },
 ];

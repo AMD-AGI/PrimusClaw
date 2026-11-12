@@ -15,6 +15,34 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+A minor release (0.8.0): the worker process moves out of the Teams package into runtime as a surface-neutral entry,
+`@primusclaw/personal-agent-runtime/worker`, so another chat app can run the same worker as a package of its own without
+touching Teams. The Teams worker behaves as before. No new npm package (the release publishes the same three), no plugin
+port (core's `src/plugins/`), setting or store change; works with any Claw.
+
+### Added
+
+- `@primusclaw/personal-agent-runtime/worker`: the worker process on any surface: the features behind the router, the
+  store and the Claw client from the environment, the HTTP endpoints, `/metrics` and the background loops
+  (`assembleWorker`, `runMain`), and the `SurfaceAdapter` interface a surface package implements to run it (its
+  settings, its `Surface`, its `SurfaceShape`, how a stored conversation reference is read back, where its inbound
+  events come from). It uses core and runtime's main entry only, and needs no Service Bus, Bot Connector or Azure
+  setting; runtime's main entry (`@primusclaw/personal-agent-runtime`) does not carry it.
+- The layering (`npm run depcruise`) refuses a surface package importing another surface's (a Slack package importing
+  Teams), the worker importing any surface package or npm package, and the rest of runtime importing the worker.
+
+### Changed
+
+- `@primusclaw/personal-agent-teams` keeps only what is Teams' own: its settings, Azure Key Vault, the queues and the
+  Bot Connector, `TeamsSurface` and its renderers, the inbound consumer and the release gate's test entry, as
+  `teamsSurface()`. `buildWorker`, `main` and the types `BuildWorker`, `PluginFactory`, `Worker`, `WorkerEnv`,
+  `WorkerOptions` and `WorkerServices` are still exported from it, unchanged, so a deployment's own entry keeps its
+  imports.
+- The notification subscription's `surface` (#787) is the worker's surface's own id (`SurfaceShape.surfaceId`, Teams'
+  `teams`), no longer a fixed `teams` in the worker.
+
 ## 0.7.2
 
 A patch release: one fix (#785). No plugin port (core's `src/plugins/`) and no store change; works with any Claw.

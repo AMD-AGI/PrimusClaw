@@ -3,7 +3,7 @@
 
 /**
  * The router's small readers, built from core's pure functions: what a message carries besides its words (quotes, links,
- * files Teams gave no way to fetch), the per-person limits, the channel context a message to the assistant carries, the
+ * files the surface gave no way to fetch), the per-person limits, the channel context a message to the assistant carries, the
  * note card a settled click ends as, `/whoami`'s connection lines, and fetching a message's files through the surface.
  */
 import type {
@@ -50,19 +50,24 @@ function isGroup(message: InboundMessage): boolean {
 
 const mask = (text: string): string => redactText(text).text;
 
-/** The router's reading of quotes, links and unreadable files (Python `activity.quote_block`, `with_links`, `with_quote`). */
-export const messageText: MessageText = {
-  quoteBlock: (message, group) => quoteBlock(message.quotes, { group, redact: mask }),
-  withLinks: (text, message) => withLinks(text, message.links, { group: isGroup(message), redact: mask }),
-  withQuote,
-  unreadable(message) {
-    const names = message.unreadableFiles;
-    if (names.length === 0) return undefined;
-    // (Python `inbound.unreadable_line`; core's turn/files.ts has the shown name but no such line)
-    const line = `Teams did not give me ${names.map((n) => turn.shownName(n)).join(", ")}. I can read images pasted into the message.`;
-    return { line, count: names.length };
-  },
-};
+/**
+ * The router's reading of quotes, links and unreadable files (Python `activity.quote_block`, `with_links`, `with_quote`), on
+ * the surface people know as `channelName` (what an unreadable file's line says did not give it).
+ */
+export function messageTextFor(channelName: string): MessageText {
+  return {
+    quoteBlock: (message, group) => quoteBlock(message.quotes, { group, redact: mask }),
+    withLinks: (text, message) => withLinks(text, message.links, { group: isGroup(message), redact: mask }),
+    withQuote,
+    unreadable(message) {
+      const names = message.unreadableFiles;
+      if (names.length === 0) return undefined;
+      // (Python `inbound.unreadable_line`; core's turn/files.ts has the shown name but no such line)
+      const line = `${channelName} did not give me ${names.map((n) => turn.shownName(n)).join(", ")}. I can read images pasted into the message.`;
+      return { line, count: names.length };
+    },
+  };
+}
 
 /** TEAMS_USER_*: messages per window, tasks at once (Python `limits.UserLimits` and `MessageRateLimiter`). */
 export function routerLimits(limits: UserLimits, clock: Clock): RouterLimits {

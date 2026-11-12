@@ -9,12 +9,21 @@ import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { errorName } from "@primusclaw/personal-agent";
 import { listen, type buildServer } from "@primusclaw/personal-agent-runtime";
 
-/** The HTTP server the runtime builds (the teams package does not depend on its framework). */
+import { startTimers, type Timer } from "./timers.js";
+import type { Worker } from "./worker-api.js";
+
+/** The HTTP server the runtime builds (the worker does not depend on its framework). */
 type Server = ReturnType<typeof buildServer>;
 
-import type { InboundConsumer } from "../servicebus/consumer.js";
-import type { Worker } from "../worker-api.js";
-import { startTimers, type Timer } from "./timers.js";
+/**
+ * Where a surface's inbound events come from when they are not posted to the worker's own HTTP routes (Teams: the Service
+ * Bus queue's consumer). `run` resolves when it has stopped (after `stop`) and rejects when it fails; the worker stops
+ * then.
+ */
+export interface InboundSource {
+  run(): Promise<void>;
+  stop(): void;
+}
 
 export interface RunnerParts {
   readonly app: Server;
@@ -22,7 +31,7 @@ export interface RunnerParts {
   readonly host: string;
   readonly port: number;
   readonly metricsPort: number;
-  readonly consumer: InboundConsumer | undefined;
+  readonly consumer: InboundSource | undefined;
   readonly start: () => Promise<void>;
   readonly timers: readonly Timer[];
   readonly clock: Clock;

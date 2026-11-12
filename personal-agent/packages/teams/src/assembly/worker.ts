@@ -2,55 +2,49 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * The worker process (`BuildWorker`, the Python worker's `main.run`): secrets, settings, the store, the Claw client, how it
- * reaches Teams, the features behind the router, the HTTP endpoints and /metrics, the inbound queue's consumer (or, in the
- * release gate's test entry, its routes on the loopback instead), and the features' timers. Nothing runs until `run`.
+ * The worker on Teams (`BuildWorker`): runtime's worker assembly with the Teams surface. What is Teams' own is here:
+ * its settings (OUTBOUND_MODE, BOT_*, SERVICEBUS_*, the reply style), secrets from Azure Key Vault, how it reaches Teams
+ * (the outbound queue or the Bot Connector), its `TeamsSurface` with the Adaptive Card renderers, the inbound queue's
+ * consumer, and the release gate's test entry (its routes on the loopback instead of the queue).
  */
 import {
-  InboundStats,
-  integrationRegistry,
-  neutralPlugins,
-  type MetricsPort,
   NOTE,
   redactText,
-  SecurityLog,
-  type Clock,
-  type IntegrationRegistry,
-  type Integrations,
+  type ConversationKind,
+  type ConversationRef,
+  type JsonObject,
   type Logger,
-  type Plugins,
-  type RequestScope,
 } from "@primusclaw/personal-agent";
+import { cryptoRandom } from "@primusclaw/personal-agent-runtime";
 import {
-  alsRequestScope,
-  buildServer,
-  ChatLog,
-  createClawClient,
-  cryptoRandom,
-  healthzRoute,
-  HttpTokenExchange,
-  lineLogger,
-  openWorkerStore,
-  PrometheusMetrics,
-  readSettings,
-  systemClock,
-  type HttpRoute,
-} from "@primusclaw/personal-agent-runtime";
+  assembleWorker,
+  type BuildWorker,
+  type ConfiguredSurface,
+  type ConnectContext,
+  type OpenedSurface,
+  type ReplyStyle,
+  type SurfaceAdapter,
+  type SurfaceDeps,
+  type SurfaceShape,
+  type WorkerEnv,
+} from "@primusclaw/personal-agent-runtime/worker";
 
+import { toInboundEvent } from "../activity/inbound/to-event.js";
+import { activityOfReference } from "../activity/outbound.js";
 import { teamsMasker } from "../activity/redact-activity.js";
-import { teamsSettingsFromEnv } from "../config/env.js";
+import { restoreConversationRef } from "../activity/reference.js";
+import { isObject, type JsonObject as WireJson } from "../cards/json.js";
+import { teamsSettingsFromEnv, type TeamsSettings } from "../config/env.js";
+import { streamsIn, type Style } from "../config/style.js";
 import { gateEntryFromEnv, LOOPBACK, type GateEntry } from "../gate/entry-env.js";
 import { gateRoutes } from "../gate/routes.js";
 import { TeamsFileFetcher } from "../inbound/fetcher.js";
-import { buildInfoText, teamsVersion, withBuildInfo } from "../observability/build-info.js";
 import { AckRegistry } from "../messenger/acks.js";
+import { teamsVersion } from "../observability/build-info.js";
 import { InboundConsumer } from "../servicebus/consumer.js";
 import type { BusClient } from "../servicebus/client.js";
 import { TeamsSurface } from "../surface.js";
 import { RENDERERS } from "../views/index.js";
-import type { BuildWorker, PluginFactory, WorkerEnv, WorkerOptions, WorkerServices } from "../worker-api.js";
-import { buildFeatures, type AssemblyBase, type Features } from "./features.js";
-import { metricsRoutes, workerRoutes } from "./http.js";
 import { inboundHandler } from "./inbound.js";
 import {
   busClients,
@@ -60,43 +54,75 @@ import {
   workerCredential,
   type Outbound,
 } from "./outbound.js";
-import { platformPlugins } from "./plugins.js";
-import { workerServices } from "./worker-services.js";
-import { closeAll, runner } from "./runner.js";
 import { loadSecrets } from "./secrets.js";
 
-/** The largest body the worker's endpoint takes (a gate's file-carrying activity is the largest). */
-const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const BOT_NAME = "Clawy";
 
-interface Basics {
-  readonly clock: Clock;
-  /** The worker's logger: its lines also kept per chat for a report's scene (`chatLog`). */
-  readonly logger: Logger;
-  readonly fetch: typeof fetch;
-  /** The one request scope: the router enters it per inbound event; the locale, audit ids and kept log lines read it. */
-  readonly requestScope: RequestScope;
-  readonly chatLog: ChatLog;
+/** The Teams style's reading of a conversation kind (`style.streams_in`'s conversation types). */
+export function conversationTypeOf(kind: string): string {
+  if (kind === "personal") return "personal";
+  return kind === "group" ? "groupChat" : "channel";
 }
 
-function basics(options: WorkerOptions): Basics {
-  const clock = options.clock ?? systemClock;
-  const write = (line: string): void => {
-    process.stderr.write(line + "\n");
-  };
-  const requestScope = alsRequestScope();
-  const chatLog = new ChatLog(
-    requestScope,
-    (text) => redactText(text).text,
-    () => clock.epochMs() / 1000,
-  );
-  const inner = options.logger ?? lineLogger({ level: "info", now: () => clock.epochMs(), write });
+/** The switches of the Teams reply style the features read. */
+export function replyStyle(style: Style): ReplyStyle {
   return {
-    clock,
-    logger: chatLog.logger(inner, "teams_agent"),
-    fetch: options.fetch ?? globalThis.fetch,
-    requestScope,
-    chatLog,
+    streamText: style.streamText,
+    assistantReceipt: style.assistantReceipt,
+    assistantProgress: style.assistantProgress,
+    assistantStreamSay: style.assistantStreamSay,
+    ownThumbsMobile: style.ownThumbsMobile,
+    suggestedReplies: style.suggestedReplies,
+    citations: style.citations,
+    streamsIn: (kind: ConversationKind) => streamsIn(style, conversationTypeOf(kind)),
+  };
+}
+
+/** A stored reference as the surface posts to it; one that names no conversation still gets one (its send then fails). */
+export function refOf(reference: JsonObject): ConversationRef {
+  const restored = restoreConversationRef(reference);
+  if (restored !== undefined) return restored;
+  const conversation = reference["conversation"];
+  const type = isObject(conversation) ? conversation["conversationType"] : undefined;
+  return { id: "", kind: type === "groupChat" ? "group" : "personal", tenantId: "", wire: reference };
+}
+
+/** The Teams fields a followed review keeps to open the reviewer's chat again (Python: service_url, tenant, bot_id). */
+export function followWire(asked: ConversationRef): Readonly<Record<string, string>> {
+  const wire = asked.wire as JsonObject;
+  const bot = wire["bot"];
+  const botId = typeof bot === "object" && bot !== null && !Array.isArray(bot) ? (bot as JsonObject)["id"] : undefined;
+  const serviceUrl = wire["serviceUrl"];
+  return {
+    service_url: typeof serviceUrl === "string" ? serviceUrl : "",
+    tenant: asked.tenantId,
+    bot_id: typeof botId === "string" ? botId : "",
+  };
+}
+
+/** What the features read of Teams besides its port. */
+export function teamsShape(teams: Pick<TeamsSettings, "style" | "installHintUrl">): SurfaceShape {
+  return {
+    style: replyStyle(teams.style),
+    installHintUrl: teams.installHintUrl,
+    restoreRef: (stored) => restoreConversationRef(stored),
+    refOf,
+    followWire,
+    surfaceId: "teams",
+    channelName: "Teams",
+    version: teamsVersion(),
+  };
+}
+
+/**
+ * `text` as the activity Teams would have sent for the person's own message `messageId` in a stored conversation, read as
+ * core's event (what a plugin's `handleAsTyped` hands the router); undefined when it cannot be read.
+ */
+export function teamsTypedEvent(logger: Logger): OpenedSurface["typedEvent"] {
+  return (conversation, messageId, text) => {
+    const activity: WireJson = { ...activityOfReference(conversation.wire as WireJson, messageId), text };
+    const read = toInboundEvent(activity, { botName: BOT_NAME, logger });
+    return read.ok ? read.value : undefined;
   };
 }
 
@@ -105,14 +131,14 @@ interface Transport {
   readonly inbound: BusClient | undefined;
 }
 
-function transport(teams: AssemblyBase["teams"], gate: GateEntry | undefined, deps: Basics): Transport {
+function transport(teams: TeamsSettings, gate: GateEntry | undefined, deps: SurfaceDeps): Transport {
   if (gate !== undefined) return { outbound: gateOutbound(gate, deps), inbound: undefined };
   const credential = workerCredential(teams, deps);
   const [inbound, out] = busClients(busConnections(teams, credential));
   return { outbound: productionOutbound(teams, out, deps), inbound };
 }
 
-function surfaceOf(teams: AssemblyBase["teams"], outbound: Outbound, gate: GateEntry | undefined, deps: Basics) {
+function surfaceOf(teams: TeamsSettings, outbound: Outbound, gate: GateEntry | undefined, deps: SurfaceDeps) {
   const acks = new AckRegistry(deps.clock, deps.logger);
   const surface = new TeamsSurface({
     mode: teams.outboundMode === "direct" || gate !== undefined ? "direct" : "queue",
@@ -136,207 +162,86 @@ function surfaceOf(teams: AssemblyBase["teams"], outbound: Outbound, gate: GateE
   return { acks, surface };
 }
 
-/**
- * The metrics, with the inbound path also counted for its `inbound_stats` line (Python `InboundStats(metrics=...)`: one line
- * a minute of what was handled, how long it waited and took, what failed and what a limit refused).
- */
-export function withInboundStats(prometheus: PrometheusMetrics, stats: InboundStats): MetricsPort {
-  return {
-    eventDelivered: (eventType, handleSeconds, since) => {
-      prometheus.eventDelivered(eventType, handleSeconds, since);
-    },
-    securityEvent: (record) => {
-      prometheus.securityEvent(record);
-    },
-    processed: (lagMs, handleMs, ok) => {
-      stats.processed(lagMs, handleMs, ok);
-    },
-    limited: (reason) => {
-      stats.limited(reason);
-    },
-    filesDropped: (path, count) => {
-      prometheus.filesDropped(path, count);
-    },
-  };
-}
-
-async function assemblyBase(env: WorkerEnv, gate: GateEntry | undefined, deps: Basics) {
-  const secrets = await loadSecrets(env, deps);
-  const settings = readSettings(env, secrets);
-  const teams = teamsSettingsFromEnv(env, { queues: gate === undefined });
-  const prometheus = new PrometheusMetrics(deps.clock);
-  const metrics = withInboundStats(prometheus, new InboundStats(deps.clock, deps.logger, prometheus));
-  const securityLog = new SecurityLog(deps.logger, metrics, deps.requestScope);
-  const store = openWorkerStore(settings, {
-    securityEvent: (event, fields) => securityLog.event(event, fields),
-    logger: deps.logger,
-    clock: deps.clock,
-    random: cryptoRandom,
-  });
-  const claw = createClawClient({
-    baseUrl: settings.clawApiUrl,
-    clock: deps.clock,
-    logger: deps.logger,
-    pluginId: settings.claw.pluginId,
-    model: settings.models.chat,
-    ruleToolId: settings.claw.ruleToolId,
-    clientLabel: settings.claw.clientLabel,
-    fetch: (url, init) => deps.fetch(url, init),
-  });
-  return { secrets, settings, teams, metrics, prometheus, securityLog, store, claw };
-}
-
-type Parts = Awaited<ReturnType<typeof assemblyBase>>;
-
-/**
- * `integrations` with what `register` adds to them (`WorkerOptions.registerIntegrations`): a registry that starts with
- * every server and line already there, in their order, then takes the deployment's. Without `register`, `integrations`.
- */
-export function withRegistered(
-  integrations: Integrations,
-  register: ((registry: IntegrationRegistry) => void) | undefined,
-): Integrations {
-  if (register === undefined) return integrations;
-  const registry = integrationRegistry();
-  for (const [name, shown] of integrations.mcpServers) {
-    registry.addMcpServer(name, shown, { query: integrations.queryServers.has(name) });
-  }
-  for (const line of integrations.connectionLines) registry.addConnectionLine(line);
-  register(registry);
-  return registry;
-}
-
-/**
- * The plugins: given, or built by the deployment's factory with the worker's services (once the store and the channel
- * exist, before the features: what the router is built with must be known then), with the integrations the options
- * register; then the platform services where they are neutral (`platformPlugins`), and the exchange.
- */
-function pluginsOf(
-  given: Plugins | PluginFactory,
-  env: WorkerEnv,
-  parts: Parts,
-  services: WorkerServices,
-  deps: Basics & { readonly registerIntegrations: WorkerOptions["registerIntegrations"] },
+function connect(
+  teams: TeamsSettings,
+  parts: { readonly acks: AckRegistry; readonly inbound: BusClient | undefined; readonly gate: GateEntry | undefined },
+  context: ConnectContext,
 ) {
-  const built = typeof given === "function" ? neutralPlugins(given(services)) : given;
-  const own = { ...built, integrations: withRegistered(built.integrations, deps.registerIntegrations) };
-  const plugins = platformPlugins(own, {
-    env,
-    settings: parts.settings,
-    secrets: parts.secrets,
-    fetch: deps.fetch,
-    now: () => deps.clock.epochMs() / 1000,
-    logger: deps.logger,
-  });
-  const exchange = parts.settings.exchange.enabled
-    ? new HttpTokenExchange(parts.settings.exchange, deps.clock, deps.fetch)
-    : plugins.tokenExchange;
-  return { plugins, exchange };
-}
-
-function routesOf(
-  base: AssemblyBase,
-  features: Features,
-  handle: (body: Parameters<ReturnType<typeof inboundHandler>>[0]) => Promise<void>,
-  gate: GateEntry | undefined,
-): HttpRoute[] {
-  const routes = workerRoutes({
-    store: base.store,
-    claw: base.claw,
-    clock: base.clock,
-    metrics: base.metrics,
-    logger: base.logger,
-    plugins: base.plugins,
-    proactive: (base.env["PROACTIVE_ENABLED"] ?? "") === "1",
-    gone: base.settings.clawEventsGone,
-    deliverEvent: features.deliverEvent,
-  });
-  if (gate === undefined) return routes;
-  return [
-    ...routes,
-    ...gateRoutes({
-      handle,
-      links: base.store.links,
-      members: base.store.members,
-      notifySubs: base.store.notifySubs,
-      sessions: base.store.sessions,
-      exchange: base.exchange,
-      subscriptions: features.gate.subscriptions,
-      madeSessions: features.gate.madeSessions,
-      logger: base.logger,
-    }),
-  ];
-}
-
-export const buildWorker: BuildWorker = async (env, plugins, options = {}) => {
-  const deps = basics(options);
-  const gate = gateEntryFromEnv(env);
-  const parts = await assemblyBase(env, gate, deps);
-  const { outbound, inbound } = transport(parts.teams, gate, deps);
-  const { acks, surface } = surfaceOf(parts.teams, outbound, gate, deps);
-  const bound = workerServices({ ...parts, surface, logger: deps.logger, botName: BOT_NAME });
-  const resolved = pluginsOf(plugins, env, parts, bound.services, {
-    ...deps,
-    registerIntegrations: options.registerIntegrations,
-  });
-  const base: AssemblyBase = { ...parts, ...deps, ...resolved, surface, random: cryptoRandom, env };
-  const features = buildFeatures(base);
-  bound.bind(features.router);
+  const { acks, inbound, gate } = parts;
   const handle = inboundHandler({
     acks,
-    route: (event) => features.router.handle(event),
+    route: context.route,
     botName: BOT_NAME,
-    logger: deps.logger,
-    groupContext: features.groupContext,
+    logger: context.logger,
+    groupContext: context.groupContext,
   });
-  const consumer =
+  const source =
     inbound === undefined
       ? undefined
       : new InboundConsumer({
           client: inbound,
-          queue: parts.teams.bus.inboundQueue,
+          queue: teams.bus.inboundQueue,
           handle,
-          receivers: parts.teams.bus.receiverCount,
-          clock: deps.clock,
-          logger: deps.logger,
+          receivers: teams.bus.receiverCount,
+          clock: context.clock,
+          logger: context.logger,
           stats: {
             processed: (lag, ms, ok) => {
-              parts.metrics.processed(lag ?? null, ms, ok);
+              context.metrics.processed(lag ?? null, ms, ok);
             },
           },
         });
-  return runner({
-    app: buildServer({
-      routes: routesOf(base, features, handle, gate),
-      maxBodyBytes: MAX_BODY_BYTES,
-      accessLog: deps.logger,
-      quietRoutes: [healthzRoute.path],
-    }),
-    metricsApp: buildServer({
-      routes: metricsRoutes(
-        withBuildInfo(() => parts.prometheus.render(), buildInfoText(teamsVersion(), process.version)),
-      ),
-      maxBodyBytes: 1024,
-    }),
-    host: gate === undefined ? "0.0.0.0" : LOOPBACK,
-    port: parts.settings.listenPort,
-    metricsPort: parts.settings.metricsPort,
-    consumer,
-    start: () => features.start(),
-    timers: features.timers,
-    clock: deps.clock,
-    logger: deps.logger,
-    close: () =>
-      closeAll(deps.logger, [
-        () => {
-          features.stop();
+  const routes =
+    gate === undefined
+      ? []
+      : gateRoutes({
+          handle,
+          links: context.store.links,
+          members: context.store.members,
+          notifySubs: context.store.notifySubs,
+          sessions: context.store.sessions,
+          exchange: context.exchange,
+          subscriptions: context.gate.subscriptions,
+          madeSessions: context.gate.madeSessions,
+          logger: context.logger,
+        });
+  return { routes, source };
+}
+
+function opened(teams: TeamsSettings, gate: GateEntry | undefined, deps: SurfaceDeps): OpenedSurface {
+  const { outbound, inbound } = transport(teams, gate, deps);
+  const { acks, surface } = surfaceOf(teams, outbound, gate, deps);
+  return {
+    surface,
+    typedEvent: teamsTypedEvent(deps.logger),
+    connect: (context) => connect(teams, { acks, inbound, gate }, context),
+    closes: [() => outbound.close(), () => inbound?.close()],
+  };
+}
+
+/**
+ * The Teams surface: the release gate's test entry is read first (TEAMS_GATE_ENTRY), the secrets come from where
+ * SECRETS_SOURCE says (the environment or Azure Key Vault), and the Teams settings are read after core's.
+ */
+export function teamsSurface(): SurfaceAdapter {
+  return {
+    name: "teams",
+    prepare(env: WorkerEnv) {
+      const gate = gateEntryFromEnv(env);
+      return {
+        loadSecrets: (_names, deps) => loadSecrets(env, deps),
+        configure(): ConfiguredSurface {
+          const teams = teamsSettingsFromEnv(env, { queues: gate === undefined });
+          return {
+            host: gate === undefined ? "0.0.0.0" : LOOPBACK,
+            shape: teamsShape(teams),
+            open: (deps) => opened(teams, gate, deps),
+          };
         },
-        () => bound.idle(),
-        () => outbound.close(),
-        () => inbound?.close(),
-        () => {
-          parts.store.close();
-        },
-      ]),
-  });
-};
+      };
+    },
+  };
+}
+
+export const buildWorker: BuildWorker = (env, plugins, options = {}) =>
+  assembleWorker(teamsSurface(), env, plugins, options);

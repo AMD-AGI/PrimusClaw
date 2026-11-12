@@ -27,6 +27,12 @@ import {
   readSettings,
   systemClock,
 } from "@primusclaw/personal-agent-runtime";
+import {
+  buildFeatures,
+  ON_BEHALF_PATH,
+  platformPlugins,
+  type AssemblyBase,
+} from "@primusclaw/personal-agent-runtime/worker";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
 import { FakeExchange } from "../../../../test-support/routing/fixtures.js";
@@ -35,10 +41,9 @@ import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
-import { teamsSettingsFromEnv } from "../../src/config/env.js";
-import { buildFeatures, ON_BEHALF_PATH, type AssemblyBase } from "../../src/assembly/features.js";
-import { platformPlugins } from "../../src/assembly/plugins.js";
+import { teamsShape } from "../../src/assembly/worker.js";
 import { StartupError } from "../../src/assembly/outbound.js";
+import { teamsSettingsFromEnv } from "../../src/config/env.js";
 import { DEFAULT_STYLE } from "../../src/config/style.js";
 import { toInboundEvent } from "../../src/activity/inbound/to-event.js";
 import { activityOf } from "../../src/messenger/render.js";
@@ -66,6 +71,16 @@ before(async () => {
       path: "/v1/chat/sessions/s1/messages",
       handle: () => ({ sse: stream }),
     },
+    {
+      method: "GET",
+      path: "/v1/notification-subscriptions",
+      handle: () => ({ status: 200, json: { ok: true, data: [] } }),
+    },
+    {
+      method: "POST",
+      path: "/v1/notification-subscriptions",
+      handle: () => ({ status: 200, json: { ok: true, data: { subscription_id: "sub-1", secret: "s" } } }),
+    },
   ]);
 });
 
@@ -85,6 +100,8 @@ function readSettingsForTest(): Settings {
 interface Overrides {
   readonly plugins?: Plugins;
   readonly settings?: Partial<Settings>;
+  /** The surface's id on the Claw wire (Teams' "teams" when absent). */
+  readonly surfaceId?: string;
 }
 
 function assembled(
@@ -100,7 +117,10 @@ function assembled(
   const requestScope = alsRequestScope();
   const base: AssemblyBase = {
     settings,
-    teams: teamsSettingsFromEnv({}, { queues: false }),
+    shape: {
+      ...teamsShape(teamsSettingsFromEnv({}, { queues: false })),
+      ...(overrides.surfaceId === undefined ? {} : { surfaceId: overrides.surfaceId }),
+    },
     store,
     claw: createClawClient({ baseUrl: clawUrl, clock: systemClock }),
     surface,
@@ -237,6 +257,23 @@ describe("the assembled features", () => {
     const { features } = assembled({ PROACTIVE_ENABLED: "1", NOTIFY_WEBHOOK_URL: "http://worker/claw-events" });
     assert.ok(features.timers.some((t) => t.name === "mend_subscriptions" && t.everyMs === 600_000 && t.runAtStart));
     assert.notEqual(features.gate.subscriptions, undefined);
+  });
+});
+
+describe("the notification subscription", () => {
+  it("a person's notification subscription names the worker's own surface to Claw, not Teams", async () => {
+    for (const surfaceId of ["teams", "slack"]) {
+      const env = { PROACTIVE_ENABLED: "1", NOTIFY_WEBHOOK_URL: "http://worker/claw-events" };
+      const { features, store } = assembled(env, new RecordingLogger(), { surfaceId });
+      store.links.redeemPending("aad-s", "Sam", store.links.stashPending("ak-sam"));
+      const before = claw.requests.length;
+      await features.gate.subscriptions?.ensure("aad-s");
+      const made = claw.requests
+        .slice(before)
+        .filter((r) => r.method === "POST" && r.path === "/v1/notification-subscriptions");
+      assert.equal(made.length, 1, surfaceId);
+      assert.equal((made[0]?.json as { surface?: unknown }).surface, surfaceId);
+    }
   });
 });
 

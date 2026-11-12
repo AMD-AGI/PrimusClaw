@@ -7,11 +7,19 @@
  *   core     (@primusclaw/personal-agent)          channel-neutral domain: imports itself, zod, and -- from
  *                                                   src/protocol.ts alone -- the Claw wire contract.
  *   runtime  (@primusclaw/personal-agent-runtime)  Node adapters of core's ports: depends on core only.
- *   teams    (@primusclaw/personal-agent-teams)    the Teams channel and the process: depends on core and runtime.
+ *   worker   (@primusclaw/personal-agent-runtime/worker, runtime's src/worker.ts and src/worker/)  the worker process
+ *                                                   on any surface (the features behind the router, the store, HTTP,
+ *                                                   metrics, timers): uses core and runtime's main entry, and no surface
+ *                                                   and no npm package. A surface package plugs into it
+ *                                                   (`SurfaceAdapter`). The rest of runtime never imports it.
+ *   teams    (@primusclaw/personal-agent-teams)    the Teams surface: depends on core and runtime (and its worker).
  *   teams-ingress (@primusclaw/personal-agent-teams-ingress)  the Teams ingress Function: depends on core and on the
  *                                                   worker's Bot Connector host rule (teams' src/connector-hosts.ts
  *                                                   entry), never on the worker or the runtime.
  *   test-support                                    fakes for tests; never imported by a package's src.
+ *
+ * Every other package is a surface package (teams, a future slack, ...), together with its own helpers named after it
+ * (teams-ingress is teams'). A surface package never imports another surface's package: Slack must not need Teams.
  *
  * The wire contract's own files (claw/packages/protocol/src) are compiled in but are not core's: what they import is
  * the contract's business, so the rules below judge the edges that start in this workspace.
@@ -57,14 +65,42 @@ module.exports = {
     {
       name: "runtime-depends-on-core-only",
       severity: "error",
-      comment: "runtime implements core's ports for Node; a channel depends on it, never the other way.",
+      comment: "runtime implements core's ports for Node; the worker and a channel depend on it, never the other way.",
       from: { path: "^packages/runtime/" },
-      to: { path: "^packages/(teams|teams-ingress)/" },
+      to: { path: "^packages/(?!core/|runtime/)[^/]+/" },
+    },
+    {
+      name: "worker-is-surface-neutral",
+      severity: "error",
+      comment:
+        "The worker (runtime's src/worker.ts and src/worker/) runs on whatever surface a surface package brings: it " +
+        "imports core, runtime and Node built-ins, and no surface package (runtime-depends-on-core-only), Azure, Bot " +
+        "Framework or other npm package of its own (a surface brings those).",
+      from: { path: "^packages/runtime/src/worker(/|\\.ts$)" },
+      to: { path: "^node_modules/" },
+    },
+    {
+      name: "runtime-not-to-its-worker",
+      severity: "error",
+      comment:
+        "runtime's main entry is the Node adapters alone: nothing of runtime but the worker itself imports the worker, " +
+        "so a user of the adapters (and runtime's dist/index.js) never takes in the worker process.",
+      from: { path: "^packages/runtime/", pathNot: "^packages/runtime/(src|test)/worker(/|\\.ts$)" },
+      to: { path: "^packages/runtime/src/worker(/|\\.ts$)" },
+    },
+    {
+      name: "surface-not-to-another-surface",
+      severity: "error",
+      comment:
+        "A surface package (any package but core and runtime) uses core, runtime and runtime's worker, and its own helpers " +
+        "named after it (teams-ingress is teams'), never another surface's: slack must not import teams.",
+      from: { path: "^packages/(?!core/|runtime/)([^/-]+)[^/]*/" },
+      to: { path: "^packages/(?!core/|runtime/|$1/|$1-)[^/]+/" },
     },
     {
       name: "teams-depends-on-core-and-runtime",
       severity: "error",
-      comment: "teams uses core and runtime; it never reaches into another channel package.",
+      comment: "teams uses core and runtime (and runtime's worker); it never reaches into its ingress Function.",
       from: { path: "^packages/teams/" },
       to: { path: "^packages/teams-ingress/" },
     },
@@ -73,7 +109,7 @@ module.exports = {
       severity: "error",
       comment:
         "The ingress Function loads core and the worker's Bot Connector host rule and nothing else of the workspace: " +
-        "its deployable bundle must not take in the worker or the runtime.",
+        "its deployable bundle must not take in the worker, the Teams surface or the runtime.",
       from: { path: "^packages/teams-ingress/src/" },
       to: { path: "^packages/(runtime|teams)/", pathNot: "^packages/teams/src/connector-hosts\\.ts$" },
     },
@@ -81,12 +117,17 @@ module.exports = {
       name: "packages-through-their-entry",
       severity: "error",
       comment:
-        "Another package is used through its public entries (src/index.ts, and teams' src/connector-hosts.ts), never " +
-        "by a deep path into its files.",
+        "Another package is used through its public entries (src/index.ts, runtime's src/worker.ts and teams' " +
+        "src/connector-hosts.ts), never by a deep path into its files.",
       from: { path: "^packages/([^/]+)/" },
       to: {
         path: "^packages/[^/]+/",
-        pathNot: ["^packages/$1/", "^packages/[^/]+/src/index\\.ts$", "^packages/teams/src/connector-hosts\\.ts$"],
+        pathNot: [
+          "^packages/$1/",
+          "^packages/[^/]+/src/index\\.ts$",
+          "^packages/runtime/src/worker\\.ts$",
+          "^packages/teams/src/connector-hosts\\.ts$",
+        ],
       },
     },
     {

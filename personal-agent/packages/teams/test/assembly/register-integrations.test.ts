@@ -20,8 +20,9 @@ import {
   silentLogger,
   type IntegrationRegistry,
 } from "@primusclaw/personal-agent";
+import { withRegistered } from "@primusclaw/personal-agent-runtime/worker";
 
-import { buildWorker, withRegistered } from "../../src/assembly/worker.js";
+import { buildWorker } from "../../src/assembly/worker.js";
 
 let dir: string;
 before(() => {

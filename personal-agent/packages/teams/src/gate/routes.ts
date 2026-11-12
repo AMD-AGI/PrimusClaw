@@ -26,18 +26,13 @@ import {
   type HttpResponse,
   type HttpRoute,
 } from "@primusclaw/personal-agent-runtime";
+import type { GateSubscriptions } from "@primusclaw/personal-agent-runtime/worker";
 import { z } from "zod";
 
 import type { JsonObject } from "../cards/json.js";
 import { NO_SUBSCRIPTION_SECONDS, PREFIX } from "./entry-env.js";
 
-/** The person's notification subscription, as the assistant feature keeps it. */
-export interface GateSubscriptions {
-  ensure(userId: string): Promise<void>;
-  remove(userId: string): Promise<void>;
-  /** Whether the subscription carries the assistant's event types. */
-  hasAssistantTypes(userId: string): boolean;
-}
+export type { GateSubscriptions };
 
 export interface GateEntryDeps {
   /** What the inbound queue's consumer hands an activity to. */

@@ -27,11 +27,14 @@ import {
   withoutRule,
 } from "@primusclaw/personal-agent";
 
-import { packageVersion, workerInfoFromEnv } from "@primusclaw/personal-agent-runtime";
+import { workerInfoFromEnv } from "@primusclaw/personal-agent-runtime";
 
-import { isObject } from "../cards/json.js";
 import type { AssemblyBase } from "./features-base.js";
 import { conversationFor } from "./features-proactive.js";
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function listOf(value: unknown): readonly unknown[] {
   return Array.isArray(value) ? (value as readonly unknown[]) : [];
@@ -90,11 +93,11 @@ function feedbackService(base: AssemblyBase, mask: (text: string) => string): Fe
         return pyStrip(state.answer);
       },
     },
-    wording: { botName: "Clawy", channelName: "Teams" },
+    wording: { botName: "Clawy", channelName: base.shape.channelName },
     publicBaseUrl: settings.publicBaseUrl,
     worker: workerInfoFromEnv(env, {
       pluginId: settings.claw.pluginId === null ? "" : String(settings.claw.pluginId),
-      version: packageVersion(new URL("../../package.json", import.meta.url)),
+      version: base.shape.version,
     }),
     logs: base.chatLog,
   });

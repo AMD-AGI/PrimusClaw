@@ -9,7 +9,7 @@ import type { Clock, Logger, SecretName } from "@primusclaw/personal-agent";
 import { EnvSecretSource, secretsSourceOf, wantedSecrets } from "@primusclaw/personal-agent-runtime";
 
 import { keyVaultSourceFromEnv } from "../azure/keyvault.js";
-import type { WorkerEnv } from "../worker-api.js";
+import type { WorkerEnv } from "@primusclaw/personal-agent-runtime/worker";
 
 export async function loadSecrets(
   env: WorkerEnv,

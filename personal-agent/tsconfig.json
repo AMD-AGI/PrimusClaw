@@ -17,6 +17,7 @@
     "paths": {
       "@primusclaw/personal-agent": ["./packages/core/src/index.ts"],
       "@primusclaw/personal-agent-runtime": ["./packages/runtime/src/index.ts"],
+      "@primusclaw/personal-agent-runtime/worker": ["./packages/runtime/src/worker.ts"],
       "@primusclaw/personal-agent-teams": ["./packages/teams/src/index.ts"],
       "@primusclaw/personal-agent-teams/connector-hosts": ["./packages/teams/src/connector-hosts.ts"],
       "@primusclaw/personal-agent-teams-ingress": ["./packages/teams-ingress/src/index.ts"]

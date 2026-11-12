@@ -22,7 +22,7 @@ import {
 import { readSettings } from "@primusclaw/personal-agent-runtime";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
-import { platformPlugins, type PlatformDeps } from "../../src/assembly/plugins.js";
+import { platformPlugins, type PlatformDeps } from "../../src/worker/plugins.js";
 
 let safe: FakeHttpServer;
 let dir: string;

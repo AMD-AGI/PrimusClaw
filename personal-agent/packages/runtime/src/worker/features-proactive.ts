@@ -8,7 +8,6 @@
  */
 import type {
   Conversation,
-  ConversationRef,
   FollowReach,
   JsonObject,
   ProactiveHold,
@@ -31,24 +30,14 @@ import {
   turn,
 } from "@primusclaw/personal-agent";
 
-import { restoreConversationRef } from "../activity/reference.js";
-import { isObject } from "../cards/json.js";
-import type { Style } from "../config/style.js";
 import type { AssistantParts } from "./features-assistant.js";
 import { isExactCommand, remoteAskCard } from "./features-assistant.js";
-import type { AssemblyBase } from "./features-base.js";
+import type { AssemblyBase, ReplyStyle } from "./features-base.js";
 
-/** A stored reference as the surface posts to it; one that names no conversation still gets one (its send then fails). */
-export function refOf(reference: JsonObject): ConversationRef {
-  const restored = restoreConversationRef(reference);
-  if (restored !== undefined) return restored;
-  const conversation = reference["conversation"];
-  const type = isObject(conversation) ? conversation["conversationType"] : undefined;
-  return { id: "", kind: type === "groupChat" ? "group" : "personal", tenantId: "", wire: reference };
-}
-
-export function conversationFor(base: Pick<AssemblyBase, "surface">): (reference: JsonObject) => Conversation {
-  return (reference) => base.surface.conversation(refOf(reference));
+export function conversationFor(
+  base: Pick<AssemblyBase, "surface" | "shape">,
+): (reference: JsonObject) => Conversation {
+  return (reference) => base.surface.conversation(base.shape.refOf(reference));
 }
 
 /** A finished run's answer lost to a restart, and the card of what its session changed (W4b's reads). */
@@ -80,7 +69,7 @@ export interface ProactiveParts {
 
 export function proactiveParts(
   base: AssemblyBase,
-  style: Style,
+  style: ReplyStyle,
   assistant: Pick<AssistantParts, "receipts" | "directChat">,
   errors: PublicErrors,
   router?: () => Router,
@@ -90,7 +79,7 @@ export function proactiveParts(
     store,
     conversationFor: conversationFor(base),
     deliverStored: async (envelope: JsonObject) => {
-      await surface.conversation(refOf((envelope["reference"] ?? {}) as JsonObject)).deliver(envelope);
+      await surface.conversation(base.shape.refOf((envelope["reference"] ?? {}) as JsonObject)).deliver(envelope);
     },
     messageIds: surface.caps.messageIds,
     say: new SayPlanner({

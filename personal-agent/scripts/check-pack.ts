@@ -47,7 +47,15 @@ const SHIPPED: Readonly<Record<PackageSpec["dir"], readonly string[]>> = {
     "dist/types/index.d.ts",
     "dist/types/protocol/remote-agents.d.ts",
   ],
-  runtime: ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/sqlite/schema.sql"],
+  runtime: [
+    "package.json",
+    "dist/LICENSE",
+    "dist/index.js",
+    "dist/types/index.d.ts",
+    "dist/sqlite/schema.sql",
+    "dist/worker.js",
+    "dist/types/worker.d.ts",
+  ],
   teams: [
     "package.json",
     "dist/LICENSE",
@@ -64,7 +72,7 @@ const ENTRY = { types: "./dist/types/index.d.ts", default: "./dist/index.js" };
 /** Each package's `exports`: its entry, and for teams the Bot Connector host rule the ingress imports on its own. */
 const EXPORTS: Readonly<Record<PackageSpec["dir"], unknown>> = {
   core: { ".": ENTRY },
-  runtime: { ".": ENTRY },
+  runtime: { ".": ENTRY, "./worker": { types: "./dist/types/worker.d.ts", default: "./dist/worker.js" } },
   teams: {
     ".": ENTRY,
     "./connector-hosts": { types: "./dist/types/connector-hosts.d.ts", default: "./dist/connector-hosts.js" },
@@ -177,6 +185,7 @@ export function manifestProblems(
 const PROBE = `
   const core = await import("@primusclaw/personal-agent");
   const runtime = await import("@primusclaw/personal-agent-runtime");
+  const worker = await import("@primusclaw/personal-agent-runtime/worker");
   const teams = await import("@primusclaw/personal-agent-teams");
   const hosts = await import("@primusclaw/personal-agent-teams/connector-hosts");
   const ingress = await import("@primusclaw/personal-agent-teams-ingress");
@@ -184,6 +193,9 @@ const PROBE = `
   if (core.CONNECTOR_PACKAGE !== "@primusclaw/connector") problems.push("core does not carry the wire contract (CONNECTOR_PACKAGE)");
   if (typeof core.neutralPlugins !== "function" || typeof core.integrationRegistry !== "function") problems.push("core lacks its plugin entry points");
   if (typeof runtime.openWorkerStore !== "function") problems.push("runtime lacks openWorkerStore");
+  if (typeof worker.assembleWorker !== "function" || typeof worker.runMain !== "function") problems.push("runtime/worker lacks assembleWorker or runMain");
+  if ("assembleWorker" in runtime) problems.push("runtime's main entry carries the worker (it belongs to runtime/worker only)");
+  if (typeof teams.teamsSurface !== "function" || teams.teamsSurface().name !== "teams") problems.push("teams lacks its surface adapter");
   if (typeof teams.buildWorker !== "function" || typeof teams.main !== "function") problems.push("teams lacks buildWorker or main");
   if (hosts.DEFAULT_HOSTS?.[0] !== "smba.trafficmanager.net") problems.push("teams/connector-hosts lacks the Bot Connector host rule");
   if (typeof ingress.createIngress !== "function" || typeof ingress.register !== "function") problems.push("teams-ingress lacks createIngress or register");
@@ -197,7 +209,8 @@ const PROBE = `
 const CONSUMER = [
   'import { neutralPlugins, integrationRegistry, CONNECTOR_PACKAGE, type Plugins, type IntegrationRegistry } from "@primusclaw/personal-agent";',
   'import { openWorkerStore } from "@primusclaw/personal-agent-runtime";',
-  'import { buildWorker, main, type WorkerOptions, type Worker } from "@primusclaw/personal-agent-teams";',
+  'import { assembleWorker, type SurfaceAdapter } from "@primusclaw/personal-agent-runtime/worker";',
+  'import { buildWorker, main, teamsSurface, type WorkerOptions, type Worker } from "@primusclaw/personal-agent-teams";',
   'import { ConnectorHosts } from "@primusclaw/personal-agent-teams/connector-hosts";',
   'import { consoleSink, createIngress, register, SERVICE_BUS, type Ingress } from "@primusclaw/personal-agent-teams-ingress";',
   "const plugins: Plugins = neutralPlugins();",
@@ -206,6 +219,10 @@ const CONSUMER = [
   "const pkg: string = CONNECTOR_PACKAGE;",
   "const options: WorkerOptions = {};",
   "const built: Promise<Worker> = buildWorker({}, plugins, options);",
+  "const surface: SurfaceAdapter = teamsSurface();",
+  "const assembled: Promise<Worker> = assembleWorker(surface, {}, plugins);",
+  "// @ts-expect-error a surface adapter has a name and a prepare stage",
+  "assembleWorker({}, {}, plugins);",
   "const exit: Promise<number> = main({});",
   'const hosts: string = new ConnectorHosts().host("https://smba.trafficmanager.net/teams/");',
   "const ingress: Ingress = createIngress({ env: {}, fetch, log: consoleSink, serviceBus: SERVICE_BUS });",
@@ -216,7 +233,7 @@ const CONSUMER = [
   "neutralPlugins(1);",
   "// @ts-expect-error openWorkerStore takes settings",
   "openWorkerStore();",
-  "export { built, exit, hosts, pkg };",
+  "export { assembled, built, exit, hosts, pkg };",
   "",
 ].join("\n");
 

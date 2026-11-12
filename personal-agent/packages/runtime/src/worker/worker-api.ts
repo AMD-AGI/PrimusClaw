@@ -4,8 +4,9 @@
 /**
  * The worker process, as an assembly can build it: the public `main` builds it with the neutral plugins, a deployment's
  * own `main` (with its identity platform, model gateway rules, extra routes) builds it with its plugins. Everything else
- * (store, Claw client, Teams outbound, inbound queue, HTTP endpoints) is assembled from the environment the same way for
- * both.
+ * (store, Claw client, the surface's outbound and inbound, HTTP endpoints) is assembled from the environment the same way
+ * for both. A surface package (such as `@primusclaw/personal-agent-teams`) exports its own `buildWorker` and `main` of
+ * these shapes, made with `assembleWorker` and its `SurfaceAdapter`.
  */
 import type {
   Clock,
