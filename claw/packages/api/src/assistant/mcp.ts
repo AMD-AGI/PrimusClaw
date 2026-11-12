@@ -113,7 +113,8 @@ function registerSkillRead(mcp: McpServer, claims: AssistantTokenClaims): void {
     + "files; with path, one of those files. Read a skill before you use it.",
     {
       name: z.string().describe("The skill's name, as listed or as the user named it."),
-      page: z.number().int().positive().optional().describe("The page to read, from 1; the result says how many there are."),
+      // A number, or one written as text ("2"): `skill-tools.ts` reads either and refuses anything else in words the model can act on.
+      page: z.union([z.number(), z.string()]).optional().describe("The page to read, from 1; the result says how many there are."),
       path: z.string().optional().describe("One file of the skill, as its list of files names it."),
     },
     (args) => answer(claims, "skill_read", () => skillRead(claims, args)),

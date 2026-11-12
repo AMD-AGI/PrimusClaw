@@ -14,7 +14,8 @@
  *   U3 the list keeps to 2000 characters: the most recently used that fit, then how many are left out
  *   U4 skill_read over the wire: the router is offered it and a worker and an observer are not; it reads the user's skill in pages with
  *      its files on the last, one file by path, a manual one by its name, an imported one marked; a read sets last_used_at; a skill
- *      the user does not have now (another user's, turned off, on probation, deleted, never saved) is not found, all alike
+ *      the user does not have now (another user's, turned off, on probation, deleted, never saved) is not found, all alike; a read
+ *      of a file alone is a use too; a page may be given as text
  *   U5 only the user's own assistant: a router session marked as one other people read has neither list nor tool; an ended turn reads
  *      nothing; a worker or an observer calling it is refused; an observer turn is given no list
  *   U6 skill_read is no source of the router's read rule (`read_taint`): Brain lets the turn start work after it, and lets it read a
@@ -256,6 +257,17 @@ describe("assistant: the user's personal skills", { skip }, () => {
     });
     const [used] = await w.q("SELECT last_used_at FROM claw_skills WHERE user_id = 'alice' AND skill_name = 'weekly-report'");
     assert.ok(used.last_used_at, "a read is a use");
+    // A read of a file alone is a use as well: it orders the list as a read of the skill does.
+    await skill("alice", "file-only", { files: [{ path: "references/a.md", content: "notes" }] });
+    await asRouter(alice, async (c) => {
+      assert.equal((await call(c, { name: "file-only", path: "references/a.md" })).body.ok, true);
+      const asText = await call(c, { name: "weekly-report", page: "2" });
+      assert.deepEqual([asText.body.ok, asText.body.page], [true, 2], "a page number written as text");
+      assert.equal((await call(c, { name: "weekly-report", page: "two" })).body.error, "invalid_arguments");
+      assert.equal((await call(c, { name: "weekly-report", page: 0 })).body.error, "invalid_arguments");
+    });
+    const [fileUsed] = await w.q("SELECT last_used_at FROM claw_skills WHERE user_id = 'alice' AND skill_name = 'file-only'");
+    assert.ok(fileUsed.last_used_at, "a file read is a use");
     const [bobs] = await w.q("SELECT last_used_at FROM claw_skills WHERE user_id = 'bob'");
     assert.equal(bobs.last_used_at, null, "another user's skill is not touched");
 
