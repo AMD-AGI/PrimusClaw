@@ -6,7 +6,9 @@
  *
  * Running it is the approval: the code is traded at Claw (`POST /v1/remote-agents/pairings/claim`, anonymous, the code is
  * the credential) for a connector grant, saved like any sign-in (0600). With no `agents.toml` yet, one is written for the
- * agents found on this machine, working in the folder the command was run in. Then the connector is started as a service
+ * agents found on this machine, working in the folder the command was run in. The Claude Code hooks are offered as `init` offers
+ * them (at a terminal, one question whose default is yes; the session hooks and the approval hooks, so a question a terminal
+ * asks also reaches the chat). Then the connector is started as a service
  * (`service install`; a container without systemd gets the keep-alive supervisor), so the machine is online seconds later
  * and stays so. A connector already running here is stopped first: it holds the previous sign-in.
  */
@@ -19,7 +21,7 @@ import { saveCredentials } from "./credentials.js";
 import { clearNeedsLogin } from "./health.js";
 import { configFile, credentialsFile, forgetIdentity } from "./paths.js";
 import { errMessage, isObject, secureUrl } from "./util.js";
-import type { Ctx } from "./commands.js";
+import type { Ctx, HookChoice } from "./commands.js";
 
 /** Agents `pair` offers when it writes `agents.toml`: the preset, and the program on PATH that shows it is installed. */
 export const DETECTED_AGENTS: ReadonlyArray<{ preset: string; binary: string }> = [
@@ -34,9 +36,11 @@ export interface PairDeps {
   /** Start it as a service: `service install`, or the installed service again. */
   start: (ctx: Ctx) => Promise<number>;
   runningPid: (ctx: Ctx) => number | null;
+  /** Offer the Claude Code hooks (commands.ts `setupHooks`); never fails the pairing. */
+  hooks?: (ctx: Ctx, o: HookChoice) => Promise<void>;
 }
 
-const USAGE = "usage: claw-connector pair <code> --server <Claw API URL> [--name <machine name>] [--no-start]";
+const USAGE = "usage: claw-connector pair <code> --server <Claw API URL> [--name <machine name>] [--no-start] [--hooks | --no-hooks] [--no-approval-hooks]";
 
 /** The account the command runs as, for {@link alternateName}. */
 function userName(env: NodeJS.ProcessEnv): string | null {
@@ -88,14 +92,18 @@ export function defaultRoot(cwd: string): string {
 }
 
 export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise<number> {
-  let values: { server?: string; name?: string; "no-start"?: boolean };
+  let values: { server?: string; name?: string; "no-start"?: boolean; hooks?: boolean; "no-hooks"?: boolean; "no-approval-hooks"?: boolean };
   let positionals: string[];
   try {
     ({ values, positionals } = parseArgs({
       args, strict: true, allowPositionals: true,
-      options: { server: { type: "string" }, name: { type: "string" }, "no-start": { type: "boolean" } },
+      options: {
+        server: { type: "string" }, name: { type: "string" }, "no-start": { type: "boolean" },
+        hooks: { type: "boolean" }, "no-hooks": { type: "boolean" }, "no-approval-hooks": { type: "boolean" },
+      },
     }));
   } catch (e) { ctx.err(`${errMessage(e)}\n${USAGE}`); return 2; }
+  if (values.hooks && values["no-hooks"]) { ctx.err(`pair: --hooks and --no-hooks contradict each other; pass one\n${USAGE}`); return 2; }
   const code = positionals[0]?.trim();
   if (!code || positionals.length > 1) { ctx.err(USAGE); return 2; }
   const cfgFile = configFile(ctx.dirs);
@@ -195,7 +203,14 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
   clearNeedsLogin(ctx.dirs);
   ctx.out(`paired "${name}" with ${server}`);
 
-  // 4. Started, and kept up.
+  // 4. The Claude Code hooks, as init offers them: a terminal's questions reach the chat once the connector runs.
+  if (deps.hooks) {
+    try { await deps.hooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] }); } catch (e) {
+      ctx.err(`hooks: ${errMessage(e)} (the machine is paired; run: claw-connector hooks install --approvals)`);
+    }
+  }
+
+  // 5. Started, and kept up.
   if (values["no-start"]) { ctx.out("not started (--no-start). Start it with: claw-connector service install   (or: claw-connector run)"); return 0; }
   const rc = await deps.start(ctx);
   if (rc !== 0) {

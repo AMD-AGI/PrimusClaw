@@ -122,6 +122,41 @@ export function suggestedRepliesOf(event: Event, text: string, styleOn: boolean,
   return [...ASSISTANT_SUGGESTED_REPLIES[lang ?? pickLang(text)]];
 }
 
+/** The fewest options a choice card shows (Claw sends from 2). */
+export const CHOICE_OPTIONS_MIN = 2;
+/** The most options a choice card shows (Claw sends at most 10). */
+export const CHOICE_OPTIONS_MAX = 10;
+/** Code points of one option (Claw sends at most 80): one line beside a radio button or a check box. */
+export const CHOICE_OPTION_MAX = 80;
+
+/** A choice an `assistant.say` puts to the person: the options, and whether several may be picked. */
+export interface SayChoice {
+  readonly options: readonly string[];
+  readonly multiple: boolean;
+}
+
+/**
+ * The choice an `assistant.say` puts to the person (`choices`); undefined when it carries none this worker draws. Read whole or not
+ * at all: an option that is not one plain line of text, or too many or too few of them, and there is no card (the words still name
+ * the options, for the person to type).
+ */
+export function choiceOf(event: Event): SayChoice | undefined {
+  const choice = record(event["choices"]);
+  if (event["type"] !== "assistant.say" || choice === undefined) return undefined;
+  const raw = choice["options"];
+  if (!Array.isArray(raw)) return undefined;
+  const options: string[] = [];
+  for (const entry of raw as unknown[]) {
+    // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused
+    if (typeof entry !== "string" || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(entry)) return undefined;
+    const option = pySplit(entry).join(" ");
+    if (!option || cpLength(option) > CHOICE_OPTION_MAX) return undefined;
+    if (!options.includes(option)) options.push(option);
+  }
+  if (options.length < CHOICE_OPTIONS_MIN || options.length > CHOICE_OPTIONS_MAX) return undefined;
+  return { options, multiple: choice["multiple"] === true };
+}
+
 export interface RemoteNotice {
   /** `resolved`: a question a terminal asked no longer waits here (answered there, or given up); `resolved` says which. */
   readonly kind: "done" | "needs_you" | "error" | "resolved";

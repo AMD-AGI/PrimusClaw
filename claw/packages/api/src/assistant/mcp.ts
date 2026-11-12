@@ -29,6 +29,7 @@ import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { SAY_SUGGESTED_PARAM, suggestedRepliesOn } from "./suggested.js";
+import { SAY_CHOICES_PARAM, sayChoicesOn } from "./choices.js";
 import { REPORT_KINDS } from "./work-items.js";
 import { githubEventsEnabled, prReply, REPLY_BODY_MAX, watchNamedPullRequests, workSubscribe, workUnsubscribe } from "./github-events.js";
 import { jobHttpSources, jobSources, jobUnwatch, jobWatch, jobWatchesEnabled, jobWatchList } from "./job-watch.js";
@@ -343,7 +344,7 @@ export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
-  suggested: boolean = suggestedRepliesOn(),
+  suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(),
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -364,7 +365,8 @@ export function createAssistantMcpServer(
   if (claims.role === "router" || claims.role === "observer") {
     mcp.tool(
       "say",
-      `Send the user a message. This is the only way to speak to them. At most ${SAY_MAX_CHARS} characters.`,
+      `Send the user a message. This is the only way to speak to them. At most ${SAY_MAX_CHARS} characters.`
+        + (choices ? " When it asks them to pick among options, pass the options in choices: they get a card to pick and send." : ""),
       {
         text: z.string().describe("What to tell the user, in the language they use."),
         item_id: z.string().optional().describe(ITEM_ID_PARAM),
@@ -376,6 +378,13 @@ export function createAssistantMcpServer(
         ...(citations ? { sources: z.preprocess(encodedList, z.array(z.string())).optional().catch(undefined).describe(SAY_SOURCES_PARAM) } : {}),
         // Checked by `say` (`suggested.ts`), never a reason to refuse it: one that does not fit the schema is read as none.
         ...(suggested ? { suggested: z.array(z.string()).optional().catch(undefined).describe(SAY_SUGGESTED_PARAM) } : {}),
+        // Checked by `say` (`choices.ts`), never a reason to refuse it: one that does not fit the schema is read as none.
+        ...(choices
+          ? {
+            choices: z.object({ options: z.array(z.string()), multiple: z.boolean().optional() })
+              .optional().catch(undefined).describe(SAY_CHOICES_PARAM),
+          }
+          : {}),
       },
       // The sources come from Brain, in the request's `_meta` (`citations.ts`); never from the model's `sources` argument.
       (args, extra) => answer(claims, "say", () => say(claims, args, {}, citations ? extra._meta ?? {} : undefined), SAY_FAULT_MESSAGE),

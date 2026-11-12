@@ -3,7 +3,7 @@
 
 /**
  * Cards and messages of the assistant (tables `assistant_cards`, `auto_replies`, `assistant_action_cards`,
- * `assistant_confirm_cards`, `assistant_messages`). A card's buttons carry only its id; what a press means is read
+ * `assistant_confirm_cards`, `assistant_choice_cards`, `assistant_messages`). A card's buttons carry only its id; what a press means is read
  * from here, so a forged, old or someone else's card changes nothing.
  */
 import type { JsonObject } from "./json.js";
@@ -66,6 +66,22 @@ export interface ConfirmCard {
   readonly createdAt: number;
 }
 
+/** A choice the assistant put to the person: what was asked, the options, and (once sent) what was picked. */
+export interface ChoiceCard {
+  readonly cardId: string;
+  readonly userId: string;
+  /** The words the card holds ("" when they were said apart). */
+  readonly text: string;
+  readonly options: readonly string[];
+  readonly multiple: boolean;
+  /** What was picked, in the card's order: being sent ('busy') or sent ('done'); empty before the first press. */
+  readonly chosen: readonly string[];
+  /** 'open'; 'busy' while a press sends it; 'done' once the router took it. */
+  readonly state: CardState;
+  readonly lang: string;
+  readonly createdAt: number;
+}
+
 export interface AssistantMessage {
   readonly userId: string;
   /** The actions (and handoffs) the message declared. */
@@ -101,6 +117,20 @@ export interface AssistantButtonRepository {
   /** Null once it is older than CONFIRM_CARD_KEEP_SECONDS. */
   getConfirmCard(cardId: string): ConfirmCard | null;
   moveConfirmCard(cardId: string, state: CardState, options?: MoveOptions): boolean;
+  addChoiceCard(
+    userId: string,
+    choice: {
+      readonly text: string;
+      readonly options: readonly string[];
+      readonly multiple: boolean;
+      readonly lang: string;
+    },
+  ): string;
+  /** Null once it is older than ASSISTANT_MESSAGE_KEEP_SECONDS. */
+  getChoiceCard(cardId: string): ChoiceCard | null;
+  /** An open card is claimed by a press to send `chosen` (it moves to 'busy'); true if this call claimed it, so of two presses exactly one sends. */
+  claimChoiceCard(cardId: string, chosen: readonly string[]): boolean;
+  moveChoiceCard(cardId: string, state: CardState, options?: MoveOptions): boolean;
 }
 
 export interface AssistantMessageRepository {

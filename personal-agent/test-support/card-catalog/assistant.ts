@@ -178,4 +178,49 @@ export const ASSISTANT_CARDS = entries(
         lang: "zh",
       }),
   ],
+  [
+    "assistant_choice",
+    () =>
+      assistantRenderers.choiceCard({
+        text: "部署到哪个集群？",
+        cardId: "card-6",
+        options: ["prod（生产）", "staging（测试）", "两个都部署"],
+        multiple: false,
+        note: "",
+        lang: null,
+      }),
+  ],
+  [
+    "assistant_choice_multi",
+    () =>
+      assistantRenderers.choiceCard({
+        text: "Which repositories should the weekly report cover?",
+        cardId: "card-7",
+        options: ["AMD-AGI/PrimusClaw", "AMD-AGI/Primus-SaFE", "AMD-AGI/Primus-Turbo"],
+        multiple: true,
+        note: "",
+        lang: null,
+      }),
+  ],
+  [
+    "assistant_choice_again",
+    () =>
+      assistantRenderers.choiceCard({
+        text: "",
+        cardId: "card-6",
+        options: ["prod（生产）", "staging（测试）"],
+        multiple: false,
+        note: "请先选一项，再点发送。",
+        lang: "zh",
+      }),
+  ],
+  [
+    "assistant_choice_sent",
+    () =>
+      assistantRenderers.choiceChosen({
+        text: "部署到哪个集群？",
+        chosen: ["prod（生产）", "staging（测试）"],
+        lang: "zh",
+      }),
+  ],
 );

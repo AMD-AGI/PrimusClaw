@@ -79,9 +79,33 @@ export interface ConfirmWriteModel {
   readonly lang: string;
 }
 
+/** A choice the assistant put to the person: its options as radio buttons (or check boxes) and Send. */
+export interface ChoiceCardModel {
+  /** The words, when the card holds them ("" when they were said apart). */
+  readonly text: string;
+  readonly cardId: string;
+  readonly options: readonly string[];
+  /** Several may be picked (check boxes); else one (radio buttons). */
+  readonly multiple: boolean;
+  /** One line under the options when the card comes back unanswered ("" none). */
+  readonly note: string;
+  /** "zh" or "en"; null to follow what was said. */
+  readonly lang: string | null;
+}
+
+/** What replaces a choice card once the person sent what they picked: what they sent, under the words it answered. */
+export interface ChoiceChosenModel {
+  readonly text: string;
+  /** The options picked, in the card's order. */
+  readonly chosen: readonly string[];
+  readonly lang: string | null;
+}
+
 declare module "../ports/surface.js" {
   interface ViewMap {
     actionCard: ActionCardModel;
+    choiceCard: ChoiceCardModel;
+    choiceChosen: ChoiceChosenModel;
     board: BoardModel;
     confirmWrite: ConfirmWriteModel;
     workCard: WorkCardModel;

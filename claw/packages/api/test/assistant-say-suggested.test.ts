@@ -34,7 +34,7 @@ describe("say with suggested replies, on a real Postgres", { skip }, () => {
 
   async function sayTool(on: boolean): Promise<{ client: Client; schema: Record<string, any> }> {
     const { createAssistantMcpServer } = await import("../src/assistant/mcp.js");
-    const server = createAssistantMcpServer(await w.routerTurn(alice) as never, false, false, false, false, false, on);
+    const server = createAssistantMcpServer(await w.routerTurn(alice) as never, false, false, false, false, false, on, false);
     const [a, b] = InMemoryTransport.createLinkedPair();
     await server.connect(a);
     const client = new Client({ name: "t", version: "1" }, { capabilities: {} });

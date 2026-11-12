@@ -7,6 +7,7 @@
  */
 import type {
   ClawPort,
+  InboundMessage,
   Clock,
   Logger,
   MetricsPort,
@@ -59,6 +60,8 @@ export interface RouterHooks {
   runCommand(text: string, sender: SenderOf, conversation: ConversationOf, key: string): Promise<boolean>;
   /** What reads Claw for a person with nobody to ask (`Agent._background_credential`); undefined: none. */
   background(userId: string): Promise<string | undefined>;
+  /** `message` handled as one the person typed (`Router.handle`): what a choice card's Send sends. */
+  typed(message: InboundMessage): Promise<void>;
 }
 
 type SenderOf = Parameters<import("@primusclaw/personal-agent").Router["chat"]>[0];

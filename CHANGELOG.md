@@ -102,6 +102,14 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- The assistant's `say` can put a choice to the user: `choices` carries the options (2 to 10, one plain line each) and
+  whether several may be picked, and the tool tells the model to use it whenever it asks the user to pick among options.
+  `assistant.say` and the session's `AssistantSay` event carry it as `choices`; a channel shows it as a card whose Send
+  sends what was picked as the user's next message. A choice that does not fit is left out whole and the message still
+  goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change (#765).
+
 ## [0.2.1] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611120828` (commit 0412146c). No schema change, no new setting. Connector requirements

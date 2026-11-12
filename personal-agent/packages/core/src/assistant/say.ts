@@ -8,8 +8,9 @@
  *   receipt already shows of it (`shown`). It is an AI answer: the AI label and the thumbs under it, a citation for each source it
  *   cites as [n], and the replies to tap under the last of its messages when no card follows.
  * - When the event's item holds a result that waits, a card with Accept and Stop; when it holds a write for the person, a card
- *   that lets it through or not; when it puts a command to the person, a card with Run and Cancel (each recorded first, so its
- *   buttons mean something). A card holds the words only when they are short and not shown already.
+ *   that lets it through or not; when it puts a command to the person, a card with Run and Cancel; when it puts a choice to the
+ *   person, a card with the options and Send (each recorded first, so its buttons mean something). A card holds the words only
+ *   when they are short and not shown already.
  * - Then a card for each file the item's worker delivered, with Claw's own download link.
  *
  * Every word of this worker's own is in the person's language, never in that of what was said.
@@ -25,7 +26,7 @@ import { replyParts } from "../turn/answer-parts.js";
 import { citationsFromSources } from "./citations.js";
 import { assistantDeliveries } from "../turn/deliveries.js";
 import type { JsonObject } from "../json.js";
-import { PULL_LINK, SUGGESTIONS_MAX, confirmActionOf, confirmWriteOf, suggestedRepliesOf } from "./events.js";
+import { PULL_LINK, SUGGESTIONS_MAX, choiceOf, confirmActionOf, confirmWriteOf, suggestedRepliesOf } from "./events.js";
 import { parseWorkItem } from "./item-of.js";
 import { fitsWorkCard, workEventText } from "./work-items.js";
 
@@ -132,8 +133,8 @@ export class SayPlanner {
   }
 
   /**
-   * The card with buttons the event asks for, recorded first: a result that waits, a write Claw holds, or a command put to the
-   * person; undefined for none. `holdsWords`: the card shows the words, which are then not said apart.
+   * The card with buttons the event asks for, recorded first: a result that waits, a write Claw holds, a command or a choice put
+   * to the person; undefined for none. `holdsWords`: the card shows the words, which are then not said apart.
    */
   private card(
     userId: string,
@@ -144,7 +145,13 @@ export class SayPlanner {
     const inCard = said.inCard ? said.text : "";
     if (item?.canAccept)
       return { message: this.workCard(userId, item, said.text, inCard, said.lang), holdsWords: said.inCard };
-    if (item !== null) return undefined;
+    const asked = item === null ? this.askCard(userId, event, inCard, said.lang) : undefined;
+    if (asked !== undefined) return { message: asked, holdsWords: said.inCard };
+    return this.choiceCard(userId, event, inCard, said.lang, said.inCard);
+  }
+
+  /** A write Claw holds for the person (Allow, Deny) or a command put to them (Run, Cancel), recorded first; undefined for none. */
+  private askCard(userId: string, event: Event, inCard: string, lang: Lang): OutMessage | undefined {
     const held = confirmWriteOf(event);
     if (held !== undefined) {
       const cardId = this.deps.store.assistantButtons.addConfirmCard(
@@ -153,8 +160,8 @@ export class SayPlanner {
         held.kind,
         held.allowLabel,
       );
-      const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, lang: said.lang };
-      return { message: view({ name: "confirmWrite", model }), holdsWords: said.inCard };
+      const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, lang };
+      return view({ name: "confirmWrite", model });
     }
     const confirm = confirmActionOf(event, this.deps.exactCommand);
     if (confirm === undefined) return undefined;
@@ -165,10 +172,26 @@ export class SayPlanner {
       confirm.name,
       confirm.args,
     );
-    return {
-      message: view({ name: "actionCard", model: { text: inCard || command, cardId, command, lang: said.lang } }),
-      holdsWords: said.inCard,
-    };
+    return view({ name: "actionCard", model: { text: inCard || command, cardId, command, lang } });
+  }
+
+  /**
+   * A choice put to the person (`choices`): its options and Send, recorded first (what a press sends is read from the record).
+   * Its Send sends what was picked as the person's own message.
+   */
+  private choiceCard(
+    userId: string,
+    event: Event,
+    inCard: string,
+    lang: Lang,
+    holdsWords: boolean,
+  ): { message: OutMessage; holdsWords: boolean } | undefined {
+    const choice = choiceOf(event);
+    if (choice === undefined) return undefined;
+    const { options, multiple } = choice;
+    const cardId = this.deps.store.assistantButtons.addChoiceCard(userId, { text: inCard, options, multiple, lang });
+    const model = { text: inCard, cardId, options, multiple, note: "", lang };
+    return { message: view({ name: "choiceCard", model }, inCard), holdsWords };
   }
 
   /** What was said, as AI answers with thumbs, each with the citations its own words cite (when the whole text cites at all). */
