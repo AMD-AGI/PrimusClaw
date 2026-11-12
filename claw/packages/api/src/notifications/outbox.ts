@@ -609,6 +609,15 @@ let running: Promise<void> | null = null;
 let rerun = false;
 let latestDeps: DeliveryDeps = {};
 let stopping = false;
+let onRequest = true;
+
+/**
+ * Whether a request's kick delivers from this process. Off with CLAW_API_BACKGROUND=off (`index.ts`): a process that
+ * runs no delivery worker claims no row either, and the replicas that run one send it within POLL_MS.
+ */
+export function deliverNotificationsOnRequest(on: boolean): void {
+  onRequest = on;
+}
 
 /**
  * Deliver what is due now instead of at the next tick. The poll waits up to
@@ -623,7 +632,7 @@ export function kickDelivery(deps: DeliveryDeps = {}): Promise<void> {
   // A process that is shutting down claims nothing more: a row it claimed is leased to it for CLAIM_LEASE_SECONDS, and its pools
   // end before it could send it, so the row waited out the lease (2026-11-07 07:14Z: a review handoff kicked in the last
   // milliseconds of a pod reached the person two minutes late). Another replica's poll delivers it within POLL_MS.
-  if (stopping) return Promise.resolve();
+  if (stopping || !onRequest) return Promise.resolve();
   latestDeps = deps;
   if (running) {
     rerun = true;

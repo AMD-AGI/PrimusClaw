@@ -46,7 +46,11 @@ test("the completion handler reaches the outbox only behind the flag, and the wo
   // The retry of a notification a processed completion still owes: behind the same flag.
   assert.match(consumer, /const owed = CLAW_NOTIFICATIONS_ENABLED \? owedRunNotice\(/);
   const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-  assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED\) startNotificationWorker\(\)/);
+  // Started through startup/background.ts, whose `notification_worker` is `when: flags.notifications`.
+  assert.match(index, /\n {4}notification_worker: \(\) => startNotificationWorker\(\),\n/);
+  assert.match(index, /\n {4}notifications: CLAW_NOTIFICATIONS_ENABLED,\n/);
+  const background = readFileSync(new URL("../src/startup/background.ts", import.meta.url), "utf8");
+  assert.match(background, /notification_worker: flags\.notifications,/);
   const db = readFileSync(new URL("../src/infra/db.ts", import.meta.url), "utf8");
   assert.match(db, /if \(CLAW_NOTIFICATIONS_ENABLED\) await ensureNotificationSchema\(client\)/);
 });
