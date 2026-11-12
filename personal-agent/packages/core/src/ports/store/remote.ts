@@ -3,6 +3,7 @@
 
 /** Remote agents: which session a chat is attached to, how far it has read, and the permission cards it showed
  * (tables `remote_state`, `remote_session_names`, `remote_permissions`). */
+import type { Lang } from "../../locales/lang.js";
 
 /** 'card': the chat box goes to the assistant and the session card's input to the session; 'chat': all to the session. */
 export type ChatBox = "card" | "chat";
@@ -107,6 +108,11 @@ export interface RemotePermission {
   readonly messageId: string;
   /** For a question a terminal asks: the whole `remote.ask`, so the card can be drawn again with its content (null otherwise). */
   readonly ask: Readonly<Record<string, unknown>> | null;
+  /**
+   * The language its card was shown in ("" for a card shown before it was kept): what the card is edited to later (answered here,
+   * at the terminal, given up) and a click on it is told are said in it, never in a language read again from something else.
+   */
+  readonly lang: Lang | "";
 }
 
 export interface NewRemotePermission {
@@ -118,6 +124,8 @@ export interface NewRemotePermission {
   readonly expiresAt: number;
   /** For a question a terminal asks: the whole `remote.ask` (see {@link RemotePermission.ask}). */
   readonly ask?: Readonly<Record<string, unknown>>;
+  /** The language the card is shown in (see {@link RemotePermission.lang}). */
+  readonly lang?: Lang;
 }
 
 export interface RemotePermissionRepository {

@@ -166,7 +166,9 @@ export class Deliveries {
   ): Promise<boolean | undefined> {
     const remote = remoteNoticeOf(event);
     if (remote?.resolved !== undefined) {
-      return (await this.endTerminalAsk(userId, conversation, remote.sessionId, remote.resolved)) ? true : undefined;
+      return (await this.endTerminalAsk(userId, conversation, remote.sessionId, remote.resolved, event["text"]))
+        ? true
+        : undefined;
     }
     if (remote?.kind === "needs_you" && remote.ask !== undefined)
       return this.sendRemoteAsk(userId, conversation, event, remote);
@@ -431,6 +433,7 @@ export class Deliveries {
         tool,
         options,
         expiresAt,
+        lang,
         ...(terminal ? { ask: shown.ask } : {}),
       })
     ) {
@@ -473,6 +476,7 @@ export class Deliveries {
     conversation: Conversation,
     sessionId: string,
     resolved: { readonly actionId: string; readonly by: string },
+    said: unknown,
   ): Promise<boolean> {
     const { store } = this.deps;
     const perm = store.remotePermissions.getRemotePermission(sessionId, resolved.actionId);
@@ -485,7 +489,10 @@ export class Deliveries {
       return true;
     }
     if (!perm.messageId) return false;
-    const lang = answerLang(store.prefs.getPrefs(userId).lang, this.clientLocale(), str(perm.ask?.["tool"]));
+    // In the language its card was shown in. (a card from before that was kept: as that card was, from Claw's own words, which
+    // are in the chat's language; never from the tool's name, which is English whatever the chat speaks)
+    const lang =
+      perm.lang || answerLang(store.prefs.getPrefs(userId).lang, this.clientLocale(), said, perm.ask?.["tool"]);
     const words = terminalApprovalText.in(lang);
     const ended =
       resolved.by === "terminal"

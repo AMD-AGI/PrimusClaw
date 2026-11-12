@@ -75,6 +75,7 @@ export const ADDED_COLUMNS: readonly (readonly [string, readonly (readonly [stri
     [
       ["message_id", "TEXT NOT NULL DEFAULT ''"], // '' = the channel never said the card's id
       ["ask_json", "TEXT NOT NULL DEFAULT ''"], // '' = not a question a terminal asks
+      ["lang", "TEXT NOT NULL DEFAULT ''"], // the card's language; '' = shown before it was kept
     ],
   ],
   [

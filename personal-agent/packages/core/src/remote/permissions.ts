@@ -93,7 +93,17 @@ export class Permissions {
     const expiresAt = this.ctx.clock.epochMs() / 1000 + secondsOf(request["timeout_ms"]);
     const words = remoteText.in(lang);
     const tool = textOf(request["tool"]) || words.anAction;
-    if (!this.ctx.permissions.saveRemotePermission({ userId: chatKey, sessionId, actionId, tool, options, expiresAt }))
+    if (
+      !this.ctx.permissions.saveRemotePermission({
+        userId: chatKey,
+        sessionId,
+        actionId,
+        tool,
+        options,
+        expiresAt,
+        lang,
+      })
+    )
       return;
     const who = state ? words.agentOnHost({ agent: state.agentLabel, host: state.host }) : words.theAgent;
     const forget = (): void => {
@@ -138,15 +148,23 @@ export class Permissions {
     return reopenedCard(this.ctx.views.optionButtons(options, perm.sessionId, perm.actionId, lang), title, text);
   }
 
+  /**
+   * What a click is told, and what its card becomes, is said in the language the card was shown in (a card Claw's push drew took
+   * it from Claw's words, which need not be the person's chosen one); for a card from before that was kept, the person's.
+   */
+  private cardLang(perm: RemotePermission | null, person: string): Lang {
+    return perm?.lang || this.state.lang(person);
+  }
+
   /** A click on an option of a permission card (see the module). */
   async decide(click: Decision): Promise<void> {
-    const lang = this.state.lang(click.person);
     const [sessionId, actionId, optionId] = ["session_id", "action_id", "option_id"].map((k) =>
       textOf(own(click.data, k)),
     );
     const perm = this.ctx.settings.enabled
       ? this.ctx.permissions.getRemotePermission(sessionId ?? "", actionId ?? "")
       : null;
+    const lang = this.cardLang(perm, click.person);
     const option = perm ? parseOptions(perm.options).find((o) => o.optionId === optionId) : undefined;
     // (a group binding's request is answered from the binder's 1:1 chat, where its card is shown; nothing else crosses chats)
     const owner =

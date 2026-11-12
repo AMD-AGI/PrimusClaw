@@ -582,3 +582,82 @@ it("the terminal answers while a click is on its way: the end is kept, and the c
   assert.deepEqual(w.surface.outbox.slice(before), []);
   assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.state, "terminal");
 });
+
+/** The title and line a terminal's card was edited to (its `update`), or undefined. */
+function endedAs(w: ReturnType<typeof world>, before: number): { title?: string; text: string } | undefined {
+  const edit = w.surface.outbox.slice(before).find((r) => r.op === "update") as
+    { message: { body: { view: { model: { title?: string; text: string } } } } } | undefined;
+  return edit?.message.body.view.model;
+}
+
+it("the end of a terminal's question is said in the language its card was shown in, whatever the tool's name or the notice says", async () => {
+  // A chat with no chosen or learnt language, outside any message (a push): the card takes Claw's Chinese words; its end
+  // must not fall back to the tool's name ("Run: npm test" reads as English) or to the resolved notice's own words.
+  for (const [by, title] of [
+    ["terminal", "已在终端里回答"],
+    ["timeout", "不再等待回答"],
+    ["session_end", "不再等待回答"],
+  ] as const) {
+    const w = world();
+    await w.proactive.handle(
+      ALICE,
+      w.reference,
+      remoteSay("rs-t", "needs_you", "say-t", { text: "dev-pod 终端里的 claude 在等你回答", ask: aTerminalAsk() }),
+    );
+    assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.lang, "zh");
+    const before = w.surface.outbox.length;
+    const notice = {
+      ...resolvedSay("rs-t", "act-t1", by, "say-r"),
+      text: "(this request was answered in the terminal)",
+    };
+    assert.equal(await w.proactive.handle(ALICE, w.reference, notice), "delivered");
+    const ended = endedAs(w, before);
+    assert.ok(ended !== undefined, by);
+    assert.ok(ended.title?.includes(title), `${by}: ${String(ended.title)}`);
+    assert.ok(
+      !/[A-Za-z]{4,}/.test(`${ended.title ?? ""}${ended.text}`),
+      `${by}: ${String(ended.title)} | ${ended.text}`,
+    );
+  }
+  // And the other way: a card shown in English ends in English, though the person chose Chinese since.
+  const w = world();
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", {
+      text: "claude in a terminal on dev-pod is waiting for you",
+      ask: aTerminalAsk(),
+    }),
+  );
+  w.store.prefs.setLang(ALICE, "zh");
+  const before = w.surface.outbox.length;
+  await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "terminal", "say-r"));
+  assert.equal(endedAs(w, before)?.title?.includes("Answered in the terminal"), true);
+});
+
+it("a terminal's card from before its language was kept ends in the language of Claw's notice, not of the tool's name", async () => {
+  const w = world();
+  await w.proactive.handle(
+    ALICE,
+    w.reference,
+    remoteSay("rs-t", "needs_you", "say-t", { text: "dev-pod 终端里的 claude 在等你回答", ask: aTerminalAsk() }),
+  );
+  // (as a row an earlier version stored: no language)
+  const row = w.store.remotePermissions.getRemotePermission("rs-t", "act-t1");
+  assert.ok(row !== null && row.ask !== null);
+  w.store.remotePermissions.forgetRemotePermission("rs-t", "act-t1");
+  w.store.remotePermissions.saveRemotePermission({
+    userId: row.userId,
+    sessionId: row.sessionId,
+    actionId: row.actionId,
+    tool: row.tool,
+    options: row.options,
+    expiresAt: row.expiresAt,
+    ask: row.ask,
+  });
+  w.store.remotePermissions.setRemotePermissionMessage("rs-t", "act-t1", row.messageId);
+  assert.equal(w.store.remotePermissions.getRemotePermission("rs-t", "act-t1")?.lang, "");
+  const before = w.surface.outbox.length;
+  await w.proactive.handle(ALICE, w.reference, resolvedSay("rs-t", "act-t1", "terminal", "say-r"));
+  assert.equal(endedAs(w, before)?.title?.includes("已在终端里回答"), true);
+});
