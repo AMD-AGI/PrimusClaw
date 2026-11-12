@@ -17,11 +17,11 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ## 0.8.0
 
-A minor release: a worker names its chat surface to Claw so an assistant message returns to the surface it came from
-(#787), core takes its channel's name, id and limits from the surface (#789) and the worker process moves into a
-surface-neutral runtime entry (#788), and a remote approval card ends in the language it was shown in (#794). The
-runtime's SQLite store gains one column (`remote_permissions.lang`), added in place at start; nothing to do for a
-deployment of the published packages.
+A minor release, because its exported API changes incompatibly (#788, #789: listed under Changed): a worker names its
+chat surface to Claw so an assistant message returns to the surface it came from (#787), core takes its channel's name,
+id and limits from the surface (#789) and the worker process moves into a surface-neutral runtime entry (#788), and a
+remote approval card ends in the language it was shown in (#794). The runtime's SQLite store gains one column
+(`remote_permissions.lang`), added in place at start; nothing to do for a deployment of the published packages.
 
 **Claw:** return-to-source routing is Claw's (claw-v0.4.0 and later reads the subscription's `surface`). With an older
 Claw the `surface` this worker sends is ignored and every subscription gets every message, as before; nothing else in
@@ -77,14 +77,11 @@ this release needs a newer Claw.
   terminal" in the tool name's language); a click answered in the person's set language, English when unset. The card's
   language is stored with it (`remote_permissions.lang`); a card stored before falls back to the person's language
   (#794). `/board` redraws such a card in the same stored language, not in the item title's (#796).
-
-### Fixed
-
 - `@primusclaw/personal-agent`: every message to the assistant names the surface it came from
   (`channel_context.channel`, the surface's `SurfaceCaps.channel`), not only a message the assistant reads first
   (`TEAMS_ASSISTANT_UNDERSTANDING`). Claw sends a turn's replies back to that surface (#787); without it a message from a
   second surface was taken as Teams', so a person on both got the reply in Teams. On Teams nothing changes: Claw already
-  read a message that names no surface as Teams'.
+  read a message that names no surface as Teams' (#799).
 
 ## 0.7.2
 
