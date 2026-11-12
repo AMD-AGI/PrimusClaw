@@ -9,9 +9,9 @@
  *
  * Teams is the one channel with words and a rule of its own. Any other channel is said generically ("in the chat") and gets the
  * plugin's generic `chat-reply-style` rule; a channel that needs its own (a markup of its own) gets an entry in CHAT_SURFACES. A
- * message that names no channel came from a client from before it did: the Teams worker.
+ * message that names no channel came from a client from before it did: the Teams worker. Which message a turn reads it from is
+ * `turnChannelTold`'s (`inbound.ts`): the one it answers, read beside the reply language with no query of its own.
  */
-import type { Querier } from "../infra/db.js";
 
 export interface ChatSurface {
   /** The channel's id as its client names it. */
@@ -41,24 +41,4 @@ export function chatSurface(channel: unknown): ChatSurface {
   const id = typeof channel === "string" && channel.length <= CHANNEL_MAX && /^[a-z0-9][a-z0-9-]*$/.test(channel)
     ? channel : DEFAULT_CHANNEL;
   return Object.hasOwn(CHAT_SURFACES, id) ? CHAT_SURFACES[id] : { channel: id, where: "in the chat", replyRules: [CHAT_REPLY_RULE] };
-}
-
-/**
- * The chat surface a router turn answers on: the channel its message came through (a message that names none is the Teams
- * worker's, whatever the person wrote from before). Only a turn that answers no message of the person's (a worker's report woke
- * the assistant: its message has no row here) takes the channel of the person's latest message, read exactly as
- * `chosenReplyLanguage` reads it (the newest row, one row); a latest message that names none is the default's.
- */
-export async function turnChatSurface(q: Querier, sessionId: string, messageId: string): Promise<ChatSurface> {
-  type Row = { channel: unknown };
-  const own = (await q(
-    "SELECT channel_context->>'channel' AS channel FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2",
-    [sessionId, messageId],
-  )).rows[0] as Row | undefined;
-  if (own !== undefined) return chatSurface(own.channel);
-  const latest = (await q(
-    "SELECT channel_context->>'channel' AS channel FROM claw_assistant_messages WHERE session_id = $1 ORDER BY received_at DESC LIMIT 1",
-    [sessionId],
-  )).rows[0] as Row | undefined;
-  return chatSurface(latest?.channel);
 }

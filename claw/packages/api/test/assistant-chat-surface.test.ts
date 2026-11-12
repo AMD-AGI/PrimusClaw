@@ -8,7 +8,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { CHAT_REPLY_RULE, chatSurface, DEFAULT_CHANNEL, turnChatSurface } from "../src/assistant/chat-surface.js";
+import { CHAT_REPLY_RULE, chatSurface, DEFAULT_CHANNEL } from "../src/assistant/chat-surface.js";
+import { chosenReplyLanguage, turnChannelTold } from "../src/assistant/inbound.js";
 import { readToolsOfPlugin, ROUTER_RULES } from "../src/assistant/read-tools.js";
 import { renderRouterReadSection } from "../src/assistant/prompts.js";
 
@@ -42,22 +43,33 @@ test("CS3 the GitHub line tells a person without GitHub to bind it where they ta
   assert.doesNotMatch(other, /Teams/);
 });
 
-test("CS4 a turn's own message decides its channel; only a turn with no message of the person's follows their latest one", async () => {
-  /** A session whose rows are `rows` (message id -> channel_context.channel, null for none), newest last. */
+test("CS4 a turn's own message decides its channel, read beside its reply language; only a turn without one follows the latest", async () => {
+  /** A session whose rows are `rows` (message id -> channel_context.channel, null for none), newest last; the statements run. */
+  const run: string[] = [];
   const querier = (rows: Array<[string, string | null]>) => async (text: string, params?: unknown[]) => {
-    if (text.includes("message_id = $2")) {
+    run.push(text);
+    assert.match(text, /^SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel FROM /);
+    if (text.endsWith("AND message_id = $2")) {
       const row = rows.find(([id]) => id === params?.[1]);
-      return { rows: row ? [{ channel: row[1] }] : [] } as never;
+      return { rows: row ? [{ chosen: "en", channel: row[1] }] : [] } as never;
     }
-    assert.match(text, /ORDER BY received_at DESC LIMIT 1$/); // (one row, as the reply language reads it)
+    assert.match(text, /ORDER BY received_at DESC LIMIT 1$/); // (one row, as the reply language always read it)
     const latest = rows.at(-1);
-    return { rows: latest ? [{ channel: latest[1] }] : [] } as never;
+    return { rows: latest ? [{ chosen: null, channel: latest[1] }] : [] } as never;
   };
+  const channel = async (rows: Array<[string, string | null]>, messageId: string | null) =>
+    chatSurface((await turnChannelTold(querier(rows), "s", messageId)).channel).channel;
   const rows: Array<[string, string | null]> = [["m1", "chatapp"], ["m2", null], ["m3", "teams"], ["m4", "chatapp"]];
-  assert.equal((await turnChatSurface(querier(rows), "s", "m2")).channel, "teams", "a message that names none is Teams'");
-  assert.equal((await turnChatSurface(querier(rows), "s", "m3")).channel, "teams");
-  assert.equal((await turnChatSurface(querier(rows), "s", "m4")).channel, "chatapp");
-  assert.equal((await turnChatSurface(querier(rows), "s", "report")).channel, "chatapp", "no message: the latest one's");
-  assert.equal((await turnChatSurface(querier([...rows, ["m5", null]]), "s", "report")).channel, "teams", "one naming none");
-  assert.equal((await turnChatSurface(querier([]), "s", "report")).channel, "teams");
+  run.length = 0;
+  assert.equal(await channel(rows, "m2"), "teams", "a message that names none is Teams'");
+  assert.equal(run.length, 1, "a message's own row: one statement, by its key");
+  assert.equal(await channel(rows, "m3"), "teams");
+  assert.equal(await channel(rows, "m4"), "chatapp");
+  assert.equal(await channel(rows, null), "chatapp", "a worker's report: the latest message's");
+  assert.equal(await channel(rows, "gone"), "chatapp", "no row of its own: the latest message's");
+  assert.equal(await channel([...rows, ["m5", null]], null), "teams", "a latest that names none");
+  assert.equal(await channel([], null), "teams");
+  // The reply language is what it was: read from the same row.
+  assert.equal((await turnChannelTold(querier(rows), "s", "m4")).chosen, "en");
+  assert.equal(await chosenReplyLanguage(querier(rows), "s", "m4"), "en");
 });

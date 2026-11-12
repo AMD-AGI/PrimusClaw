@@ -26,7 +26,7 @@ import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
-import { replyLanguageFor, withReplyLanguage } from "./language.js";
+import { replyLanguageFor, withReplyLanguage, type ChosenLanguage } from "./language.js";
 import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
 import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
@@ -44,7 +44,7 @@ import { askedOfOthers, askedOfOthersTotals, type AskedOfOthersTotals } from "./
 import { reviewContextFor } from "./review-tools.js";
 import { toldRefs } from "./told.js";
 import { earlierFilesOf, promptImagesOf, renderFilesState } from "./files.js";
-import { chosenReplyLanguage, turnMessage } from "./inbound.js";
+import { turnChannelTold, turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobHttpSources, jobWatchesEnabled } from "./job-watch.js";
@@ -53,7 +53,7 @@ import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./wri
 import { devenvToolsOn } from "./devenv-tools.js";
 import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
-import { turnChatSurface } from "./chat-surface.js";
+import { chatSurface } from "./chat-surface.js";
 import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
 import { commandLanguage } from "./typed-commands.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
@@ -230,12 +230,24 @@ async function earlierUserMessages(sessionId: string): Promise<string[]> {
  * report says nothing about the user's language, so for it the language is their choice as of their latest message, or the one they
  * last wrote in. Only the request changes: the turn that is stored and shown is the user's words as they sent them.
  */
-async function replyLanguageOf(task: Record<string, unknown>, sessionId: string, messageId: string): Promise<string | null> {
+async function replyLanguageOf(task: Record<string, unknown>, sessionId: string, chosen: ChosenLanguage | null): Promise<string | null> {
   const prompt = stringField(task, "prompt");
   if (!prompt) return null;
   const report = prompt.startsWith(WORK_EVENT_PREFIX);
-  const chosen = await chosenReplyLanguage((t, p) => db.query(t, p), sessionId, report ? null : messageId);
   return replyLanguageFor(chosen, report ? null : prompt, () => earlierUserMessages(sessionId));
+}
+
+/**
+ * What the channel told with the message the turn answers (`turnChannelTold`): a worker's report answers none of the person's.
+ * A turn with no words (one the system starts) reads nothing, as the reply language never did for it: nothing chosen, Teams.
+ */
+async function turnTold(
+  task: Record<string, unknown>, sessionId: string, messageId: string,
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined }> {
+  const prompt = stringField(task, "prompt");
+  if (!prompt) return { chosen: null, channel: undefined };
+  const report = prompt.startsWith(WORK_EVENT_PREFIX);
+  return turnChannelTold((t, p) => db.query(t, p), sessionId, report ? null : messageId);
 }
 
 /** The line `replyLanguageOf` worked out, put beside the message. */
@@ -298,8 +310,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
     // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
     // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
-    // The chat app the turn answers on (`chat-surface.ts`): which reply-style rule it is given, and where it is told it is talked to.
-    const surface = await turnChatSurface((t, p) => db.query(t, p), sessionId, messageId);
+    // What the channel told with the message this turn answers (the person's latest, for a worker's report): the language they
+    // chose, and the chat app it came through (`chat-surface.ts`), which picks the reply-style rule and where it is told it is talked to.
+    const told = await turnTold(task, sessionId, messageId);
+    const surface = chatSurface(told.channel);
     const lookups = await routerLookups(role.userId, sessionId, {
       mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key, surface,
     });
@@ -353,7 +367,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
     // The language this turn answers in (`language.ts`), worked out once: beside the message, and in every command the turn's state
     // tells the router the user can type back (`typed-commands.ts`), so that a hint repeated to the user is in their language.
-    const replyLanguage = await replyLanguageOf(task, sessionId, messageId);
+    const replyLanguage = await replyLanguageOf(task, sessionId, told.chosen);
     const commands = commandLanguage(replyLanguage);
     const asked = await askedOfOthersManifest(role.userId);
     const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];

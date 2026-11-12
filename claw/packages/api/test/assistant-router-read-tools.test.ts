@@ -162,8 +162,8 @@ describe("assistant router read tools", { skip }, () => {
     const teams = await send(alice.routerSid, QUESTION);
     assert.deepEqual(teams.plugin_tools.map((t: any) => t.id), [17, 3, 26, 18], "no channel named: Teams' rule");
     assert.match(teams.system_append, /In Teams people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in Teams\./);
-    // The person's latest message names the channel it came through. This turn answers no message of theirs that has a row here
-    // (as a worker's report does), so it follows that one; a message that names no channel itself stays Teams' (CS4).
+    // The person's latest message names the channel it came through. This turn's message has no row here (the test dispatches it
+    // directly), so it follows that one, as a worker's report does; a message whose row names no channel stays Teams' (CS4).
     await w.q(
       `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context)
        VALUES ($1, 'from-chatapp', 'alice', 'hi', '{"channel": "chatapp"}'::jsonb)`,
