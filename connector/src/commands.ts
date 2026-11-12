@@ -17,7 +17,11 @@ import {
 } from "./credentials.js";
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
-import { approvalHooksStatus, HooksError, hooksStatus, type HooksStatus, installApprovalHooks, installHooks, settingsFile, uninstallApprovalHooks, uninstallHooks } from "./hooks.js";
+import {
+  approvalHooksStatus, cursorApprovalHooksStatus, cursorHooksFile, HooksError, hooksStatus, type HooksStatus, installApprovalHooks, installCursorApprovalHooks, installHooks,
+  settingsFile, uninstallApprovalHooks, uninstallCursorApprovalHooks, uninstallHooks,
+} from "./hooks.js";
+import { CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, cursorConfigDir } from "./cursor-approvals.js";
 import { approvalSocketFile } from "./approvals.js";
 import { offerAfter, offerApprovalHooks } from "./approval-offer.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
@@ -121,13 +125,17 @@ terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
     run: (rest, ctx) => cmdInit(rest, ctx),
   },
   hooks: {
-    usage: "hooks install|uninstall|status [--approvals] [--config-dir DIR]",
+    usage: "hooks install|uninstall|status [--approvals] [--agent claude|cursor] [--hold SECONDS] [--config-dir DIR]",
     about: `the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
 in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
 directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed.
 --approvals also adds the approval hooks: a question Claude Code asks in a terminal (run a command,
 edit a file, approve a plan, a multiple-choice question) is also put to you in the chat, and the
-first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those`,
+first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those
+--agent cursor: the same for the Cursor Agent CLI (its hooks.json; needs a "cursor" agent in agents.toml):
+a command or MCP call Cursor would ask about is put on your phone first, and Cursor waits up to
+--hold seconds (default 60) for it; "No" there blocks it, otherwise Cursor asks at the terminal.
+Cursor cannot take a "Yes" from a hook, so approving happens at the terminal`,
     run: (rest, ctx) => cmdHooks(rest, ctx),
   },
   pair: {
@@ -456,10 +464,65 @@ const describeApprovals = (dir: string, changed: boolean): string => changed
   ? `installed the approval hooks in ${settingsFile(dir)}: questions Claude Code asks in a terminal also go to your chat, and the first answer wins ("claw-connector hooks uninstall --approvals" takes them out)`
   : `the approval hooks are already in ${settingsFile(dir)}`;
 
+/** The Cursor configuration directories: those of the `cursor` agents in agents.toml, else the one the CLI uses here. */
+function cursorDirs(ctx: Ctx, flag: string | undefined): string[] {
+  if (flag !== undefined) return [path.resolve(flag)];
+  let dirs: string[] = [];
+  try {
+    dirs = loadCfg(ctx).agents.filter((a) => a.kind === "cursor").map((a) => cursorConfigDir({ ...ctx.env, ...a.env }, a.env.HOME?.trim() || os.homedir()));
+  } catch { /* no usable agents.toml yet: the default directory */ }
+  return dirs.length ? [...new Set(dirs)] : [cursorConfigDir(ctx.env)];
+}
+
+/** `hooks ... --agent cursor`: Cursor has the approval hooks only. */
+function cmdCursorHooks(sub: string, values: { "config-dir"?: string; json?: boolean; approvals?: boolean; hold?: string }, ctx: Ctx): number {
+  let holdS = CURSOR_HOLD_DEFAULT_S;
+  if (values.hold !== undefined) {
+    holdS = Number(values.hold);
+    if (!Number.isInteger(holdS) || holdS < CURSOR_HOLD_MIN_S || holdS > CURSOR_HOLD_MAX_S) {
+      ctx.err(`hooks: --hold takes whole seconds from ${CURSOR_HOLD_MIN_S} to ${CURSOR_HOLD_MAX_S}`);
+      return EXIT.usage;
+    }
+  }
+  if (sub === "install" && !values.approvals) {
+    ctx.err("hooks: for Cursor there are only the approval hooks; run: claw-connector hooks install --approvals --agent cursor");
+    return EXIT.usage;
+  }
+  let code: number = EXIT.ok;
+  const report: Array<Record<string, unknown>> = [];
+  for (const dir of cursorDirs(ctx, values["config-dir"])) {
+    try {
+      if (sub === "install") {
+        if (values["config-dir"] === undefined && !fs.existsSync(dir)) { ctx.err(`no Cursor directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
+        const r = installCursorApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state), holdS);
+        ctx.out(r.changed
+          ? `installed the Cursor approval hooks in ${cursorHooksFile(dir)}: a command or MCP call the Cursor CLI asks about goes to your chat first, and Cursor waits up to ${holdS} s for it ("No" there blocks it; otherwise Cursor asks at the terminal)`
+          : `the Cursor approval hooks are already in ${cursorHooksFile(dir)}`);
+      } else if (sub === "uninstall") {
+        ctx.out(uninstallCursorApprovalHooks(dir).changed ? `removed the Cursor approval hooks from ${cursorHooksFile(dir)}` : `no Cursor approval hooks of ours in ${cursorHooksFile(dir)}`);
+      } else {
+        const st = cursorApprovalHooksStatus(dir);
+        report.push({ dir, agent: "cursor", approvals: st });
+        const say = st.installed ? (st.healthy ? `installed (hold ${st.holdS ?? "?"} s)` : "installed, but broken") : st.events.length ? `partly installed (${st.events.join(", ")})` : "not installed";
+        if (!values.json) ctx.out(`${dir}: cursor approvals: ${say}${st.problem ? `; ${st.problem}` : ""}`);
+      }
+    } catch (e) {
+      ctx.err(e instanceof HooksError ? e.message : `error: ${errMessage(e)}`);
+      code = EXIT.failure;
+    }
+  }
+  if (sub === "status" && values.json) ctx.out(JSON.stringify(report, null, 2));
+  return code;
+}
+
 function cmdHooks(args: string[], ctx: Ctx): number {
   const [sub, ...rest] = args;
-  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--config-dir DIR]"); return EXIT.usage; }
-  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" } } });
+  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--approvals] [--agent claude|cursor] [--config-dir DIR]"); return EXIT.usage; }
+  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" }, agent: { type: "string" }, hold: { type: "string" } } });
+  const agent = values.agent ?? "claude";
+  if (agent !== "claude" && agent !== "cursor") { ctx.err(`hooks: --agent is claude or cursor, not ${JSON.stringify(agent)}`); return EXIT.usage; }
+  if (agent === "cursor") return cmdCursorHooks(sub, values, ctx);
+  if (values.hold !== undefined) { ctx.err("hooks: --hold is for --agent cursor (Claude Code asks at the terminal while the phone has the question)"); return EXIT.usage; }
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
   let code: number = EXIT.ok;

@@ -27,6 +27,10 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { UNATTENDED_MODES } from "./approval-skip.js";
+import {
+  CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, type CursorDecision, type CursorRules, cursorWouldAsk, loadCursorRules, mapCursorRequest,
+  parseCursorEvent,
+} from "./cursor-approvals.js";
 import { boundedInput, type OfferedOption } from "./permissions.js";
 import { redactDeep } from "./redact.js";
 
@@ -46,11 +50,17 @@ export type HookDecision =
   | { behavior: "allow"; updatedInput?: Record<string, unknown>; updatedPermissions?: Array<Record<string, unknown>> }
   | { behavior: "deny"; message: string; interrupt?: boolean };
 
+/** What a hook prints: Claude Code's `PermissionRequest` decision, or a Cursor before-hook's answer (cursor-approvals.ts). */
+export type AnyDecision = HookDecision | CursorDecision;
+
 /** How a request is put to the owner: one card or several (a question each), and how the choices become the hook's decision. */
-export interface Mapping {
+export interface Mapping<D extends AnyDecision = AnyDecision> {
   cards: CardSpec[];
-  /** The decision for the options chosen, one per card in order; null when the choices do not make one (never expected). */
-  decide(chosen: string[]): HookDecision | null;
+  /**
+   * The decision for the options chosen, one per card in order; null when the choices make none (for Claude Code never expected;
+   * for Cursor, "ask me at the terminal").
+   */
+  decide(chosen: string[]): D | null;
 }
 
 /** What Claude Code hands a `PermissionRequest` hook (measured on 2.1.322); everything else in it is ignored. */
@@ -145,7 +155,7 @@ const ruleText = (rules: Array<Record<string, unknown>>): string =>
  * one the terminal also offers; none switches the session into a mode that stops asking (auto, accept edits, bypass), and an
  * "always" answer is kept for this session only.
  */
-export function mapRequest(e: PermissionEvent): Mapping | null {
+export function mapRequest(e: PermissionEvent): Mapping<HookDecision> | null {
   if (e.tool_name === "AskUserQuestion") return mapQuestions(e);
   if (e.tool_name === "ExitPlanMode") return mapPlan(e);
   const shown = shownInput(redactDeep(e.tool_input));
@@ -180,7 +190,7 @@ export function shownInput(masked: unknown): { input: unknown; complete: boolean
 
 interface Question { question: string; header: string; labels: string[]; descriptions: string[] }
 
-function mapQuestions(e: PermissionEvent): Mapping | null {
+function mapQuestions(e: PermissionEvent): Mapping<HookDecision> | null {
   const raw = e.tool_input.questions;
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null;
   const qs: Question[] = [];
@@ -222,7 +232,7 @@ function mapQuestions(e: PermissionEvent): Mapping | null {
   };
 }
 
-function mapPlan(e: PermissionEvent): Mapping {
+function mapPlan(e: PermissionEvent): Mapping<HookDecision> {
   const plan = typeof e.tool_input.plan === "string" ? e.tool_input.plan : "";
   const heading = /^\s*#+\s*(.+)$/m.exec(plan)?.[1] ?? plan.split("\n").find((l) => l.trim() !== "") ?? "";
   const shown = shownInput(redactDeep({ plan, ...(typeof e.tool_input.planFilePath === "string" ? { planFilePath: e.tool_input.planFilePath } : {}) }));
@@ -258,9 +268,12 @@ export const approvalSocketFile = (stateDir: string): string => path.join(stateD
 
 /** One line each way: the hook's request, the connector's answer. */
 export type HookMessage =
-  | { v: 1; type: "ask"; event: Record<string, unknown> }
-  | { v: 1; type: "settled"; event: Record<string, unknown> };
-export type ConnectorReply = { v: 1; decision: HookDecision | null; why?: string };
+  | { v: 1; type: "ask"; event: Record<string, unknown>; agent?: "claude" | "cursor"; hold_ms?: number }
+  | { v: 1; type: "settled"; event: Record<string, unknown>; agent?: "claude" | "cursor" };
+export type ConnectorReply = { v: 1; decision: AnyDecision | null; why?: string };
+
+/** Which coding agent's hooks a request came from. */
+export type HookAgent = "claude" | "cursor";
 
 /** The largest line either side reads: a plan or a file written whole can be long. */
 export const MAX_LINE_BYTES = 2 * 1024 * 1024;
@@ -268,11 +281,13 @@ export const MAX_LINE_BYTES = 2 * 1024 * 1024;
 /** What the broker needs from the running connector. */
 export interface BrokerDeps {
   /** Open (or find) the Claw session for this conversation; null when Claw cannot or will not take it (the reason is returned). */
-  openSession(p: { configDir: string; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }>;
+  openSession(p: { agent: HookAgent; configDir: string; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }>;
   emit(sessionId: string, type: string, data: Record<string, unknown>): void;
   audit(event: string, detail: Record<string, unknown>): void;
   /** How long a card waits before it is withdrawn (the hook then leaves the question to the terminal). */
   ttlMs: number;
+  /** Cursor's rules for a Cursor config directory and the conversation's workspace roots (default: read from their files). */
+  cursorRules?: (configDir: string, workspaceRoots: string[]) => CursorRules;
 }
 
 interface Card { actionId: string; spec: CardSpec; chosen: string | null }
@@ -282,6 +297,8 @@ interface Pending {
   sessionId: string;
   tool: string;
   input: string;
+  /** Cursor: the call's id, which its after-hooks name. */
+  toolUseId: string | null;
   mapping: Mapping;
   cards: Card[];
   reply: (r: ConnectorReply) => void;
@@ -333,26 +350,56 @@ export class ApprovalBroker {
       once({ v: 1, decision: null, why: "no_card_shape" });
       return () => {};
     }
-    const title = oneLine(path.basename(e.cwd), 80) || e.cwd;
-    const opened = await this.d.openSession({ configDir, ref: e.session_id, cwd: e.cwd, title }).catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
+    return this.put({ agent: "claude", configDir, ref: e.session_id, cwd: e.cwd, tool: e.tool_name, input: canon(e.tool_input), toolUseId: null, mapping, waitMs: this.d.ttlMs }, once, () => done);
+  }
+
+  /**
+   * A Cursor before-hook asks (cursor-approvals.ts). A call Cursor would not ask about is answered at once with no decision;
+   * any other is put on the phone for up to `holdMs` (Cursor waits that long), then left to Cursor's own question.
+   */
+  async askCursor(raw: Record<string, unknown>, configDir: string, holdMs: number, reply: (r: ConnectorReply) => void): Promise<() => void> {
+    let done = false;
+    const once = (r: ConnectorReply) => { if (!done) { done = true; reply(r); } };
+    const e = parseCursorEvent(raw);
+    if (!e) { once({ v: 1, decision: null, why: "not_a_cursor_request" }); return () => {}; }
+    const rules = (this.d.cursorRules ?? loadCursorRules)(configDir, e.workspaceRoots);
+    if (!cursorWouldAsk(e, rules)) { once({ v: 1, decision: null, why: "cursor_would_not_ask" }); return () => {}; }
+    const mapping = mapCursorRequest(e);
+    const tool = e.event === "beforeShellExecution" ? "Shell" : `MCP:${e.tool}`;
+    const input = canon(e.event === "beforeShellExecution" ? e.command : e.args);
+    // The hold the hook's entry names, within the bounds `hooks install --hold` takes (a value from the socket is never trusted further).
+    const waitMs = holdMs >= CURSOR_HOLD_MIN_S * 1000 && holdMs <= CURSOR_HOLD_MAX_S * 1000
+      ? Math.min(Math.round(holdMs), this.d.ttlMs)
+      : Math.min(CURSOR_HOLD_DEFAULT_S * 1000, this.d.ttlMs);
+    return this.put({ agent: "cursor", configDir, ref: e.ref, cwd: e.cwd, tool, input, toolUseId: e.toolUseId, mapping, waitMs }, once, () => done);
+  }
+
+  /** Open (or find) the conversation's Claw session, put the request's cards on it and wait for them to be settled. */
+  private async put(
+    q: { agent: HookAgent; configDir: string; ref: string; cwd: string; tool: string; input: string; toolUseId: string | null; mapping: Mapping; waitMs: number },
+    once: (r: ConnectorReply) => void, isDone: () => boolean,
+  ): Promise<() => void> {
+    const { mapping } = q;
+    const title = oneLine(path.basename(q.cwd), 80) || q.cwd;
+    const opened = await this.d.openSession({ agent: q.agent, configDir: q.configDir, ref: q.ref, cwd: q.cwd, title }).catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
     if ("refused" in opened) {
-      this.d.audit("approval_not_sent", { ref: e.session_id, tool: e.tool_name, reason: opened.refused });
+      this.d.audit("approval_not_sent", { ref: q.ref, tool: q.tool, reason: opened.refused });
       once({ v: 1, decision: null, why: opened.refused });
       return () => {};
     }
-    if (done) return () => {};
+    if (isDone()) return () => {};
     const sid = opened.sessionId;
-    if (this.sessions.get(e.session_id) !== sid) {
-      this.sessions.set(e.session_id, sid);
+    if (this.sessions.get(q.ref) !== sid) {
+      this.sessions.set(q.ref, sid);
       this.owned.add(sid);
       // Not `read_only`: Claw refuses a decision on a read-only session. What makes it carry nothing but cards is its origin.
-      this.d.emit(sid, "session_started", { origin: "terminal_hook", ref: e.session_id, title, agent: "claude", cwd: e.cwd });
+      this.d.emit(sid, "session_started", { origin: "terminal_hook", ref: q.ref, title, agent: q.agent, cwd: q.cwd });
     }
     const p: Pending = {
-      id: randomUUID(), ref: e.session_id, sessionId: sid, tool: e.tool_name, input: canon(e.tool_input), mapping,
+      id: randomUUID(), ref: q.ref, sessionId: sid, tool: q.tool, input: q.input, toolUseId: q.toolUseId, mapping,
       cards: mapping.cards.map((spec) => ({ actionId: randomUUID(), spec, chosen: null })),
       reply: once,
-      timer: setTimeout(() => this.settle(p, null, "timeout"), this.d.ttlMs),
+      timer: setTimeout(() => this.settle(p, null, "timeout"), q.waitMs),
     };
     p.timer.unref?.();
     this.pending.set(p.id, p);
@@ -360,11 +407,13 @@ export class ApprovalBroker {
       this.byAction.set(c.actionId, p);
       this.d.emit(sid, "permissionRequest", {
         actionId: c.actionId, tool: c.spec.tool, kind: c.spec.kind, input: c.spec.input, toolCallId: null, options: c.spec.options,
-        timeout_ms: this.d.ttlMs, origin: "terminal_hook", cwd: e.cwd,
+        timeout_ms: q.waitMs, origin: "terminal_hook", cwd: q.cwd,
+        // Cursor asks at the terminal only once the card is answered or its time is up (cursor-approvals.ts), not meanwhile.
+        ...(q.agent === "cursor" ? { terminal_asks: "after_card" } : {}),
         ...(c.spec.questionCount ? { question_index: c.spec.questionIndex, question_count: c.spec.questionCount } : {}),
       });
     }
-    this.d.audit("approval_requested", { session_id: sid, ref: e.session_id, tool: e.tool_name, actions: p.cards.map((c) => c.actionId) });
+    this.d.audit("approval_requested", { session_id: sid, ref: q.ref, agent: q.agent, tool: q.tool, actions: p.cards.map((c) => c.actionId) });
     // The hook went away (SIGTERM: the terminal's answer interrupted the turn): settled as answered there.
     return () => this.settle(p, null, "terminal");
   }
@@ -393,7 +442,9 @@ export class ApprovalBroker {
    * prompt, a turn's end or the session's end settles every request of that conversation.
    */
   settled(raw: Record<string, unknown>): void {
-    if (!isObject(raw) || typeof raw.session_id !== "string") return;
+    if (!isObject(raw)) return;
+    if (typeof raw.conversation_id === "string") { this.settledCursor(raw); return; }
+    if (typeof raw.session_id !== "string") return;
     const ref = raw.session_id;
     const event = raw.hook_event_name;
     const mine = [...this.pending.values()].filter((p) => p.ref === ref);
@@ -405,14 +456,36 @@ export class ApprovalBroker {
     } else if (event === "UserPromptSubmit" || event === "Stop" || event === "SessionEnd") {
       for (const p of mine) this.settle(p, null, "terminal");
     }
-    if (event === "SessionEnd") {
-      const sid = this.sessions.get(ref);
-      if (sid) {
-        this.sessions.delete(ref);
-        this.owned.delete(sid);
-        this.d.emit(sid, "session_closed", { reason: "terminal_ended" });
-      }
+    if (event === "SessionEnd") this.ended(ref);
+  }
+
+  /**
+   * A Cursor event after a call or a turn: the call's result (or failure) settles the request for that call; a new prompt or the
+   * turn's end (Ctrl-C at the terminal ends it while the hook still waits) settles every request of the conversation; the
+   * session's end also closes its Claw session.
+   */
+  private settledCursor(raw: Record<string, unknown>): void {
+    const ref = String(raw.conversation_id);
+    const event = raw.hook_event_name;
+    const mine = [...this.pending.values()].filter((p) => p.ref === ref);
+    if (event === "afterShellExecution" || event === "afterMCPExecution" || event === "postToolUseFailure") {
+      const id = typeof raw.tool_use_id === "string" ? raw.tool_use_id : null;
+      const hit = (id ? mine.find((p) => p.toolUseId === id) : undefined)
+        ?? (event === "afterShellExecution" ? mine.find((p) => p.tool === "Shell" && p.input === canon(raw.command)) : undefined);
+      if (hit) this.settle(hit, null, "terminal");
+    } else if (event === "beforeSubmitPrompt" || event === "stop" || event === "sessionEnd") {
+      for (const p of mine) this.settle(p, null, "terminal");
     }
+    if (event === "sessionEnd") this.ended(ref);
+  }
+
+  /** The conversation ended in the terminal: its Claw session is closed. */
+  private ended(ref: string): void {
+    const sid = this.sessions.get(ref);
+    if (!sid) return;
+    this.sessions.delete(ref);
+    this.owned.delete(sid);
+    this.d.emit(sid, "session_closed", { reason: "terminal_ended" });
   }
 
   /** A close from Claw: its waiting requests go back to the terminal, and the next request opens a session again. */
@@ -428,7 +501,7 @@ export class ApprovalBroker {
     for (const p of [...this.pending.values()]) this.settle(p, null, "connector_restart");
   }
 
-  private settle(p: Pending, decision: HookDecision | null, by: string): void {
+  private settle(p: Pending, decision: AnyDecision | null, by: string): void {
     if (this.pending.get(p.id) !== p) return;
     this.pending.delete(p.id);
     clearTimeout(p.timer);
@@ -475,10 +548,14 @@ export async function serveApprovals(stateDir: string, broker: ApprovalBroker, c
       const event = msg.event;
       if (msg.type === "settled") { broker.settled(event); sock.end(); return; }
       if (msg.type !== "ask") { sock.destroy(); return; }
-      void broker.ask(event, configDirOf(msg as Record<string, unknown>), (r) => {
+      const onReply = (r: ConnectorReply) => {
         gone = null;
         if (!sock.destroyed) sock.end(`${JSON.stringify(r)}\n`);
-      }).then((cancel) => {
+      };
+      const asked = msg.agent === "cursor"
+        ? broker.askCursor(event, configDirOf(msg as Record<string, unknown>), Number(msg.hold_ms), onReply)
+        : broker.ask(event, configDirOf(msg as Record<string, unknown>), onReply);
+      void asked.then((cancel) => {
         if (sock.destroyed) cancel(); else gone = cancel;
       }, (err: unknown) => {
         log("an approval request failed", { error: err instanceof Error ? err.message : String(err) });
