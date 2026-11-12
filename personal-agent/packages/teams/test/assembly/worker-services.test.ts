@@ -14,14 +14,13 @@ import { after, before, it } from "node:test";
 
 import { noMetrics, SecurityLog, silentLogger, type InboundEvent, type Router } from "@primusclaw/personal-agent";
 import { alsRequestScope } from "@primusclaw/personal-agent-runtime";
+import { ON_BEHALF_PATH, workerServices, type WorkerServices } from "@primusclaw/personal-agent-worker";
 
 import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
-import { ON_BEHALF_PATH } from "../../src/assembly/features.js";
-import { buildWorker } from "../../src/assembly/worker.js";
-import { workerServices } from "../../src/assembly/worker-services.js";
-import type { WorkerServices } from "../../src/worker-api.js";
+import { restoreConversationRef } from "../../src/activity/reference.js";
+import { buildWorker, teamsTypedEvent } from "../../src/assembly/worker.js";
 
 const ALICE = "aad-a";
 const REFERENCE = {
@@ -49,7 +48,8 @@ function services() {
     surface,
     securityLog: new SecurityLog(security, noMetrics, alsRequestScope()),
     logger: silentLogger,
-    botName: "Clawy",
+    restoreRef: restoreConversationRef,
+    typedEvent: teamsTypedEvent(silentLogger),
   });
   return { bound, store, surface, security };
 }

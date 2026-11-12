@@ -9,25 +9,30 @@
 import {
   errorName,
   type ConversationRef,
+  type InboundEvent,
+  type JsonObject,
   type Logger,
+  type MessageId,
   type Router,
   type SecurityLog,
   type Surface,
 } from "@primusclaw/personal-agent";
 import type { SqliteStore } from "@primusclaw/personal-agent-runtime";
 
-import { restoreConversationRef } from "../activity/reference.js";
-import { toInboundEvent } from "../activity/inbound/to-event.js";
-import { activityOfReference } from "../activity/outbound.js";
-import type { JsonObject } from "../cards/json.js";
-import type { WorkerServices } from "../worker-api.js";
+import type { WorkerServices } from "./worker-api.js";
 
 export interface ServicesParts {
   readonly store: SqliteStore;
   readonly surface: Surface;
   readonly securityLog: SecurityLog;
   readonly logger: Logger;
-  readonly botName: string;
+  /** A stored conversation reference back as core's (the surface's `restoreRef`). */
+  readonly restoreRef: (stored: JsonObject) => ConversationRef | undefined;
+  /**
+   * `text` as the event the surface would have made of the person's own message `messageId` in `conversation` (the
+   * surface's `typedEvent`); undefined when it cannot be read.
+   */
+  readonly typedEvent: (conversation: ConversationRef, messageId: MessageId, text: string) => InboundEvent | undefined;
 }
 
 /** The services, the router they wait for, and the background tasks to wait for when the worker stops. */
@@ -53,18 +58,17 @@ export function workerServices(parts: ServicesParts): BoundServices {
     hasKey: (userId) => store.links.getKey(userId) !== null,
     conversationOf: (userId) => {
       const stored = store.references.getReference(userId);
-      return stored === null ? undefined : restoreConversationRef(stored);
+      return stored === null ? undefined : parts.restoreRef(stored);
     },
     knownPeople: () => store.members.knownMembers().map((m) => ({ name: m.name, objectId: m.objectId })),
     post: (conversation, text) => surface.conversation(conversation).post({ body: { type: "text", text } }),
     async handleAsTyped(conversation: ConversationRef, userId: string, messageId: string, text: string) {
-      const activity: JsonObject = { ...activityOfReference(conversation.wire as JsonObject, messageId), text };
-      const read = toInboundEvent(activity, { botName: parts.botName, logger });
-      if (!read.ok || read.value?.type !== "message" || read.value.sender.id !== userId) {
+      const read = parts.typedEvent(conversation, messageId, text);
+      if (read?.type !== "message" || read.sender.id !== userId) {
         logger.warn("a message sent on someone's behalf could not be read as theirs; not handled");
         return;
       }
-      await router().handle({ ...read.value, provenance: "on_behalf" });
+      await router().handle({ ...read, provenance: "on_behalf" });
     },
     spawn(task) {
       router();

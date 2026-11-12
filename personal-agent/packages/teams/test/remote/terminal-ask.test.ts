@@ -9,12 +9,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { remoteDomain, remoteView } from "@primusclaw/personal-agent";
+import { remoteAskCard } from "@primusclaw/personal-agent-worker";
 
 import { cardOf, textsOf } from "../../../../test-support/adaptive-card.js";
 import { assertValidCard } from "./card-schema.js";
 import { terminalAskCard } from "../../src/views/remote/index.js";
 import { TERMINAL_CARD_SAFE_BYTES } from "../../src/views/remote/permission-cards.js";
-import { remoteAskCard } from "../../src/assembly/features-assistant.js";
 
 type Json = Record<string, unknown>;
 const COMMAND_OPTIONS = [

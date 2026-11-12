@@ -25,6 +25,7 @@ import {
   readSettings,
   systemClock,
 } from "@primusclaw/personal-agent-runtime";
+import { buildFeatures, workCardPoster, type AssemblyBase } from "@primusclaw/personal-agent-worker";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
 import { inboundMessage } from "../../../../test-support/inbound.js";
@@ -33,9 +34,8 @@ import { SeededRandom } from "../../../../test-support/random.js";
 import { openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
 import { toInboundEvent } from "../../src/activity/inbound/to-event.js";
+import { teamsShape } from "../../src/assembly/worker.js";
 import { teamsSettingsFromEnv } from "../../src/config/env.js";
-import { buildFeatures, type AssemblyBase } from "../../src/assembly/features.js";
-import { workCardPoster } from "../../src/assembly/features-review.js";
 
 const ALICE = { id: "aad-a", channelUserId: "29:aad-a", name: "Alice", email: "" };
 const ITEM = { item_id: "item-7", seq: 7, title: "Review acme/app#825", kind: "review", board_state: "in_progress" };
@@ -102,7 +102,7 @@ function assembled(
   const base: AssemblyBase = {
     settings:
       options.review === false ? { ...settings, githubReview: { ...settings.githubReview, enabled: false } } : settings,
-    teams: teamsSettingsFromEnv({}, { queues: false }),
+    shape: teamsShape(teamsSettingsFromEnv({}, { queues: false })),
     store,
     claw: createClawClient({ baseUrl: claw.url, clock: systemClock }),
     surface,

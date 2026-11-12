@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Fails unless the four npm tarballs are what is meant to be published, and work once installed. Run after
+ * Fails unless the five npm tarballs are what is meant to be published, and work once installed. Run after
  * `npm run build`, from personal-agent/:
  *
  *   node --import tsx scripts/check-pack.ts [--version X.Y.Z] [--repository https://github.com/OWNER/REPO] [--out DIR]
  *
  * It packs each package with `npm pack` and reads the real tarball, never the `files` field. The file list: the bundles,
  * the declarations, the licence, the files a bundle reads at run time, and nothing else (no TypeScript source, test or
- * fixture). The manifest: name, one version for all four, the exact version they name each other by, not private, the
- * licence, the repository directory, the engine, the entries. Then it installs the four tarballs into an empty
+ * fixture). The manifest: name, one version for all five, the exact version they name each other by, not private, the
+ * licence, the repository directory, the engine, the entries. Then it installs the five tarballs into an empty
  * directory outside the workspace and checks what a user gets there: each package imports, the wire contract is compiled
  * into core, the store's schema loads, the worker program runs and refuses an empty environment, the ingress's Function
- * entry loads and registers its messaging endpoint, and a TypeScript file naming the four packages compiles against
+ * entry loads and registers its messaging endpoint, and a TypeScript file naming the five packages compiles against
  * their declarations. The ingress's deployable zip is scripts/build-ingress.ts's.
  *
  * --version pins the version (a release passes its tag's), --repository the repository that publishes (npm refuses a
@@ -48,6 +48,7 @@ const SHIPPED: Readonly<Record<PackageSpec["dir"], readonly string[]>> = {
     "dist/types/protocol/remote-agents.d.ts",
   ],
   runtime: ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts", "dist/sqlite/schema.sql"],
+  worker: ["package.json", "dist/LICENSE", "dist/index.js", "dist/types/index.d.ts"],
   teams: [
     "package.json",
     "dist/LICENSE",
@@ -65,6 +66,7 @@ const ENTRY = { types: "./dist/types/index.d.ts", default: "./dist/index.js" };
 const EXPORTS: Readonly<Record<PackageSpec["dir"], unknown>> = {
   core: { ".": ENTRY },
   runtime: { ".": ENTRY },
+  worker: { ".": ENTRY },
   teams: {
     ".": ENTRY,
     "./connector-hosts": { types: "./dist/types/connector-hosts.d.ts", default: "./dist/connector-hosts.js" },
@@ -177,6 +179,7 @@ export function manifestProblems(
 const PROBE = `
   const core = await import("@primusclaw/personal-agent");
   const runtime = await import("@primusclaw/personal-agent-runtime");
+  const worker = await import("@primusclaw/personal-agent-worker");
   const teams = await import("@primusclaw/personal-agent-teams");
   const hosts = await import("@primusclaw/personal-agent-teams/connector-hosts");
   const ingress = await import("@primusclaw/personal-agent-teams-ingress");
@@ -184,6 +187,8 @@ const PROBE = `
   if (core.CONNECTOR_PACKAGE !== "@primusclaw/connector") problems.push("core does not carry the wire contract (CONNECTOR_PACKAGE)");
   if (typeof core.neutralPlugins !== "function" || typeof core.integrationRegistry !== "function") problems.push("core lacks its plugin entry points");
   if (typeof runtime.openWorkerStore !== "function") problems.push("runtime lacks openWorkerStore");
+  if (typeof worker.assembleWorker !== "function" || typeof worker.runMain !== "function") problems.push("worker lacks assembleWorker or runMain");
+  if (typeof teams.teamsSurface !== "function" || teams.teamsSurface().name !== "teams") problems.push("teams lacks its surface adapter");
   if (typeof teams.buildWorker !== "function" || typeof teams.main !== "function") problems.push("teams lacks buildWorker or main");
   if (hosts.DEFAULT_HOSTS?.[0] !== "smba.trafficmanager.net") problems.push("teams/connector-hosts lacks the Bot Connector host rule");
   if (typeof ingress.createIngress !== "function" || typeof ingress.register !== "function") problems.push("teams-ingress lacks createIngress or register");
@@ -197,7 +202,8 @@ const PROBE = `
 const CONSUMER = [
   'import { neutralPlugins, integrationRegistry, CONNECTOR_PACKAGE, type Plugins, type IntegrationRegistry } from "@primusclaw/personal-agent";',
   'import { openWorkerStore } from "@primusclaw/personal-agent-runtime";',
-  'import { buildWorker, main, type WorkerOptions, type Worker } from "@primusclaw/personal-agent-teams";',
+  'import { assembleWorker, type SurfaceAdapter } from "@primusclaw/personal-agent-worker";',
+  'import { buildWorker, main, teamsSurface, type WorkerOptions, type Worker } from "@primusclaw/personal-agent-teams";',
   'import { ConnectorHosts } from "@primusclaw/personal-agent-teams/connector-hosts";',
   'import { consoleSink, createIngress, register, SERVICE_BUS, type Ingress } from "@primusclaw/personal-agent-teams-ingress";',
   "const plugins: Plugins = neutralPlugins();",
@@ -206,6 +212,10 @@ const CONSUMER = [
   "const pkg: string = CONNECTOR_PACKAGE;",
   "const options: WorkerOptions = {};",
   "const built: Promise<Worker> = buildWorker({}, plugins, options);",
+  "const surface: SurfaceAdapter = teamsSurface();",
+  "const assembled: Promise<Worker> = assembleWorker(surface, {}, plugins);",
+  "// @ts-expect-error a surface adapter has a name and a prepare stage",
+  "assembleWorker({}, {}, plugins);",
   "const exit: Promise<number> = main({});",
   'const hosts: string = new ConnectorHosts().host("https://smba.trafficmanager.net/teams/");',
   "const ingress: Ingress = createIngress({ env: {}, fetch, log: consoleSink, serviceBus: SERVICE_BUS });",
@@ -216,7 +226,7 @@ const CONSUMER = [
   "neutralPlugins(1);",
   "// @ts-expect-error openWorkerStore takes settings",
   "openWorkerStore();",
-  "export { built, exit, hosts, pkg };",
+  "export { assembled, built, exit, hosts, pkg };",
   "",
 ].join("\n");
 

@@ -35,7 +35,6 @@ import {
   PublicPullReader,
 } from "@primusclaw/personal-agent-runtime";
 
-import { restoreConversationRef } from "../activity/reference.js";
 import type { AssistantParts } from "./features-assistant.js";
 import type { AssemblyBase } from "./features-base.js";
 
@@ -126,7 +125,7 @@ function reviewHost(base: AssemblyBase, inputs: ReviewInputs, afterTurn: () => G
 }
 
 function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost): ReviewDeps {
-  const { settings, teams, clock, logger, securityLog } = base;
+  const { settings, shape, clock, logger, securityLog } = base;
   const review = settings.githubReview;
   const fetch = (url: string, init?: RequestInit) => base.fetch(url, init);
   return {
@@ -161,9 +160,9 @@ function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost):
     },
     host,
     followWire,
-    restoreRef: (stored) => restoreConversationRef(stored),
+    restoreRef: (stored) => shape.restoreRef(stored),
     owners: review.owners,
-    installUrl: teams.installHintUrl,
+    installUrl: shape.installHintUrl,
     defaultModel: settings.models.review,
   };
 }

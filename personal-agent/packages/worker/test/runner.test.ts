@@ -5,8 +5,8 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
-import { RecordingLogger } from "../../../../test-support/recording-logger.js";
-import { closeAll } from "../../src/assembly/runner.js";
+import { RecordingLogger } from "../../../test-support/recording-logger.js";
+import { closeAll } from "../src/runner.js";
 
 it("every part is closed even when one before it fails, and the failure is logged by its kind", async () => {
   const closed: string[] = [];

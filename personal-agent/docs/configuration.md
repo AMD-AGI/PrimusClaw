@@ -24,7 +24,7 @@ Where each group is read:
   `packages/teams/src/azure/workload-identity.ts`: how the worker reaches Teams, the queues, its Azure identity, the reply
   style.
 - `packages/runtime/src/github/feedback-worker.ts` (`workerInfoFromEnv`): the image tags a feedback report names.
-- `packages/teams/src/assembly/features-switches.ts`: the feature switches.
+- `packages/worker/src/features-switches.ts`: the feature switches.
 - `packages/teams-ingress/src/settings.ts` and `packages/teams-ingress/src/auth.ts`: the Teams ingress.
 
 ### How switches read

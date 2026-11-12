@@ -31,8 +31,7 @@ import {
   WorkClicks,
 } from "@primusclaw/personal-agent";
 
-import type { Style } from "../config/style.js";
-import type { AssemblyBase, RouterHooks } from "./features-base.js";
+import type { AssemblyBase, ReplyStyle, RouterHooks } from "./features-base.js";
 import { messageFiles } from "./features-text.js";
 
 /** The router's test of a command typed whole (`understanding.exact_command`). */
@@ -88,7 +87,7 @@ export function remoteAskCard(request: Parameters<ConstructorParameters<typeof B
 function assistantChat(
   base: AssemblyBase,
   integrations: Integrations,
-  style: Style,
+  style: ReplyStyle,
   parts: { subs: SubscriptionKeeper | undefined; receipts: Receipts; directChat: DirectChat; board: Board },
   hooks: RouterHooks,
 ): AssistantChatService {
@@ -134,7 +133,7 @@ function actionClicks(actions: AssistantActions): ClickHandler {
 }
 
 export interface AssistantInputs {
-  readonly style: Style;
+  readonly style: ReplyStyle;
   readonly integrations: Integrations;
   /** A review the assistant handed back (`review_for_other`): to the review service, "dropped" without it. */
   readonly reviewHandoff: (userId: string, event: Readonly<Record<string, unknown>>) => "delivered" | "dropped";

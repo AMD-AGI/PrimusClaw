@@ -25,13 +25,11 @@ import {
   turnApprovals,
 } from "@primusclaw/personal-agent";
 
-import { streamsIn, type Style } from "../config/style.js";
-import type { AssemblyBase, RouterHooks } from "./features-base.js";
-import { conversationTypeOf } from "./features-base.js";
+import type { AssemblyBase, ReplyStyle, RouterHooks } from "./features-base.js";
 import { fetchAll } from "./features-text.js";
 
 export interface TurnInputs {
-  readonly style: Style;
+  readonly style: ReplyStyle;
   readonly errors: PublicErrors;
   readonly integrations: Integrations;
 }
@@ -55,7 +53,7 @@ export function turnRunner(base: AssemblyBase, inputs: TurnInputs): TurnRunner {
         style: {
           streamText: style.streamText,
           suggestedReplies: style.suggestedReplies,
-          streamsIn: (kind) => streamsIn(style, conversationTypeOf(kind)),
+          streamsIn: (kind) => style.streamsIn(kind),
         },
         approvals,
         fetchFiles: async (files) => {

@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 
 import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { silentLogger } from "@primusclaw/personal-agent";
+import { StartupError } from "@primusclaw/personal-agent-worker";
 
 import { FederatedCredential, readWorkerKey } from "../azure/workload-identity.js";
 import type { TeamsSettings } from "../config/env.js";
@@ -37,9 +38,7 @@ export interface AssemblyDeps {
   readonly readFile?: (path: string) => Buffer;
 }
 
-export class StartupError extends Error {
-  override name = "StartupError";
-}
+export { StartupError };
 
 /** The bot's token in direct mode (BOT_TOKEN_SOURCE). A federated key that cannot be read stops the worker here, at start. */
 export function botTokenSource(settings: TeamsSettings, deps: AssemblyDeps): TokenSource {

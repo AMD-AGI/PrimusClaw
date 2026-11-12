@@ -27,6 +27,7 @@ import {
   readSettings,
   systemClock,
 } from "@primusclaw/personal-agent-runtime";
+import { buildFeatures, ON_BEHALF_PATH, platformPlugins, type AssemblyBase } from "@primusclaw/personal-agent-worker";
 
 import { FakeHttpServer } from "../../../../test-support/http-server.js";
 import { FakeExchange } from "../../../../test-support/routing/fixtures.js";
@@ -35,10 +36,9 @@ import { RecordingLogger } from "../../../../test-support/recording-logger.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { advanceSeconds, openTestStore } from "../../../../test-support/store.js";
 import { FakeSurface } from "../../../../test-support/surface.js";
-import { teamsSettingsFromEnv } from "../../src/config/env.js";
-import { buildFeatures, ON_BEHALF_PATH, type AssemblyBase } from "../../src/assembly/features.js";
-import { platformPlugins } from "../../src/assembly/plugins.js";
+import { teamsShape } from "../../src/assembly/worker.js";
 import { StartupError } from "../../src/assembly/outbound.js";
+import { teamsSettingsFromEnv } from "../../src/config/env.js";
 import { DEFAULT_STYLE } from "../../src/config/style.js";
 import { toInboundEvent } from "../../src/activity/inbound/to-event.js";
 import { activityOf } from "../../src/messenger/render.js";
@@ -100,7 +100,7 @@ function assembled(
   const requestScope = alsRequestScope();
   const base: AssemblyBase = {
     settings,
-    teams: teamsSettingsFromEnv({}, { queues: false }),
+    shape: teamsShape(teamsSettingsFromEnv({}, { queues: false })),
     store,
     claw: createClawClient({ baseUrl: clawUrl, clock: systemClock }),
     surface,

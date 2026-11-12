@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * @primusclaw/personal-agent-teams: the personal agent on Microsoft Teams. It implements core's Surface for Teams and
- * assembles the worker process; it depends on core and on the runtime's public interface.
+ * @primusclaw/personal-agent-teams: the personal agent on Microsoft Teams. It implements core's Surface for Teams and runs
+ * the worker package's process on it (`teamsSurface`, `buildWorker`, `main`); it depends on core, on the runtime's public
+ * interface and on the worker package, never on another surface package.
  */
 export * from "./caps.js";
 export * from "./activity/reference.js";
@@ -13,6 +14,13 @@ export * from "./cards/view-buttons.js";
 export type { CardElement, Json, JsonObject as CardJson } from "./cards/json.js";
 export * from "./surface.js";
 export * from "./views/index.js";
-export * from "./worker-api.js";
-export { buildWorker } from "./assembly/worker.js";
+export type {
+  BuildWorker,
+  PluginFactory,
+  Worker,
+  WorkerEnv,
+  WorkerOptions,
+  WorkerServices,
+} from "@primusclaw/personal-agent-worker";
+export { buildWorker, teamsSurface } from "./assembly/worker.js";
 export { main } from "./main.js";

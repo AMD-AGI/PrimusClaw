@@ -7,11 +7,17 @@
  *   core     (@primusclaw/personal-agent)          channel-neutral domain: imports itself, zod, and -- from
  *                                                   src/protocol.ts alone -- the Claw wire contract.
  *   runtime  (@primusclaw/personal-agent-runtime)  Node adapters of core's ports: depends on core only.
- *   teams    (@primusclaw/personal-agent-teams)    the Teams channel and the process: depends on core and runtime.
+ *   worker   (@primusclaw/personal-agent-worker)   the worker process on any surface (the features behind the router,
+ *                                                   the store, HTTP, metrics, timers): depends on core and runtime, and
+ *                                                   on no surface. A surface package plugs into it (`SurfaceAdapter`).
+ *   teams    (@primusclaw/personal-agent-teams)    the Teams surface: depends on core, runtime and worker.
  *   teams-ingress (@primusclaw/personal-agent-teams-ingress)  the Teams ingress Function: depends on core and on the
  *                                                   worker's Bot Connector host rule (teams' src/connector-hosts.ts
  *                                                   entry), never on the worker or the runtime.
  *   test-support                                    fakes for tests; never imported by a package's src.
+ *
+ * Every other package is a surface package (teams, a future slack, ...), together with its own helpers named after it
+ * (teams-ingress is teams'). A surface package never imports another surface's package: Slack must not need Teams.
  *
  * The wire contract's own files (claw/packages/protocol/src) are compiled in but are not core's: what they import is
  * the contract's business, so the rules below judge the edges that start in this workspace.
@@ -57,14 +63,32 @@ module.exports = {
     {
       name: "runtime-depends-on-core-only",
       severity: "error",
-      comment: "runtime implements core's ports for Node; a channel depends on it, never the other way.",
+      comment: "runtime implements core's ports for Node; the worker and a channel depend on it, never the other way.",
       from: { path: "^packages/runtime/" },
-      to: { path: "^packages/(teams|teams-ingress)/" },
+      to: { path: "^packages/(?!core/|runtime/)[^/]+/" },
     },
     {
-      name: "teams-depends-on-core-and-runtime",
+      name: "worker-is-surface-neutral",
       severity: "error",
-      comment: "teams uses core and runtime; it never reaches into another channel package.",
+      comment:
+        "The worker runs on whatever surface a surface package brings: it imports core, runtime and Node built-ins, and " +
+        "no surface package, Azure, Bot Framework or other npm package of its own (a surface brings those).",
+      from: { path: "^packages/worker/" },
+      to: { path: ["^packages/(?!core/|runtime/|worker/)[^/]+/", "^node_modules/"] },
+    },
+    {
+      name: "surface-not-to-another-surface",
+      severity: "error",
+      comment:
+        "A surface package (any package but core, runtime and worker) uses core, runtime and worker, and its own helpers " +
+        "named after it (teams-ingress is teams'), never another surface's: slack must not import teams.",
+      from: { path: "^packages/(?!core/|runtime/|worker/)([^/-]+)[^/]*/" },
+      to: { path: "^packages/(?!core/|runtime/|worker/|$1/|$1-)[^/]+/" },
+    },
+    {
+      name: "teams-depends-on-core-runtime-and-worker",
+      severity: "error",
+      comment: "teams uses core, runtime and worker; it never reaches into its ingress Function.",
       from: { path: "^packages/teams/" },
       to: { path: "^packages/teams-ingress/" },
     },
@@ -73,9 +97,9 @@ module.exports = {
       severity: "error",
       comment:
         "The ingress Function loads core and the worker's Bot Connector host rule and nothing else of the workspace: " +
-        "its deployable bundle must not take in the worker or the runtime.",
+        "its deployable bundle must not take in the worker, the Teams surface or the runtime.",
       from: { path: "^packages/teams-ingress/src/" },
-      to: { path: "^packages/(runtime|teams)/", pathNot: "^packages/teams/src/connector-hosts\\.ts$" },
+      to: { path: "^packages/(runtime|worker|teams)/", pathNot: "^packages/teams/src/connector-hosts\\.ts$" },
     },
     {
       name: "packages-through-their-entry",

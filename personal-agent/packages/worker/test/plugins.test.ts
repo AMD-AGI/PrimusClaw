@@ -21,8 +21,8 @@ import {
 } from "@primusclaw/personal-agent";
 import { readSettings } from "@primusclaw/personal-agent-runtime";
 
-import { FakeHttpServer } from "../../../../test-support/http-server.js";
-import { platformPlugins, type PlatformDeps } from "../../src/assembly/plugins.js";
+import { FakeHttpServer } from "../../../test-support/http-server.js";
+import { platformPlugins, type PlatformDeps } from "../src/plugins.js";
 
 let safe: FakeHttpServer;
 let dir: string;

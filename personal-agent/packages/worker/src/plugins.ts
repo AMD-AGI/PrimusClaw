@@ -24,7 +24,7 @@ import {
   HttpKeyRevoker,
 } from "@primusclaw/personal-agent-runtime";
 
-import type { WorkerEnv } from "../worker-api.js";
+import type { WorkerEnv } from "./worker-api.js";
 
 export interface PlatformDeps {
   readonly env: WorkerEnv;

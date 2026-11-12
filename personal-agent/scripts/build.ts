@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Builds the four packages into what npm publishes (from personal-agent/: `npm run build`):
+ * Builds the five packages into what npm publishes (from personal-agent/: `npm run build`):
  *
  *   packages/<pkg>/dist/index.js        one ES module per package, bundled by esbuild (teams also dist/main.js, the
  *                                       program, and dist/connector-hosts.js; teams-ingress also dist/main.js, the
@@ -25,7 +25,7 @@
  *
  * The Teams ingress's deployable Function package (one bundle with its dependencies) is scripts/build-ingress.ts.
  *
- *   node --import tsx scripts/build.ts [core|runtime|teams|teams-ingress ...]
+ *   node --import tsx scripts/build.ts [core|runtime|worker|teams|teams-ingress ...]
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -39,7 +39,7 @@ const protocolSrc = path.resolve(root, "..", "claw", "packages", "protocol", "sr
 
 export interface PackageSpec {
   /** The directory under packages/. */
-  readonly dir: "core" | "runtime" | "teams" | "teams-ingress";
+  readonly dir: "core" | "runtime" | "worker" | "teams" | "teams-ingress";
   readonly name: string;
   /** The entries under src/, each bundled into dist/<entry>.js. */
   readonly entries: readonly string[];
@@ -49,6 +49,7 @@ export interface PackageSpec {
 export const PACKAGES: readonly PackageSpec[] = [
   { dir: "core", name: "@primusclaw/personal-agent", entries: ["index"] },
   { dir: "runtime", name: "@primusclaw/personal-agent-runtime", entries: ["index"] },
+  { dir: "worker", name: "@primusclaw/personal-agent-worker", entries: ["index"] },
   { dir: "teams", name: "@primusclaw/personal-agent-teams", entries: ["index", "main", "connector-hosts"] },
   { dir: "teams-ingress", name: "@primusclaw/personal-agent-teams-ingress", entries: ["index", "main"] },
 ];

@@ -8,7 +8,7 @@
  */
 import { own, pyStrip } from "@primusclaw/personal-agent";
 
-import { StartupError } from "./outbound.js";
+import { StartupError } from "./startup-error.js";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 

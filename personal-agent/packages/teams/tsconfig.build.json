@@ -7,7 +7,8 @@
     "rootDir": "../../..",
     "paths": {
       "@primusclaw/personal-agent": ["../core/dist/types/index.d.ts"],
-      "@primusclaw/personal-agent-runtime": ["../runtime/dist/types/index.d.ts"]
+      "@primusclaw/personal-agent-runtime": ["../runtime/dist/types/index.d.ts"],
+      "@primusclaw/personal-agent-worker": ["../worker/dist/types/index.d.ts"]
     }
   },
   "include": ["src"]
