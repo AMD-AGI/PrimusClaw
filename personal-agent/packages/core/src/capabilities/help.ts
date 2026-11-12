@@ -85,6 +85,8 @@ export interface HelpOptions {
   readonly understanding?: boolean;
   /** The deployment keeps a group's recent messages as background (what the data statement then says it sees). */
   readonly groupContext?: GroupContextKept;
+  /** The chat app's full name (`SurfaceCaps.name`): where the data statement says messages go through. */
+  readonly channel?: string;
 }
 
 function capabilityLine(c: Capability, lang: Lang, current: string | undefined): string {
@@ -172,7 +174,7 @@ export function renderHelp(language: string, options: HelpOptions = {}): string 
             `This group's language is set here: @${bot} "use English in this group" (or Chinese, or "follow the asker").`,
     );
   // (every help: 1:1, group and the assistant's)
-  out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"), options.groupContext));
+  out.push(dataStatement(lang, !chat.group && chat.parts.has("remote"), options.groupContext, options.channel));
   out.push(
     zh
       ? "随时问我「你能做什么」看这份说明。底部菜单里也有常用的按钮。"

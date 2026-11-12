@@ -6,9 +6,9 @@ import { defineCatalog } from "./catalog.js";
 /** Connecting a chat to an account: the `/link` steps, the identity binding, `/link` and `/unlink` outcomes. */
 export const linkText = defineCatalog({
   en: {
-    linkSteps: (p: { lead: string; bot: string; page: string; notice: string }) =>
+    linkSteps: (p: { lead: string; bot: string; page: string; notice: string; channel: string }) =>
       `${p.lead}To use ${p.bot}, connect your PrimusClaw account first. Open this page, sign in, and select Connect ` +
-      `Microsoft Teams:\n\n${p.page}\n\n` +
+      `${p.channel}:\n\n${p.page}\n\n` +
       "You will get a short code; send `/link CODE` here (valid for 10 minutes, works once).\n\n" +
       p.notice,
     platformDown: "I could not reach the Primus platform to check your connection. Please try again in a minute.",
@@ -30,7 +30,7 @@ export const linkText = defineCatalog({
   },
   zh: {
     linkSteps: (p) =>
-      `${p.lead}要使用 ${p.bot}，请先连上你的 PrimusClaw 账号。打开这个页面，登录后选择 Connect Microsoft Teams：\n\n` +
+      `${p.lead}要使用 ${p.bot}，请先连上你的 PrimusClaw 账号。打开这个页面，登录后选择 Connect ${p.channel}：\n\n` +
       `${p.page}\n\n你会拿到一个短码；在这里发 \`/link CODE\`（CODE 换成短码，10 分钟内有效，只能用一次）。`,
     platformDown: "I could not reach the Primus platform to check your connection. Please try again in a minute.",
     notConfirmedYet: "我还没看到你的确认。",
@@ -50,8 +50,21 @@ export const linkText = defineCatalog({
   },
 });
 
-/** The name the linked key has in SaFE (the console creates it under this name). */
-export const LINK_KEY_NAME = "PrimusClaw Teams";
+/**
+ * The console's page that gives a `/link` code for the channel `channel` (`SurfaceCaps.channel`), e.g.
+ * `<console>/primus-claw/teams-link`.
+ */
+export function linkPage(publicBaseUrl: string, channel: string): string {
+  return `${publicBaseUrl}/primus-claw/${channel}-link`;
+}
+
+/**
+ * The name the linked key has in SaFE (the console creates it under this name): "PrimusClaw " and the channel's short
+ * name (`SurfaceCaps.shortName`), e.g. "PrimusClaw Teams".
+ */
+export function linkKeyName(shortName: string): string {
+  return `PrimusClaw ${shortName}`;
+}
 
 /** `/unlink`. */
 export const unlinkText = defineCatalog({
@@ -60,7 +73,8 @@ export const unlinkText = defineCatalog({
       "This chat acts as you through a SaFE identity binding, which only you can remove: " +
       "delete it in SaFE under identity bindings. Until then I keep working for you.",
     deleted: "The API key was deleted.",
-    notDeleted: `I could not delete the API key named "${LINK_KEY_NAME}"; please delete it in SaFE under API keys.`,
+    notDeleted: (p: { key: string }) =>
+      `I could not delete the API key named "${p.key}"; please delete it in SaFE under API keys.`,
     stillBound:
       " This chat is still connected through a SaFE identity binding, which only you can remove: " +
       "delete it in SaFE under identity bindings.",
@@ -70,7 +84,7 @@ export const unlinkText = defineCatalog({
     bindingOnly:
       "这个聊天通过 SaFE 身份绑定以你的身份工作，只有你能删除这个绑定：在 SaFE 的身份绑定里删除。删除之前我会继续为你工作。",
     deleted: "API key 已删除。",
-    notDeleted: `我没能删除 API key "${LINK_KEY_NAME}"; 请在 SaFE 的 API keys 里删除。`,
+    notDeleted: (p) => `我没能删除 API key "${p.key}"; 请在 SaFE 的 API keys 里删除。`,
     stillBound: "这个聊天仍通过 SaFE 身份绑定连着，只有你能删除它：在 SaFE 的身份绑定里删除。",
     unlinked: (p) => `已断开。${p.tail}`,
   },

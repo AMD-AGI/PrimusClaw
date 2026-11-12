@@ -57,7 +57,7 @@ export class HttpSessions implements ClawSessionsPort {
       name: cpHead(session.text, 50),
       mode: "claw",
       config: sessionConfig(session),
-      ...(withMessage ? { message: await this.#textMessage(key, session.text, acting) } : {}),
+      ...(withMessage ? { message: await this.#textMessage(key, session.text, acting, session.channel ?? "") } : {}),
     };
     const model = session.model !== undefined && session.model !== "" ? session.model : this.defaults.model;
     const sent = model === "" ? body : { ...body, model };
@@ -109,7 +109,7 @@ export class HttpSessions implements ClawSessionsPort {
     options: SendOptions = {},
   ): Promise<string | null> {
     const headers = modelKeyHeader(key, options.modelKey);
-    const body = await this.#textMessage(key, text, options.acting ?? false);
+    const body = await this.#textMessage(key, text, options.acting ?? false, options.channel ?? "");
     const path = `/v1/sessions/${segment(sessionId)}/messages`;
     return messageIdOf(await this.http.json({ method: "POST", path, key, body, headers }));
   }
@@ -216,14 +216,14 @@ export class HttpSessions implements ClawSessionsPort {
   /**
    * A person's message, carrying the plugin id the way the web client does. A session that acts as a user gets the
    * text alone: no plugin (its tools act with the requester's own key, and such a session reads a stranger's pull
-   * request) and nothing appended.
+   * request) and nothing appended. `channel`: the chat app's short name the appended headings carry.
    */
-  async #textMessage(key: ClawCredential, text: string, acting: boolean): Promise<JsonObject> {
+  async #textMessage(key: ClawCredential, text: string, acting: boolean, channel: string): Promise<JsonObject> {
     if (acting) return { content: text, messageType: "text" };
     const { rule, pluginId } = this.defaults;
     const ruleText = rule === null ? "" : await rule.text(key);
     return {
-      content: messageContent(text, ruleText, rule !== null),
+      content: messageContent(text, ruleText, rule !== null, channel),
       messageType: "text",
       ...(pluginId === null ? {} : { pluginId }),
     };

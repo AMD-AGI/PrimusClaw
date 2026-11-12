@@ -17,7 +17,7 @@ import { hostnameOf, sourceName, sourceUrl } from "./citation-sources.js";
 
 export { CITATION_NAME_MAX, SOURCE_TITLE_INPUT_MAX, SOURCE_URL_MAX, sourceName } from "./citation-sources.js";
 
-/** Teams shows at most 20 citations on a message. */
+/** The citations kept of a reply when the channel's own limit is not given (`SurfaceCaps.citationsMax`). */
 export const CITATIONS_MAX = 20;
 export const CITATION_ABSTRACT_MAX = 160;
 
@@ -152,19 +152,19 @@ function citationOf(source: Record<string, unknown>, cited: ReadonlySet<number>)
 }
 
 /**
- * The Teams citations of an assistant reply: one per source it carries (`[{n, url, title, kind}]`) whose `[n]` the
- * text has, in number order, at most CITATIONS_MAX. A source that is not well formed, repeats a number or is not cited
- * in the text is left out.
+ * The citations of an assistant reply: one per source it carries (`[{n, url, title, kind}]`) whose `[n]` the text has,
+ * in number order, at most `max` (the channel's `SurfaceCaps.citationsMax`). A source that is not well formed, repeats a
+ * number or is not cited in the text is left out.
  *
  * One difference from Python, which JSON parsing makes: `{"n": 1.0}` is a float there (refused) and the number 1 here
  * (accepted).
  */
-export function citationsFromSources(text: string, sources: unknown): Citation[] {
+export function citationsFromSources(text: string, sources: unknown, max = CITATIONS_MAX): Citation[] {
   if (!Array.isArray(sources)) return [];
   const cited = citedNumbers(text);
   const out = new Map<number, Citation>();
   for (const source of sources as unknown[]) {
-    if (out.size >= CITATIONS_MAX) break;
+    if (out.size >= max) break;
     if (typeof source !== "object" || source === null || Array.isArray(source)) continue;
     const citation = citationOf(source as Record<string, unknown>, cited);
     if (citation && !out.has(citation.position)) out.set(citation.position, citation);

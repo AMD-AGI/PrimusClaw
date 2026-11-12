@@ -26,7 +26,10 @@ export type Mask = (text: string) => string;
 
 export const FEEDBACK_LABEL = "clawy-feedback";
 export const LABEL_COLOR = "d93f0b";
-export const LABEL_DESCRIPTION = "Reported by a user from Teams through Clawy";
+/** The feedback label's description: who reports, from the chat app `channel` (`SurfaceCaps.shortName`, e.g. "Teams"). */
+export function labelDescription(channel: string): string {
+  return `Reported by a user from ${channel} through Clawy`;
+}
 
 const TITLE_TEXT_CHARS = 60;
 const TITLE_MAX_CHARS = 120;

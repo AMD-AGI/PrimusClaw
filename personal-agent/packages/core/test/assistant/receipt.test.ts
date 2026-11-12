@@ -137,6 +137,19 @@ it("a receipt that hears nothing closes itself in time keeping what it showed", 
   assert.equal(receipt.done, true);
 });
 
+it("a receipt closes itself a minute before its channel would close the stream", async () => {
+  const clock = new FakeClock();
+  const receipts = new Receipts(clock, silentLogger);
+  const stream = Object.assign(new FakeReceiptStream(), { lifetimeSeconds: 300 });
+  const receipt = await receipts.openIn("c1", "en", () => Promise.resolve(stream));
+  assert.ok(receipt);
+  await clock.advance(240 * 1000 - 1);
+  assert.equal(stream.finals().length, 0);
+  await clock.advance(1);
+  assert.equal(stream.finals().length, 1);
+  assert.equal(RECEIPT_CLOSE_SECONDS, 540); // (a channel that keeps a stream 10 minutes, Teams: as before)
+});
+
 it("words that do not grow or pass the limit are not shown", async () => {
   const { stream, receipt } = await opened();
   receipt.head = "💬 **Clawy**";

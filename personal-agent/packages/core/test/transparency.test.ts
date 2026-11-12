@@ -11,7 +11,7 @@ import type { Part } from "../src/capabilities/registry.js";
 import { menuCommand } from "../src/commands/parse.js";
 import {
   AI_NOTICE,
-  DATA_LINES,
+  dataLines,
   DATA_TITLE,
   dataStatement,
   groupContextLines,
@@ -47,6 +47,7 @@ test("test_where_remote_agents_are_on_a_1to1_help_says_an_attached_chat_goes_to_
 });
 
 test("test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_to_stop", () => {
+  const DATA_LINES = dataLines("Microsoft Teams");
   const en = DATA_LINES.en.join(" ");
   for (const words of [
     "only the messages you send me",
@@ -69,6 +70,16 @@ test("test_the_data_statement_says_what_is_seen_where_it_goes_how_long_and_how_t
   const zh = DATA_LINES.zh.join(" ");
   for (const words of ["@我", "Primus SaFE", "AMD APIM", "运行在 Primus 上", "约一周", "30 天", "停一下", "并不抹掉"]) {
     assert.ok(zh.includes(words), words);
+  }
+  assert.ok(zh.includes("经 Microsoft Teams 到"));
+});
+
+test("the data statement names the chat app the messages come through, and no other", () => {
+  for (const lang of ["en", "zh"] as const) {
+    const other = renderHelp(lang, { parts: PARTS, channel: "Chat App" });
+    assert.ok(other.includes(dataStatement(lang, true, undefined, "Chat App")) && other.includes("Chat App"));
+    assert.ok(!other.includes("Teams"), lang);
+    assert.ok(renderHelp(lang, { parts: PARTS, channel: "Microsoft Teams" }).includes("Microsoft Teams"), lang);
   }
 });
 
@@ -98,14 +109,14 @@ test("where a group's recent messages are kept, the data statement says what, fo
       // The one "what I see" line becomes these, in its place; every other line is as before.
       assert.deepEqual(lines.slice(2, 3 + added.length), [`- ${SEES_LINE[lang]}`, ...added]);
       assert.deepEqual([...lines.slice(0, 2), ...lines.slice(3 + added.length)], [...old.slice(0, 2), ...old.slice(3)]);
-      assert.equal(old[2], `- ${DATA_LINES[lang][1] ?? ""}`);
+      assert.equal(old[2], `- ${dataLines()[lang][1] ?? ""}`);
     }
     // Off (the default): the statement, and help, keep a group's @mentions as all it sees.
     assert.ok(!dataStatement(lang).includes("/context off"));
     for (const group of [false, true]) {
       const on = renderHelp(lang, { group, parts: PARTS, groupContext: kept });
-      assert.ok(on.includes(dataStatement(lang, !group, kept)) && !on.includes(DATA_LINES[lang][1] ?? "-"));
-      assert.ok(renderHelp(lang, { group, parts: PARTS }).includes(DATA_LINES[lang][1] ?? "-"));
+      assert.ok(on.includes(dataStatement(lang, !group, kept)) && !on.includes(dataLines()[lang][1] ?? "-"));
+      assert.ok(renderHelp(lang, { group, parts: PARTS }).includes(dataLines()[lang][1] ?? "-"));
     }
   }
 });

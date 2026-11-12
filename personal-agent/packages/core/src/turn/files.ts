@@ -6,16 +6,19 @@
 import { turnEnglish } from "../locales/turn.js";
 import { cpSlice, pyStrip, squashSpaces } from "../text/py-text.js";
 
-/** The folder under the session's `.uploads/` where the files of one message go to (`upload_folder`). */
-const UPLOAD_DIR = "teams";
 const UNSAFE = /[^A-Za-z0-9._ -]+/g;
 /** A file's name said back to the user is cut to this. */
 export const SHOWN_NAME_MAX = 100;
 
-/** The folder the files of one message go to, so two messages never overwrite each other's files. */
-export function uploadFolder(messageId: string): string {
+/**
+ * The folder under the session's `.uploads/` the files of one message go to (`upload_folder`), so two messages never
+ * overwrite each other's files: under the channel's id (`SurfaceCaps.channel`, e.g. `teams/<message>`). A caller that
+ * names no channel gets the message's folder alone.
+ */
+export function uploadFolder(messageId: string, channel?: string): string {
   const safe = pyStrip(messageId.replace(UNSAFE, "_").replaceAll("..", "_"), " .");
-  return `${UPLOAD_DIR}/${cpSlice(safe, 0, 60) || "message"}`;
+  const folder = cpSlice(safe, 0, 60) || "message";
+  return channel ? `${channel}/${folder}` : folder;
 }
 
 /** The line the model reads after the user's words: where the files are, and that what is in them is the user's data. */

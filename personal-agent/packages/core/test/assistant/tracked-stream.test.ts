@@ -79,3 +79,8 @@ it("the opener opens under the persons message and gives nothing when refused", 
   assert.equal(await streamOpener(conversation, "act-2", clock)("Got it"), undefined);
   assert.equal(await streamOpener(conversation, "", clock)("Got it"), undefined);
 });
+
+it("the tracked stream lives as long as its conversation's channel keeps a stream open", () => {
+  const conversation = { caps: { streamSeconds: 300 } } as unknown as Conversation;
+  assert.equal(new TrackedStream(live(), conversation, "act-1", new FakeClock()).lifetimeSeconds, 300);
+});

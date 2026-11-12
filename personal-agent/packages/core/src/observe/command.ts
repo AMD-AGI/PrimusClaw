@@ -30,14 +30,16 @@ export function parseObserve(text: string): ObserveVerb | undefined {
   return VERBS.get(words[1]?.toLowerCase() ?? "") ?? "usage";
 }
 
-const SCOPE_PREFIX = "group:teams:";
 /** Claw's `group:<channel>:<id>` takes an id of at most 160 characters, with no white space. */
 const SCOPE_ID_MAX = 160;
 
-/** The scope a group chat is to Claw, or undefined when its id cannot be one. */
-export function scopeOf(conversationId: string): string | undefined {
+/**
+ * The scope a group chat is to Claw, `group:<channel>:<id>` (`channel` is `SurfaceCaps.channel`, e.g.
+ * `group:teams:19:...@thread.v2`), or undefined when its id cannot be one.
+ */
+export function scopeOf(conversationId: string, channel: string): string | undefined {
   if (!conversationId || cpLength(conversationId) > SCOPE_ID_MAX || Array.from(conversationId).some(isPySpace)) {
     return undefined;
   }
-  return SCOPE_PREFIX + conversationId;
+  return `group:${channel}:${conversationId}`;
 }

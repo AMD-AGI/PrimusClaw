@@ -53,11 +53,18 @@ export interface ThumbsDeps {
   readonly log: Logger;
 }
 
-/** The key a thumb is stored under in Claw: `teams:<message id>`, hashed when Claw would refuse it as it is. */
-export function voteMessageId(sha256Hex: (text: string) => string, messageId: string): string | undefined {
+/**
+ * The key a thumb is stored under in Claw: `<channel>:<message id>` (`channel` is `SurfaceCaps.channel`, e.g.
+ * `teams:<activity id>`), hashed when Claw would refuse it as it is.
+ */
+export function voteMessageId(
+  sha256Hex: (text: string) => string,
+  messageId: string,
+  channel: string,
+): string | undefined {
   if (!pyStrip(messageId)) return undefined;
-  const key = `teams:${messageId}`;
-  return VOTE_MESSAGE_ID.test(key) ? key : `teams:${sha256Hex(messageId).slice(0, 40)}`;
+  const key = `${channel}:${messageId}`;
+  return VOTE_MESSAGE_ID.test(key) ? key : `${channel}:${sha256Hex(messageId).slice(0, 40)}`;
 }
 
 export class FeedbackThumbs {
@@ -168,7 +175,7 @@ export class FeedbackThumbs {
   }
 
   private async voteInClaw(route: RouteBase, messageId: string, reaction: Reaction, words: string): Promise<string> {
-    const key = voteMessageId(this.deps.sha256Hex, messageId);
+    const key = voteMessageId(this.deps.sha256Hex, messageId, route.conversation.caps.channel);
     if (key === undefined) return "no message to vote on";
     const credential = await this.deps.credential(route.sender);
     if (!credential) return "not linked";

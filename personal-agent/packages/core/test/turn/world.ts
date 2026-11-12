@@ -7,6 +7,7 @@
  * context builder with the worker's defaults.
  */
 
+import { ALL_CAPS } from "../../../../test-support/surface.js";
 import { ClawError } from "../../src/claw/errors.js";
 import type { SseEvent } from "../../src/claw/model.js";
 import type { JsonObject } from "../../src/json.js";
@@ -98,6 +99,7 @@ export interface BusOptions {
  * `chat` is the messages the user sees (posts, edited in place, minus the deleted ones).
  */
 export class Bus implements TurnSurface {
+  readonly caps = ALL_CAPS;
   readonly sent: Sent[] = [];
   readonly at: number[] = [];
   readonly shown = new Map<string, string>();

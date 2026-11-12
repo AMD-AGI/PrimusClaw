@@ -273,8 +273,35 @@ export interface OutMessage {
   readonly citations?: readonly Citation[];
 }
 
+/**
+ * Which channel this is, as core names it to Claw, keys what it stores per channel, and says it to a person. Core holds
+ * no channel's name of its own: everything it says or stores about the channel comes from here.
+ */
+export interface SurfaceIdentity {
+  /**
+   * The channel's id: what Claw is told the message came through (`channel_context.channel`), and the prefix of what is
+   * kept per channel (a vote's key, a message's upload folder, a group's scope, the console's link page). Lower case
+   * letters, digits and "-" only, e.g. "teams".
+   */
+  readonly channel: string;
+  /** The channel's full name as a person reads it ("Microsoft Teams"). */
+  readonly name: string;
+  /** Its short name ("Teams"). */
+  readonly shortName: string;
+}
+
+/** How much of a decoration a message carries, and how long a live stream stays open, on this channel. */
+export interface SurfaceLimits {
+  /** Citations shown on one message. */
+  readonly citationsMax: number;
+  /** Suggested replies shown under one message. */
+  readonly suggestionsMax: number;
+  /** Seconds after its first request that the channel closes a live stream itself. */
+  readonly streamSeconds: number;
+}
+
 /** What the channel can do, so core picks the shape that works instead of trying and failing. */
-export interface SurfaceCaps {
+export interface SurfaceCaps extends SurfaceIdentity, SurfaceLimits {
   /** A live, growing status/answer bubble (`LiveStream`). */
   readonly streaming: boolean;
   /** `post` returns the id of the new message (so it can be edited later). */
@@ -286,6 +313,9 @@ export interface SurfaceCaps {
   readonly citations: boolean;
   readonly suggestions: boolean;
 }
+
+/** A channel id as `SurfaceIdentity.channel` allows it. */
+export const SURFACE_CHANNEL = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /** A message could not be removed (the channel cannot delete, or it refused). The message is still there. */
 export interface DeleteUnsupported {
@@ -341,6 +371,13 @@ export type Envelope = JsonObject;
  */
 export interface Conversation {
   readonly ref: ConversationRef;
+  /** The caps of the channel this conversation is on (`Surface.caps`). */
+  readonly caps: SurfaceCaps;
+  /**
+   * The message this conversation's reference was read from (Teams: the reference's activity id): the person's message
+   * a live stream for it answers. "" when the reference names none (a new 1:1 chat).
+   */
+  readonly replyTo: MessageId;
   /** The messages this conversation has tried to replace (a clicked card is settled when its id is here). */
   readonly edited: ReadonlySet<MessageId>;
   /**

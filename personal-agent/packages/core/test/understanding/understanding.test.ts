@@ -140,6 +140,25 @@ test("the people a message names are read as the Python worker read them", () =>
   for (const { person, keys } of PARITY.keys) assert.deepEqual([...memberKeys(rosterOf(person))].sort(), keys);
 });
 
+test("mentions as the channel gave them name the same people as the older assembly's records of them", () => {
+  const asGiven = (m: Mention): Mention => {
+    const who = (m as unknown as { mentioned?: Record<string, unknown> }).mentioned ?? {};
+    const text = (v: unknown) => (typeof v === "string" ? v : "");
+    return { channelUserId: text(who["id"]), userId: text(who["aadObjectId"]), name: text(who["name"]) };
+  };
+  let mentioned = 0;
+  for (const row of PARITY.people) {
+    const mentions = PARITY.mentions[row.mentions] ?? [];
+    mentioned += mentions.length;
+    assert.deepEqual(
+      peopleOf(mentions.map(asGiven), row.text, PARITY.known, userIdOf, aadOf),
+      row.people,
+      `${row.text} (mentions ${String(row.mentions)})`,
+    );
+  }
+  assert.ok(mentioned > 0);
+});
+
 test("a stop is read as the Python worker read it", () => {
   for (const row of PARITY.stops) assert.deepEqual(reviewStop(row.text), row.pulls, row.text);
 });
@@ -186,15 +205,34 @@ test("what waits, the attached session and the whole context are said as the con
     attached: { session: "s".repeat(200), live: true },
   });
   const people = [{ name: "Lin Mei", user_id: "u-lm", source: "known" as const }];
-  assert.deepEqual(channelContext({ channelMessageId: "m1", people, pending: [], actions: [{ name: "brief" }] }), {
-    channel: "teams",
-    channel_message_id: "m1",
-    people,
-    actions: [{ name: "brief" }],
-    pending: [],
-  });
+  assert.deepEqual(
+    channelContext({ channel: "teams", channelMessageId: "m1", people, pending: [], actions: [{ name: "brief" }] }),
+    {
+      channel: "teams",
+      channel_message_id: "m1",
+      people,
+      actions: [{ name: "brief" }],
+      pending: [],
+    },
+  );
+  // (no channel given: the key is still first, for the router to fill with the conversation's channel)
+  assert.deepEqual(
+    Object.keys(channelContext({ channelMessageId: "m1", people, pending: [], actions: [] }))[0],
+    "channel",
+  );
+  assert.deepEqual(
+    channelContext({ channel: "chatapp", channelMessageId: "m1", people, pending: [], actions: [{ name: "brief" }] }),
+    {
+      channel: "chatapp",
+      channel_message_id: "m1",
+      people,
+      actions: [{ name: "brief" }],
+      pending: [],
+    },
+  );
   assert.deepEqual(
     channelContext({
+      channel: "teams",
       channelMessageId: "m2",
       people: [],
       pending: [],

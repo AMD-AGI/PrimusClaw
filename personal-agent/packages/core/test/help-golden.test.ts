@@ -63,6 +63,7 @@ test("help is rendered byte for byte as the Python worker renders it", () => {
       values: row.values ?? {},
       lead: row.lead ?? "",
       ...(row.bot === undefined ? {} : { bot: row.bot }),
+      channel: "Microsoft Teams", // (the goldens are the Teams worker's)
     });
     if (row.text !== undefined) assert.equal(text, row.text);
     else if (sha256(text) !== row.sha256) differences.push(JSON.stringify({ ...row, sha256: undefined }));
@@ -76,5 +77,7 @@ test("the actions a chat declares are the Python worker's", () => {
 });
 
 test("the data statement is the Python worker's", () => {
-  for (const row of golden.statement) assert.equal(dataStatement(row.lang, row.remote), row.text);
+  for (const row of golden.statement) {
+    assert.equal(dataStatement(row.lang, row.remote, undefined, "Microsoft Teams"), row.text);
+  }
 });

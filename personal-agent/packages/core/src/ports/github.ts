@@ -113,14 +113,21 @@ export interface ListedMention {
 /**
  * One small model call that says what a message asks for, with the asker's own key. undefined for anything but an answer in
  * time (no model, the gateway refused or was slow): the rules read it instead. `{ intent: null }` when it answered something
- * that is not a JSON object.
+ * that is not a JSON object. `channel` is the full name of the chat app the message came through (`SurfaceCaps.name`),
+ * which the model is told.
  */
 export interface IntentReader {
-  read(key: string, text: string, mentions: readonly ListedMention[]): Promise<Record<string, unknown> | undefined>;
-  readMode(key: string, text: string): Promise<Record<string, unknown> | undefined>;
+  read(
+    key: string,
+    text: string,
+    mentions: readonly ListedMention[],
+    channel: string,
+  ): Promise<Record<string, unknown> | undefined>;
+  readMode(key: string, text: string, channel: string): Promise<Record<string, unknown> | undefined>;
   readAnswer(
     key: string,
     text: string,
     pending: readonly Readonly<Record<string, string>>[],
+    channel: string,
   ): Promise<Record<string, unknown> | undefined>;
 }

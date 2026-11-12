@@ -5,7 +5,7 @@
  * The assistant's receipt (teams_agent/stream.py, the receipt half): a message to the assistant returns at once and the assistant
  * answers later, by notification; the receipt is a live stream opened when the message is handed over ("Working on it…"
  * under it), and the assistant's first reply to that chat closes it, so the reply appears where the status was. A reply that does
- * not come before RECEIPT_CLOSE_SECONDS closes it with "running in the background", and the reply comes as a message of its own.
+ * not come before the channel would close the stream (`closeSeconds`) closes it with "running in the background", and the reply comes as a message of its own.
  *
  * While the turn runs, the step it is on (`showStep`) and the words of its reply as the model writes them (`showText`) may be
  * shown: only the newest of either is sent. Words streamed in are only a preview: words known not to be said (`voidText`) never stay
@@ -23,21 +23,25 @@ import type { Result } from "../result.js";
 import { cpLength, pyRstrip, pyStrip } from "../text/py-text.js";
 import { informativeText } from "./informative.js";
 
-/** Teams closes a stream 10 minutes after its first request; the receipt closes itself before that. */
-export const RECEIPT_CLOSE_SECONDS = 9 * 60;
+/** The receipt closes itself this long before the channel would close its stream (`SurfaceCaps.streamSeconds`). */
+export const RECEIPT_CLOSE_MARGIN_SECONDS = 60;
+/** When the receipt closes itself on a channel that closes a stream 10 minutes after its first request. */
+export const RECEIPT_CLOSE_SECONDS = 10 * 60 - RECEIPT_CLOSE_MARGIN_SECONDS;
 /** The reply's words streamed into the receipt stop growing here; the reply itself still comes whole. */
 export const STREAM_SAY_MAX = 4000;
 
 /** What the receipt needs of a live stream (a superset of the Surface's `LiveStream`). */
 export interface ReceiptStream {
-  /** Still open: no final was sent and Teams has not closed it. */
+  /** Still open: no final was sent and the channel has not closed it. */
   readonly open: boolean;
   /** The text streamed so far ("" none). */
   readonly streamed: string;
-  /** The stream's message id once Teams gave one ("" before). */
+  /** The stream's message id once the channel gave one ("" before). */
   readonly streamId: MessageId;
   /** The person's message the stream answers. */
   readonly replyTo: MessageId;
+  /** Seconds after its first request that the channel closes the stream (absent: 10 minutes). */
+  readonly lifetimeSeconds?: number;
   /** A final may still be refused and then edited into place: the stream has an id and was not closed. */
   readonly closable: boolean;
   /** Seconds since the stream's first request. */
@@ -213,9 +217,15 @@ export class Receipt {
     for (const resolve of this.closedWaiters.splice(0)) resolve();
   }
 
-  /** Close the receipt by itself at RECEIPT_CLOSE_SECONDS unless a reply closed it first. */
+  /** When the receipt closes itself: RECEIPT_CLOSE_MARGIN_SECONDS before the channel would close its stream. */
+  private get closeSeconds(): number {
+    const lifetime = this.stream.lifetimeSeconds;
+    return lifetime === undefined ? RECEIPT_CLOSE_SECONDS : Math.max(lifetime - RECEIPT_CLOSE_MARGIN_SECONDS, 0);
+  }
+
+  /** Close the receipt by itself at `closeSeconds` unless a reply closed it first. */
   arm(clock: Clock, stillMine: () => boolean, onClose: () => void): void {
-    const wait = Math.max(RECEIPT_CLOSE_SECONDS - this.stream.ageSeconds(), 0) * 1000;
+    const wait = Math.max(this.closeSeconds - this.stream.ageSeconds(), 0) * 1000;
     clock.sleep(wait, this.closer.signal).then(
       async () => {
         if (!stillMine()) return;
@@ -234,7 +244,7 @@ export class Receipt {
     const closed = shown
       ? (await this.stream.final(plainMessage(`${shown}\n\n${background}`))).ok
       : await this.closeReplacing(plainMessage(background));
-    if (!closed) this.log.warn("the assistant receipt could not be closed; Teams closes it at 10 minutes");
+    if (!closed) this.log.warn("the assistant receipt could not be closed; the channel closes its stream itself");
   }
 
   /** The reply's words this receipt shows, final: nothing more is shown in it from now on. */
@@ -284,7 +294,7 @@ export class Receipt {
     });
     const id = this.stream.streamId;
     if (!(await this.stream.final(plainMessage(shown))).ok) {
-      this.log.warn("the receipt could not be closed; Teams closes it at 10 minutes");
+      this.log.warn("the receipt could not be closed; the channel closes its stream itself");
       return false;
     }
     try {

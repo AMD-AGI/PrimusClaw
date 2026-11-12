@@ -11,6 +11,7 @@ import { cpLength, pyCasefold } from "../text/py-text.js";
 import { similarity } from "./sequence-matcher.js";
 import { CONTEXT_ITEMS_MAX, CONTEXT_TEXT_MAX, clip } from "./limits.js";
 import { own } from "../own.js";
+import type { Mention } from "../review-text/names.js";
 
 /** One person the message names, as the channel context carries them. */
 export interface NamedPerson {
@@ -21,10 +22,30 @@ export interface NamedPerson {
   readonly source: "mention" | "known" | "near";
 }
 
-/** A channel mention (`{mentioned: {name, aadObjectId, id}}`). */
+/**
+ * A mention in the shape an older assembly still builds from `InboundMention` (`{mentioned: {id, name, aadObjectId}}`),
+ * read as the same `Mention`. New callers pass `message.mentions` as they are.
+ */
 export type MentionRecord = Readonly<Record<string, unknown>>;
 
-/** The Claw user id of a person by their channel id (null: not linked, or no id recorded). */
+/** A mention as `peopleOf` reads it: as the channel gave it, or in the older assembly's shape. */
+function mentionedOf(entity: Mention | MentionRecord): Mention {
+  if (typeof entity["channelUserId"] === "string") {
+    return {
+      channelUserId: entity["channelUserId"],
+      userId: textOf(entity["userId"]),
+      name: textOf(entity["name"]),
+    };
+  }
+  const who = field(entity, "mentioned") ?? {};
+  return {
+    channelUserId: textOf(field(who, "id")),
+    userId: textOf(field(who, "aadObjectId")),
+    name: textOf(field(who, "name")),
+  };
+}
+
+/** The Claw user id of a person by their directory id (null: not linked, or no id recorded). */
 export type UserIdOf = (channelUserId: string) => string | null | undefined;
 
 /** A review request that names nobody offers at most this many people it may have meant. */
@@ -45,10 +66,11 @@ class People {
 
   constructor(private readonly userIdOf: UserIdOf) {}
 
-  add(name: string, aad: string, source: NamedPerson["source"], email = ""): void {
-    if (!name || this.seen.has(aad || name)) return;
-    this.seen.add(aad || name);
-    const userId = aad ? this.userIdOf(aad) : null;
+  /** `directoryId`: the person's directory id (`UserRef.id`), "" when not known. */
+  add(name: string, directoryId: string, source: NamedPerson["source"], email = ""): void {
+    if (!name || this.seen.has(directoryId || name)) return;
+    this.seen.add(directoryId || name);
+    const userId = directoryId ? this.userIdOf(directoryId) : null;
     this.out.push({
       name: clip(name),
       ...(userId && cpLength(userId) <= CONTEXT_TEXT_MAX ? { user_id: userId } : {}),
@@ -64,20 +86,20 @@ const field = (record: unknown, name: string): unknown =>
 /**
  * Who the message names: the people it @mentions, then the people this worker knows whose name it writes (in any
  * order, run together, or their address), each once; with nobody named, the people a review request may have meant
- * (`nearPeople`). `user_id` only for a linked person. A mention without its Entra id is looked up by its channel id.
+ * (`nearPeople`). `user_id` only for a linked person. A mention without the person's directory id is looked up by its
+ * channel id (`userIdOfChannel`). A known person is matched by their directory id (`objectId` of the member record).
  */
 export function peopleOf(
-  mentions: readonly MentionRecord[],
+  mentions: readonly (Mention | MentionRecord)[],
   text: string,
   known: readonly PersonRecord[],
   userIdOf: UserIdOf,
-  aadOf: (channelId: string) => string | null | undefined = () => null,
+  userIdOfChannel: (channelUserId: string) => string | null | undefined = () => null,
 ): NamedPerson[] {
   const people = new People(userIdOf);
   for (const entity of mentions) {
-    const who = field(entity, "mentioned") ?? {};
-    const aad = textOf(field(who, "aadObjectId")) || textOf(aadOf(textOf(field(who, "id"))));
-    people.add(textOf(field(who, "name")), aad, "mention");
+    const who = mentionedOf(entity);
+    people.add(who.name, who.userId || textOf(userIdOfChannel(who.channelUserId)), "mention");
   }
   // Pull requests and model names are left out first: an owner in a link is no one asked to review.
   const plain = withoutRefs(text);
@@ -125,9 +147,9 @@ export function nearPeople(text: string, known: readonly PersonRecord[], userIdO
   if (words.length === 0) return [];
   const scored: Array<{ best: number; index: number; person: PersonRecord }> = [];
   known.forEach((person, index) => {
-    const aad = textOf(person["objectId"]);
+    const directoryId = textOf(person["objectId"]);
     const keys = new Set([...memberKeys(rosterOf(person))].filter((k) => cpLength(k) >= NEAR_WORD_MIN));
-    if (keys.size === 0 || !aad || !userIdOf(aad) || written(person, keys, text)) return;
+    if (keys.size === 0 || !directoryId || !userIdOf(directoryId) || written(person, keys, text)) return;
     const best = Math.max(...words.flatMap((w) => [...keys].map((k) => similarity(w, k))));
     if (best >= NEAR_RATIO) scored.push({ best, index, person });
   });

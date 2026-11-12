@@ -8,9 +8,9 @@
  */
 
 import {
-  ANSWER_PROMPT,
-  INTENT_PROMPT,
-  MODE_PROMPT,
+  answerPrompt,
+  intentPrompt,
+  modePrompt,
   type IntentReader,
   type ListedMention,
   type Logger,
@@ -62,20 +62,26 @@ export class GatewayIntentReader implements IntentReader {
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 
-  read(key: string, text: string, mentions: readonly ListedMention[]): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, INTENT_PROMPT, { message: text, mentions });
+  read(
+    key: string,
+    text: string,
+    mentions: readonly ListedMention[],
+    channel: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    return this.complete(key, intentPrompt(channel), { message: text, mentions });
   }
 
-  readMode(key: string, text: string): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, MODE_PROMPT, { message: text });
+  readMode(key: string, text: string, channel: string): Promise<Record<string, unknown> | undefined> {
+    return this.complete(key, modePrompt(channel), { message: text });
   }
 
   readAnswer(
     key: string,
     text: string,
     pending: readonly Readonly<Record<string, string>>[],
+    channel: string,
   ): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, ANSWER_PROMPT, { message: text, waiting_for_this_person: pending });
+    return this.complete(key, answerPrompt(channel), { message: text, waiting_for_this_person: pending });
   }
 
   private async complete(key: string, system: string, payload: unknown): Promise<Record<string, unknown> | undefined> {

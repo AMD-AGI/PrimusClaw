@@ -24,6 +24,11 @@ export interface NewSession {
   readonly reviewOnly?: boolean;
   /** false: the session is made with no message (`text` is only its name) and `messageId` is "". Default true. */
   readonly withMessage?: boolean;
+  /**
+   * The short name of the chat app the message came through (`SurfaceCaps.shortName`), which the headings of what the
+   * worker appends to it carry ("## Teams reply style ..."); without it they name none.
+   */
+  readonly channel?: string;
   /** Other people read the session (a group chat): `config.memory = "off"`. */
   readonly shared?: boolean;
 }
@@ -39,6 +44,8 @@ export interface UploadFile {
 export interface SendOptions {
   /** See `NewSession.modelKey`. */
   readonly modelKey?: string;
+  /** See `NewSession.channel`. */
+  readonly channel?: string;
   /** The session acts as a user: the message goes as the text alone, without plugin or appended rules. */
   readonly acting?: boolean;
 }

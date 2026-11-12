@@ -112,3 +112,62 @@ test("the check itself refuses each kind of forbidden import", () => {
     [],
   );
 });
+
+/**
+ * The words of core's sources name no channel: what core says, stores or sends about the channel comes from its surface
+ * (`SurfaceCaps`: its id, name and short name). Only names that are no word of core's are kept: the deployment's
+ * TEAMS_* settings and the stored review record's field names.
+ */
+const CHANNEL_WORD = /teams/i;
+const KEPT_NAMES = [/^TEAMS_[A-Z_]*$/, /^[A-Za-z]+:(requester|actor)_teams_id$/];
+
+function channelWords(file: string, text: string): string[] {
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isTemplateHead(node) ||
+      ts.isTemplateMiddle(node) ||
+      ts.isTemplateTail(node) ||
+      ts.isRegularExpressionLiteral(node)
+    ) {
+      if (CHANNEL_WORD.test(node.text) && !KEPT_NAMES.some((name) => name.test(node.text))) {
+        const { line } = source.getLineAndCharacterOfPosition(node.getStart());
+        found.push(`${path.relative(core, file)}:${String(line + 1)}: ${node.text.slice(0, 80)}`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+test("core's sources name no channel in what they say, store or send", () => {
+  assert.deepEqual(
+    sourceFiles(src).flatMap((f) => channelWords(f, fs.readFileSync(f, "utf8"))),
+    [],
+  );
+});
+
+test("the check itself finds a channel's name in each kind of literal, and keeps the settings' names", () => {
+  const file = path.join(src, "x.ts");
+  for (const line of [
+    'const a = "teams";',
+    "const b = `from your Teams client`;",
+    "const c = `${x} Microsoft Teams ${y}`;",
+    "const d = /teams-link/;",
+    "const e = 'group:teams:';",
+  ]) {
+    assert.equal(channelWords(file, line).length, 1, line);
+  }
+  for (const line of [
+    'const a = "TEAMS_LIMIT_";',
+    'const b = "requesterChannelId:requester_teams_id";',
+    "// Teams: the activity id",
+    "const teams = channel;",
+  ]) {
+    assert.deepEqual(channelWords(file, line), [], line);
+  }
+});

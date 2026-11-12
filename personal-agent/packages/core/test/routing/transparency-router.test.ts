@@ -20,9 +20,9 @@ test("test_help_through_the_worker_in_a_1to1_chat_and_in_a_group", async () => {
   await w.router.handle(message("what can you do", { id: "h3", kind: "group", conversation: "g-1" }));
   const [en = "", zh = "", group = ""] = said(w).slice(-3);
   // (the world keeps a group's messages but its app is not granted them, as the default: help says @mentions only)
-  assert.ok(
-    en.includes(dataStatement("en")) && zh.includes(dataStatement("zh")) && group.includes(dataStatement("en")),
-  );
+  // (the chat app is the surface's: Teams' name, as the Python worker said it)
+  const statement = (lang: string) => dataStatement(lang, false, undefined, "Microsoft Teams");
+  assert.ok(en.includes(statement("en")) && zh.includes(statement("zh")) && group.includes(statement("en")));
   assert.ok(group.startsWith("**What Clawy can do for you**") && group.includes("@mention Clawy"));
 });
 

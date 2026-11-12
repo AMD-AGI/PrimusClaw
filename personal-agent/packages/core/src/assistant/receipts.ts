@@ -121,6 +121,14 @@ export class ReceiptConversation implements Conversation {
     return this.inner.ref;
   }
 
+  get caps() {
+    return this.inner.caps;
+  }
+
+  get replyTo() {
+    return this.inner.replyTo;
+  }
+
   get edited() {
     return this.inner.edited;
   }

@@ -14,6 +14,7 @@ import type { OutMessage } from "../../src/ports/surface.js";
 import { err } from "../../src/result.js";
 import { runTurn } from "../../src/turn/engine/run-turn.js";
 import type { TurnSurface } from "../../src/turn/ports.js";
+import { ALL_CAPS } from "../../../../test-support/surface.js";
 import { Timeline } from "./timeline.js";
 import { Bus, end, said, ScriptedClaw, textOf, world } from "./world.js";
 
@@ -40,6 +41,7 @@ interface QueueOptions {
 
 /** The outbound queue with the relay behind it; it cannot delete (the relay's contract has none). */
 class QueueAndTeams implements TurnSurface {
+  readonly caps = ALL_CAPS;
   readonly sent: Queued[] = [];
   readonly logs: string[] = [];
 

@@ -4,19 +4,16 @@
 /** CLAW_RULE_TOOL_ID: the reply-style rule is a Claw rule tool, and the client attaches it to every message. */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import {
-  CHANGE_HEADING,
-  CHANGE_SUMMARY_RULE,
-  ClawAnswerInvalid,
-  RULE_HEADING,
-  RULE_MAX_BYTES,
-  RULE_TTL_MS,
-} from "@primusclaw/personal-agent";
+import { CHANGE_SUMMARY_RULE, ClawAnswerInvalid, RULE_MAX_BYTES, RULE_TTL_MS } from "@primusclaw/personal-agent";
 import { ruleText } from "../../src/index.js";
 import { FakeClock, json, RecordingLogger, Wire, zip, type Sent } from "./wire.js";
 
 const RULE = "Write this reply for a Microsoft Teams chat.\n1. Open with a one-line answer in bold.";
+/** The headings as the Teams worker has always written them (the chat app's short name, "Teams", is the caller's). */
+const RULE_HEADING = "## Teams reply style (formatting only, facts unchanged)";
+const CHANGE_HEADING = "## Teams change summary (only when files in a git repository changed)";
 const CHANGE = `${CHANGE_HEADING}\n\n${CHANGE_SUMMARY_RULE}`;
+const TEAMS = { channel: "Teams" };
 /** Written by Python's `zipfile` (stored), and (deflated, with a directory entry and an upper-case `.MD`). */
 const PY_STORED =
   "UEsDBBQAAAAAANRmaV0sQ+EPFQAAABUAAAAHAAAAcnVsZS5tZCAgV3JpdGUgdGhpcyByZXBseS4KClBLAQIUAxQAAAAAANRmaV0sQ+EPFQAAABUAAAAHAAAAAAAAAAAAAACAAQAAAABydWxlLm1kUEsFBgAAAAABAAEANQAAADoAAAAAAA==";
@@ -76,8 +73,8 @@ describe("the rule on the wire", () => {
   it("every message carries the rule after the text and the plugin id beside it", async () => {
     const wire = new RuleWire();
     const claw = wire.client({ pluginId: 2, ruleToolId: 17 });
-    await claw.sessions.create("ak-a", { text: "hi", idempotencyKey: "idem" });
-    await claw.sessions.sendMessage("ak-a", "s", "again");
+    await claw.sessions.create("ak-a", { text: "hi", idempotencyKey: "idem", channel: "Teams" });
+    await claw.sessions.sendMessage("ak-a", "s", "again", TEAMS);
     const [create, send] = wire.messages();
     assert.ok(create && send);
     assert.equal(create.rawPath, "/v1/sessions");
@@ -95,8 +92,8 @@ describe("the rule on the wire", () => {
   it("the rule is read with the caller's key and kept for later messages", async () => {
     const wire = new RuleWire();
     const claw = wire.client({ pluginId: 2, ruleToolId: 17 });
-    await claw.sessions.sendMessage("ak-a", "s", "one");
-    await claw.sessions.sendMessage("ak-b", "s", "two");
+    await claw.sessions.sendMessage("ak-a", "s", "one", TEAMS);
+    await claw.sessions.sendMessage("ak-b", "s", "two", TEAMS);
     assert.deepEqual(
       wire.downloads().map((s) => [s.method, s.rawPath, s.headers.get("authorization")]),
       [["GET", "/v1/tools/17/download", "Bearer ak-a"]],
@@ -107,13 +104,13 @@ describe("the rule on the wire", () => {
     const wire = new RuleWire();
     const clock = new FakeClock();
     const claw = wire.client({ pluginId: 2, ruleToolId: 17, clock });
-    await claw.sessions.sendMessage("ak-a", "s", "one");
+    await claw.sessions.sendMessage("ak-a", "s", "one", TEAMS);
     clock.now += RULE_TTL_MS - 1000;
-    await claw.sessions.sendMessage("ak-a", "s", "two");
+    await claw.sessions.sendMessage("ak-a", "s", "two", TEAMS);
     assert.equal(wire.downloads().length, 1);
     clock.now += 2000;
     wire.download = () => new Response(zip({ "rule.md": "A newer rule." }));
-    await claw.sessions.sendMessage("ak-a", "s", "three");
+    await claw.sessions.sendMessage("ak-a", "s", "three", TEAMS);
     assert.equal(wire.downloads().length, 2);
     assert.equal(wire.lastBody()["content"], `three\n\n${CHANGE}\n\n${RULE_HEADING}\n\nA newer rule.`);
   });
@@ -130,7 +127,7 @@ describe("a rule that cannot be read", () => {
       const wire = new RuleWire();
       wire.download = download;
       const logger = new RecordingLogger();
-      await wire.client({ pluginId: 2, ruleToolId: 17, logger }).sessions.sendMessage("ak-a", "s", "hi");
+      await wire.client({ pluginId: 2, ruleToolId: 17, logger }).sessions.sendMessage("ak-a", "s", "hi", TEAMS);
       assert.deepEqual(wire.lastBody(), { content: `hi\n\n${CHANGE}`, messageType: "text", pluginId: 2 });
       const line = logger.lines.find((l) => l.message === "could not read the reply-style rule");
       assert.equal(line?.fields["fallback"], "the message goes without it");
@@ -144,24 +141,24 @@ describe("what rides on a message", () => {
     const clock = new FakeClock();
     const logger = new RecordingLogger();
     const claw = wire.client({ pluginId: 2, ruleToolId: 17, clock, logger });
-    await claw.sessions.sendMessage("ak-a", "s", "one");
+    await claw.sessions.sendMessage("ak-a", "s", "one", TEAMS);
     clock.now += RULE_TTL_MS + 1000;
     wire.download = () => new Response("", { status: 500 });
-    await claw.sessions.sendMessage("ak-a", "s", "two");
+    await claw.sessions.sendMessage("ak-a", "s", "two", TEAMS);
     assert.equal(wire.lastBody()["content"], `two\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`);
     assert.equal(logger.lines.at(-1)?.fields["fallback"], "using the last copy");
   });
 
   it("with no rule tool nothing is fetched or appended", async () => {
     const wire = new RuleWire();
-    await wire.client({ pluginId: 2 }).sessions.sendMessage("ak-a", "s", "hi");
+    await wire.client({ pluginId: 2 }).sessions.sendMessage("ak-a", "s", "hi", TEAMS);
     assert.deepEqual(wire.downloads(), []);
     assert.equal(wire.lastBody()["content"], "hi");
   });
 
   it("the change summary request is in the message exactly once and last", async () => {
     const wire = new RuleWire();
-    await wire.client({ pluginId: 2, ruleToolId: 17 }).sessions.sendMessage("ak-a", "s", "fix the parser");
+    await wire.client({ pluginId: 2, ruleToolId: 17 }).sessions.sendMessage("ak-a", "s", "fix the parser", TEAMS);
     const content = wire.lastBody()["content"] as string;
     assert.equal(content.split(CHANGE_HEADING).length - 1, 1);
     assert.ok(content.endsWith(RULE));
@@ -185,7 +182,7 @@ describe("what rides on a message", () => {
     const wire = new RuleWire();
     wire.download = () => new Response(body, { status: 500 });
     const logger = new RecordingLogger();
-    await wire.client({ ruleToolId: 7, logger }).sessions.sendMessage("ak-a", "s", "hi");
+    await wire.client({ ruleToolId: 7, logger }).sessions.sendMessage("ak-a", "s", "hi", TEAMS);
     assert.deepEqual(logger.lines, [
       {
         level: "warn",
@@ -238,7 +235,7 @@ describe("a rule download larger than a rule can be", () => {
       sent.rawPath.endsWith("/download") ? new Response(endless) : json(200, { ok: true, message_id: "m" }),
     );
     const logger = new RecordingLogger();
-    await wire.client({ ruleToolId: 17, logger }).sessions.sendMessage("ak-a", "s", "hi");
+    await wire.client({ ruleToolId: 17, logger }).sessions.sendMessage("ak-a", "s", "hi", TEAMS);
     assert.ok(handed <= 4 * RULE_MAX_BYTES + 2 * 65536, String(handed));
     assert.equal(logger.lines[0]?.fields["error"], "ReplayRefused");
     assert.equal((wire.sent.at(-1)?.body as Record<string, unknown>)["content"], `hi\n\n${CHANGE}`);

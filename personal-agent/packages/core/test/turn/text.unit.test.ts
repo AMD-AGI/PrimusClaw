@@ -60,11 +60,13 @@ it("an empty answer says there was no text and a lead goes in front of it", () =
 });
 
 it("a message's upload folder keeps only safe characters, never two dots, at most 60 of them", () => {
-  assert.equal(uploadFolder("abc/def..g"), "teams/abc_def_g");
-  assert.equal(uploadFolder(" .."), "teams/_");
-  assert.equal(uploadFolder(""), "teams/message");
-  assert.equal(uploadFolder(". ."), "teams/message");
-  assert.equal(uploadFolder("é".repeat(3) + "a".repeat(80)), `teams/_${"a".repeat(59)}`);
+  assert.equal(uploadFolder("abc/def..g", "teams"), "teams/abc_def_g");
+  assert.equal(uploadFolder(" ..", "teams"), "teams/_");
+  assert.equal(uploadFolder("", "teams"), "teams/message");
+  assert.equal(uploadFolder(". .", "teams"), "teams/message");
+  assert.equal(uploadFolder("é".repeat(3) + "a".repeat(80), "teams"), `teams/_${"a".repeat(59)}`);
+  assert.equal(uploadFolder("abc/def..g", "chatapp"), "chatapp/abc_def_g"); // (under the channel's own id)
+  assert.equal(uploadFolder("abc/def..g"), "abc_def_g");
 });
 
 it("the files note names each path and says they are the user's data", () => {

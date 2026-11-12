@@ -23,6 +23,8 @@ const quiet: Logger = {
 function wrap(conversation: Conversation, overrides: Partial<Pick<Conversation, "send" | "update">>): Conversation {
   return {
     ref: conversation.ref,
+    caps: conversation.caps,
+    replyTo: conversation.replyTo,
     edited: conversation.edited,
     markSettled: (id) => {
       conversation.markSettled(id);

@@ -22,6 +22,7 @@ import type { Random } from "../ports/random.js";
 import type { StorePort } from "../ports/store/index.js";
 import type { Conversation, InboundFile } from "../ports/surface.js";
 import { cpHead } from "../text/py-text.js";
+import { uploadFolder } from "../turn/files.js";
 import type { DirectChat } from "../direct-chat/direct-chat.js";
 import { handOver, type MessageFiles } from "./files.js";
 import { FOLLOW_OPEN_SECONDS, TurnFollower, type StepLabel } from "./follow.js";
@@ -358,7 +359,7 @@ export class AssistantChat {
   }
 
   private handOverFiles(handing: Handing, sessionId: string, messageId: string, files: readonly InboundFile[]) {
-    const folder = this.o.files?.uploadFolder(messageId) ?? `.uploads/${messageId}`;
+    const folder = this.o.files ? uploadFolder(messageId, handing.conversation.caps.channel) : `.uploads/${messageId}`;
     return handOver(
       { claw: this.o.claw.sessions, files: this.o.files, logger: this.o.logger, onDropped: this.o.onFilesDropped },
       { credential: handing.credential, sessionId, folder, files, conversation: handing.conversation },
@@ -390,12 +391,10 @@ export class AssistantChat {
   private async acknowledge(handing: Handing): Promise<Receipt | undefined> {
     const { conversation } = handing;
     try {
-      const replyTo =
-        typeof conversation.ref.wire["activityId"] === "string" ? conversation.ref.wire["activityId"] : "";
       const receipt = await this.o.receipts.openIn(
         conversation.ref.id,
         handing.lang,
-        streamOpener(conversation, replyTo, this.o.clock),
+        streamOpener(conversation, conversation.replyTo, this.o.clock),
       );
       if (receipt !== undefined) {
         receipt.awaitHandOver(); // (until the message is handed to Claw: `handingOver`)

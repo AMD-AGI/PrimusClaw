@@ -168,7 +168,10 @@ export class ReviewLaunch {
     if (first === undefined) return;
     const chosen = modelChosenNote(first, who, s.model);
     markHeld(reviews, Boolean(s.ask.handoffId));
-    const reach = await this.notices.reachNote(reviews.find((r) => r.forReviewer));
+    const reach = await this.notices.reachNote(
+      reviews.find((r) => r.forReviewer),
+      s.ctx.conversation.caps.shortName,
+    );
     const setting = [mergeLine(reviews, who, s.ask.merge, auto), reach].filter(Boolean).join("\n\n");
     const stop = stopHint(reviews, s.ctx.group);
     const verb = s.ask.merge ? "review 合入" : "review（只 review，不合入）";

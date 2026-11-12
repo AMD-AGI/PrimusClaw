@@ -104,7 +104,7 @@ export class Observer implements Observing {
   private async turnOn(route: MessageRoute, say: (text: string) => Promise<void>): Promise<void> {
     const { sender, conversation } = route;
     if (!this.mayTurnOn(sender.id)) return say(T.notAllowed);
-    const scope = scopeOf(conversation.ref.id);
+    const scope = scopeOf(conversation.ref.id, conversation.caps.channel);
     if (scope === undefined) return say(T.noScope);
     const key = this.deps.links.getKey(sender.id); // their own key: it is their assistant, on their quota
     if (key === null) return say(T.notLinked);

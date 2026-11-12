@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
-  ANSWER_PROMPT,
+  answerPrompt,
+  intentPrompt,
+  modePrompt,
   decisionWords,
   namesReviewAndMerge,
   pickRow,
@@ -265,8 +268,26 @@ test("a pull request held for a merge and a review is asked which, and one held 
 });
 
 test("the model is asked only whether it is an answer", () => {
-  assert.ok(ANSWER_PROMPT.startsWith("You read one message a person sent to Clawy"));
-  assert.ok(ANSWER_PROMPT.endsWith("only classify it."));
+  const prompt = answerPrompt("Microsoft Teams");
+  assert.ok(prompt.startsWith("You read one message a person sent to Clawy"));
+  assert.ok(prompt.endsWith("only classify it."));
+});
+
+test("the models are told the chat app the message came through, and on Teams exactly what they were told before", () => {
+  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+  // (the prompts as they were when they named Microsoft Teams themselves)
+  assert.equal(
+    sha(intentPrompt("Microsoft Teams")),
+    "66b61239320d53a2f75b6d7b4d6f7157fee6299cfdcdd45844027e103755d3e7",
+  );
+  assert.equal(sha(modePrompt("Microsoft Teams")), "5a81148db3e2b3bf49255468fc136f7e7900075e75e375b5791ace71c4d788f9");
+  assert.equal(
+    sha(answerPrompt("Microsoft Teams")),
+    "8f678827e427d39a97dac7c361b31b9c8a38c51e8efe53a626310e2e402fc204",
+  );
+  for (const prompt of [intentPrompt("Chat App"), modePrompt("Chat App"), answerPrompt("Chat App")]) {
+    assert.ok(prompt.includes(" Chat App ") && !prompt.includes("Teams"));
+  }
 });
 
 test("a number past 2^53 is read and said back as Python's int writes it, never thrown on", () => {

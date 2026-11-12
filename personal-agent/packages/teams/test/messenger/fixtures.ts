@@ -7,6 +7,7 @@ import type { ConversationRef } from "@primusclaw/personal-agent";
 import { FakeClock } from "../../../../test-support/clock.js";
 import { SeededRandom } from "../../../../test-support/random.js";
 import { DEFAULT_STYLE, type Style } from "../../src/config/style.js";
+import { teamsCaps } from "../../src/caps.js";
 import { AckRegistry } from "../../src/messenger/acks.js";
 import { TeamsConversation } from "../../src/messenger/conversation.js";
 import type { Masker } from "../../src/messenger/masker.js";
@@ -55,6 +56,7 @@ export function build(outbox: Outbox, options: BuildOptions = {}): Built {
   const style = options.style ?? DEFAULT_STYLE;
   const conversation = new TeamsConversation({
     ref: options.ref ?? ref(),
+    caps: teamsCaps("direct"),
     outbox,
     acks,
     clock,

@@ -3,6 +3,7 @@
 
 import { errorName } from "../errors.js";
 import { groupText, onboardingText } from "../locales/group.js";
+import { linkPage } from "../locales/link.js";
 import { routingText } from "../locales/routing.js";
 import type { PendingRequest } from "../ports/store/onboarding.js";
 import type { Conversation, InboundAction, InboundMessage } from "../ports/surface.js";
@@ -131,7 +132,10 @@ export class Onboarding {
     } else if (await this.sendSteps(chat, false)) {
       closing = onboardingText.stepsSent(config.botName);
     } else {
-      said = onboardingText.noDm(`${config.publicBaseUrl}/primus-claw/teams-link`);
+      said = onboardingText.noDm(
+        linkPage(config.publicBaseUrl, chat.conversation.caps.channel),
+        chat.conversation.caps,
+      );
       closing = this.ctx.views.onboarding(card, promptId, false, said);
     }
     await this.ctx.settle(action, chat, closing, said === undefined ? {} : { fallback: said });

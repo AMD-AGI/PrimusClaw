@@ -46,7 +46,7 @@ export const accountText = defineCatalog({
     langUsage: "Use `/lang zh`, `/lang en` or `/lang auto`.",
     langWhySet: "you set it",
     langWhyWritten: "from what you last wrote",
-    langWhyClient: "from your Teams client's language",
+    langWhyClient: (p: { channel: string }) => `from your ${p.channel} client's language`,
     langIs: (p: { name: string; why: string }) =>
       `I answer you in ${p.name} (${p.why}). Change it with \`/lang zh\` or \`/lang en\`; \`/lang auto\` follows what you write.`,
   },
@@ -79,7 +79,7 @@ export const accountText = defineCatalog({
     langUsage: "用 `/lang zh`、`/lang en` 或 `/lang auto`。",
     langWhySet: "你设定的",
     langWhyWritten: "按你最近写的话",
-    langWhyClient: "按你的 Teams 客户端语言",
+    langWhyClient: (p) => `按你的 ${p.channel} 客户端语言`,
     langIs: (p) => `我用${p.name}回复你（${p.why}）。改：\`/lang zh\`、\`/lang en\`，\`/lang auto\` 按你写的话自动选。`,
   },
 });

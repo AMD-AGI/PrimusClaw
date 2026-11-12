@@ -28,6 +28,7 @@ import {
 /** The test chat as the router hands it: the recording outbound side with its reference. */
 class Chat extends Bus {
   readonly edited = new Set<MessageId>();
+  readonly replyTo = "";
   markSettled(id: MessageId): void {
     this.edited.add(id);
   }

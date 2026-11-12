@@ -26,8 +26,11 @@ export interface FetchedUpload {
 /** The channel's side of a message's files (W3's inbound): fetching them, and how a failure and a folder are worded. */
 export interface MessageFiles {
   fetch(files: readonly InboundFile[]): Promise<{ fetched: FetchedUpload[]; failed: [name: string, why: string][] }>;
-  /** The folder under .uploads/ one message's files go to. */
-  uploadFolder(messageId: string): string;
+  /**
+   * The folder under .uploads/ one message's files go to. Not read: core names it itself, under the channel's id
+   * (`turn.uploadFolder(messageId, channel)`); kept so an assembly that still supplies it keeps compiling.
+   */
+  uploadFolder?(messageId: string): string;
   /** What the person is told about files that did not reach the agent. */
   failedLine(failed: readonly (readonly [string, string])[]): string;
 }
