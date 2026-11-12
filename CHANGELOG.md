@@ -49,9 +49,10 @@ while a MINOR update may need you to read its notes first.
 
 Changes are released in batches, not one release per change: each of Claw,
 the connector and the personal agent is cut at most once in a day's release
-window (06:00-09:00 UTC), from whatever is merged by then, and never while
-the nightly evaluation runs (18:17-20:20 UTC). An urgent fix, or a release
-the maintainers ask for, may go out at once, outside the window.
+window (06:00-09:00 UTC), from whatever is merged by then. An urgent fix, or
+a release the maintainers ask for, may go out at once, outside the window.
+No release, urgent or not, is cut while the nightly evaluation runs
+(18:17-20:20 UTC), whose results the release checks rely on.
 
 ### What each release's notes must say
 
