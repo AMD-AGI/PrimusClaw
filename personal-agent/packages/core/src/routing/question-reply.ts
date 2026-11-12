@@ -10,7 +10,7 @@
 import { cardQuestions, typedAnswers, type CardQuestion } from "../approvals/questions.js";
 import { viewMessage } from "../approvals/click.js";
 import { errorName } from "../errors.js";
-import { pickLang } from "../language/detect.js";
+import { answerLang } from "../language/detect.js";
 import { approvalText } from "../locales/approval.js";
 import { zoneOf } from "../proactive/quiet.js";
 import type { PendingQuestion } from "../ports/store/index.js";
@@ -69,7 +69,10 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
     questions: questions.length,
     card: pending.cardId ? "edited" : "not editable",
   });
-  await settleCard(ctx, chat, pending.cardId, [...answers.answers], pickLang(reply.text, questions[0]?.question));
+  // The card speaks the chat's language (the person's chosen or learnt language, else the client's locale, as `chat.lang()`),
+  // and without either the question's: never the reply's alone, since "1" or "a" typed in a Chinese chat is no English.
+  const lang = answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
+  await settleCard(ctx, chat, pending.cardId, [...answers.answers], lang);
   return true;
 }
 
