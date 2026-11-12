@@ -15,11 +15,12 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.8.1
 
-A patch release (0.8.1): the worker's own settings get surface-neutral `PA_` names, and the older `TEAMS_` names still
-work, so no deployment needs a change. No new npm package, no plugin port (core's `src/plugins/`) or store change;
-works with any Claw.
+A patch release: the worker's own settings get surface-neutral `PA_` names, and the older `TEAMS_` names still work, so
+no deployment needs a change (#800); a Teams text message keeps its single line breaks (#811); and the store commits
+without waiting for an fsync, so a slow disk no longer stalls the worker (#808). No new npm package, no plugin port
+(core's `src/plugins/`) or store schema change; works with any Claw. The quick start and the examples use the `PA_` names.
 
 ### Changed
 
@@ -42,6 +43,19 @@ works with any Claw.
 - The `TEAMS_` names of those settings. Each is still read when its `PA_` name is unset or blank; when both are set the
   `PA_` name wins and the worker warns that the `TEAMS_` one is ignored. A worker that reads any of them logs one warning
   at start naming each with its replacement (never a value). They are removed only in a release whose notes say so.
+
+### Fixed
+
+- `@primusclaw/personal-agent-teams`: a text message keeps its single line breaks. Teams' markdown joined two lines
+  separated by one `"\n"` (two links on two lines showed as one, a bilingual note as one line, the sentence after a list
+  as part of its last item); such a break is now sent as a paragraph break, in a sent message and in a streamed one.
+  Blank lines, fenced code, list items and their continuation lines, and table rows are left as they are (#811).
+- `@primusclaw/personal-agent-runtime`: the SQLite store is opened with `synchronous=NORMAL` under WAL, the documented
+  safe setting there, instead of `FULL`: a commit no longer waits for an fsync, which on a congested disk blocked the
+  worker for seconds and could make its `/claw-events` answer miss Claw's 5 s delivery timeout. A commit stays atomic
+  and the store consistent; a process crash or container restart loses nothing committed, and only a power loss or
+  kernel crash can drop the last commits. A held event (one Claw is answered 200 for and never sends again) is still
+  written with `FULL` (#808).
 
 ## 0.8.0
 

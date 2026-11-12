@@ -10,9 +10,9 @@ Teams bot that people talk to, and finally with a developer machine connected th
 
 | Artifact                                      | Version | Where                                                                                                                                                                                                                                                                       |
 | --------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The Teams worker, as npm packages             | 0.8.0   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
-| The Teams worker, as an image                 | 0.8.0   | [`docker.io/primussafe/personal-agent-teams:0.8.0`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
-| The Teams ingress, as an Azure Function       | 0.8.0   | `personal-agent-teams-ingress-0.8.0.zip` on the GitHub Release `personal-agent-v0.8.0` ([step 4](#4-the-ingress))                                                                                                                                                           |
+| The Teams worker, as npm packages             | 0.8.1   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
+| The Teams worker, as an image                 | 0.8.1   | [`docker.io/primussafe/personal-agent-teams:0.8.1`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
+| The Teams ingress, as an Azure Function       | 0.8.1   | `personal-agent-teams-ingress-0.8.1.zip` on the GitHub Release `personal-agent-v0.8.1` ([step 4](#4-the-ingress))                                                                                                                                                           |
 | claw-connector, for a developer's own machine | 0.1.23  | [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector)                                                                                                                                                                                              |
 
 The worker holds no model and no sandbox: every answer comes from a [Claw](../../claw/README.md) deployment, which runs
@@ -50,7 +50,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
    ```bash
    mkdir personal-agent-try && cd personal-agent-try
    npm init -y >/dev/null
-   npm install @primusclaw/personal-agent-teams@0.8.0
+   npm install @primusclaw/personal-agent-teams@0.8.1
    base=https://raw.githubusercontent.com/AMD-AGI/PrimusClaw/main/personal-agent/examples/local-taste
    curl -fsSL --remote-name-all "$base/stand-in-connector.mjs" "$base/message.json" "$base/try.env.example"
    ```
@@ -71,7 +71,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
 4. In a third terminal, start the worker, with its store in the current directory instead of `/data`:
 
    ```bash
-   TEAMS_DB_PATH=./state.db node --env-file=try.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
+   PA_DB_PATH=./state.db node --env-file=try.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
    ```
 
    It logs `WARN release gate test entry: outbound to the recording connector only; no queue` and keeps running.
@@ -80,7 +80,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
 
    ```bash
    curl -fsS http://127.0.0.1:8080/healthz; echo                      # ok
-   curl -fsS http://127.0.0.1:9090/metrics | grep build_info           # personal_agent_build_info{version="0.8.0",...} 1
+   curl -fsS http://127.0.0.1:9090/metrics | grep build_info           # personal_agent_build_info{version="0.8.1",...} 1
    say() { n=$((n + 1)); sed "s|__ID__|$(date +%s)-$n|; s|__TEXT__|$1|" message.json |
      curl -fsS -H 'content-type: application/json' --data @- http://127.0.0.1:8080/gate/v1/activity; echo; }
    say hello                                                           # {"status":"handled"}
@@ -110,7 +110,7 @@ otherwise. The answer to a message arrives in the stand-in connector's terminal 
 the host's network; the stand-in connector runs on the host as above):
 
 ```bash
-docker run --rm --network host --env-file try.env docker.io/primussafe/personal-agent-teams:0.8.0
+docker run --rm --network host --env-file try.env docker.io/primussafe/personal-agent-teams:0.8.1
 ```
 
 **Claw's tool layer, without a cluster.** To see the part of Claw that edits files and runs commands for an agent, clone
@@ -285,7 +285,7 @@ Deploy the release's zip, after checking it is the one the release names. A Flex
 through One Deploy as `application/zip`:
 
 ```bash
-v=0.8.0
+v=0.8.1
 gh release download "personal-agent-v$v" -R AMD-AGI/PrimusClaw -p "personal-agent-teams-ingress-$v.zip*"
 sha256sum -c "personal-agent-teams-ingress-$v.zip.sha256"
 gh attestation verify "personal-agent-teams-ingress-$v.zip" --repo AMD-AGI/PrimusClaw
@@ -336,7 +336,7 @@ filled-in file out of any repository; it holds the encryption key, the bot's cli
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `CLAW_API_URL`, `SAFE_API_URL`                                             | step 1                                                                              |
 | `PUBLIC_BASE_URL`                                                          | the worker's public https origin (your reverse proxy in front of port 8080)         |
-| `TEAMS_ENCRYPTION_KEYS`                                                    | `openssl rand -base64 32 \| tr '+/' '-_'`; it encrypts the linked keys in the store |
+| `PA_ENCRYPTION_KEYS`                                                       | `openssl rand -base64 32 \| tr '+/' '-_'`; it encrypts the linked keys in the store |
 | `SERVICEBUS_LISTEN_CONNECTION_STRING`, `SERVICEBUS_SEND_CONNECTION_STRING` | step 3                                                                              |
 | `OUTBOUND_MODE=direct`                                                     | the worker posts to the Bot Connector itself                                        |
 | `BOT_CLIENT_ID`, `BOT_TENANT_ID`, `BOT_CLIENT_SECRET`                      | step 2a; paste the secret from `bot-client-secret` with an editor, then delete it   |
@@ -362,16 +362,16 @@ With plain Docker:
 ```bash
 docker run -d --name personal-agent --env-file .env -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
   -v personal-agent-data:/data -v "$PWD/assertion-key.pem:/run/secrets/assertion-key.pem:ro" \
-  docker.io/primussafe/personal-agent-teams:0.8.0
+  docker.io/primussafe/personal-agent-teams:0.8.1
 ```
 
 From npm (Node 26), with the store in a directory the user running it can write (SQLite creates the file, not the
 directory):
 
 ```bash
-npm install @primusclaw/personal-agent-teams@0.8.0
+npm install @primusclaw/personal-agent-teams@0.8.1
 mkdir -p "$HOME/personal-agent"
-TEAMS_DB_PATH="$HOME/personal-agent/state.db" \
+PA_DB_PATH="$HOME/personal-agent/state.db" \
   node --env-file=.env node_modules/@primusclaw/personal-agent-teams/dist/main.js
 ```
 
@@ -388,7 +388,7 @@ exits.
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz                    # ok
-curl -fsS http://127.0.0.1:9090/metrics | grep build_info   # personal_agent_build_info{version="0.8.0",node="v26..."} 1
+curl -fsS http://127.0.0.1:9090/metrics | grep build_info   # personal_agent_build_info{version="0.8.1",node="v26..."} 1
 ```
 
 `/healthz` says the process is up, not that it reaches anything. Read the start of the log too: it names the outbound
@@ -451,7 +451,7 @@ machine runs claw-connector, which only makes outbound HTTPS requests to Claw; t
 
 | What you see                                                                                     | What it means, and the fix                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`TEAMS_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error.                                                            |
+| The worker exits at once with `CRITICAL the worker does not start: ...` (status 1)               | A required setting is missing, a number is malformed, or a strict switch has an unknown word; the line names it. Status 2 with `CRITICAL secrets: ...` means a secret is missing or could not be loaded (`PA_ENCRYPTION_KEYS` unset, say); a key that is not a Fernet key stops it with status 1 and a decoding error.                                                               |
 | `/healthz` answers, but Teams messages get no reply and the log repeats `inbound receiver error` | The worker cannot read the inbound queue: check the listen connection string, the queue's name, and that sessions are enabled on it. No `inbound message` lines at all, and no errors: nothing reaches the queue, so look at the ingress and the bot's messaging endpoint.                                                                                                           |
 | The log says `direct send not delivered, handing it to the queue`                                | The Bot Connector refused the post or the bot's token could not be had: check the client id and tenant (and for `secret` the secret's expiry; the `AADSTS` code in `Entra ID answered ...` names the cause), and for `federated` the issuer, subject and the published key set. Without the ingress's outbound trigger (step 4), a reply that went to the queue never reaches Teams. |
 | `/primus-claw-agent/link` answers `422 key_rejected`                                             | Claw refused the key, or the worker cannot reach `CLAW_API_URL`. Check the key with `printf 'Authorization: Bearer %s\n' "$CLAW_KEY" \| curl -fsS -H @- '<CLAW_API_URL>/v1/sessions?limit=1'`.                                                                                                                                                                                       |
