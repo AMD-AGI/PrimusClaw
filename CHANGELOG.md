@@ -106,7 +106,9 @@ release version, and its `appVersion` stays `latest`.
 
 Image `docker.io/primussafe/claw:202611121326` (commit 86eeb027). A minor release; no schema change; new setting
 `CLAW_ASSISTANT_CHOICES` (on by default). Choice cards and the chosen reply language need personal agent 0.6.0 or later;
-the per-agent notice needs connector 0.2.0. Connector requirements otherwise unchanged from 0.1.0.
+an older worker ignores a say's `choices` and shows its text, which names the options, and sends no reply language. The
+per-agent notice needs connector 0.2.0; with an older connector every terminal question keeps Claude Code's wording.
+Connector requirements otherwise unchanged from 0.1.0.
 
 ### Added
 
