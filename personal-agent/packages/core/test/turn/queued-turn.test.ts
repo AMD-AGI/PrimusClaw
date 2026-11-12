@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A message Claw queues behind a turn it is still running opens no "Thinking…" stream and is told it is queued. On 11-11 a
+ * A message Claw queues behind a turn it is still running does not say "Thinking…" while it waits, and is told it is queued.
+ * On 11-11 a
  * message queued behind a question that waited ten minutes had a floating status of its own for nine of them, and no word
  * that it waited (Claw gave it an id, `claw-pending-4691`, and the notice only went out for a message with none).
  */
@@ -38,25 +39,36 @@ function queued(busy: boolean, lang: "en" | "zh" = "en") {
 const notices = (run: Awaited<ReturnType<typeof queued>>, lang: "en" | "zh"): string[] =>
   run.bus.sent.map((s) => textOf(s.message)).filter((t) => t === turnText.in(lang).queuedNotice);
 
-it("a message queued behind a running turn opens no live stream: the queued notice says it waits, then the answer comes", async () => {
-  for (const lang of ["en", "zh"] as const) {
-    const run = await queued(true, lang);
-    assert.deepEqual(run.bus.streamOps, []); // no "Thinking…" for the whole wait
-    assert.equal(notices(run, lang).length, 1, `${lang}: the queued notice, once`);
+it("a message Claw queues closes its stream with the queued notice at once: no Thinking… for the wait, the answer comes after", async () => {
+  // (what the worker may have seen before the send does not matter: only Claw's answer to the send says it is queued)
+  for (const [busy, lang] of [
+    [true, "en"],
+    [false, "en"],
+    [true, "zh"],
+  ] as const) {
+    const run = await queued(busy, lang);
+    const ops = run.bus.streamOps;
+    assert.equal(ops[0]?.op, "open");
+    const finishes = ops.filter((o) => o.op === "finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0]?.text, turnText.in(lang).queuedNotice);
+    assert.ok(finishes[0].at < 5, "closed at once, not when the wait is over");
+    assert.ok(!ops.some((o) => o.op === "inform" && o.at > 5), "nothing more is streamed while it waits");
+    assert.deepEqual(notices(run, lang), []); // (said in the bubble, not twice)
     assert.ok(run.final.includes("明天吃火锅"));
   }
 });
 
-it("a message Claw queues after its stream opened closes the stream with the queued notice at once", async () => {
-  // (the turn in front started between the worker's look and the send: only Claw's answer to the send says it is queued)
-  const run = await queued(false);
-  const ops = run.bus.streamOps;
-  assert.equal(ops[0]?.op, "open");
-  const finish = ops.find((o) => o.op === "finish");
-  assert.equal(finish?.text, turnText.in("en").queuedNotice);
-  assert.ok(finish.at < 5, "closed at once, not when the wait is over");
-  assert.equal(ops.filter((o) => o.op === "finish").length, 1);
-  assert.deepEqual(notices(run, "en"), []); // (said in the bubble, not twice)
+it("a queued message without a stream gets the queued notice as a message", async () => {
+  const run = await play(QUEUED_ANSWER, {
+    request: { key: "ak", text: "火锅", lang: "zh" },
+    sessionId: "s1",
+    setUp: (w: World) => {
+      w.claw.sendMessage = () => Promise.resolve(QUEUED_ID);
+    },
+  });
+  assert.deepEqual(run.bus.streamOps, []);
+  assert.equal(notices(run, "zh").length, 1);
   assert.ok(run.final.includes("明天吃火锅"));
 });
 

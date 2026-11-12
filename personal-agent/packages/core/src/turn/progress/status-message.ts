@@ -213,10 +213,9 @@ export class StatusMessage<S> {
   }
 
   /**
-   * Claw queued the message behind a turn it is still running, after its stream was opened (the turn in front started between
-   * the worker's look and the send): `notice` closes the stream at once, so it does not say "Thinking…" for the whole wait. The
-   * answer comes as a message of its own, as after the limit. When the stream did not open after all, `notice` is said as a
-   * message. False when there is no stream: the caller says it. Never fails the turn.
+   * Claw queued the message behind a turn it is still running: `notice` closes the stream at once, so it does not say
+   * "Thinking…" for the whole wait. The answer comes as a message of its own, as after the limit. When the stream did not open
+   * after all, `notice` is said as a message. False when there is no stream: the caller says it. Never fails the turn.
    */
   queued(notice: string): boolean {
     const live = this.live;
