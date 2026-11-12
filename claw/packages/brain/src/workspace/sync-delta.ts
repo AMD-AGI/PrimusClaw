@@ -416,17 +416,32 @@ export function withoutAddresses(text: string): string {
 }
 
 const RESTORE_HELD_MAX_SANDBOXES = 1024;
-/** Sandboxes (by `HandsClient.generation`) this process saw fail a restore; bounded like `unneutralised`. */
+/** Sandboxes this process saw fail a restore (`restoreHoldKey`); bounded like `unneutralised`. */
 const restoreHeld = new Set<string>();
+
+/**
+ * What the in-memory hold is kept under: the session and the sandbox's address.
+ *
+ * The address alone (`HandsClient.generation`, the MCP url) is not an identity
+ * that is never reused: it is the pod's IP, and a later sandbox -- another
+ * session's, or this one's after a reclaim -- can come up on it. With the
+ * session in the key another session's sandbox is never held by this note; a
+ * later sandbox of the same session is always restored into first, and a
+ * restore that succeeds releases the note (`releaseRestoreHold`).
+ */
+function restoreHoldKey(hands: HandsClient, sessionId: string): string {
+  return JSON.stringify([sessionId, hands.generation]);
+}
 
 /**
  * Record that this sandbox's restore did not complete, so no save from it
  * deletes or replaces anything. Never throws: the in-memory note is set first, and a sandbox
  * that refuses the write is still held by this process.
  */
-export async function holdAfterFailedRestore(hands: HandsClient, reason: string): Promise<void> {
-  restoreHeld.delete(hands.generation);
-  restoreHeld.add(hands.generation);
+export async function holdAfterFailedRestore(hands: HandsClient, sessionId: string, reason: string): Promise<void> {
+  const key = restoreHoldKey(hands, sessionId);
+  restoreHeld.delete(key);
+  restoreHeld.add(key);
   while (restoreHeld.size > RESTORE_HELD_MAX_SANDBOXES) {
     restoreHeld.delete(restoreHeld.values().next().value as string);
   }
@@ -452,8 +467,8 @@ export async function holdAfterFailedRestore(hands: HandsClient, reason: string)
  * deletes and replaces nothing, and what it leaves out is still there for the
  * next save that can tell, so the doubtful case costs a deferred save at most.
  */
-export async function isRestoreHeld(hands: HandsClient): Promise<boolean> {
-  if (restoreHeld.has(hands.generation)) return true;
+export async function isRestoreHeld(hands: HandsClient, sessionId: string): Promise<boolean> {
+  if (restoreHeld.has(restoreHoldKey(hands, sessionId))) return true;
   let raw: string | null;
   try {
     raw = finishedOutput(await bash(
@@ -465,6 +480,16 @@ export async function isRestoreHeld(hands: HandsClient): Promise<boolean> {
     return true;
   }
   return raw?.trim() !== "clear";
+}
+
+/**
+ * Forget this process's hold on a sandbox a restore has just filled in full. The
+ * hold was for a sandbox at this address that could not be restored; a restore
+ * that succeeded there is a sandbox whose /workspace is whole, and its own note
+ * on disk, if any, is the one `isRestoreHeld` still reads.
+ */
+export function releaseRestoreHold(hands: HandsClient, sessionId: string): void {
+  restoreHeld.delete(restoreHoldKey(hands, sessionId));
 }
 
 /**

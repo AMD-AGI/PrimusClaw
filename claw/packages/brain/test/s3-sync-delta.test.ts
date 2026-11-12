@@ -1316,6 +1316,41 @@ test("R7 a held sandbox puts nothing into the in-flight checkpoint, whose recove
   for (const k of saved) assert.ok(store.objects.has(k));
 });
 
+test("R8 a hold is not kept for a later sandbox at the same address: another session's, or this one's restored in full", async () => {
+  // The address is the pod's IP and comes back for other pods. A hold kept by
+  // address alone would make every later sandbox there drop edits to saved files.
+  const P = "http://10.0.0.9:9100/mcp";
+  const at = (sb: Sandbox): HandsClient => ({
+    generation: P,
+    callTool: (t: string, a: Record<string, unknown>) => sb.client.callTool(t, a),
+  }) as unknown as HandsClient;
+
+  savedSession();
+  const failed = freshSandbox();
+  failed.downloadThrows = "Request failed with status code 413";
+  await assert.rejects(() => syncWorkspaceFromS3(at(failed), "sess-1", "user-1"));
+  assert.equal((await syncWorkspaceToS3(at(failed), "sess-1", "user-1")).withheld, 1, "that sandbox is held");
+
+  // Another session's sandbox at the same address, while the hold stands.
+  const other = new Sandbox();
+  other.put("notes.md", "v1");
+  await syncWorkspaceToS3(at(other), "sess-2", "user-1");
+  other.put("notes.md", "v2, edited");
+  other.resetUploads();
+  const r2 = await syncWorkspaceToS3(at(other), "sess-2", "user-1");
+  assert.equal(r2.withheld, undefined, "not held");
+  assert.deepEqual(other.uploaded, ["/workspace/notes.md"], "its edit is saved");
+
+  // This session's next sandbox at the same address, restored in full.
+  const next = new Sandbox();
+  await syncWorkspaceFromS3(at(next), "sess-1", "user-1");
+  next.put("f1.txt", "edited after a good restore");
+  next.resetUploads();
+  const r = await syncWorkspaceToS3(at(next), "sess-1", "user-1");
+  assert.equal(r.withheld, undefined, "a restore that succeeded released the hold");
+  assert.ok(next.uploaded.includes("/workspace/f1.txt"), "the edit to a saved file is saved");
+});
+
 test("R6 a restore whose listing failed holds the sandbox too", async () => {
   savedSession();
   const sb = freshSandbox();

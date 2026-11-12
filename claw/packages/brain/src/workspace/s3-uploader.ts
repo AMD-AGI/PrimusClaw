@@ -23,6 +23,7 @@ import {
   invalidateSyncManifest,
   isRestoreHeld,
   planUploadDelta,
+  releaseRestoreHold,
   seedSyncManifest,
   withoutAddresses,
 } from "./sync-delta.js";
@@ -814,7 +815,7 @@ export async function syncWorkspaceToS3(
   // below does not run -- run, it deleted every file the restore had not brought
   // back. It keeps no record either, since what it leaves out is not in S3 as it
   // is here. See RESTORE_HOLD_PATH.
-  const restoreHeld = await isRestoreHeld(hands);
+  const restoreHeld = await isRestoreHeld(hands, sessionId);
   if (!listing.trusted || restoreHeld) await invalidateSyncManifest(hands, s3Prefix);
   const delta = listing.trusted && !restoreHeld
     ? await planUploadDelta(hands, s3Prefix, files, excludeArgs)
@@ -1087,14 +1088,17 @@ export async function syncWorkspaceFromS3(
   userId: string,
   options?: { s3PrefixOverride?: string },
 ): Promise<number> {
+  let restored: number;
   try {
-    return await restoreWorkspaceFromS3(hands, sessionId, userId, options);
+    restored = await restoreWorkspaceFromS3(hands, sessionId, userId, options);
   } catch (e) {
     const message = (e as { message?: string })?.message ?? String(e);
-    await holdAfterFailedRestore(hands, message);
+    await holdAfterFailedRestore(hands, sessionId, message);
     logger.error({ sessionId, err: message.slice(0, 500) }, "s3.restore.failed_prune_held");
     throw e;
   }
+  releaseRestoreHold(hands, sessionId);
+  return restored;
 }
 
 async function restoreWorkspaceFromS3(
