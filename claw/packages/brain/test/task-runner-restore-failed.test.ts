@@ -135,6 +135,20 @@ test("a restore that came back incomplete is reported under its own reason", asy
   assert.match(String(restoreFailed[0].message), /restored=10\/534/);
 });
 
+test("the event names no address: not the sandbox's, not a presigned URL", async () => {
+  const { WorkspaceRestoreIncomplete } = await import("../src/workspace/s3-uploader.js");
+  const { restoreFailed } = await runOnNewSandbox(() => Promise.reject(new Error(
+    "fetch failed for http://10.0.0.7:8080/mcp while fetching https://s3.example/b/k?X-Amz-Signature=abc",
+  )));
+  assert.equal(restoreFailed.length, 1);
+  assert.doesNotMatch(String(restoreFailed[0].message), /10\.0\.0\.7|X-Amz-Signature|https?:/);
+  assert.match(String(restoreFailed[0].message), /fetch failed for <url>/);
+
+  const incomplete = new WorkspaceRestoreIncomplete(0, 3, 3, "HTTP 413 from https://s3.example/b/k?X-Amz-Signature=abc");
+  assert.match(incomplete.message, /failed=3; first: HTTP 413 from <url>/);
+  assert.doesNotMatch(incomplete.message, /X-Amz-Signature/);
+});
+
 test("a restore that succeeded says nothing", async () => {
   const { restoreFailed, verdicts } = await runOnNewSandbox(() => Promise.resolve(534));
   assert.equal(restoreFailed.length, 0);

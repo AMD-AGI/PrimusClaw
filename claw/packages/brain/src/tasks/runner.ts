@@ -3260,6 +3260,9 @@ class TaskRunner {
         ? String((e as { message: string }).message).slice(0, 500)
         : String(e);
       const reason = workspaceTransferFailureReason(e, errMsg);
+      // The user is told what went wrong, never where: a sandbox's address is
+      // internal and a presigned URL is a credential.
+      const shown = errMsg.replace(/https?:\/\/\S+/g, "<url>");
       metrics.onWorkspaceRestore("failed");
       logger.warn({ err: e, sessionId: this.sessionId, site, reason }, "s3.restore_failed");
       await this.onEvent({
@@ -3267,7 +3270,7 @@ class TaskRunner {
         status: "workspace_restore_failed",
         reason,
         message: "The saved workspace could not be restored, so /workspace is missing files this session saved "
-          + `(${errMsg}). The saved copy is kept as it was: saves from this sandbox add new files to it `
+          + `(${shown}). The saved copy is kept as it was: saves from this sandbox add new files to it `
           + "and do not delete or replace any.",
         message_id: this.messageId,
       }).catch((err: unknown) => {

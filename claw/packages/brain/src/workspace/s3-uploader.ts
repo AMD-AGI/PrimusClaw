@@ -1047,11 +1047,14 @@ async function downloadRound(
 /**
  * A restore that ran out of retries with files still missing. Thrown, like any
  * other restore failure, so the caller tells the user: the files that did not
- * come back are in S3 and not in /workspace.
+ * come back are in S3 and not in /workspace. The message carries the first
+ * failure's error (a 413, say), which is what the caller's reason is read from;
+ * any URL in it is cut out, since a presigned one is a credential.
  */
 export class WorkspaceRestoreIncomplete extends Error {
-  constructor(readonly restored: number, readonly total: number, readonly failed: number) {
-    super(`workspace restore incomplete: restored=${restored}/${total}, failed=${failed}`);
+  constructor(readonly restored: number, readonly total: number, readonly failed: number, firstError = "") {
+    const first = firstError.replace(/https?:\/\/\S+/g, "<url>").slice(0, 200);
+    super(`workspace restore incomplete: restored=${restored}/${total}, failed=${failed}${first ? `; first: ${first}` : ""}`);
     this.name = "WorkspaceRestoreIncomplete";
   }
 }
@@ -1135,7 +1138,7 @@ async function restoreWorkspaceFromS3(
     "s3.restore.exhausted",
   );
   await putBackGitDirs();
-  throw new WorkspaceRestoreIncomplete(downloaded, keys.length, lastFailures.length);
+  throw new WorkspaceRestoreIncomplete(downloaded, keys.length, lastFailures.length, lastFailures[0]?.error);
 }
 
 /**
