@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.0 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.1 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.7.1 |
 
@@ -102,6 +102,20 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611121517` (commit e7255a96). No schema change, no new setting. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- A question a terminal asks names the tool that asked ("Claude Code", "Codex", "Cursor", from the connector's
+  `session_started.agent`, sent by connector 0.2.0) in the work item's title, the ask message and the "many are waiting"
+  message, instead of the connector's agent id (`claude-sessions`); items opened before keep working and are renamed on
+  their next request. The notice carries it as `remote.tool` (protocol `AssistantRemoteNotice.tool`), which personal
+  agent 0.7.1 shows on the card; an older worker keeps the agent id there. The one-minute "waiting in a terminal" notice
+  says "Claude Code", not "Claude Code (existing sessions)" (#779).
+
 ## [0.3.0] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611121326` (commit 86eeb027). A minor release; no schema change; new setting
@@ -130,15 +144,6 @@ Connector requirements otherwise unchanged from 0.1.0.
   `on_input` for Codex, sent by connector 0.2.0); Claude Code's wording is unchanged (#773).
 - The `claw` image no longer contains npm or npx (it never ran them; the image scan found six HIGH findings in the base
   image's bundled npm) nor `packages/*/test` (#774).
-
-### Fixed
-
-- A question asked in a terminal and put to the user (the connector's approval hooks) names the tool that asked, "Claude
-  Code", "Codex" or "Cursor", instead of the connector's id for its agent (`claude-sessions`): in the item's title, the
-  message, and the one that says many are waiting. Claw reads it from the `agent` the connector (0.2.0 and later) puts
-  on the session's `session_started`, and passes it on as `remote.tool` for a channel's card; a session that does not
-  say keeps the agent's id, as before; an item already open learns it on its next request. The one-minute "waiting in a
-  terminal" notice says "Claude Code", not "Claude Code (existing sessions)". No schema change, no new setting (#779).
 
 ## [0.2.1] - 2026-11-12
 
