@@ -17,7 +17,7 @@ import { CONTEXT_TEXT_MAX } from "./chat.js";
 export const PULL_LINK = /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[0-9]+/;
 /** Code points of one of Claw's suggested replies (Claw sends at most 30): a button's few words. */
 export const SUGGESTED_REPLY_MAX = 30;
-/** Teams shows the first three suggested replies only. */
+/** The suggested replies kept under a message when the channel's own limit is not given (`SurfaceCaps.suggestionsMax`). */
 export const SUGGESTIONS_MAX = 3;
 /** The writes Claw holds for the person that this worker draws as a card. */
 export const CONFIRM_KINDS = [
@@ -106,9 +106,16 @@ export function confirmWriteOf(event: Event): ConfirmWrite | undefined {
 
 /**
  * The suggested replies under an `assistant.say` (none under anything else, or with the style off): Claw's own, each one plain
- * line that is no command, else the defaults in the person's language (`lang`; without it, the language of `text`).
+ * line that is no command (at most `max`, the channel's `SurfaceCaps.suggestionsMax`), else the defaults in the person's
+ * language (`lang`; without it, the language of `text`).
  */
-export function suggestedRepliesOf(event: Event, text: string, styleOn: boolean, lang?: Lang): SuggestedReply[] {
+export function suggestedRepliesOf(
+  event: Event,
+  text: string,
+  styleOn: boolean,
+  lang?: Lang,
+  max = SUGGESTIONS_MAX,
+): SuggestedReply[] {
   if (event["type"] !== "assistant.say" || !styleOn) return [];
   const own = event["suggested_replies"];
   const replies: SuggestedReply[] = [];
@@ -118,7 +125,7 @@ export function suggestedRepliesOf(event: Event, text: string, styleOn: boolean,
       reply && !reply.startsWith("/") && cpLength(reply) <= SUGGESTED_REPLY_MAX && !String(raw).includes("\n");
     if (fits && !replies.some(([title]) => title === reply)) replies.push([reply, reply]);
   }
-  if (replies.length) return replies.slice(0, SUGGESTIONS_MAX);
+  if (replies.length) return replies.slice(0, max);
   return [...ASSISTANT_SUGGESTED_REPLIES[lang ?? pickLang(text)]];
 }
 

@@ -170,10 +170,16 @@ test("the message a thumb is stored under", () => {
     ["\x1c", undefined],
   ];
   for (const [replyTo, expected] of cases) {
-    const got = voteMessageId(sha, replyTo);
+    const got = voteMessageId(sha, replyTo, "teams");
     assert.equal(got, expected, replyTo);
     if (got !== undefined) assert.match(got, /^[A-Za-z0-9._:@-]{1,100}$/);
   }
+});
+
+test("a vote's key is under the channel's own id, hashed or not", () => {
+  const sha = (t: string) => createHash("sha256").update(t, "utf8").digest("hex");
+  assert.equal(voteMessageId(sha, "1700000000.000100", "chatapp"), "chatapp:1700000000.000100");
+  assert.equal(voteMessageId(sha, "é-1", "chatapp"), "chatapp:ac09ccc36d141ca34c1420f0d859cf1fb19476e7");
 });
 
 test("a thumbs down files the same issue by either thumbs", async () => {

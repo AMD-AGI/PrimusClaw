@@ -45,9 +45,9 @@ export const onboardingText = {
     "You are connected. " + (pending ? "Running your request now." : "Mention me again to ask something."),
   stepsSent: (bot: string) =>
     `I sent you the steps in a 1:1 chat with ${bot}. Open it to connect; I run your request here as soon as you are connected.`,
-  noDm: (page: string) =>
-    "I could not message you directly. Open a 1:1 chat with me in Teams and send me any message there to see how to " +
-    "connect. On a desktop you can also open the page below, sign in, and select Connect Microsoft Teams. Send " +
+  noDm: (page: string, channel: { readonly name: string; readonly shortName: string }) =>
+    `I could not message you directly. Open a 1:1 chat with me in ${channel.shortName} and send me any message there to see how to ` +
+    `connect. On a desktop you can also open the page below, sign in, and select Connect ${channel.name}. Send ` +
     `me the \`/link CODE\` it gives you in that chat.\n\n${page}`,
   resuming: (name: string, bot: string) =>
     `${name || "Someone"} connected ${bot}, so I am running their earlier request now.`,

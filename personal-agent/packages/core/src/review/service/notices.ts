@@ -10,7 +10,7 @@
 import { errorKind } from "../../claw/errors.js";
 import type { WorkItem, PullRef } from "../../claw/model.js";
 import { errorName } from "../../errors.js";
-import { REACH_WORDS } from "../../locales/review-github.js";
+import { reachWords } from "../../locales/review-github.js";
 import type { Conversation, ConversationRef, UserRef } from "../../ports/surface.js";
 import { shortName } from "../../review-text/pull-ref.js";
 import { queueReason, shorts } from "../refusals.js";
@@ -149,13 +149,16 @@ export class Notices {
     return `${question ? `${lead}：${question}` : `${lead}。`}${line ? `\n${line}` : ""}\n\n${how}`;
   }
 
-  /** For a review handed to someone else: '' when what waits for them reaches their chat, else one line for the asker. */
-  async reachNote(review: ReviewTurn | undefined): Promise<string> {
+  /**
+   * For a review handed to someone else: '' when what waits for them reaches their chat, else one line for the asker.
+   * `channel`: the chat app's short name (`SurfaceCaps.shortName`).
+   */
+  async reachNote(review: ReviewTurn | undefined, channel: string): Promise<string> {
     if (review === undefined || this.deps.host.reviewerReach === undefined) return "";
     const why = await this.deps.host.reviewerReach(review.actorId);
     if (!why) return "";
-    const [cause, fix] = (Object.hasOwn(REACH_WORDS, why) ? REACH_WORDS[why] : undefined) ??
-      REACH_WORDS.no_subscription ?? ["", ""];
+    const words = reachWords(channel);
+    const [cause, fix] = (Object.hasOwn(words, why) ? words[why] : undefined) ?? words.no_subscription ?? ["", ""];
     return `注意：${reviewerName(review)} 现在收不到这项代审在等 TA 确认时的提醒和确认卡片（${cause}）。需要 TA 确认的步骤会一直等着，请提醒 TA ${fix}。`;
   }
 

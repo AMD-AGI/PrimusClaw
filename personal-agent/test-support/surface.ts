@@ -41,7 +41,28 @@ export type Recorded =
   | { readonly op: "stream.emit"; readonly conversation: string; readonly text: string }
   | { readonly op: "stream.finish"; readonly conversation: string; readonly message: OutMessage };
 
+/** The channel the fakes are by default: Teams' name and limits, so what core says and keys reads as on Teams. */
+export const FAKE_CHANNEL = {
+  channel: "teams",
+  name: "Microsoft Teams",
+  shortName: "Teams",
+  citationsMax: 20,
+  suggestionsMax: 3,
+  streamSeconds: 600,
+} as const;
+
+/** Another channel, for tests that core says and keys what the channel's caps give it (not Teams' words). */
+export const OTHER_CHANNEL = {
+  channel: "chatapp",
+  name: "Chat App",
+  shortName: "ChatApp",
+  citationsMax: 5,
+  suggestionsMax: 2,
+  streamSeconds: 300,
+} as const;
+
 export const ALL_CAPS: SurfaceCaps = {
+  ...FAKE_CHANNEL,
   streaming: true,
   messageIds: true,
   edit: true,
@@ -135,6 +156,16 @@ class FakeConversation implements Conversation {
     private readonly surface: FakeSurface,
     readonly ref: ConversationRef,
   ) {}
+
+  get caps(): SurfaceCaps {
+    return this.surface.caps;
+  }
+
+  /** As Teams reads it: the reference's `activityId`. */
+  get replyTo(): MessageId {
+    const id = this.ref.wire["activityId"];
+    return typeof id === "string" ? id : "";
+  }
 
   markSettled(id: MessageId): void {
     this.edited.add(id);

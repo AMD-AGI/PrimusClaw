@@ -124,10 +124,16 @@ test("a message of a person the assistant understands but cannot reach yet is no
 
 test("the line names the client platform and the review route, and nothing else", () => {
   const { logger, started } = recording();
-  logTurnStarted(logger, "android", false, "review");
-  logTurnStarted(logger, "", true, "legacy");
+  logTurnStarted(logger, "Teams", "android", false, "review");
+  logTurnStarted(logger, "Teams", "", true, "legacy");
   assert.deepEqual(started, [
     { platform: "android", chat: "1:1", route: "review" },
     { platform: "unknown", chat: "group", route: "legacy" },
   ]);
+});
+
+test("the line names the chat app the turn came from", () => {
+  const { logger, lines } = recording();
+  logTurnStarted(logger, "ChatApp", "web", false, "assistant");
+  assert.deepEqual(lines, ['turn started from ChatApp client {"platform":"web","chat":"1:1","route":"assistant"}']);
 });

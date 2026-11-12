@@ -20,6 +20,7 @@ import type {
   Random,
   Result,
   StreamRefused,
+  SurfaceCaps,
   UpdateOptions,
 } from "@primusclaw/personal-agent";
 import { err, ok, silentLogger } from "@primusclaw/personal-agent";
@@ -51,6 +52,8 @@ export const SLOW_PUBLISH_MS = 1000;
 
 export interface ConversationParts {
   readonly ref: ConversationRef;
+  /** The caps of the surface this conversation is on. */
+  readonly caps: SurfaceCaps;
   readonly outbox: Outbox;
   readonly acks: AckRegistry;
   readonly clock: Clock;
@@ -80,6 +83,16 @@ export class TeamsConversation implements Conversation {
 
   get ref(): ConversationRef {
     return this.parts.ref;
+  }
+
+  get caps(): SurfaceCaps {
+    return this.parts.caps;
+  }
+
+  /** The activity the reference was read from (`activityId` of the stored reference), which a stream replies under. */
+  get replyTo(): MessageId {
+    const id = this.parts.ref.wire["activityId"];
+    return typeof id === "string" ? id : "";
   }
 
   private get masker(): Masker | undefined {

@@ -64,6 +64,11 @@ export function attachedContext(attached: Attached): { attached?: JsonObject | n
 
 /** What a channel context is made of. */
 export interface ChannelContextInput {
+  /**
+   * The channel the message came through (`SurfaceCaps.channel`). The router sets it on what the builder returns, so a
+   * builder that does not pass it on gets "" here and the channel there.
+   */
+  readonly channel?: string;
   readonly channelMessageId: string;
   readonly people: readonly NamedPerson[];
   readonly pending: readonly PendingEntry[];
@@ -84,7 +89,7 @@ export interface ChannelContextInput {
 export function channelContext(input: ChannelContextInput): JsonObject {
   const via = input.via ?? "typed";
   return {
-    channel: "teams",
+    channel: input.channel ?? "",
     channel_message_id: input.channelMessageId,
     people: input.people as unknown as JsonValue,
     actions: input.actions.slice(0, CONTEXT_ITEMS_MAX),

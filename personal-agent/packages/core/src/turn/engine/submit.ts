@@ -82,6 +82,7 @@ export function sendOptions(ctx: TurnContext): SendOptions {
   return {
     ...(ctx.request.modelKey ? { modelKey: ctx.request.modelKey } : {}),
     ...(ctx.request.actingAs ? { acting: true } : {}),
+    channel: ctx.deps.surface.caps.shortName,
   };
 }
 
@@ -98,6 +99,7 @@ function newSession(ctx: TurnContext, text: string, withMessage: boolean): NewSe
     ...(r.reviewModel ? { model: r.reviewModel } : {}),
     ...(r.reviewOnly ? { reviewOnly: true } : {}),
     ...(withMessage ? {} : { withMessage: false }),
+    channel: ctx.deps.surface.caps.shortName,
   };
 }
 
@@ -138,7 +140,7 @@ interface Uploaded {
 async function upload(ctx: TurnContext, sessionId: string | undefined, signal?: AbortSignal): Promise<Uploaded> {
   const fetched = ctx.record.fetched ?? [];
   const files = fetched.map((f) => ({ name: f.name, content: f.bytes, mediaType: f.mediaType }));
-  const folder = uploadFolder(ctx.request.idempotencyKey);
+  const folder = uploadFolder(ctx.request.idempotencyKey, ctx.deps.surface.caps.channel);
   let target = sessionId;
   for (;;) {
     target ??= (await create(ctx, ctx.request.text || "Files", false, signal))[0];

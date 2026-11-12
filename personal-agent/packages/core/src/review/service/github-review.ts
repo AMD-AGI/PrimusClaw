@@ -116,7 +116,7 @@ export class GithubReview {
    */
   async request(route: MessageRoute): Promise<boolean> {
     const ctx = this.context(route);
-    const asking = { message: ctx.message, sender: ctx.sender, group: ctx.group };
+    const asking = { message: ctx.message, sender: ctx.sender, group: ctx.group, channel: ctx.conversation.caps.name };
     const expanded = await this.requests.barePulls(asking);
     if (typeof expanded === "string") {
       await say(this.deps, ctx.conversation, expanded);
@@ -206,7 +206,10 @@ export class GithubReview {
   async modeMessage(sender: UserRef, text: string, conversation: Conversation): Promise<boolean> {
     if (!MODE_WORDS.test(text) || Array.from(text).length > 300) return false;
     const key = this.deps.intent === undefined ? null : this.deps.store.links.getKey(sender.id);
-    const raw = key && this.deps.intent !== undefined ? await this.deps.intent.readMode(key, text) : undefined;
+    const raw =
+      key && this.deps.intent !== undefined
+        ? await this.deps.intent.readMode(key, text, conversation.caps.name)
+        : undefined;
     if (raw === undefined && !MODE_STRONG.test(text)) return false;
     const suggested = raw === undefined ? "" : modeWanted(raw);
     if (suggested === null) return false;

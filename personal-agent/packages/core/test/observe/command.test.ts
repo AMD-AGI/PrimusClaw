@@ -43,12 +43,13 @@ test("a verb that names an Object.prototype property is no verb", async (t) => {
 });
 
 test("a scope is only an id claw takes", () => {
-  assert.equal(scopeOf(CONV), `group:teams:${CONV}`);
-  assert.equal(scopeOf(""), undefined);
-  assert.equal(scopeOf("a b"), undefined);
-  assert.equal(scopeOf("a　b"), undefined);
-  assert.equal(scopeOf("x".repeat(161)), undefined);
-  assert.equal(scopeOf("x".repeat(160)), `group:teams:${"x".repeat(160)}`);
+  assert.equal(scopeOf(CONV, "teams"), `group:teams:${CONV}`);
+  assert.equal(scopeOf("", "teams"), undefined);
+  assert.equal(scopeOf("a b", "teams"), undefined);
+  assert.equal(scopeOf("a　b", "teams"), undefined);
+  assert.equal(scopeOf("x".repeat(161), "teams"), undefined);
+  assert.equal(scopeOf("x".repeat(160), "teams"), `group:teams:${"x".repeat(160)}`);
+  assert.equal(scopeOf(CONV, "chatapp"), `group:chatapp:${CONV}`); // (the channel's own id, never Teams')
 });
 
 test("a suggestion shows a reply's text, a task's title and brief, else the call's arguments", () => {

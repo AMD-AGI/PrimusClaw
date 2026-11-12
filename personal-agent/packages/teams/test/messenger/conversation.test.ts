@@ -196,3 +196,15 @@ test("a group chat shows the plan through the same redaction as everything else"
   assert.ok(everything.includes("Plan: 0 of 2 done") && everything.includes("Open the PR"));
   assert.ok(!everything.includes(secret));
 });
+
+test("a conversation answers the activity its reference was read from, and has the surface's caps", () => {
+  const queue = new RecordingQueue();
+  const { conversation } = build(queue);
+  assert.equal(conversation.replyTo, "user-msg-1");
+  assert.equal(conversation.caps.channel, "teams");
+  const stored = ref();
+  for (const activityId of [null, undefined, 7]) {
+    const wire = { ...stored.wire, activityId };
+    assert.equal(build(queue, { ref: { ...stored, wire } }).conversation.replyTo, "", String(activityId));
+  }
+});

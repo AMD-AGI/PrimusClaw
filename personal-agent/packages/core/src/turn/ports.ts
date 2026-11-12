@@ -23,7 +23,7 @@ export function sleepSeconds(clock: Clock, seconds: number, signal?: AbortSignal
 /** The conversation the turn answers in: the calls of the Conversation port it makes. */
 export type TurnSurface = Pick<
   Conversation,
-  "typing" | "send" | "post" | "update" | "delete" | "openStream" | "outgoing" | "deliver"
+  "caps" | "typing" | "send" | "post" | "update" | "delete" | "openStream" | "outgoing" | "deliver"
 >;
 
 /** The calls of Claw's sessions port a turn makes. */

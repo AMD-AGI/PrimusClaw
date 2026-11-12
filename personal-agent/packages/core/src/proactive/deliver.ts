@@ -296,6 +296,7 @@ export class Deliveries {
       shown,
       head: said.head,
       replies: said.replies,
+      limits: conversation.caps,
     });
     const [first, ...rest] = messages;
     if (first === undefined) return;
@@ -313,10 +314,15 @@ export class Deliveries {
   /** The one text message of `event` as an edit can carry it; undefined when it is more than that (several, or a card). */
   private oneText(
     userId: string,
+    conversation: Conversation,
     event: JsonObject,
     options: { head: string; replies: readonly (readonly [string, string])[] },
   ) {
-    const said = this.deps.say.messages(userId, event, { linkFor: this.deps.deliveryLink, ...options });
+    const said = this.deps.say.messages(userId, event, {
+      linkFor: this.deps.deliveryLink,
+      ...options,
+      limits: conversation.caps,
+    });
     const [only] = said;
     return said.length === 1 && only !== undefined && only.body.type !== "view" ? only : undefined;
   }
@@ -337,7 +343,7 @@ export class Deliveries {
     const text = pyStrip(str(event["text"]));
     if (earlier === undefined || !text) return false;
     const both = { ...earlier.event, text: `${pyRstrip(str(earlier.event["text"]))}\n\n${text}` };
-    const message = this.oneText(userId, both, options);
+    const message = this.oneText(userId, conversation, both, options);
     if (
       message === undefined ||
       !(await this.edit(
@@ -364,7 +370,7 @@ export class Deliveries {
     if (event["type"] !== "assistant.say" || typeof replaces !== "string" || !replaces) return false;
     const earlier = this.deps.said.get(replaces);
     if (earlier === undefined || !pyStrip(str(event["text"]))) return false;
-    const message = this.oneText(userId, event, options);
+    const message = this.oneText(userId, conversation, event, options);
     if (
       message === undefined ||
       !(await this.edit(

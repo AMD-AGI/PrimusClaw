@@ -167,11 +167,22 @@ test("the reader calls the gateway with the askers key and gives up on anything 
     });
   const ok = await reader(() =>
     Promise.resolve(Response.json({ choices: [{ message: { content: 'x {"intent": "none"} y' } }] })),
-  ).read("ak-1", "请 Bob review 合入 x/y#1", []);
+  ).read("ak-1", "请 Bob review 合入 x/y#1", [], "Microsoft Teams");
   assert.deepEqual(ok, { intent: "none" });
   assert.ok(bodies[0]?.includes('"model":"small"') && bodies[0].includes("请 Bob review 合入 x/y#1"));
-  assert.equal(await reader(() => Promise.resolve(new Response("", { status: 429 }))).readMode("k", "t"), undefined);
-  assert.equal(await reader(() => Promise.reject(new Error("timeout"))).readAnswer("k", "t", []), undefined);
+  assert.ok(bodies[0]?.includes("in a Microsoft Teams group chat")); // (the model is told the chat app the message came through)
+  assert.equal(
+    await reader(() => Promise.resolve(new Response("", { status: 429 }))).readMode("k", "t", "Microsoft Teams"),
+    undefined,
+  );
+  assert.equal(
+    await reader(() => Promise.reject(new Error("timeout"))).readAnswer("k", "t", [], "Microsoft Teams"),
+    undefined,
+  );
+  const other = reader(() => Promise.resolve(Response.json({ choices: [{ message: { content: "{}" } }] })));
+  await other.readMode("k", "t", "Chat App");
+  await other.readAnswer("k", "t", [], "Chat App");
+  for (const body of bodies.slice(-2)) assert.ok(body.includes("one-to-one Chat App chat") && !body.includes("Teams"));
   assert.deepEqual(readingOf("no json"), { intent: null });
   assert.deepEqual(readingOf("[1]"), { intent: null });
 });

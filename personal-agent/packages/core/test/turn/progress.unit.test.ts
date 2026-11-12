@@ -123,6 +123,17 @@ it("a stream still open at the chat's limit is closed with Still working, and th
   assert.ok(refused.log.lines.some((l) => l.message.startsWith("the turn's stream could not be closed before")));
 });
 
+it("a stream is closed a minute before its own chat's limit", async () => {
+  const { clock, bus, status } = streaming();
+  Object.assign(bus, { caps: { ...bus.caps, streamSeconds: 300 } }); // (a chat that keeps a stream five minutes)
+  status.begin();
+  await clock.advanceTo(clock.start + 239);
+  assert.notEqual(bus.streamOps.at(-1)?.op, "finish");
+  await clock.advanceTo(clock.start + 241);
+  assert.equal(bus.streamOps.at(-1)?.text, "Still working on it; the result will follow as a new message.");
+  assert.equal(STREAM_CLOSE_SECONDS, 540); // (Teams: ten minutes, as before)
+});
+
 it("a card waiting for the person closes the stream at once, even before it opened, and never again at the limit", async () => {
   const { clock, bus, log, status } = streaming({}, "zh");
   status.begin();

@@ -15,7 +15,7 @@ import type { MessageFiles } from "../../packages/core/src/assistant/files.js";
 import { Receipts } from "../../packages/core/src/assistant/receipts.js";
 import { DirectChat } from "../../packages/core/src/direct-chat/direct-chat.js";
 import { silentLogger } from "../../packages/core/src/ports/logger.js";
-import type { Conversation, InboundFile } from "../../packages/core/src/ports/surface.js";
+import type { Conversation, InboundFile, SurfaceCaps } from "../../packages/core/src/ports/surface.js";
 import { Subscriptions } from "../../packages/core/src/subscriptions/subscriptions.js";
 import { FakeClawSubscriptions } from "./subscription-fakes.js";
 import { FakeClock } from "../clock.js";
@@ -65,6 +65,8 @@ export interface AssistantWorldOptions {
   readonly files?: MessageFiles;
   readonly progress?: boolean;
   readonly streamSay?: boolean;
+  /** What the channel is and can do (default: `FakeSurface`'s). */
+  readonly caps?: Partial<SurfaceCaps>;
 }
 
 /** The step labels of an assistant's lookups the Python tests read (step_labels.lookup_label, zh). */
@@ -83,7 +85,7 @@ export class AssistantWorld {
   readonly claw = new FakeAssistantClaw();
   readonly subsClaw = new FakeClawSubscriptions();
   readonly feed = new LiveFeed();
-  readonly surface = new FakeSurface();
+  readonly surface: FakeSurface;
   readonly receipts = new Receipts(this.clock, silentLogger);
   /** The texts the assistant did not take, in order. */
   readonly started: string[] = [];
@@ -102,6 +104,7 @@ export class AssistantWorld {
   private readonly conversations = new Map<string, Conversation>();
 
   constructor(private readonly options: AssistantWorldOptions = {}) {
+    this.surface = new FakeSurface(options.caps ? { caps: options.caps } : {});
     this.assistant = options.assistant ?? true;
     if (options.oldClaw) this.subsClaw.knownTypes = new Set(OLD_TYPES);
     if (options.oldClaw || options.itemApprovals === false) this.subsClaw.knownSources.delete("assistant_item");

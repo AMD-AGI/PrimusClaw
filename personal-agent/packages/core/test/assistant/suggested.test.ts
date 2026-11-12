@@ -110,3 +110,37 @@ for (const [name, words] of [
     assert.deepEqual([final?.aiGenerated, final?.feedback], [true, true]);
   });
 }
+
+it("as many replies and citations are kept as the channel shows, and Teams' three and twenty without a word from it", () => {
+  const { store } = openTestStore();
+  const planner = new SayPlanner({
+    store,
+    exactCommand: () => false,
+    style: () => ({ citations: true, suggestedReplies: true }),
+  });
+  const sources = Array.from({ length: 25 }, (_, i) => ({
+    n: i + 1,
+    url: `https://example.com/${String(i + 1)}`,
+    title: "t",
+  }));
+  const event = {
+    type: "assistant.say",
+    text: `Many sources ${sources.map((s) => `[${String(s.n)}]`).join(" ")}.`,
+    sources,
+    suggested_replies: ["one", "two", "three", "four"],
+  };
+  const [teams] = planner.messages(ALICE, event);
+  const [other] = planner.messages(ALICE, event, { limits: { citationsMax: 5, suggestionsMax: 2 } });
+  const [wide] = planner.messages(ALICE, event, { limits: { citationsMax: 30, suggestionsMax: 4 } });
+  assert.ok(teams && other && wide);
+  assert.deepEqual([buttons(teams).length, (teams.citations ?? []).length], [3, 20]);
+  assert.deepEqual(buttons(other), [
+    ["one", "one"],
+    ["two", "two"],
+  ]);
+  assert.deepEqual(
+    (other.citations ?? []).map((c) => c.position),
+    [1, 2, 3, 4, 5],
+  );
+  assert.deepEqual([buttons(wide).length, (wide.citations ?? []).length], [4, 25]);
+});

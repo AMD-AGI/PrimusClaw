@@ -5,7 +5,7 @@ import type { LinkRepository } from "../ports/store/link.js";
 import type { OutMessage, UserRef } from "../ports/surface.js";
 import type { Lang } from "../locales/lang.js";
 import { AI_NOTICE } from "../locales/transparency.js";
-import { linkText } from "../locales/link.js";
+import { linkPage, linkText } from "../locales/link.js";
 import { routingText } from "../locales/routing.js";
 import type { TokenExchange } from "../plugins/token-exchange.js";
 import type { Chat } from "./chat.js";
@@ -169,8 +169,9 @@ export class Credentials {
     const request = await this.deps.exchange.bindingRequest(sender.id, sender.email);
     if (!request.ok) {
       this.deps.logger.warn("binding request failed", { kind: request.error.kind });
-      const who = sender.email || `your Teams account (${sender.name || "this chat"})`;
-      return this.views.link(who);
+      const { channel, shortName } = chat.conversation.caps;
+      const who = sender.email || `your ${shortName} account (${sender.name || "this chat"})`;
+      return this.views.link(who, channel);
     }
     const shown = bindingLang(chat, lead);
     return this.views.binding(request.value.confirmUrl, shown.lead, shown.lang);
@@ -179,14 +180,15 @@ export class Credentials {
   /** The `/link` steps, in the person's language (all English after a lead that has no Chinese of its own). */
   async askToLink(chat: Chat, lead = ""): Promise<void> {
     const { botName, publicBaseUrl } = this.deps.config;
-    const page = `${publicBaseUrl}/primus-claw/teams-link`;
+    const { channel: id, name: channel } = chat.conversation.caps;
+    const page = linkPage(publicBaseUrl, id);
     const dmLead = routingText.in("en").dmLead;
     if (chat.zh() && (lead === "" || lead === dmLead)) {
       const zhLead = lead === "" ? "" : routingText.in("zh").dmLead;
-      await chat.say(linkText.in("zh").linkSteps({ lead: zhLead, bot: botName, page, notice: AI_NOTICE.zh }));
+      await chat.say(linkText.in("zh").linkSteps({ lead: zhLead, bot: botName, page, notice: AI_NOTICE.zh, channel }));
       return;
     }
-    await chat.say(linkText.in("en").linkSteps({ lead, bot: botName, page, notice: AI_NOTICE.en }));
+    await chat.say(linkText.in("en").linkSteps({ lead, bot: botName, page, notice: AI_NOTICE.en, channel }));
   }
 }
 

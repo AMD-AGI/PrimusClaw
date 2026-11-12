@@ -242,6 +242,8 @@ export class RemoteWorld {
     };
     return {
       ref: to.ref,
+      caps: to.caps,
+      replyTo: to.replyTo,
       edited: to.edited,
       typing: () => to.typing(),
       send: (message) => refused(message) ?? to.send(message),

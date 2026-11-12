@@ -3,7 +3,11 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CHANGE_HEADING, CHANGE_SUMMARY_RULE, RULE_HEADING, messageContent, withoutRule } from "../../src/index.js";
+import { CHANGE_SUMMARY_RULE, changeHeading, messageContent, ruleHeading, withoutRule } from "../../src/index.js";
+
+/** The headings as the Teams worker has always written them. */
+const RULE_HEADING = "## Teams reply style (formatting only, facts unchanged)";
+const CHANGE_HEADING = "## Teams change summary (only when files in a git repository changed)";
 
 const RULE = "Write this reply for a Microsoft Teams chat.\n1. Open with a one-line answer in bold.";
 const CHANGE = `${CHANGE_HEADING}\n\n${CHANGE_SUMMARY_RULE}`;
@@ -41,6 +45,19 @@ describe("withoutRule", () => {
     assert.equal(withoutRule(`first\n\n${RULE_HEADING}\n\n${RULE}`), "first");
   });
 
+  it("a heading the user wrote with more than a chat app's one-word name before it is theirs", () => {
+    const mine = "my notes\n\n## A Teams reply style (formatting only, facts unchanged)\n\nkeep this";
+    assert.equal(withoutRule(mine), mine);
+    assert.equal(withoutRule(`${mine}\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`), mine);
+  });
+
+  it("reads a long run of blank lines and hashes at once", () => {
+    const long = "\n".repeat(50_000) + "## ".repeat(20_000) + " reply style";
+    const started = Date.now();
+    assert.equal(withoutRule(long), long);
+    assert.ok(Date.now() - started < 1000);
+  });
+
   it("keeps the user's own blank lines", () => {
     assert.equal(withoutRule(`first\n\nsecond\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`), "first\n\nsecond");
   });
@@ -48,9 +65,22 @@ describe("withoutRule", () => {
 
 describe("messageContent", () => {
   it("puts the summary request first, then the rule", () => {
-    assert.equal(messageContent("hi", RULE, true), `hi\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`);
-    assert.equal(messageContent("hi", "", true), `hi\n\n${CHANGE}`);
-    assert.equal(messageContent("hi", "", false), "hi");
+    assert.equal(messageContent("hi", RULE, true, "Teams"), `hi\n\n${CHANGE}\n\n${RULE_HEADING}\n\n${RULE}`);
+    assert.equal(messageContent("hi", "", true, "Teams"), `hi\n\n${CHANGE}`);
+    assert.equal(messageContent("hi", "", false, "Teams"), "hi");
+  });
+
+  it("the headings carry the chat app's own name, or none", () => {
+    assert.equal(ruleHeading("Teams"), RULE_HEADING);
+    assert.equal(changeHeading("Teams"), CHANGE_HEADING);
+    assert.equal(ruleHeading("ChatApp"), "## ChatApp reply style (formatting only, facts unchanged)");
+    assert.equal(ruleHeading(""), "## Reply style (formatting only, facts unchanged)");
+    for (const channel of ["ChatApp", ""]) {
+      const sent = messageContent("how are the plans?", RULE, true, channel);
+      assert.ok(!sent.includes("Teams reply") && !sent.includes("Teams change"));
+      assert.equal(withoutRule(sent), "how are the plans?", channel);
+      assert.equal(withoutRule(`first\n\n${ruleHeading(channel)}\n\n${RULE}`), "first", channel);
+    }
   });
 
   it("the change summary request asks for git diff stat, read only, and only when something changed", () => {

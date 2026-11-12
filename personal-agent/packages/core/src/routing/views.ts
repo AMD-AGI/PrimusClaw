@@ -3,6 +3,7 @@
 
 import { AI_NOTICE } from "../locales/transparency.js";
 import type { Lang } from "../locales/lang.js";
+import { linkPage } from "../locales/link.js";
 import { noteMessage, type NoteTone } from "../note/note.js";
 import type { OutMessage, ViewButton } from "../ports/surface.js";
 import type { NoteButton, NoteFactory } from "./features.js";
@@ -149,11 +150,12 @@ export class CommandViews {
     readonly note: NoteFactory,
   ) {}
 
-  link(who: string): OutMessage {
+  /** The card that sends the person to the console's `/link` page of the channel `channel` (`SurfaceCaps.channel`). */
+  link(who: string, channel: string): OutMessage {
     const model: LinkCardView = {
       bot: this.bot,
       who,
-      page: `${this.publicBaseUrl}/primus-claw/teams-link`,
+      page: linkPage(this.publicBaseUrl, channel),
       notice: AI_NOTICE.en,
     };
     return view({ type: "view", view: { name: "link", model }, fallbackText: `Connect ${this.bot}` });

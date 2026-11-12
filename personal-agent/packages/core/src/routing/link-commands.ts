@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { linkText, unlinkText } from "../locales/link.js";
+import { linkKeyName, linkText, unlinkText } from "../locales/link.js";
 import type { PendingRequest } from "../ports/store/onboarding.js";
 import type { InboundAction } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
@@ -72,7 +72,8 @@ export class LinkCommands {
     store.links.unlink(userId);
     const stillBound = await this.stillBound(userId);
     const said = unlinkText.in(chat.lang());
-    const tail = (revoked ? said.deleted : said.notDeleted) + (stillBound ? said.stillBound : "");
+    const key = linkKeyName(chat.conversation.caps.shortName);
+    const tail = (revoked ? said.deleted : said.notDeleted({ key })) + (stillBound ? said.stillBound : "");
     await chat.say(said.unlinked({ tail }));
   }
 

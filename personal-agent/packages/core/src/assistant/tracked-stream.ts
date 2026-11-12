@@ -39,6 +39,10 @@ export class TrackedStream implements ReceiptStream {
     return this.open && this.streamId !== "";
   }
 
+  get lifetimeSeconds(): number {
+    return this.conversation.caps.streamSeconds;
+  }
+
   ageSeconds(): number {
     return (this.clock.monotonicMs() - this.started) / 1000;
   }

@@ -45,6 +45,7 @@ export class AccountCommands {
         values: await this.values(chat, key, zh),
         lead: lead.join("\n\n"),
         bot: config.botName,
+        channel: chat.conversation.caps.name,
         understanding: assistant.understands(chat.sender.id),
         ...(groupContext === undefined ? {} : { groupContext }),
       }),
@@ -74,7 +75,7 @@ export class AccountCommands {
     const prefs = store.prefs.getPrefs(chat.sender.id);
     const [on, off] = zh ? ["开", "关"] : ["on", "off"];
     const names = LANG_NAMES[chat.lang()];
-    const how = langHow(prefs.langSet, prefs.lang !== "", zh);
+    const how = langHow(prefs.langSet, prefs.lang !== "", zh, chat.conversation.caps.shortName);
     const values: Record<string, string> = {
       timezone: prefs.timezone,
       quiet: prefs.quietEnabled ? `${prefs.quietStart}-${prefs.quietEnd}` : off,
@@ -207,7 +208,11 @@ export class AccountCommands {
     const current = prefs.getPrefs(chat.sender.id);
     const lang = chat.lang();
     const said = accountText.in(lang);
-    const why = current.langSet ? said.langWhySet : current.lang ? said.langWhyWritten : said.langWhyClient;
+    const why = current.langSet
+      ? said.langWhySet
+      : current.lang
+        ? said.langWhyWritten
+        : said.langWhyClient({ channel: chat.conversation.caps.shortName });
     await chat.say(said.langIs({ name: LANG_NAMES[lang][lang === "zh" ? 0 : 1], why }));
   }
 }
@@ -222,9 +227,9 @@ const LANG_WORDS: Readonly<Record<string, "zh" | "en">> = {
   英文: "en",
 };
 
-/** How the language help shows was chosen: by the person, by what they wrote, or by their client. */
-function langHow(set: boolean, learnt: boolean, zh: boolean): string {
+/** How the language help shows was chosen: by the person, by what they wrote, or by their client (on `channel`). */
+function langHow(set: boolean, learnt: boolean, zh: boolean, channel: string): string {
   if (set) return zh ? "（你设定的）" : ", set by you";
   if (learnt) return zh ? "（自动）" : ", auto";
-  return zh ? "（按 Teams 客户端）" : ", from Teams";
+  return zh ? `（按 ${channel} 客户端）` : `, from ${channel}`;
 }

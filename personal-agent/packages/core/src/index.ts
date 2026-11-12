@@ -16,7 +16,7 @@ export * from "./own.js";
 export * from "./guardrails/index.js";
 export * from "./limits/index.js";
 export * from "./review-text/index.js";
-export { INTENT_PROMPT, MODE_PROMPT } from "./locales/review-github.js";
+export { intentPrompt, modePrompt } from "./locales/review-github.js";
 export * from "./typed-answer/index.js";
 export * from "./understanding/index.js";
 export * from "./locales/index.js";

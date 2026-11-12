@@ -122,6 +122,7 @@ export class GroupRouter {
           assistant,
           parts: this.ctx.parts(),
           bot: config.botName,
+          channel: chat.conversation.caps.name,
           ...(groupContext === undefined ? {} : { groupContext }),
         }),
       );

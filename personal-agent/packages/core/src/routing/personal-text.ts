@@ -173,7 +173,13 @@ export class PersonalText {
       ...(await this.attached(userId, key)),
     });
     if (routed) {
-      logTurnStarted(this.ctx.deps.logger, message.clientPlatform, false, "assistant");
+      logTurnStarted(
+        this.ctx.deps.logger,
+        chat.conversation.caps.shortName,
+        message.clientPlatform,
+        false,
+        "assistant",
+      );
       return;
     }
     this.ctx.admission.dropLastHandoff(userId); // (not the assistant's after all: a turn here, counted as one)
@@ -274,7 +280,9 @@ export class PersonalText {
         });
     }
     const channelMessageId = message.id || `clawy-${this.ctx.deps.random.hexId()}`;
+    const { channel } = chat.conversation.caps;
     const context = this.ctx.deps.channelContext({
+      channel,
       channelMessageId,
       userId,
       message,
@@ -286,7 +294,7 @@ export class PersonalText {
     const held = assistant.reachable(userId);
     if (held && (await this.ctx.admission.assistantOverLimit(chat, message.id, key))) return;
     // (one the assistant cannot reach is only told so: no turn starts on any path)
-    if (held) logTurnStarted(logger, message.clientPlatform, false, "assistant");
+    if (held) logTurnStarted(logger, chat.conversation.caps.shortName, message.clientPlatform, false, "assistant");
     // (recorded before it is sent: an action the assistant asks for may arrive before the send returns)
     store.assistantMessages.noteAssistantMessage(
       channelMessageId,
@@ -299,7 +307,7 @@ export class PersonalText {
       credential,
       modelKey,
       prompt: prompt || assistant.filesOnly(chat.lang()),
-      context: context.context,
+      context: { ...context.context, channel }, // (in its place: `channel` is the context's first field)
       lang: chat.lang(),
       conversation: chat.conversation,
       files,

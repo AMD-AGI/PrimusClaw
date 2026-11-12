@@ -18,24 +18,31 @@ import type { ReviewRunFields, TurnHooks, TurnOutcome, TurnRun } from "./turn-ru
 
 const MOBILE_PLATFORMS = ["ios", "ipados", "android"];
 
-/** Teams on a phone or a tablet: its own Stop under a reply is greyed out, and its own thumbs never reach the worker. */
+/** A client on a phone or a tablet (Teams: its own Stop under a reply is greyed out, its own thumbs never reach the worker). */
 export function isMobile(clientPlatform: string): boolean {
   return MOBILE_PLATFORMS.includes(clientPlatform.toLowerCase());
 }
 
 /**
- * The path a message from Teams took: to the person's assistant, to a plain Claw session of their own (the old path, neither
+ * The path a message from the chat took: to the person's assistant, to a plain Claw session of their own (the old path, neither
  * the assistant's nor a work item's), or to a review's turn. Logged so the worker's lines can be counted per path.
  */
 export type TurnRoute = "assistant" | "legacy" | "review";
 
 /**
- * The line for a turn started from Teams: where it came from and which path it took, never its words or any id. One line
- * per turn: a message to the assistant or to a plain session is one turn, and a review request for several pull requests
- * starts one review turn (and one line) for each.
+ * The line for a turn started from a chat app (`channel`: its short name, `SurfaceCaps.shortName`; "turn started from
+ * Teams client"): where it came from and which path it took, never its words or any id. One line per turn: a message to
+ * the assistant or to a plain session is one turn, and a review request for several pull requests starts one review turn
+ * (and one line) for each.
  */
-export function logTurnStarted(logger: Logger, clientPlatform: string, group: boolean, route: TurnRoute): void {
-  logger.info("turn started from Teams client", {
+export function logTurnStarted(
+  logger: Logger,
+  channel: string,
+  clientPlatform: string,
+  group: boolean,
+  route: TurnRoute,
+): void {
+  logger.info(`turn started from ${channel} client`, {
     platform: clientPlatform || "unknown",
     chat: group ? "group" : "1:1",
     route,
@@ -263,7 +270,13 @@ export class TurnStarter {
     const { store, config, logger } = this.ctx.deps;
     const session = await this.sessionPart(request);
     const group = chat.scope !== "";
-    logTurnStarted(logger, request.clientPlatform, group, review ? "review" : "legacy");
+    logTurnStarted(
+      logger,
+      chat.conversation.caps.shortName,
+      request.clientPlatform,
+      group,
+      review ? "review" : "legacy",
+    );
     return {
       ...session,
       conversation: chat.conversation,

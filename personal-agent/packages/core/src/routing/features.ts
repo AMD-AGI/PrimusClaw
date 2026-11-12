@@ -231,6 +231,8 @@ export type ReviewStopReader = (text: string) => readonly (readonly [string, num
 
 /** What a message to the assistant carries about the chat (the Python `understanding.channel_context`). */
 export interface ChannelContextRequest {
+  /** The channel the message came through (`SurfaceCaps.channel`): what Claw is told as `channel`. */
+  readonly channel: string;
   readonly channelMessageId: string;
   readonly userId: string;
   readonly message: InboundMessage;

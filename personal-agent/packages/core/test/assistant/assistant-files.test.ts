@@ -12,6 +12,7 @@ import { it } from "node:test";
 import { ALICE, AssistantWorld } from "../../../../test-support/assistant/assistant-world.js";
 import { modelOf, viewsOf } from "../../../../test-support/assistant/view-of.js";
 import { openTestStore } from "../../../../test-support/store.js";
+import { OTHER_CHANNEL } from "../../../../test-support/surface.js";
 import type { MessageFiles } from "../../src/assistant/files.js";
 import { SayPlanner, type DeliveryLink } from "../../src/assistant/say.js";
 import type { JsonObject } from "../../src/json.js";
@@ -40,7 +41,6 @@ function fetcher(fail: readonly string[] = []) {
         .map((f): [string, string] => [f.name, "Teams answered 403"]);
       return Promise.resolve({ fetched, failed });
     },
-    uploadFolder: (messageId) => `.uploads/teams/${messageId}`,
     failedLine: (failed) => {
       told.push(failed);
       return `could not pass on ${String(failed.length)}`;
@@ -76,8 +76,8 @@ it("files go to the assistant with the message", async () => {
   assert.deepEqual(
     w.uploaded.map((u) => [u.sessionId, `${u.folder}/${u.name}`, u.bytes]),
     [
-      [session, ".uploads/teams/act-f1/err.png", PNG],
-      [session, ".uploads/teams/act-f1/report.pdf", PDF],
+      [session, "teams/act-f1/err.png", PNG],
+      [session, "teams/act-f1/report.pdf", PDF],
     ],
   );
   assert.deepEqual(namedFiles(w), [
@@ -85,6 +85,16 @@ it("files go to the assistant with the message", async () => {
     { path: "teams/act-f1/report.pdf", name: "report.pdf", media_type: "application/pdf", size: PDF.length },
   ]);
   assert.deepEqual(told, [], "nothing is said about files not being passed on");
+});
+
+it("a message's files go under the channel's own id", async () => {
+  const { files } = fetcher();
+  const w = await AssistantWorld.start({ understanding: [ALICE], files, caps: OTHER_CHANNEL });
+  await understand(w, "what does this say?", "1700000000.000100", inbound("err.png"));
+  assert.deepEqual(
+    w.uploaded.map((u) => `${u.folder}/${u.name}`),
+    ["chatapp/1700000000.000100/err.png"],
+  );
 });
 
 it("files alone are a message to the assistant", async () => {

@@ -31,6 +31,8 @@ export interface Asking {
   readonly message: InboundMessage;
   readonly sender: UserRef;
   readonly group: boolean;
+  /** The chat app's full name (`SurfaceCaps.name`): what the model reading the request is told. */
+  readonly channel: string;
 }
 
 /** The message with each bare number written as owner/repo#N, the repository read, and what was and was not taken. */
@@ -189,7 +191,7 @@ export class RequestReader {
       id: m.channelUserId || m.userId || m.name,
       name: m.name,
     }));
-    const raw = await this.deps.intent.read(key, full, listed);
+    const raw = await this.deps.intent.read(key, full, listed, asking.channel);
     if (raw === undefined) return rules();
     const verdict = checkIntent(raw, text, mentions, found, !asking.group);
     if (verdict.kind === "unreadable") {

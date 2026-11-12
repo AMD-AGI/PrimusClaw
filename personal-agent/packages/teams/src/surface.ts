@@ -84,6 +84,7 @@ export class TeamsSurface implements Surface {
     const { parts } = this;
     return new TeamsConversation({
       ref,
+      caps: this.caps,
       outbox: parts.outbox,
       acks: parts.acks,
       clock: parts.clock,

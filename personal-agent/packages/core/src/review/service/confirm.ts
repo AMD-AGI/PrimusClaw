@@ -366,7 +366,10 @@ export class HeldWrites {
     if (Array.from(text).length > 300 || !decisionWords(text) || namesReviewAndMerge(text)) return false;
     const pending = this.deps.store.githubConfirmations.pendingGithubConfirmations(sender.id);
     const mode = typedMode(text);
-    const reading = pending.length || mode !== null ? await this.readAnswer(sender, text, pending) : undefined;
+    const reading =
+      pending.length || mode !== null
+        ? await this.readAnswer(sender, text, pending, conversation.caps.name)
+        : undefined;
     if (reading === "none") return false;
     // (no reading: only a message that is nothing but an answer counts)
     const strict = reading !== "answer";
@@ -437,6 +440,7 @@ export class HeldWrites {
     sender: UserRef,
     text: string,
     pending: readonly GithubConfirmation[],
+    channel: string,
   ): Promise<"answer" | "none" | undefined> {
     const key = this.deps.intent === undefined ? null : this.deps.store.links.getKey(sender.id);
     if (!key || this.deps.intent === undefined) return undefined;
@@ -444,7 +448,7 @@ export class HeldWrites {
       pull_request: `${r.repo}#${String(r.pr)}`,
       waits: r.kind === "review" ? `${r.event} review to post` : "merge",
     }));
-    const raw = await this.deps.intent.readAnswer(key, text, listed);
+    const raw = await this.deps.intent.readAnswer(key, text, listed, channel);
     const intent = raw?.intent;
     return intent === "answer" || intent === "none" ? intent : undefined;
   }

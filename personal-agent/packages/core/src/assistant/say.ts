@@ -20,10 +20,10 @@ import type { WorkItem } from "../claw/model.js";
 import { answerLang } from "../language/detect.js";
 import type { Lang } from "../locales/lang.js";
 import type { StorePort } from "../ports/store/index.js";
-import type { Citation, OutMessage, View } from "../ports/surface.js";
+import type { Citation, OutMessage, SurfaceLimits, View } from "../ports/surface.js";
 import { squashSpaces } from "../text/py-text.js";
 import { replyParts } from "../turn/answer-parts.js";
-import { citationsFromSources } from "./citations.js";
+import { CITATIONS_MAX, citationsFromSources } from "./citations.js";
 import { assistantDeliveries } from "../turn/deliveries.js";
 import type { JsonObject } from "../json.js";
 import { PULL_LINK, SUGGESTIONS_MAX, choiceOf, confirmActionOf, confirmWriteOf, suggestedRepliesOf } from "./events.js";
@@ -43,6 +43,8 @@ export interface SayOptions {
   readonly head?: string;
   /** Suggested replies of the worker's own, before Claw's. */
   readonly replies?: readonly SuggestedReply[];
+  /** How many citations and suggested replies the channel shows (the conversation's `caps`). */
+  readonly limits?: Pick<SurfaceLimits, "citationsMax" | "suggestionsMax">;
 }
 
 export interface SayDeps {
@@ -76,7 +78,7 @@ export class SayPlanner {
     if (!text) return files.cards;
     const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, this.deps.clientLocale?.() ?? "", text);
     const parts = replyParts(text, options.shown ?? "");
-    const said = this.said(event, text, parts);
+    const said = this.said(event, text, parts, options.limits?.citationsMax ?? CITATIONS_MAX);
     const card = this.card(userId, event, item, {
       text,
       lang,
@@ -123,13 +125,12 @@ export class SayPlanner {
     const last = said.at(-1);
     if (last === undefined || filesFollow) return said;
     const mine = options.replies ?? [];
-    const own = suggestedRepliesOf(event, text, this.deps.style().suggestedReplies, lang).filter(
+    const max = options.limits?.suggestionsMax ?? SUGGESTIONS_MAX;
+    const own = suggestedRepliesOf(event, text, this.deps.style().suggestedReplies, lang, max).filter(
       ([t, v]) => !mine.some(([mt, mv]) => mt === t && mv === v),
     );
     const all = [...mine, ...own];
-    return all.length
-      ? [...said.slice(0, -1), { ...last, suggestions: toReplies(all.slice(0, SUGGESTIONS_MAX)) }]
-      : said;
+    return all.length ? [...said.slice(0, -1), { ...last, suggestions: toReplies(all.slice(0, max)) }] : said;
   }
 
   /**
@@ -195,13 +196,13 @@ export class SayPlanner {
   }
 
   /** What was said, as AI answers with thumbs, each with the citations its own words cite (when the whole text cites at all). */
-  private said(event: Event, text: string, parts: readonly string[]): OutMessage[] {
+  private said(event: Event, text: string, parts: readonly string[], citationsMax: number): OutMessage[] {
     const cites =
       this.deps.style().citations &&
       event["type"] === "assistant.say" &&
-      citationsFromSources(text, event["sources"]).length > 0;
+      citationsFromSources(text, event["sources"], citationsMax).length > 0;
     return parts.map((part) => {
-      const citations: readonly Citation[] = cites ? citationsFromSources(part, event["sources"]) : [];
+      const citations: readonly Citation[] = cites ? citationsFromSources(part, event["sources"], citationsMax) : [];
       return {
         body: { type: "rich", markdown: part, lead: false },
         aiGenerated: true,
