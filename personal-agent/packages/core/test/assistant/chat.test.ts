@@ -20,7 +20,7 @@ import { ClawError, ClawUnreachable } from "../../src/claw/errors.js";
 import { DirectChat } from "../../src/direct-chat/direct-chat.js";
 import { silentLogger } from "../../src/ports/logger.js";
 import type { Prefs } from "../../src/ports/store/index.js";
-import type { InboundFile } from "../../src/ports/surface.js";
+import type { InboundFile, SurfaceCaps } from "../../src/ports/surface.js";
 
 const ALICE = "aad-a";
 
@@ -41,11 +41,11 @@ class Store {
   }
 }
 
-function world(options: Partial<AssistantChatOptions> & { streaming?: boolean } = {}) {
+function world(options: Partial<AssistantChatOptions> & { streaming?: boolean; caps?: Partial<SurfaceCaps> } = {}) {
   const store = new Store();
   const claw = new FakeAssistantClaw();
   const clock = new FakeClock();
-  const surface = new FakeSurface({ caps: { streaming: options.streaming ?? true } });
+  const surface = new FakeSurface({ caps: { streaming: options.streaming ?? true, ...options.caps } });
   const ref = { ...testConversation(`c-${ALICE}`), wire: { conversation: { id: `c-${ALICE}` }, activityId: "act-1" } };
   const conversation = surface.conversation(ref);
   const dropped: number[] = [];
@@ -117,7 +117,7 @@ it("a message goes to the assistant as typed and nothing waits for the answer", 
   assert.equal(await route(w, "看看 SaFE 节点"), true);
   assert.deepEqual(
     w.claw.heard.map((h) => [h.key, h.sessionId, h.text, h.context, h.plugin]),
-    [["ak-alice", "asst-ak-alice", "看看 SaFE 节点", undefined, undefined]],
+    [["ak-alice", "asst-ak-alice", "看看 SaFE 节点", { channel: "teams" }, undefined]],
   );
   assert.deepEqual(w.surface.outbox[0], {
     op: "stream.open",
@@ -139,10 +139,10 @@ it("without a stream the typing indicator acknowledges the message", async () =>
 it("the plugin id and the attached session ride on the message", async () => {
   const w = world({ pluginId: 7 });
   await route(w, "which session is this chat on", { attached: { label: "Claude", busy: true, n: 3 } });
-  assert.deepEqual(w.claw.heard[0]?.context, { attached: { label: "Claude", busy: true } });
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", attached: { label: "Claude", busy: true } });
   assert.equal(w.claw.heard.at(0)?.plugin, 7);
   await route(w, "again", { attached: null });
-  assert.deepEqual(w.claw.heard[1]?.context, { attached: null });
+  assert.deepEqual(w.claw.heard[1]?.context, { channel: "teams", attached: null });
 });
 
 it("the language the person chose rides on the message, whatever it is written in; none chosen sends nothing", async () => {
@@ -151,20 +151,26 @@ it("the language the person chose rides on the message, whatever it is written i
   w.store.lang = "en";
   w.store.langSet = true;
   await route(w, "看看 SaFE 节点");
-  assert.deepEqual(w.claw.heard[0]?.context, { reply_language: "en" });
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", reply_language: "en" });
   // /lang zh, a message in English, beside the attached session.
   w.store.lang = "zh";
   await route(w, "check the nodes", { attached: null });
-  assert.deepEqual(w.claw.heard[1]?.context, { attached: null, reply_language: "zh" });
-  // /lang auto (a language learnt from what they write is no choice): nothing is sent, and Claw reads the message as before.
+  assert.deepEqual(w.claw.heard[1]?.context, { channel: "teams", attached: null, reply_language: "zh" });
+  // /lang auto (a language learnt from what they write is no choice): no language is sent, and Claw reads the message as before.
   w.store.langSet = false;
   await route(w, "看看 SaFE 节点");
-  assert.equal(w.claw.heard[2]?.context, undefined);
+  assert.deepEqual(w.claw.heard[2]?.context, { channel: "teams" });
   // A choice of a language the agent does not speak is none.
   w.store.lang = "fr";
   w.store.langSet = true;
   await route(w, "regarde les nœuds");
-  assert.equal(w.claw.heard[3]?.context, undefined);
+  assert.deepEqual(w.claw.heard[3]?.context, { channel: "teams" });
+});
+
+it("a message names the surface it came from, so Claw sends the turn's replies back there and not to another surface", async () => {
+  const w = world({ caps: { channel: "slack", name: "Slack", shortName: "Slack" } });
+  await route(w, "deploy the fix");
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "slack" });
 });
 
 it("a claw without the assistant keeps the old path and is not asked again for a minute", async () => {

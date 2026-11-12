@@ -279,7 +279,9 @@ export class AssistantChat {
           ? { files: await this.handOverFiles(handing, sessionId, this.o.random.hexId(), request.files) }
           : {};
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
-        const context = { ...files, ...attached, ...this.chosenLanguage(request.userId) };
+        // (the surface the message came from: Claw sends the turn's replies back there, not to another surface of the person's)
+        const channel = { channel: request.conversation.caps.channel };
+        const context = { ...channel, ...files, ...attached, ...this.chosenLanguage(request.userId) };
         await ready();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),
