@@ -13,6 +13,7 @@ import { advanceSeconds } from "../../../../test-support/store.js";
 import { ALICE, at, shown, world } from "../../../../test-support/assistant/proactive-world.js";
 import type { JsonObject } from "../../src/json.js";
 import type { RemoteAskRequest } from "../../src/proactive/deps.js";
+import { terminalAskView } from "../../src/remote-view/terminal-ask-view.js";
 import { DirectChat } from "../../src/direct-chat/direct-chat.js";
 import type { RequestContext, RequestScope } from "../../src/ports/request-scope.js";
 
@@ -39,7 +40,7 @@ function remoteSay(
   sessionId: string,
   kind: string,
   eventId: string,
-  options: { text?: string; ask?: JsonObject; occurredAt?: string; seq?: number } = {},
+  options: { text?: string; ask?: JsonObject; occurredAt?: string; seq?: number; agent?: string; tool?: string } = {},
 ): JsonObject {
   const seq = options.seq ?? 7;
   return {
@@ -53,7 +54,8 @@ function remoteSay(
       kind,
       session_id: sessionId,
       machine: "dev-pod",
-      agent: "claude",
+      agent: options.agent ?? "claude",
+      ...(options.tool ? { tool: options.tool } : {}),
       ...(options.ask ? { ask: options.ask } : {}),
     },
   };
@@ -381,6 +383,48 @@ it("a terminal's question is posted as a card whose id is kept, with its whole a
     "delivered",
   );
   assert.equal(w.store.remotePermissions.getRemotePermission("rs-1", "act-1")?.ask, null);
+});
+
+it("a terminal's card names the tool that asked (Claude Code, Codex, Cursor), not the connector's id for it", async () => {
+  const cases: Array<[string | undefined, string]> = [
+    ["claude", "Claude Code"],
+    ["codex", "Codex"],
+    ["cursor", "Cursor"],
+    // (a Claw that did not say which, or said something else: the agent's id, as before)
+    [undefined, "claude-sessions"],
+    ["vim", "claude-sessions"],
+  ];
+  for (const [tool, name] of cases) {
+    const asked: RemoteAskRequest[] = [];
+    const w = world({
+      remote: {
+        options: (raw): readonly unknown[] => (Array.isArray(raw) ? (raw as unknown[]) : []),
+        askCard: (request) => {
+          asked.push(request);
+          return { body: { type: "text", text: "card" } };
+        },
+        saidParts: (label, text) => [`${label}: ${text}`],
+      },
+    });
+    const push = remoteSay("rs-t", "needs_you", "say-t", {
+      text: "x",
+      ask: aTerminalAsk(),
+      agent: "claude-sessions",
+      ...(tool ? { tool } : {}),
+    });
+    assert.equal(await w.proactive.handle(ALICE, w.reference, push), "delivered");
+    assert.deepEqual(
+      asked.map((r) => r.agent),
+      [name],
+      String(tool),
+    );
+    // What the card's line says, in both languages.
+    const r = asked[0];
+    assert.ok(r !== undefined);
+    const request = { ask: r.ask, options: [], sessionId: r.sessionId, machine: r.machine, agent: r.agent };
+    assert.equal(terminalAskView(request, "en").who, `${name} in a terminal on dev-pod`);
+    assert.equal(terminalAskView(request, "zh").who, `dev-pod 终端里的 ${name}`);
+  }
 });
 
 it("answered at the terminal first: the card is edited in place to say so, without buttons, and nothing new is sent", async () => {

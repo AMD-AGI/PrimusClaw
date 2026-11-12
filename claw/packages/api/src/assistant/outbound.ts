@@ -210,6 +210,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
 function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
   return {
     kind: r.kind, session_id: r.session_id, machine: redact(r.machine), agent: redact(r.agent),
+    ...(r.tool ? { tool: r.tool } : {}),
     ...(r.ask ? {
       ask: {
         action_id: r.ask.action_id, tool: redact(r.ask.tool),

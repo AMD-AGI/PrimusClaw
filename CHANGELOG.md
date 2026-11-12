@@ -110,6 +110,15 @@ release version, and its `appVersion` stays `latest`.
   sends what was picked as the user's next message. A choice that does not fit is left out whole and the message still
   goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change (#765).
 
+### Fixed
+
+- A question asked in a terminal and put to the user (the connector's approval hooks) names the tool that asked, "Claude
+  Code", "Codex" or "Cursor", instead of the connector's id for its agent (`claude-sessions`): in the item's title, the
+  message, and the one that says many are waiting. Claw reads it from the `agent` the connector (0.2.0 and later) puts on
+  the session's `session_started`, and passes it on as `remote.tool` for a channel's card; a session that does not say
+  keeps the agent's id, as before. The one-minute "waiting in a terminal" notice says "Claude Code", not "Claude Code
+  (existing sessions)". No schema change, no new setting (#779).
+
 ## [0.2.1] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611120828` (commit 0412146c). No schema change, no new setting. Connector requirements

@@ -559,6 +559,9 @@ claw-connector hooks install --approvals      # "hooks uninstall --approvals" ta
 A setup that already has the session hooks gets only the approval hooks offered when `init` or `pair` runs again at a terminal;
 run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead.
 
+The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
+for you" (or Codex, or Cursor, for their hooks below).
+
 This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
 background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
 hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this
