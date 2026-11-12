@@ -127,6 +127,7 @@ export async function runWorker(opts: {
     releaseTaskLock: noop(undefined),
     flushTranscript: (() => Promise.resolve()) as never,
     makeHandsClient: (() => ({
+      generation: "http://hands.test",
       endpoint: () => ({ url: "http://hands.test", token: "t" }),
       close: async () => {},
       reapShells: async () => ({ shells: [], stopped: 0, escalated: 0, surviving: 0 }),

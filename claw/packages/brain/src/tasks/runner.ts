@@ -3296,13 +3296,6 @@ class TaskRunner {
    * for dev-path sessions (no hex user id) or a failed workspace restore.
    */
   private async resolveResumeState(ckpt: TaskCheckpoint | null, created: boolean): Promise<void> {
-    // A sandbox just created starts with nothing held, whatever address it was
-    // given: pod IPs are reused, and a hold this process kept for an earlier
-    // sandbox of this session at the same address is not this one's. Released
-    // before any restore, so it holds only if its own restore fails -- by any
-    // route, the shared-filesystem one included, which never reaches the S3
-    // restore that would otherwise release it.
-    if (created && this.hands) releaseRestoreHold(this.hands, this.sessionId);
     // A script run taken over part-way is continued in the sandbox it was
     // running in, because that is where its earlier steps' work is -- a
     // background job still running, files a later step reads. A new sandbox
@@ -3315,6 +3308,14 @@ class TaskRunner {
         + `continue from step ${ckpt.script.step}; its earlier steps' work went with the sandbox`,
       );
     }
+    // A sandbox just created starts with nothing held, whatever address it was
+    // given: pod IPs are reused, and a hold this process kept for an earlier
+    // sandbox of this session at the same address is not this one's. Released
+    // here, after the one way out above that restores nothing, and before every
+    // route below -- each of which restores into the new sandbox, the
+    // shared-filesystem one included, which never reaches the S3 restore's own
+    // release -- so the sandbox is held again exactly when its own restore fails.
+    if (created && this.hands) releaseRestoreHold(this.hands, this.sessionId);
     if (!ckpt) {
       // No prior progress: still run S3 baseline restore for new sandboxes
       // so any pre-Plan-Y persisted workspace materializes back into
