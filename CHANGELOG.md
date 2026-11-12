@@ -111,6 +111,17 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- The assistant's router sees the user's personal skills: with `CLAW_USER_SKILLS_ENABLED`, a router turn of the
+  user's own assistant is given, with its message, each current, enabled skill that applies on its own (name and
+  description, an imported one marked, most recently used first, at most 2000 characters), and reads one with the new
+  read-only tool `skill_read` (SKILL.md in pages with its file list, or one file). The system prompt gains a fixed
+  section only, so it stays the same from turn to turn. `skill_read` may follow a lookup and is not a `read_taint`
+  source, so a router that read a skill can still start the work. Never for an observer, a worker or a session marked
+  `config.memory: "off"`. New metrics `claw_user_skill_listed_chars`, `claw_user_skill_truncated_total` and
+  `claw_user_skill_read_total` (#809).
+
 ## [0.4.0] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611130054` (commit cf083e95). A MINOR release: personal skills get their own switch
