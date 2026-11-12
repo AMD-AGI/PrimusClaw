@@ -927,7 +927,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     assert.match(both.errText(), /contradict/);
   });
 
-  test("init --no-hooks leaves Claude Code alone; with no Claude directory it says how to do it later and creates nothing", async () => {
+  test("init --no-hooks leaves Claude Code alone; with no Claude directory and no Claude Code installed it says how to do it later and creates nothing", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
     const a = ctx(home, { hookScript: stand(), ask: async () => assert.fail("--no-hooks must not ask") });
@@ -936,7 +936,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const other = tmpdir();
     const b = ctx(other, { hookScript: stand() });
     assert.equal(await main(["init"], b.c), EXIT.ok);
-    assert.match(b.text(), /no Claude Code directory at .*claude hooks install|no Claude Code directory at .*hooks install/s);
+    assert.match(b.text(), /Claude Code is not installed here \(no claude on PATH\), so its hooks were not added; once you install it, run: claw-connector hooks install --approvals/);
     assert.equal(fs.existsSync(path.join(other, "claude-config")), false);
   });
 
@@ -1023,9 +1023,17 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const j = ctx(home, { hookScript: stand() });
     assert.equal(await main(["hooks", "install"], j.c), EXIT.ok);
     assert.equal(hookCommands(dflt).length, 2);
-    // a directory that does not exist, not named explicitly, is not invented
+    // a directory that does not exist, not named explicitly, is not invented while Claude Code is not installed
     const k = ctx(tmpdir(), { hookScript: stand() });
     assert.equal(await main(["hooks", "install"], k.c), EXIT.failure);
-    assert.match(k.errText(), /no Claude Code directory .*--config-dir/);
+    assert.match(k.errText(), /no Claude Code directory .*Claude Code is not installed here .*--config-dir/);
+    assert.equal(fs.existsSync(path.join(k.c.env.CLAUDE_CONFIG_DIR!)), false);
+    // installed but never run (claude on PATH, no directory yet): made, with the hooks in it, as pair makes it
+    const bin = tmpdir("bin-");
+    fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\n", { mode: 0o755 });
+    const fresh = tmpdir();
+    const m = ctx(fresh, { hookScript: stand(), env: { PATH: bin, CLAUDE_CONFIG_DIR: path.join(fresh, "claude-config") } });
+    assert.equal(await main(["hooks", "install"], m.c), EXIT.ok, m.errText());
+    assert.equal(hookCommands(path.join(fresh, "claude-config")).length, 2);
   });
 });

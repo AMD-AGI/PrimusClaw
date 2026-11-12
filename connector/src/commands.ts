@@ -29,7 +29,7 @@ import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
 import { applyServiceEnv, cmdService, cmdSupervise, ephemeralWhere, loadServiceEnv, startAfterLogin, type ServiceDeps } from "./service.js";
-import { cmdPair } from "./pair.js";
+import { cmdPair, detectAgents } from "./pair.js";
 import {
   auditFile, childrenFile, configFile, credentialsFile, doctorFile, forgetIdentity, identityFile, logDir, pauseFile, pidFile, serviceEnvFile, stopRequestFile, type Dirs,
 } from "./paths.js";
@@ -374,12 +374,21 @@ export interface HookChoice { hooks: boolean; noHooks: boolean; noApprovals: boo
  * terminal (one question, Enter is yes), and never when nobody can answer, which prints the command instead. Hooks of ours
  * already there were agreed to before: they are brought up to date (a moved program) without asking again, and only what is
  * missing is asked about. A file that cannot be merged into is reported, and the command still succeeds.
+ *
+ * Claude Code makes its config directory the first time it runs. Installed but not run yet (no directory, `claude` on PATH): the
+ * same question, and agreeing creates the directory with the hooks in it, which Claude Code then reads on its first run. Not
+ * installed (neither): nothing is asked or created, and the command to run once it is installed is printed (`--hooks` adds them
+ * anyway: it was asked for).
  */
 export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
   if (o.noHooks) return;
   const dir = defaultClaudeDir(ctx);
   const later = o.noApprovals ? "claw-connector hooks install" : "claw-connector hooks install --approvals";
-  if (!fs.existsSync(dir)) { ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: ${later}`); return; }
+  const fresh = !fs.existsSync(dir);
+  if (fresh && !o.hooks && !claudeInstalled(ctx)) {
+    ctx.out(`Claude Code is not installed here (no claude on PATH), so its hooks were not added; once you install it, run: ${later}`);
+    return;
+  }
   let session = o.hooks || present(hooksStatus, dir);
   let approvals = !o.noApprovals && (o.hooks || present(approvalHooksStatus, dir));
   const askSession = !session;
@@ -387,7 +396,9 @@ export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
   if (askSession || askApprovals) {
     let yes = false;
     if (ctx.ask) {
-      ctx.out(`Claude Code hooks for ${settingsFile(dir)} (only entries marked --managed-by claw-connector; nothing else in it changes):`);
+      ctx.out(fresh
+        ? `Claude Code hooks for ${settingsFile(dir)} (Claude Code has not run here yet: ${dir} is created with only entries marked --managed-by claw-connector, and Claude Code adds its own on its first run):`
+        : `Claude Code hooks for ${settingsFile(dir)} (only entries marked --managed-by claw-connector; nothing else in it changes):`);
       if (askSession) ctx.out("  session hooks (SessionStart, SessionEnd): Claw can tell which Claude Code sessions are open in a terminal");
       if (askApprovals) ctx.out("  approval hooks: a question Claude Code asks in a terminal (run a command, edit a file, approve a plan, a multiple-choice question) also comes to your chat; the terminal keeps asking and the first answer wins");
       yes = await ctx.ask("Add them? [Y/n] ", true);
@@ -406,6 +417,9 @@ export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
     if (approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));
   } catch (e) { ctx.err(`hooks: ${errMessage(e)} (everything else is set up; fix it and run: ${later})`); }
 }
+
+/** Whether Claude Code is installed here: its program on PATH (pair.ts `detectAgents`). */
+const claudeInstalled = (ctx: Ctx): boolean => detectAgents(ctx.env).includes("claude");
 
 /** Whether any hook of that set is in this directory's settings already; a settings file that cannot be read counts as no. */
 function present(status: (dir: string) => HooksStatus, dir: string): boolean {
@@ -578,7 +592,12 @@ function cmdHooks(args: string[], ctx: Ctx): number {
   for (const dir of dirs) {
     try {
       if (sub === "install") {
-        if (values["config-dir"] === undefined && !fs.existsSync(dir)) { ctx.err(`no Claude Code directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
+        // Claude Code installed but not run yet: its directory is made with the hooks in it, as `pair` does.
+        if (values["config-dir"] === undefined && !fs.existsSync(dir) && !claudeInstalled(ctx)) {
+          ctx.err(`no Claude Code directory at ${dir}, and Claude Code is not installed here (no claude on PATH); install it and run this again, or pass --config-dir to name one`);
+          code = EXIT.failure;
+          continue;
+        }
         ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
         // The approval hooks are added only when asked for: they put what a terminal asks on the owner's phone.
         if (approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));

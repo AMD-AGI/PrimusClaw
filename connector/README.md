@@ -36,7 +36,11 @@ Before it starts the connector it asks once whether to add the Claude Code hooks
 the session hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
 [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). Run where nobody can answer (a script,
 a pipe), it adds nothing and prints the command that would; `--no-hooks` skips the question, `--no-approval-hooks` leaves the
-approval hooks out. The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
+approval hooks out. On a machine where Claude Code is installed but has never run (`claude` is on your `PATH`, and its
+config directory, `~/.claude` or `$CLAUDE_CONFIG_DIR`, does not exist yet), it asks the same question, and Enter creates that
+directory with the hooks in it; Claude Code adds its own files there on its first run. Where Claude Code is not installed
+(no `claude` on your `PATH`), nothing is asked or created: it says so and prints `claw-connector hooks install --approvals`,
+to run once you have installed it (`--hooks` adds them anyway). The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
 here; either ends this machine's sign-in for good. An `agents.toml` that is already there is kept as it is.
 
 The pairing is a connector grant: it reaches the connector routes of Claw for this one machine and nothing else, and it ends
@@ -557,7 +561,9 @@ claw-connector hooks install --approvals      # "hooks uninstall --approvals" ta
 ```
 
 A setup that already has the session hooks gets only the approval hooks offered when `init` or `pair` runs again at a terminal;
-run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead.
+run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead. With Claude Code
+installed but never run, `hooks install` (like `init` and `pair`) creates its config directory with the hooks in it; with
+Claude Code not installed and no `--config-dir`, it refuses and says so, since there is nothing to hook into yet.
 
 This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
 background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session

@@ -272,6 +272,46 @@ describe("claw-connector pair", () => {
       assert.deepEqual(spent, []);
     });
 
+    test("Claude Code installed but never run here (no config directory yet): the same question, and Enter creates the directory with the hooks; a no or no terminal creates nothing", async () => {
+      for (const [how, ask] of [["enter", async (_q: string, d?: boolean) => d ?? false], ["no", async () => false], ["no terminal", undefined]] as const) {
+        const home = tmpdir();
+        const cc = path.join(home, "never-run", ".claude");
+        const asked: string[] = [];
+        const a = ctx(home, {
+          fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(),
+          ...(ask ? { ask: async (q: string, d?: boolean) => { asked.push(q); return ask(q, d); } } : {}),
+        });
+        assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, `${how}: ${a.errText()}`);
+        assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), `${how}: paired`);
+        assert.doesNotMatch(a.text(), /not installed|once you use Claude Code/, how);
+        if (how === "enter") {
+          assert.deepEqual(asked, ["Add them? [Y/n] "]);
+          assert.match(a.text(), /Claude Code has not run here yet: .* is created with only entries marked --managed-by claw-connector/);
+          const cmds = commands(cc);
+          assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
+          assert.equal(cmds.filter((c) => c.includes("approval-hook.js")).length, 6);
+          assert.match(a.text(), /installed the approval hooks/);
+        } else {
+          assert.equal(fs.existsSync(cc), false, `${how}: nothing created`);
+          assert.match(a.text(), /did not add the Claude Code hooks .*claw-connector hooks install --approvals/, how);
+        }
+      }
+    });
+
+    test("Claude Code not installed here: nothing asked or created, and the command to run once it is; --hooks adds them anyway", async () => {
+      const home = tmpdir();
+      const cc = path.join(home, ".claude");
+      const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("codex"), CLAUDE_CONFIG_DIR: cc }, ...scripts(), ask: async () => assert.fail("nothing to ask about") });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
+      assert.equal(fs.existsSync(cc), false);
+      assert.match(a.text(), /Claude Code is not installed here \(no claude on PATH\), so its hooks were not added; once you install it, run: claw-connector hooks install --approvals/);
+      const forced = tmpdir();
+      const fc = path.join(forced, ".claude");
+      const b = ctx(forced, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: "", CLAUDE_CONFIG_DIR: fc }, ...scripts(), ask: async () => assert.fail("--hooks must not ask") });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start", "--hooks"], b.c), EXIT.ok, b.errText());
+      assert.equal(commands(fc).filter((c) => c.includes("approval-hook.js")).length, 6);
+    });
+
     test("paired again on a machine that has the hooks: nothing asked, nothing changed", async () => {
       const home = tmpdir();
       const cc = setup(home);
