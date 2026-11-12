@@ -5,7 +5,9 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 
 import { workItem } from "../../../../test-support/assistant/work-items.js";
+import { Board } from "../../src/assistant/board.js";
 import { ClawError } from "../../src/claw/errors.js";
+import { silentLogger } from "../../src/ports/logger.js";
 import { ALICE, clicksWorld } from "./clicks-world.js";
 
 it("the board shows the items and a card for each that waits", async () => {
@@ -64,6 +66,48 @@ it("a development environment item that waits shows its own approval card", asyn
   });
   await w.board.show(ALICE, "ak", w.conversation);
   assert.deepEqual(w.sent(), ["view:board", "ask rs-1 a1"]);
+});
+
+it("a development environment item's approval card is drawn again on the board in the language it was shown in", async () => {
+  // (the card was shown in Chinese; the item's title is English and the person never chose a language, so a language read again
+  // from the title would redraw it in English)
+  const w = clicksWorld();
+  const drawn: string[] = [];
+  const board = new Board({
+    store: w.store,
+    claw: w.claw,
+    logger: silentLogger,
+    on: () => true,
+    remoteAsk: (r) => {
+      drawn.push(`${String(r.ask["action_id"])} ${r.lang}`);
+      return { body: { type: "text", text: "" } };
+    },
+  });
+  for (const [itemId, actionId, lang] of [
+    ["r1", "a1", "zh"],
+    ["r2", "a2", undefined], // (a card shown before its language was kept: as before, from the title)
+  ] as const) {
+    w.claw.add(
+      workItem({
+        itemId,
+        kind: "remote",
+        title: "Fix the flaky upload test",
+        canAccept: false,
+        params: { session_id: `rs-${itemId}`, waiting: [actionId], machine: "robin-dev" },
+      }),
+    );
+    w.store.remotePermissions.saveRemotePermission({
+      userId: ALICE,
+      sessionId: `rs-${itemId}`,
+      actionId,
+      tool: "Bash",
+      options: [],
+      expiresAt: w.store.now() + 600,
+      ...(lang ? { lang } : {}),
+    });
+  }
+  await board.show(ALICE, "ak", w.conversation);
+  assert.deepEqual(drawn.sort(), ["a1 zh", "a2 en"]);
 });
 
 it("the board is not shown where the assistant is off", async () => {
