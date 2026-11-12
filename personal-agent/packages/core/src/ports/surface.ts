@@ -156,6 +156,12 @@ export interface InboundMessage extends InboundBase {
    */
   readonly unreadableFiles: readonly string[];
   readonly provenance: Provenance;
+  /**
+   * What was picked on a choice card the assistant put (`assistant_choice`): an answer, never read as a command. The menu's
+   * words and help's phrases ("New", "重新开始", "Stop", "关闭记忆") stay the words picked; it goes where a typed message that
+   * is no command goes (the assistant, or the agent a 1:1 chat is attached to).
+   */
+  readonly choice?: true;
 }
 
 /** A button pressed on a card the bot posted. */

@@ -141,3 +141,15 @@ test("test_in_a_group_chat_the_slash_forms_of_the_personal_commands_are_refused"
   await w.router.handle(message("/sessions", { kind: "group", conversation: "g-1" }));
   assert.equal(said(w)[0], "`/sessions` works only in a 1:1 chat. Please do this in a 1:1 chat with me.");
 });
+
+test("a pick on the assistant's choice card in an attached chat goes to the agent as words: no menu word or phrase runs", async () => {
+  // (a pick is the person's next message, as a typed one that is no command: in a chat attached to an agent, the agent's)
+  const { w, prompts, agents, listed } = attachedWorld();
+  const words = ["New", "Stop", "Help", "Sessions", "detach", "停止", "重新开始", "回到助理"];
+  for (const word of words) await w.router.handle({ ...message(word), choice: true });
+  assert.deepEqual(
+    prompts.map((p) => p.prompt),
+    words,
+  );
+  assert.deepEqual([agents, listed], [[], []]);
+});

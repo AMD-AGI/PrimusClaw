@@ -16,11 +16,14 @@
  *   CC8 a send that threw is never shown as picked: the card comes back open and a press sends it, once; a card a press is still
  *       sending is never sent again
  *   CC9 a message Claw does not take is told as for a typed one, and typing it again sends it
+ *   CC10 an option that is a menu word or a phrase help teaches ("New", "重新开始", "Stop", "关闭记忆") is an answer, never that
+ *        command: the assistant hears it (with the assistant on, and with the assistant understanding the person), and in a
+ *        group chat it is the turn's words
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AssistantWorld } from "../../../../test-support/assistant/assistant-world.js";
+import { AssistantWorld, type AssistantWorldOptions } from "../../../../test-support/assistant/assistant-world.js";
 import { advanceSeconds } from "../../../../test-support/store.js";
 import { AssistantChoiceClicks, pickedOn } from "../../src/assistant/choice-clicks.js";
 import { choiceOf } from "../../src/assistant/events.js";
@@ -39,8 +42,8 @@ function viewOf(message: OutMessage | undefined) {
   return body.view;
 }
 
-async function choiceWorld() {
-  const aw = await AssistantWorld.start();
+async function choiceWorld(options: AssistantWorldOptions = {}) {
+  const aw = await AssistantWorld.start(options);
   const late: { w?: ReturnType<typeof world> } = {};
   /** Sends that fail before the router takes the message (the worker's Claw call threw). */
   const failing = { next: 0 };
@@ -308,4 +311,45 @@ test("CC9 Claw refusing the message is told as for a typed one: the person learn
   await w.router.handle(message("staging"));
   await w.router.settled();
   assert.deepEqual(heard(), ["staging"], "typed again, it goes");
+});
+
+/** Options that are, typed, one of the bot's commands: a word of the commands menu, or a sentence help teaches. */
+const COMMAND_WORDS = ["New", "重新开始", "新会话", "Stop", "停止", "Help", "Sessions", "关闭记忆"];
+
+for (const understanding of [false, true]) {
+  const options = understanding ? { understanding: [ALICE.id] } : {};
+  for (const word of COMMAND_WORDS) {
+    test(`CC10 the option "${word}" is an answer the assistant hears, never that command (understanding: ${String(understanding)})`, async () => {
+      const { aw, w, card, heard } = await choiceWorld(options);
+      const id = card({ options: [word, "继续"] }, "要怎么做？");
+      await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "0" }));
+      await w.router.settled();
+      assert.deepEqual(heard(), [word], `heard as the person's answer, not run as a command: ${said(w).join(" | ")}`);
+      assert.equal(aw.store.assistantButtons.getChoiceCard(id)?.state, "done");
+      assert.ok(said(w).includes(`你选了：${word}`));
+    });
+  }
+  test(`CC10 typed, a command's word is still that command (understanding: ${String(understanding)})`, async () => {
+    const { w, heard } = await choiceWorld(options);
+    // (the menu's words; a phrase help teaches is the assistant's to read when it understands the person)
+    for (const word of understanding ? ["New", "Help"] : ["New", "Help", "停止"]) await w.router.handle(message(word));
+    await w.router.settled();
+    assert.deepEqual(heard(), [], "only a pick on the card is kept from command parsing");
+  });
+}
+
+test("CC10 in a group chat an option that is a command's word is the turn's words, never that command", async () => {
+  const { w, card } = await choiceWorld();
+  link(w, BOB.id, "ak-bob");
+  for (const word of COMMAND_WORDS) {
+    const id = card({ options: [word, "继续"] }, "要怎么做？");
+    await w.router.handle(clickOf(VERB, { primusclaw: VERB, card: id, choice: "0" }, { user: BOB, group: true }));
+    await w.router.settled();
+  }
+  const runs = w.turns.runs.filter((r) => r.userId === BOB.id && r.group);
+  assert.deepEqual(
+    runs.map((r) => r.text),
+    COMMAND_WORDS,
+    "each one the group turn's words",
+  );
 });

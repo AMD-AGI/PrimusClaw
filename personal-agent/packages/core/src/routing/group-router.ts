@@ -71,7 +71,8 @@ export class GroupRouter {
   private async message(message: InboundMessage, chat: Chat): Promise<void> {
     const words = this.words(message);
     learnLang(this.ctx.deps.store, chat.sender.id, message.text);
-    if (await this.groupOwn(message, chat, words)) return;
+    const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
+    if (!choice && (await this.groupOwn(message, chat, words))) return;
     const route: MessageRoute = {
       sender: chat.sender,
       conversation: chat.conversation,
@@ -80,10 +81,12 @@ export class GroupRouter {
       message,
       text: words.text,
     };
-    for (const interceptor of this.ctx.deps.handlers.groupInterceptors) if (await interceptor.intercept(route)) return;
+    if (!choice)
+      for (const interceptor of this.ctx.deps.handlers.groupInterceptors)
+        if (await interceptor.intercept(route)) return;
     const key = await this.ctx.credentials.credential(chat, false);
     if (key === undefined) {
-      const keep = parseCommand(words.text) === null; // (/new, /stop and /whoami mean nothing to replay after a link)
+      const keep = choice || parseCommand(words.text) === null; // (/new, /stop and /whoami mean nothing to replay after a link)
       await this.onboarding.member(message, chat, { ...words, keep, identity: false });
       return;
     }
@@ -130,7 +133,7 @@ export class GroupRouter {
   }
 
   private async withKey(message: InboundMessage, chat: Chat, key: string, words: GroupWords): Promise<void> {
-    const command = parseCommand(words.text);
+    const command = message.choice === true ? null : parseCommand(words.text);
     if (command === "new") await this.sessions.new(chat, chat.scope);
     else if (command === "stop") await this.sessions.stop(chat, key, chat.scope);
     else if (command === "whoami") await this.whoami(chat, key);

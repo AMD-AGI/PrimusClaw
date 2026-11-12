@@ -11,6 +11,7 @@
  * same line said as a message: a phone does not redraw an edited card). A send that threw before the router took it gives the
  * card back to be pressed again. A card is never taken over while 'busy' (two sends could then both reach Claw): one whose worker
  * stopped mid-send says so, and the person replies in the chat. In a group chat the press is the presser's message there.
+ * The message is marked `choice`: what was picked is never read as a command ("New", "停止", "关闭记忆" are answers).
  */
 import { viewMessage } from "../approvals/click.js";
 import { errorName } from "../errors.js";
@@ -46,7 +47,10 @@ export function pickedOn(card: Pick<ChoiceCard, "options">, value: unknown): str
   return card.options.filter((_, i) => places.has(i));
 }
 
-/** The message a press sends: the presser's, in the chat it was pressed in, saying `text`, as a typed one is (to the bot, in a group). */
+/**
+ * The message a press sends: the presser's, in the chat it was pressed in, saying `text`, as a typed one is (to the bot, in a
+ * group), but marked `choice`, so no word of it is read as a command.
+ */
 export function typedMessage(click: Pick<ClickRoute, "action" | "sender">, text: string, id: string): InboundMessage {
   const { action } = click;
   return {
@@ -67,6 +71,7 @@ export function typedMessage(click: Pick<ClickRoute, "action" | "sender">, text:
     files: [],
     unreadableFiles: [],
     provenance: "typed",
+    choice: true, // (an option that is a menu word or a help phrase is an answer, never that command)
   };
 }
 
