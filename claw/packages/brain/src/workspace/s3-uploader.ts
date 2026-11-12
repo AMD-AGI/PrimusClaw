@@ -1065,6 +1065,11 @@ async function downloadRound(
       stopped ??= { err };
     }
   };
+  // Connected before the workers start, so they do not all open the session at
+  // once (HandsClient.connect shares one in flight anyway). A sandbox that cannot
+  // be reached stops the restore here, as the first call would have.
+  // (A stand-in without `connect` is already connected.)
+  if (slices.length > 1) await (hands as Partial<Pick<HandsClient, "connect">>).connect?.();
   await Promise.all(
     Array.from({ length: Math.min(DOWNLOAD_BATCH_CONCURRENCY, slices.length) }, worker),
   );

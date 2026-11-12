@@ -135,7 +135,8 @@ release version, and its `appVersion` stays `latest`.
   list, a call), as the upload has long been sent, instead of in one call: a session past about a thousand files was
   refused with 413 and its workspace came back empty (measured on a 3,632-file clone). A batch that fails is retried
   alone; an unreachable sandbox still stops the restore at once. The uploads given to a reused sandbox go in the same
-  batches. No schema change, no new setting (#805).
+  batches. Concurrent first calls on a fresh Hands client now share one connect instead of all but one failing with
+  "Already connected to a transport". No schema change, no new setting (#805).
 
 ## [0.3.1] - 2026-11-12
 
