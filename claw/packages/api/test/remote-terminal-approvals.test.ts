@@ -24,6 +24,7 @@
  *   T8 turned off, an open session puts nothing more to the user
  *   T10 the tool that asked (session_started `agent`) is named as its users know it (Claude Code, Codex, Cursor) in the item's title
  *      and every notice, and carried as `remote.tool`; a session_started that does not say, or says something else, keeps the agent's id
+ *   T11 an item stored before Claw read the tool learns it from the session's session_started on its next request
  *   T9 how the terminal asks too, as the request's `terminal_asks` says, in each language: Claude Code (absent) alongside the card,
  *      the first answer counting; Cursor (`after_card`) only after the card, which offers to decline or hand it back; Codex
  *      (`on_input`) once someone types there; the field goes on with the card, and a value no channel knows is read as absent
@@ -400,6 +401,26 @@ describe("approvals from terminals", { skip }, () => {
       }
       if (c.tool) assert.ok(!got.some((g) => g.text.includes(c.agent_id)), `${i}: the id is not in the words`);
     }
+  });
+
+  test("T11 an item made before Claw read the tool learns it from the session's session_started on its next request", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const SESSIONS = { agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u"] } };
+    const cid = await machine("alice", "dev-box", [SESSIONS]);
+    const sid = (await open("alice", cid, "conv-old", { agent_id: "claude-sessions" })).body.data.session_id as string;
+    await events("alice", cid, sid, [
+      ["session_started", { origin: "terminal_hook", ref: "conv-old", title: "修 CI", agent: "claude", cwd: "/home/u/work/claw" }], ask("act-1"),
+    ]);
+    // As an item stored by a Claw before this one: no tool in its params.
+    await w.q("UPDATE claw_work_items SET params = params - 'tool' WHERE worker_session_id = $1", [`remote:${sid}`]);
+    await events("alice", cid, sid, [resolved("act-1", "terminal"), ask("act-2", "Run: make test")]);
+    const item = await remoteItem(sid);
+    assert.equal(item.params.tool, "claude");
+    const got = await pushed(item.item_id);
+    const last = got.at(-1);
+    assert.equal(last.text, "dev-box 上终端里的 Claude Code（修 CI，work/claw）在等你回答：Run: make test。在下面选，或直接在终端里回答，先答的算数。");
+    assert.deepEqual([last.remote.agent, last.remote.tool], ["claude-sessions", "claude"]);
   });
 
   test("T6 new terminal sessions are limited per minute on their own", async () => {

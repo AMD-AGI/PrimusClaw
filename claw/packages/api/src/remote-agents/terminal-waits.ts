@@ -74,9 +74,10 @@ const oneLine = (text: unknown, max: number): string => {
 /** The words of a notice, in `lang`. Pure, for the tests. What the connector reported is quoted text, one line each. */
 export function terminalWaitText(n: TerminalWaitNotice, lang: "zh" | "en"): string {
   const machine = oneLine(n.machine, NAME_MAX) || n.connectorId.slice(0, 8);
-  // A claude agent's derived agent for the conversations already on the machine is named "<its name> (existing sessions)"
-  // (connector/src/config.ts existingSessionAgents): to the owner it is the tool they started in that terminal.
-  const agent = oneLine(n.agent, NAME_MAX).replace(/ \(existing sessions\)$/, "") || n.agentId;
+  // A claude agent's derived agent for the conversations already on the machine (id "<its id>-sessions") is named "<its name>
+  // (existing sessions)" (connector/src/config.ts existingSessionAgents): to the owner it is the tool they started in that terminal.
+  const name = oneLine(n.agent, NAME_MAX);
+  const agent = (n.agentId.endsWith("-sessions") ? name.replace(/ \(existing sessions\)$/, "") : name) || n.agentId;
   const what = oneLine(n.title, TITLE_MAX) || oneLine(n.cwd, TITLE_MAX);
   const why = oneLine(n.waitingFor, WAITING_FOR_MAX);
   return lang === "zh"

@@ -773,6 +773,14 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       tell(`undelivered:${e.id}`, "undelivered", remoteNotice("undelivered", p, item.seq, ""));
     };
     if (p.origin === "terminal") {
+      // An item made before Claw read the tool (or before its session said it): learned from the session's session_started now.
+      if (!terminalToolOf(p.tool)) {
+        const tool = terminalToolOf((await q(
+          `SELECT data->>'agent' AS tool FROM claw_remote_events WHERE session_id = $1 AND type = 'session_started' ORDER BY id DESC LIMIT 1`,
+          [sessionId],
+        )).rows[0]?.tool);
+        if (tool) p.tool = tool;
+      }
       const said = await applyTerminal(events, p, board, write, await approvalsEnabled(owner, q));
       // A message filed under the item is the one that told the user of its current wait (one per `attention_seq`): the last request
       // said in this pass. The others (an earlier request of the same pass, a card marked resolved) are said without it.

@@ -331,5 +331,7 @@ describe("conversations open in a terminal that wait for their person", { skip }
     // An owner's own name for their agent is theirs, and kept.
     assert.match(waits.terminalWaitText({ ...n, agent: "work claude (existing sessions)" }, "en"), /^work claude in a terminal/);
     assert.match(waits.terminalWaitText({ ...n, agent: "My Claude" }, "en"), /^My Claude in a terminal/);
+    // Another agent whose own name ends so is not the derived one: its name is said as it is.
+    assert.match(waits.terminalWaitText({ ...n, agentId: "mine", agent: "Mine (existing sessions)" }, "en"), /^Mine \(existing sessions\) in a terminal/);
   });
 });
