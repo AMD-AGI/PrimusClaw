@@ -36,7 +36,7 @@ import { randomUUID } from "node:crypto";
 import pino from "pino";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
-  REMOTE_ORIGIN_TERMINAL_HOOK,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -518,11 +518,18 @@ function askOf(e: MovingEvent, actionId: string, tool: string): AssistantRemoteA
     else options = options.filter((o) => o.kind.startsWith("reject"));
   }
   ask.options = options;
+  const asks = terminalAsksOf(e.data.terminal_asks);
+  if (asks) ask.terminal_asks = asks;
   for (const f of ["question_index", "question_count"] as const) {
     const n = e.data[f];
     if (typeof n === "number" && Number.isSafeInteger(n) && n >= 0 && n < 100) ask[f] = n;
   }
   return options.length ? ask : null;
+}
+
+/** When the terminal asks a request too, as its connector said (`terminal_asks`); undefined: alongside the card (Claude Code). */
+export function terminalAsksOf(v: unknown): TerminalAsks | undefined {
+  return TERMINAL_ASKS.find((t) => t === v);
 }
 
 /** How large a terminal's request may be (its `input`, as JSON) to be carried whole on a card: the connector keeps it to 12 KB. */
@@ -600,19 +607,52 @@ export function cwdTail(cwd: string): string {
   return parts.slice(-2).join("/");
 }
 
-/** What a terminal's request says to the user, in their language: where it waits, and what for. */
+/**
+ * What a terminal's request says to the user, in their language: where it waits, what for, and how the terminal asks it too
+ * (`asks`, the request's `terminal_asks`): alongside the card, the first answer counting (Claude Code); only once the card is
+ * answered or its time is up, the card offering to decline or to hand it back (Cursor, `after_card`); or only once someone types in
+ * that terminal, which takes it back from the card (Codex, `on_input`).
+ */
 export function terminalAskNotice(
-  p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, what: string, answerable = true,
+  p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, what: string, answerable = true, asks?: TerminalAsks,
 ): string {
   const where = [flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(p.lang === "zh" ? "，" : ", ");
   const zh = p.lang === "zh";
-  const how = answerable
-    ? (zh ? "在下面选，或直接在终端里回答，先答的算数。" : "Choose below, or answer in the terminal; whichever comes first counts.")
-    : (zh ? "这个请求没法在这里完整显示，请到终端里回答。" : "It cannot be shown here in full: answer it in the terminal.");
+  const how = (zh ? HOW_ZH : HOW_EN)[asks ?? "alongside"][answerable ? "answerable" : "cut"];
   return zh
     ? `${p.machine} 上终端里的 ${p.agent_id}${where ? `（${where}）` : ""}在等你回答：${what}。${how}`
     : `${p.agent_id} in a terminal on ${p.machine}${where ? ` (${where})` : ""} is waiting for you: ${what}. ${how}`;
 }
+
+type HowWords = Record<TerminalAsks | "alongside", { answerable: string; cut: string }>;
+const HOW_EN: HowWords = {
+  alongside: {
+    answerable: "Choose below, or answer in the terminal; whichever comes first counts.",
+    cut: "It cannot be shown here in full: answer it in the terminal.",
+  },
+  after_card: {
+    answerable: "Decline it below, or hand it back to the terminal: the terminal asks only after that (or once this wait is over), and you approve it there.",
+    cut: "It cannot be shown here in full: the terminal asks once its wait for the phone is over; answer it there.",
+  },
+  on_input: {
+    answerable: "Choose below; to answer in the terminal instead, type anything there, and the question goes back to it.",
+    cut: "It cannot be shown here in full: type anything in the terminal, and it asks you there.",
+  },
+};
+const HOW_ZH: HowWords = {
+  alongside: {
+    answerable: "在下面选，或直接在终端里回答，先答的算数。",
+    cut: "这个请求没法在这里完整显示，请到终端里回答。",
+  },
+  after_card: {
+    answerable: "可以在下面拒绝，或交回终端：终端要等这里答完（或等待时间到了）才会问，批准请在终端里。",
+    cut: "这个请求没法在这里完整显示：终端等手机的时间一过就会问你，请到终端里回答。",
+  },
+  on_input: {
+    answerable: "在下面选；想改在终端里回答，就在终端里随便输入点什么，问题就回到终端。",
+    cut: "这个请求没法在这里完整显示：在终端里随便输入点什么，它就会在终端里问你。",
+  },
+};
 
 /** Said instead of each request once more of one conversation's wait than are put one by one in a minute. */
 export function terminalBusyNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, waiting: number): string {
@@ -977,9 +1017,10 @@ async function applyTerminal(
       if (recent.length < TERMINAL_ASKS_PER_MINUTE) {
         p.asked_at = [...recent, now];
         // Nothing that can be answered from a card (no option, or none that may be chosen without seeing all of it): said, to the terminal.
+        const asks = terminalAsksOf(e.data.terminal_asks);
         said.push(ask
-          ? { key: `ask:${e.id}`, text: terminalAskNotice(p, what), ask, actionId }
-          : { key: `ask:${e.id}`, text: terminalAskNotice(p, what, false), actionId });
+          ? { key: `ask:${e.id}`, text: terminalAskNotice(p, what, true, asks), ask, actionId }
+          : { key: `ask:${e.id}`, text: terminalAskNotice(p, what, false, asks), actionId });
       } else {
         p.asked_at = recent;
         if (!(Number(p.summarized_at) > now - MINUTE_MS)) {

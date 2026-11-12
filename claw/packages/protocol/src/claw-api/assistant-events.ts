@@ -126,8 +126,8 @@ export interface AssistantRemoteAsk {
   /** When the connector stops waiting for an answer (it refuses the request then); absent when it did not say. */
   expires_at?: string;
   /**
-   * `terminal`: asked in a terminal on the machine (a conversation its person started there), whose own prompt stays open: whichever
-   * answer comes first is taken. Absent for a session opened through Claw.
+   * `terminal`: asked in a terminal on the machine (a conversation its person started there), which asks it too (when: see
+   * `terminal_asks`); whichever answer comes first is taken. Absent for a session opened through Claw.
    */
   origin?: "terminal";
   /** A terminal's request: what kind of prompt it is (`execute`, `edit`, `question`, `switch_mode` for a plan, `mcp`, `other`). */
@@ -144,7 +144,19 @@ export interface AssistantRemoteAsk {
   /** A terminal's question asked as several cards: which this is (from 0), and how many. */
   question_index?: number;
   question_count?: number;
+  /**
+   * A terminal's request: when the terminal asks it too, as its connector said (`terminal_asks` on the request). Absent: alongside
+   * the card, and the first answer counts (Claude Code). `after_card`: only once the card is answered or its time is up, and the
+   * card offers only to decline or to hand it back to the terminal (Cursor). `on_input`: only once someone types in that terminal,
+   * which withdraws the card (Codex).
+   */
+  terminal_asks?: TerminalAsks;
 }
+
+/** When a terminal asks a request that is also on a card, besides alongside it: see {@link AssistantRemoteAsk.terminal_asks}. */
+export type TerminalAsks = "after_card" | "on_input";
+/** The values of `terminal_asks` a channel knows; any other is read as absent. */
+export const TERMINAL_ASKS: readonly TerminalAsks[] = ["after_card", "on_input"];
 
 /** A choice a say puts to the person: from 2 to 10 options, one plain line each; `multiple` when several may be picked. */
 export interface AssistantSayChoice {

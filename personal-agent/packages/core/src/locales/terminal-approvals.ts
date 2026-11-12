@@ -18,7 +18,15 @@ export const terminalApprovalText = defineCatalog({
     newText: "With:",
     alwaysOption: (p: { name: string }) => `"Always allow (this session)" means: ${p.name}`,
     firstAnswerWins: "The terminal is asking too: the first answer, here or there, counts.",
+    afterCard:
+      "The terminal asks only after this card is answered or its wait is over: decline it here, or hand it back to the terminal and approve it there.",
+    onInput:
+      "To answer at the terminal instead, type anything there: the question goes back to it and this card is withdrawn.",
     tooLong: "Too long to show in full here: it can only be turned down from the phone; approve it at the terminal.",
+    tooLongAfterCard:
+      "Too long to show in full here: it can only be declined from the phone; the terminal asks once this card's wait is over.",
+    tooLongOnInput:
+      "Too long to show in full here: it can only be turned down from the phone; to approve it, type anything at the terminal and answer it there.",
     questionOf: (p: { n: number; of: number }) => `Question ${String(p.n)} of ${String(p.of)}`,
     optionYes: "Yes",
     optionSession: "Always allow (this session)",
@@ -26,6 +34,7 @@ export const terminalApprovalText = defineCatalog({
     optionNoStop: "No, and stop",
     optionPlanApprove: "Approve (ask before edits)",
     optionPlanKeep: "Keep planning",
+    optionToTerminal: "Ask me at the terminal",
     answeredInTerminal: "Answered in the terminal",
     noLongerWaiting: "No longer waiting for an answer",
     answeredInTerminalLine: "This request was answered in the terminal.",
@@ -50,7 +59,11 @@ export const terminalApprovalText = defineCatalog({
     newText: "改为：",
     alwaysOption: (p) => `“本会话始终允许”即：${p.name}`,
     firstAnswerWins: "终端里也在等你回答，先答的算数。",
+    afterCard: "终端要等这张卡片答完或等待时间到了才会问：在这里拒绝，或交回终端、到终端里批准。",
+    onInput: "想改在终端里回答，就在终端里随便输入点什么：问题回到终端，这张卡片随之撤回。",
     tooLong: "内容过长，这里显示不全：手机上只能拒绝，请到终端批准。",
+    tooLongAfterCard: "内容过长，这里显示不全：手机上只能拒绝；这张卡片的等待时间一过，终端就会问你。",
+    tooLongOnInput: "内容过长，这里显示不全：手机上只能拒绝；要批准，在终端里随便输入点什么，到终端里回答。",
     questionOf: (p) => `第 ${String(p.n)} 题，共 ${String(p.of)} 题`,
     optionYes: "允许",
     optionSession: "本会话始终允许",
@@ -58,6 +71,7 @@ export const terminalApprovalText = defineCatalog({
     optionNoStop: "拒绝并停止",
     optionPlanApprove: "批准（编辑前逐个询问）",
     optionPlanKeep: "继续规划",
+    optionToTerminal: "交回终端",
     answeredInTerminal: "已在终端里回答",
     noLongerWaiting: "不再等待回答",
     answeredInTerminalLine: "这个请求已在终端里回答。",

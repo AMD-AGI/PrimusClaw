@@ -628,7 +628,8 @@ never approve one. So for Cursor the phone goes first and the terminal second:
 - `agent --force` (`--yolo`) turns Run Everything on for one run without writing it to `cli-config.json`, and a hook cannot see
   it: such a run still holds every command that is not on an allow list for the phone first (then runs it, as `--force` says).
 - A Cursor session keeps the hooks it started with: install, uninstall or a new `--hold` takes effect in the next one.
-- Claw and the chat still say "the first answer counts" on these cards; the card's event says `terminal_asks: "after_card"`.
+- The card's event says `terminal_asks: "after_card"`, so Claw and the chat say that the terminal asks only after the card: decline
+  it there, or hand it back and approve it at the terminal (not "the first answer counts", as for Claude Code).
 - `CLAW_APPROVAL_HOOKS=off` in the environment of `agent` leaves its questions in the terminal, as for Claude Code.
 - Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
   editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
