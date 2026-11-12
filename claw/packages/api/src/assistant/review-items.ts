@@ -1144,13 +1144,16 @@ export function ciWaitOf(f: ReviewFacts): { headSha: string; failed: string[]; p
 }
 
 /**
- * A review whose turn ended without posting or holding anything, having read a head the same acting account had already reviewed
+ * A review whose turn ended without trying to write anything, having read a head the same acting account had already reviewed
  * (`ReviewFacts.unchanged`): with no new commits it rightly posts no second review, and it is not stuck. Nothing for the reviewer to do.
+ * Any attempt to post or merge, whatever became of it, is not this: a write that was refused or failed (an expired credential, a GitHub
+ * error, the say withdrawn, CI not green) is judged as it always was, and the reviewer is asked; never told as "no new commits".
  */
 export function unchangedReview(f: ReviewFacts): boolean {
   if (!f.unchanged || f.turn !== "finished" || f.lastPosted || f.confirmations.length > 0) return false;
-  return !f.writes.some((w) => w.result === "ok" && (w.tool === "gh_review_submit" || w.tool === "gh_pr_merge"));
+  return !f.writes.some((w) => WRITE_TOOLS.has(w.tool));
 }
+const WRITE_TOOLS: ReadonlySet<string> = new Set(["gh_review_submit", "gh_pr_merge"]);
 
 /** The audit rows of `GithubReview.followPullRequest`, and the details of those that end a review item. */
 export const FOLLOW_TOOL = "gh_pr_follow";
@@ -1308,14 +1311,16 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
 
 /**
  * The head session $1 last read (`gh_pr_get`), with when, if the acting account $2 had already posted a review of the same pull request at
- * that head in another session (`ReviewFacts.unchanged`); no row otherwise.
+ * that head in another session (`ReviewFacts.unchanged`), and session $1 tried no write at all (no review or merge call, in any state,
+ * one still unfinished included); no row otherwise.
  */
 export const UNCHANGED_HEAD_SQL = `
   SELECT g.head_sha, g.at FROM (
     SELECT repo, pr, head_sha, at FROM claw_github_audit
      WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND head_sha <> '' AND pr IS NOT NULL
      ORDER BY at DESC, id DESC LIMIT 1) g
-   WHERE EXISTS (SELECT 1 FROM claw_github_audit a
+   WHERE NOT EXISTS (SELECT 1 FROM claw_github_audit w WHERE w.session_id = $1 AND w.tool IN ('gh_review_submit', 'gh_pr_merge'))
+     AND EXISTS (SELECT 1 FROM claw_github_audit a
                   WHERE a.actor_user_id = $2 AND a.session_id <> $1 AND a.tool = 'gh_review_submit' AND a.result = 'ok'
                     AND a.detail IN ('submitted', 'already_submitted') AND lower(a.repo) = lower(g.repo) AND a.pr = g.pr
                     AND lower(a.head_sha) = lower(g.head_sha))`;

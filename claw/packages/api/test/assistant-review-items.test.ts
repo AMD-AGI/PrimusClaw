@@ -47,16 +47,36 @@
  *   RS5 a re-review of a head the same account already reviewed that posts nothing (no new commits) is not stuck: the reviewer is not
  *       asked, whoever asked for it is told why; it waits for CI on that head and is run once more when it is green, then ends with
  *       nothing new to post; a head nobody reviewed, or reviewed by another account, is still the reviewer's to look at (N25, #532)
+ *   RS6 the same re-review that tried a write which was refused or failed, with any code the review tools can answer (an expired
+ *       credential, a GitHub error, the say withdrawn, CI not green, ...), or one still unfinished, is judged as before: the reviewer is
+ *       asked, the requester is never told "no new commits", and no re-run is allowed
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
 import { reviewQuestionZh } from "../src/assistant/review-questions.js";
 import { startWorld, type World } from "./support/assistant-world.js";
 
 const skip = postgresSkipReason();
+
+/**
+ * Every code a review or merge call can be refused or fail with, read off the review tools' source (`new Refusal("…")`, `failure("…")`,
+ * the GitHub error codes and the workflow-scope refusal), so that a new code is covered without anyone adding it here.
+ */
+function writeRefusalCodes(): string[] {
+  const dir = join(import.meta.dirname, "../src/github-review");
+  const codes = new Set<string>();
+  for (const f of readdirSync(dir).filter((x) => x.endsWith(".ts"))) {
+    const text = readFileSync(join(dir, f), "utf8");
+    for (const m of text.matchAll(/\b(?:new Refusal|failure)\("([a-z_]+)"/g)) codes.add(m[1]!);
+    for (const m of text.matchAll(/"(github_(?:rate_limited|not_found|error|workflow_scope_missing))"/g)) codes.add(m[1]!);
+  }
+  return [...codes].sort();
+}
 
 describe("assistant review items", { skip }, () => {
   let w: World;
@@ -1120,6 +1140,20 @@ describe("assistant review items", { skip }, () => {
     const nothingNew = ri.reviewState({ ...base, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 2 } as never);
     assert.deepEqual([nothingNew.summary, nothingNew.boardState === "done" && nothingNew.result],
       ["AMD-AGI/PrimusClaw#7 has no new commits since its last review", "unchanged"]);
+    // A re-review of an unchanged head that tried a write which was refused or failed: never "nothing new", whatever the code (RS6).
+    const codes = writeRefusalCodes();
+    assert.ok(codes.length >= 60 && ["credential_expired", "github_error", "delegation_off", "ci_not_green", "internal_error"].every((x) => codes.includes(x)), codes.join(","));
+    for (const code of codes) {
+      for (const tool of ["gh_review_submit", "gh_pr_merge"]) {
+        for (const reviewOnly of [false, true]) {
+          const f = { ...base, reviewOnly, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, writes: [wr(tool, "refused", code)] };
+          assert.equal(ri.unchangedReview(f as never), false, `${tool} ${code}`);
+          const st = ri.reviewState(f as never);
+          assert.equal(st.boardState, "needs_you", `${tool} refused ${code} (review only: ${reviewOnly})`);
+          assert.ok(!/no new commits/.test(st.summary), st.summary);
+        }
+      }
+    }
     const waiting = ri.reviewState({ ...base, actingAs: "bob", actingAsName: "Bob B", confirmations: [c("pending")] } as never);
     assert.equal(waiting.boardState === "in_progress" && waiting.question, "Waiting for Bob B to confirm the merge");
     // Every status the confirmations table allows is in the table above.
@@ -1942,5 +1976,58 @@ describe("assistant review items", { skip }, () => {
     const ownItem = await w.item(own.item_id);
     assert.deepEqual([ownItem.board_state, ownItem.outcome, ownItem.params.ci_wait_ended.reason], ["done", "accepted", "head_moved"]);
     assert.match((await toldTo("alice")).at(-1)!, /- The pull request got new commits, so I stopped waiting for CI on the old head\.\n- Next: once the pull request has new commits, reply `review again #\d+`\./);
+  });
+
+  test("RS6 a re-review of an unchanged head whose write was refused or failed is judged as before, for every code: the reviewer is asked, no re-run", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const HEAD = "a".repeat(40);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, posted, write, at)
+       VALUES ('alice', 'bob', 'earlier-session', 'AMD-AGI/PrimusClaw', 254, $1, 'gh_review_submit', '{"event":"COMMENT"}', 'ok', 'submitted',
+               '{"event":"COMMENT","review_id":1,"findings":[]}', true, NOW() - INTERVAL '1 hour')`,
+      [HEAD],
+    );
+    const asked = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    const it = await w.item(asked.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    const words = await firstTurnWords(sid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_pr_get', 'ok', 'ok')`,
+      [sid, HEAD],
+    );
+    // The review tried to post and was refused (the review's own finding: an expired credential).
+    const write = (await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, write)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_review_submit', '{"event":"APPROVE"}', 'refused', 'credential_expired', false)
+       RETURNING id`,
+      [sid, HEAD],
+    ))[0].id as number;
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    const item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.last_report_kind, item.summary], ["needs_you", "blocked", "the review of AMD-AGI/PrimusClaw#254 ended without posting anything"]);
+    assert.equal(item.params.ci_waiting, undefined, "not waiting for CI");
+    assert.equal((await w.pending(bob.routerSid)).length, 1, "the reviewer is asked, as before");
+    assert.ok((await toldTo("alice")).every((t) => !/already reviewed|no new commits/i.test(t)), "the requester is never told it had nothing new");
+    const { proofForReviewAfterGreenCi } = await import("../src/github-review/acting-session.js");
+    const { UNCHANGED_HEAD_SQL } = ri;
+    // Every code, a submit or a merge, and a call still unfinished: no unchanged fact, no re-run proof, still the reviewer's.
+    for (const [tool, result, detail] of [
+      ...writeRefusalCodes().flatMap((code) => [["gh_review_submit", "refused", code], ["gh_pr_merge", "refused", code]]),
+      ["gh_review_submit", "started", ""], ["gh_pr_merge", "started", ""],
+    ] as Array<[string, string, string]>) {
+      await w.q("UPDATE claw_github_audit SET tool = $2, result = $3, detail = $4 WHERE id = $1", [write, tool, result, detail]);
+      assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 0, `${tool} ${result} ${detail}: not unchanged`);
+      assert.equal(await proofForReviewAfterGreenCi({ query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never, sid, words), null, `${tool} ${result} ${detail}: no re-run`);
+      await ri.syncReviewItem(it.item_id);
+      assert.equal((await w.item(it.item_id)).board_state, "needs_you", `${tool} ${result} ${detail}`);
+    }
+    // The control: with no write tried, the same session is the unchanged re-review (RS5), and the re-run proof is its once CI is green.
+    await w.q("DELETE FROM claw_github_audit WHERE id = $1", [write]);
+    assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 1);
+    assert.notEqual(await proofForReviewAfterGreenCi({ query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never, sid, words), null);
   });
 });

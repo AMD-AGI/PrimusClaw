@@ -136,7 +136,8 @@ export async function proofForFirstMessageAgain(
  * turn it lets through is the session's second.
  *
  * Or, for a review asked of anyone (2026-11-11, N25): its one completed turn read a head the same acting account had already reviewed in
- * another session and posted, merged and held nothing, as a re-review of a pull request with no new commits does, and the head is green now.
+ * another session and tried no review or merge call at all (a refused or failed one is not this), as a re-review of a pull request with no
+ * new commits does, and the head is green now.
  * The same words, once more; a review someone asked of the owner still passes every gate a queued turn does (`gateRequestedReviewTurn`:
  * the reviewer's say asked again, and the turn budget).
  */
@@ -155,7 +156,7 @@ export async function proofForReviewAfterGreenCi(
                            AND EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool = 'gh_review_submit'
                                         AND a.result = 'refused' AND a.detail = 'ci_not_green'))
                        OR (NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id
-                                        AND a.tool IN ('gh_review_submit', 'gh_pr_merge') AND a.result = 'ok')
+                                        AND a.tool IN ('gh_review_submit', 'gh_pr_merge'))
                            AND NOT EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = s.session_id)
                            AND EXISTS (SELECT 1 FROM (SELECT g.repo, g.pr, g.head_sha FROM claw_github_audit g
                                                        WHERE g.session_id = s.session_id AND g.tool = 'gh_pr_get' AND g.result = 'ok'
