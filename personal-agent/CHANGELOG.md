@@ -31,16 +31,17 @@ this release needs a newer Claw.
 
 - `@primusclaw/personal-agent`: exported ports and helpers change for anyone implementing or importing them (the
   published runtime and Teams packages implement and call all of them, so a deployment of the published packages has
-  nothing to do). Ports: `ClawNotificationsPort.create` takes an optional `surface` and `updateTypes` an optional `{
-  surface }`; `IntentReader.read`, `readMode` and `readAnswer` take the channel's name; Claw's `NewSession` and
+  nothing to do). Ports: `ClawNotificationsPort.create` takes an optional `surface` and `updateTypes` an optional
+  `surface` option; `IntentReader.read`, `readMode` and `readAnswer` take the channel's name; Claw's `NewSession` and
   `SendOptions` carry an optional `channel`; `SurfaceCaps` now extends `SurfaceIdentity` (`channel`, `name`,
   `shortName`) and `SurfaceLimits` (`citationsMax`, `suggestionsMax`, `streamSeconds`), `Conversation` gains `caps` and
   `replyTo`, and `turn.TurnSurface` requires `caps`; `ChannelContextRequest` requires `channel`; `RemotePermission`
   gains `lang` (and `NewRemotePermission` an optional `lang`). Helpers that named Teams now take the channel: the
-  constants `INTENT_PROMPT`, `MODE_PROMPT`, `ANSWER_PROMPT`, `LABEL_DESCRIPTION`, `RULE_HEADING`, `CHANGE_HEADING` and
-  `CHANGE_SECTION` are replaced by functions of the channel (`intentPrompt`, `modePrompt`, `answerPrompt`,
-  `labelDescription` and the reply-style heading helpers), and `messageContent`, `voteMessageId`, `scopeOf`,
-  `logTurnStarted` and `CommandViews.link` take the channel as a required argument (#787, #789, #794).
+  constants `INTENT_PROMPT`, `MODE_PROMPT`, `ANSWER_PROMPT`, `LABEL_DESCRIPTION`, `DATA_LINES`, `RULE_HEADING`,
+  `CHANGE_HEADING` and `CHANGE_SECTION` are replaced by functions of the channel (`intentPrompt`, `modePrompt`,
+  `answerPrompt`, `labelDescription`, `dataLines` and the reply-style heading helpers), and `messageContent`,
+  `voteMessageId`, `scopeOf`, `logTurnStarted` and `CommandViews.link` take the channel as a required argument (#787,
+  #789, #794).
 - `@primusclaw/personal-agent-teams` keeps only what is Teams' own (its settings, Azure Key Vault, the queues and the
   Bot Connector, `TeamsSurface` and its renderers, the inbound consumer and the release gate's test entry, as
   `teamsSurface()`); `buildWorker`, `main` and the types `BuildWorker`, `PluginFactory`, `Worker`, `WorkerEnv`,
