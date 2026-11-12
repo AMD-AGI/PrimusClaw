@@ -22,6 +22,9 @@
  *   T7 a terminal's request goes whole on its card (kind, input, which question): one too large keeps only the options that refuse,
  *      and one with nothing left to choose is said in words, to the terminal
  *   T8 turned off, an open session puts nothing more to the user
+ *   T10 the tool that asked (session_started `agent`) is named as its users know it (Claude Code, Codex, Cursor) in the item's title
+ *      and every notice, and carried as `remote.tool`; a session_started that does not say, or says something else, keeps the agent's id
+ *   T11 an item stored before Claw read the tool learns it from the session's session_started on its next request, title included
  *   T9 how the terminal asks too, as the request's `terminal_asks` says, in each language: Claude Code (absent) alongside the card,
  *      the first answer counting; Cursor (`after_card`) only after the card, which offers to decline or hand it back; Codex
  *      (`on_input`) once someone types there; the field goes on with the card, and a value no channel knows is read as absent
@@ -199,10 +202,11 @@ describe("approvals from terminals", { skip }, () => {
     await events("alice", cid, sid, [ask("act-1")]);
     await events("alice", cid, sid, [["permissionRequest", { ...ask("act-1")[1], resent: true }]]);
     const item = await remoteItem(sid);
-    assert.deepEqual([item.board_state, item.params.origin, item.title], ["needs_you", "terminal", "laptop claude：修 CI"]);
+    assert.deepEqual([item.board_state, item.params.origin, item.title], ["needs_you", "terminal", "laptop Claude Code：修 CI"]);
     let got = await pushed(item.item_id);
     assert.equal(got.length, 1, JSON.stringify(got));
-    assert.equal(got[0].text, "laptop 上终端里的 claude（修 CI，work/claw）在等你回答：Which color?。在下面选，或直接在终端里回答，先答的算数。");
+    assert.equal(got[0].text, "laptop 上终端里的 Claude Code（修 CI，work/claw）在等你回答：Which color?。在下面选，或直接在终端里回答，先答的算数。");
+    assert.deepEqual([got[0].remote.agent, got[0].remote.tool], ["claude", "claude"], "the agent's id, and the tool that asked");
     assert.deepEqual([got[0].remote.kind, got[0].remote.session_id, got[0].remote.ask.action_id], ["needs_you", sid, "act-1"]);
     assert.deepEqual(got[0].remote.ask.options, OPTIONS);
     assert.deepEqual([got[0].remote.ask.title, got[0].remote.ask.cwd], ["修 CI", "/home/u/work/claw"], "where it asks, for the card");
@@ -314,7 +318,8 @@ describe("approvals from terminals", { skip }, () => {
         ]);
         const got = await pushed((await remoteItem(sid)).item_id);
         assert.equal(got.length, 2, JSON.stringify(got.map((g) => g.text)));
-        const where = zh ? `laptop 上终端里的 ${c.agent}（${title}，work/claw）在等你回答：` : `${c.agent} in a terminal on laptop (${title}, work/claw) is waiting for you: `;
+        const name = { claude: "Claude Code", cursor: "Cursor", codex: "Codex" }[c.agent];
+        const where = zh ? `laptop 上终端里的 ${name}（${title}，work/claw）在等你回答：` : `${name} in a terminal on laptop (${title}, work/claw) is waiting for you: `;
         const stop = zh ? "。" : ". ";
         assert.equal(got[0].text, `${where}Run: make test${stop}${zh ? c.zh : c.en}`, `${c.agent} ${owner}`);
         assert.equal(got[1].text, `${where}Run: big${stop}${zh ? c.zhCut : c.enCut}`, `${c.agent} ${owner} cut`);
@@ -358,7 +363,65 @@ describe("approvals from terminals", { skip }, () => {
     assert.equal(got.length, 6, JSON.stringify(got.map((g) => g.text)));
     assert.deepEqual(got.slice(0, 5).map((g) => g.remote.ask?.action_id), ["act-1", "act-2", "act-3", "act-4", "act-5"]);
     assert.equal(got[5].remote.ask, undefined);
-    assert.match(got[5].text, /一分钟内问了很多次，现在有 6 个在等你/);
+    assert.match(got[5].text, /^laptop 上终端里的 Claude Code（修 CI，work\/claw）一分钟内问了很多次，现在有 6 个在等你/);
+  });
+
+  test("T10 the tool that asked is named as its users know it, whatever the connector's id for its agent; an older connector's by that id", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    // As a connector names them: the claude agent's derived agent for the conversations already on the machine.
+    const SESSIONS = { agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u"] } };
+    const cid = await machine("alice", "dev-box", [SESSIONS, CURSOR, CODEX]);
+    const cases: Array<{ agent_id: string; agent?: unknown; name: string; tool?: string }> = [
+      { agent_id: "claude-sessions", agent: "claude", name: "Claude Code", tool: "claude" },
+      { agent_id: "codex", agent: "codex", name: "Codex", tool: "codex" },
+      { agent_id: "cursor", agent: "cursor", name: "Cursor", tool: "cursor" },
+      // A session_started that does not say which (a connector before 0.2.0), or says something no channel knows: the agent's id, as before.
+      { agent_id: "claude-sessions", name: "claude-sessions" },
+      { agent_id: "claude-sessions", agent: "vim", name: "claude-sessions" },
+      { agent_id: "claude-sessions", agent: 7, name: "claude-sessions" },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const ref = `conv-${i}`;
+      const sid = (await open("alice", cid, ref, { agent_id: c.agent_id })).body.data.session_id as string;
+      await events("alice", cid, sid, [
+        ["session_started", { origin: "terminal_hook", ref, title: "修 CI", ...(c.agent === undefined ? {} : { agent: c.agent }), cwd: "/home/u/work/claw" }],
+        ask("act-1", "Run: touch x"),
+      ]);
+      const item = await remoteItem(sid);
+      assert.equal(item.title, `dev-box ${c.name}：修 CI`, `${i} title`);
+      for (let n = 2; n <= 6; n++) await events("alice", cid, sid, [ask(`act-${n}`, `Run: step ${n}`)]);
+      const got = await pushed(item.item_id);
+      assert.equal(got.length, 6, JSON.stringify(got.map((g) => g.text)));
+      assert.equal(got[0].text, `dev-box 上终端里的 ${c.name}（修 CI，work/claw）在等你回答：Run: touch x。在下面选，或直接在终端里回答，先答的算数。`, `${i}`);
+      assert.match(got[5].text, new RegExp(`^dev-box 上终端里的 ${c.name}（修 CI，work/claw）一分钟内问了很多次`), `${i} busy`);
+      for (const g of got) {
+        assert.equal(g.remote.agent, c.agent_id, "the agent is still named by its id for a channel that acts on it");
+        assert.equal(g.remote.tool, c.tool, `${i} tool`);
+      }
+      if (c.tool) assert.ok(!got.some((g) => g.text.includes(c.agent_id)), `${i}: the id is not in the words`);
+    }
+  });
+
+  test("T11 an item made before Claw read the tool learns it from the session's session_started on its next request", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const SESSIONS = { agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u"] } };
+    const cid = await machine("alice", "dev-box", [SESSIONS]);
+    const sid = (await open("alice", cid, "conv-old", { agent_id: "claude-sessions" })).body.data.session_id as string;
+    await events("alice", cid, sid, [
+      ["session_started", { origin: "terminal_hook", ref: "conv-old", title: "修 CI", agent: "claude", cwd: "/home/u/work/claw" }], ask("act-1"),
+    ]);
+    // As an item stored by a Claw before this one: no tool in its params.
+    await w.q("UPDATE claw_work_items SET params = params - 'tool', title = 'dev-box claude-sessions：修 CI' WHERE worker_session_id = $1", [`remote:${sid}`]);
+    await events("alice", cid, sid, [resolved("act-1", "terminal"), ask("act-2", "Run: make test")]);
+    const item = await remoteItem(sid);
+    assert.equal(item.params.tool, "claude");
+    assert.equal(item.title, "dev-box Claude Code：修 CI", "its title names the tool too");
+    const got = await pushed(item.item_id);
+    const last = got.at(-1);
+    assert.equal(last.text, "dev-box 上终端里的 Claude Code（修 CI，work/claw）在等你回答：Run: make test。在下面选，或直接在终端里回答，先答的算数。");
+    assert.deepEqual([last.remote.agent, last.remote.tool], ["claude-sessions", "claude"]);
   });
 
   test("T6 new terminal sessions are limited per minute on their own", async () => {

@@ -127,6 +127,11 @@ export interface RemoteParams {
   cancels?: PendingCancel[];
   /** A terminal's item: the conversation's title (its name, or the start of its first prompt) and folder, as its connector said them. */
   title?: string;
+  /**
+   * A terminal's item: which tool asked (`claude`, `codex`, `cursor`: the `agent` its connector put on the session's `session_started`,
+   * connector 0.2.0 and newer), said to the user by its own name ({@link TERMINAL_TOOL_NAMES}). Absent otherwise: the agent's id is said.
+   */
+  tool?: TerminalTool;
   cwd?: string;
   /** A terminal's item: when (ms) each of its requests was put to the user one by one within the last minute (`TERMINAL_ASKS_PER_MINUTE`). */
   asked_at?: number[];
@@ -168,6 +173,18 @@ const pendingCancels = (p: Partial<RemoteParams> | null | undefined): PendingCan
     }))
     : [];
 
+/** The tools whose terminals a connector's hooks carry the questions of, by the names their users know them by. */
+export const TERMINAL_TOOL_NAMES = { claude: "Claude Code", codex: "Codex", cursor: "Cursor" } as const;
+export type TerminalTool = keyof typeof TERMINAL_TOOL_NAMES;
+export const terminalToolOf = (v: unknown): TerminalTool | undefined =>
+  typeof v === "string" && Object.hasOwn(TERMINAL_TOOL_NAMES, v) ? (v as TerminalTool) : undefined;
+
+/** Who a remote item's agent is to the user: the tool by its name for a terminal's item that says which, else the agent's id. */
+export const remoteAgentName = (p: Partial<Pick<RemoteParams, "agent_id" | "tool">>): string => {
+  const tool = terminalToolOf(p.tool);
+  return tool ? TERMINAL_TOOL_NAMES[tool] : String(p.agent_id ?? "").trim();
+};
+
 export const langOf = (text: string): RemoteLang => (/\p{Script=Han}/u.test(text) ? "zh" : "en");
 
 const flat = (v: unknown, max: number): string => {
@@ -195,7 +212,7 @@ export function remoteTitle(machine: string, agent: string, asked: string, lang:
 
 /** The same title with no machine: agent, and the start of what it was asked (an item whose machine is no longer the user's). */
 export function remoteTitleWithoutMachine(p: Partial<RemoteParams>): string {
-  const agent = String(p.agent_id ?? "").trim();
+  const agent = remoteAgentName(p);
   const asked = String(p.asked ?? "").trim();
   return clipOneLine(p.lang === "zh" ? `${agent}：${asked}` : `${agent}: ${asked}`, TITLE_MAX);
 }
@@ -566,10 +583,10 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
  */
 async function terminalItem(q: Querier, owner: string, sessionId: string): Promise<boolean> {
   const s = (await q(
-    `SELECT s.connector_id::text AS connector_id, s.agent_id, s.cwd, c.name,
-            (SELECT e.data->>'title' FROM claw_remote_events e WHERE e.session_id = s.session_id AND e.type = 'session_started'
-              ORDER BY e.id DESC LIMIT 1) AS title
+    `SELECT s.connector_id::text AS connector_id, s.agent_id, s.cwd, c.name, st.title, st.tool
        FROM claw_remote_sessions s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
+       LEFT JOIN LATERAL (SELECT e.data->>'title' AS title, e.data->>'agent' AS tool FROM claw_remote_events e
+                           WHERE e.session_id = s.session_id AND e.type = 'session_started' ORDER BY e.id DESC LIMIT 1) st ON TRUE
       WHERE s.session_id = $1 AND s.owner_user_id = $2 AND s.origin = $3`,
     [sessionId, owner, REMOTE_ORIGIN_TERMINAL_HOOK],
   )).rows[0];
@@ -585,16 +602,17 @@ async function terminalItem(q: Querier, owner: string, sessionId: string): Promi
   const cwd = flat(s.cwd, 300);
   const lang: RemoteLang = (await personWritesChinese(q, owner, title)) ? "zh" : "en";
   const asked = title || cwdTail(cwd) || (lang === "zh" ? "终端会话" : "terminal conversation");
+  const tool = terminalToolOf(s.tool);
   const params: RemoteParams = {
     connector_id: String(s.connector_id), session_id: sessionId, agent_id: String(s.agent_id), machine, asked, origin: "terminal", lang,
-    open_turns: 0, open_cmd_seqs: [], waiting: [], last_event_id: 0, title, cwd,
+    open_turns: 0, open_cmd_seqs: [], waiting: [], last_event_id: 0, title, cwd, ...(tool ? { tool } : {}),
   };
   const seq = Number((await q("SELECT COALESCE(MAX(seq), 0)::int + 1 AS next FROM claw_work_items WHERE user_id = $1", [owner])).rows[0].next);
   const itemId = newWorkItemId();
   await q(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
      VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb) ON CONFLICT (worker_session_id) DO NOTHING`,
-    [itemId, owner, seq, remoteTitle(machine, String(s.agent_id), asked, lang), remoteWorkerSessionId(sessionId), JSON.stringify(params)],
+    [itemId, owner, seq, remoteTitle(machine, remoteAgentName(params), asked, lang), remoteWorkerSessionId(sessionId), JSON.stringify(params)],
   );
   await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
            SELECT $1, 'created', 'remote', 0, NULL WHERE EXISTS (SELECT 1 FROM claw_work_items WHERE item_id = $1)`, [itemId]);
@@ -614,14 +632,15 @@ export function cwdTail(cwd: string): string {
  * that terminal, which takes it back from the card (Codex, `on_input`).
  */
 export function terminalAskNotice(
-  p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, what: string, answerable = true, asks?: TerminalAsks,
+  p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd">, what: string, answerable = true, asks?: TerminalAsks,
 ): string {
+  const agent = remoteAgentName(p);
   const where = [flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(p.lang === "zh" ? "，" : ", ");
   const zh = p.lang === "zh";
   const how = (zh ? HOW_ZH : HOW_EN)[asks ?? "alongside"][answerable ? "answerable" : "cut"];
   return zh
-    ? `${p.machine} 上终端里的 ${p.agent_id}${where ? `（${where}）` : ""}在等你回答：${what}。${how}`
-    : `${p.agent_id} in a terminal on ${p.machine}${where ? ` (${where})` : ""} is waiting for you: ${what}. ${how}`;
+    ? `${p.machine} 上终端里的 ${agent}${where ? `（${where}）` : ""}在等你回答：${what}。${how}`
+    : `${agent} in a terminal on ${p.machine}${where ? ` (${where})` : ""} is waiting for you: ${what}. ${how}`;
 }
 
 type HowWords = Record<TerminalAsks | "alongside", { answerable: string; cut: string }>;
@@ -655,11 +674,12 @@ const HOW_ZH: HowWords = {
 };
 
 /** Said instead of each request once more of one conversation's wait than are put one by one in a minute. */
-export function terminalBusyNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "lang" | "title" | "cwd">, waiting: number): string {
+export function terminalBusyNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd">, waiting: number): string {
+  const agent = remoteAgentName(p);
   const where = [flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(p.lang === "zh" ? "，" : ", ");
   return p.lang === "zh"
-    ? `${p.machine} 上终端里的 ${p.agent_id}${where ? `（${where}）` : ""}一分钟内问了很多次，现在有 ${waiting} 个在等你；不再逐条推送，请到终端里处理（发 /approvals off 可关掉终端审批推送）。`
-    : `${p.agent_id} in a terminal on ${p.machine}${where ? ` (${where})` : ""} asked many times within a minute and ${waiting} wait for you now; they are no longer sent one by one: answer them in the terminal (/approvals off stops approvals from terminals).`;
+    ? `${p.machine} 上终端里的 ${agent}${where ? `（${where}）` : ""}一分钟内问了很多次，现在有 ${waiting} 个在等你；不再逐条推送，请到终端里处理（发 /approvals off 可关掉终端审批推送）。`
+    : `${agent} in a terminal on ${p.machine}${where ? ` (${where})` : ""} asked many times within a minute and ${waiting} wait for you now; they are no longer sent one by one: answer them in the terminal (/approvals off stops approvals from terminals).`;
 }
 
 async function applySession(owner: string, sessionId: string): Promise<Notice[] | null> {
@@ -753,15 +773,31 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       tell(`undelivered:${e.id}`, "undelivered", remoteNotice("undelivered", p, item.seq, ""));
     };
     if (p.origin === "terminal") {
+      // An item made before Claw read the tool (or before its session said it): learned from the session's session_started now.
+      if (!terminalToolOf(p.tool)) {
+        const tool = terminalToolOf((await q(
+          `SELECT data->>'agent' AS tool FROM claw_remote_events WHERE session_id = $1 AND type = 'session_started' ORDER BY id DESC LIMIT 1`,
+          [sessionId],
+        )).rows[0]?.tool);
+        if (tool) {
+          p.tool = tool;
+          // Its title named the agent's id: named by the tool now, unless it is no longer the title it was made with.
+          await q("UPDATE claw_work_items SET title = $3 WHERE item_id = $1 AND title = $2", [
+            item.item_id, remoteTitle(p.machine, p.agent_id, p.asked, p.lang), remoteTitle(p.machine, remoteAgentName(p), p.asked, p.lang),
+          ]);
+        }
+      }
       const said = await applyTerminal(events, p, board, write, await approvalsEnabled(owner, q));
       // A message filed under the item is the one that told the user of its current wait (one per `attention_seq`): the last request
       // said in this pass. The others (an earlier request of the same pass, a card marked resolved) are said without it.
       const filed = said.map((n) => !n.resolved).lastIndexOf(true);
+      const tool = terminalToolOf(p.tool);
       for (const [i, n] of said.entries()) {
         notices.push({
           userId: owner, routerSid: item.router_sid, itemId: i === filed ? item.item_id : undefined, key: `remote:${item.item_id}:${n.key}`, text: n.text,
           remote: {
             kind: n.resolved ? "resolved" : "needs_you", session_id: sessionId, machine: p.machine, agent: p.agent_id,
+            ...(tool ? { tool } : {}),
             ...(n.ask ? { ask: n.ask } : {}), ...(n.resolved ? { resolved: n.resolved } : {}),
           },
         });

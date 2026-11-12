@@ -163,11 +163,22 @@ export interface RemoteNotice {
   readonly sessionId: string;
   readonly ask: Event | undefined;
   readonly machine: string;
+  /** Who asked, as the person knows it: the tool's name (Claude Code, Codex, Cursor) when Claw said which, else the agent's id. */
   readonly agent: string;
   readonly resolved?: { readonly actionId: string; readonly by: string };
 }
 
 const REMOTE_KINDS = new Set(["done", "needs_you", "error", "resolved"]);
+
+/**
+ * The tools a terminal's question can come from (`remote.tool`, Claw names it when the connector said which), by the names their
+ * users know them by: the card says these instead of the connector's id for the agent (`claude-sessions`).
+ */
+const TERMINAL_TOOL_NAMES: Readonly<Record<string, string>> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  cursor: "Cursor",
+};
 
 /** A `resolved` notice's request and who ended it; undefined when it names no request. */
 function resolvedOf(remote: Event): RemoteNotice["resolved"] {
@@ -175,6 +186,9 @@ function resolvedOf(remote: Event): RemoteNotice["resolved"] {
   const actionId = resolved?.["action_id"];
   return resolved && typeof actionId === "string" && actionId ? { actionId, by: field(resolved["by"]) } : undefined;
 }
+
+const toolName = (tool: unknown): string | undefined =>
+  typeof tool === "string" && Object.hasOwn(TERMINAL_TOOL_NAMES, tool) ? TERMINAL_TOOL_NAMES[tool] : undefined;
 
 /** What an `assistant.say` says of an agent session on the person's machine, or undefined for any other message. */
 export function remoteNoticeOf(event: Event): RemoteNotice | undefined {
@@ -191,6 +205,6 @@ export function remoteNoticeOf(event: Event): RemoteNotice | undefined {
     sessionId,
     ask: record(remote["ask"]),
     machine: field(remote["machine"]),
-    agent: field(remote["agent"]),
+    agent: toolName(remote["tool"]) ?? field(remote["agent"]),
   };
 }

@@ -19,6 +19,8 @@
  *       `unknown`, or this one); a list that knows its conversations and lacks it, or an agent gone from the report, ends it *   T9  an owner with no assistant yet is told once they have one, if it still waits
  *   T10 a wait whose request the terminal's hook already put to the owner as a card (a terminal-hook session of that machine and
  *       conversation with a request not yet answered) is not told again; one whose request was answered is told as before
+ *   T11 the agent a claude agent derives for the conversations already on the machine ("<name> (existing sessions)") is said by
+ *       the tool's own name
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -317,5 +319,19 @@ describe("conversations open in a terminal that wait for their person", { skip }
     assert.deepEqual(await says("alice"), ["dev-pod 上终端里的 Claude Code 在等你（input needed）：second。已经等了一分多钟，回到那个终端处理。"]);
     await sweep();
     assert.equal((await says("alice")).length, 1, "the carded one is not told later either");
+  });
+
+  test("T11 the derived agent of a claude agent is said as the tool, not as its \"(existing sessions)\" name", () => {
+    const n = {
+      owner: "alice", connectorId: "c0ffee00-0000-0000-0000-000000000000", agentId: "claude-sessions", ref: "s-1", machine: "dev-pod",
+      agent: "Claude Code (existing sessions)", title: "fix the flaky test", cwd: "/home/u/repo", waitingFor: "input needed", since: new Date(),
+    };
+    assert.equal(waits.terminalWaitText(n, "zh"), "dev-pod 上终端里的 Claude Code 在等你（input needed）：fix the flaky test。已经等了一分多钟，回到那个终端处理。");
+    assert.equal(waits.terminalWaitText(n, "en"), "Claude Code in a terminal on dev-pod is waiting for you (input needed): fix the flaky test. It has waited over a minute; answer it in that terminal.");
+    // An owner's own name for their agent is theirs, and kept.
+    assert.match(waits.terminalWaitText({ ...n, agent: "work claude (existing sessions)" }, "en"), /^work claude in a terminal/);
+    assert.match(waits.terminalWaitText({ ...n, agent: "My Claude" }, "en"), /^My Claude in a terminal/);
+    // Another agent whose own name ends so is not the derived one: its name is said as it is.
+    assert.match(waits.terminalWaitText({ ...n, agentId: "mine", agent: "Mine (existing sessions)" }, "en"), /^Mine \(existing sessions\) in a terminal/);
   });
 });

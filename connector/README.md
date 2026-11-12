@@ -565,6 +565,9 @@ run without one (a script, a pipe), they add nothing to `settings.json` and prin
 installed but never run, `hooks install` (like `init` and `pair`) creates its config directory with the hooks in it; with
 Claude Code not installed and no `--config-dir`, it refuses and says so, since there is nothing to hook into yet.
 
+The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
+for you" (or Codex, or Cursor, for their hooks below).
+
 This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
 background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
 hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this

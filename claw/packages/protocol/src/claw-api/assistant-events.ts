@@ -112,6 +112,11 @@ export interface AssistantRemoteNotice {
   session_id: string;
   machine: string;
   agent: string;
+  /**
+   * A terminal's request (`ask.origin` "terminal"): which tool asked there (`claude`, `codex`, `cursor`), for a channel to name it as its
+   * users know it (Claude Code, Codex, Cursor) instead of by `agent`, the connector's id for it. Absent when the connector did not say.
+   */
+  tool?: "claude" | "codex" | "cursor";
   ask?: AssistantRemoteAsk;
   /** With `kind: "resolved"`: which request, and who ended it (`terminal`, or `timeout`, `session_end`, `connector_restart` when nobody did). */
   resolved?: { action_id: string; by: string };
