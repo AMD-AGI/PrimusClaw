@@ -18,8 +18,9 @@ import {
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
 import {
-  approvalHooksStatus, cursorApprovalHooksStatus, cursorHooksFile, HooksError, hooksStatus, type HooksStatus, installApprovalHooks, installCursorApprovalHooks, installHooks,
-  settingsFile, uninstallApprovalHooks, uninstallCursorApprovalHooks, uninstallHooks,
+  approvalHooksStatus, codexApprovalHooksStatus, codexHooksFile, cursorApprovalHooksStatus, cursorHooksFile, HooksError, hooksStatus, type HooksStatus,
+  installApprovalHooks, installCodexApprovalHooks, installCursorApprovalHooks, installHooks, settingsFile, uninstallApprovalHooks,
+  uninstallCodexApprovalHooks, uninstallCursorApprovalHooks, uninstallHooks,
 } from "./hooks.js";
 import { CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, cursorConfigDir } from "./cursor-approvals.js";
 import { approvalSocketFile } from "./approvals.js";
@@ -125,13 +126,17 @@ terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
     run: (rest, ctx) => cmdInit(rest, ctx),
   },
   hooks: {
-    usage: "hooks install|uninstall|status [--approvals] [--agent claude|cursor] [--hold SECONDS] [--config-dir DIR]",
+    usage: "hooks install|uninstall|status [--approvals] [--agent claude|codex|cursor] [--hold SECONDS] [--config-dir DIR]",
     about: `the SessionStart/SessionEnd hooks that tell this connector which Claude Code sessions are open
 in a terminal; merged into DIR/settings.json (default: the claude-attach agents' config
 directories, else $CLAUDE_CONFIG_DIR or ~/.claude); only its own entries are ever changed.
 --approvals also adds the approval hooks: a question Claude Code asks in a terminal (run a command,
 edit a file, approve a plan, a multiple-choice question) is also put to you in the chat, and the
-first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those
+first answer, there or at the terminal, wins; "hooks uninstall --approvals" takes out only those.
+--agent codex (or --codex): the same for the Codex CLI, in DIR/hooks.json (default: the codex agents'
+CODEX_HOME, else $CODEX_HOME or ~/.codex): a command, patch or MCP tool Codex asks about in a terminal
+nobody has typed in for 30 s goes to the chat; typing in the terminal takes it back. Codex asks you
+to trust the hook the next time it starts.
 --agent cursor: the same for the Cursor Agent CLI (its hooks.json; needs a "cursor" agent in agents.toml):
 a command or MCP call Cursor would ask about is put on your phone first, and Cursor waits up to
 --hold seconds (default 60) for it; "No" there blocks it, otherwise Cursor asks at the terminal.
@@ -464,6 +469,47 @@ const describeApprovals = (dir: string, changed: boolean): string => changed
   ? `installed the approval hooks in ${settingsFile(dir)}: questions Claude Code asks in a terminal also go to your chat, and the first answer wins ("claw-connector hooks uninstall --approvals" takes them out)`
   : `the approval hooks are already in ${settingsFile(dir)}`;
 
+const defaultCodexDir = (ctx: Ctx): string => path.resolve(ctx.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"));
+
+/** The CODEX_HOME directories the connector looks at: those of its codex agents, else the default one. */
+function codexDirs(ctx: Ctx, flag: string | undefined): string[] {
+  if (flag !== undefined) return [path.resolve(flag)];
+  let dirs: string[] = [];
+  try {
+    dirs = loadCfg(ctx).agents.filter((a) => a.kind === "codex").map((a) => path.resolve(a.env.CODEX_HOME ?? (ctx.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"))));
+  } catch { /* no usable agents.toml yet: the default directory */ }
+  return dirs.length ? [...new Set(dirs)] : [defaultCodexDir(ctx)];
+}
+
+/** `hooks ... --agent codex` (or `--codex`): the Codex approval hook only (Codex has no session hooks of ours). */
+function cmdCodexHooks(sub: "install" | "uninstall" | "status", flag: string | undefined, json: boolean, ctx: Ctx): number {
+  let code: number = EXIT.ok;
+  const report: Array<Record<string, unknown>> = [];
+  for (const dir of codexDirs(ctx, flag)) {
+    try {
+      if (sub === "install") {
+        if (flag === undefined && !fs.existsSync(dir)) { ctx.err(`no Codex directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
+        const r = installCodexApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state));
+        ctx.out(r.changed
+          ? `installed the Codex approval hook in ${codexHooksFile(dir)}: a question Codex asks in a terminal nobody is typing in also goes to your chat. Codex runs it only once you trust it: it asks the next time it starts (or review it under /hooks)`
+          : `the Codex approval hook is already in ${codexHooksFile(dir)}`);
+      } else if (sub === "uninstall") {
+        ctx.out(uninstallCodexApprovalHooks(dir).changed ? `removed the Codex approval hook from ${codexHooksFile(dir)}` : `no Codex approval hook of ours in ${codexHooksFile(dir)}`);
+      } else {
+        const st = codexApprovalHooksStatus(dir);
+        report.push({ dir, codex: true, approvals: st });
+        const say = st.installed ? (st.healthy ? "installed (Codex runs it once trusted: /hooks)" : "installed, but broken") : st.events.length ? `partly installed (${st.events.join(", ")})` : "not installed";
+        if (!json) ctx.out(`${dir}: codex approvals: ${say}${st.problem ? `; ${st.problem}` : ""}`);
+      }
+    } catch (e) {
+      ctx.err(e instanceof HooksError ? e.message : `error: ${errMessage(e)}`);
+      code = EXIT.failure;
+    }
+  }
+  if (sub === "status" && json) ctx.out(JSON.stringify(report, null, 2));
+  return code;
+}
+
 /** The Cursor configuration directories: those of the `cursor` agents in agents.toml, else the one the CLI uses here. */
 function cursorDirs(ctx: Ctx, flag: string | undefined): string[] {
   if (flag !== undefined) return [path.resolve(flag)];
@@ -517,12 +563,14 @@ function cmdCursorHooks(sub: string, values: { "config-dir"?: string; json?: boo
 
 function cmdHooks(args: string[], ctx: Ctx): number {
   const [sub, ...rest] = args;
-  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--approvals] [--agent claude|cursor] [--config-dir DIR]"); return EXIT.usage; }
-  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" }, agent: { type: "string" }, hold: { type: "string" } } });
-  const agent = values.agent ?? "claude";
-  if (agent !== "claude" && agent !== "cursor") { ctx.err(`hooks: --agent is claude or cursor, not ${JSON.stringify(agent)}`); return EXIT.usage; }
+  if (sub !== "install" && sub !== "uninstall" && sub !== "status") { ctx.err("usage: claw-connector hooks install|uninstall|status [--approvals] [--agent claude|codex|cursor] [--config-dir DIR]"); return EXIT.usage; }
+  const { values } = parseArgs({ args: rest, strict: true, options: { "config-dir": { type: "string" }, json: { type: "boolean" }, approvals: { type: "boolean" }, agent: { type: "string" }, hold: { type: "string" }, codex: { type: "boolean" } } });
+  if (values.codex && values.agent !== undefined && values.agent !== "codex") { ctx.err(`hooks: --codex is --agent codex, not --agent ${JSON.stringify(values.agent)}`); return EXIT.usage; }
+  const agent = values.codex ? "codex" : values.agent ?? "claude";
+  if (agent !== "claude" && agent !== "cursor" && agent !== "codex") { ctx.err(`hooks: --agent is claude, codex or cursor, not ${JSON.stringify(agent)}`); return EXIT.usage; }
   if (agent === "cursor") return cmdCursorHooks(sub, values, ctx);
-  if (values.hold !== undefined) { ctx.err("hooks: --hold is for --agent cursor (Claude Code asks at the terminal while the phone has the question)"); return EXIT.usage; }
+  if (values.hold !== undefined) { ctx.err("hooks: --hold is for --agent cursor (Claude Code and Codex ask at the terminal while the phone has the question)"); return EXIT.usage; }
+  if (agent === "codex") return cmdCodexHooks(sub, values["config-dir"], !!values.json, ctx);
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
   let code: number = EXIT.ok;

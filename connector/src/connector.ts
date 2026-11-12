@@ -427,18 +427,21 @@ export class Connector {
 
   /**
    * The Claw session for a terminal conversation's approvals, or why there is none: this machine is paused or not connected,
-   * the owner turned approvals off, no agent reads that Claude config directory, or the folder is outside the agent's roots.
+   * the owner turned approvals off, no agent reads that Claude config directory (or CODEX_HOME), or the folder is outside the agent's roots.
    */
   private async openTerminalSession(p: { agent: HookAgent; configDir: string; ref: string; cwd: string; title: string }): Promise<{ sessionId: string } | { refused: string }> {
     if (this.paused) return { refused: "paused" };
     if (!this.cid || this.revoked) return { refused: "not_connected" };
     if (Date.now() < this.approvalsOffUntil) return { refused: "approvals_off" };
     const dir = path.resolve(p.configDir);
-    // Claude Code: the claude-attach agent that reads that Claude config directory. Cursor: a `cursor` agent whose Cursor
-    // configuration directory (as the CLI resolves it in that agent's environment) is the one the hooks were installed in.
+    // Claude Code: the claude-attach agent that reads that Claude config directory. Codex: a `codex` agent that reads the same
+    // CODEX_HOME. Cursor: a `cursor` agent whose Cursor configuration directory (as the CLI resolves it in that agent's
+    // environment) is the one the hooks were installed in.
     const agents = p.agent === "cursor"
       ? this.d.config.agents.filter((a) => a.kind === "cursor" && cursorConfigDir({ ...process.env, ...a.env }, a.env.HOME?.trim() || os.homedir()) === dir)
-      : this.d.config.agents.filter((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
+      : p.agent === "codex"
+        ? this.d.config.agents.filter((a) => a.kind === "codex" && path.resolve(a.env.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex")) === dir)
+        : this.d.config.agents.filter((a) => a.attach && path.resolve(a.env.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")) === dir);
     if (agents.length === 0) return { refused: "no_agent_for_config_dir" };
     // Several agents may read one directory with different roots: the first whose roots hold the folder takes it.
     let agent = agents[0]!;

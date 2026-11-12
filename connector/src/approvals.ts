@@ -18,6 +18,13 @@
  * `SessionEnd`): the first of those for the same call settles the request as answered at the terminal, the card is withdrawn
  * (`permission_resolved` by `terminal`) and the waiting hook is let go.
  *
+ * OpenAI Codex (the `codex` TUI, measured on 0.153.4) has the same `PermissionRequest` hook, for a command, a patch and an MCP
+ * tool, but runs it before it shows its own prompt, not alongside it: while the hook waits, the terminal shows only that a hook
+ * is running. So for Codex the hook puts the question on the phone only when nobody has typed in that terminal for a while
+ * (its tty's access time, as `w` reads it), and gives the question back to the terminal as soon as someone types there
+ * (approval-hook.ts); a card for Codex offers only *Yes* and *No*, the decisions Codex reads (it refuses a hook that returns
+ * anything more).
+ *
  * Nothing here can approve anything by itself: a request is answered only with an option the card offered, chosen by the owner
  * (a `decision` command from Claw), and a request that cannot be put on a card, or that meets a connector without Claw, is
  * left to the terminal at once. Claude Code's own deny and ask rules are still applied after a hook allows a call.
@@ -181,6 +188,53 @@ export function mapRequest(e: PermissionEvent): Mapping<HookDecision> | null {
   };
 }
 
+/** The files a Codex patch (`apply_patch`) adds, changes or deletes, as its own headers name them. */
+export function patchFiles(patch: unknown): string[] {
+  if (typeof patch !== "string") return [];
+  return [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1]!.trim()).filter((f) => f !== "");
+}
+
+/** A Codex card's title (measured on 0.153.4: `Bash` with `command`, `apply_patch` with the patch as `command`, `mcp__<server>__<tool>`). */
+export function codexTitle(e: PermissionEvent): string {
+  const i = e.tool_input;
+  if (e.tool_name === "Bash") return oneLine(`Run: ${oneLine(i.command, 160)}`, 200);
+  if (e.tool_name === "apply_patch") {
+    const files = patchFiles(i.command);
+    return oneLine(files.length ? `Edit ${files.join(", ")}` : "Apply a patch", 200);
+  }
+  if (e.tool_name.startsWith("mcp__")) return oneLine(`MCP tool ${oneLine(e.tool_name.slice(5).replace("__", " / "), 120)}`, 200);
+  return oneLine(e.tool_name, 80);
+}
+
+/** The card kind for a Codex tool. */
+export function codexKind(tool: string): string {
+  if (tool === "Bash") return "execute";
+  if (tool === "apply_patch") return "edit";
+  if (tool.startsWith("mcp__")) return "mcp";
+  return "other";
+}
+
+/**
+ * How a Codex request is put to the owner: *Yes* or *No*. Codex 0.153.4 reads only `behavior` and `message` from a
+ * `PermissionRequest` hook and treats `updatedInput`, `updatedPermissions` or `interrupt` as a failure (it refuses the call),
+ * so there is no "always" and no "stop" here; those stay at the terminal.
+ */
+export function mapCodexRequest(e: PermissionEvent): Mapping {
+  const shown = shownInput(redactDeep(e.tool_input));
+  const options: OfferedOption[] = [
+    ...(shown.complete ? [{ optionId: "allow", name: "Yes", kind: "allow_once" }] : []),
+    { optionId: "deny", name: "No", kind: "reject_once" },
+  ];
+  return {
+    cards: [{ tool: codexTitle(e), kind: codexKind(e.tool_name), input: shown.input, options }],
+    decide([c]) {
+      if (c === "allow" && shown.complete) return { behavior: "allow" };
+      if (c === "deny") return { behavior: "deny", message: DENIED_MESSAGE };
+      return null;
+    },
+  };
+}
+
 /** The input as the card carries it: whole when it fits, else cut and marked (`complete: false`). */
 export function shownInput(masked: unknown): { input: unknown; complete: boolean } {
   const text = JSON.stringify(masked ?? null);
@@ -268,12 +322,12 @@ export const approvalSocketFile = (stateDir: string): string => path.join(stateD
 
 /** One line each way: the hook's request, the connector's answer. */
 export type HookMessage =
-  | { v: 1; type: "ask"; event: Record<string, unknown>; agent?: "claude" | "cursor"; hold_ms?: number }
-  | { v: 1; type: "settled"; event: Record<string, unknown>; agent?: "claude" | "cursor" };
+  | { v: 1; type: "ask"; event: Record<string, unknown>; agent?: HookAgent; hold_ms?: number }
+  | { v: 1; type: "settled"; event: Record<string, unknown>; agent?: HookAgent };
 export type ConnectorReply = { v: 1; decision: AnyDecision | null; why?: string };
 
 /** Which coding agent's hooks a request came from. */
-export type HookAgent = "claude" | "cursor";
+export type HookAgent = "claude" | "cursor" | "codex";
 
 /** The largest line either side reads: a plan or a file written whole can be long. */
 export const MAX_LINE_BYTES = 2 * 1024 * 1024;
@@ -330,27 +384,28 @@ export class ApprovalBroker {
   get size(): number { return this.pending.size; }
 
   /**
-   * A hook asks. `reply` is called exactly once. `configDir` is the Claude config directory the hook was installed for, which
-   * says which agent the conversation belongs to.
+   * A hook asks. `reply` is called exactly once. `configDir` is the Claude config directory (or, for Codex, `CODEX_HOME`) the hook
+   * was installed for, which says which agent the conversation belongs to.
    */
-  async ask(raw: Record<string, unknown>, configDir: string, reply: (r: ConnectorReply) => void): Promise<() => void> {
+  async ask(raw: Record<string, unknown>, configDir: string, reply: (r: ConnectorReply) => void, agent: "claude" | "codex" = "claude"): Promise<() => void> {
     let done = false;
     const once = (r: ConnectorReply) => { if (!done) { done = true; reply(r); } };
     const e = parsePermissionEvent(raw);
     if (!e) { once({ v: 1, decision: null, why: "not_a_permission_request" }); return () => {}; }
-    // The hook already leaves a session in such a mode alone (approval-skip.ts); this holds for a hook of another version too.
+    // The hook already leaves a session in such a mode alone (approval-skip.ts); this holds for a hook of another version too,
+    // and for Codex, whose events carry the same `permission_mode` (`bypassPermissions` under approval policy `never`).
     if (e.permission_mode !== undefined && UNATTENDED_MODES.has(e.permission_mode)) {
       this.d.audit("approval_skipped", { ref: e.session_id, tool: e.tool_name, reason: "unattended_mode", mode: e.permission_mode });
       once({ v: 1, decision: null, why: "unattended_mode" });
       return () => {};
     }
-    const mapping = mapRequest(e);
+    const mapping = agent === "codex" ? mapCodexRequest(e) : mapRequest(e);
     if (!mapping) {
       this.d.audit("approval_skipped", { ref: e.session_id, tool: e.tool_name, reason: "no_card_shape" });
       once({ v: 1, decision: null, why: "no_card_shape" });
       return () => {};
     }
-    return this.put({ agent: "claude", configDir, ref: e.session_id, cwd: e.cwd, tool: e.tool_name, input: canon(e.tool_input), toolUseId: null, mapping, waitMs: this.d.ttlMs }, once, () => done);
+    return this.put({ agent, configDir, ref: e.session_id, cwd: e.cwd, tool: e.tool_name, input: canon(e.tool_input), toolUseId: null, mapping, waitMs: this.d.ttlMs }, once, () => done);
   }
 
   /**
@@ -410,6 +465,8 @@ export class ApprovalBroker {
         timeout_ms: q.waitMs, origin: "terminal_hook", cwd: q.cwd,
         // Cursor asks at the terminal only once the card is answered or its time is up (cursor-approvals.ts), not meanwhile.
         ...(q.agent === "cursor" ? { terminal_asks: "after_card" } : {}),
+        // Codex shows its own prompt once the owner types at the terminal (approval-hook.ts), not as soon as it asks.
+        ...(q.agent === "codex" ? { terminal_asks: "on_input" } : {}),
         ...(c.spec.questionCount ? { question_index: c.spec.questionIndex, question_count: c.spec.questionCount } : {}),
       });
     }
@@ -554,7 +611,7 @@ export async function serveApprovals(stateDir: string, broker: ApprovalBroker, c
       };
       const asked = msg.agent === "cursor"
         ? broker.askCursor(event, configDirOf(msg as Record<string, unknown>), Number(msg.hold_ms), onReply)
-        : broker.ask(event, configDirOf(msg as Record<string, unknown>), onReply);
+        : broker.ask(event, configDirOf(msg as Record<string, unknown>), onReply, msg.agent === "codex" ? "codex" : "claude");
       void asked.then((cancel) => {
         if (sock.destroyed) cancel(); else gone = cancel;
       }, (err: unknown) => {

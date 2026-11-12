@@ -44,8 +44,7 @@ const isOurs = (h: unknown): boolean =>
 interface Loaded { doc: Json; text: string | null; file: string }
 
 /** The settings as they are now. A missing file is an empty object; one that is not a JSON object is an error, never overwritten. */
-function load(configDir: string): Loaded {
-  const given = settingsFile(configDir);
+function load(configDir: string, given = settingsFile(configDir)): Loaded {
   let file = given;
   try { file = fs.realpathSync(given); } catch { /* not there yet */ }
   let text: string;
@@ -219,14 +218,18 @@ export function approvalHookCommand(node: string, script: string, arg: "ask" | "
 
 /** Add (or bring up to date) the approval hooks; the same merge rules as {@link installHooks}. */
 export function installApprovalHooks(configDir: string, node: string, script: string, socket: string): InstallResult {
-  const l = load(configDir);
-  const where = settingsFile(configDir);
+  return installApprovalEntries(settingsFile(configDir), APPROVAL_HOOKED.map((h) => ({
+    event: h.event, entry: { type: "command", command: approvalHookCommand(node, script, h.arg, configDir, socket), timeout: h.timeout, ...(h.async ? { async: true } : {}) },
+  })), configDir);
+}
+
+function installApprovalEntries(where: string, entries: Array<{ event: string; entry: Json }>, configDir: string): InstallResult {
+  const l = load(configDir, where);
   const before = JSON.stringify(l.doc);
   const doc: Json = JSON.parse(before);
   const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
-  for (const h of APPROVAL_HOOKED) {
-    const entry: Json = { type: "command", command: approvalHookCommand(node, script, h.arg, configDir, socket), timeout: h.timeout, ...(h.async ? { async: true } : {}) };
-    const groups = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
+  for (const { event, entry } of entries) {
+    const groups = groupsOf(hooks, event, where) ?? (hooks[event] = []) as unknown[];
     let seen = false;
     for (let i = 0; i < groups.length; i++) {
       const g = groups[i];
@@ -237,7 +240,7 @@ export function installApprovalHooks(configDir: string, node: string, script: st
         if (!isOursApproval(x)) { kept.push(x); continue; }
         if (seen) { dropped = true; continue; }
         seen = true;
-        const { async: _a, ...rest } = x as Json;
+        const { async: _a, statusMessage: _s, ...rest } = x as Json;
         kept.push({ ...rest, ...entry });
       }
       g.hooks = kept;
@@ -252,13 +255,16 @@ export function installApprovalHooks(configDir: string, node: string, script: st
 
 /** Remove the approval hooks only (the session hooks stay). */
 export function uninstallApprovalHooks(configDir: string): InstallResult {
-  const l = load(configDir);
-  const where = settingsFile(configDir);
+  return uninstallApprovalEntries(settingsFile(configDir), APPROVAL_HOOKED.map((h) => h.event), configDir);
+}
+
+function uninstallApprovalEntries(where: string, events: readonly string[], configDir: string): InstallResult {
+  const l = load(configDir, where);
   const doc: Json = JSON.parse(JSON.stringify(l.doc));
   const hooks = hooksOf(doc, where);
   let touchedAny = false;
   if (hooks) {
-    for (const event of new Set(APPROVAL_HOOKED.map((h) => h.event))) {
+    for (const event of new Set(events)) {
       const groups = groupsOf(hooks, event, where);
       if (!groups) continue;
       let touched = false;
@@ -282,26 +288,68 @@ export function uninstallApprovalHooks(configDir: string): InstallResult {
 
 /** Whether the approval hooks are in place (all of them), and whether what they run still exists; never throws. */
 export function approvalHooksStatus(configDir: string): HooksStatus {
+  return approvalEntriesStatus(settingsFile(configDir), APPROVAL_HOOKED.map((h) => h.event), configDir, "hooks install --approvals");
+}
+
+function approvalEntriesStatus(where: string, wanted: readonly string[], configDir: string, fix: string): HooksStatus {
   let l: Loaded;
-  try { l = load(configDir); } catch (e) { return { installed: false, events: [], healthy: false, problem: (e as Error).message }; }
+  try { l = load(configDir, where); } catch (e) { return { installed: false, events: [], healthy: false, problem: (e as Error).message }; }
   const events: string[] = [];
   let healthy = true;
   let problem: string | null = null;
   const hooks = isObject(l.doc.hooks) ? l.doc.hooks : {};
-  for (const h of APPROVAL_HOOKED) {
-    const groups = Array.isArray(hooks[h.event]) ? (hooks[h.event] as unknown[]) : [];
+  for (const event of wanted) {
+    const groups = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
     const mine = groups.flatMap((g) => (isObject(g) && Array.isArray(g.hooks) ? g.hooks.filter(isOursApproval) : []) as Json[]);
     if (mine.length === 0) continue;
-    events.push(h.event);
+    events.push(event);
     for (const x of mine) {
       const m = /^'((?:[^']|'\\'')*)' '((?:[^']|'\\'')*)' /.exec(String(x.command));
       if (!m) continue;
       for (const f of [m[1]!, m[2]!].map((s) => s.replace(/'\\''/g, "'"))) {
-        if (!fs.existsSync(f)) { healthy = false; problem ??= `${f} (named by the ${h.event} approval hook) does not exist; run: claw-connector hooks install --approvals`; }
+        if (!fs.existsSync(f)) { healthy = false; problem ??= `${f} (named by the ${event} approval hook) does not exist; run: claw-connector ${fix}`; }
       }
     }
   }
-  return { installed: events.length === APPROVAL_HOOKED.length, events, healthy, problem };
+  return { installed: events.length === wanted.length, events, healthy, problem };
+}
+
+// --- the Codex approval hook (approvals.ts, approval-hook.ts) ----------------------------
+
+/** Codex's own hooks file in a CODEX_HOME (Codex also reads inline `[hooks]` in config.toml; this file is the one written). */
+export const codexHooksFile = (codexHome: string): string => path.join(codexHome, "hooks.json");
+
+/** How long nobody must have typed in a Codex terminal before its question goes to the phone (seconds). */
+export const CODEX_IDLE_S = 30;
+
+/**
+ * The Codex approval hooks. `PermissionRequest` waits as long as a card may (Codex shows its own prompt only after it exits, so
+ * it gives the question back as soon as someone types in the terminal); `SessionEnd` closes the conversation's Claw session.
+ * Codex runs hooks only once the person has trusted them (it asks at its next start, or under /hooks).
+ */
+export const CODEX_APPROVAL_HOOKED = [
+  { event: "PermissionRequest", arg: "ask", timeout: 3600, statusMessage: "Asked on your phone (Claw); type anything here to answer in this terminal" },
+  { event: "SessionEnd", arg: "settled", timeout: 1 },
+] as const;
+
+export function codexApprovalHookCommand(node: string, script: string, arg: "ask" | "settled", codexHome: string, socket: string): string {
+  return `${shellQuote(node)} ${shellQuote(script)} ${arg} --dir ${shellQuote(codexHome)} --socket ${shellQuote(socket)} --agent codex --idle ${CODEX_IDLE_S} ${MANAGED_MARK}`;
+}
+
+/** Add (or bring up to date) the Codex approval hooks in CODEX_HOME/hooks.json; the same merge rules as {@link installHooks}. */
+export function installCodexApprovalHooks(codexHome: string, node: string, script: string, socket: string): InstallResult {
+  return installApprovalEntries(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => ({
+    event: h.event,
+    entry: { type: "command", command: codexApprovalHookCommand(node, script, h.arg, codexHome, socket), timeout: h.timeout, ...("statusMessage" in h ? { statusMessage: h.statusMessage } : {}) },
+  })), codexHome);
+}
+
+export function uninstallCodexApprovalHooks(codexHome: string): InstallResult {
+  return uninstallApprovalEntries(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => h.event), codexHome);
+}
+
+export function codexApprovalHooksStatus(codexHome: string): HooksStatus {
+  return approvalEntriesStatus(codexHooksFile(codexHome), CODEX_APPROVAL_HOOKED.map((h) => h.event), codexHome, "hooks install --agent codex");
 }
 
 // --- Cursor's approval hooks (cursor-approvals.ts) ---------------------------------------
