@@ -405,6 +405,8 @@ export class LazyDefaultSkills {
    */
   private writing = new Map<string, Promise<boolean>>();
   private lastHands: HandsClient | null = null;
+  /** Sandboxes this run has written a personal skill into, so the run can take them out again (`removePersonal`). */
+  private personalWrittenTo = new Set<HandsClient>();
 
   constructor(
     private skills: DefaultSkill[],
@@ -461,6 +463,24 @@ export class LazyDefaultSkills {
     }
   }
 
+  /**
+   * Take the user's personal skills out of every sandbox this run wrote one into. A sandbox outlives the run (it is
+   * kept for the session's next message), and a copy left there would be readable by a later turn that is not served
+   * the skill: one after the user turned it off or deleted it, or after the session stopped being one that gets them.
+   * The next turn that needs one writes it again. Best effort; never throws.
+   */
+  async removePersonal(): Promise<void> {
+    const dir = path.posix.join(this.sessionDir, ".skills", PERSONAL_SKILLS_DIR);
+    for (const hands of this.personalWrittenTo) {
+      try {
+        await removeSandboxDir(hands, dir);
+      } catch (err) {
+        logger.warn({ err: (err as Error).message }, "skill.user_remove_failed");
+      }
+    }
+    this.personalWrittenTo.clear();
+  }
+
   /** One skill's upload; reports a failure and resolves false rather than throwing. */
   private async write(hands: HandsClient, s: DefaultSkill, coldSandbox: boolean): Promise<boolean> {
     const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
@@ -472,6 +492,12 @@ export class LazyDefaultSkills {
       const base = rel ? path.posix.join(rel, sub) : sub;
       // A personal skill is staged from the API on first use; the first write may be that use.
       if (user && !fs.existsSync(s.localDir) && s.restage) s.localDir = await s.restage();
+      if (user) {
+        // From a clean directory: a copy an earlier run left (it may have ended before it could remove it) can hold a
+        // file this version no longer has.
+        this.personalWrittenTo.add(hands);
+        await removeSandboxDir(hands, path.posix.join(this.sessionDir, sub));
+      }
       const attempt = async () => {
         const up = await uploadDirToSandbox(hands, s.localDir, base);
         const shippable = up.total - up.skipped;
@@ -516,4 +542,11 @@ export class LazyDefaultSkills {
       return false;
     }
   }
+}
+
+/** `rm -rf` of one directory in the sandbox; throws when the sandbox says it failed. */
+async function removeSandboxDir(hands: HandsClient, dir: string): Promise<void> {
+  const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
+  const out = await hands.callTool("bash", { command: `rm -rf -- ${quoted} && echo CLAW_RM_OK`, timeout: 30 });
+  if (!String(out).includes("CLAW_RM_OK")) throw new Error(`could not remove ${dir}`);
 }

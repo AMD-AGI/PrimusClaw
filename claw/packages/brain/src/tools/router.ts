@@ -163,6 +163,11 @@ export type RouteOutcome = {
    * what `ExecuteRequest.cite` keeps, when it believes the tool (`RunCitations.producedBy`). Never read from the result's text.
    */
   sources?: unknown[];
+  /**
+   * The result's text is not to be repeated outside the conversation: the log line and the turn event carry this
+   * instead (a personal skill's text, `load_skill`). The model still gets the whole result.
+   */
+  withheld?: string;
 };
 
 /**
@@ -392,8 +397,9 @@ export class ToolRouter {
 
   /** Parse a file path for `.skills/{name}/SKILL.md` and record the skill name. */
   private trackSkillRead(path: string): void {
-    // A personal skill's SKILL.md is one directory further down: `.skills/.personal-skills/<name>/SKILL.md`.
-    const m = path.match(/\.skills\/(?:\.personal-skills\/)?([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
+    // A personal skill's SKILL.md is one directory further down: `.skills/.personal-skills/<name>/SKILL.md`. Names as
+    // SKILL_NAME_RE allows them (a skill stored before the kebab-case rule can have `.` or `_`).
+    const m = path.match(/\.skills\/(?:\.personal-skills\/)?([a-z0-9][a-z0-9._-]*)\/SKILL\.md/i);
     if (m) this.skillsRead.add(m[1]);
   }
 
@@ -732,12 +738,15 @@ export class ToolRouter {
       const file = typeof input.file === "string" ? input.file : undefined;
       const loaded = await this.skillStore.load(skillName, file, input.offset);
       const wholeSkill = file === undefined || file === "" || file === "SKILL.md";
-      if (wholeSkill && this.skillStore.get(skillName)?.source === "user") {
+      const personal = this.skillStore.get(skillName)?.source === "user";
+      if (wholeSkill && personal) {
         // Whether a personal skill was really used: the signal that loading without being named happens at all.
         if (loaded.ok) metrics.onUserSkillRead("worker", "ok");
         else if (loaded.reason) metrics.onUserSkillRead("worker", loaded.reason === "failed" ? "failed" : "not_found");
       }
       if (!loaded.ok) return refuse(outcome, loaded.error);
+      // A personal skill's text goes to the model and nowhere else: not into a log line, not into the turn's events.
+      if (personal && outcome) outcome.withheld = `[personal skill '${skillName}'${file && file !== "SKILL.md" ? `, file '${file}'` : ""}: ${loaded.text.length} chars loaded]`;
       // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
       if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);
       return loaded.text;

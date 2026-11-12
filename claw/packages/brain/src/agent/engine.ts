@@ -796,6 +796,8 @@ export class AgentEngine {
         skillsUsed,
       };
     } finally {
+      // The user's personal skills leave the sandbox with the run that wrote them (see `removePersonal`).
+      await lazySkills?.removePersonal();
       await mcpResult.closeAll();
       await decisions?.close().catch(() => {});
       try { fs.rmSync(pluginWorkRoot, { recursive: true, force: true }); } catch { /* best-effort */ }

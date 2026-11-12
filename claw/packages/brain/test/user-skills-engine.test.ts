@@ -24,6 +24,10 @@
  *   P8 a read through the sandbox path counts as a use, as a platform skill's does
  *   P9 none of it where the API did not send it, or in a run that acts as a user or is a router's/observer's turn
  *   P10 what was fetched is in a private directory under the run's work root, gone when the run ends
+ *   P11 the sandbox's copy leaves with the run that wrote it (a sandbox outlives the run); a run that wrote none
+ *       removes nothing
+ *   P12 a skill's text goes to the model only: not into a log line or the turn's events
+ *   P13 a skill changed between its SKILL.md and its files is refused whole, never served mixed
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -95,18 +99,49 @@ function manifest(names = Object.keys(store)) {
   }));
 }
 
+/** A recording Hands whose bash answers an `rm -rf ... && echo CLAW_RM_OK` as a sandbox does. */
+function skillHands() {
+  const h = fakeHands();
+  return {
+    ...h,
+    async callTool(name: string, args: Record<string, unknown>) {
+      h.calls.push({ name, args });
+      return name === "bash" && String(args.command).includes("CLAW_RM_OK") ? "CLAW_RM_OK\n" : "ok";
+    },
+  };
+}
+
 let n = 0;
-async function run(over: Record<string, unknown>, script: Turn[], hands = fakeHands()) {
+async function run(over: Record<string, unknown>, script: Turn[], hands: ReturnType<typeof fakeHands> = skillHands()) {
   const sessionId = `s-user-skills-${++n}`;
   let attached = 0;
   world.script(script);
   world.llmBodies.length = 0;
-  const result = await new AgentEngine().execute(
-    baseRequest({ session_id: sessionId, message_id: "m-turn", user_skills_enabled: true, user_skills: manifest(), ...over }),
-    (async () => {}) as never, undefined, null as never,
-    { attachHands: async () => { attached++; return hands as never; } } as never,
-  );
-  return { sessionId, attached, calls: hands.calls, prompt: world.llmBodies[0] ?? "", bodies: [...world.llmBodies], result };
+  const events: Array<Record<string, unknown>> = [];
+  const logs: string[] = [];
+  const realWriteSync = fs.writeSync;
+  const realWrite = fs.write;
+  // pino writes to fd 1 with fs.write / fs.writeSync, not through process.stdout.
+  fs.writeSync = ((fd: number, data: unknown, ...rest: unknown[]) => {
+    if (fd === 1 || fd === 2) logs.push(String(data));
+    return (realWriteSync as (...a: unknown[]) => number)(fd, data, ...rest);
+  }) as typeof fs.writeSync;
+  fs.write = ((fd: number, data: unknown, ...rest: unknown[]) => {
+    if (fd === 1 || fd === 2) logs.push(String(data));
+    return (realWrite as (...a: unknown[]) => void)(fd, data, ...rest);
+  }) as typeof fs.write;
+  try {
+    const result = await new AgentEngine().execute(
+      baseRequest({ session_id: sessionId, message_id: "m-turn", user_skills_enabled: true, user_skills: manifest(), ...over }),
+      (async (e: Record<string, unknown>) => { events.push(e); }) as never, undefined, null as never,
+      { attachHands: async () => { attached++; return hands as never; } } as never,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { sessionId, attached, calls: hands.calls, prompt: world.llmBodies[0] ?? "", bodies: [...world.llmBodies], result, events, logs: logs.join("") };
+  } finally {
+    fs.writeSync = realWriteSync;
+    fs.write = realWrite;
+  }
 }
 
 async function counter(name: string, labels: Record<string, string>): Promise<number> {
@@ -227,7 +262,7 @@ test("P6 the list's share: platform skills keep their place beside many personal
 
 test("P7 written into the sandbox only when a command names it, before that command; binary as binary; a bare .skills writes none", async () => {
   resetStore();
-  const hands = fakeHands();
+  const hands = skillHands();
   const r = await run({}, [
     { tool: "bash", input: { command: "ls /workspace/.skills" } },
     { tool: "bash", input: { command: "bash /workspace/.skills/.personal-skills/weekly-report/scripts/collect.sh" } },
@@ -235,7 +270,7 @@ test("P7 written into the sandbox only when a command names it, before that comm
     { text: "done" },
   ], hands);
   const writes = r.calls.map((c, at) => ({ at, c })).filter(({ c }) => c.name === "write" && String(c.args.path).includes(".personal-skills"));
-  const bashes = r.calls.map((c, at) => ({ at, c })).filter(({ c }) => c.name === "bash");
+  const bashes = r.calls.map((c, at) => ({ at, c })).filter(({ c }) => c.name === "bash" && !String(c.args.command).startsWith("rm -rf"));
   assert.deepEqual(writes.map(({ c }) => String(c.args.path)).sort(), [
     ".skills/.personal-skills/weekly-report/SKILL.md",
     ".skills/.personal-skills/weekly-report/assets/logo.png",
@@ -251,16 +286,21 @@ test("P7 written into the sandbox only when a command names it, before that comm
   resetStore();
   const sent = manifest();
   delete store["pr-notes"];
-  const h2 = fakeHands();
+  const h2 = skillHands();
   const f = await run({ user_skills: sent }, [{ tool: "bash", input: { command: "cat /workspace/.skills/.personal-skills/pr-notes/SKILL.md" } }, { text: "done" }], h2);
   assert.match(f.bodies[1], /Failed to write personal skill 'pr-notes' into the sandbox; this call was not run/);
   assert.equal(h2.calls.some((c) => c.name === "bash" && String(c.args.command).includes("pr-notes")), false, "the command did not run");
 });
 
-test("P8 a read through the sandbox path counts as a use of the personal skill", async () => {
+test("P8 a read through the sandbox path counts as a use of the personal skill, a name from before the kebab-case rule too", async () => {
   resetStore();
-  const r = await run({}, [{ tool: "read", input: { path: "/workspace/.skills/.personal-skills/weekly-report/SKILL.md" } }, { text: "done" }]);
-  assert.deepEqual(r.result.skillsUsed, { "weekly-report": 3 });
+  store["Old_notes.v1"] = { version: 5, sha: "sha-old", description: "Old notes", content: md("Old_notes.v1", "o", "OLD-BODY") };
+  const r = await run({}, [
+    { tool: "read", input: { path: "/workspace/.skills/.personal-skills/weekly-report/SKILL.md" } },
+    { tool: "read", input: { path: "/workspace/.skills/.personal-skills/Old_notes.v1/SKILL.md" } },
+    { text: "done" },
+  ]);
+  assert.deepEqual(r.result.skillsUsed, { "weekly-report": 3, "Old_notes.v1": 5 });
 });
 
 test("P9 none of it where the API did not send it, or in a run that acts as a user, or a router's or observer's turn", async () => {
@@ -334,4 +374,64 @@ test("P5b a personal skill replaces the bound repository's skill of its name; th
   assert.match(r.prompt, /fmt: \[repository\] Format the code/, "its other skills are");
   assert.match(r.prompt, /- weekly-report: Write the user's weekly report/);
   assert.ok(r.bodies[1].includes("WR-BODY-MARKER") && !r.bodies[1].includes("REPO-WR-BODY"), "load_skill serves the personal one");
+});
+
+test("P11 the sandbox's copy leaves with the run that wrote it; it is written from a clean directory; a run that wrote none removes nothing", async () => {
+  resetStore();
+  const r = await run({}, [
+    { tool: "bash", input: { command: "bash /workspace/.skills/.personal-skills/weekly-report/scripts/collect.sh" } },
+    { text: "done" },
+  ]);
+  const at = (pred: (c: { name: string; args: Record<string, unknown> }) => boolean) => r.calls.findIndex(pred);
+  const cleanSkill = at((c) => c.name === "bash" && String(c.args.command) === "rm -rf -- '/workspace/.skills/.personal-skills/weekly-report' && echo CLAW_RM_OK");
+  const firstWrite = at((c) => c.name === "write" && String(c.args.path).includes(".personal-skills/weekly-report"));
+  const script = at((c) => c.name === "bash" && String(c.args.command).includes("collect.sh") && !String(c.args.command).startsWith("rm"));
+  const removeAll = r.calls.map((c) => String(c.args.command ?? "")).lastIndexOf("rm -rf -- '/workspace/.skills/.personal-skills' && echo CLAW_RM_OK");
+  assert.ok(cleanSkill >= 0 && cleanSkill < firstWrite, "the skill's directory is emptied before it is written");
+  assert.ok(script > firstWrite, "the command runs after the write");
+  assert.ok(removeAll > script, "and every personal skill is taken out of the sandbox when the run ends");
+  assert.equal(removeAll, r.calls.length - 1, "as the run's last sandbox call");
+
+  resetStore();
+  const none = await run({}, [{ tool: "bash", input: { command: "ls /workspace" } }, { text: "done" }]);
+  assert.equal(none.attached, 1);
+  assert.equal(none.calls.some((c) => String(c.args.command ?? "").startsWith("rm -rf")), false, "nothing to take out: no extra call");
+});
+
+test("P12 a personal skill's text goes to the model only: not into a log line or the turn's events", async () => {
+  resetStore();
+  const r = await run({}, [
+    { tool: "load_skill", input: { name: "weekly-report" } },
+    { tool: "load_skill", input: { name: "weekly-report", file: "scripts/collect.sh" } },
+    { text: "done" },
+  ]);
+  assert.ok(r.bodies[1].includes("WR-BODY-MARKER"), "the model has it");
+  assert.equal(r.logs.includes("WR-BODY-MARKER"), false, "no log line has it");
+  assert.equal(r.logs.includes("echo COLLECT"), false, "nor a file of it");
+  assert.match(r.logs, /\[personal skill 'weekly-report': \d+ chars loaded\]/, "the log says what was loaded");
+  const used = r.events.filter((e) => e.type === "toolUsed" && e.tool === "load_skill" && e.status === "success");
+  assert.equal(used.length, 2);
+  assert.equal(JSON.stringify(used).includes("WR-BODY-MARKER") || JSON.stringify(used).includes("echo COLLECT"), false, "no event has it");
+  assert.match(String(used[1].description), /\[personal skill 'weekly-report', file 'scripts\/collect\.sh': \d+ chars loaded\]/);
+});
+
+test("P13 a skill changed between its SKILL.md and its files is refused whole, never served mixed", async () => {
+  resetStore();
+  const inner = world.internal!;
+  world.internal = (url, body, headers) => {
+    const out = inner(url, body, headers);
+    // The user saves a new version right after Brain read SKILL.md.
+    if (body.name === "weekly-report" && body.path === undefined) {
+      store["weekly-report"] = { ...store["weekly-report"], version: 4, sha: "sha-wr-4", content: md("weekly-report", "w", "WR-V4-BODY") };
+    }
+    return out;
+  };
+  try {
+    const r = await run({}, [{ tool: "load_skill", input: { name: "weekly-report" } }, { text: "done" }]);
+    assert.match(r.bodies[1], /changed it after this message was sent/);
+    assert.equal(r.bodies[1].includes("WR-BODY-MARKER") || r.bodies[1].includes("WR-V4-BODY"), false, "neither version");
+    assert.deepEqual(r.result.skillsUsed, {});
+  } finally {
+    world.internal = inner;
+  }
 });

@@ -2780,7 +2780,7 @@ class AgentLoopRunner {
             resultLen: resultText.length,
             // Tool output is the widest exposure of the four: this is the text
             // of whatever the agent just read, ran or searched.
-            resultPreview: safePreview(resultText, 500),
+            resultPreview: outcome.withheld ?? safePreview(resultText, 500),
           },
           "tool.result",
         );
@@ -2864,7 +2864,7 @@ class AgentLoopRunner {
         // turn is rebuilt with (`completion-turns.ts` keeps an "error" result as it keeps a "success" one); is_error says the same
         // for readers of the earlier shape.
         type: "toolUsed", tool: toolName, actionId: toolId, status: toolOutcome.isError ? "error" : "success",
-        description: resultText.slice(0, 2000),
+        description: toolOutcome.withheld ?? resultText.slice(0, 2000),
         ...(toolOutcome.isError ? { is_error: true } : {}),
         // The file a client offers for download (tools/deliver-file.ts).
         ...(toolOutcome.delivery ? { delivery: toolOutcome.delivery } : {}),
