@@ -26,6 +26,7 @@ import type {
   LlmSessionOptions,
   LlmToolUseBlock,
   LlmTurnResult,
+  StreamTurnOptions,
 } from "./provider.js";
 import {
   headerModelFromStream,
@@ -163,6 +164,15 @@ const markersRefusedByModel = new Set<string>();
 
 const logger = pino({ name: "openai-provider" });
 
+/** Run a `StreamTurnOptions.text` callback: one that throws is logged and the turn goes on. */
+function plainTextCallback(call: () => void): void {
+  try {
+    call();
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, "llm.plain_text.callback_failed");
+  }
+}
+
 async function streamingTurn(
   client: OpenAI,
   model: string,
@@ -173,6 +183,7 @@ async function streamingTurn(
   cacheState: OpenAiCacheState,
   effort?: ReasoningEffort,
   rollingCacheTtl?: "5m",
+  options?: StreamTurnOptions,
 ): Promise<LlmTurnResult> {
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort(signal?.reason);
@@ -377,6 +388,8 @@ async function streamingTurn(
       if (typeof delta.content === "string" && delta.content) {
         if (!textBlock) textBlock = { type: "text", text: "" };
         textBlock.text += delta.content;
+        // One text block per call on this wire.
+        if (options?.text) plainTextCallback(() => options.text!.onText({ index: 0, text: textBlock!.text }));
       }
       // Best-effort: some OpenAI-compatible gateways (vLLM reasoning
       // parsers, DeepSeek-style APIs) stream a non-standard
@@ -391,6 +404,7 @@ async function streamingTurn(
         const idx = tc.index as number;
         const fn = (tc.function as Record<string, unknown> | undefined) ?? {};
         const existing = toolCallBuf.get(idx);
+        if (!existing && options?.text) plainTextCallback(() => options.text!.onToolCall());
         if (!existing) {
           toolCallBuf.set(idx, {
             id: String(tc.id ?? `call_${idx}`),
@@ -545,8 +559,8 @@ export function buildOpenAiSession(
 ): LlmSession {
   const cacheState: OpenAiCacheState = { markersDisabled: false, decoratedFailures: 0, probedWithoutRelief: false };
   return {
-    streamTurn: (messages, tools, signal) =>
-      streamingTurn(client, model, messages, tools, signal, capture, cacheState, effort, rollingCacheTtl),
+    streamTurn: (messages, tools, signal, options) =>
+      streamingTurn(client, model, messages, tools, signal, capture, cacheState, effort, rollingCacheTtl, options),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.chat.completions.create({
           model,

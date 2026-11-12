@@ -1774,6 +1774,11 @@ export const WEB_FETCH_CACHE_MAX_BYTES = envInt("WEB_FETCH_CACHE_MAX_BYTES", 50 
 // flag (it serves recovery, not user-facing artifacts).
 export const BRAIN_WORKSPACE_SNAPSHOT_ENABLED = envBool("BRAIN_WORKSPACE_SNAPSHOT_ENABLED", false);
 
+// --- Assistant text streaming ---
+// `false` stops publishing the top-level loop's own text while the model writes it (`assistantTextDelta`,
+// agent/assistant-text-stream.ts). The turn's `AssistantMessage` is sent either way.
+export const ASSISTANT_TEXT_STREAM_ENABLED = envBool("ASSISTANT_TEXT_STREAM_ENABLED", true);
+
 // --- Todo Write ---
 export const TODO_WRITE_ENABLED = envBool("TODO_WRITE_ENABLED", true);
 

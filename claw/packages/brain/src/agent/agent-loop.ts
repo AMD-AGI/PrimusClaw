@@ -14,8 +14,9 @@ import {
   COMPACTION_TRIGGER_INPUT_TOKENS,
   CHECKPOINT_TURN_INTERVAL, CHECKPOINT_MAX_WALL_GAP_MS,
   LLM_CACHE_TTL, HITL_SUMMARY_MODEL,
-  SIGTERM_TOOL_GRACE_MS,
+  SIGTERM_TOOL_GRACE_MS, ASSISTANT_TEXT_STREAM_ENABLED,
 } from "../config.js";
+import { AssistantTextStream } from "./assistant-text-stream.js";
 import { shieldFromDrain } from "./drain-shield.js";
 import {
   HandsRebuildFailed,
@@ -443,6 +444,13 @@ export interface LoopOptions {
    * "tool_call", source: "text"}`) takes it back.
    */
   streamTextAs?: string;
+  /**
+   * The top-level loop's own text is published while the model writes it, as `assistantTextDelta` events (`@claw/protocol`,
+   * `AssistantTextStream`), and the turn's `AssistantMessage` names what it streamed (`text_id`). Absent: on unless the deployment
+   * turned it off (`ASSISTANT_TEXT_STREAM_ENABLED`). Never for a sub-agent, nor for an assistant router turn (`streamToolText` or
+   * `streamTextAs` set), whose text streams as its say's.
+   */
+  streamText?: boolean;
   /**
    * `ExecuteRequest.report_at_turn_cap`: the top-level loop, too, asks its model for a text-only reply when it used its last turn without
    * ending (`reportAtTurnCap`), as a sub-agent's always does. Sub-agents are unaffected (they always do).
@@ -998,6 +1006,8 @@ class AgentLoopRunner {
   private readonly textPreviewShown = new Set<string>();
   /** Model calls that could show the run's own text, for unique ids across retries and turns. */
   private textPreviewAttempts = 0;
+  /** The `assistantTextDelta` ids of the last model call's text blocks, in order (`AssistantTextStream.textIds`). */
+  private lastTextIds: string[] = [];
   /** A sub-agent runs inside the slot its parent holds, so its waits must not
    *  park: that would hand back a slot this loop never acquired. */
   private readonly waitMode: WaitMode;
@@ -1333,7 +1343,8 @@ class AgentLoopRunner {
    */
   private async reportAtTurnCap(turn: number): Promise<void> {
     this.workingMessages.push({ role: "user", content: TURN_CAP_NOTICE });
-    const { content, usage } = await this.streamTurnWithRetry(turn, Date.now());
+    // Not streamed: the reply is the call's text blocks joined, which no streamed block is.
+    const { content, usage } = await this.streamTurnWithRetry(turn, Date.now(), false);
     this.usage.input_tokens += usage.input_tokens;
     this.usage.output_tokens += usage.output_tokens;
     this.usage.cache_read += usage.cache_read;
@@ -2024,14 +2035,19 @@ class AgentLoopRunner {
     this.turnText = content.filter((b: any) => b.type === "text").map((b: any) => String(b.text ?? "")).join(" ");
     // A replayed turn's text was published, and kept, by the attempt that
     // received it.
+    // The streamed ids, matched to the turn's non-empty text blocks in order: the blocks the provider reported text for.
+    const textIds = replay ? [] : this.lastTextIds;
+    this.lastTextIds = [];
+    let streamedBlocks = 0;
     for (const b of replay ? [] : content) {
       if ((b as any).type === "text") {
         const text = (b as any).text as string;
+        const textId = text ? textIds[streamedBlocks++] : undefined;
         this.textParts.push(text);
         // The model reproduces whatever it was shown, so its output can carry a
         // credential the agent read out of a file moments earlier.
         logger.info({ turn, sessionId: this.sessionId, textLen: text.length, textPreview: safePreview(text, 500) }, "llm.text_block");
-        await this.onEvent({ type: "AssistantMessage", data: { content: [b] }, ...turnTokenStats });
+        await this.onEvent({ type: "AssistantMessage", data: { content: [b] }, ...turnTokenStats, ...(textId ? { text_id: textId } : {}) });
       } else if ((b as any).type === "thinking") {
         logger.info({ turn, sessionId: this.sessionId, thinkingLen: ((b as any).thinking || "").length }, "llm.thinking_block");
         await this.onEvent({ type: "ThinkingMessage", data: { content: [b] }, ...turnTokenStats });
@@ -2387,10 +2403,22 @@ class AgentLoopRunner {
     return true;
   }
 
+  /**
+   * The streamer of this model call's own text (`LoopOptions.streamText`), or none: a sub-agent's text is its parent's to report,
+   * and an assistant router turn's text streams as its say's (`toolTextDelta`).
+   */
+  private assistantTextStream(turn: number): AssistantTextStream | undefined {
+    if (this.depth !== 0 || !(this.opts.streamText ?? ASSISTANT_TEXT_STREAM_ENABLED)) return undefined;
+    if (this.opts.streamToolText?.length || this.opts.streamTextAs) return undefined;
+    return new AssistantTextStream(turn, (event) => Promise.resolve(this.onEvent(event as unknown as Record<string, unknown>)));
+  }
+
   /** One LLM streamTurn call with retry-with-backoff on transient errors. */
   private async streamTurnWithRetry(
     turn: number,
     turnStart: number,
+    /** False: this call's text is not streamed (`assistantTextDelta`), e.g. a reply that is rebuilt before it is shown. */
+    streamText = true,
   ): Promise<Awaited<ReturnType<LlmSession["streamTurn"]>>> {
     const STREAM_MAX_RETRIES = 3;
     // Backoff (ms) per attempt index. Jittered ±50% to spread reconnect storms
@@ -2405,6 +2433,7 @@ class AgentLoopRunner {
     let sanitizedRetryUsed = false;
     let imagesDropped = false;
     let toolText: ToolTextThrottle | undefined;
+    let assistantText: AssistantTextStream | undefined;
     for (let attempt = 0; ; attempt++) {
       try {
         // Filter accumulated [system-notice]: messages before each
@@ -2413,7 +2442,12 @@ class AgentLoopRunner {
         // does NOT mutate workingMessages — KV stays a full audit trail.
         const llmMessages = filterResumeNotices(this.workingMessages);
         toolText = this.toolTextOptions();
-        const result = await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, toolText?.options);
+        assistantText = streamText ? this.assistantTextStream(turn) : undefined;
+        this.lastTextIds = [];
+        const options: StreamTurnOptions | undefined = assistantText
+          ? { ...toolText?.options, text: assistantText.options }
+          : toolText?.options;
+        const result = await this.session.streamTurn(llmMessages, this.effectiveTools, this.signal, options);
         const textAs = this.opts.streamTextAs;
         if (toolText && textAs && this.textPreviewOpen && this.depth === 0) {
           const calls = result.content.filter((b) => b.type === "tool_use");
@@ -2424,8 +2458,15 @@ class AgentLoopRunner {
         }
         // The text written since the last delta, before the calls run: without it a text written inside one interval is a single delta.
         await toolText?.flush();
+        // Every streamed text whole before the turn's AssistantMessage, which names them (`text_id`).
+        if (assistantText) {
+          await assistantText.flush();
+          this.lastTextIds = assistantText.textIds();
+        }
         return result;
       } catch (err: any) {
+        // What the failed call showed of its text is taken back; the retry streams its own under new ids.
+        if (assistantText) await assistantText.void();
         // A failed attempt's text is not the turn's: the retry streams it again from the start.
         toolText?.cancel();
         // What the attempt showed of the run's own text is taken back: the retry shows its own under a new id, or a tool call.

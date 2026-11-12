@@ -39,3 +39,44 @@ export interface SessionReplayWindow<Time = string> {
   data: Array<SessionReplayRow<Time>>;
   has_more: boolean;
 }
+
+/**
+ * The model's own text while it is written: one `assistantTextDelta` per piece, from the model's first token on, before the
+ * turn's `AssistantMessage` carries the whole text. Live only: the API forwards it to whoever follows the session and stores
+ * none of it, so a replayed history has the `AssistantMessage` alone.
+ *
+ * A client appends each `delta` to the text named by `text_id`, in `seq` order, and replaces that text with the block of the
+ * `AssistantMessage` whose `text_id` names it when that arrives. A client that does not know the event keeps working as before:
+ * the `AssistantMessage` is unchanged. Top-level run only (a sub-agent's text is its parent's to report), and not for an
+ * assistant router turn, whose text streams as its say's (`toolTextDelta`).
+ */
+export const ASSISTANT_TEXT_DELTA_EVENT = "assistantTextDelta";
+
+/** The `data:` of an `assistantTextDelta` frame. */
+export interface AssistantTextDeltaData {
+  type: typeof ASSISTANT_TEXT_DELTA_EVENT;
+  /** One text block of one model call. Every delta of the block carries it; so does the `AssistantMessage` that ends it. */
+  text_id: string;
+  /** 0, 1, 2, ... per `text_id`: the order the deltas are appended in. */
+  seq: number;
+  /** The text written since the previous delta of this `text_id`. */
+  delta: string;
+  /** The loop's turn the text belongs to. */
+  turn: number;
+  /** The run (`ExecuteRequest.message_id`), as on every event of the run. */
+  message_id?: string;
+}
+
+/**
+ * Text streamed as `assistantTextDelta` that is not going to be the turn's: the model call that wrote it failed and is made
+ * again (`reason: "retry"`), and the retry streams under new ids. A client drops what it showed under `text_id`. Live only.
+ */
+export const ASSISTANT_TEXT_VOID_EVENT = "assistantTextVoid";
+
+/** The `data:` of an `assistantTextVoid` frame. */
+export interface AssistantTextVoidData {
+  type: typeof ASSISTANT_TEXT_VOID_EVENT;
+  text_id: string;
+  reason: "retry";
+  message_id?: string;
+}

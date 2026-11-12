@@ -51,6 +51,7 @@ import { randomUUID } from "node:crypto";
 import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
+import { ASSISTANT_TEXT_DELTA_EVENT, ASSISTANT_TEXT_VOID_EVENT } from "@claw/protocol";
 import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
@@ -60,6 +61,13 @@ import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
 export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
+
+/**
+ * Brain's live-only events (`@claw/protocol`): forwarded to whoever follows the session, never stored. Each is a piece of
+ * something a stored event carries whole (the model's text is the turn's `AssistantMessage`), so a row of it is a row nobody
+ * reads back, many for every turn.
+ */
+export const LIVE_ONLY_EVENTS: ReadonlySet<string> = new Set([ASSISTANT_TEXT_DELTA_EVENT, ASSISTANT_TEXT_VOID_EVENT]);
 
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
@@ -456,6 +464,10 @@ export async function consumeEventDelivery(msg: {
         msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
         return;
       }
+      msg.ack();
+      return;
+    }
+    if (typeof event.type === "string" && LIVE_ONLY_EVENTS.has(event.type)) {
       msg.ack();
       return;
     }

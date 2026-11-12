@@ -158,7 +158,9 @@ test("without stream_tool_text, and in a sub-agent's loop, no text is asked for"
     const { session: s, seen } = session([{ content: [{ type: "text", text: "hi" }] }]);
     const { opts: o, events } = opts({ llmSession: s, ...over });
     await agentLoop([{ role: "user", content: "hi" }], TOOLS, o);
-    assert.equal(seen[0], undefined);
+    // No tool's text; the loop's own text is asked for only at the top level (`assistantTextDelta`, not a say's preview).
+    assert.equal(seen[0]?.toolText, undefined);
+    if (over.depth) assert.equal(seen[0], undefined);
     assert.equal(events.some((e) => e.type === "toolTextDelta"), false);
   }
 });
