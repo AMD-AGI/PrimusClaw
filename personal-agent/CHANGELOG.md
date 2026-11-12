@@ -17,14 +17,15 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ## 0.6.0
 
-A minor release: a choice the assistant puts to the person is a card (#765), a reply language chosen with `/lang` governs
-the assistant's answers too (#771), and an answered question card speaks the chat's language (#766). No plugin port (core's `src/plugins/`) changed. The runtime's SQLite store gains one table (the
-choice cards), created at start; nothing to do for a deployment.
+A minor release: a choice the assistant puts to the person is a card (#765), a reply language chosen with `/lang`
+governs the assistant's answers too (#771), and an answered question card speaks the chat's language (#766). No plugin
+port (core's `src/plugins/`) changed. The runtime's SQLite store gains one table (the choice cards), created at start;
+nothing to do for a deployment.
 
-**Claw:** choice cards, and the chosen language on the assistant's answers, need claw-v0.3.0 or later, which adds `choices` to the assistant's `say`. With an older Claw this
-worker never sees a choice and nothing changes. The other way round, a worker before 0.6.0 under claw-v0.3.0 or later
-ignores a say's `choices` (it reads the say's known fields only) and shows the say's text, which names the options, so
-the person answers by typing; no card, nothing lost.
+**Claw:** choice cards, and the chosen language on the assistant's answers, need claw-v0.3.0 or later, which adds
+`choices` to the assistant's `say`. With an older Claw this worker never sees a choice and nothing changes. The other
+way round, a worker before 0.6.0 under claw-v0.3.0 or later ignores a say's `choices` (it reads the say's known fields
+only) and shows the say's text, which names the options, so the person answers by typing; no card, nothing lost.
 
 ### Added
 
@@ -35,11 +36,12 @@ the person answers by typing; no card, nothing lost.
   whole typed path (rate limit, attached agent, assistant); a second press or two at once send once, and only the person
   the card was for can press it. A pick is an answer, never a command: an option that is a menu word or a phrase help
   teaches ("New", "重新开始", "Stop", "停止", "Help", ...) is sent as those words, not as /new, /stop or /help (#765).
-- `@primusclaw/personal-agent`: a language chosen with `/lang zh` or `/lang en` is sent with each message, so Claw answers in
-  it too, not only the agent's own texts: to the assistant as `channel_context.reply_language`, to a plain session's turn
-  (a group's, or a 1:1 chat without the assistant) as the `[Reply language: ...]` line after the message (in a group, the
-  sender's choice). A language only learnt from what the person writes, and `/lang auto`, send nothing (#771). With a
-  Claw before claw-v0.3.0 the assistant drops `reply_language` and answers as before; plain sessions still get the line.
+- `@primusclaw/personal-agent`: a language chosen with `/lang zh` or `/lang en` is sent with each message, so Claw
+  answers in it too, not only the agent's own texts: to the assistant as `channel_context.reply_language`, to a plain
+  session's turn (a group's, or a 1:1 chat without the assistant) as the `[Reply language: ...]` line after the message
+  (in a group, the sender's choice). A language only learnt from what the person writes, and `/lang auto`, send nothing
+  (#771). With a Claw before claw-v0.3.0 the assistant drops `reply_language` and answers as before; plain sessions
+  still get the line.
 
 ### Fixed
 
