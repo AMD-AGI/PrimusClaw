@@ -26,7 +26,7 @@ import { z } from "zod";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS } from "../config.js";
 import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
-import { PASS_REASONS, SAY_MAX_CHARS } from "./prompts.js";
+import { PASS_REASONS, SAY_MAX_CHARS, WORK_CREATE_REPO_PARAM } from "./prompts.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import { SAY_SUGGESTED_PARAM, suggestedRepliesOn } from "./suggested.js";
 import { SAY_CHOICES_PARAM, sayChoicesOn } from "./choices.js";
@@ -396,7 +396,7 @@ export function createAssistantMcpServer(
       {
         title: z.string().describe("At most 40 characters."),
         brief: z.string().describe("Everything the worker needs, as a self-contained task: it cannot see the conversation."),
-        repo: z.unknown().optional().describe("The repository the work is in, if any: { url, branch? }."),
+        repo: z.unknown().optional().describe(WORK_CREATE_REPO_PARAM),
         ...(modelChoice ? { model: z.string().optional().describe(MODEL_PARAM_CHOICE) } : {}),
       },
       (args) => answer(claims, "work_create", () => workCreateWatching(claims, args)),
