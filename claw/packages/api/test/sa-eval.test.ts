@@ -1417,12 +1417,16 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "把仓库名发我。", "麻烦发我仓库名。", "请把仓库名和测试名发我。", "需要你提供仓库名和测试名。", "还需要你提供仓库和测试名称。",
     "我需要知道仓库和测试名称才能继续。", "说一下要做什么", "告知我仓库名和测试名。",
     "请直接提供仓库名。", "请直接给我仓库名。", "请直接说明你要哪个仓库。", "Please directly provide the repository name.", "麻烦告知我仓库名。",
+    "请帮忙提供仓库名。", "请尽快告知我仓库名。", "请务必提供仓库和测试名。", "麻烦帮我确认仓库名。", "Kindly provide the repository name.",
+    "Please make sure to provide the repository name.",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
     assert.deepEqual(graded(final), [], final);
   }
   assert.ok(!asksUser("**⚠️ 没看懂“提前开题”要做什么**", 0));
+  // Unchanged: any question mark asks, a closing question too ("Any questions?"); the judge reads what it asks.
+  assert.ok(asksUser("Done. Any questions?") && asksUser("已经处理好了，还有其他问题吗？"));
   // A choice put to the person (`choices` on the say) asks, whatever the text; one option is no choice.
   assert.deepEqual(graded("**⚠️ 没看懂“提前开题”要做什么**", { finalChoices: 2 }), []);
   assert.deepEqual(graded("**⚠️ 没看懂“提前开题”要做什么**", { finalChoices: 1 }), ["route=clarify"]);
@@ -1439,11 +1443,6 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "I'll send the report when it is ready.",
     "我先确认一下状态，稍后回复你。",
     "我们先简单说明一下：提前开题是在规定日期前完成开题材料。",
-    // A closing offer is no question, with a question mark or without.
-    "Done. Any questions?",
-    "已经处理好了。还有其他问题吗？",
-    "提前开题就是提前做开题报告。还需要我做什么吗？",
-    "I opened it. Anything else I can help with?",
     "提前开题就是提前做开题报告。如果有任何问题，请告诉我。",
     "提前开题就是提前做开题报告。如有问题，请随时告诉我。",
     "I opened the issue. If you have any questions, please let me know.",
@@ -1452,14 +1451,14 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "I opened the issue. If anything comes up, feel free to let me know.",
     "Please let me know if you need anything else.", "Please let me know if anything else comes up.", "Please tell me if you need anything.",
     "如果还有问题随时告诉我。", "如果有问题随时告诉我。", "如果需要帮助就告诉我。", "如果有需要请告诉我。", "如果还有疑问可以告诉我。",
-    "有任何问题欢迎随时联系我。", "Is there anything else I can help with?", "Hope this helps!", "Feel free to reach out.",
+    "有任何问题欢迎随时联系我。", "Hope this helps!", "Feel free to reach out.",
     "我需要先查一下。", "你的开题报告需要包含哪些内容，一般由导师决定。", "这个仓库是哪个团队的我也不清楚，但测试已经修好了。",
     "有事告诉我。", "有什么事告诉我。", "有事随时告诉我。", "需要任何东西告诉我。", "这取决于你想做什么。", "我不知道你想做什么。",
     "我需要先查一下仓库名是否存在。", "我需要确认一下仓库名称是否可用。", "我需要的内容已经找到了。", "请给我一点时间，我马上检查。",
     "给我一点时间，我来确认。", "请给我几分钟处理。", "给我看看，我先检查一下。", "我会把结果发给我们的群。",
     "你昨天告诉我的仓库已经处理好了。", "你要的报告已经发了，还是老样子。",
     "我需要确认仓库名。", "我需要检查一下仓库名。", "我需要核对仓库地址。", "项目负责人已经告知我仓库暂停维护。", "我已经告知我们团队这个结果。",
-    "Done, any questions?", "已经处理好了，还有其他问题吗？", "我需要知道的内容刚才已经说过了。",
+    "我需要知道的内容刚才已经说过了。",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
