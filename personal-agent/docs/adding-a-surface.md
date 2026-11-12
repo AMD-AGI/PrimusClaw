@@ -10,7 +10,8 @@ for whoever adds the next (Slack, a web chat, a messenger): what to build, which
 worker and Claw expect of it, and how to prove it works. Every interface below is linked to its source, which is the
 authority; the guide explains how the parts fit.
 
-Two pieces of code back the guide and run in CI, so it cannot drift from the code without a red build:
+Two pieces of code back the guide and run in CI, so the contract it describes is exercised on every change (the prose
+itself is checked by review, not by a test):
 
 - **The echo surface** ([`test-support/echo-surface/`](../test-support/echo-surface)): a complete, minimal surface for
   a made-up chat app, about 600 lines. The [walkthrough](#walkthrough-the-echo-surface) below follows it.
@@ -404,7 +405,7 @@ over HTTP and a store in a temporary directory serves every test, and each test 
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | names            | `caps.channel` is a valid channel id and a surface label Claw takes; names and the stream's life are set.                                                                                            |
 | linking          | `/primus-claw-agent/link` and `/link CODE` connect the person; their subscription names this surface (`surface` = `caps.channel`).                                                                   |
-| not linked       | A person who has not linked is told how to connect; Claw is not called.                                                                                                                              |
+| not linked       | A person who has not linked is told how to connect; nothing is sent to Claw for them (no write of any kind).                                                                                         |
 | a turn           | A 1:1 message starts a Claw session with the person's key and the answer reaches the chat.                                                                                                           |
 | streaming        | Where `streaming`, the answer closes the live message that showed progress, once; elsewhere no stream and the answer is a message.                                                                   |
 | groups           | A group message that does not mention the bot is not answered and starts nothing; one that does is answered in the group.                                                                            |

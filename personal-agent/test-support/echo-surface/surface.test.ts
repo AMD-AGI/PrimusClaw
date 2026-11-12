@@ -12,6 +12,11 @@ import { EchoSurface } from "./surface.js";
 
 const TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
 
+function note(button: string): OutMessage {
+  const model = { text: "a note", buttons: [{ title: button, verb: "noop", data: {} }] };
+  return { body: { type: "view", view: { name: "note", model }, fallbackText: "a note" } };
+}
+
 function choiceCard(option: string): OutMessage {
   const model = {
     text: `pick ${TOKEN}`,
@@ -33,4 +38,13 @@ it("in a group every word of a card is masked; in a 1:1 chat it is shown as it i
   assert.equal(JSON.stringify(group.message).includes(TOKEN), false, JSON.stringify(group.message));
   assert.deepEqual(group.message.choices?.options.map((o) => o.title)[1], "staging");
   assert.equal(personal.message.choices?.options[0]?.title, `use ${TOKEN}`);
+});
+
+it("in a group a button's title is masked too", async () => {
+  const surface = new EchoSurface();
+  await surface.conversation(refOf({ id: "g", kind: "group" })).send(note(`copy ${TOKEN}`));
+  const [posted] = surface.records;
+  assert.ok(posted?.op === "post");
+  assert.equal(posted.message.buttons.length, 1);
+  assert.equal(JSON.stringify(posted.message).includes(TOKEN), false, JSON.stringify(posted.message));
 });
