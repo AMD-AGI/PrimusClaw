@@ -159,6 +159,7 @@ function lateHooks(get: () => Router): RouterHooks {
       return router.commands.run(text, router.chat(sender, conversation), key);
     },
     background: (userId) => get().ctx.credentials.background(userId),
+    typed: (message) => get().handle(message),
   };
 }
 

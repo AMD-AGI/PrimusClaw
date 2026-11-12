@@ -109,6 +109,9 @@ CREATE TABLE IF NOT EXISTS assistant_action_cards (
 CREATE TABLE IF NOT EXISTS assistant_confirm_cards (
   card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS assistant_choice_cards (
+  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,
+  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS asker_follows (
   item_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, review_json TEXT NOT NULL, reference_json TEXT NOT NULL,
   said TEXT NOT NULL DEFAULT '', reviewer_told INTEGER NOT NULL DEFAULT 0, deadline REAL NOT NULL, created_at REAL NOT NULL);

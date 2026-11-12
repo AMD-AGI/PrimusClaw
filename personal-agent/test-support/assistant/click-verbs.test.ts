@@ -17,6 +17,7 @@ import type { InboundAction } from "../../packages/core/src/ports/surface.js";
 import { ApprovalClicks } from "../../packages/core/src/approvals/handler.js";
 import type { ApprovalDecisions } from "../../packages/core/src/approvals/decide.js";
 import { AssistantActionClicks } from "../../packages/core/src/assistant/action-handler.js";
+import { CHOICE_VERB } from "../../packages/core/src/assistant/choice-clicks.js";
 import { WorkCardClicks } from "../../packages/core/src/assistant/work-handler.js";
 import type { WatchClicks } from "../../packages/core/src/assistant/watch-clicks.js";
 import type { WorkClicks } from "../../packages/core/src/assistant/work-clicks.js";
@@ -107,7 +108,7 @@ function opOf(data: Readonly<Record<string, unknown>>): string {
   return typeof op === "string" ? op : "";
 }
 
-/** The three handlers of these cards, each recording which of its features a press reached and settling it, as they do. */
+/** The handlers of these cards, each recording which of its features a press reached and settling it, as they do. */
 function handlers(reached: string[]): ClickHandler[] {
   const hit = async (click: ClickRoute, what: string): Promise<void> => {
     reached.push(what);
@@ -136,13 +137,20 @@ function handlers(reached: string[]): ClickHandler[] {
       actionClick: (click) => hit(click as ClickRoute, `action ${opOf(click.action.data)}`),
       confirmClick: (click) => hit(click as ClickRoute, `confirm ${opOf(click.action.data)}`),
     }),
+    {
+      verbs: [CHOICE_VERB],
+      beforeCredential: async (click) => {
+        await hit(click, "choice");
+        return true;
+      },
+    },
   ];
 }
 
 const INACTIVE = "That button is not active any more.";
 
 /**
- * A worker's router (W4's, as production assembles it) with the three handlers of these cards registered, Alice linked, and
+ * A worker's router (W4's, as production assembles it) with the handlers of these cards registered, Alice linked, and
  * every session a Show here button names answered.
  */
 function routed(reached: string[]) {
@@ -205,6 +213,7 @@ it("a press on each kind of card reaches what answers it", async () => {
       (b) => b.data["primusclaw"] === "assistant_confirm" && b.data["op"] === "deny",
       "confirm deny",
     ],
+    ["assistant choice", (b) => b.data["primusclaw"] === "assistant_choice", "choice"],
   ];
   for (const [what, which, outcome] of expected) {
     const button = BUTTONS.find(which);

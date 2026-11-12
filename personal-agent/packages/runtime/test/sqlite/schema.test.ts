@@ -33,9 +33,9 @@ function structureAfter(prepare: (path: string) => void, opens = 1): StoreStruct
   }
 }
 
-test("a fresh database has the Python store's structure: 43 tables, their columns, indexes and SQL", () => {
+test("a fresh database has the Python store's structure: 44 tables, their columns, indexes and SQL", () => {
   const actual = structureAfter(() => undefined);
-  assert.equal(Object.keys(actual.tables).length, 43);
+  assert.equal(Object.keys(actual.tables).length, 44);
   assert.deepEqual(actual, EXPECTED.fresh);
 });
 

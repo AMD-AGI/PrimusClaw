@@ -4,7 +4,8 @@
 /**
  * The words of the assistant's cards: a work item's card, the board, a command or a write put to the person
  * (teams_agent/render.py work_card, work_buttons, board_card, board_line, asked_section, action_card, confirm_write_card,
- * work_done_card). What the Python worker said in English whatever the language stays English in both.
+ * work_done_card), and a choice put to the person. What the Python worker said in English whatever the language stays English in
+ * both.
  */
 import { defineCatalog } from "./catalog.js";
 
@@ -60,6 +61,15 @@ export const assistantCardText = defineCatalog({
     hoursAgo: (p: { n: number }) => `${String(p.n)} h ago`,
     daysAgo: (p: { n: number }) => `${String(p.n)} d ago`,
     askedTitle: (p: { n: number }) => `Asked of others · ${String(p.n)}`,
+    choiceTitle: "Pick one",
+    choiceTitleMany: "Pick any that apply",
+    choiceSend: "Send",
+    choiceTyped: "You can also just reply in the chat.",
+    choiceNone: "Pick an option first, then press Send.",
+    choiceSent: (p: { answer: string }) => `Sent: ${p.answer}`,
+    choiceGone: "This choice is no longer open. Reply in the chat instead.",
+    /** How the options picked are joined into the person's message. */
+    choiceJoin: ", ",
   },
   zh: {
     ...english,
@@ -99,6 +109,14 @@ export const assistantCardText = defineCatalog({
     hoursAgo: (p) => `${String(p.n)} 小时前`,
     daysAgo: (p) => `${String(p.n)} 天前`,
     askedTitle: (p) => `请别人做的代审 · ${String(p.n)}`,
+    choiceTitle: "请选择一项",
+    choiceTitleMany: "可多选",
+    choiceSend: "发送",
+    choiceTyped: "也可以直接在聊天里回复。",
+    choiceNone: "请先选一项，再点发送。",
+    choiceSent: (p) => `已发送：${p.answer}`,
+    choiceGone: "这个选择已经失效，请直接在聊天里回复。",
+    choiceJoin: "、",
   },
 });
 

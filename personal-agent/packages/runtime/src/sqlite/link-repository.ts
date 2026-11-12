@@ -43,6 +43,7 @@ const PERSON_TABLES = [
   "auto_replies",
   "assistant_action_cards",
   "assistant_confirm_cards",
+  "assistant_choice_cards",
   "observed_groups",
   "observe_cards",
   "pending_requests",

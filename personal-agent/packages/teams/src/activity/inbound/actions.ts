@@ -72,6 +72,8 @@ export const observeAction = reader("observe");
 export const assistantActionClick = reader("assistant_action");
 /** A held write's card (allow or deny). */
 export const assistantConfirmClick = reader("assistant_confirm");
+/** Send on a choice the assistant put to the person, with the places of the options picked. */
+export const assistantChoiceClick = reader("assistant_choice");
 /** "Merge" / "Do not merge" on the card a high-risk merge sends to the reviewer. */
 export const githubConfirmAction = reader("github_confirm");
 /** One of the two confirmation settings of the review mode card. */

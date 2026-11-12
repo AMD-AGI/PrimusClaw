@@ -411,3 +411,54 @@ test("a command and a write put to the person carry only the card's id, in the p
     ],
   );
 });
+
+test("a choice is radio buttons (check boxes for several) whose places are the values, and Send carries only the card's id", () => {
+  const single = cardOf(
+    assistantRenderers.choiceCard({
+      text: "部署到哪个集群？",
+      cardId: "c6",
+      options: ["prod", "staging"],
+      multiple: false,
+      note: "",
+      lang: null,
+    }),
+  );
+  valid(single);
+  const set = body(single).find((e) => e["type"] === "Input.ChoiceSet");
+  assert.deepEqual(set, {
+    type: "Input.ChoiceSet",
+    id: "choice",
+    style: "expanded",
+    isMultiSelect: false,
+    choices: [
+      { title: "prod", value: "0" },
+      { title: "staging", value: "1" },
+    ],
+  });
+  assert.deepEqual(texts(body(single)), ["❓ 请选择一项", "部署到哪个集群？", "也可以直接在聊天里回复。"]);
+  assert.deepEqual(
+    actions(single).map((a) => [a["type"], a["title"], a["verb"], a["data"]]),
+    [["Action.Execute", "发送", "primusclaw.assistant_choice", { primusclaw: "assistant_choice", card: "c6" }]],
+  );
+  const several = cardOf(
+    assistantRenderers.choiceCard({
+      text: "",
+      cardId: "c7",
+      options: ["a", "b", "c"],
+      multiple: true,
+      note: "Pick an option first, then press Send.",
+      lang: "en",
+    }),
+  );
+  valid(several);
+  assert.equal(body(several).find((e) => e["type"] === "Input.ChoiceSet")?.["isMultiSelect"], true);
+  assert.deepEqual(texts(body(several)), [
+    "❓ Pick any that apply",
+    "Pick an option first, then press Send.",
+    "You can also just reply in the chat.",
+  ]);
+  const sent = cardOf(assistantRenderers.choiceChosen({ text: "Which?", chosen: ["a", "c"], lang: "en" }));
+  valid(sent);
+  assert.deepEqual(texts(body(sent)), ["✅ Sent: a, c", "Which?"]);
+  assert.deepEqual(actions(sent), [], "nothing left to press");
+});

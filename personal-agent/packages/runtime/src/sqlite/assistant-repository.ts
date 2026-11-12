@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** The assistant's cards and messages on SQLite (tables `assistant_cards`, `auto_replies`, `assistant_action_cards`,
- * `assistant_confirm_cards`, `assistant_messages`). */
+ * `assistant_confirm_cards`, `assistant_choice_cards`, `assistant_messages`). */
 import {
   ASSISTANT_CARD_KEEP_SECONDS,
   ASSISTANT_MESSAGE_KEEP_SECONDS,
@@ -14,6 +14,7 @@ import {
   type AssistantMessage,
   type AssistantMessageRepository,
   type CardState,
+  type ChoiceCard,
   type ConfirmCard,
   type JsonObject,
   type MoveOptions,
@@ -225,6 +226,63 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
 
   moveConfirmCard(cardId: string, state: CardState, options?: MoveOptions): boolean {
     return moveCard(this.ctx.db, "assistant_confirm_cards", cardId, state, options);
+  }
+
+  addChoiceCard(
+    userId: string,
+    choice: {
+      readonly text: string;
+      readonly options: readonly string[];
+      readonly multiple: boolean;
+      readonly lang: string;
+    },
+  ): string {
+    const now = this.ctx.now();
+    this.ctx.db.run("DELETE FROM assistant_choice_cards WHERE created_at < ?", now - ASSISTANT_MESSAGE_KEEP_SECONDS);
+    const cardId = tokenUrlsafe(this.ctx.random, 12);
+    this.ctx.db.run(
+      "INSERT INTO assistant_choice_cards (card_id, aad_id, text, options_json, multiple, lang, state, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
+      cardId,
+      userId,
+      choice.text,
+      pyJsonDumps(choice.options),
+      flag(choice.multiple),
+      choice.lang,
+      now,
+    );
+    return cardId;
+  }
+
+  getChoiceCard(cardId: string): ChoiceCard | null {
+    const row = this.ctx.db.get(
+      "SELECT card_id, aad_id, text, options_json, multiple, chosen_json, lang, state, created_at FROM assistant_choice_cards " +
+        "WHERE card_id = ? AND created_at >= ?",
+      cardId,
+      this.ctx.now() - ASSISTANT_MESSAGE_KEEP_SECONDS,
+    );
+    if (!row) return null;
+    return {
+      cardId: col.str(row, "card_id"),
+      userId: col.str(row, "aad_id"),
+      text: col.str(row, "text"),
+      options: jsonStrings(col.str(row, "options_json") || "[]"),
+      multiple: col.bool(row, "multiple"),
+      chosen: jsonStrings(col.str(row, "chosen_json") || "[]"),
+      lang: col.str(row, "lang"),
+      state: col.str(row, "state"),
+      createdAt: col.num(row, "created_at"),
+    };
+  }
+
+  chooseChoiceCard(cardId: string, chosen: readonly string[]): boolean {
+    return (
+      this.ctx.db.run(
+        "UPDATE assistant_choice_cards SET state = 'done', chosen_json = ? WHERE card_id = ? AND state = 'open'",
+        pyJsonDumps(chosen),
+        cardId,
+      ) === 1
+    );
   }
 }
 
