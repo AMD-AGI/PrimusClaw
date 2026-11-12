@@ -108,8 +108,7 @@ release version, and its `appVersion` stays `latest`.
   word, ending in "…" (never inside an emoji or a combined character), instead of cutting the whole line at 40 characters
   ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
   the word crossing them whole, and the title runs past 40. An item an older Claw titled is renamed on its next request, as
-  before. No schema change, no new
-  setting.
+  before. No schema change, no new setting.
 
 ## [0.3.1] - 2026-11-12
 
