@@ -15,6 +15,12 @@
  * A review someone asked of another person is not told here: the chat that started it follows its turn and tells the one who asked
  * (`personal-agent`'s review service), and the item belongs to the reviewer. Started after the sync's commit (`syncReviewItem`), not waited
  * for. Each notice is told once: its key is the item, the kind, the head, the turn and why a wait ended.
+ *
+ * Except a re-review of a head already reviewed that posted nothing (`unchanged_wait`, `unchanged`; 2026-11-11, N25): no chat tells anyone of
+ * a review that posted nothing, and the reviewer was asked to look at it as if it were stuck. Whoever asked for it is told, the owner of
+ * their own review or the person who asked someone else for it, within what that person may know of it (`requester-view.ts`): the pull
+ * request, its head, and that it has no new commits since that head was reviewed; then that it waits for CI on that head before it is run
+ * once more, or why it does not.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
@@ -147,6 +153,49 @@ export function resultText(kind: ReviewResult, f: ResultFacts, zh: boolean): str
     : [`**${f.pr} is reviewed and not approved**`, "", `- Verdict: ${verdict}; the review says why.`, `- Next: to review it again, reply ${again}.`, link].join("\n");
 }
 
+/** The facts of a re-review of a head already reviewed that posted nothing (`unchanged_wait`, `unchanged`). */
+export interface UnchangedFacts {
+  pr: string;
+  url: string;
+  seq: number;
+  headSha: string;
+  reviewOnly: boolean;
+  turns: number;
+  ended: CiWaitEnd | null;
+  /** Told to the person who asked someone else for the review, not to its owner. */
+  forRequester: boolean;
+}
+
+/** What whoever asked for a re-review that had nothing new to post is told, by language. */
+export function unchangedText(kind: "unchanged_wait" | "unchanged", f: UnchangedFacts, zh: boolean): string {
+  const sha = f.headSha.slice(0, 7);
+  const title = zh
+    ? `**${f.forRequester ? "你请人评审的 " : ""}${f.pr} 这次没有发新评审：代码和上次审过的一样**`
+    : `**No new review of ${f.pr}${f.forRequester ? ", which you asked for" : ""}: the code is what was already reviewed**`;
+  const same = zh
+    ? `- head \`${sha}\` 已经审过，之后没有新提交，所以没有重复发评审。`
+    : `- Head \`${sha}\` was already reviewed and has no new commits since, so no second review was posted.`;
+  const again = f.forRequester
+    ? (zh ? "再请一次评审" : "ask for a review again")
+    : (zh ? `回复 \`再审 #${f.seq}\`` : `reply \`review again #${f.seq}\``);
+  const link = zh ? `- PR：${f.url}` : `- The pull request: ${f.url}`;
+  if (kind === "unchanged_wait") {
+    const after = f.reviewOnly ? (zh ? "审过就批准" : "approve it if it passes") : (zh ? "审过就批准并继续合入" : "approve it and go on to the merge if it passes");
+    return zh
+      ? [title, "", same, `- 接下来：我盯着这个 PR，这个 head 的 CI 全绿后自动再审一次（只再审一次，最多等 ${WAIT_HOURS} 小时），${after}。`, `- PR 有了新提交：${again}。`, link].join("\n")
+      : [title, "", same, `- Next: I am watching the pull request. Once CI on this head is all green I review it once more (once, for up to ${WAIT_HOURS} hours) and ${after}.`, `- After new commits: ${again}.`, link].join("\n");
+  }
+  const why = f.ended === "threads_open"
+    ? (zh ? "CI 已经全绿，但 PR 上还有没解决的评审讨论，所以没有自动再审" : "CI is green now, but review threads are still open, so it was not run again")
+    : f.ended ? (zh ? ENDED_ZH[f.ended] : ENDED_EN[f.ended])
+      : f.turns > 1 ? (zh ? "已经在 CI 转绿后自动再审过一次，还是没有新内容可发" : "it was already run again once after CI turned green, and still had nothing new to post")
+        : null;
+  const next = f.ended === "threads_open"
+    ? (zh ? `- 接下来：讨论都解决后${again}。` : `- Next: once every thread is resolved, ${again}.`)
+    : (zh ? `- 接下来：PR 有了新提交后${again}。` : `- Next: once the pull request has new commits, ${again}.`);
+  return [title, "", same, ...(why ? [zh ? `- ${why}。` : `- ${why.charAt(0).toUpperCase()}${why.slice(1)}.`] : []), next, link].join("\n");
+}
+
 /** The checks a `ci_not_green` refusal named on its audit row (`ciEvidence` in the review service): failed and not finished. */
 export function ciNamesOf(riskReasons: unknown): { failed: string[]; pending: string[] } {
   const lines = Array.isArray(riskReasons) ? riskReasons.filter((x): x is string => typeof x === "string") : [];
@@ -184,9 +233,39 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
       "SELECT item_id, user_id, seq, params, worker_session_id, kind FROM claw_work_items WHERE item_id = $1", [itemId],
     )).rows[0] as { item_id: string; user_id: string; seq: number; params: Record<string, unknown> | null; worker_session_id: string; kind: string } | undefined;
     if (!item || item.kind !== "review" || !item.params) return skipped("no_review_item");
-    if (typeof item.params.requested_by === "string" && item.params.requested_by) return skipped("asked_by_someone_else");
+    const requester = typeof item.params.requested_by === "string" && item.params.requested_by ? item.params.requested_by : null;
+    if (requester && kind !== "unchanged_wait" && kind !== "unchanged") return skipped("asked_by_someone_else");
     const pr = item.params.pr as { owner?: unknown; repo?: unknown; number?: unknown } | undefined;
     if (!pr || typeof pr.owner !== "string" || typeof pr.repo !== "string" || typeof pr.number !== "number") return skipped("no_pr");
+    if (kind === "unchanged_wait" || kind === "unchanged") {
+      if (requester === item.user_id) return skipped("requested_by_is_owner");
+      const to = requester ?? item.user_id;
+      const read = (await q(
+        `SELECT head_sha FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_get' AND result = 'ok' AND head_sha <> ''
+          ORDER BY at DESC, id DESC LIMIT 1`,
+        [item.worker_session_id],
+      )).rows[0] as { head_sha: string } | undefined;
+      if (!read) return skipped("no_head_read");
+      const turns = Number((await q(
+        "SELECT COUNT(*)::int AS n FROM claw_tasks WHERE session_id = $1 AND origin = 'chat'", [item.worker_session_id],
+      )).rows[0]?.n ?? 0);
+      const ended = (item.params.ci_wait_ended as { reason?: unknown } | undefined)?.reason;
+      const facts: UnchangedFacts = {
+        pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq),
+        headSha: String(read.head_sha).toLowerCase(), reviewOnly: String(item.params.review_only ?? "true") !== "false", turns,
+        ended: ended === "head_moved" || ended === "timeout" || ended === "not_queued" || ended === "threads_open" ? ended : null,
+        forRequester: requester !== null,
+      };
+      const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [to])).rows[0]?.session_id as string | undefined;
+      if (!sessionId) return skipped(requester ? "requester_has_no_assistant" : "owner_has_no_assistant");
+      const told = await reviewResultPorts.recordSystemNotice({
+        userId: to, sessionId, text: unchangedText(kind, facts, await personWritesChinese(q, to)),
+        key: `review_result:${item.item_id}:${kind}:${facts.headSha}:${turns}:${facts.ended ?? "-"}`,
+      });
+      if (told === null) return skipped("already_told");
+      logger.info({ itemId, kind, pr: facts.pr, head: facts.headSha, toRequester: requester !== null }, "assistant.review_result_told");
+      return true;
+    }
     const last = (await q(
       `SELECT head_sha, COALESCE(posted->>'event', arguments->>'event', '') AS event, posted FROM claw_github_audit
         WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok' AND detail IN ('submitted', 'already_submitted')

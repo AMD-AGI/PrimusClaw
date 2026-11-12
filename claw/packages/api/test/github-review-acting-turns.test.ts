@@ -392,8 +392,11 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   // A review of the owner's own account whose one turn posted a comment because CI was not green: its same words once more, once CI is
   // green. Made only for a session that acts as a user, had one completed turn with those words and nothing queued, whose approval was
   // refused ci_not_green, and whose item is the owner's own, open and still waiting.
-  assert.match(actingSession, /Number\(row\.turns\) !== 1 \|\| Number\(row\.queued\) !== 0\) return null;\s*if \(row\.status !== "completed" \|\| row\.words !== content \|\| !row\.ci_refused \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
-    "the green-CI re-run's proof only for one completed turn with the same words, a ci_not_green refusal and a waiting own review");
+  assert.match(actingSession, /Number\(row\.turns\) !== 1 \|\| Number\(row\.queued\) !== 0\) return null;\s*if \(row\.status !== "completed" \|\| row\.words !== content \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the green-CI re-run's proof only for one completed turn with the same words, whose item is open and still waiting");
+  // Waiting: the owner's own review refused ci_not_green, or a re-review of a head the same account already reviewed that wrote and held nothing.
+  assert.match(actingSession, /AND NOT \(w\.params \? 'ci_wait_ended'\)\s*AND \(\(NOT \(w\.params \? 'requested_by'\)\s*AND EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id AND a\.tool = 'gh_review_submit'\s*AND a\.result = 'refused' AND a\.detail = 'ci_not_green'\)\)\s*OR \(NOT EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id\s*AND a\.tool IN \('gh_review_submit', 'gh_pr_merge'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_confirmations c WHERE c\.session_id = s\.session_id\)/,
+    "and waiting is exactly the two cases: an own review held by CI, or an unchanged re-review that tried no write at all");
   const greenProof = [...found.keys()].filter((f) => /\bproofForReviewAfterGreenCi\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(greenProof, ["assistant/review-items.ts"], "only the review items ask for the green-CI re-run's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
