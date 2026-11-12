@@ -11,6 +11,8 @@
  *   P3  the worker is told to report, to finish with a report, and to check before repeating an effect
  *   P3b the worker makes a write the task asks for and lets its hold ask the user; it never asks first in a report (both prompts)
  *   P3c a GitHub write no tool makes (a star) is made with gh, whose shell hold asks the user; never failed for want of a tool
+ *   P3d such a write that leaves the same state however often it runs (a star) is the first command, with no read of its state before it
+ *   P3e work_create's repo is passed only when the worker needs its files, since it is cloned first; never for a star or a label
  *   P4  the work event that wakes the router begins with the marker the prompt names, and says what the router needs
  *   P5  the item list the router sees is one line per item and says "none" when there are none
  *   P6  what workers and models wrote reaches the router only as quoted data inside the untrusted block, under its preamble
@@ -22,7 +24,7 @@ import test from "node:test";
 
 import { parseReport, REPORT_QUESTION_MAX, REPORT_SUMMARY_MAX } from "../src/assistant/report.js";
 import {
-  ROUTER_PROMPT, SAY_MAX_CHARS, UNTRUSTED_CLOSE, UNTRUSTED_OPEN, UNTRUSTED_PREAMBLE, WORKER_DISCIPLINE_PROMPT, WORKER_PROMPT, WORK_EVENT_PREFIX,
+  ROUTER_PROMPT, SAY_MAX_CHARS, UNTRUSTED_CLOSE, UNTRUSTED_OPEN, UNTRUSTED_PREAMBLE, WORKER_DISCIPLINE_PROMPT, WORKER_PROMPT, WORK_CREATE_REPO_PARAM, WORK_EVENT_PREFIX,
   formatManifestLine, formatWorkEvent, itemStatus, manifestTime, renderRouterSystem, renderWorkerSystem,
 } from "../src/assistant/prompts.js";
 
@@ -120,6 +122,27 @@ test("P3c a GitHub write no tool makes is made with gh, whose hold asks the user
     // The missing login stays a blocked report: the new line never overrides it.
     assert.match(prompt, /When you cannot make it \(no GitHub login, no write access\), report\(kind="blocked"\)/);
   }
+});
+
+// G0 2026-11-12 cat-github-edge-001: "star vllm" first read the star state (403 on the eval token), looked into it, then made the PUT,
+// so the card came at 8.5-17.7 s instead of 2.5-3.9 s. The card already stops the write before it runs; a read first only delays it.
+test("P3d a write that leaves the same state however often it runs is the first command, with no read of its state first (both prompts)", () => {
+  for (const prompt of [WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT]) {
+    assert.match(prompt, /Such a write that leaves the same state however often it runs \(starring or unstarring a repository, watching it, adding a label\), when the task only asks for it, is the first command you run/);
+    assert.match(prompt, /never read its state first \(whether it is starred already, which labels it has\), and never look into why such a read fails/);
+    assert.match(prompt, /The card puts the command to the user before it runs, and its own success is the check/);
+    assert.match(prompt, /verify it\. Say what you actually ran and saw, not what you expect\. A write is verified after it is made, never by reading its target before it\./);
+    // A task that also asks to find things out still reports them before the write: the new line is only for a write asked for alone.
+    assert.match(prompt, /first report\(kind="progress", summary\) with everything you found that answers what was asked, with the numbers, then make the write/);
+  }
+});
+
+// G0 2026-11-12 cat-github-edge-001: the router passed repo { url: vllm } for "star vllm", and the worker's first step waited 27.8-32.3 s
+// for a full clone of vllm. The repository is cloned before the work starts, so it is for work on its files only.
+test("P3e work_create's repo is for work on the repository's files only: it is cloned first, and an API-only action has none", () => {
+  assert.match(WORK_CREATE_REPO_PARAM, /^The repository whose files the worker needs, if any: \{ url, branch\? \}\./);
+  assert.match(WORK_CREATE_REPO_PARAM, /It is cloned into the worker's workspace before the work starts, so pass it only when the work reads or changes that repository's files/);
+  assert.match(WORK_CREATE_REPO_PARAM, /Leave it out for an action through the GitHub API alone \(a star, a label, a release, an issue, a comment\)/);
 });
 
 test("P4 the work event begins with the marker the prompt names", () => {

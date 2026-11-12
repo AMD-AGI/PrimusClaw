@@ -79,9 +79,12 @@ process.env.S3_ACCESS_KEY = "AK";
 process.env.S3_SECRET_KEY = "SK";
 process.env.S3_BUCKET = "claw";
 
-const { syncWorkspaceToS3, syncWorkspaceFromS3, syncLeftSnapshot } = await import("../src/workspace/s3-uploader.js");
+const {
+  syncWorkspaceToS3, syncWorkspaceFromS3, syncLeftSnapshot, WorkspaceRestoreIncomplete,
+} = await import("../src/workspace/s3-uploader.js");
 const {
   finishedOutput, invalidateSyncManifest, parseDigestListing, parseStatListing, planUploadDelta, SYNC_STATE_DIR,
+  RESTORE_HOLD_PATH,
 } = await import("../src/workspace/sync-delta.js");
 const { findExcludeArgs, s3Excludes } = await import("../src/workspace/excludes.js");
 import type { HandsClient } from "../src/clients/hands.js";
@@ -111,6 +114,8 @@ class Sandbox {
   uploadDelayMs = 0;
   /** When set, `download_from_s3` fails every file. */
   failDownloads = false;
+  /** When set, `download_from_s3` throws this, as a call Hands refused outright (a 413) does. */
+  downloadThrows: string | undefined;
   inFlight = 0;
   maxInFlight = 0;
   private clock = 1_700_000_000;
@@ -181,6 +186,7 @@ class Sandbox {
       }
       if (tool === "log_s3_upload_manifest") return JSON.stringify({ ok: true });
       if (tool === "download_from_s3") {
+        if (this.downloadThrows) throw new Error(this.downloadThrows);
         // Every file comes down with the same bytes; what is under test is what the
         // restore leaves behind for the next sync, not the copy.
         const files = (args.files as Array<{ local_path: string }>).map((f) => f.local_path);
@@ -1160,18 +1166,209 @@ test("L6 a sandbox restored from S3 syncs without listing again what its restore
     "a restored file is uploaded again: the record knows it is in S3, not that it is unchanged");
 });
 
-test("L7 a restore that did not bring everything back leaves the next sync to list the prefix", async () => {
+test("L7 a restore that did not bring everything back fails, leaves no record, and the next sync deletes nothing", async () => {
   leftBehind();
   const sb = new Sandbox();
   sb.failDownloads = true;
-  await syncWorkspaceFromS3(sb.client, "sess-1", "user-1");
+  await assert.rejects(
+    () => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"),
+    (e: Error) => e instanceof WorkspaceRestoreIncomplete && /restored=0\/2, failed=2/.test(e.message),
+  );
   sb.failDownloads = false;
   assert.deepEqual(sb.manifestFiles(), [], "no record");
 
   sb.put("new.txt", "new");
   store.lists = 0;
-  await sb.sync();
-  assert.equal(store.lists, 1);
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, 0, "held, with nothing of the session's in the sandbox to withhold");
+  assert.deepEqual(store.deletes, [], "the files that did not come back are still the session's");
+  assert.equal(store.lists, 1, "listed once, for what is already saved; the prune that would list again does not run");
+  assert.ok(store.objects.has("users/user-1/sessions/sess-1/new.txt"), "what the turn made is still saved");
+});
+
+// ===== a failed restore holds the prune =====
+
+/** The session as saved: 534 files, the size of the one measured coming out of a save with 52. */
+function savedSession(): string[] {
+  for (const k of [...store.objects]) if (k.startsWith(PREFIX)) store.objects.delete(k);
+  const keys: string[] = [];
+  for (let i = 0; i < 534; i++) keys.push(`${PREFIX}${i < 40 ? "" : `src/m${i % 7}/`}f${i}.txt`);
+  for (const k of keys) store.objects.add(k);
+  return keys;
+}
+
+/**
+ * A new sandbox as it comes up: 52 files of its own (a fresh clone), one of which
+ * has the name of a file the session saved -- the clone's version of it, not the
+ * session's.
+ */
+function freshSandbox(): Sandbox {
+  const sb = new Sandbox();
+  for (let i = 0; i < 51; i++) sb.put(`clone/c${i}.txt`, `clone ${i}`);
+  sb.put("f1.txt", "the clone's f1, not the session's");
+  return sb;
+}
+
+test("R1 a restore Hands refused with 413 is followed by a save that deletes nothing (534 stays 534)", async () => {
+  // The measured failure: the session had 534 files saved, the restore into the
+  // new sandbox died on Hands' body limit, the turn ran on the 52 files the
+  // sandbox started with, and the save after it mirrored those 52 into S3 --
+  // deleting every saved file it did not have and reporting `synced`. (Here the
+  // sandbox shares one name with the session, so the base code deletes 533 and
+  // leaves 52.)
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.downloadThrows = "MCP error -32603: Request failed with status code 413 Payload Too Large";
+  await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"), /413/);
+  assert.ok(existsSync(join(sb.state, "restore-incomplete")), "the sandbox carries the hold");
+
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, 1, "the save says it held, and what it left out");
+  assert.equal(r.empty, false);
+  assert.deepEqual(store.deletes, [], "nothing deleted");
+  for (const k of saved) assert.ok(store.objects.has(k), `${k} is still saved`);
+  assert.ok(!sb.uploaded.includes("/workspace/f1.txt"), "the session's f1 is not replaced by the clone's");
+  assert.equal(sb.uploaded.length, 51, "the files the session did not have are added");
+  assert.equal([...store.objects].filter((k) => k.startsWith(PREFIX)).length, 534 + 51,
+    "the old snapshot whole, and the new files beside it");
+  assert.deepEqual(sb.manifestFiles(), [], "no record: f1 is not in S3 as it is here");
+
+  // The next run reuses the sandbox without restoring again; its save holds too.
+  sb.remove("clone/c0.txt");
+  sb.resetUploads();
+  const again = await sb.sync(undefined, sb.newRunClient());
+  assert.equal(again.withheld, 51);
+  assert.deepEqual(store.deletes, [], "not even a file this sandbox itself deleted");
+  assert.deepEqual(sb.uploaded, []);
+});
+
+test("R2 a sandbox that refuses the hold's write is still held by this process", async () => {
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.downloadThrows = "Request failed with status code 413";
+  sb.writeRefused = true;
+  await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"));
+  assert.ok(!existsSync(join(sb.state, "restore-incomplete")));
+  sb.writeRefused = false;
+
+  store.deletes = [];
+  const r = await sb.sync(undefined, sb.newRunClient());
+  assert.equal(r.withheld, 1);
+  assert.deepEqual(store.deletes, []);
+  for (const k of saved) assert.ok(store.objects.has(k));
+});
+
+test("R3 a hold another Brain process wrote is honoured", async () => {
+  // This process never saw the failure (a restarted Brain, or another one): the
+  // sandbox's own note is what holds the prune.
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.run(`mkdir -p ${SYNC_STATE_DIR} && echo '{}' > ${RESTORE_HOLD_PATH}`);
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, 1);
+  assert.deepEqual(store.deletes, []);
+  for (const k of saved) assert.ok(store.objects.has(k));
+});
+
+test("R4 a sandbox that cannot say whether it is held is treated as held", async () => {
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.reply = (command) => (command.includes(RESTORE_HOLD_PATH) ? "timeout after 20s" : undefined);
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, 1);
+  assert.deepEqual(store.deletes, []);
+  for (const k of saved) assert.ok(store.objects.has(k));
+});
+
+test("R5 a sandbox whose restore succeeded still prunes what its user deleted", async () => {
+  // The other side: the hold is for a failed restore, and must not freeze every prune.
+  const saved = savedSession();
+  const sb = freshSandbox();
+  await syncWorkspaceFromS3(sb.client, "sess-1", "user-1");
+  sb.remove("f0.txt");
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, undefined);
+  assert.deepEqual(store.deletes, [`${PREFIX}f0.txt`]);
+  assert.equal(saved.filter((k) => store.objects.has(k)).length, 533);
+});
+
+test("R7 a held sandbox puts nothing into the in-flight checkpoint, whose recovery copy would replace the session's files", async () => {
+  // A failed terminal save copies the in-flight checkpoint prefix over the session
+  // prefix (copyS3Prefix) -- whatever the prefix holds, including objects an
+  // earlier attempt of the same message left there. A held sandbox's checkpoint
+  // would be the new sandbox's f1.txt, or the cue that copies a stale one.
+  const saved = savedSession();
+  const sb = freshSandbox();
+  sb.downloadThrows = "Request failed with status code 413";
+  await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"));
+  const ckpt = "users/user-1/checkpoints/sess-1/msg-1/inflight/";
+  store.objects.add(`${ckpt}f2.txt`); // left by an earlier attempt
+  const r = await sb.sync(ckpt);
+  assert.equal(r.withheld, 52, "every file is withheld from a checkpoint");
+  assert.deepEqual(sb.uploaded, []);
+  assert.equal(syncLeftSnapshot(r), false, "so the run has no checkpoint to recover from");
+  assert.deepEqual([...store.objects].filter((k) => k.startsWith(ckpt)), [`${ckpt}f2.txt`]);
+  for (const k of saved) assert.ok(store.objects.has(k));
+});
+
+test("R8 a hold is not kept for a later sandbox at the same address: another session's, or this one's restored in full", async () => {
+  // The address is the pod's IP and comes back for other pods. A hold kept by
+  // address alone would make every later sandbox there drop edits to saved files.
+  const P = "http://10.0.0.9:9100/mcp";
+  const at = (sb: Sandbox): HandsClient => ({
+    generation: P,
+    callTool: (t: string, a: Record<string, unknown>) => sb.client.callTool(t, a),
+  }) as unknown as HandsClient;
+
+  savedSession();
+  const failed = freshSandbox();
+  failed.downloadThrows = "Request failed with status code 413";
+  await assert.rejects(() => syncWorkspaceFromS3(at(failed), "sess-1", "user-1"));
+  assert.equal((await syncWorkspaceToS3(at(failed), "sess-1", "user-1")).withheld, 1, "that sandbox is held");
+
+  // Another session's sandbox at the same address, while the hold stands.
+  const other = new Sandbox();
+  other.put("notes.md", "v1");
+  await syncWorkspaceToS3(at(other), "sess-2", "user-1");
+  other.put("notes.md", "v2, edited");
+  other.resetUploads();
+  const r2 = await syncWorkspaceToS3(at(other), "sess-2", "user-1");
+  assert.equal(r2.withheld, undefined, "not held");
+  assert.deepEqual(other.uploaded, ["/workspace/notes.md"], "its edit is saved");
+
+  // This session's next sandbox at the same address, restored in full.
+  const next = new Sandbox();
+  await syncWorkspaceFromS3(at(next), "sess-1", "user-1");
+  next.put("f1.txt", "edited after a good restore");
+  next.resetUploads();
+  const r = await syncWorkspaceToS3(at(next), "sess-1", "user-1");
+  assert.equal(r.withheld, undefined, "a restore that succeeded released the hold");
+  assert.ok(next.uploaded.includes("/workspace/f1.txt"), "the edit to a saved file is saved");
+});
+
+test("R6 a restore whose listing failed holds the sandbox too", async () => {
+  savedSession();
+  const sb = freshSandbox();
+  // The listing call itself fails, as it does when the object store is unreachable.
+  const { S3Client } = await import("@aws-sdk/client-s3");
+  const proto = S3Client.prototype as { send: unknown };
+  const own = Object.prototype.hasOwnProperty.call(proto, "send");
+  const send = proto.send;
+  proto.send = () => Promise.reject(new Error("connect ECONNREFUSED"));
+  try {
+    await assert.rejects(() => syncWorkspaceFromS3(sb.client, "sess-1", "user-1"), /ECONNREFUSED/);
+  } finally {
+    if (own) proto.send = send; else delete (proto as { send?: unknown }).send;
+  }
+  store.deletes = [];
+  const r = await sb.sync();
+  assert.equal(r.withheld, 1);
+  assert.deepEqual(store.deletes, []);
 });
 
 test("L8 a file called __proto__ is in the record like any other, so its removal is pruned too", async () => {

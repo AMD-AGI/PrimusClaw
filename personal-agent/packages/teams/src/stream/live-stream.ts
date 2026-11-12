@@ -20,6 +20,7 @@ import { err, ok } from "@primusclaw/personal-agent";
 
 import { isObject, type JsonObject } from "../cards/json.js";
 import { streamsIn, type Style } from "../config/style.js";
+import { streamedLineBreaks } from "../activity/line-breaks.js";
 import { StreamRefusedError } from "../outbound/outbox.js";
 import type { BusyConversations } from "./busy.js";
 import { informativeText } from "./informative.js";
@@ -83,7 +84,8 @@ class TeamsLiveStream implements LiveStream {
   }
 
   emit(text: string, options?: UpdateOptions): Promise<Result<void, StreamRefused>> {
-    return attempt(() => this.stream.emit(text, options?.signal));
+    // (with the line breaks its final message gets, so the final still contains what was streamed)
+    return attempt(() => this.stream.emit(streamedLineBreaks(text), options?.signal));
   }
 
   finish(message: OutMessage): Promise<Result<void, StreamRefused>> {

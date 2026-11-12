@@ -164,11 +164,24 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
+- A sandbox whose workspace could not be restored from object storage (Hands refused the download with 413, the listing
+  failed, or files were still missing after the retries) no longer lets the save after the turn delete the session's
+  saved files: such a save only adds files the saved copy does not have, and replaces and deletes nothing, for as long
+  as the sandbox lives. Before, it pruned every saved file the restore had not brought back (534 files down to 52) and
+  reported success. The failed restore is reported to the session as `sandboxStatus` `workspace_restore_failed` (reason
+  `payload_too_large`, `sandbox_unreachable` or the error class), and counted in
+  `claw_brain_workspace_restore_total{result}`. No schema change, no new setting (#804).
 - A terminal's work item title keeps the machine's and the tool's names whole and cuts what was asked after its last whole
   word, ending in "…" (never inside an emoji or a combined character), instead of cutting the whole line at 40 characters
   ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
   the word crossing them whole, and the title runs past 40. An item an older Claw titled is renamed on its next request, as
   before. No schema change, no new setting.
+- A sandbox's workspace is restored from object storage in batches Hands accepts (100 files, at most 256 KiB of file
+  list, a call), as the upload has long been sent, instead of in one call: a session past about a thousand files was
+  refused with 413 and its workspace came back empty (measured on a 3,632-file clone). A batch that fails is retried
+  alone; an unreachable sandbox still stops the restore at once. The uploads given to a reused sandbox go in the same
+  batches. Concurrent first calls on a fresh Hands client now share one connect instead of all but one failing with
+  "Already connected to a transport". No schema change, no new setting (#805).
 
 ## [0.3.1] - 2026-11-12
 

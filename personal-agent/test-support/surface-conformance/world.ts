@@ -138,7 +138,9 @@ export class KitRun {
 
   /**
    * `person` links their chat the way a person does: the console posts their key to the worker's link route, and they
-   * type the code it gave as `/link CODE` in their 1:1 chat. Resolves once the chat said they are connected.
+   * type the code it gave as `/link CODE` in their 1:1 chat. Resolves once the chat said they are connected, and they
+   * turned quiet hours off (`/quiet off`): a new person has them on (22:00-08:00 in the default zone), and on the real
+   * clock a notice or an approval Claw pushes would be held instead of delivered whenever the kit runs at night there.
    */
   async link(person: KitPerson, chat: KitChat): Promise<void> {
     const answer = await fetch(`${this.baseUrl}/primus-claw-agent/link`, {
@@ -151,6 +153,9 @@ export class KitRun {
     const before = this.driver.seen(chat).length;
     await this.driver.say(chat, person, `/link ${code}`);
     await this.shown(chat, (m) => /connected|linked/i.test(m.text), "the chat to say it is connected", before);
+    const linked = this.driver.seen(chat).length;
+    await this.driver.say(chat, person, "/quiet off");
+    await this.shown(chat, (m) => /quiet hours are off/i.test(m.text), "the chat to say quiet hours are off", linked);
   }
 
   /** The subscription `person`'s worker made with Claw (its latest). */
