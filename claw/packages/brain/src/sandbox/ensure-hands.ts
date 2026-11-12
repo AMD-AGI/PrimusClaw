@@ -36,6 +36,7 @@ import {
   resourcesMapToWorkloadArray,
   assertImageDigest,
   applyMultiNodeExternalEnv,
+  usesTopologyHandoff,
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
@@ -2857,7 +2858,8 @@ async function provisionHands(
   // The topology handoff goes after the key it points at, outside the synced
   // workspace. During the transition the legacy env is sufficient on its own, so
   // a write failure is a warning, not a failed sandbox. Only paths are logged.
-  if (multiNodeContext) {
+  // atomesh and sglangrouter hand off through the node list env instead.
+  if (multiNodeContext && usesTopologyHandoff(multiNodeContext)) {
     const r = await writeTopologyHandoff(
       (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
       multiNodeContext,

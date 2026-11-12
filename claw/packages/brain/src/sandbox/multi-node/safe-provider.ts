@@ -817,6 +817,15 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         routerIps: groups.frontend.map((p) => p.podIp),
         prefillIps: groups.prefill.map((p) => p.podIp),
         decodeIps: groups.decode.map((p) => p.podIp),
+        pdLaunch: {
+          model: spec.model,
+          kvTransferBackend: spec.kvTransferBackend,
+          prefillTp: spec.pdPrefillTp,
+          decodeTp: spec.pdDecodeTp,
+          serverArgs: spec.serverArgs,
+          prefillExtraArgs: spec.pdPrefillExtraArgs,
+          decodeExtraArgs: spec.pdDecodeExtraArgs,
+        },
       };
     }
 

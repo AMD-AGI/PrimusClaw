@@ -54,6 +54,59 @@ export interface MultiNodeContext {
   prefillUrl?: string;
   /** atomesh/sglangrouter: decode engine Service URL. */
   decodeUrl?: string;
+  /** atomesh/sglangrouter: what the prompt asked of the PD launch, carried into the node list. */
+  pdLaunch?: PdLaunchRequest;
+}
+
+/** The prompt's PD launch settings, as the cluster was created with them. */
+export interface PdLaunchRequest {
+  /** `--model`. */
+  model: string;
+  /** `--pd-transfer-backend`, the KV transfer backend the cluster runs. */
+  kvTransferBackend: string;
+  /** `--pd-prefill-tp`; 0 when the prompt does not fix it. */
+  prefillTp: number;
+  /** `--pd-decode-tp`; 0 when the prompt does not fix it. */
+  decodeTp: number;
+  /** `--server-args`, for both roles. */
+  serverArgs: string;
+  /** `--pd-prefill-extra-args`. */
+  prefillExtraArgs: string;
+  /** `--pd-decode-extra-args`. */
+  decodeExtraArgs: string;
+}
+
+/** One role's parallelism the operator fixed; `null` leaves it to the launch source. */
+export interface NodeListRoleTopology {
+  tp: number | null;
+  ep: number | null;
+  dp_attention: boolean | null;
+}
+
+/**
+ * The InferenceSuite multi-node node list (`inference_suite.multinode` input
+ * contract): the cluster's service and engine URLs, hosts per role, SSH access,
+ * GPUs per node and the operator's optional topology and args. Holds the SSH
+ * key by path only.
+ */
+export interface MultiNodeNodeList {
+  framework: "sglang" | "atom";
+  model: string;
+  /** Router Service URL the client and accuracy eval target. */
+  service_url: string;
+  /** Prefill engine Service URL; its port is the one the engines listen on. */
+  prefill_url?: string;
+  /** Decode engine Service URL; its port is the one the engines listen on. */
+  decode_url?: string;
+  router: { host: string };
+  prefill: Array<{ host: string }>;
+  decode: Array<{ host: string }>;
+  gpus_per_node: number;
+  ssh?: { port: number; user: string; key_file: string };
+  transfer_backend?: string;
+  topology?: { prefill: NodeListRoleTopology; decode: NodeListRoleTopology };
+  launch_mode: "direct" | "in_place";
+  config?: { prefill_args: string; decode_args: string; router_args: string };
 }
 
 export interface MultiNodeEnsureOptions {
