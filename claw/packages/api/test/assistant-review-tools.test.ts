@@ -61,6 +61,7 @@
  *   M1  review_mode_set can only make reviews ask more
  *   X1  channel_action runs a listed action at once only when the message is its command typed whole; anything else is put to
  *       the user as that command with a button (an `assistant.say` carrying it), and runs nothing; a handoff's name is no channel action
+ *   X1s a channel action goes only to the subscription of the surface its message came from, not the surface used last
  *   U1  what a worker wrote in the item list (summary, question) never makes a signed-in message allow a write or run a channel
  *       action: the list renders it as untrusted data, and no phrase but the exact command does either
  *   W1  work_send refuses a review item; work_stop stops one only in a turn that answers the person
@@ -1082,6 +1083,28 @@ describe("assistant review tools", { skip }, () => {
     const out = await rt.reviewModeSet(ask, { mode: "high_risk_confirm" });
     assert.deepEqual(out, { ok: true, review_mode: "high_risk_confirm", was: "fully_auto" });
     assert.equal((await w.q("SELECT review_mode FROM claw_github_review_settings WHERE user_id = $1", [alice.userId]))[0].review_mode, "high_risk_confirm");
+  });
+
+  test("X1s a channel action goes to the surface its message came from, whichever the person used last", async () => {
+    const ctx = { ...DEFAULT_CTX, actions: [{ name: "/brief", usage: "/brief on HH:MM", summary: "每个工作日的晨报" }] };
+    const teams = await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    const slack = await w.subscribe(alice.userId, ["assistant.say", "assistant.action"]);
+    await w.q("UPDATE claw_notification_subscriptions SET surface = 'slack' WHERE subscription_id = $1", [slack]);
+    await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = $1", [alice.userId]);
+    // Teams is the surface used last; the message the action answers came from Slack.
+    await w.q("INSERT INTO claw_assistant_surfaces (user_id, surface, last_inbound_at) VALUES ($1, 'slack', NOW() - interval '1 minute'), ($1, 'teams', NOW())", [alice.userId]);
+    try {
+      const fromSlack = await userTurn(alice, "/brief on 10:00", { context: { ...ctx, channel: "slack", channel_message_id: "slack-ts-1" } });
+      const out = await rt.channelAction(fromSlack, { name: "brief", args: "on 10:00" }) as Recorded;
+      assert.equal(out.ran, true);
+      const sent = await w.q("SELECT subscription_id, payload FROM claw_notification_outbox WHERE event_id = $1", [out.event_id]);
+      assert.deepEqual(sent.map((r) => [r.subscription_id, r.payload.channel_message_id]), [[slack, "slack-ts-1"]], "only the channel that has the message");
+      const fromTeams = await userTurn(alice, "/brief off", { context: ctx });
+      const off = await rt.channelAction(fromTeams, { name: "brief", args: "off" }) as Recorded;
+      assert.deepEqual((await w.q("SELECT subscription_id FROM claw_notification_outbox WHERE event_id = $1", [off.event_id])).map((r) => r.subscription_id), [teams]);
+    } finally {
+      await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = $1", [alice.userId]);
+    }
   });
 
   test("X1 channel_action runs at once only its command typed whole; anything else is put to the user as a button", async () => {

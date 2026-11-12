@@ -122,6 +122,15 @@ describe("notification subscriptions", () => {
     wire.answer = () => json(200, { data: [{ subscription_id: "sub1" }] });
     assert.deepEqual(await claw.notifications.list("ak-a"), [{ subscription_id: "sub1" }]);
   });
+
+  it("carry the worker's surface when it names one", async () => {
+    const wire = new Wire(() => json(200, { data: { subscription_id: "sub1", secret: "s3cr3t" } }));
+    const claw = wire.client();
+    await claw.notifications.create("ak-a", "https://w.test/claw-events", [], [], "slack");
+    assert.deepEqual(wire.sent.at(-1)?.body, { url: "https://w.test/claw-events", surface: "slack" });
+    await claw.notifications.updateTypes("ak-a", "sub1", ["run.failed"], { surface: "slack" });
+    assert.deepEqual(wire.sent.at(-1)?.body, { event_types: ["run.failed"], surface: "slack" });
+  });
 });
 
 describe("triggers and held merges", () => {

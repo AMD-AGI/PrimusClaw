@@ -18,6 +18,8 @@ export async function ensureNotificationSchema(client: pg.PoolClient): Promise<v
       event_types          TEXT[] NOT NULL DEFAULT ARRAY['run.completed','run.failed'],
       sources              TEXT[] NOT NULL DEFAULT ARRAY['trigger','long_run'],
       enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+      -- The chat surface the receiver delivers to ('teams', 'slack', ...): where an assistant message goes (surfaces.ts).
+      surface              TEXT NOT NULL DEFAULT 'teams',
       consecutive_failures INT NOT NULL DEFAULT 0,
       failing_since        TIMESTAMPTZ,
       created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -26,6 +28,8 @@ export async function ensureNotificationSchema(client: pg.PoolClient): Promise<v
   `);
   await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS failing_since TIMESTAMPTZ");
   await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN NOT NULL DEFAULT FALSE");
+  // Every subscription made before the label delivered to Teams, which is what the default says of it.
+  await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS surface TEXT NOT NULL DEFAULT 'teams'");
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_notification_subs_owner ON claw_notification_subscriptions(owner_user_id) WHERE enabled",
   );

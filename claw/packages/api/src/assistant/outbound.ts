@@ -5,14 +5,16 @@
  * What an assistant says to its user, and how that leaves the system.
  *
  * A message is stored first (`claw_assistant_says`) and only then announced: as a
- * row in the notification outbox for every subscription that asked for the type,
- * and as an `AssistantSay` event in the assistant's session for a web client. The
- * store and the outbox rows are one transaction, so a message exists to be
+ * row in the notification outbox for each subscription that asked for the type on
+ * the person's surface it goes to (`notifications/surfaces.ts`), and as an
+ * `AssistantSay` event in the assistant's session for a web client. The store and
+ * the outbox rows are one transaction, so a message exists to be
  * delivered if and only if it exists at all. Delivery is kicked at once rather than
  * left to the poll, and `delivered_at` is written when a receiver answers 2xx, which
  * is the fact "a message nobody received is not a message sent" depends on.
  *
- * Nothing here knows which channel a person reads on.
+ * Which surface that is (the one the turn's message came from, else the one the
+ * person used last) is `routeToSurface`'s; nothing else here knows about surfaces.
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
@@ -39,6 +41,7 @@ import {
   type WorkItemNeedsYouPayload,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
+import { routeToSurface } from "../notifications/surfaces.js";
 import type { ItemRefError } from "./item-ref.js";
 import { detectLanguage, isChosenLanguage, replyLanguageFor } from "./language.js";
 import { canAccept, resolveWorkItem } from "./work-items.js";
@@ -169,6 +172,11 @@ interface ToStoreBase {
   text: string;
   /** Held deliveries (`say-hold.ts`). */
   hold?: { status: string; seconds: number };
+  /**
+   * The person's message whose turn says it, when the message is not kept on the payload (`turnMessageId`, `noticeOfTurn`): it goes
+   * back to the surface that message came from (`routeToSurface`).
+   */
+  sourceTurn?: string;
 }
 
 type ToStore =
@@ -242,13 +250,15 @@ async function store(q: Querier, m: ToStore): Promise<Stored | null> {
   if (!inserted) return null;
   const payload = payloadOf(m, inserted.created_at);
 
-  // The subscription's `sources` is about what started a run; an assistant message is not one.
+  // The subscription's `sources` is about what started a run; an assistant message is not one. Of the person's surfaces, it goes to
+  // the one their message of this turn came from, or, said of nobody's message, the one they wrote from last (`routeToSurface`).
+  const turnId = m.sourceTurn ?? (m.type === "assistant.say" ? m.noticeOfTurn ?? m.turnMessageId : undefined);
   const subs = CLAW_NOTIFICATIONS_ENABLED
-    ? (await q(
-      `SELECT subscription_id FROM claw_notification_subscriptions
+    ? await routeToSurface(q, m.userId, (await q(
+      `SELECT subscription_id, surface FROM claw_notification_subscriptions
         WHERE owner_user_id = $1 AND enabled AND $2 = ANY(event_types)`,
       [m.userId, m.type],
-    )).rows
+    )).rows as Array<{ subscription_id: string; surface: string }>, turnId && m.sessionId ? { sessionId: m.sessionId, messageId: turnId } : null)
     : [];
   const subscribers = await enqueue(m.sayId, subs, payload, q, m.hold);
   // Nothing carries it now: kept as it would have been sent, for the user's next subscription (`resendUnreachedSays`).
@@ -1135,6 +1145,7 @@ export async function recordWriteConfirm(
     type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
     sayId: deterministicEventId("assistant.confirm_write", input.userId, input.confirm.confirmation_id),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
+    ...(input.turnMessageId ? { sourceTurn: input.turnMessageId } : {}),
   });
   if (!stored) return null;
   // The card's session event names the turn that proposed it, as that turn's says do: whoever follows the session (the web client, an

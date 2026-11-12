@@ -25,6 +25,7 @@ import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
 import type { NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
+import { routeToSurface } from "./surfaces.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
 
 const logger = pino({ name: "notification-outbox" });
@@ -121,11 +122,12 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
     if (row.trigger_id) sources.push("trigger");
     if (row.notify_on_finish === true && Number(row.seconds) >= NOTIFY_MIN_RUN_SECONDS) sources.push("long_run");
     if (!sources.length) continue;
-    const subs = (await db.query(
-      `SELECT subscription_id FROM claw_notification_subscriptions
+    // On the surface the owner wrote from last (`routeToSurface`): nobody's message in the chat is answered by a run's end.
+    const subs = await routeToSurface(db.query, row.user_id, (await db.query(
+      `SELECT subscription_id, surface FROM claw_notification_subscriptions
         WHERE owner_user_id = $1 AND enabled AND $2 = ANY(event_types) AND sources && $3::text[]`,
       [row.user_id, type, sources],
-    )).rows;
+    )).rows as Array<{ subscription_id: string; surface: string }>);
     if (!subs.length) continue;
     const eventId = deterministicEventId(type, input.sessionId, row.task_id);
     const name = String(row.name || "").trim();
@@ -240,11 +242,11 @@ export async function recordApprovalRequested(
   if (session.trigger_id) sources.push("trigger");
   if (session.notify_on_finish === true) sources.push("long_run");
   if (!sources.length) return 0;
-  const subs = (await db.query(
-    `SELECT subscription_id FROM claw_notification_subscriptions
+  const subs = await routeToSurface(db.query, session.user_id, (await db.query(
+    `SELECT subscription_id, surface FROM claw_notification_subscriptions
       WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND sources && $2::text[]`,
     [session.user_id, sources],
-  )).rows;
+  )).rows as Array<{ subscription_id: string; surface: string }>);
   if (!subs.length) return 0;
 
   const clock = now();

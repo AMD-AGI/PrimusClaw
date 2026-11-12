@@ -27,12 +27,24 @@ export const NOTIFICATION_SUBSCRIPTION_EVENT_TYPES = [...NOTIFICATION_RUN_EVENT_
 export const NOTIFICATION_SOURCES = ["trigger", "long_run", "assistant_item"] as const;
 export type NotificationSource = (typeof NOTIFICATION_SOURCES)[number];
 
+/**
+ * The chat surface a subscription delivers to (`surface`) and a message to the assistant came from (`channel_context.channel`):
+ * a lowercase label the receiver chooses, such as `teams` or `slack`. An assistant message goes back to the surface the turn's
+ * message came from, and a proactive one to the surface the person used last (`api/src/notifications/surfaces.ts`). A subscription
+ * or a message that names none is `teams`, which is what every receiver was before the label existed.
+ */
+export const NOTIFICATION_SURFACE_DEFAULT = "teams";
+/** What a surface label may be: a lowercase letter, then up to 31 lowercase letters, digits, `-` or `_`. */
+export const NOTIFICATION_SURFACE_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
 /** One subscription, as listed, created (with its signing `secret`, once) and changed. */
 export interface NotificationSubscription<Time = string> {
   subscription_id: string;
   url: string;
   event_types: string[];
   sources: string[];
+  /** The surface it delivers to (`NOTIFICATION_SURFACE_DEFAULT` when its receiver named none). Absent from a Claw before the label. */
+  surface?: string;
   enabled: boolean;
   consecutive_failures: number;
   created_at: Time;
