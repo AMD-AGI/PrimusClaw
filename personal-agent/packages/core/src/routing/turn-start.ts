@@ -299,8 +299,10 @@ export class TurnStarter {
     if (request.review !== undefined) return {};
     const { store } = this.ctx.deps;
     const { chat } = request;
+    // (the asker's language is remembered under a group's own setting too, for when the group goes back to following the asker)
+    const asker = chat.scope ? this.askers.answer(chat.scope, chat.sender.id, request.text) : undefined;
     const lang = chat.scope
-      ? (groupChosenLang(store, chat.scope) ?? this.askers.answer(chat.scope, chat.sender.id, request.text))
+      ? (groupChosenLang(store, chat.scope) ?? asker)
       : chosenLang(store.prefs.getPrefs(chat.sender.id));
     return lang === undefined ? {} : { replyLang: lang };
   }

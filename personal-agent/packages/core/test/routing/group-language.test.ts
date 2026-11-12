@@ -238,6 +238,23 @@ test("rule 3: a message with no words of its own follows the asker's last one in
   }
 });
 
+test("rule 3: what the asker wrote under a group's own language is what a wordless message follows after /lang auto", async () => {
+  const w = asked();
+  link(w, ALICE.id, "ak-alice");
+  await w.router.handle(gmsg("帮我看看这个 PR"));
+  await w.router.settled();
+  w.store.groupLanguage.setGroupLanguage(CONV, "en");
+  await w.router.handle(gmsg("please check the build again"));
+  await w.router.settled();
+  w.store.groupLanguage.setGroupLanguage(CONV, "auto");
+  await w.router.handle(gmsg("ok"));
+  await w.router.settled();
+  assert.deepEqual(
+    w.turns.runs.map((r) => r.replyLang),
+    ["zh", "en", "en"],
+  );
+});
+
 test("rule 3: a group's own language still wins over the words of the message", async () => {
   for (const [setting, text, want] of [
     ["en", "推荐一种适合夏天喝的饮料", "en"],
