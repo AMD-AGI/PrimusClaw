@@ -93,7 +93,7 @@ test("a reply that names an option, by its label or its number, answers with tha
   }
 });
 
-test("the answered card speaks the chat's language, not the reply's: \"1\" or \"a\" in a Chinese chat leaves it Chinese", async () => {
+test("the answered card speaks the chat's language, not the reply's: 1 or a typed in a Chinese chat leaves it Chinese", async () => {
   const question = { ...QUESTION, options: [...QUESTION.options, { id: "a", label: "a" }] };
   for (const [typed, locale] of [
     ["1", "zh-CN"],
