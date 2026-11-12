@@ -945,6 +945,10 @@ export const CLAW_ASSISTANT_RESEARCH_USERS: ReadonlySet<string> = new Set(
 // `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
 // carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
 export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);
+// `true` (the default) gives the router's `say` an optional `choices`: the options of a question the user answers by picking one or
+// several, carried by `assistant.say` as `choices` for a channel to show as a card whose Send sends the picked options as the user's
+// message (`assistant/choices.ts`).
+export const CLAW_ASSISTANT_CHOICES = envBool("CLAW_ASSISTANT_CHOICES", true);
 // `false` takes `claw_self_status` from the router (`assistant/self-status.ts`): how the assistant itself has been running over the last
 // day, read from Claw's own tables. On by default: it reads only counts, never a message, a session's settings or a user.
 export const CLAW_ASSISTANT_SELF_STATUS = envBool("CLAW_ASSISTANT_SELF_STATUS", true);

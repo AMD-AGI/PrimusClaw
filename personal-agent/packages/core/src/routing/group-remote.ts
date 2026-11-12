@@ -49,7 +49,7 @@ export class GroupRemote {
     const { remote } = this.ctx.deps;
     const bound = this.chatOf(chat);
     const attached = remote.attached(bound.id);
-    const args = this.agentArgs(words.text, attached);
+    const args = message.choice === true ? null : this.agentArgs(words.text, attached); // (a choice is an answer)
     const provider = this.ctx.credentials.provider(chat.sender.id, key);
     if (args !== null) {
       const parsed = parseAgentCommand(args);
@@ -71,11 +71,12 @@ export class GroupRemote {
     const { remote } = this.ctx.deps;
     const bound = this.chatOf(chat);
     const provider = this.ctx.credentials.provider(chat.sender.id, key);
-    if (naturalCommand(words.text) === "/stop" || parseCommand(words.text) === "stop") {
+    const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
+    if (!choice && (naturalCommand(words.text) === "/stop" || parseCommand(words.text) === "stop")) {
       await remote.stop(bound, key, chat.conversation);
       return true;
     }
-    if (parseCommand(words.text) !== null) return false; // (the group's own commands stay the bot's)
+    if (!choice && parseCommand(words.text) !== null) return false; // (the group's own commands stay the bot's)
     let quote = words.quote;
     if (remote.windowMode(bound.id) === "card") {
       if (!remote.quotesWindow(bound.id, message)) return false; // (the card is the window: the @-message is the bot's)

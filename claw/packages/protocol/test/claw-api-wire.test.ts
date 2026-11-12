@@ -190,6 +190,7 @@ test("representative payloads of each event type round-trip unchanged", () => {
     type: "assistant.say", event_id: "e1", occurred_at: "2026-11-09T11:00:00.000Z", user_id: "u", text: "Done [1].",
     item: { item_id: "wi_1", seq: 1, title: "t", board_state: "needs_you", result_version: 1, can_accept: true },
     sources: [{ n: 1, url: "https://example.com", title: "Example", kind: "web" }], suggested_replies: ["ok"],
+    choices: { options: ["prod", "staging"], multiple: false },
     confirm_write: { confirmation_id: "c1", ref: "a1", kind: "trigger_create", allow_label: "Create", expires_at: "2026-11-10T11:00:00.000Z" },
     files: [{ session_id: "s", id: "d1", name: "a.png", size: 3, content_type: "image/png" }],
     remote: { kind: "needs_you", session_id: "rs", machine: "m", agent: "a", ask: { action_id: "x", tool: "Bash", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] } },

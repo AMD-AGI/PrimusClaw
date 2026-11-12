@@ -79,7 +79,7 @@ export const CHAT_ENTRIES: readonly Capability[] = [
     category: "chat",
     zh: "要你拍板时我发卡片：点按钮回答、批准或拒绝",
     en: "When I need you, I send a card: tap to answer, approve or deny",
-    covers: ["card:decision", "card:answer", "card:assistant_action"],
+    covers: ["card:decision", "card:answer", "card:assistant_action", "card:assistant_choice"],
     where: "both",
   }),
   capability({

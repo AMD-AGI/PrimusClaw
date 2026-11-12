@@ -146,6 +146,12 @@ export interface AssistantRemoteAsk {
   question_count?: number;
 }
 
+/** A choice a say puts to the person: from 2 to 10 options, one plain line each; `multiple` when several may be picked. */
+export interface AssistantSayChoice {
+  options: string[];
+  multiple: boolean;
+}
+
 /** Something the assistant chose to say to the user. */
 export interface AssistantSayPayload extends AssistantEventBase {
   type: "assistant.say";
@@ -157,6 +163,12 @@ export interface AssistantSayPayload extends AssistantEventBase {
    * next, each one plain line. A channel shows them as buttons that send the words as the user's message; one that cannot ignores them.
    */
   suggested_replies?: string[];
+  /**
+   * Present only when the router put a choice to the person (`CLAW_ASSISTANT_CHOICES`): the options they pick from, each one plain
+   * line, and whether they may pick several. A channel shows them as a card whose Send sends the picked options as the person's own
+   * message (their words, joined); one that cannot ignores it, and the text still names the options.
+   */
+  choices?: AssistantSayChoice;
   confirm_write?: AssistantConfirmWrite;
   /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
   files?: AssistantFile[];

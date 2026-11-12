@@ -292,6 +292,44 @@ test("action and confirm buttons live as long as their message or confirmation, 
   assert.equal(buttons.moveActionCard(action, "done"), false);
 });
 
+test("a choice card keeps its options for a day, is sent once with what was picked, and goes with the person's link", () => {
+  const { store, clock } = openTestStore();
+  const buttons = store.assistantButtons;
+  const card = buttons.addChoiceCard("aad-a", {
+    text: "哪个？",
+    options: ["prod", "staging"],
+    multiple: true,
+    lang: "zh",
+  });
+  assert.deepEqual(buttons.getChoiceCard(card), {
+    cardId: card,
+    userId: "aad-a",
+    text: "哪个？",
+    options: ["prod", "staging"],
+    multiple: true,
+    chosen: [],
+    lang: "zh",
+    state: "open",
+    createdAt: store.now(),
+  });
+  assert.equal(buttons.claimChoiceCard(card, ["staging"]), true);
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "of two presses exactly one sends");
+  assert.deepEqual([buttons.getChoiceCard(card)?.state, buttons.getChoiceCard(card)?.chosen], ["busy", ["staging"]]);
+  advanceSeconds(clock, 3600);
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "never taken over while a press sends it");
+  assert.equal(buttons.moveChoiceCard(card, "done", { onlyFrom: "busy" }), true);
+  assert.equal(buttons.claimChoiceCard(card, ["prod"]), false, "never once it was sent");
+  assert.deepEqual([buttons.getChoiceCard(card)?.state, buttons.getChoiceCard(card)?.chosen], ["done", ["staging"]]);
+  const single = buttons.addChoiceCard("aad-a", { text: "", options: ["a", "b"], multiple: false, lang: "" });
+  assert.equal(buttons.getChoiceCard(single)?.multiple, false);
+  assert.equal(buttons.claimChoiceCard("forged", ["a"]), false);
+  advanceSeconds(clock, ASSISTANT_MESSAGE_KEEP_SECONDS + 1);
+  assert.equal(buttons.getChoiceCard(card), null);
+  const kept = buttons.addChoiceCard("aad-a", { text: "", options: ["a", "b"], multiple: false, lang: "" });
+  store.links.unlink("aad-a");
+  assert.equal(buttons.getChoiceCard(kept), null, "unlinking clears the person's cards");
+});
+
 test("an assistant message is known for a day: whose it was, its actions and the people it named", () => {
   const { store, clock } = openTestStore();
   const messages = store.assistantMessages;

@@ -1,0 +1,90 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-6",
+       "primusclaw": "assistant_choice"
+      },
+      "style": "positive",
+      "title": "发送",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_choice"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "❓ 请选择一项",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "choices": [
+       {
+        "title": "prod（生产）",
+        "value": "0"
+       },
+       {
+        "title": "staging（测试）",
+        "value": "1"
+       }
+      ],
+      "id": "choice",
+      "isMultiSelect": false,
+      "style": "expanded",
+      "type": "Input.ChoiceSet"
+     },
+     {
+      "text": "请先选一项，再点发送。",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "也可以直接在聊天里回复。",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}
