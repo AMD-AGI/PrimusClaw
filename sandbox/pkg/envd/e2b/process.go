@@ -49,6 +49,7 @@ type proc struct {
 	trunc  bool
 	exited bool
 	code   int
+	last   time.Time
 }
 
 func newProc(pid int, tag string, cfg processConfig, cmd Command) *proc {
@@ -60,6 +61,12 @@ func newProc(pid int, tag string, cfg processConfig, cmd Command) *proc {
 func (p *proc) add(c chunk) {
 	p.mu.Lock()
 	if c.data != nil {
+		// Output from a detached descendant after the end event is drained, not kept.
+		if p.exited {
+			p.mu.Unlock()
+			return
+		}
+		p.last = time.Now()
 		if p.bytes >= maxCapture {
 			p.trunc = true
 			p.mu.Unlock()
@@ -163,10 +170,49 @@ func (s *processes) startOne(req startRequest) (*proc, error) {
 		if cmd.Exit != nil {
 			code = <-cmd.Exit
 		}
-		wg.Wait()
+		closed := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(closed)
+		}()
+		p.awaitOutput(closed)
 		p.finish(code, "")
 	}()
 	return p, nil
+}
+
+// Bounds on the output wait after the command exits. A descendant the command
+// detached can hold the output pipes open for as long as it runs, so the
+// stream ends without waiting for them to close.
+const (
+	outputQuietPeriod    = 100 * time.Millisecond
+	outputFirstByteGrace = 500 * time.Millisecond
+	outputQuietCeiling   = 2 * time.Second
+)
+
+// awaitOutput returns once the output pipes close, or once output written
+// before the exit has arrived: a quiet period after the last chunk, a grace
+// when nothing was written, and a ceiling in any case.
+func (p *proc) awaitOutput(closed <-chan struct{}) {
+	started := time.Now()
+	deadline := started.Add(outputQuietCeiling)
+	for time.Now().Before(deadline) {
+		select {
+		case <-closed:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+		p.mu.Lock()
+		last := p.last
+		p.mu.Unlock()
+		if last.IsZero() {
+			if time.Since(started) >= outputFirstByteGrace {
+				return
+			}
+		} else if time.Since(last) >= outputQuietPeriod {
+			return
+		}
+	}
 }
 
 func (p *proc) done() bool {
