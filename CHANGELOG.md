@@ -15,7 +15,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
 | Release | Tag | Current version |
 |---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.2.0 |
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.2.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.1.23 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.4.0 |
 
@@ -101,6 +101,21 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+## [0.2.1] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611120828` (commit 0412146c). No schema change, no new setting. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- An assistant answer that tells the user to send `/agent attach <session id>` is delivered instead of being held back as
+  internal text: the UUID right after `/agent attach` is let through, like one the user wrote (only in that position). Plain
+  text whose only internal text is an id is delivered with the id replaced; any other withheld answer tells the user why
+  it was not sent, instead of asking them to say it again (#757).
+- A review asked again of a pull request whose head the same account has already reviewed, and that therefore posts
+  nothing, is no longer marked blocked with the reviewer asked to look at it: whoever asked is told why, the review waits
+  for CI on that head and runs once more when it is green, and otherwise ends as done with nothing new to post (#758).
 
 ## [0.2.0] - 2026-11-11
 
