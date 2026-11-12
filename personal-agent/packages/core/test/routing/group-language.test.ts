@@ -261,6 +261,12 @@ test("rule 4: following the asker is a choice too, and a mention that sets the l
   assert.equal(w.store.groupLanguage.groupLanguage(CONV), "en");
   await w.router.handle(gmsg("/help"));
   assert.deepEqual(cards(w), []);
+  for (const first of ["/lang", "/lang fr"]) {
+    const asking = world(); // (a first mention that only asks about the language gets its answer and the card)
+    await asking.router.handle(gmsg(first));
+    assert.equal(cards(asking).length, 1, first);
+    assert.equal(asking.store.groupLanguage.groupLanguage(CONV), "", first);
+  }
   const other = world();
   await other.router.handle(gmsg("/help"));
   assert.equal(cards(other).length, 1); // (any first mention: help too)

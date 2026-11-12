@@ -78,9 +78,11 @@ export class GroupRouter {
     const words = this.words(message);
     learnLang(this.ctx.deps.store, chat.sender.id, message.text);
     const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
-    // (the group's language is the chat's: set by anyone, read before the account check; and asked once, at the first @mention)
-    if (!choice && (await this.languages.command(chat, words.text))) return;
+    // (the group's language is the chat's: set by anyone, read before the account check; and asked once, at the first @mention,
+    // whatever it says: a `/lang` that set it leaves nothing to ask)
+    const language = !choice && (await this.languages.command(chat, words.text));
     await this.languages.askOnce(chat);
+    if (language) return;
     if (!choice && (await this.groupOwn(message, chat, words))) return;
     const route: MessageRoute = {
       sender: chat.sender,
