@@ -15,6 +15,19 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.7.1
+
+A patch release: one fix (#779). No plugin port (core's `src/plugins/`) and no store change.
+
+**Claw:** the tool's name on the card needs claw-v0.3.1 or later, which passes it as `remote.tool`; with an older Claw the
+card keeps the connector's agent id as before.
+
+### Fixed
+
+- `@primusclaw/personal-agent`: the card of a question a terminal asks names the tool that asked ("Claude Code", "Codex",
+  "Cursor": "Claude Code in a terminal on dev-pod"), from the notice's `remote.tool`, instead of the connector's agent id
+  (`claude-sessions`). Without `remote.tool` the card says the agent as before (#779).
+
 ## 0.7.0
 
 A minor release: each group chat gets its own reply language (#775), and the card of a question a terminal asks says how
