@@ -311,6 +311,19 @@ async function codexAuth(env: NodeJS.ProcessEnv, d: DoctorDeps): Promise<{ ok: t
   return { ok: false, detail: "Codex is not signed in on this machine", fix: "npm install -g @openai/codex, then: codex login" };
 }
 
+/**
+ * What keeps the agent `pair` would write for `preset` from signing in here, asked as `doctor` asks: null when it can, or when that
+ * cannot be told (a false "not signed in" would leave a working agent out), else what is missing and the one command that fixes it.
+ */
+export async function presetSignInProblem(preset: string, env: NodeJS.ProcessEnv, d: DoctorDeps): Promise<{ detail: string; fix: string } | null> {
+  if (preset === "claude") return (await claudeSignedIn(env, d)) === false ? { detail: "Claude Code is not signed in on this machine", fix: LOGIN_FIX.claude } : null;
+  if (preset === "codex") {
+    const auth = await codexAuth(env, d);
+    return auth && !auth.ok ? { detail: auth.detail, fix: auth.fix } : null;
+  }
+  return null;
+}
+
 // --- the checks --------------------------------------------------------------------------------
 
 export interface CheckInput {

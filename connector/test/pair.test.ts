@@ -9,7 +9,8 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { main, EXIT, setupHooks, type Ctx } from "../src/commands.js";
 import { parseConfig } from "../src/config.js";
-import { alternateName, cmdPair, defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
+import { alternateName, chooseAgents, cmdPair, defaultRoot, detectAgents, pairedConfig } from "../src/pair.js";
+import { defaultDeps, presetSignInProblem, type DoctorDeps } from "../src/doctor.js";
 import { credentialsFile, identityFile, identityKeepFile, resolveDirs } from "../src/paths.js";
 import { saveCredentials } from "../src/credentials.js";
 import { FakeClaw } from "./support/fake-claw.js";
@@ -17,12 +18,25 @@ import { tmpdir } from "./support/harness.js";
 
 const GRANT = `cpg_${"g".repeat(43)}`;
 
+/** How `pair` finds the sign-ins here (doctor.ts, its programs answering as below): each agent signed in, unless named in `out`. */
+function signIns(out: string[] = []): DoctorDeps {
+  return defaultDeps({}, {
+    platform: "linux", home: tmpdir("pair-signin-"),
+    probe: async (cmd) => {
+      const tool = path.basename(cmd);
+      if (tool === "claude") return { code: 0, out: JSON.stringify({ loggedIn: !out.includes("claude") }) };
+      if (tool === "codex") return out.includes("codex") ? { code: 1, out: "Not logged in" } : { code: 0, out: "Logged in using ChatGPT" };
+      return { code: null, out: "" };
+    },
+  });
+}
+
 function ctx(home: string, extra: Partial<Ctx> = {}) {
   const out: string[] = [];
   const err: string[] = [];
   const c: Ctx = {
     dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { CLAUDE_CONFIG_DIR: path.join(home, "claude-config") },
-    out: (l) => out.push(l), err: (l) => err.push(l), hostname: "box", ...extra,
+    out: (l) => out.push(l), err: (l) => err.push(l), hostname: "box", doctor: signIns(), ...extra,
   };
   return { c, out, err, text: () => out.join("\n"), errText: () => err.join("\n") };
 }
@@ -324,6 +338,55 @@ describe("claw-connector pair", () => {
       assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), bytes);
       assert.match(again.text(), /approval hooks are already in/);
     });
+  });
+
+  test("an agent installed but not signed in is written commented out, with what to run before turning it on", async () => {
+    const home = tmpdir();
+    const work = tmpdir("w-");
+    const f = claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), []);
+    // claude and codex on PATH, Codex never signed in (codex login status: "Not logged in").
+    const a = ctx(home, { fetch: f, cwd: work, env: { PATH: fakePath("claude", "codex"), CLAUDE_CONFIG_DIR: path.join(home, "cc") }, doctor: signIns(["codex"]) });
+    assert.equal(await main(["pair", "abcd-efgh-jkmn", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
+    const file = path.join(home, "config", "agents.toml");
+    const toml = fs.readFileSync(file, "utf8");
+    assert.deepEqual(parseConfig(toml, { hostname: "box" }).agents.map((x) => x.id), ["claude", "claude-sessions"], "codex is not turned on");
+    assert.match(toml, /^# codex is installed here but cannot be used yet: Codex is not signed in on this machine\.\n# To offer it: codex login; then remove the "# " in front of the four lines below and run: claw-connector service install\n# \[\[agents\]\]\n# id = "codex"$/m);
+    assert.match(a.text(), new RegExp(`^wrote ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: claude, working in`, "m"));
+    assert.match(a.text(), /^codex is installed but cannot be used yet \(Codex is not signed in on this machine\), so it was left out: .*To offer it: codex login; then uncomment that block and run: claw-connector service install$/m);
+    // Uncommented as the note says, it is a working agent.
+    const on = toml.split("\n").map((l) => (/^# (\[\[agents\]\]|id = "codex"|preset = "codex"|roots = )/.test(l) ? l.slice(2) : l)).join("\n");
+    assert.deepEqual(parseConfig(on, { hostname: "box" }).agents.filter((x) => x.id !== "claude-sessions").map((x) => [x.id, x.roots]), [["claude", [work]], ["codex", [work]]]);
+  });
+
+  test("none signed in: the first installed is turned on anyway (agents.toml needs one) and pair says what it needs", async () => {
+    const home = tmpdir();
+    const f = claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), []);
+    const a = ctx(home, { fetch: f, cwd: tmpdir("w-"), env: { PATH: fakePath("claude", "codex"), CLAUDE_CONFIG_DIR: path.join(home, "cc") }, doctor: signIns(["claude", "codex"]) });
+    assert.equal(await main(["pair", "abcd-efgh-jkmn", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
+    const toml = fs.readFileSync(path.join(home, "config", "agents.toml"), "utf8");
+    assert.deepEqual(parseConfig(toml, { hostname: "box" }).agents.map((x) => x.id), ["claude", "claude-sessions"]);
+    assert.match(a.text(), /^claude: Claude Code is not signed in on this machine; its sessions fail until you run: claude auth login$/m);
+    assert.match(a.text(), /^codex is installed but cannot be used yet/m);
+    // A check that cannot tell (it throws, or answers nothing) never leaves an agent out.
+    const unsure = await chooseAgents({ PATH: fakePath("claude", "codex") }, async (id) => { if (id === "codex") throw new Error("no answer"); return null; });
+    assert.deepEqual([unsure.agents, unsure.parked], [["claude", "codex"], []]);
+  });
+
+  test("the sign-in check pair uses is doctor's, asked of the real programs", async () => {
+    const bin = tmpdir("bin-");
+    const prog = (name: string, body: string) => fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    const home = tmpdir("signin-home-");
+    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, CODEX_HOME: path.join(home, ".codex"), CLAUDE_CONFIG_DIR: path.join(home, ".claude") };
+    const d = defaultDeps(env, { home, platform: "linux" });
+    prog("codex", `echo "Not logged in"; exit 1`);
+    prog("claude", `echo '{"loggedIn": false}'`);
+    assert.deepEqual(await presetSignInProblem("codex", env, d), { detail: "Codex is not signed in on this machine", fix: "codex login" });
+    assert.deepEqual(await presetSignInProblem("claude", env, d), { detail: "Claude Code is not signed in on this machine", fix: "claude auth login" });
+    prog("codex", `echo "Logged in using ChatGPT"`);
+    prog("claude", `echo '{"loggedIn": true}'`);
+    assert.equal(await presetSignInProblem("codex", env, d), null);
+    assert.equal(await presetSignInProblem("claude", env, d), null);
+    assert.equal(await presetSignInProblem("cursor", env, d), null, "no check for it: never left out");
   });
 
   test("what pair writes and where agents may work", () => {

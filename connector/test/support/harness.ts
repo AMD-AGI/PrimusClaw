@@ -13,7 +13,7 @@ import type { Report } from "../../src/doctor.js";
 import { fileAudit, type Audit } from "../../src/audit.js";
 import { redactDeep } from "../../src/redact.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
-import { silentLogger } from "../../src/util.js";
+import { silentLogger, type Logger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
 import { onCleanup, tmpdir } from "./tmp.js";
 import { FAST } from "./timing.js";
@@ -68,6 +68,8 @@ export interface HarnessOptions {
   start?: boolean;
   /** The connector's health checks (doctor.ts); absent: none. */
   health?: () => Promise<Report>;
+  /** Where the connector logs (default: nowhere). */
+  log?: Logger;
 }
 
 export class Harness {
@@ -143,7 +145,7 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
       flush: () => file.flush?.() ?? Promise.resolve(),
     };
     this.connector = new Connector({
-      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit, log: silentLogger,
+      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit, log: o.log ?? silentLogger,
       version: "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health,
     });
   }

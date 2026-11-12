@@ -6,7 +6,8 @@
  *
  * Running it is the approval: the code is traded at Claw (`POST /v1/remote-agents/pairings/claim`, anonymous, the code is
  * the credential) for a connector grant, saved like any sign-in (0600). With no `agents.toml` yet, one is written for the
- * agents found on this machine, working in the folder the command was run in. The Claude Code hooks are offered as `init` offers
+ * agents found on this machine that can sign in (one installed but not signed in is written commented out, with the command
+ * that makes it usable), working in the folder the command was run in. The Claude Code hooks are offered as `init` offers
  * them (at a terminal, one question whose default is yes; the session hooks and the approval hooks, so a question a terminal
  * asks also reaches the chat). Then the connector is started as a service
  * (`service install`; a container without systemd gets the keep-alive supervisor), so the machine is online seconds later
@@ -18,6 +19,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { parseConfig, type ConnectorConfig } from "./config.js";
 import { saveCredentials } from "./credentials.js";
+import { defaultDeps, presetSignInProblem } from "./doctor.js";
 import { clearNeedsLogin } from "./health.js";
 import { configFile, credentialsFile, forgetIdentity } from "./paths.js";
 import { errMessage, isObject, secureUrl } from "./util.js";
@@ -57,10 +59,25 @@ export function detectAgents(env: NodeJS.ProcessEnv): string[] {
   return DETECTED_AGENTS.filter((a) => found(a.binary)).map((a) => a.preset);
 }
 
-/** The `agents.toml` pairing writes: the server, the machine's name, and each agent asking before it acts, in `root`. */
-export function pairedConfig(o: { server: string; name: string; agents: string[]; root: string }): string {
+/** An agent installed here that cannot be used yet: what is missing, and the one command that fixes it. */
+export interface ParkedAgent { id: string; why: string; fix: string }
+
+/**
+ * The `agents.toml` pairing writes: the server, the machine's name, and each agent asking before it acts, in `root`. An agent in
+ * `parked` (installed, not signed in) is written commented out, with what to run before it is turned on.
+ */
+export function pairedConfig(o: { server: string; name: string; agents: string[]; root: string; parked?: ParkedAgent[] }): string {
   const q = (s: string) => JSON.stringify(s);
-  const blocks = o.agents.map((id) => `[[agents]]\nid = ${q(id)}\npreset = ${q(id)}\nroots = [${q(o.root)}]`);
+  const one = (s: string) => s.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const block = (id: string) => `[[agents]]\nid = ${q(id)}\npreset = ${q(id)}\nroots = [${q(o.root)}]`;
+  const blocks = [
+    ...o.agents.map(block),
+    ...(o.parked ?? []).map((p) => [
+      `# ${p.id} is installed here but cannot be used yet: ${one(p.why)}.`,
+      `# To offer it: ${one(p.fix)}; then remove the "# " in front of the four lines below and run: claw-connector service install`,
+      ...block(p.id).split("\n").map((l) => `# ${l}`),
+    ].join("\n")),
+  ];
   return `# Written by "claw-connector pair". Everything that limits an agent lives here, on your machine; nothing Claw sends can
 # widen it. Each agent asks before it writes a file or runs a command, and your phone answers each question.
 # roots: the directories an agent may work in. Add more, then run: claw-connector service install
@@ -71,6 +88,22 @@ name = ${q(o.name)}
 
 ${blocks.join("\n\n")}
 `;
+}
+
+/**
+ * Which agents `pair` turns on: those installed here that can sign in (or of which that cannot be told). An installed one that
+ * cannot is parked, unless none can: an agents.toml needs one, so the first installed (else claude) is turned on anyway and
+ * `unready` says what it needs.
+ */
+export async function chooseAgents(env: NodeJS.ProcessEnv, signIn: (preset: string) => Promise<{ detail: string; fix: string } | null>): Promise<{
+  installed: string[]; agents: string[]; parked: ParkedAgent[]; unready: ParkedAgent[];
+}> {
+  const installed = detectAgents(env);
+  const checked = await Promise.all(installed.map(async (id) => ({ id, problem: await signIn(id).catch(() => null) })));
+  const ready = checked.filter((c) => !c.problem).map((c) => c.id);
+  const agents = ready.length ? ready : [installed[0] ?? "claude"];
+  const notReady = checked.flatMap((c) => (c.problem ? [{ id: c.id, why: c.problem.detail, fix: c.problem.fix }] : []));
+  return { installed, agents, parked: notReady.filter((p) => !agents.includes(p.id)), unready: notReady.filter((p) => agents.includes(p.id)) };
 }
 
 /**
@@ -165,15 +198,19 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
 
   // 2. What may run here: an agents.toml of its own when there is none.
   if (!cfg) {
-    let agents = detectAgents(ctx.env);
-    const none = agents.length === 0;
-    if (none) agents = ["claude"];
+    // An agent installed but not signed in would only fail every session (and make the machine's health red): left out.
+    const doctorDeps = ctx.doctor ?? defaultDeps(ctx.env);
+    const { installed, agents, parked, unready } = await chooseAgents(ctx.env, (id) => presetSignInProblem(id, ctx.env, doctorDeps));
     fs.mkdirSync(path.dirname(cfgFile), { recursive: true, mode: 0o700 });
     try {
       // "wx": created only if it is still not there, in one step.
-      fs.writeFileSync(cfgFile, pairedConfig({ server, name, agents, root }), { mode: 0o600, flag: "wx" });
+      fs.writeFileSync(cfgFile, pairedConfig({ server, name, agents, root, parked }), { mode: 0o600, flag: "wx" });
       ctx.out(`wrote ${cfgFile}: ${agents.join(", ")}, working in ${root}, asking before every write and command`);
-      if (none) ctx.out("no claude, codex or cursor-agent on PATH: claude is offered; install Claude Code, or edit the file for another agent");
+      if (installed.length === 0) ctx.out("no claude, codex or cursor-agent on PATH: claude is offered; install Claude Code, or edit the file for another agent");
+      for (const p of parked) {
+        ctx.out(`${p.id} is installed but cannot be used yet (${p.why}), so it was left out: its block in ${cfgFile} is commented out. To offer it: ${p.fix}; then uncomment that block and run: claw-connector service install`);
+      }
+      for (const p of unready) ctx.out(`${p.id}: ${p.why}; its sessions fail until you run: ${p.fix}`);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       // Written by something else since it was read: kept, but held to the same rule as one that was there before.

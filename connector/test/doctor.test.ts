@@ -293,9 +293,15 @@ roots = [${JSON.stringify(work)}]
       { code: "no_service", severity: "warn", detail: "not a service", fix: "claw-connector service install" },
       { code: "agent_not_signed_in", severity: "fail", agent: "fake2", detail: "Codex is not signed in on this machine", fix: "codex login" },
     ] };
-    const h = await Harness.create({ secondToml: "", timing: { healthMinGapMs: 0 }, health: async () => { calls++; if (calls === 2) throw new Error("boom"); return report; } });
+    const logged: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const log = { info: (msg: string, fields?: Record<string, unknown>) => { logged.push({ msg, fields }); }, warn() {}, error() {} };
+    const h = await Harness.create({ secondToml: "", timing: { healthMinGapMs: 0 }, log, health: async () => { calls++; if (calls === 2) throw new Error("boom"); return report; } });
     try {
       await h.claw.until("a heartbeat with health", () => h.claw.heartbeats.some((b: any) => b.agents[0].capabilities.health));
+      // The log line on the machine says what to do about each problem, not only its code.
+      assert.deepEqual(logged.find((l) => l.msg === "health")?.fields, {
+        problems: ["machine:no_service", "fake2:agent_not_signed_in"], fix: ["machine: claw-connector service install", "fake2: codex login"],
+      });
       const hb = [...h.claw.heartbeats].reverse().find((b: any) => b.agents[0].capabilities.health);
       const caps = Object.fromEntries(hb.agents.map((a: any) => [a.agent_id, a.capabilities.health]));
       assert.deepEqual(caps.fake.problems.map((p: any) => [p.code, p.scope]), [["no_service", "machine"]]);

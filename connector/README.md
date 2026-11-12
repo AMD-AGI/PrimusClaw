@@ -31,7 +31,8 @@ npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connect
 Run it in a terminal on the machine, in the folder the agents may work in. That is the whole setup: it installs the connector,
 pairs this machine with you (running the command is the approval; the code works once, for 10 minutes), writes `agents.toml`
 for the agents it finds (`claude`, `codex`, `cursor-agent` on your `PATH`), each asking before it writes a file or runs a
-command and working in that folder, and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
+command and working in that folder (one that is installed but not signed in, such as `codex` before `codex login`, is written
+commented out, and the command prints what to run before you turn it on), and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
 Before it starts the connector it asks once whether to add the Claude Code hooks to your Claude `settings.json` (Enter is yes):
 the session hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
 [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). Run where nobody can answer (a script,

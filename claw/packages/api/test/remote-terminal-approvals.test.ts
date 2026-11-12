@@ -25,6 +25,7 @@
  *   T10 the tool that asked (session_started `agent`) is named as its users know it (Claude Code, Codex, Cursor) in the item's title
  *      and every notice, and carried as `remote.tool`; a session_started that does not say, or says something else, keeps the agent's id
  *   T11 an item stored before Claw read the tool learns it from the session's session_started on its next request, title included
+ *   T11b the same for an item whose stored title an older Claw cut at 40 code points: renamed with the tool and a whole word
  *   T9 how the terminal asks too, as the request's `terminal_asks` says, in each language: Claude Code (absent) alongside the card,
  *      the first answer counting; Cursor (`after_card`) only after the card, which offers to decline or hand it back; Codex
  *      (`on_input`) once someone types there; the field goes on with the card, and a value no channel knows is read as absent
@@ -422,6 +423,24 @@ describe("approvals from terminals", { skip }, () => {
     const last = got.at(-1);
     assert.equal(last.text, "dev-box 上终端里的 Claude Code（修 CI，work/claw）在等你回答：Run: make test。在下面选，或直接在终端里回答，先答的算数。");
     assert.deepEqual([last.remote.agent, last.remote.tool], ["claude-sessions", "claude"]);
+  });
+
+  test("T11b an item whose stored title was cut at 40 code points is renamed too, now with the tool's name and a whole word", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const SESSIONS = { agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { roots: ["/home/u"] } };
+    const cid = await machine("alice", "gpu-dev-pod-7f3k2-node-0", [SESSIONS]);
+    const title = "修复 flaky 的 CI 任务并补上测试";
+    const sid = (await open("alice", cid, "conv-long", { agent_id: "claude-sessions", title })).body.data.session_id as string;
+    await events("alice", cid, sid, [
+      ["session_started", { origin: "terminal_hook", ref: "conv-long", title, agent: "claude", cwd: "/home/u/work/claw" }], ask("act-1"),
+    ]);
+    // The title an older Claw stored: the whole line cut at 40 code points, which left nothing of what was asked.
+    await w.q("UPDATE claw_work_items SET params = params - 'tool', title = 'gpu-dev-pod-7f3k2-node-0 claude-sessions' WHERE worker_session_id = $1", [`remote:${sid}`]);
+    await events("alice", cid, sid, [resolved("act-1", "terminal"), ask("act-2", "Run: make test")]);
+    const item = await remoteItem(sid);
+    assert.equal(item.params.tool, "claude");
+    assert.equal(item.title, "gpu-dev-pod-7f3k2-node-0 Claude Code：修复 flaky 的 CI 任…");
   });
 
   test("T6 new terminal sessions are limited per minute on their own", async () => {
