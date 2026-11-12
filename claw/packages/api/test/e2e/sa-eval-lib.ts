@@ -1456,33 +1456,37 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
 }
 
 /**
- * Whether a reply asks the person for what is missing, the check of `route: clarify`: it has a question mark; or it puts a choice to
- * them (`choices`: two options or more); or it asks in so many words, in Chinese or English ("请说明一下…", "请告诉我…", "Send me the
- * repository", "Could you tell me…"), which a router often writes instead of a question. A generic closing offer ("如果还有其他问题，
- * 随时告诉我", "Let me know if you need anything else") asks for nothing, so a reply that only answers and ends with one does not ask.
+ * Whether a reply asks the person for what is missing, the check of `route: clarify`: it puts a choice to them (`choices`: two
+ * options or more); or a sentence of it is a question; or it asks in so many words, in Chinese or English ("请说明一下…", "请告诉我…",
+ * "Send me the repository", "Could you tell me…"), which a router often writes instead of a question. A generic closing offer ("如果还有
+ * 其他问题，随时告诉我", "Let me know if you need anything else", "Any questions?") asks for nothing, so a reply that only answers and
+ * ends with one does not ask.
  */
 export function asksUser(text: string, choices = 0): boolean {
-  if (choices >= 2 || /[?？]/.test(text)) return true;
-  // The sentences of the reply (a list item or a line is one), less the generic offers that end an answer.
-  const sentences = text.split(/[。！!；;\n]+|(?<=[.])\s+/).filter((t) => t.trim() && !CLOSING_OFFER.test(t));
-  return sentences.some((t) => ASKS.some((re) => re.test(t.trim())));
+  if (choices >= 2) return true;
+  // The sentences of the reply (a list item or a line is one; each keeps its own end mark), less the generic offers that end an answer.
+  const sentences = text.split(/(?<=[。！!；;?？\n])|(?<=[.])\s+/).map((t) => t.trim()).filter((t) => t && !CLOSING_OFFER.test(t));
+  return sentences.some((t) => /[?？]/.test(t) || ASKS.some((re) => re.test(t)));
 }
 /** A closing offer that asks for nothing: "if there is anything else, tell me", "feel free to ask". */
 const CLOSING_OFFER = new RegExp([
   String.raw`(如果|如需|若|要是)(你|您)?(还)?(有|需要)(任何|其他|别的|更多)`,
   String.raw`随时(告诉|找|问|联系)`,
+  String.raw`^(请问)?(你|您)?还有(没有)?(任何|其他|别的|什么)(问题|疑问|需要|事情|要)`,
+  String.raw`^(你|您)?还(需要|要)(我)?(做|帮)?(点|些)?(什么|别的|其他)`,
   String.raw`\bif (you|there)('re| are| is)? (need|want|have|like|any|anything|more|other|further|questions?)\b`,
-  String.raw`\b(feel free|anything else|any (other|more|further) questions?)\b`,
+  String.raw`\b(feel free|anything else|any (other |more |further )?questions?)\b`,
 ].join("|"), "i");
 /** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
 const ASKS: readonly RegExp[] = [
   /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|给我|发给我|发我|回复|指明|明确|描述|选择|选一)/,
-  // "我确认一下" is the assistant saying what it does next, not asking.
-  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认)|告诉我|发给我|(?<![我来先去])(说明|补充|确认|明确)一下/,
+  // Asked of the person ("需要你补充一下"), not the assistant saying what it does next ("我确认一下", "先简单说明一下").
+  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认)|告诉我|发给我|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
   /(你|您)(是)?(指|想|要|希望|说的是)[^。\n]{0,40}还是/,
   /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
   /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
   /\b(let me know|tell me) (which|what|where|who|when|how|whether)\b/i,
+  /\bI (still )?need (to know|more (details|information|info)|a few details|some details|your|the (name|repo|repository|id|link|path|test|job|cluster|workload))\b/i,
   // Only as the sentence's own request ("Send me the repo", "If it is elsewhere, send me its name"), not "I'll send the report".
   /(^|[,:]\s*)[^\p{L}\p{N}]*(reply|respond) with\b|(^|[,:]\s*)[^\p{L}\p{N}]*send (me|those|these|them|the|it|its|their)\b|\bdo you mean\b/iu,
 ];

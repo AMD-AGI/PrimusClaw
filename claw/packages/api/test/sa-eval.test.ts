@@ -1400,6 +1400,9 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
       + "- **Test:** the name or path of the flaky test.\n\n📌 Send those two and I'll file it right away. Failure details, CI links and logs are optional.",
     "Could you tell me which cluster you mean",
     "你是想重新开之前的调研，还是新建一个事项",
+    "I need the repository and the failing test name.",
+    // A question stays a question with a closing offer after it.
+    "Which repository should the issue go in? Let me know if you need anything else.",
   ];
   for (const final of asked) {
     assert.ok(asksUser(final), final);
@@ -1421,6 +1424,12 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
     "Cancelled your training job. Feel free to ask if there is anything else.",
     "I'll send the report when it is ready.",
     "我先确认一下状态，稍后回复你。",
+    "我们先简单说明一下：提前开题是在规定日期前完成开题材料。",
+    // A closing offer is no question, with a question mark or without.
+    "Done. Any questions?",
+    "已经处理好了。还有其他问题吗？",
+    "提前开题就是提前做开题报告。还需要我做什么吗？",
+    "I opened it. Anything else I can help with?",
   ]) {
     assert.ok(!asksUser(final), final);
     assert.deepEqual(graded(final), ["route=clarify"], final);
