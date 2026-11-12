@@ -23,7 +23,10 @@
  *   K10 the save a worker's save_skill sends is checked the same way and recorded as the model's, from the worker
  *   K11 a disabled skill is kept but not offered to a turn
  *   K12 a delete is audited; a draft older than 24 hours is cleaned up, a newer one kept
- *   K13 the platform's own save (source auto) is refused when full and drops nothing
+ *   K13 the platform's own save (source auto) is refused when full and drops nothing, and so is an unproven one past
+ *       the probation limit
+ *   K14 the same save twice (a completion handled again) writes and records once
+ *   K15 a longer SKILL.md that, with the files the skill already has, passes 256 KB is refused
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -111,9 +114,9 @@ describe("personal skills: save", { skip }, () => {
     const shaV2 = row.content_sha;
     assert.equal(shaV2, svc.skillContentSha("## Steps\n1. list PRs\n2. group by repo", []));
 
-    // The same content again: nothing moves.
+    // The same content again: nothing moves, and nothing is recorded.
     const same = await save({ content: "## Steps\n1. list PRs\n2. group by repo" });
-    assert.ok(same.ok && same.version === 2);
+    assert.ok(same.ok && same.version === 2 && !same.changed);
 
     // A file write moves the fingerprint, and so does removing it.
     const added = await rest("POST", "/v1/users/me/skills/weekly-report/files", { file_path: "templates/report.md", content: "# Week {{n}}" });
@@ -127,10 +130,10 @@ describe("personal skills: save", { skip }, () => {
 
     const ev = await events();
     assert.deepEqual(ev.map((e) => [e.op, e.actor, e.version]), [
-      ["create", "api", 1], ["update", "model", 2], ["update", "api", 2], ["update", "api", 2], ["update", "api", 2],
+      ["create", "api", 1], ["update", "model", 2], ["update", "api", 2], ["update", "api", 2],
     ]);
     assert.equal(ev[1].session_id, "s-1");
-    assert.deepEqual(ev[3].detail, { file_path: "templates/report.md", file_action: "add" });
+    assert.deepEqual(ev[2].detail, { file_path: "templates/report.md", file_action: "add" });
   });
 
   test("K3 full is refused and drops nothing; an update still works; a delete frees a place; a revival when full is refused", async () => {
@@ -330,12 +333,41 @@ describe("personal skills: save", { skip }, () => {
     assert.deepEqual((await q("SELECT id FROM claw_skill_drafts")).map((r) => r.id), ["new"]);
   });
 
-  test("K13 the platform's own save is refused when full and drops nothing", async () => {
+  test("K13 the platform's own save is refused when full, or past the probation limit, and drops nothing", async () => {
     await fill(svc.USER_SKILL_MAX);
     const r = await svc.saveSkill("auto-made", "alice", "content", "auto", "s-1", "d");
     assert.deepEqual([r.ok, (r as any).error], [false, "full"]);
     assert.equal((await skills()).length, svc.USER_SKILL_MAX);
     assert.equal((await q("SELECT 1 FROM claw_skills WHERE deleted_at IS NOT NULL")).length, 0);
+
+    await q("TRUNCATE claw_skills");
+    for (let i = 0; i < 5; i++) assert.equal((await svc.saveSkill(`auto-${i}`, "alice", "c", "auto", "s-1", "d")).ok, true);
+    const sixth = await svc.saveSkill("auto-5", "alice", "c", "auto-pattern", "s-1", "d");
+    assert.deepEqual([sixth.ok, (sixth as any).error], [false, "full"]);
+    const rows = await skills();
+    assert.deepEqual(rows.map((x) => [x.skill_name, x.status, x.deleted_at]), [0, 1, 2, 3, 4].map((i) => [`auto-${i}`, "probation", null]), "no unproven skill was dropped for it");
+  });
+
+  test("K14 the same save twice writes and records once", async () => {
+    const input = { name: "twice", content: "## Steps\n1. a", files: [{ path: "references/a.md", content: "a" }] };
+    const first = await save(input, { origin: "worker", actor: "model", sessionId: "s-1" });
+    const again = await save(input, { origin: "worker", actor: "model", sessionId: "s-1" });
+    assert.ok(first.ok && first.changed && again.ok && !again.changed);
+    assert.equal(again.version, 1);
+    assert.deepEqual((await events()).map((e) => e.op), ["create"]);
+    const sameFile = await svc.updateSkillFile("alice", "twice", { file_path: "references/a.md", content: "a" }, { actor: "model", origin: "worker" });
+    assert.equal(sameFile.ok, true);
+    assert.deepEqual((await events()).map((e) => e.op), ["create"], "an unchanged file records nothing");
+  });
+
+  test("K15 a longer SKILL.md that passes 256 KB with the stored files is refused", async () => {
+    const files = [0, 1, 2].map((i) => ({ path: `references/f${i}.md`, content: "x".repeat(svc.SKILL_FILE_MAX_BYTES) }));
+    assert.equal((await save({ name: "heavy", content: "short", files })).ok, true);
+    // 20000 four-byte characters: within the character limit, 80000 bytes.
+    const r = await save({ name: "heavy", content: "😀".repeat(svc.SKILL_MD_MAX_CHARS) });
+    assert.deepEqual([r.ok, (r as any).error], [false, "too_large"]);
+    const [row] = await skills();
+    assert.deepEqual([row.content, row.version], ["short", 1], "the skill is as it was");
   });
 
   test("another user's skills are not reachable", async () => {

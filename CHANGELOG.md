@@ -117,11 +117,12 @@ release version, and its `appVersion` stays `latest`.
   the least used one, SKILL.md at most 20000 characters (was 2000 on the routes, 5000 from a turn), a description 300,
   a file 64 KB (was 10 KB), 20 files and 256 KB per skill (was 50 KB), no credential (the answer names the file and
   line, never the text) and no instruction to override the agent (`scanInjection`, Chinese included). The platform's own saves are refused when full as
-  well, and checked for length, credentials and injection. A refused route
+  well (and past five unproven ones, where the oldest unproven skill used to be deleted), checked for length,
+  credentials and injection, kept within the per-skill limits, and audited. A refused route
   write answers with `reason` and, for a secret or injection, `at: {file, line, kind}` beside `error`. Schema, added
   at start-up: `claw_skills.enabled`, `origin`, `content_sha`, `last_used_at`, `invocation`, and the tables
   `claw_skill_events` (every save, refusal, file change, rollback and delete) and `claw_skill_drafts` (unused until
-  saving from a conversation is confirmed by the user; drafts older than 24 hours are deleted daily).
+  saving from a conversation is confirmed by the user; drafts older than 24 hours are deleted daily) (#801).
 - An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
   a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
   (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,
