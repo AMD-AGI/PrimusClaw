@@ -46,8 +46,8 @@ export function chatSurface(channel: unknown): ChatSurface {
 /**
  * The chat surface a router turn answers on: the channel its message came through (a message that names none is the Teams
  * worker's, whatever the person wrote from before). Only a turn that answers no message of the person's (a worker's report woke
- * the assistant: its message has no row here) takes the channel of the person's latest message that names one; else the default.
- * The latest is read as `chosenReplyLanguage` reads it, along the session's own rows.
+ * the assistant: its message has no row here) takes the channel of the person's latest message, read exactly as
+ * `chosenReplyLanguage` reads it (the newest row, one row); a latest message that names none is the default's.
  */
 export async function turnChatSurface(q: Querier, sessionId: string, messageId: string): Promise<ChatSurface> {
   type Row = { channel: unknown };
@@ -57,8 +57,7 @@ export async function turnChatSurface(q: Querier, sessionId: string, messageId: 
   )).rows[0] as Row | undefined;
   if (own !== undefined) return chatSurface(own.channel);
   const latest = (await q(
-    `SELECT channel_context->>'channel' AS channel FROM claw_assistant_messages
-      WHERE session_id = $1 AND coalesce(channel_context->>'channel', '') <> '' ORDER BY received_at DESC LIMIT 1`,
+    "SELECT channel_context->>'channel' AS channel FROM claw_assistant_messages WHERE session_id = $1 ORDER BY received_at DESC LIMIT 1",
     [sessionId],
   )).rows[0] as Row | undefined;
   return chatSurface(latest?.channel);
