@@ -102,7 +102,8 @@ jobs:
 
         # Changes to the workflow itself should rebuild all images described by
         # this workflow, so a CI-only edit is still validated end-to-end.
-        if echo "$CHANGED_FILES" | grep -qE '^\.github/workflows/build\.yaml$'; then
+        # The image scan's script is part of every image's check, so the same applies to it.
+        if echo "$CHANGED_FILES" | grep -qE '^(\.github/workflows/build\.yaml|\.github/scripts/image-scan\.sh)$'; then
           WORKFLOW_CHANGED=true
           echo "workflow_changed=true" >> $GITHUB_OUTPUT
         else
@@ -262,6 +263,40 @@ jobs:
           grep -q "^personal_agent_build_info{version=\"$VERSION\"," <<<"$METRICS" \
             || { echo "::error::/metrics does not name version $VERSION"; podman logs pa-smoke; exit 1; }
           podman stop -t 10 pa-smoke >/dev/null
+
+      # Before anything is pushed, the image goes through the scan that gates the publication of a public image: the
+      # same Trivy release and parameters, no ignore list (.github/scripts/image-scan.sh says what fails and why). A
+      # pull request builds, and so scans, only the images whose inputs it changes; a push to main or a tag scans
+      # what it is about to push, and a finding stops the push.
+      - name: Export the image for the scan
+        env:
+          NAME: ${{ matrix.name }}
+          IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image-scan"
+          buildah push "localhost/$NAME:$IMAGE_VERSION" "docker-archive:$RUNNER_TEMP/image-scan/$NAME.tar:$NAME:$IMAGE_VERSION"
+
+      - name: Day of the scanner's database cache
+        id: scan-day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # Trivy's vulnerability database and checks bundle, one cache a day. Trivy still replaces a database past its
+      # own next-update time, exactly as on any runner, so the cache saves the download and changes no answer.
+      - name: Restore the scanner's database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+            ~/.cache/trivy/policy
+          key: image-scan-trivy-0.74.0-${{ steps.scan-day.outputs.day }}
+          restore-keys: image-scan-trivy-0.74.0-
+
+      - name: Scan the image as its publication will
+        env:
+          NAME: ${{ matrix.name }}
+        run: bash .github/scripts/image-scan.sh "$NAME" "$RUNNER_TEMP/image-scan/$NAME.tar"
 
       - name: Push with Buildah
         if: github.event_name != 'pull_request' && matrix.push != 'no'
