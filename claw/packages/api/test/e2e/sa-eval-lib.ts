@@ -1462,7 +1462,7 @@ export function replyLanguage(lang: "zh" | "en", text: string, titles: readonly 
  * 其他问题，随时告诉我", "Let me know if you need anything else", "Any questions?") asks for nothing, so a reply that only answers and
  * ends with one does not ask. An offer is a clause that opens with one: "If you need more details, please send the repository" still
  * asks (its second clause), and so does "Which repository should I use if you have any other requirements?" (a question that opens
- * with no offer). Known to pass wrongly: "Done, any questions?" (an answer and an offer in one sentence). Not counted: a question
+ * with no offer). Not counted: a question
  * without its mark ("哪个仓库", "Which repository should I use"), and "我需要仓库名" (as often the assistant's own next step, "我需要
  * 确认仓库名"); routers mark their questions and ask in so many words, and the judge reads every reply.
  */
@@ -1473,12 +1473,16 @@ export function asksUser(text: string, choices = 0): boolean {
   return sentences.some((sentence) => {
     const clauses = sentence.split(/[,，]/).map((c) => c.replace(/^[^\p{L}\p{N}]+/u, "").trim()).filter(Boolean);
     const offer = (c: string): boolean => CLOSING_OFFER.test(c);
-    // A question whose first or last clause is no offer ("If you want, which repo?"; "Which repo, if you have any preference?").
-    if (/[?？]/.test(sentence) && clauses.length && (!offer(clauses[0]!) || !offer(clauses.at(-1)!))) return true;
+    // The question mark is the last clause's: a question unless that clause is an offer ("Done, any questions?"), or a conditional
+    // one after a question ("Which repo should I use, if you have any preference?"; "If you want, which repo?" asks too).
+    const last = clauses.at(-1);
+    if (/[?？]/.test(sentence) && last !== undefined
+      && (!offer(last) || (CONDITIONAL.test(last) && clauses.length > 1 && !offer(clauses[0]!)))) return true;
     const kept = clauses.filter((c) => !offer(c)).join(", ");
     return kept !== "" && ASKS.some((re) => re.test(kept));
   });
 }
+const CONDITIONAL = /^(如果|如需|如有|若|要是|假如|if)\b|^(如果|如需|如有|若|要是|假如)/i;
 /** A clause that opens with an offer asking for nothing: "if there is anything else", "随时告诉我", "Any questions?", "feel free". */
 const CLOSING_OFFER = new RegExp([
   String.raw`^(如果|如需|若|要是|假如)(你|您)?(还|再)?(有|需要)(任何|其他|别的|更多|什么)?(问题|疑问|需要|帮助|事|其他|别的)`,
@@ -1499,18 +1503,19 @@ const CLOSING_OFFER = new RegExp([
 ].join("|"), "i");
 /** Words that ask the person for something: a request for information, or one of two alternatives to pick. */
 const ASKS: readonly RegExp[] = [
-  /请(你|您)?(再|先)?(具体)?(说明|说一下|说下|讲一下|讲讲|告诉|补充|提供|确认|给出|回复|指明|明确|描述|选择|选一)/,
+  /请(你|您)?(直接|再|先|具体|简单)*(说明|说一下|说下|讲一下|讲讲|告诉|告知|补充|提供|确认|给出|回复|指明|明确|描述|选择|选一)/,
+  /请(你|您)?(直接|再)*(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)/,
   // Asked of the person ("需要你补充一下"), not the assistant saying what it does next ("我确认一下", "先简单说明一下").
-  /请问|麻烦(你|您)?(说明|告诉|补充|提供|确认|发|给)|(?<!(你|您|过|经|曾|已)[^，,。]{0,6})告诉我|发给我(?!们)|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
+  /请问|麻烦(你|您)?(说明|告诉|告知|补充|提供|确认|发|给)|(?<!(你|您|过|经|曾|已)[^，,。]{0,6})告诉我|发给我(?!们)|(你|您)(再|先)?(说明|补充|确认|明确|说|讲)一下/,
   // "把仓库名发我", "请把…发我", "需要你提供…", "我需要知道…" / "我需要仓库名" (not "我需要先查一下": what the assistant does next).
   /(?<![我会来])把.{1,30}(发|告诉|给|发给)我(?!们)|请(你|您)?把|需要(你|您)(再)?(提供|告诉|补充|说明|确认|给|发|指定|选)/,
   // "我需要知道…"; a bare "我需要…" is not counted: "我需要确认仓库名" is the assistant's own next step as often as a request.
-  /我(还|们)?需要知道/,
+  /我(还|们)?需要知道(?!的)/,
   // An imperative that opens the clause and names what to give ("说一下要做什么", "给我题目和要求"; not "给我一点时间").
   /^(请)?(再)?(说|讲)(一下|一声)|^(请)?(给|发)我(一下)?(题目|主题|仓库|名|名称|名字|链接|地址|编号|ID|具体|详细|更多信息|要求|内容)|^(请)?(你|您)?告知(我|我们)/,
   /(你|您)(是)?(指|想|希望|说的是)[^。\n]{0,40}还是/,
   /\b(could|can|would) you (please )?(tell|share|clarify|confirm|specify|send|give|provide|let me know|point me|say)\b/i,
-  /\bplease (tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
+  /\bplease (directly |just |also )?(tell|share|clarify|confirm|specify|send|provide|give|let me know|reply|choose|pick|say)\b/i,
   /\b(let me know|tell me) (which|what|where|who|when|how|whether)\b/i,
   /\bI (still )?need (to know|more (details|information|info)|a few details|some details|your|the (name|repo|repository|id|link|path|test|job|cluster|workload))\b/i,
   // Only as the sentence's own request ("Send me the repo", "If it is elsewhere, send me its name"), not "I'll send the report".
