@@ -28,6 +28,8 @@
  *       removes nothing
  *   P12 a skill's text goes to the model only: not into a log line or the turn's events
  *   P13 a skill changed between its SKILL.md and its files is refused whole, never served mixed
+ *   P14 where the sandbox's shell cannot remove what `write` created (a per-run identity), the write goes on and the
+ *       run empties every file it wrote instead
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -162,6 +164,7 @@ test("P1 listed under their own heading, most recently used first, no text; manu
   assert.deepEqual(reads, [], "nothing is read from the API for a turn that uses no skill");
   assert.equal(r.attached, 0, "and no sandbox is opened");
   assert.ok(/"name":"load_skill"/.test(r.prompt), "load_skill is offered");
+  assert.ok(r.prompt.includes("or a personal skill the user names"), "and says it loads personal skills");
 });
 
 test("P2 load_skill reads from the API with the turn's fingerprint, once; manual loads by name; counted and reported used", async () => {
@@ -312,7 +315,10 @@ test("P9 none of it where the API did not send it, or in a run that acts as a us
   ]) {
     resetStore();
     const r = await run(over, [{ tool: "load_skill", input: { name: "weekly-report" } }, { text: "done" }]);
-    assert.equal(r.prompt.includes("Personal Skills (the user's own"), false, `${JSON.stringify(over)}: no list`);
+    assert.equal(r.prompt.includes("Personal Skills"), false, `${JSON.stringify(over)}: no list, and load_skill's description does not mention them`);
+    if (/"name":"load_skill"/.test(r.prompt)) {
+      assert.ok(r.prompt.includes("Load a skill listed under 'Platform Skills' in the prompt: with only `name`"), `${JSON.stringify(over)}: load_skill described as before`);
+    }
     assert.equal(r.prompt.includes("Write the user's weekly report"), false);
     assert.equal(r.bodies[1].includes("WR-BODY-MARKER"), false, `${JSON.stringify(over)}: not served`);
     assert.deepEqual(reads, [], `${JSON.stringify(over)}: nothing read from the API`);
@@ -434,4 +440,31 @@ test("P13 a skill changed between its SKILL.md and its files is refused whole, n
   } finally {
     world.internal = inner;
   }
+});
+
+test("P14 where the sandbox's shell cannot remove the copy, the write goes on and the run empties every file it wrote", async () => {
+  resetStore();
+  const h = fakeHands();
+  const denied = {
+    ...h,
+    async callTool(name: string, args: Record<string, unknown>) {
+      h.calls.push({ name, args });
+      // A shell under a per-run identity: what the sandbox's own `write` created is not its to remove.
+      if (name === "bash" && String(args.command).startsWith("rm -rf")) return "exit 1\nstdout: \nstderr: rm: cannot remove '/workspace/.skills/.personal-skills/weekly-report/SKILL.md': Permission denied";
+      return "ok";
+    },
+  };
+  const r = await run({}, [
+    { tool: "bash", input: { command: "bash /workspace/.skills/.personal-skills/weekly-report/scripts/collect.sh" } },
+    { text: "done" },
+  ], denied as never);
+  const script = r.calls.findIndex((c) => c.name === "bash" && String(c.args.command).includes("collect.sh") && !String(c.args.command).startsWith("rm"));
+  assert.ok(script >= 0, "the command ran: a copy that could not be cleaned first does not fail it");
+  const emptied = r.calls.map((c, at) => ({ c, at })).filter(({ c }) => c.name === "write" && c.args.contents === "");
+  assert.deepEqual(emptied.map(({ c }) => String(c.args.path)).sort(), [
+    ".skills/.personal-skills/weekly-report/SKILL.md",
+    ".skills/.personal-skills/weekly-report/assets/logo.png",
+    ".skills/.personal-skills/weekly-report/scripts/collect.sh",
+  ], "every file the run wrote is emptied");
+  assert.ok(emptied.every(({ at }) => at > script), "when the run ends");
 });

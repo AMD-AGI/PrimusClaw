@@ -11,7 +11,7 @@ import { metrics } from "../infra/metrics.js";
 import { downloadSkill } from "../tools/resolve.js";
 import { lookupTool, type LookupFailure } from "../tools/lookup.js";
 export { platformToolsBase } from "../tools/lookup.js";
-import { uploadDirToSandbox } from "../sandbox/write.js";
+import { listRegularFiles, uploadDirToSandbox, writeFileToSandbox } from "../sandbox/write.js";
 import { PERSONAL_SKILLS_DIR } from "../workspace/excludes.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import { ENV_PLACEHOLDER_NAME_RE } from "../clients/mcp-config.js";
@@ -405,8 +405,11 @@ export class LazyDefaultSkills {
    */
   private writing = new Map<string, Promise<boolean>>();
   private lastHands: HandsClient | null = null;
-  /** Sandboxes this run has written a personal skill into, so the run can take them out again (`removePersonal`). */
-  private personalWrittenTo = new Set<HandsClient>();
+  /**
+   * The files of personal skills this run has written, by sandbox (paths as written), so the run can take them out
+   * again (`removePersonal`).
+   */
+  private personalWritten = new Map<HandsClient, Set<string>>();
 
   constructor(
     private skills: DefaultSkill[],
@@ -468,17 +471,32 @@ export class LazyDefaultSkills {
    * kept for the session's next message), and a copy left there would be readable by a later turn that is not served
    * the skill: one after the user turned it off or deleted it, or after the session stopped being one that gets them.
    * The next turn that needs one writes it again. Best effort; never throws.
+   *
+   * Removed with bash. Where the sandbox runs the model's commands under an identity of their own
+   * (HANDS_CHILD_UID_MIN/MAX), that identity cannot remove what the sandbox's `write` created; then each file this run
+   * wrote is overwritten with nothing through `write`, which can, so no text of a skill is left either way.
    */
   async removePersonal(): Promise<void> {
     const dir = path.posix.join(this.sessionDir, ".skills", PERSONAL_SKILLS_DIR);
-    for (const hands of this.personalWrittenTo) {
+    for (const [hands, files] of this.personalWritten) {
       try {
         await removeSandboxDir(hands, dir);
+        continue;
       } catch (err) {
-        logger.warn({ err: (err as Error).message }, "skill.user_remove_failed");
+        logger.info({ err: (err as Error).message }, "skill.user_remove_by_shell_failed");
       }
+      let failed = 0;
+      for (const file of files) {
+        try {
+          await writeFileToSandbox(hands, file, "");
+        } catch {
+          failed++;
+        }
+      }
+      if (failed) logger.warn({ failed, files: files.size }, "skill.user_empty_failed");
+      else logger.info({ files: files.size }, "skill.user_emptied_in_sandbox");
     }
-    this.personalWrittenTo.clear();
+    this.personalWritten.clear();
   }
 
   /** One skill's upload; reports a failure and resolves false rather than throwing. */
@@ -493,12 +511,22 @@ export class LazyDefaultSkills {
       // A personal skill is staged from the API on first use; the first write may be that use.
       if (user && !fs.existsSync(s.localDir) && s.restage) s.localDir = await s.restage();
       if (user) {
-        // From a clean directory: a copy an earlier run left (it may have ended before it could remove it) can hold a
-        // file this version no longer has.
-        this.personalWrittenTo.add(hands);
-        await removeSandboxDir(hands, path.posix.join(this.sessionDir, sub));
+        // From a clean directory where the sandbox lets one remove it: a copy an earlier run left (it may have ended
+        // before it could take it out) can hold a file this version no longer has. Where it cannot (see
+        // `removePersonal`), the write goes on over what is there.
+        if (!this.personalWritten.has(hands)) this.personalWritten.set(hands, new Set());
+        try {
+          await removeSandboxDir(hands, path.posix.join(this.sessionDir, sub));
+        } catch (err) {
+          logger.info({ name: s.name, err: (err as Error).message }, "skill.user_clean_before_write_failed");
+        }
       }
       const attempt = async () => {
+        if (user) {
+          // Recorded before the upload: a part-written skill is taken out too.
+          const mine = this.personalWritten.get(hands)!;
+          for (const f of listRegularFiles(s.localDir)) mine.add(path.posix.join(base, path.relative(s.localDir, f).split(path.sep).join("/")));
+        }
         const up = await uploadDirToSandbox(hands, s.localDir, base);
         const shippable = up.total - up.skipped;
         if (up.failed > 0 || (shippable > 0 && up.uploaded === 0) || up.total === 0) throw new Error("upload failed");

@@ -74,6 +74,9 @@ export class SkillStore {
 
   has(name: string): boolean { return this.byName.has(name); }
 
+  /** Whether any of the user's personal skills is served (the tool's description says so only then). */
+  get hasPersonal(): boolean { return [...this.byName.values()].some((s) => s.source === "user"); }
+
   /** The skill served under `name`, if any. */
   get(name: string): DefaultSkill | undefined { return this.byName.get(name); }
 

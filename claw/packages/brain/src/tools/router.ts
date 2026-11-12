@@ -201,10 +201,12 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
 export const INHERIT_MODEL = "inherit";
 
 /** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
-function loadSkillSchema(): ToolSchema {
+function loadSkillSchema(personal = false): ToolSchema {
   return {
     name: LOAD_SKILL_TOOL,
-    description: "Load a skill listed under 'Platform Skills' or 'Personal Skills' in the prompt, or a personal skill the user names: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
+    description: (personal
+      ? "Load a skill listed under 'Platform Skills' or 'Personal Skills' in the prompt, or a personal skill the user names: with only"
+      : "Load a skill listed under 'Platform Skills' in the prompt: with only") + " `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
     input_schema: {
       type: "object", properties: {
         name: { type: "string", description: "The skill's name, as listed in the prompt" },
@@ -840,7 +842,7 @@ export class ToolRouter {
     const out = this.allToolSchemas().filter((t) =>
       (this.memoryEnabled || !MEMORY_TOOLS.has(t.name))
       && (this.skillEvolutionEnabled || !SKILL_WRITE_TOOLS.has(t.name)));
-    return this.skillStore ? [...out, loadSkillSchema()] : out;
+    return this.skillStore ? [...out, loadSkillSchema(this.skillStore.hasPersonal)] : out;
   }
 
   private allToolSchemas(): ToolSchema[] {
