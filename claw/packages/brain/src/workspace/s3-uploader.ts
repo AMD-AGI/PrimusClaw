@@ -1082,8 +1082,7 @@ async function downloadRound(
  * Rehydrate a freshly-created sandbox with the "current" S3 workspace state
  * (top-level files, excluding historical claw-<mid> archive subdirs). Called
  * after ensureHands creates a new workload; skipped when reusing an existing
- * one. Files go down in batches Hands accepts (`downloadRound`); failures are
- * retried up to MAX_UPLOAD_ROUNDS with freshly signed URLs.
+ * one. Failures are retried up to MAX_UPLOAD_ROUNDS with freshly signed URLs.
  */
 export async function syncWorkspaceFromS3(
   hands: HandsClient,
