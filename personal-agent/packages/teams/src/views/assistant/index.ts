@@ -3,7 +3,7 @@
 
 /**
  * The assistant's cards (teams_agent/render.py work_button, work_buttons, work_card, work_done_card, note_card, board_buttons,
- * board_card, asked_section, action_buttons, action_card, confirm_write_card). What they say is core's
+ * board_card, asked_section, action_buttons, action_card, confirm_write_card), and a choice put to the person. What they say is core's
  * (`assistantCardText`, the work item helpers); this draws it on the card kit. The buttons carry only the id of the card the
  * worker recorded: what a press means is read from the record, never from the click.
  */
@@ -25,6 +25,8 @@ import {
   type ActionCardModel,
   type BoardModel,
   type BoardRetry,
+  type ChoiceCardModel,
+  type ChoiceChosenModel,
   type ConfirmWriteModel,
   type Lang,
   type ReviewAskedOfOther,
@@ -39,6 +41,7 @@ import type { CardElement } from "../../cards/json.js";
 import type { Meaning, Tone } from "../../cards/kit.js";
 import {
   BUTTONS_MAX,
+  TITLE_MAX,
   badges,
   buttons,
   execute,
@@ -237,8 +240,48 @@ function confirmWrite(model: ConfirmWriteModel): TeamsMessage {
   );
 }
 
+/**
+ * A choice put to the person: the words (when the card holds them), the options as radio buttons (check boxes when several may be
+ * picked), and Send. Send carries the card's id and, as its input, the places of the options picked: what it sends is read from
+ * the record. The person may also just reply in the chat.
+ */
+function choiceCard(model: ChoiceCardModel): TeamsMessage {
+  const lang = cardLang(model.lang, model.text, ...model.options);
+  const t = assistantCardText.in(lang);
+  const body: CardElement[] = [
+    header(model.multiple ? t.choiceTitleMany : t.choiceTitle, { tone: "accent", emoji: "question" }),
+  ];
+  if (model.text) body.push(text(model.text));
+  body.push({
+    type: "Input.ChoiceSet",
+    id: "choice",
+    style: "expanded",
+    isMultiSelect: model.multiple,
+    choices: model.options.map((option, i) => ({ title: clip(option, LABEL_MAX), value: String(i) })),
+  });
+  if (model.note) body.push(text(model.note, { weight: "Bolder" }));
+  body.push(note(t.choiceTyped));
+  const send = execute(t.choiceSend, "primusclaw.assistant_choice", {
+    primusclaw: "assistant_choice",
+    card: model.cardId,
+  });
+  return message(body, buttons([send]));
+}
+
+/** What replaces a choice card once sent: what was sent, under the words it answered. */
+function choiceChosen(model: ChoiceChosenModel): TeamsMessage {
+  const lang = cardLang(model.lang, model.text, ...model.chosen);
+  const t = assistantCardText.in(lang);
+  const answer = model.chosen.join(t.choiceJoin);
+  const body = [header(t.choiceSent({ answer: clip(answer, TITLE_MAX) }), { tone: "good", emoji: "good" })];
+  if (model.text) body.push(text(model.text, { subtle: true }));
+  return message(body);
+}
+
 export const assistantRenderers = {
   actionCard,
+  choiceCard,
+  choiceChosen,
   board,
   confirmWrite,
   workCard,

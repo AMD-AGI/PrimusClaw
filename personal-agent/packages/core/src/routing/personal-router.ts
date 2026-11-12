@@ -110,11 +110,13 @@ export class PersonalRouter {
     const userId = chat.sender.id;
     // The assistant understands this person's messages: only an exact command is read here
     const understood = assistant.understands(userId);
-    const switching = understood && remote.enabled && switchCommand(message.text) !== null;
-    const forAssistant = understood && !exactCommand(message.text, { menuCommand, isKnownCommand }) && !switching;
-    const text = understood ? menuCommand(message.text) : this.text.textOf(message);
+    const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
+    const switching = understood && !choice && remote.enabled && switchCommand(message.text) !== null;
+    const forAssistant =
+      understood && (choice || !exactCommand(message.text, { menuCommand, isKnownCommand })) && !switching;
+    const text = understood && !choice ? menuCommand(message.text) : this.text.textOf(message);
     learnLang(this.ctx.deps.store, userId, message.text);
-    if (await this.beforeCredential(message, chat, text, forAssistant)) return;
+    if (!choice && (await this.beforeCredential(message, chat, text, forAssistant))) return;
     const key = await this.ctx.credentials.credential(chat, true);
     if (key === undefined) return;
     if (forAssistant && !this.text.talksToAgent(message)) await this.text.understand(message, chat, key);

@@ -57,6 +57,12 @@
    },
    {
     "type": "table",
+    "name": "assistant_choice_cards",
+    "tbl_name": "assistant_choice_cards",
+    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "assistant_confirm_cards",
     "tbl_name": "assistant_confirm_cards",
     "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
@@ -703,6 +709,91 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_assistant_cards_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "assistant_choice_cards": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "card_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "aad_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "text",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 3,
+      "name": "options_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 4,
+      "name": "multiple",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 5,
+      "name": "chosen_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'[]'",
+      "pk": 0
+     },
+     {
+      "cid": 6,
+      "name": "lang",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "state",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'open'",
+      "pk": 0
+     },
+     {
+      "cid": 8,
+      "name": "created_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_assistant_choice_cards_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0
@@ -3047,6 +3138,12 @@
    },
    {
     "type": "table",
+    "name": "assistant_choice_cards",
+    "tbl_name": "assistant_choice_cards",
+    "sql": "CREATE TABLE assistant_choice_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', options_json TEXT NOT NULL, multiple INTEGER NOT NULL,\n  chosen_json TEXT NOT NULL DEFAULT '[]', lang TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
+   },
+   {
+    "type": "table",
     "name": "assistant_confirm_cards",
     "tbl_name": "assistant_confirm_cards",
     "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
@@ -3693,6 +3790,91 @@
      {
       "seq": 0,
       "name": "sqlite_autoindex_assistant_cards_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
+   "assistant_choice_cards": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "card_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "aad_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "text",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 3,
+      "name": "options_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 4,
+      "name": "multiple",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 5,
+      "name": "chosen_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'[]'",
+      "pk": 0
+     },
+     {
+      "cid": 6,
+      "name": "lang",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "''",
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "state",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'open'",
+      "pk": 0
+     },
+     {
+      "cid": 8,
+      "name": "created_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_assistant_choice_cards_1",
       "unique": 1,
       "origin": "pk",
       "partial": 0

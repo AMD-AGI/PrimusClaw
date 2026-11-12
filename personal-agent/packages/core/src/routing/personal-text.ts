@@ -29,9 +29,11 @@ export class PersonalText {
 
   /**
    * What the person wrote, with a word of the commands menu read as its command and a sentence help teaches read as the
-   * command it means; a sentence for what this chat cannot do right now stays words.
+   * command it means; a sentence for what this chat cannot do right now stays words. A choice picked on the assistant's card
+   * is the words picked, never a command.
    */
   textOf(message: InboundMessage, group = false): string {
+    if (message.choice === true) return message.text;
     const { github, assistant, remote, config } = this.ctx.deps;
     const userId = group ? undefined : message.sender.id;
     const on = (test: (id: string) => boolean): boolean => userId !== undefined && test(userId);
@@ -63,6 +65,10 @@ export class PersonalText {
 
   async onText(message: InboundMessage, chat: Chat, key: string): Promise<void> {
     const text = this.textOf(message);
+    if (message.choice === true) {
+      await this.sentOn(message, chat, key); // (an answer: no command runs, whatever its words)
+      return;
+    }
     if (parseCommand(text) === "unlink" && !message.text.startsWith("/")) {
       // the menu's word, sent by a tap, does not delete a key: the typed `/unlink` is the confirmation
       await chat.say(routingText.in(chat.lang()).unlinkAsk);
@@ -121,7 +127,8 @@ export class PersonalText {
     const sent = messageText.withLinks(text, message);
     const prompt = messageText.withQuote(sent, quote);
     const files = await this.attachments(message, chat, toAgent);
-    const control = this.sessionControl(userId, prompt, toAgent, quote, files, text);
+    // (a choice picked on the assistant's card is an answer, never a switch of sessions)
+    const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, files, text);
     if (control && assistant.understands(userId)) {
       await this.understand(message, chat, key); // (the switch is put to the person as a button)
     } else if (prompt && toAgent && !control) {

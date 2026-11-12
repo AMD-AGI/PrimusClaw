@@ -18,8 +18,8 @@ import {
 import { DeviceFlowError, deviceLogin } from "./deviceflow.js";
 import { applyRootSandbox, bypassUnavailableWarnings } from "./claude-mode.js";
 import {
-  approvalHooksStatus, codexApprovalHooksStatus, codexHooksFile, HooksError, hooksStatus, installApprovalHooks, installCodexApprovalHooks, installHooks, settingsFile,
-  uninstallApprovalHooks, uninstallCodexApprovalHooks, uninstallHooks,
+  approvalHooksStatus, codexApprovalHooksStatus, codexHooksFile, HooksError, hooksStatus, type HooksStatus, installApprovalHooks, installCodexApprovalHooks,
+  installHooks, settingsFile, uninstallApprovalHooks, uninstallCodexApprovalHooks, uninstallHooks,
 } from "./hooks.js";
 import { approvalSocketFile } from "./approvals.js";
 import { offerAfter, offerApprovalHooks } from "./approval-offer.js";
@@ -74,11 +74,11 @@ export interface Ctx {
   /** How `service` runs systemctl/launchctl, which program a unit starts, and where the units go (tests set them). */
   service?: Partial<ServiceDeps>;
   /**
-   * Asks the person at the terminal a yes/no question; absent when nobody can answer (stdin or stdout is not a
-   * terminal: a script, a pipe, CI). `init` asks before it changes Claude Code's own settings, and without this it
-   * changes nothing there and prints the command that would.
+   * Asks the person at the terminal a yes/no question, `dflt` being what an empty answer (Enter) means; absent when nobody
+   * can answer (stdin or stdout is not a terminal: a script, a pipe, CI). `init` and `pair` ask before they change Claude
+   * Code's own settings, and without this they change nothing there and print the command that would.
    */
-  ask?: (question: string) => Promise<boolean>;
+  ask?: (question: string, dflt?: boolean) => Promise<boolean>;
   /**
    * Install the pinned adapters into the state directory (adapter-install.ts): at init, service install, the start of
    * run, and when a session needs one. The command line sets it; a test leaves it off, so nothing is downloaded.
@@ -114,10 +114,11 @@ interface Command {
 /** Every subcommand, in the order the overall help lists them. The single source for dispatch and for help. */
 export const COMMANDS: Readonly<Record<string, Command>> = {
   init: {
-    usage: "init [--approval ask|never | --approval AGENT=ask|never ...] [--hooks | --no-hooks] [--no-probe]",
-    about: `write a sample agents.toml. In a terminal it then asks whether to add the Claude Code session
-hooks to Claude's settings.json (see "hooks"); --hooks adds them without asking, --no-hooks
-does not, and when nobody can answer they are not added. Agents ask before every write and command by default;
+    usage: "init [--approval ask|never | --approval AGENT=ask|never ...] [--hooks | --no-hooks] [--no-approval-hooks] [--no-probe]",
+    about: `write a sample agents.toml. In a terminal it then asks (default yes) whether to add the Claude
+Code hooks to Claude's settings.json: the session hooks and the approval hooks (see "hooks");
+--hooks adds them without asking, --no-hooks does not, --no-approval-hooks leaves the approval
+hooks out, and when nobody can answer nothing is added. Agents ask before every write and command by default;
 "--approval never" (or "--approval claude=never") lets phone sessions run like your
 terminal, with no per-step approval. Agents are: ${SAMPLE_AGENTS.join(", ")}.`,
     run: (rest, ctx) => cmdInit(rest, ctx),
@@ -140,9 +141,10 @@ trust the hook the next time it starts`,
     usage: "pair CODE --server URL",
     about: `connect this machine with the one-time code your chat gave you ("连接我的开发环境"): writes
 agents.toml if there is none (the agents found here, working in this folder), saves the
-sign-in and starts the service. [--name HOST] [--no-start]`,
+sign-in, offers the Claude Code hooks as init does, and starts the service.
+[--name HOST] [--no-start] [--hooks | --no-hooks] [--no-approval-hooks]`,
     run: (rest, ctx) => cmdPair(rest, ctx, {
-      runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers),
+      runningPid, stop: (c) => cmdStop(c, true), start: (c) => cmdService(["install"], c, serviceHelpers), hooks: setupHooks,
     }),
   },
   login: {
@@ -321,7 +323,7 @@ function parseApproval(values: string[]): Partial<Record<string, Approval>> | st
 }
 
 async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
-  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, hooks: { type: "boolean" }, "no-hooks": { type: "boolean" }, "no-probe": { type: "boolean" } } });
+  const { values } = parseArgs({ args, strict: true, options: { approval: { type: "string", multiple: true }, hooks: { type: "boolean" }, "no-hooks": { type: "boolean" }, "no-approval-hooks": { type: "boolean" }, "no-probe": { type: "boolean" } } });
   if (values.hooks && values["no-hooks"]) { ctx.err("init: --hooks and --no-hooks contradict each other; pass one"); return EXIT.usage; }
   const approval = parseApproval(values.approval ?? []);
   if (typeof approval === "string") { ctx.err(approval); return EXIT.usage; }
@@ -344,7 +346,7 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
   // A dev pod's home directory is often thrown away with the pod: say so now, not after the first restart.
   const where = ephemeralWhere(ctx.dirs.config);
   if (where) ctx.out(`note: ${where}`);
-  await initHooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"] });
+  await setupHooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] });
   // Installed first, so the probe below (and the first phone session) starts the adapter without a download.
   await installAdapters(ctx, true);
   if (ctx.probe && !values["no-probe"]) {
@@ -357,29 +359,51 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
   return EXIT.ok;
 }
 
+/** What `init` and `pair` were told about the Claude Code hooks: add them without asking, leave them out, leave out the approval hooks. */
+export interface HookChoice { hooks: boolean; noHooks: boolean; noApprovals: boolean }
+
 /**
- * The hooks are a convenience, and they live in Claude Code's own settings file, which is the user's, not ours: they are
- * added only when asked for (--hooks) or agreed to at the terminal. A file that cannot be merged into is reported, and
- * init still succeeds.
+ * `init` and `pair`: the Claude Code hooks, the session hooks and (unless `--no-approval-hooks`) the approval hooks. They live in
+ * Claude Code's own settings file, which is the user's, not ours: they are added when asked for (`--hooks`) or agreed to at the
+ * terminal (one question, Enter is yes), and never when nobody can answer, which prints the command instead. Hooks of ours
+ * already there were agreed to before: they are brought up to date (a moved program) without asking again, and only what is
+ * missing is asked about. A file that cannot be merged into is reported, and the command still succeeds.
  */
-async function initHooks(ctx: Ctx, o: { hooks: boolean; noHooks: boolean }): Promise<void> {
+export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
   if (o.noHooks) return;
   const dir = defaultClaudeDir(ctx);
-  if (!fs.existsSync(dir)) { ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: claw-connector hooks install`); return; }
-  // Hooks of ours already there were agreed to before: they are brought up to date (a moved program) without asking again.
-  if (!o.hooks && !hooksPresent(dir)) {
-    const yes = ctx.ask ? await ctx.ask(`Add two hooks (SessionStart, SessionEnd) to ${settingsFile(dir)}, so Claw can tell which Claude Code sessions are open in a terminal? [y/N] `) : false;
-    if (!yes) {
-      ctx.out(`left ${settingsFile(dir)} alone${ctx.ask ? "" : " (no terminal to ask in)"}. Without the session hooks, a Claude Code session open in a terminal is found by listing processes only; to add them: claw-connector hooks install`);
-      return;
+  const later = o.noApprovals ? "claw-connector hooks install" : "claw-connector hooks install --approvals";
+  if (!fs.existsSync(dir)) { ctx.out(`no Claude Code directory at ${dir}; once you use Claude Code, run: ${later}`); return; }
+  let session = o.hooks || present(hooksStatus, dir);
+  let approvals = !o.noApprovals && (o.hooks || present(approvalHooksStatus, dir));
+  const askSession = !session;
+  const askApprovals = !o.noApprovals && !approvals;
+  if (askSession || askApprovals) {
+    let yes = false;
+    if (ctx.ask) {
+      ctx.out(`Claude Code hooks for ${settingsFile(dir)} (only entries marked --managed-by claw-connector; nothing else in it changes):`);
+      if (askSession) ctx.out("  session hooks (SessionStart, SessionEnd): Claw can tell which Claude Code sessions are open in a terminal");
+      if (askApprovals) ctx.out("  approval hooks: a question Claude Code asks in a terminal (run a command, edit a file, approve a plan, a multiple-choice question) also comes to your chat; the terminal keeps asking and the first answer wins");
+      yes = await ctx.ask("Add them? [Y/n] ", true);
+    }
+    if (yes) { session = true; approvals ||= askApprovals; } else {
+      const left = askSession && askApprovals ? "the Claude Code hooks" : askSession ? "the session hooks" : "the approval hooks";
+      const without = [
+        askSession ? "a Claude Code session open in a terminal is found by listing processes only" : "",
+        askApprovals ? "a question it asks waits for you at that terminal only" : "",
+      ].filter(Boolean).join(", and ");
+      ctx.out(`did not add ${left} to ${settingsFile(dir)}${ctx.ask ? "" : " (no terminal to ask in)"}. Without them, ${without}; to add them: ${later}`);
     }
   }
-  installForInit(ctx, dir);
+  try {
+    if (session) ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
+    if (approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));
+  } catch (e) { ctx.err(`hooks: ${errMessage(e)} (everything else is set up; fix it and run: ${later})`); }
 }
 
-/** Whether any hook of ours is in this directory's settings already; a settings file that cannot be read counts as no. */
-function hooksPresent(dir: string): boolean {
-  try { return hooksStatus(dir).events.length > 0; } catch { return false; }
+/** Whether any hook of that set is in this directory's settings already; a settings file that cannot be read counts as no. */
+function present(status: (dir: string) => HooksStatus, dir: string): boolean {
+  try { return status(dir).events.length > 0; } catch { return false; }
 }
 
 /**
@@ -397,10 +421,6 @@ async function installAdapters(ctx: Ctx, initFallback: boolean): Promise<void> {
     agents = SAMPLE_ACTIVE.map((id) => ({ command: PRESETS[id]!.command, args: PRESETS[id]!.args, env: {} }));
   }
   await installAll(store, agents, ctx.env, (l) => ctx.out(`adapters: ${l}`));
-}
-
-function installForInit(ctx: Ctx, dir: string): void {
-  try { ctx.out(describeInstall(dir, installOne(ctx, dir).changed)); } catch (e) { ctx.err(`hooks: ${errMessage(e)} (everything else is set up; fix it and run: claw-connector hooks install)`); }
 }
 
 // --- hooks -----------------------------------------------------------------------------
@@ -439,6 +459,9 @@ function installApprovalsOne(ctx: Ctx, dir: string) {
 
 const describeInstall = (dir: string, changed: boolean): string =>
   changed ? `installed the Claude Code session hooks in ${settingsFile(dir)}` : `the Claude Code session hooks are already in ${settingsFile(dir)}`;
+const describeApprovals = (dir: string, changed: boolean): string => changed
+  ? `installed the approval hooks in ${settingsFile(dir)}: questions Claude Code asks in a terminal also go to your chat, and the first answer wins ("claw-connector hooks uninstall --approvals" takes them out)`
+  : `the approval hooks are already in ${settingsFile(dir)}`;
 
 const defaultCodexDir = (ctx: Ctx): string => path.resolve(ctx.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"));
 
@@ -496,9 +519,7 @@ function cmdHooks(args: string[], ctx: Ctx): number {
         if (values["config-dir"] === undefined && !fs.existsSync(dir)) { ctx.err(`no Claude Code directory at ${dir}; pass --config-dir to name one`); code = EXIT.failure; continue; }
         ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
         // The approval hooks are added only when asked for: they put what a terminal asks on the owner's phone.
-        if (approvals) ctx.out(installApprovalsOne(ctx, dir).changed
-          ? `installed the approval hooks in ${settingsFile(dir)}: questions Claude Code asks in a terminal also go to your chat, and the first answer wins`
-          : `the approval hooks are already in ${settingsFile(dir)}`);
+        if (approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));
       } else if (sub === "uninstall") {
         // `--approvals` takes out only the approval hooks; without it, both sets go.
         if (!approvals) ctx.out(uninstallHooks(dir).changed ? `removed the Claude Code session hooks from ${settingsFile(dir)}` : `no session hooks of ours in ${settingsFile(dir)}`);

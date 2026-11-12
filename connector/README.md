@@ -32,7 +32,11 @@ Run it in a terminal on the machine, in the folder the agents may work in. That 
 pairs this machine with you (running the command is the approval; the code works once, for 10 minutes), writes `agents.toml`
 for the agents it finds (`claude`, `codex`, `cursor-agent` on your `PATH`), each asking before it writes a file or runs a
 command and working in that folder, and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
-The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
+Before it starts the connector it asks once whether to add the Claude Code hooks to your Claude `settings.json` (Enter is yes):
+the session hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
+[Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). Run where nobody can answer (a script,
+a pipe), it adds nothing and prints the command that would; `--no-hooks` skips the question, `--no-approval-hooks` leaves the
+approval hooks out. The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
 here; either ends this machine's sign-in for good. An `agents.toml` that is already there is kept as it is.
 
 The pairing is a connector grant: it reaches the connector routes of Claw for this one machine and nothing else, and it ends
@@ -63,6 +67,7 @@ claw-connector status    # after you edit it: prints a "problem:" line if the fi
 claw-connector doctor    # checks the machine (step 5), then starts each agent's adapter, opens a session (no prompt) and checks the modes it offers
 ```
 
+At a terminal, `init` also asks once whether to add the Claude Code hooks (Enter is yes; see `init` under [Commands](#commands)).
 `init` runs the adapter check of `doctor` at the end. `doctor` says `ok` for an agent whose phone sessions will open, and otherwise a
 `problem:` line with the fix, for example an agent whose sessions would be refused with `mode_unavailable`.
 
@@ -407,8 +412,8 @@ is noticed even if it has exited by the next prompt: that prompt goes to a fresh
 while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
 conversation between two reads, which is shorter than anything that can take a turn, is not seen.
 
-The first thing asked is the terminal itself. `claw-connector hooks install` (or `claw-connector init`, when you say yes at
-its question or pass `--hooks`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+The first thing asked is the terminal itself. `claw-connector hooks install` (or `claw-connector init` and `claw-connector pair`,
+when you say yes at their question or pass `--hooks`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
 program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
 process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
 (this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
@@ -543,11 +548,16 @@ session stops the agent process; it never deletes the conversation.
 
 A Claude Code session you started yourself, in your own terminal, still stops and waits for you when it wants to run a command,
 edit a file, leave plan mode or put a multiple-choice question to you. With the approval hooks installed, that question is also
-put to you in the chat as a card with the same choices, so you can answer it away from the screen:
+put to you in the chat as a card with the same choices, so you can answer it away from the screen. `claw-connector init` and
+`claw-connector pair` offer them together with the session hooks (one question at the terminal, Enter is yes; `--no-approval-hooks`
+leaves them out); on a machine set up before, or to add them by hand:
 
 ```sh
-claw-connector hooks install --approvals      # opt-in; "hooks uninstall --approvals" takes them out again
+claw-connector hooks install --approvals      # "hooks uninstall --approvals" takes them out again
 ```
+
+A setup that already has the session hooks gets only the approval hooks offered when `init` or `pair` runs again at a terminal;
+run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead.
 
 This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
 background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
@@ -626,7 +636,8 @@ the hook is done. So:
 
 | Command | |
 |---|---|
-| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks before adding the Claude Code session hooks to Claude's `settings.json`; `--hooks` adds them without asking, `--no-hooks` skips them, and with nobody to answer (a script, a pipe) they are not added and the `hooks install` command is printed instead. |
+| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks] [--no-approval-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks once (`[Y/n]`, Enter is yes) before adding the Claude Code hooks to Claude's `settings.json`: the session hooks and the approval hooks (only those not there yet are offered); `--hooks` adds them without asking, `--no-hooks` skips them, `--no-approval-hooks` leaves the approval hooks out, and with nobody to answer (a script, a pipe) nothing is added and the `hooks install --approvals` command is printed instead. |
+| `pair CODE --server URL [--name HOST] [--no-start] [--hooks \| --no-hooks] [--no-approval-hooks]` | Connect this machine with the one-time code from the chat (see [Fastest](#fastest-pair-from-the-chat-one-command)); offers the Claude Code hooks as `init` does, then starts the service. |
 | `hooks install\|uninstall\|status [--approvals \| --codex]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). With `--codex`, the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |

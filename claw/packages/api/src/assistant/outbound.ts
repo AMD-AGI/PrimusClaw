@@ -33,6 +33,7 @@ import {
   type AssistantConfirmWrite,
   type AssistantHeldWrite,
   type AssistantRemoteNotice,
+  type AssistantSayChoice,
   type AssistantSayPayload,
   type AssistantSaySource,
   type WorkItemNeedsYouPayload,
@@ -100,6 +101,8 @@ export interface SayInput {
   amendNotice?: boolean;
   /** The replies it suggests, already checked (`suggested.ts`): carried by its event as `suggested_replies`. */
   suggested?: string[];
+  /** The choice it puts to the user, already checked (`choices.ts`): carried by its event as `choices`. */
+  choice?: AssistantSayChoice;
   /** The turn was refused something for want of a confirmed identity (`markIdentityRefused`): carried by its event as `needs_identity`. */
   needsIdentity?: boolean;
   /**
@@ -172,6 +175,7 @@ type ToStore =
   | (ToStoreBase & {
     type: "assistant.say"; item: ItemRow | null; fallback?: boolean; confirmAction?: AssistantConfirmAction; confirmWrite?: AssistantConfirmWrite;
     sources?: AssistantSaySource[]; files?: AssistantFile[]; amends?: string; replaces?: string; suggested?: string[];
+    choice?: AssistantSayChoice;
     /** A system notice's turn (the message it answers): kept on its payload, so a later say of that turn finds it (`turnAnnouncedStart`). */
     noticeOfTurn?: string;
     /** A router say's turn, kept on its payload the same way, so a later say of that turn finds it (`turnFirstSay`). */
@@ -191,6 +195,7 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...base, type: m.type, ...(m.item ? { item: snapshot(m.item) } : {}), ...(m.confirmAction ? { confirm_action: m.confirmAction } : {}),
       ...(m.sources?.length ? { sources: m.sources } : {}),
       ...(m.suggested?.length ? { suggested_replies: m.suggested.map(redact) } : {}),
+      ...(m.choice ? { choices: { options: m.choice.options.map(redact), multiple: m.choice.multiple } } : {}),
       ...(m.confirmWrite ? { confirm_write: m.confirmWrite } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
       ...(m.amends ? { amends: m.amends } : {}),
@@ -322,6 +327,7 @@ async function sendSayEvent(
     ...(payload.item ? { item: payload.item } : {}),
     ...(payload.type === "assistant.say" && payload.sources ? { sources: payload.sources } : {}),
     ...(payload.type === "assistant.say" && payload.suggested_replies ? { suggested_replies: payload.suggested_replies } : {}),
+    ...(payload.type === "assistant.say" && payload.choices ? { choices: payload.choices } : {}),
     // What the message puts to the person to press, as a channel gets it: a web client, and an evaluation reading the session,
     // must see the card the channel draws, not only its words.
     ...(payload.type === "assistant.say" && payload.confirm_action ? { confirm_action: payload.confirm_action } : {}),
@@ -656,6 +662,7 @@ export async function recordAssistantSay(input: SayInput, deps: SayDeps = {}): P
       const said = item && item.item_id === input.fromEarlierConversationItem ? withMovedPrefix(text) : text;
       return storeOne({
         type: "assistant.say", sayId, userId: input.userId, sessionId: input.sessionId, text: said, item, sources: input.sources, suggested: input.suggested,
+        ...(input.choice ? { choice: input.choice } : {}),
         ...(input.turnMessageId ? { turnMessageId: input.turnMessageId } : {}),
         ...(input.needsIdentity ? { needsIdentity: true } : {}),
         // After the turn's start notice a say adds to that notice (`amends`); otherwise a later say takes the place of the turn's first one.

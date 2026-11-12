@@ -4,6 +4,7 @@
 /** What the assembly wires of the assistant (one line each; the views and work-item text are exported from the package root). */
 export { AssistantActionClicks } from "./action-handler.js";
 export { AssistantActions } from "./actions.js";
+export { AssistantChoiceClicks } from "./choice-clicks.js";
 export { Board } from "./board.js";
 export { AssistantChat as AssistantChatService } from "./chat.js";
 export type { AssistantChatOptions } from "./chat.js";

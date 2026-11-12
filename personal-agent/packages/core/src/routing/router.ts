@@ -141,7 +141,7 @@ export class Router {
    */
   private async withinRate(message: InboundMessage, chat: Chat): Promise<boolean> {
     const group = message.conversation.kind === "group";
-    if ((group && !message.mentioned) || Router.isStop(message.text, group)) return true;
+    if ((group && !message.mentioned) || (message.choice !== true && Router.isStop(message.text, group))) return true;
     const { limits, securityEvent, metrics } = this.ctx.deps;
     const verdict = limits.checkMessage(chat.sender.id);
     if (verdict.allowed) return true;
