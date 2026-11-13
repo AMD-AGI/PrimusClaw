@@ -77,7 +77,7 @@ import { silentTurnNotice, turnLostNotice } from "../src/assistant/router-turn-e
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
-  apiQuery, caseSays, cardsOf, cardsShownBy, clearsSkillDrafts, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
@@ -1490,4 +1490,17 @@ test("S-skills a skills case clears the identity's waiting skill drafts and thei
     say(3, "m1", "plain answer"),
   ], ["m1"]);
   assert.deepEqual([...shown], ["c1"]);
+  // A draft the attempt answered without making or showing it came from elsewhere; its own draft, and a card it showed, are its own.
+  const tc = (name: string, input: Record<string, unknown>, result = "{}") => ({ id: name, name: `mcp__assistant__${name}`, input, ok: true, result, at: 0 });
+  assert.deepEqual(foreignDraftAnswers([
+    tc("skill_draft", { name: "meeting-notes" }, '{"ok":true,"draft_id":"d-own"}'),
+    tc("skill_save", { draft_id: "d-own" }),
+    tc("confirmation_answer", { confirmation_id: "c1", decision: "allow" }, '{"saved skill":"x"}'),
+  ], shown), []);
+  assert.deepEqual(foreignDraftAnswers([
+    tc("skill_save", { draft_id: "d-old" }),
+    tc("confirmation_answer", { confirmation_id: "c9", decision: "allow" }, '{"result":{"name":"meeting-notes","skill":true}}'),
+    tc("confirmation_answer", { confirmation_id: "m7", decision: "allow" }, '{"merged":true}'),
+    tc("skill_save", { name: "standup", content: "x" }),
+  ], shown), ["skill_save of draft d-old", "confirmation_answer of card c9"]);
 });

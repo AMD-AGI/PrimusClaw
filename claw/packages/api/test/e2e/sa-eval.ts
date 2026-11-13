@@ -106,9 +106,10 @@
  *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
  *                     `deny`; once more after the last attempt); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
  *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`.
- *                     A skills case (area skills) clears, before each attempt, the skill drafts waiting for the identity and their
- *                     cards (`clearSkillDrafts`: the card's Discard with EVAL_SEND_TOKEN_CMD's token, then the skill routes' Discard
- *                     for a draft with no card), whatever this setting: drafts are the user's, shown in every session.
+ *                     Every assistant-mode attempt first clears the skill drafts waiting for the identity and their cards
+ *                     (`clearSkillDrafts`: the card's Discard with EVAL_SEND_TOKEN_CMD's token, then the skill routes' Discard for a
+ *                     draft with no card), whatever this setting: drafts are the user's, shown in every session; and after it, a skill
+ *                     draft card it did not show, or a draft it answered and did not make, makes it an infra error (not graded).
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -171,7 +172,7 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
+  freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
@@ -1331,7 +1332,7 @@ async function closeCards(): Promise<WaitingCard[] | null> {
 }
 
 /**
- * Before each attempt of a skills case: every skill draft left waiting for the identity (by another case, or an earlier attempt) is
+ * Before each attempt (assistant mode): every skill draft left waiting for the identity (by another case, or an earlier attempt) is
  * discarded, as the person would: its card's Discard
  * (`deny` on the card's decision route, with EVAL_SEND_TOKEN_CMD's token: the person's answer, which discards the draft too), then any
  * draft with no card left (`DELETE /v1/users/me/skill-drafts/:id`, the skill routes' Discard). The drafts are the user's, not a
@@ -1340,10 +1341,11 @@ async function closeCards(): Promise<WaitingCard[] | null> {
  * (`infra:`) when one could not be read or is still there after: the attempt is not graded. A draft the server makes later still from an
  * earlier turn is waited for first (EVAL_SKILL_SETTLE_S), and one that comes anyway is caught after the attempt (`foreignSkillCardError`).
  */
-async function clearSkillDrafts(): Promise<void> {
+async function clearSkillDrafts(settleFirst: boolean): Promise<void> {
   // The server drafts a skill after a turn has ended, in the background (`skill-auto-draft.ts`: one model call, retried, under about
-  // three minutes): the session is idle by then, so the clear first waits that long from the end of the run's last turns.
-  const settle = LAST_TURNS_END + SKILL_SETTLE_MS - Date.now();
+  // three minutes): the session is idle by then, so a skills case's clear first waits that long from the end of the run's last turns.
+  // Any other case does not wait: a draft that lands anyway is caught after the attempt (`foreignSkillCardError`).
+  const settle = settleFirst ? LAST_TURNS_END + SKILL_SETTLE_MS - Date.now() : 0;
   if (settle > 0) {
     log(`waiting ${Math.ceil(settle / 1000)} s for a skill the server may still draft from the last turns before clearing drafts`);
     await pause(settle);
@@ -1390,10 +1392,13 @@ async function skillCardsNow(): Promise<WaitingCard[] | null> {
  * draft the server made late from an earlier case's turn), and the assistant may have been shown it: the attempt is not graded (an
  * `infra:` error, run again once). Erring that way: a card that came only after the attempt's turns is counted too.
  */
-async function foreignSkillCardError(events: readonly LiveEvent[], messageIds: readonly string[]): Promise<string | null> {
+async function foreignSkillCardError(events: readonly LiveEvent[], messageIds: readonly string[], calls: readonly ToolCall[]): Promise<string | null> {
+  const own = cardsShownBy(events, messageIds);
+  // One the attempt answered (saved or discarded) is no longer waiting: its own calls say so.
+  const answered = foreignDraftAnswers(calls, own);
+  if (answered.length) return `infra: the attempt answered a skill draft it did not make (${answered.join(", ")}): not graded`;
   const waiting = await skillCardsNow();
   if (!waiting) return "infra: the skill draft cards could not be read after the attempt: not graded";
-  const own = cardsShownBy(events, messageIds);
   const foreign = waiting.filter((w) => !own.has(w.id));
   return foreign.length
     ? `infra: ${foreign.length} skill draft card(s) not of this attempt appeared while it ran (a draft made late from an earlier turn): not graded`
@@ -1680,9 +1685,9 @@ async function main(): Promise<void> {
                 throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
               }
               preflightFailed = true;
-              // Skill drafts are cleared once no earlier turn is running: one past its attempt may still draft (its own skill_draft, or
-              // the server's draft after it ends).
-              if (clearsSkillDrafts(c)) await clearSkillDrafts();
+              // Skill drafts are cleared before every case (they are the user's, shown in every session), once no earlier turn is
+              // running: one past its attempt may still draft (its own skill_draft, or the server's draft after it ends).
+              await clearSkillDrafts(clearsSkillDrafts(c));
             }
             memBefore = await memoriesBefore(filled);
             ATTEMPT_MEMORIES_BEFORE = memBefore;
@@ -1706,9 +1711,10 @@ async function main(): Promise<void> {
             CASE_CARDS.set(c.id, own);
           }
           if (waiting) a = { ...a, cardsWaiting: waiting.length };
-          if (MODE === "assistant" && clearsSkillDrafts(c) && !a.error && !preflightFailed) {
+          if (MODE === "assistant" && !a.error && !preflightFailed) {
             const mine = RUN_MESSAGES.filter((id) => !earlier.has(id));
-            const foreign = await foreignSkillCardError(session!.stream.events, mine).catch(() => "infra: the skill draft cards could not be read after the attempt: not graded");
+            const calls = turnCalls(session!.stream.events, mine);
+            const foreign = await foreignSkillCardError(session!.stream.events, mine, calls).catch(() => "infra: the skill draft cards could not be read after the attempt: not graded");
             if (foreign) a = { ...a, pass: false, error: foreign };
           }
           // A say the server refused for its hourly cap is the run's failure, not the assistant's.
