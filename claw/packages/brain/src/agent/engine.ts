@@ -456,14 +456,15 @@ export class AgentEngine {
     // The user's connections from earlier turns are reused (`mcp-pool.ts`), the servers are connected side by side, and the run
     // waits at most MCP_CONNECT_BUDGET_MS for them: a server not ready by then is left out of this turn and offered on the next.
     // A review session's review tools are the exception (MCP_REQUIRED_CONNECT_BUDGET_MS): the API offers them only to a session that
-    // acts as a user to review one pull request, its turn can do nothing without them, and it has no next turn to wait for (a cold
-    // connection past 2 s once ended a requested review with no tool call at all and woke the reviewer for it).
+    // acts as a user (`withhold_sandbox_keys`) to review one pull request, its turn can do nothing without them, and it has no next turn
+    // to wait for (a cold connection past 2 s once ended a requested review with no tool call at all and woke the reviewer for it). A
+    // server of that name in any other turn waits no longer than the rest.
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp, {
           pool: MCP_POOL_ENABLED ? mcpPool : undefined,
           userId: request.user_id,
           budgetMs: MCP_CONNECT_BUDGET_MS,
-          required: REVIEW_SERVER_NAME in mergedMcp ? [REVIEW_SERVER_NAME] : [],
+          required: request.withhold_sandbox_keys === true && REVIEW_SERVER_NAME in mergedMcp ? [REVIEW_SERVER_NAME] : [],
           requiredBudgetMs: MCP_REQUIRED_CONNECT_BUDGET_MS,
         })
       : { clients: new Map(), schemas: [], failed: [], deferred: [], closeAll: async () => {} };

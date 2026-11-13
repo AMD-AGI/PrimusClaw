@@ -1195,6 +1195,14 @@ describe("assistant review items", { skip }, () => {
     assert.equal(ri.reviewState({ ...base, writes: [...firstHead, wr("gh_review_submit", "ok", "submitted", 3, B), wr("gh_pr_merge", "ok", "merged", 4, B)] } as never).boardState, "done");
     const again = ri.reviewState({ ...base, writes: [...firstHead, wr("gh_review_submit", "ok", "submitted", 3, B), wr("gh_pr_merge", "refused", "merge_state_not_clean", 4, B, "DIRTY")] } as never);
     assert.deepEqual([again.boardState, again.boardState === "in_progress" && again.authorWait], ["in_progress", "conflict"]);
+    // The same with the first approval a confirmed one (a held write the reviewer confirmed): it is of the older head too, and never
+    // reads as the review of the new one; a confirmed approval of the new head does.
+    const confirmedA = [{ status: "submitted", kind: "review", at: 1, headSha: A }];
+    const viaCard = ri.reviewState({ ...base, confirmations: confirmedA, writes: [wr("gh_pr_merge", "refused", "merge_state_not_clean", 2, A, "DIRTY"), ...onB] } as never);
+    assert.deepEqual([viaCard.boardState, viaCard.summary], ["needs_you", "the review of AMD-AGI/PrimusClaw#810 ended without posting anything"]);
+    const staleA = ri.reviewState({ ...base, confirmations: [{ status: "stale", kind: "merge", at: 2, headSha: A }], writes: [...firstHead, ...onB] } as never);
+    assert.doesNotMatch(staleA.summary, /lapsed/);
+    assert.equal(ri.reviewState({ ...base, confirmations: [...confirmedA, { status: "submitted", kind: "review", at: 5, headSha: B }], writes: [...firstHead, ...onB] } as never).boardState, "done");
     // The control: with no write on a newer head, the first head's refusal is still what the item stands at.
     const control = ri.reviewState({ ...base, writes: firstHead } as never);
     assert.deepEqual([control.boardState, control.summary], ["needs_you", "the merge of AMD-AGI/PrimusClaw#810 was refused: merge_state_not_clean"]);

@@ -1118,7 +1118,7 @@ export interface ReviewFacts {
   reviewOnly: boolean;
   pr: PrRef;
   /** Every confirmation of the session; a pending one that ran out is `expired`. `at` is when it was last decided, or opened. */
-  confirmations: Array<{ status: string; kind: string; at: number }>;
+  confirmations: Array<{ status: string; kind: string; at: number; headSha?: string }>;
   /**
    * The session's review and merge calls: `result` ok or refused, `detail` the status or the refusal, `mergeState` GitHub's merge state a
    * merge was refused on (`merge_state_not_clean`), else null or unset.
@@ -1275,7 +1275,8 @@ export function reviewState(f: ReviewFacts): ReviewState {
     return { boardState: "done", outcome: "accepted", summary: `${pr} was merged on GitHub` };
   }
   // A write of a head the review has since moved past says nothing of where it stands: once the review ran again on new commits (after
-  // its author pushed), what it did on them decides, never a refusal or a review of the older head (N32).
+  // its author pushed), what it did on them decides, never a refusal, a review or a closed held write of the older head (N32). The latest
+  // write call names the head the review is at; a held write still open (pending, merging) is judged above whatever its head.
   const lastWrite = latest(f.writes.filter((w) => WRITE_TOOLS.has(w.tool)));
   const current = (w: { headSha?: string }): boolean => !w.headSha || !lastWrite?.headSha || w.headSha === lastWrite.headSha;
   const merged = f.confirmations.find((c) => c.status === "merged" || c.status === "queued")
@@ -1296,7 +1297,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
   }
   if (f.turn === "running") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   const submitted = latest([
-    ...f.confirmations.filter((c) => c.status === "submitted"),
+    ...f.confirmations.filter((c) => c.status === "submitted" && current(c)),
     ...f.writes.filter((w) => w.tool === "gh_review_submit" && w.result === "ok" && (w.detail === "submitted" || w.detail === "already_submitted") && current(w)),
   ]);
   // A review the server stopped before its turn ran: the owner's to look at, with the reason; never a review in progress for ever.
@@ -1304,7 +1305,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
     return { boardState: "needs_you", reportKind: "failed", summary: `${pr} not run: ${f.halted.message}`, question: RQ.lookAtReview.en(pr) };
   }
   if (f.turn === "none") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
-  const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status)));
+  const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status) && current(c)));
   if (closed && (!submitted || closed.at >= submitted.at)) {
     switch (closed.status) {
       case "denied": return { boardState: "done", outcome: "stopped", summary: `the held write to ${pr} was denied` };
@@ -1390,10 +1391,10 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   const ms = (v: unknown): number => (v instanceof Date ? v.getTime() : new Date(String(v)).getTime());
   const confirmations = (await q.query(
     `SELECT CASE WHEN status = 'pending' AND expires_at <= NOW() THEN 'expired' ELSE status END AS status, kind,
-            COALESCE(decided_at, CASE WHEN status = 'pending' AND expires_at <= NOW() THEN expires_at END, created_at) AS at
+            COALESCE(decided_at, CASE WHEN status = 'pending' AND expires_at <= NOW() THEN expires_at END, created_at) AS at, head_sha
        FROM claw_github_confirmations WHERE session_id = $1`,
     [sessionId],
-  )).rows as Array<{ status: string; kind: string; at: unknown }>;
+  )).rows as Array<{ status: string; kind: string; at: unknown; head_sha: string | null }>;
   const writes = (await q.query(
     `SELECT tool, result, detail, at, merge_state, head_sha FROM claw_github_audit
       WHERE session_id = $1 AND tool IN ('gh_pr_merge', 'gh_review_submit', '${FOLLOW_TOOL}') AND result <> 'started'`,
@@ -1426,7 +1427,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
-    confirmations: confirmations.map((c) => ({ status: c.status, kind: c.kind, at: ms(c.at) })),
+    confirmations: confirmations.map((c) => ({ status: c.status, kind: c.kind, at: ms(c.at), headSha: String(c.head_sha ?? "").toLowerCase() })),
     writes: writes.map((w) => ({ tool: w.tool, result: w.result, detail: w.detail, at: ms(w.at), mergeState: w.merge_state ?? null, headSha: String(w.head_sha ?? "").toLowerCase() })),
     turn: turn.busy ? "running" : turn.last === null ? "none" : turn.last === "failed" || turn.last === "cancelled" ? "failed" : "finished",
     halted: row.params.halted ?? null,
