@@ -3,10 +3,11 @@
 
 /** What is kept of a question a terminal asks (a connector's approval hooks), for the clicks on its card. */
 import type { RemotePermission } from "../ports/store/remote.js";
+import { PERSISTED_SHOWN_WHOLE } from "../legacy-names.js";
 import type { PermissionOption } from "./options.js";
 
 /** The field of a kept terminal ask that says its card showed the request whole (set by this worker, never by Claw). */
-export const SHOWN_WHOLE = "clawy_shown_whole";
+export const SHOWN_WHOLE = PERSISTED_SHOWN_WHOLE;
 
 /** Whether `perm` is a question a terminal asks. */
 export function isTerminalPermission(perm: RemotePermission): boolean {

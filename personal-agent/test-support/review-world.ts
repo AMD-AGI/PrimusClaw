@@ -382,6 +382,7 @@ export function reviewWorld(owners: readonly string[] = ["AMD-AGI"], options: Wo
     owners,
     installUrl: "",
     defaultModel: "",
+    botName: "PrimusClaw Assistant",
   };
   const link = (userId: string, name: string, key: string): void => {
     store.links.redeemPending(userId, name, store.links.stashPending(key));

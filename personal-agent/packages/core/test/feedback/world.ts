@@ -41,6 +41,7 @@ import { createHash } from "node:crypto";
 
 import { FakeSurface, openTestStore } from "../../../../test-support/index.js";
 import { redactText } from "../../src/security/redact.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 export const SECRET = "ghp_" + "S".repeat(36);
 export const QUESTION_MARK = "QUESTION-MARK-31337";
@@ -217,6 +218,8 @@ export interface WorldOptions {
   readonly assistantOn?: boolean;
   /** Chats run on this exchange (as the assembly passes it to the thumbs); none: on the linked key. */
   readonly exchange?: TokenExchange;
+  /** The deployment's name for the bot (default: none set, the default name). */
+  readonly botName?: string;
 }
 
 export type World = ReturnType<typeof makeWorld>;
@@ -266,7 +269,13 @@ export function makeWorld(options: WorldOptions = {}) {
     clock,
     log,
   });
-  const flow = new FeedbackFlow({ reports: store.feedback, reporting, service, log });
+  const flow = new FeedbackFlow({
+    reports: store.feedback,
+    reporting,
+    service,
+    log,
+    botName: options.botName ?? BOT_NAME,
+  });
   const thumbs = new FeedbackThumbs({
     reporting,
     sessions: store.sessions,

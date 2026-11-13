@@ -14,6 +14,7 @@ import { contextInterceptor, DEFAULT_GROUP_CONTEXT, GroupContext, parseContext }
 import { openTestStore } from "../../../../test-support/index.js";
 import { ALICE, BOB } from "../routing/fixtures.js";
 import { groupAsked, link, message, said, silent, world } from "../routing/world.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 function gmsg(text: string, options: { user?: typeof ALICE; mentioned?: boolean; targeted?: boolean } = {}) {
   const m = message(text, { kind: "group", conversation: "g-1", ...(options.user ? { user: options.user } : {}) });
@@ -29,7 +30,11 @@ function setup(messages = DEFAULT_GROUP_CONTEXT.messages, granted = true) {
     off: testStore.store.groupContext,
     log: silent,
   });
-  const w = world({ testStore, groupHistory: context, handlers: { groupInterceptors: [contextInterceptor(context)] } });
+  const w = world({
+    testStore,
+    groupHistory: context,
+    handlers: { groupInterceptors: [contextInterceptor(context, BOT_NAME)] },
+  });
   link(w, ALICE.id, "ak-alice");
   groupAsked(w); // (the group was asked its language before: that card is group-language.test.ts's)
   return { w, context };
@@ -94,7 +99,7 @@ test("/context off in the group: said to all, nothing more is kept or sent; /con
   assert.match(lines[1] ?? "", /^本群关着/);
   assert.match(lines[2] ?? "", /^已打开/);
   assert.match(lines[3] ?? "", /现在记着 1 条/);
-  assert.match(lines[4] ?? "", /^用法：@Clawy \/context on \| off \| status/);
+  assert.match(lines[4] ?? "", /^用法：@PrimusClaw Assistant \/context on \| off \| status/);
 });
 
 test("/context status says when nothing has reached the bot (the chat may not allow reading)", async () => {

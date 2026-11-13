@@ -77,7 +77,7 @@ export class ReviewChecks {
   /** The pull requests' checks, then `take`. `named`: the reviewer, already known (a handoff); undefined: read from the message. */
   async request(ctx: RequestContext, ask: ReviewAsk, named?: Actor): Promise<void> {
     if (!ask.pulls.length) {
-      await this.say(ctx, t.attachPulls(ask.unread.join("、")));
+      await this.say(ctx, t.attachPulls(ask.unread.join("、"), this.deps.botName));
       return;
     }
     if (ask.pulls.length > MAX_PULLS_PER_REQUEST) {
@@ -140,7 +140,7 @@ export class ReviewChecks {
     if (own) return requester;
     if (nobody && !ctx.group) {
       // (nobody named, yet someone is: ask)
-      await this.say(ctx, t.unsureWho);
+      await this.say(ctx, t.unsureWho(this.deps.botName));
       return undefined;
     }
     const actor = await this.reviewers.resolve({ conversation: asked(ctx), group: ctx.group }, ask);
@@ -150,7 +150,7 @@ export class ReviewChecks {
     }
     // (a reading, or a quote, named someone the asker's own words do not)
     if (!ask.named.includes(actor.channelUserId)) {
-      await this.say(ctx, t.unsureWhoFull);
+      await this.say(ctx, t.unsureWhoFull(this.deps.botName));
       return undefined;
     }
     return actor;
@@ -194,12 +194,12 @@ export class ReviewChecks {
     const who = actor.name || "对方";
     const key = this.deps.store.links.getKey(actor.userId) ?? "";
     if (!key.startsWith("ak-")) {
-      await this.say(ctx, t.reviewerNotLinked(who));
+      await this.say(ctx, t.reviewerNotLinked(who, this.deps.botName));
       return undefined;
     }
     const token = await tokenFor(this.deps, actor.userId);
     if ("token" in token) return { token: token.token, key };
-    if (token.failed === "not_bound") await this.say(ctx, t.reviewerNotConnected(who));
+    if (token.failed === "not_bound") await this.say(ctx, t.reviewerNotConnected(who, this.deps.botName));
     else {
       this.deps.logger.warn("the reviewer's token could not be exchanged", { error: token.reason });
       await this.say(ctx, t.reviewerPlatformDown(who));
@@ -320,7 +320,7 @@ export class ReviewChecks {
       // (undefined: not read; Claw's own rule is the backstop)
       if (author !== undefined && author.toLowerCase() === state.login.toLowerCase()) {
         if (!several) {
-          await this.say(ctx, t.ownPull(shortName(pull), who));
+          await this.say(ctx, t.ownPull(shortName(pull), who, this.deps.botName));
           return undefined;
         }
         refused.push([pull, t.ownPullShort(who)]);

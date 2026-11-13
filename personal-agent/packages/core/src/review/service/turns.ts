@@ -199,7 +199,7 @@ export class ReviewTurns {
   /** The reviewer's notice of what was left on GitHub as them: [delivered, why not]. */
   private async tellActor(review: ReviewTurn, answer: string): Promise<readonly [boolean, string]> {
     const chat = await this.notices.reviewerChat(review);
-    if (chat === undefined) return [false, "TA 还没和 Clawy 私聊过"];
+    if (chat === undefined) return [false, `TA 还没和 ${this.deps.botName} 私聊过`];
     const summary = answer.trim()
       ? clipSummary(shapeGroupAnswer(answer), DM_SUMMARY_CHARS)
       : "（没有拿到这次 review 的结论，请打开 PR 查看。 / The review's conclusion did not reach me; look at the pull request.）";

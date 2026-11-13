@@ -108,6 +108,8 @@ export interface ReviewDeps {
   readonly installUrl: string;
   /** What a review runs on when its request names no model ('' Claw's default). */
   readonly defaultModel: string;
+  /** The bot's name in this deployment (`Settings.botName`), in every text that names it. */
+  readonly botName: string;
 }
 
 /** The language of a text a person wrote, as the review service answers in it. */

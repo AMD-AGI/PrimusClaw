@@ -130,7 +130,7 @@ export const remoteText = defineCatalog({
     phaseStarting: "starting",
     phaseOffline: "the machine is offline; nothing can be sent",
     phaseWatching: "read-only: it is in use in a terminal, so you can only watch its output here",
-    clawyLine: (p: { bot: string }) =>
+    botLine: (p: { bot: string }) =>
       `To talk to ${p.bot}: start the message with @${p.bot}, or use a ${p.bot} / command. Requests sent on your behalf by your coordinator are handled by ${p.bot} too and never go to this session.`,
     readOnly:
       "It is in use in a terminal, so you can only watch; your message was not sent. To send from here without disturbing the terminal, open the conversation in tmux (this machine's connector needs 0.1.9 or newer), then tap Connect (the terminal keeps working) in the sessions list: messages are typed into that terminal.",
@@ -331,7 +331,7 @@ It installs the connector, pairs the machine with you and keeps it running. I wi
     phaseStarting: "正在启动",
     phaseOffline: "机器离线，消息发不过去",
     phaseWatching: "只读旁观：终端里正在用，这里只能看它的输出",
-    clawyLine: (p) =>
+    botLine: (p) =>
       `要跟 ${p.bot} 说：消息以 @${p.bot} 开头，或用 ${p.bot} 的 / 命令；协调者代发的请求也由 ${p.bot} 处理，不会发给这个会话。`,
     readOnly:
       "终端里正在用，这里只能看，你的消息没有发出去。要在手机上发消息又不影响终端：在 tmux 里打开这个会话（这台机器的连接器要 0.1.9 或更新），再到会话列表里点「连上（终端照常用）」，消息会打进那个终端。",

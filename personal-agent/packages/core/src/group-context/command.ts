@@ -1,7 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { BOT_NAME } from "../branding.js";
 import { GROUP_CONTEXT_TEXT as T } from "../locales/group-context.js";
 import type { MessageInterceptor, MessageRoute } from "../ports/routing.js";
 import { textMessage } from "../ports/surface.js";
@@ -36,21 +35,20 @@ export function parseContext(text: string): ContextVerb | undefined {
  * `/context on|off|status` in a group, read before the account check: anybody in the chat may turn it off or on (it is
  * the chat's, not one person's), and off drops what was kept at once.
  */
-export function contextInterceptor(context: GroupContext): MessageInterceptor {
+export function contextInterceptor(context: GroupContext, bot: string): MessageInterceptor {
   return {
     name: "group_context",
     intercept: async (route) => {
       const verb = parseContext(route.text);
       if (verb === undefined) return false;
-      await route.conversation.send(textMessage(answer(context, route, verb)));
+      await route.conversation.send(textMessage(answer(context, route, verb, bot)));
       return true;
     },
   };
 }
 
-function answer(context: GroupContext, route: MessageRoute, verb: ContextVerb): string {
+function answer(context: GroupContext, route: MessageRoute, verb: ContextVerb, bot: string): string {
   const chatId = route.conversation.ref.id;
-  const bot = BOT_NAME;
   if (verb === "usage") return T.usage({ bot });
   if (!context.enabled) return T.unavailable;
   if (verb === "off") {

@@ -70,6 +70,11 @@ export interface AssistantChatOptions {
   readonly understanding: ReadonlySet<string>;
   /** CLAW_PLUGIN_ID: named on each message; undefined for none. */
   readonly pluginId: number | undefined;
+  /**
+   * The bot's display name in this deployment (`Settings.botName`), sent on each message as `channel_context.assistant_name` so
+   * that the assistant knows the name people call it by ("" sends none). Claw keeps it only when it reads as a short name.
+   */
+  readonly assistantName: string;
   /** A chat turn of the old kind is running for this person: it is let finish. */
   readonly legacyTurn: (userId: string) => boolean;
   readonly files: MessageFiles | undefined;
@@ -149,6 +154,12 @@ export class AssistantChat {
     return replyLanguageContext(this.o.store.prefs.getPrefs(userId));
   }
 
+  /** The bot's display name, as the message's `channel_context` carries it (none configured: nothing is sent). */
+  private named(): { assistant_name?: string } {
+    const name = this.o.assistantName.trim();
+    return name ? { assistant_name: name } : {};
+  }
+
   private langOf(userId: string, text: string): Lang {
     return answerLang(this.o.store.prefs.getPrefs(userId).lang, this.o.clientLocale?.() ?? "", text);
   }
@@ -186,6 +197,7 @@ export class AssistantChat {
           ? { files: await this.handOverFiles(handing, sessionId, folderId || this.o.random.hexId(), request.files) }
           : {}),
         ...this.chosenLanguage(request.userId),
+        ...this.named(),
       };
       await ready();
       return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
@@ -281,7 +293,7 @@ export class AssistantChat {
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
         // (the surface the message came from: Claw sends the turn's replies back there, not to another surface of the person's)
         const channel = { channel: request.conversation.caps.channel };
-        const context = { ...channel, ...files, ...attached, ...this.chosenLanguage(request.userId) };
+        const context = { ...channel, ...files, ...attached, ...this.chosenLanguage(request.userId), ...this.named() };
         await ready();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),
@@ -388,7 +400,7 @@ export class AssistantChat {
 
   /**
    * The person sees at once that their message was taken: the receipt under it, or (none can be opened) the typing indicator.
-   * Never fails the message. In a chat that is an agent's window the receipt's words start with Clawy's head.
+   * Never fails the message. In a chat that is an agent's window the receipt's words start with the bot's head.
    */
   private async acknowledge(handing: Handing): Promise<Receipt | undefined> {
     const { conversation } = handing;
@@ -400,7 +412,7 @@ export class AssistantChat {
       );
       if (receipt !== undefined) {
         receipt.awaitHandOver(); // (until the message is handed to Claw: `handingOver`)
-        receipt.head = this.o.directChat.clawyExtras(this.attachedReader(), handing.userId, handing.lang).head;
+        receipt.head = this.o.directChat.botExtras(this.attachedReader(), handing.userId, handing.lang).head;
         return receipt;
       }
       await conversation.typing();

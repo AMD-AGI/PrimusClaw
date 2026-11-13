@@ -410,7 +410,7 @@ describe("the platform services", () => {
     const models = { ...readSettingsForTest().models, fallback: "backup-model" };
     assert.throws(
       () => assembled({}, new RecordingLogger(), { settings: { models } }),
-      (error: unknown) => error instanceof StartupError && /CLAWY_FALLBACK_MODEL/.test(error.message),
+      (error: unknown) => error instanceof StartupError && /PERSONAL_AGENT_FALLBACK_MODEL/.test(error.message),
     );
     const policy = { refusal: () => undefined } as unknown as Plugins["modelRefusalPolicy"];
     assembled({}, new RecordingLogger(), {

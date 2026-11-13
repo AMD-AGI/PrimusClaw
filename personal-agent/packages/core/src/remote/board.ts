@@ -382,10 +382,11 @@ export class StatusBoard {
       cwd: state.cwd,
       mode: state.mode,
       lang,
+      bot: this.ctx.settings.botName,
       unattended: unattendedNow,
       lead,
     });
-    const [title, value] = backReply(lang);
+    const [title, value] = backReply(lang, this.ctx.settings.botName);
     await to.send({ ...textMessage(line), suggestions: [{ title, value }] });
   }
 
@@ -404,14 +405,14 @@ export class StatusBoard {
       },
     };
     return this.ctx.directChat
-      .clawyExtras(reader, chatKey, this.state.lang(chatKey))
+      .botExtras(reader, chatKey, this.state.lang(chatKey))
       .replies.map(([title, value]) => ({ title, value }));
   }
 
   /** How a chat that is the agent's window signs what it wrote: its head, and the way on and back under the last message. */
   signerOf(chatKey: string, state: RemoteState): Signer {
     const lang = this.state.lang(chatKey);
-    const replies = agentReplies(lang).map(([title, value]) => ({ title, value }));
+    const replies = agentReplies(lang, this.ctx.settings.botName).map(([title, value]) => ({ title, value }));
     return new Signer(state.agentLabel, state.host, lang, replies);
   }
 }

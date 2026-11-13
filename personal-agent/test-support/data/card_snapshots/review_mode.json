@@ -24,7 +24,7 @@
       "verb": "primusclaw.github_mode"
      },
      {
-      "title": "添加 Clawy",
+      "title": "添加 PrimusClaw Assistant",
       "type": "Action.OpenUrl",
       "url": "https://teams.microsoft.com/l/app/x"
      }
@@ -102,7 +102,7 @@
        {
         "isSubtle": true,
         "spacing": "Small",
-        "text": "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/clawy.yml 的 confirm_merge: always 等）仍会先问你。",
+        "text": "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
         "type": "TextBlock",
         "wrap": true
        }
@@ -113,7 +113,7 @@
      {
       "isSubtle": true,
       "size": "Small",
-      "text": "这个设置对你自己让 Clawy 审 PR、以及同事请你代审都生效。是否允许同事以你的名义请我审并合入，是另一个开关：`/github auto-merge on|off`。",
+      "text": "这个设置对你自己让 PrimusClaw Assistant 审 PR、以及同事请你代审都生效。是否允许同事以你的名义请我审并合入，是另一个开关：`/github auto-merge on|off`。",
       "type": "TextBlock",
       "wrap": true
      },
@@ -157,7 +157,7 @@
        },
        {
         "size": "Small",
-        "text": "This applies when you ask Clawy to review a pull request and when a colleague asks Clawy to review one as you. Whether colleagues may ask at all is the other switch, `/github auto-merge on|off`.",
+        "text": "This applies when you ask PrimusClaw Assistant to review a pull request and when a colleague asks PrimusClaw Assistant to review one as you. Whether colleagues may ask at all is the other switch, `/github auto-merge on|off`.",
         "type": "TextBlock",
         "wrap": true
        }

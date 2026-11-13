@@ -16,6 +16,16 @@ export const KEYVAULT_API_VERSION = "7.4";
 
 /** The setting a secret replaces -> the name of the secret in the vault. */
 export const VAULT_NAMES: Readonly<Record<SecretName, string>> = {
+  TEAMS_ENCRYPTION_KEYS: "personal-agent-encryption-keys",
+  TEAMS_EXCHANGE_CLIENT_SECRET: "personal-agent-exchange-client-secret",
+  FEEDBACK_GITHUB_APP_KEY: "personal-agent-feedback-github-app-key",
+};
+
+/**
+ * The name each secret was stored under before the bot's default name changed. Deprecated: it is read only when the vault
+ * holds no secret under the `VAULT_NAMES` name (with a warning at start), and never written.
+ */
+export const LEGACY_VAULT_NAMES: Readonly<Record<SecretName, string>> = {
   TEAMS_ENCRYPTION_KEYS: "clawy-encryption-keys",
   TEAMS_EXCHANGE_CLIENT_SECRET: "clawy-exchange-client-secret",
   FEEDBACK_GITHUB_APP_KEY: "clawy-feedback-github-app-key",

@@ -14,6 +14,7 @@ import {
 } from "../text/py-text.js";
 import { EMAIL } from "./identifiers.js";
 import { fence } from "./markdown.js";
+import { PERSISTED_FEEDBACK_LABEL, PERSISTED_FEEDBACK_MARKER } from "../legacy-names.js";
 
 /**
  * The words of an issue and its comments: the title, who reported it, the body, the comment of a second report in the
@@ -24,11 +25,11 @@ import { fence } from "./markdown.js";
 /** Credential shapes in a text replaced by a placeholder (the runtime's redaction). */
 export type Mask = (text: string) => string;
 
-export const FEEDBACK_LABEL = "clawy-feedback";
+export const FEEDBACK_LABEL = PERSISTED_FEEDBACK_LABEL;
 export const LABEL_COLOR = "d93f0b";
-/** The feedback label's description: who reports, from the chat app `channel` (`SurfaceCaps.shortName`, e.g. "Teams"). */
-export function labelDescription(channel: string): string {
-  return `Reported by a user from ${channel} through Clawy`;
+/** The feedback label's description: who reports, from the chat app `channel` (`SurfaceCaps.shortName`, e.g. "Teams"), through `bot`. */
+export function labelDescription(channel: string, bot: string): string {
+  return `Reported by a user from ${channel} through ${bot}`;
 }
 
 const TITLE_TEXT_CHARS = 60;
@@ -44,7 +45,7 @@ const MARKDOWN = /([\\`*_[\]~])/g;
 
 /** How the deployment names itself and where its users talk to it. */
 export interface IssueWording {
-  /** The bot's display name ("Clawy"). */
+  /** The bot's display name (the deployment's `Settings.botName`). */
   readonly botName: string;
   /** The chat channel ("Teams"). */
   readonly channelName: string;
@@ -108,7 +109,7 @@ export function cleanText(mask: Mask, text: string): string {
 
 /** Hidden in the issue or comment, so a retry can tell that an earlier attempt got through. */
 export function retryMarker(report: Pick<ReportText, "id" | "createdAt">): string {
-  return `<!-- clawy-feedback-id: ${String(report.id)}-${String(Math.trunc(report.createdAt))} -->`;
+  return `<!-- ${PERSISTED_FEEDBACK_MARKER}: ${String(report.id)}-${String(Math.trunc(report.createdAt))} -->`;
 }
 
 /** The web console's page of a session. */

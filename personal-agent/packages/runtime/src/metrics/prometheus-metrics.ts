@@ -5,6 +5,10 @@
  * The worker's counters for the operator's alerts, in memory (they start from zero when the worker restarts), written in
  * the Prometheus text format for `GET /metrics` on its own port (the listener is the channel's assembly). The text is
  * the Python worker's, line for line: the alert queries and dashboards read these names and labels.
+ *
+ * Every series is written twice for one release: under its `personal_agent_` name, then under the name an earlier release used
+ * (`LEGACY_METRIC_PREFIX`), so that alert rules and dashboards can move to the new names after the new build is live. The old
+ * names are deprecated and go away in the next minor release.
  */
 import {
   SECURITY_FIELD_CATEGORIES,
@@ -21,7 +25,11 @@ import {
 import { Histogram } from "./exposition.js";
 
 export const CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
-/** `clawy_inbound_lag_max_ms`: the longest wait of the messages handled in this many milliseconds. */
+/** The prefix of every metric's name. */
+export const METRIC_PREFIX = "personal_agent_";
+/** The prefix an earlier release wrote the same metrics under, still written beside the new names for one release. */
+export const LEGACY_METRIC_PREFIX = "clawy_";
+/** `personal_agent_inbound_lag_max_ms`: the longest wait of the messages handled in this many milliseconds. */
 export const LAG_WINDOW_MS = 60_000;
 /** Seconds; the 5 s bucket is the "card within 5 s" line. */
 export const EVENT_BUCKETS = [0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0] as const;
@@ -50,29 +58,32 @@ export const ALERTED: ReadonlyArray<readonly [string, Labels]> = [
   ["key_unlinked", [["reason", "rejected"]]],
 ];
 
-/** Every metric: its type and help text. */
+/** Every metric (by its `personal_agent_` name): its type and help text. */
 export const HELP: Readonly<Record<string, readonly [string, string]>> = {
-  clawy_security_events_total: ["counter", "Security events logged by the worker, by event and category."],
-  clawy_inbound_handled_total: ["counter", "Inbound messages handled (completed or abandoned)."],
-  clawy_inbound_failed_total: [
+  personal_agent_security_events_total: ["counter", "Security events logged by the worker, by event and category."],
+  personal_agent_inbound_handled_total: ["counter", "Inbound messages handled (completed or abandoned)."],
+  personal_agent_inbound_failed_total: [
     "counter",
     "Inbound messages whose handler failed and that were abandoned for redelivery.",
   ],
-  clawy_inbound_handle_ms_total: ["counter", "Milliseconds spent handling inbound messages, summed."],
-  clawy_inbound_lag_max_ms: [
+  personal_agent_inbound_handle_ms_total: ["counter", "Milliseconds spent handling inbound messages, summed."],
+  personal_agent_inbound_lag_max_ms: [
     "gauge",
     "Longest time a message handled in the last 60 seconds waited in the inbound queue.",
   ],
-  clawy_inbound_limited_total: ["counter", "Messages and tasks refused by a per-user limit, by reason."],
-  clawy_event_handle_seconds: [
+  personal_agent_inbound_limited_total: ["counter", "Messages and tasks refused by a per-user limit, by reason."],
+  personal_agent_event_handle_seconds: [
     "histogram",
     "Seconds from receiving a Claw event to having sent it to the chat, by event type.",
   ],
-  clawy_event_to_chat_seconds: [
+  personal_agent_event_to_chat_seconds: [
     "histogram",
     "Seconds from when Claw says an event happened to having sent it to the chat, by event type.",
   ],
-  clawy_files_dropped_total: ["counter", "Files a user sent that did not reach Claw, by where they were dropped."],
+  personal_agent_files_dropped_total: [
+    "counter",
+    "Files a user sent that did not reach Claw, by where they were dropped.",
+  ],
 };
 
 /** Python's ordering of `(event, ((name, value), ...))` tuples. */
@@ -173,49 +184,54 @@ export class PrometheusMetrics implements MetricsPort {
     while ((this.lags[0]?.[0] ?? Infinity) <= now - this.lagWindowMs) this.lags.shift();
   }
 
-  /** All series in the Prometheus text exposition format (version 0.0.4). */
+  /**
+   * All series in the Prometheus text exposition format (version 0.0.4): under their names, then, with the same values and
+   * help, under the deprecated names of an earlier release (that half is the text it wrote, byte for byte).
+   */
   render(): string {
+    const lagMaxMs = this.lagMaxMs();
+    return this.renderAs(METRIC_PREFIX, lagMaxMs) + this.renderAs(LEGACY_METRIC_PREFIX, lagMaxMs);
+  }
+
+  private renderAs(prefix: string, lagMaxMs: number): string {
     const lines: string[] = [];
-    const head = (name: string): void => {
-      const [kind, text] = own(HELP, name) ?? ["untyped", ""];
-      lines.push(`# HELP ${name} ${text}`, `# TYPE ${name} ${kind}`);
+    const named = (stem: string): string => prefix + stem;
+    const head = (stem: string): void => {
+      const [kind, text] = own(HELP, METRIC_PREFIX + stem) ?? ["untyped", ""];
+      lines.push(`# HELP ${named(stem)} ${text}`, `# TYPE ${named(stem)} ${kind}`);
     };
-    head("clawy_security_events_total");
+    head("security_events_total");
     const events = [...this.events.values()].sort((a, b) =>
       compareTuples([a.event, ...a.labels.flat()], [b.event, ...b.labels.flat()]),
     );
     for (const { event, labels, value } of events) {
       const pairs = [["event", event] as const, ...labels].map(([k, v]) => `${k}="${v}"`).join(",");
-      lines.push(`clawy_security_events_total{${pairs}} ${String(value)}`);
+      lines.push(`${named("security_events_total")}{${pairs}} ${String(value)}`);
     }
     const plain: ReadonlyArray<readonly [string, number]> = [
-      ["clawy_inbound_handled_total", this.handledCount],
-      ["clawy_inbound_failed_total", this.failedCount],
-      ["clawy_inbound_handle_ms_total", this.handleMsTotal],
-      ["clawy_inbound_lag_max_ms", this.lagMaxMs()],
+      ["inbound_handled_total", this.handledCount],
+      ["inbound_failed_total", this.failedCount],
+      ["inbound_handle_ms_total", this.handleMsTotal],
+      ["inbound_lag_max_ms", lagMaxMs],
     ];
-    for (const [name, value] of plain) {
-      head(name);
-      lines.push(`${name} ${String(value)}`);
+    for (const [stem, value] of plain) {
+      head(stem);
+      lines.push(`${named(stem)} ${String(value)}`);
     }
-    head("clawy_inbound_limited_total");
+    head("inbound_limited_total");
     for (const [reason, value] of [...this.limits].sort(([a], [b]) => compareTuples([a], [b]))) {
-      lines.push(`clawy_inbound_limited_total{reason="${reason}"} ${String(value)}`);
+      lines.push(`${named("inbound_limited_total")}{reason="${reason}"} ${String(value)}`);
     }
-    this.renderHistograms(lines, head);
-    head("clawy_files_dropped_total");
-    for (const [path, value] of [...this.dropped].sort(([a], [b]) => compareTuples([a], [b]))) {
-      lines.push(`clawy_files_dropped_total{path="${path}"} ${String(value)}`);
-    }
-    return lines.join("\n") + "\n";
-  }
-
-  private renderHistograms(lines: string[], head: (name: string) => void): void {
-    (["clawy_event_handle_seconds", "clawy_event_to_chat_seconds"] as const).forEach((name, position) => {
-      head(name);
+    (["event_handle_seconds", "event_to_chat_seconds"] as const).forEach((stem, position) => {
+      head(stem);
       for (const type of DELIVERED_EVENT_TYPES) {
-        lines.push(...(this.eventTimes.get(type)?.[position]?.lines(name, `type="${type}"`) ?? []));
+        lines.push(...(this.eventTimes.get(type)?.[position]?.lines(named(stem), `type="${type}"`) ?? []));
       }
     });
+    head("files_dropped_total");
+    for (const [path, value] of [...this.dropped].sort(([a], [b]) => compareTuples([a], [b]))) {
+      lines.push(`${named("files_dropped_total")}{path="${path}"} ${String(value)}`);
+    }
+    return lines.join("\n") + "\n";
   }
 }

@@ -31,7 +31,7 @@ export const CHANGES_MAX_BYTES = 1_048_576;
 export interface MessageDefaults {
   /** CLAW_PLUGIN_ID, named as the web client names it (`pluginId`); null none. */
   readonly pluginId: number | null;
-  /** CLAWY_MODEL: what a new session asks for when its caller names none ("" none). */
+  /** PERSONAL_AGENT_MODEL: what a new session asks for when its caller names none ("" none). */
   readonly model: string;
   /** The reply-style rule, when a rule tool is configured. */
   readonly rule: StyleRule | null;

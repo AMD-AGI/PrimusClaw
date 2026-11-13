@@ -9,7 +9,8 @@ A personal chat assistant that works through [Claw](../claw/README.md). People t
 answers in Claw sessions run with their own Claw identity, keeps a standing assistant for each person, posts Claw's
 notifications back into the chat, drives the coding agents on a person's own machine (through
 [claw-connector](../connector/README.md)), and can review pull requests on a colleague's behalf. The agent's display
-name defaults to "Clawy".
+name defaults to "PrimusClaw Assistant"; a deployment names it with `PERSONAL_AGENT_BOT_NAME`
+([configuration](docs/configuration.md)).
 
 The entry point today is **Microsoft Teams**. The domain logic is channel-neutral and the worker process is
 surface-neutral, so another channel is a new surface package plugged into the worker (see

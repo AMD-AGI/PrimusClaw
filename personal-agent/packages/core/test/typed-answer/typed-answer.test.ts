@@ -268,25 +268,30 @@ test("a pull request held for a merge and a review is asked which, and one held 
 });
 
 test("the model is asked only whether it is an answer", () => {
-  const prompt = answerPrompt("Microsoft Teams");
-  assert.ok(prompt.startsWith("You read one message a person sent to Clawy"));
+  const prompt = answerPrompt("Microsoft Teams", "PrimusClaw Assistant");
+  assert.ok(prompt.startsWith("You read one message a person sent to PrimusClaw Assistant, a bot"));
   assert.ok(prompt.endsWith("only classify it."));
 });
 
 test("the models are told the chat app the message came through, and on Teams exactly what they were told before", () => {
   const sha = (text: string) => createHash("sha256").update(text).digest("hex");
-  // (the prompts as they were when they named Microsoft Teams themselves)
+  // (the prompts as they were when they named Microsoft Teams themselves, and the bot by the name a deployment may still give it)
   assert.equal(
-    sha(intentPrompt("Microsoft Teams")),
+    sha(intentPrompt("Microsoft Teams", "Clawy")),
     "66b61239320d53a2f75b6d7b4d6f7157fee6299cfdcdd45844027e103755d3e7",
   );
-  assert.equal(sha(modePrompt("Microsoft Teams")), "5a81148db3e2b3bf49255468fc136f7e7900075e75e375b5791ace71c4d788f9");
   assert.equal(
-    sha(answerPrompt("Microsoft Teams")),
+    sha(modePrompt("Microsoft Teams", "Clawy")),
+    "5a81148db3e2b3bf49255468fc136f7e7900075e75e375b5791ace71c4d788f9",
+  );
+  assert.equal(
+    sha(answerPrompt("Microsoft Teams", "Clawy")),
     "8f678827e427d39a97dac7c361b31b9c8a38c51e8efe53a626310e2e402fc204",
   );
-  for (const prompt of [intentPrompt("Chat App"), modePrompt("Chat App"), answerPrompt("Chat App")]) {
+  const bot = "PrimusClaw Assistant";
+  for (const prompt of [intentPrompt("Chat App", bot), modePrompt("Chat App", bot), answerPrompt("Chat App", bot)]) {
     assert.ok(prompt.includes(" Chat App ") && !prompt.includes("Teams"));
+    assert.ok(prompt.includes(`sent to ${bot}, a bot`) && !/clawy/iu.test(prompt));
   }
 });
 

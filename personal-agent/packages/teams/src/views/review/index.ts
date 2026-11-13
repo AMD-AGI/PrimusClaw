@@ -34,7 +34,7 @@ import {
 } from "../../cards/kit.js";
 import { action } from "../turn/note.js";
 import type { Renderers } from "../registry.js";
-import { BOT_NAME, own } from "@primusclaw/personal-agent";
+import { own } from "@primusclaw/personal-agent";
 
 const MARKDOWN = /([\\`*_[\]<])/gu;
 
@@ -49,15 +49,15 @@ const MODE_WHAT: Readonly<Record<string, readonly [string, string]>> = {
     "Approved and merged when nothing needs fixing and every check passes; a change the reviewing model judges high risk (security, credentials, CI/release, permissions, data migrations, ...) or one the repository asks to confirm waits for your own click on a card.",
   ],
   fully_auto: [
-    "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/clawy.yml 的 confirm_merge: always 等）仍会先问你。",
+    "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
     "Approved and merged when nothing needs fixing and every check passes, without asking you; only a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
   ],
 };
 const MODE_BUTTON: Readonly<Record<string, string>> = { high_risk_confirm: "高风险再问我", fully_auto: "全自动合入" };
 
 /** The button that adds the app for a person (none when no such link is configured). */
-function addAppButton(installUrl: string): CardElement[] {
-  return installUrl ? [openUrl(`添加 ${BOT_NAME}`, installUrl)] : [];
+function addAppButton(installUrl: string, bot: string): CardElement[] {
+  return installUrl ? [openUrl(`添加 ${bot}`, installUrl)] : [];
 }
 
 export function reviewModeCard(model: ReviewModeView): CardMessage {
@@ -85,12 +85,12 @@ export function reviewModeCard(model: ReviewModeView): CardMessage {
   }
   body.push(
     note(
-      "这个设置对你自己让 Clawy 审 PR、以及同事请你代审都生效。是否允许同事以你的名义请我审并合入，是另一个开关：`/github auto-merge on|off`。",
+      `这个设置对你自己让 ${model.bot} 审 PR、以及同事请你代审都生效。是否允许同事以你的名义请我审并合入，是另一个开关：\`/github auto-merge on|off\`。`,
     ),
   );
   english.push(
     text(
-      "This applies when you ask Clawy to review a pull request and when a colleague asks Clawy to review one as you. Whether colleagues may ask at all is the other switch, `/github auto-merge on|off`.",
+      `This applies when you ask ${model.bot} to review a pull request and when a colleague asks ${model.bot} to review one as you. Whether colleagues may ask at all is the other switch, \`/github auto-merge on|off\`.`,
       { size: "Small" },
     ),
   );
@@ -100,7 +100,7 @@ export function reviewModeCard(model: ReviewModeView): CardMessage {
   const choices = order.map((m) =>
     execute(own(MODE_BUTTON, m) ?? m, "primusclaw.github_mode", { primusclaw: "github_mode", mode: m }),
   );
-  return message(body, buttons([...choices, ...(model.hint ? addAppButton(model.installUrl) : [])]));
+  return message(body, buttons([...choices, ...(model.hint ? addAppButton(model.installUrl, model.bot) : [])]));
 }
 
 /** The line under a confirmation card for a person whose buttons may not work: the answer they can type instead. */
@@ -238,7 +238,7 @@ export function githubConfirmCard(m: GithubConfirmView): CardMessage {
   ];
   if (m.hint) body.push(note(typedConfirmHint(m.number, m.lang)));
   const actions = buttons(githubConfirmButtons(m.confirmationId, m.review !== undefined, m.lang).map(action));
-  return message(body, [...actions, ...(m.hint ? addAppButton(m.installUrl) : [])]);
+  return message(body, [...actions, ...(m.hint ? addAppButton(m.installUrl, m.bot) : [])]);
 }
 
 /** The colour of a review card's band once the review ended, from the line that says how. */

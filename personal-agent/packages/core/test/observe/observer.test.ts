@@ -25,6 +25,7 @@ import {
   record,
   suggestions,
 } from "./world.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 function aliceObserves() {
   const world = observeWorld({ users: ["AAD-A"] }); // the list is read without case
@@ -94,12 +95,14 @@ test("status and usage say what they say", async () => {
   await inGroup(world, "/observe on", USER_A);
   await inGroup(world, "/observe 状态", USER_B);
   assert.ok(
-    groupTexts(world).at(-1)?.startsWith("本群开着静默观察（只记录，不行动）。任何人都可以 @Clawy /observe off 关闭。"),
+    groupTexts(world)
+      .at(-1)
+      ?.startsWith("本群开着静默观察（只记录，不行动）。任何人都可以 @PrimusClaw Assistant /observe off 关闭。"),
   );
   await inGroup(world, "/observe maybe", USER_B);
   assert.equal(
     groupTexts(world).at(-1),
-    "用法：@Clawy /observe on | off | status / Usage: @Clawy /observe on | off | status",
+    "用法：@PrimusClaw Assistant /observe on | off | status / Usage: @PrimusClaw Assistant /observe on | off | status",
   );
   assert.equal(await inGroup(world, "please observe on", USER_B), false);
 });
@@ -116,6 +119,7 @@ test("taken off the list nothing more goes to them", async () => {
     conversationOf: () => listed.surface.conversation({ id: CONV, kind: "group", tenantId: "t", wire: {} }),
     pluginId: undefined,
     log: listed.log,
+    botName: BOT_NAME,
   });
   await delisted.forward(groupMessage("CI is red", USER_B));
   assert.deepEqual(listed.assistant.observed, []);

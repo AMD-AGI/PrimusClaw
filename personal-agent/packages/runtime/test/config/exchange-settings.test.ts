@@ -61,7 +61,7 @@ describe("the review for a colleague", () => {
       ...ON,
       TEAMS_GITHUB_REVIEW_ENABLED: "on",
       TEAMS_GITHUB_REVIEW_OWNERS: "AMD-AGI, other ,",
-      CLAWY_MODEL: "m",
+      PERSONAL_AGENT_MODEL: "m",
     });
     assert.deepEqual(s.githubReview.owners, ["AMD-AGI", "other"]);
     assert.equal(s.githubReview.intentModel, "m");

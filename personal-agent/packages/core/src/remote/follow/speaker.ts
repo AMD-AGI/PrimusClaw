@@ -63,6 +63,8 @@ export interface SpeakerDeps {
   lang(): Lang;
   /** The chat is the agent's window itself (`direct-chat`): what the agent says is signed with its head. */
   direct(): boolean;
+  /** The bot's name in this deployment, for the way back to it under what the agent said. */
+  readonly botName: string;
   /** The paragraph that says the session ended and why (the reason a connector gave). */
   describeEnd?: (reason: string) => Promise<string>;
   /** The chat's session card, when it is the window: the text so far (`final` false) or the burst (`final` true); false when
@@ -240,7 +242,10 @@ export class BurstSpeaker {
     return parts.map((part, i) => {
       const message = richMessage(part, { lead: false, aiGenerated: true }); // (what the coding agent wrote)
       if (!direct || i !== parts.length - 1) return message;
-      return { ...message, suggestions: agentReplies(lang).map(([title, value]) => ({ title, value })) };
+      return {
+        ...message,
+        suggestions: agentReplies(lang, this.deps.botName).map(([title, value]) => ({ title, value })),
+      };
     });
   }
 

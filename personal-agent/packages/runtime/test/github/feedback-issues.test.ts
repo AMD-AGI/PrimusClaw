@@ -41,6 +41,7 @@ class FakeGitHub {
   readonly calls: string[] = [];
   labelCreations = 0;
   labelCreateStatus = 201;
+  labelDescription = "";
   mintStatus = 201;
   rejectNextApiCall = false;
   now = 1_000_000;
@@ -76,6 +77,7 @@ class FakeGitHub {
     }
     if (method === "POST" && path === `${base}/labels`) {
       this.labelCreations += 1;
+      this.labelDescription = String(body["description"]);
       if (this.labelCreateStatus === 201) this.labels.add(String(body["name"]));
       return Response.json({}, { status: this.labelCreateStatus });
     }
@@ -146,7 +148,12 @@ function rig(mode: "app" | "token" | "both", privatePem = KEYS.privatePem): Rig 
     tokenFile: mode !== "app" ? join(dir, "token") : "",
     apiUrl: "https://api.github.test",
   };
-  const sink = feedbackSink(config, { fetch: gh.fetch, clock: () => gh.now, log: silentLogger });
+  const sink = feedbackSink(config, {
+    fetch: gh.fetch,
+    clock: () => gh.now,
+    log: silentLogger,
+    botName: "PrimusClaw Assistant",
+  });
   assert.ok(sink);
   return { gh, sink, dir, config };
 }
@@ -165,6 +172,8 @@ test("the label is created once when missing and a label failure does not stop t
   assert.equal(await file(sink), "#1");
   assert.equal(await file(sink), "#2");
   assert.equal(gh.labelCreations, 1);
+  // (the label keeps the name filed issues already carry; its description names the bot by the deployment's name)
+  assert.equal(gh.labelDescription, "Reported by a user from Teams through PrimusClaw Assistant");
   const other = rig("app");
   other.gh.labelCreateStatus = 403;
   assert.equal(await file(other.sink), "#1");
@@ -253,7 +262,10 @@ test("configuration comes from the environment", () => {
     "PEM",
   );
   assert.deepEqual([fromVault.keyFile, fromVault.keyPem, feedbackConfigured(fromVault)], ["", "PEM", true]);
-  assert.equal(feedbackSink(feedbackConfigFromEnv({}), { log: silentLogger }), undefined);
+  assert.equal(
+    feedbackSink(feedbackConfigFromEnv({}), { log: silentLogger, botName: "PrimusClaw Assistant" }),
+    undefined,
+  );
 });
 
 test("a credential with no repository stops the start", () => {

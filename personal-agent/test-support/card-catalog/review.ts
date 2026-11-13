@@ -34,6 +34,7 @@ const CONFIRM = {
   model: "",
   hint: false,
   installUrl: "",
+  bot: "PrimusClaw Assistant",
   base: "",
   login: "linmei-amd",
   lang: "zh",
@@ -60,6 +61,7 @@ export const REVIEW_CARDS = entries(
         model: "claude-opus-4-8",
         hint: true,
         installUrl: "https://teams.microsoft.com/l/app/x",
+        bot: "PrimusClaw Assistant",
         base: "main",
       }),
   ],
@@ -91,6 +93,7 @@ export const REVIEW_CARDS = entries(
         lead: "",
         hint: TYPED_MODE_HINT,
         installUrl: "https://teams.microsoft.com/l/app/x",
+        bot: "PrimusClaw Assistant",
       }),
   ],
   [

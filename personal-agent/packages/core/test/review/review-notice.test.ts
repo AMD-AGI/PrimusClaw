@@ -142,7 +142,7 @@ for (const origin of ["group", "1:1"] as const) {
           assert.ok(!saidIn(world.surface, askerChat).includes("未能通知到"));
         } else {
           assert.deepEqual(notices(world), []);
-          const why = delivery === "no-reference" ? "TA 还没和 Clawy 私聊过" : "私聊发送失败";
+          const why = delivery === "no-reference" ? "TA 还没和 PrimusClaw Assistant 私聊过" : "私聊发送失败";
           assert.ok(
             saidIn(world.surface, askerChat).includes(`${PR}：未能通知到 Bob（${why}）`),
             saidIn(world.surface, askerChat),
@@ -201,7 +201,7 @@ test("a chat with the reviewer the channel fails to open is said as no chat", as
   world.surface.openPersonal = () => Promise.reject(new Error("Teams said 502"));
   await askAndEnd(world, "group", wrote("merged"), "结论：没有必须修改的问题。\nVERDICT: CLEAN");
   assert.ok(
-    saidIn(world.surface, CONV).includes(`${PR}：未能通知到 Bob（TA 还没和 Clawy 私聊过）`),
+    saidIn(world.surface, CONV).includes(`${PR}：未能通知到 Bob（TA 还没和 PrimusClaw Assistant 私聊过）`),
     saidIn(world.surface, CONV),
   );
 });

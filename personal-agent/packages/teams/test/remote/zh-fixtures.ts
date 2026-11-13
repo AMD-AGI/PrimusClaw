@@ -195,7 +195,7 @@ function lines(lang: Lang): string {
     remoteDomain.terminalClosedLine(lang),
     remoteDomain.readOnlyRefused(lang),
     remoteDomain.readOnlyRefused(lang, true),
-    remoteDomain.clawyLine(lang, "Clawy"),
+    remoteDomain.botLine(lang, "Clawy"),
     remoteDomain.typedLine("修复一下", lang),
     ...remoteDomain.unsolicitedParts("cx-main", "做完了。", lang),
     ...remoteDomain.unsolicitedParts("cx-main", "做完了。", lang, true),

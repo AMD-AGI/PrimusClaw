@@ -9,6 +9,7 @@
 import { pyLower, pyLstrip, pyRstrip, pySplit, pyStrip } from "../text/py-text.js";
 import { MAX_COMMAND_TEXT_CHARS, within } from "./command-text.js";
 import { pyFullmatch } from "../text/py-regex.js";
+import { BOT_NAME } from "../branding.js";
 import * as P from "./phrases.js";
 import { sessionControl, switchCommand } from "./sessions-words.js";
 import { clockOf, flatten, NUM, phraseKey, PUNCT, spokenDuration, TIME } from "./spoken.js";
@@ -232,9 +233,22 @@ const VALUED: readonly ((flat: string) => string | null)[] = [
   repoCommand,
 ];
 
-function personal(text: string, flat: string, key: string): string {
+const backTo = new Map<string, ReadonlySet<string>>();
+
+/** "Back to <bot>" as phrase keys, for the bot's name in this deployment. */
+function backToKeys(bot: string): ReadonlySet<string> {
+  let found = backTo.get(bot);
+  if (found === undefined) {
+    found = keys(P.backToBot(bot));
+    backTo.set(bot, found);
+  }
+  return found;
+}
+
+function personal(text: string, flat: string, key: string, bot: string): string {
   if (STOP_IT.has(key)) return "/stop";
-  if (DETACH.has(detachKey(key))) return "/agent detach";
+  const detach = detachKey(key);
+  if (DETACH.has(detach) || backToKeys(bot).has(detach)) return "/agent detach";
   const phrase = lookUp(key, PERSONAL_PHRASES);
   if (phrase !== null) return phrase;
   for (const read of VALUED) {
@@ -244,7 +258,7 @@ function personal(text: string, flat: string, key: string): string {
   return text;
 }
 
-function natural(text: string, group: boolean): string {
+function natural(text: string, group: boolean, bot: string): string {
   if (text === "" || pyLstrip(text).startsWith("/")) return text;
   const flat = flatten(text);
   const key = phraseKey(text);
@@ -254,7 +268,7 @@ function natural(text: string, group: boolean): string {
   if (FEEDBACK_ALONE.has(key)) return "/feedback";
   const command = lookUp(key, GROUP_PHRASES);
   if (command !== null) return command;
-  return group ? (lookUp(key, GROUP_ONLY_PHRASES) ?? text) : personal(text, flat, key);
+  return group ? (lookUp(key, GROUP_ONLY_PHRASES) ?? text) : personal(text, flat, key, bot);
 }
 
 /**
@@ -262,10 +276,16 @@ function natural(text: string, group: boolean): string {
  * itself. Only the whole message counts. `group`: a group chat reads only what a group may do (help, stop, a new session, which
  * account, feedback), and asking it to introduce itself, read as help. `off`: what this chat cannot do right now, as a command word (`board` without the assistant, `github` without
  * the review service, `agents` and `agent` with remote agents off) or a command and its verb (`agent detach` with no agent
- * attached): a sentence that would mean one of them stays the words it is, for Claw.
+ * attached): a sentence that would mean one of them stays the words it is, for Claw. `bot`: the bot's name in this
+ * deployment, so "back to <bot>" detaches as "back to" the default name does.
  */
-export function naturalCommand(text: string, group = false, off: ReadonlySet<string> = new Set()): string {
-  const command = natural(text, group);
+export function naturalCommand(
+  text: string,
+  group = false,
+  off: ReadonlySet<string> = new Set(),
+  bot: string = BOT_NAME,
+): string {
+  const command = natural(text, group, bot);
   if (command === text) return text;
   if (command === "/stop" && off.has("stop it") && STOP_IT.has(phraseKey(text))) return text;
   const parts = pySplit(command.slice(1));

@@ -74,10 +74,10 @@ test("a delivered event is counted with how long it took", async () => {
   // (now is 22:13:20Z: 3 s before)
   assert.equal((await r.handle(signed(clock, completed({ occurred_at: "2023-11-14T22:13:17Z" })))).status, 200);
   const text = metrics.render();
-  assert.ok(text.includes('clawy_event_to_chat_seconds_count{type="run.completed"} 1'), text);
-  assert.ok(text.includes('clawy_event_to_chat_seconds_bucket{type="run.completed",le="3"} 1'));
-  assert.ok(text.includes('clawy_event_to_chat_seconds_bucket{type="run.completed",le="2"} 0'));
-  assert.ok(text.includes('clawy_event_handle_seconds_count{type="run.completed"} 1'));
+  assert.ok(text.includes('personal_agent_event_to_chat_seconds_count{type="run.completed"} 1'), text);
+  assert.ok(text.includes('personal_agent_event_to_chat_seconds_bucket{type="run.completed",le="3"} 1'));
+  assert.ok(text.includes('personal_agent_event_to_chat_seconds_bucket{type="run.completed",le="2"} 0'));
+  assert.ok(text.includes('personal_agent_event_handle_seconds_count{type="run.completed"} 1'));
 });
 
 test("an event that did not reach the chat is not counted", async () => {
@@ -85,5 +85,5 @@ test("an event that did not reach the chat is not counted", async () => {
   linkedAlice(store, false);
   const metrics = new PrometheusMetrics(clock);
   await route(store, clock, false, metrics).handle(signed(clock, completed()));
-  assert.ok(metrics.render().includes('clawy_event_to_chat_seconds_count{type="run.completed"} 0'));
+  assert.ok(metrics.render().includes('personal_agent_event_to_chat_seconds_count{type="run.completed"} 0'));
 });

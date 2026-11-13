@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import {
+  BOT_NAME,
   ConfigError,
   DEFAULT_MAX_CONCURRENT_TASKS,
   DEFAULT_MESSAGE_LIMIT,
@@ -62,6 +63,7 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
     publicBaseUrl,
     listenPort,
     metricsPort,
+    botName: read.text("PERSONAL_AGENT_BOT_NAME") || BOT_NAME,
     claw: {
       pluginId: read.optionalInt("CLAW_PLUGIN_ID"),
       ruleToolId: read.optionalInt("CLAW_RULE_TOOL_ID"),
@@ -69,9 +71,9 @@ export function readSettings(env: Env, secrets: ReadonlyMap<SecretName, string> 
     },
     exchange,
     models: {
-      chat: read.text("CLAWY_MODEL"),
-      fallback: read.text("CLAWY_FALLBACK_MODEL"),
-      review: read.text("CLAWY_REVIEW_MODEL"),
+      chat: read.text("PERSONAL_AGENT_MODEL"),
+      fallback: read.text("PERSONAL_AGENT_FALLBACK_MODEL"),
+      review: read.text("PERSONAL_AGENT_REVIEW_MODEL"),
     },
     githubReview: githubReviewSettings(read, publicBaseUrl),
     assistant: assistantSettings(read),
@@ -158,7 +160,7 @@ function githubReviewSettings(read: EnvReader, publicBaseUrl: string): GithubRev
   return {
     enabled,
     owners,
-    intentModel: enabled ? read.text("PA_REVIEW_INTENT_MODEL") || read.text("CLAWY_MODEL") : "",
+    intentModel: enabled ? read.text("PA_REVIEW_INTENT_MODEL") || read.text("PERSONAL_AGENT_MODEL") : "",
     credentialUrl: enabled
       ? withoutTrailingSlash(read.raw("PA_GITHUB_CREDENTIAL_URL", `${publicBaseUrl}/oauth/external-credentials`))
       : "",

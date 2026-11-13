@@ -12,7 +12,14 @@ import {
   type SecurityEventName,
 } from "@primusclaw/personal-agent";
 import { FakeClock } from "../../../../test-support/index.js";
-import { ALERTED, CONTENT_TYPE, HELP, PrometheusMetrics } from "../../src/index.js";
+import {
+  ALERTED,
+  CONTENT_TYPE,
+  HELP,
+  LEGACY_METRIC_PREFIX,
+  METRIC_PREFIX,
+  PrometheusMetrics,
+} from "../../src/index.js";
 
 const AAD = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 // A label value is a closed-list word: lower case and `_`, or, for the histograms, an event type or a bucket bound; a
@@ -47,7 +54,7 @@ function world() {
   const metrics = new PrometheusMetrics(clock);
   const log = new SecurityLog(silentLogger, metrics);
   const event = (name: string, labels: Readonly<Record<string, string>> = {}): number | undefined =>
-    samples(metrics.render()).get(key("clawy_security_events_total", { event: name, ...labels }));
+    samples(metrics.render()).get(key("personal_agent_security_events_total", { event: name, ...labels }));
   return { clock, metrics, log, event };
 }
 
@@ -140,7 +147,9 @@ describe("security event labels", () => {
     );
     for (const name of names)
       assert.ok(["event", "scope", "outcome", "reason", "type", "le", "path"].includes(name ?? ""));
-    const paths = found.filter((k) => k.startsWith("clawy_files_dropped_total|")).map((k) => k.split("path=")[1]);
+    const paths = found
+      .filter((k) => k.startsWith("personal_agent_files_dropped_total|"))
+      .map((k) => k.split("path=")[1]);
     assert.deepEqual(paths.sort(), [...FILES_DROPPED_PATHS].sort());
   });
 
@@ -149,7 +158,10 @@ describe("security event labels", () => {
     assert.equal(event("link_lockout", { scope: "global" }), 0);
     const found = samples(metrics.render());
     for (const [name, labels] of ALERTED) {
-      assert.ok(found.has(key("clawy_security_events_total", { event: name, ...Object.fromEntries(labels) })), name);
+      assert.ok(
+        found.has(key("personal_agent_security_events_total", { event: name, ...Object.fromEntries(labels) })),
+        name,
+      );
     }
   });
 });
@@ -158,7 +170,7 @@ describe("files and inbound counted", () => {
   it("counts dropped files where they were dropped, and only there", () => {
     const { metrics } = world();
     const dropped = (path: string): number | undefined =>
-      samples(metrics.render()).get(key("clawy_files_dropped_total", { path }));
+      samples(metrics.render()).get(key("personal_agent_files_dropped_total", { path }));
     for (const path of FILES_DROPPED_PATHS) assert.equal(dropped(path), 0, "every series exists before its first file");
     metrics.filesDropped("assistant", 2);
     metrics.filesDropped("unreadable");
@@ -170,7 +182,7 @@ describe("files and inbound counted", () => {
 
   it("keeps the longest wait of the last minute as the lag gauge", async () => {
     const { clock, metrics } = world();
-    const lag = (): number | undefined => samples(metrics.render()).get(key("clawy_inbound_lag_max_ms"));
+    const lag = (): number | undefined => samples(metrics.render()).get(key("personal_agent_inbound_lag_max_ms"));
     metrics.processed(5000, 10, true);
     await clock.advance(20_000);
     metrics.processed(90000, 10, true);
@@ -194,30 +206,63 @@ describe("files and inbound counted", () => {
     metrics.limited("concurrency_limit");
     metrics.limited("a reason a caller made up"); // counted as user_limit, never under its own name
     const found = samples(metrics.render());
-    assert.equal(found.get(key("clawy_inbound_limited_total", { reason: "user_limit" })), 2);
-    assert.equal(found.get(key("clawy_inbound_limited_total", { reason: "concurrency_limit" })), 2);
+    assert.equal(found.get(key("personal_agent_inbound_limited_total", { reason: "user_limit" })), 2);
+    assert.equal(found.get(key("personal_agent_inbound_limited_total", { reason: "concurrency_limit" })), 2);
   });
 
   it("gives every series its help and type", () => {
     const text = new PrometheusMetrics(new FakeClock()).render();
     const names = new Set(
       [...samples(text).keys()].map((k) => {
-        const name = k.split("|")[0] ?? "";
+        const name = (k.split("|")[0] ?? "").replace(LEGACY_METRIC_PREFIX, METRIC_PREFIX);
         const base = name.replace(/_(bucket|sum|count)$/, "");
         return base !== name && own(HELP, base)?.[0] === "histogram" ? base : name;
       }),
     );
     assert.deepEqual([...names].sort(), Object.keys(HELP).sort());
     for (const [name, [kind]] of Object.entries(HELP)) {
-      assert.ok(text.includes(`# TYPE ${name} ${kind}\n`) && text.includes(`# HELP ${name} `), name);
+      assert.ok(name.startsWith(METRIC_PREFIX), name);
+      const legacy = LEGACY_METRIC_PREFIX + name.slice(METRIC_PREFIX.length);
+      for (const written of [name, legacy]) {
+        assert.ok(text.includes(`# TYPE ${written} ${kind}\n`) && text.includes(`# HELP ${written} `), written);
+      }
     }
     assert.equal(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
   });
 });
 
+describe("the names of an earlier release, for one more release", () => {
+  it("every sample is written under its new name and under its deprecated name, with the same value", () => {
+    const clock = new FakeClock();
+    const m = new PrometheusMetrics(clock);
+    const log = new SecurityLog(silentLogger, m);
+    log.event("link_attempt", { aad_object_id: AAD, outcome: "wrong" });
+    m.processed(5000, 250, true);
+    m.limited("user_limit");
+    m.filesDropped("assistant", 2);
+    m.eventDelivered("assistant.say", 0.3, 4.2);
+    const found = samples(m.render());
+    const current = [...found].filter(([k]) => k.startsWith(METRIC_PREFIX));
+    const legacy = [...found].filter(([k]) => k.startsWith(LEGACY_METRIC_PREFIX));
+    assert.ok(current.length > 0);
+    assert.equal(current.length + legacy.length, found.size);
+    assert.deepEqual(
+      legacy.map(([k, v]) => [k.slice(LEGACY_METRIC_PREFIX.length), v]),
+      current.map(([k, v]) => [k.slice(METRIC_PREFIX.length), v]),
+    );
+    assert.equal(found.get(key("clawy_security_events_total", { event: "link_attempt", outcome: "wrong" })), 1);
+    assert.equal(
+      found.get(key("personal_agent_security_events_total", { event: "link_attempt", outcome: "wrong" })),
+      1,
+    );
+    assert.equal(found.get(key("clawy_inbound_handled_total")), 1);
+    assert.equal(found.get(key("personal_agent_inbound_handled_total")), 1);
+  });
+});
+
 describe("the text the Python worker wrote", () => {
-  it("is written byte for byte", async () => {
-    // data/python-render.txt is `Metrics.render()` of the Python worker after the same calls.
+  it("is written byte for byte, under the new names and then under the deprecated ones", async () => {
+    // data/python-render.txt is `Metrics.render()` of the Python worker after the same calls (its names are the deprecated ones).
     const clock = new FakeClock();
     const m = new PrometheusMetrics(clock);
     m.securityEvent({ event: "link_attempt", outcome: "wrong" });
@@ -236,7 +281,7 @@ describe("the text the Python worker wrote", () => {
     m.eventDelivered("assistant.say", 7.123456, null);
     m.eventDelivered("weird", 0.5, -2.0);
     m.eventDelivered("approval.requested", 65.0, 0.0004);
-    const expected = readFileSync(new URL("data/python-render.txt", import.meta.url), "utf8");
-    assert.equal(m.render(), expected);
+    const python = readFileSync(new URL("data/python-render.txt", import.meta.url), "utf8");
+    assert.equal(m.render(), python.replaceAll(LEGACY_METRIC_PREFIX, METRIC_PREFIX) + python);
   });
 });

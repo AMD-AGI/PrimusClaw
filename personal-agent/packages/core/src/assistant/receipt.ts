@@ -80,7 +80,7 @@ export class Receipt {
   reserved = false;
   /** The words shown are known not to be said. */
   voided = false;
-  /** The line the reply starts with (direct chat: Clawy's head), shown before its words. */
+  /** The line the reply starts with (direct chat: the bot's head), shown before its words. */
   head = "";
   /**
    * Which turn of the assistant's session answers the message this receipt stands under (`answeredBy`): its id, once Claw gave

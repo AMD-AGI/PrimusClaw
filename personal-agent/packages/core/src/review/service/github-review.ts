@@ -134,7 +134,7 @@ export class GithubReview {
     const left = expanded.taken.filter((k) => !kept.has(k)).map((k) => Number(k.split("\u0000")[2]));
     let ask = { ...reading.ask, repo: expanded.repo, unread: unique([...expanded.stray, ...left]) };
     if (!bareName(ask.who) && ctx.group) {
-      await say(this.deps, ctx.conversation, rt.askWho);
+      await say(this.deps, ctx.conversation, rt.askWho(this.deps.botName));
       return true;
     }
     const others = otherReviewers(ask);
@@ -179,7 +179,7 @@ export class GithubReview {
       await say(
         this.deps,
         conversation,
-        `${name} 还没有在 Clawy 里连接自己的 Primus key（1:1 里发 \`/link\`），我没法以 TA 的身份 review，所以没有开始 review。`,
+        `${name} 还没有在 ${this.deps.botName} 里连接自己的 Primus key（1:1 里发 \`/link\`），我没法以 TA 的身份 review，所以没有开始 review。`,
       );
       return;
     }

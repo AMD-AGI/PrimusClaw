@@ -22,7 +22,6 @@ import type {
   VoteRoute,
 } from "@primusclaw/personal-agent";
 import {
-  BOT_NAME,
   chatTurnKey,
   contextInterceptor,
   Guardrails,
@@ -125,14 +124,14 @@ export const ON_BEHALF_PATH = "/primus-claw-agent/on-behalf";
 /**
  * A setting that turns on something this worker would not do stops the start: production runs it, so a worker that
  * quietly ran without it would be a different worker.
- * - CLAWY_FALLBACK_MODEL with no model refusal policy: the fallback would never be used.
+ * - PERSONAL_AGENT_FALLBACK_MODEL with no model refusal policy: the fallback would never be used.
  * - PA_ON_BEHALF_USERS with no plugin serving the on-behalf route: the route would not exist.
  */
 function refuseMissing(base: AssemblyBase): void {
   const { settings, plugins } = base;
   if (settings.models.fallback !== "" && plugins.modelRefusalPolicy === noModelRefusalPolicy)
     throw new StartupError(
-      "CLAWY_FALLBACK_MODEL is set, but no plugin says when a model refused (modelRefusalPolicy): the fallback would never be used",
+      "PERSONAL_AGENT_FALLBACK_MODEL is set, but no plugin says when a model refused (modelRefusalPolicy): the fallback would never be used",
     );
   if (
     settings.onBehalfUsers.size > 0 &&
@@ -195,7 +194,7 @@ function routerDeps(base: AssemblyBase, built: Built, errors: PublicErrorLog): R
   return {
     config: {
       publicBaseUrl: settings.publicBaseUrl,
-      botName: BOT_NAME,
+      botName: settings.botName,
       pluginId: settings.claw.pluginId === null ? "" : String(settings.claw.pluginId),
       model: settings.models.chat,
       reviewModel: settings.models.review,
@@ -383,7 +382,7 @@ export function buildFeatures(given: AssemblyBase): Features {
   const reviewHandlers = review?.service.routeHandlers();
   // (in a group, Python reads `/observe` first, then the feedback answer, then the review-stop words, then review requests)
   const groupInterceptors: RouteHandlers["groupInterceptors"][number][] = [
-    contextInterceptor(w8.groupContext),
+    contextInterceptor(w8.groupContext, base.settings.botName),
     w8.observer.interceptor,
     w8.flow.interceptor,
   ];

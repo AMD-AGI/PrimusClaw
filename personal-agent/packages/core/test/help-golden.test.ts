@@ -14,6 +14,7 @@ import { test } from "node:test";
 import { z } from "zod";
 
 import { renderHelp } from "../src/capabilities/help.js";
+import { LEGACY_BOT_NAME } from "../src/legacy-names.js";
 import type { Part } from "../src/capabilities/registry.js";
 import { agentActionAllowed, channelActions } from "../src/capabilities/visibility.js";
 import { dataStatement } from "../src/locales/transparency.js";
@@ -62,7 +63,7 @@ test("help is rendered byte for byte as the Python worker renders it", () => {
       parts: new Set<Part>(row.parts),
       values: row.values ?? {},
       lead: row.lead ?? "",
-      ...(row.bot === undefined ? {} : { bot: row.bot }),
+      bot: row.bot ?? LEGACY_BOT_NAME, // (the Python worker rendered them under the bot's earlier default name)
       channel: "Microsoft Teams", // (the goldens are the Teams worker's)
     });
     if (row.text !== undefined) assert.equal(text, row.text);

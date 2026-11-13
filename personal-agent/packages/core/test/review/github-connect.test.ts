@@ -188,15 +188,19 @@ test("the consent says clawy reads github with it only where claw does", () => {
     expiresIn: 900,
     interval: 5,
   };
-  assert.ok(consentText(code, true).includes("To let me read your GitHub for you"));
-  assert.ok(!consentText(code, false).includes("To let me read your GitHub for you"));
-  assert.ok(consentText(code, false).includes("（15 分钟内有效）"));
+  assert.ok(consentText(code, true, "PrimusClaw Assistant").includes("To let me read your GitHub for you"));
+  assert.ok(!consentText(code, false, "PrimusClaw Assistant").includes("To let me read your GitHub for you"));
+  assert.ok(consentText(code, false, "PrimusClaw Assistant").includes("（15 分钟内有效）"));
+  // (what is posted names the bot by the deployment's name)
+  const named = consentText(code, false, "Robin");
+  assert.ok(named.includes("注明是 Robin 代你所发") && named.includes("made by Robin on your behalf"));
+  assert.ok(!named.includes("{bot}"));
 });
 
 test("github status says whether clawy reads github with the binding", () => {
   assert.ok(
     readsLine({ readsWith: "binding", login: "", missing: "", bindingReads: true }, true).startsWith(
-      "Clawy 用这个令牌读你的 GitHub",
+      "我用这个令牌读你的 GitHub",
     ),
   );
   assert.ok(readsLine({ readsWith: "env", login: "", missing: "", bindingReads: true }, true).includes("GH_TOKEN"));

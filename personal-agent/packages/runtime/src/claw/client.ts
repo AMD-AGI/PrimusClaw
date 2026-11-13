@@ -12,7 +12,7 @@ import { HttpWorkItems } from "./work-items.js";
 import { HttpSkills } from "./skills.js";
 
 /** What Claw's audit trail calls this client by default (`X-Claw-Client`). */
-export const DEFAULT_CLIENT_LABEL = "clawy";
+export const DEFAULT_CLIENT_LABEL = "personal-agent";
 
 /** How the Claw client is made (from the worker's settings). */
 export interface ClawClientOptions {
@@ -22,7 +22,7 @@ export interface ClawClientOptions {
   readonly logger?: Logger;
   /** CLAW_PLUGIN_ID (null: plain sessions). */
   readonly pluginId?: number | null;
-  /** CLAWY_MODEL ("" sends none). */
+  /** PERSONAL_AGENT_MODEL ("" sends none). */
   readonly model?: string;
   /** CLAW_RULE_TOOL_ID (null: no rule rides on a message). */
   readonly ruleToolId?: number | null;

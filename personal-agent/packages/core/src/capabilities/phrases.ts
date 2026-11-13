@@ -5,6 +5,8 @@
  * The plain sentences help teaches, and close ways of saying the same, each read as the command it means (`natural.ts`). A whole
  * message is looked up as a phrase: lower case, no spaces between the words, no punctuation at either end (`phraseKey`).
  */
+import { BOT_NAME } from "../branding.js";
+import { LEGACY_BOT_NAME } from "../legacy-names.js";
 
 export const HELP = [
   "help",
@@ -114,14 +116,22 @@ export const AGENT_SESSIONS = [
   "agent会话列表",
   "开发环境会话",
 ];
+/** "Back to <name>" for the bot's name `name` (a deployment's own name is read beside these: `naturalCommand`'s `bot`). */
+export function backToBot(name: string): string[] {
+  const lower = name.toLowerCase();
+  return [`回到${lower}`, `back to ${lower}`, `come back to ${lower}`];
+}
+/**
+ * The default name, and the name an earlier release gave the bot: "back to ..." buttons under cards it sent are still in
+ * people's chats.
+ */
 export const DETACH = [
-  "回到clawy",
+  ...backToBot(BOT_NAME),
+  ...backToBot(LEGACY_BOT_NAME),
   "回到你这里",
   "回来吧",
   "不跟agent说了",
   "断开agent",
-  "back to clawy",
-  "come back to clawy",
   "detach the agent",
   "回到助理",
   "回到助手",

@@ -24,5 +24,5 @@ it("a minute of handled messages and refusals is one inbound_stats line, and eac
   const line = logger.lines.find((l) => l.message === "inbound_stats");
   assert.ok(line !== undefined, JSON.stringify(logger.lines));
   assert.deepEqual([line.fields["handled"], line.fields["failed"], line.fields["rate_limited"]], [2, 1, 1]);
-  assert.match(prometheus.render(), /clawy_inbound_handled_total 2/);
+  assert.match(prometheus.render(), /personal_agent_inbound_handled_total 2/);
 });

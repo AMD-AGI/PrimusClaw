@@ -108,7 +108,9 @@ test("a message that starts by naming the bot (measured)", () => {
   ];
   for (const [name, text, expected] of cases)
     assert.equal(addressedToBot({ text }, name), expected, `${name}: ${text}`);
-  assert.equal(addressedToBot({ text: "@Clawy" }), true, "the default name");
+  assert.equal(addressedToBot({ text: "@PrimusClaw Assistant" }), true, "the default name");
+  assert.equal(addressedToBot({ text: "<at>PrimusClaw Assistant</at> hi" }), true, "the default name, mentioned");
+  assert.equal(addressedToBot({ text: "@Clawy" }), false, "the earlier name is a deployment's to give");
 });
 
 test("python's ignorecase letters only: caseless spells the folds python matches", () => {

@@ -871,7 +871,7 @@ describe("a container whose home does not outlive it", () => {
     assert.match(said ?? "", /then run init and login again/, "a machine that signed in with login is told to do so again");
     // A paired machine never ran init or login: it is sent back to the chat for a new pairing command.
     const paired = ephemeralWhere("/root/.config/claw-connector", mounts, true) ?? "";
-    assert.match(paired, /then ask Clawy for a new pairing command \("连接我的开发环境"\) and run it in that shell/);
+    assert.match(paired, /then ask the assistant in your chat for a new pairing command \("连接我的开发环境"\) and run it in that shell/);
     assert.doesNotMatch(paired, /init|login/);
   });
 

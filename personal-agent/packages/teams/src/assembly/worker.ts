@@ -56,8 +56,6 @@ import {
 } from "./outbound.js";
 import { loadSecrets } from "./secrets.js";
 
-const BOT_NAME = "Clawy";
-
 /** The Teams style's reading of a conversation kind (`style.streams_in`'s conversation types). */
 export function conversationTypeOf(kind: string): string {
   if (kind === "personal") return "personal";
@@ -118,10 +116,10 @@ export function teamsShape(teams: Pick<TeamsSettings, "style" | "installHintUrl"
  * `text` as the activity Teams would have sent for the person's own message `messageId` in a stored conversation, read as
  * core's event (what a plugin's `handleAsTyped` hands the router); undefined when it cannot be read.
  */
-export function teamsTypedEvent(logger: Logger): OpenedSurface["typedEvent"] {
+export function teamsTypedEvent(botName: string, logger: Logger): OpenedSurface["typedEvent"] {
   return (conversation, messageId, text) => {
     const activity: WireJson = { ...activityOfReference(conversation.wire as WireJson, messageId), text };
-    const read = toInboundEvent(activity, { botName: BOT_NAME, logger });
+    const read = toInboundEvent(activity, { botName, logger });
     return read.ok ? read.value : undefined;
   };
 }
@@ -164,14 +162,19 @@ function surfaceOf(teams: TeamsSettings, outbound: Outbound, gate: GateEntry | u
 
 function connect(
   teams: TeamsSettings,
-  parts: { readonly acks: AckRegistry; readonly inbound: BusClient | undefined; readonly gate: GateEntry | undefined },
+  parts: {
+    readonly botName: string;
+    readonly acks: AckRegistry;
+    readonly inbound: BusClient | undefined;
+    readonly gate: GateEntry | undefined;
+  },
   context: ConnectContext,
 ) {
-  const { acks, inbound, gate } = parts;
+  const { botName, acks, inbound, gate } = parts;
   const handle = inboundHandler({
     acks,
     route: context.route,
-    botName: BOT_NAME,
+    botName,
     logger: context.logger,
     groupContext: context.groupContext,
   });
@@ -208,13 +211,13 @@ function connect(
   return { routes, source };
 }
 
-function opened(teams: TeamsSettings, gate: GateEntry | undefined, deps: SurfaceDeps): OpenedSurface {
+function opened(teams: TeamsSettings, botName: string, gate: GateEntry | undefined, deps: SurfaceDeps): OpenedSurface {
   const { outbound, inbound } = transport(teams, gate, deps);
   const { acks, surface } = surfaceOf(teams, outbound, gate, deps);
   return {
     surface,
-    typedEvent: teamsTypedEvent(deps.logger),
-    connect: (context) => connect(teams, { acks, inbound, gate }, context),
+    typedEvent: teamsTypedEvent(botName, deps.logger),
+    connect: (context) => connect(teams, { botName, acks, inbound, gate }, context),
     closes: [() => outbound.close(), () => inbound?.close()],
   };
 }
@@ -230,12 +233,12 @@ export function teamsSurface(): SurfaceAdapter {
       const gate = gateEntryFromEnv(env);
       return {
         loadSecrets: (_names, deps) => loadSecrets(env, deps),
-        configure(): ConfiguredSurface {
+        configure(settings): ConfiguredSurface {
           const teams = teamsSettingsFromEnv(env, { queues: gate === undefined });
           return {
             host: gate === undefined ? "0.0.0.0" : LOOPBACK,
             shape: teamsShape(teams),
-            open: (deps) => opened(teams, gate, deps),
+            open: (deps) => opened(teams, settings.botName, gate, deps),
           };
         },
       };
