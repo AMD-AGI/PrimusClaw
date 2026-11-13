@@ -417,7 +417,9 @@ export async function decideSkillDraft(q: Querier, userId: string, params: Recor
 
 /**
  * The user's own words a worker's request quote may come from: for a work item's worker, what they wrote to their assistant, signed
- * in, from just before the item was started (the request that started it) until now; for a chat of their own, what they wrote there.
+ * in, around when the item was started (the request that started it: from a few minutes before until just after); for a chat of their
+ * own, what they wrote there. A later message is not the request that started this worker's work: a save it asks for is the router's,
+ * or, quoted by the worker, a draft the user confirms.
  */
 async function userWordsFor(sessionId: string, userId: string): Promise<string[]> {
   const item = (await db.query(
@@ -427,6 +429,7 @@ async function userWordsFor(sessionId: string, userId: string): Promise<string[]
   return ((await db.query(
     `SELECT m.content FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id AND a.user_id = $1
       WHERE m.user_id = $1 AND m.attended_via IS NOT NULL AND m.received_at >= $2::timestamptz - make_interval(mins => $3::int)
+        AND m.received_at <= $2::timestamptz
       ORDER BY m.received_at DESC LIMIT 20`,
     [userId, new Date(item.created_at).toISOString(), WORKER_QUOTE_WINDOW_MIN],
   )).rows as Array<{ content: string }>).map((r) => r.content);
@@ -474,15 +477,19 @@ export async function handleWorkerSkillWrites(
         logger.info({ skillName: name, sessionId, ok: saved.ok, ...(saved.ok ? { version: saved.version } : { reason: saved.error }) }, "skill.worker_saved");
         continue;
       }
-      // Not asked for in the user's own words: a draft, with this turn's file writes for it folded in.
+      // Not asked for in the user's own words: a draft, with this turn's file writes for it folded in (a removal of a file the skill
+      // already has is kept as one, for the save to make).
       const files = new Map((Array.isArray(skill.files) ? skill.files : []).map((f) => [f.path, f]));
+      const removed = new Set<string>();
       for (const m of mutations.filter((m) => m.skill_name === name)) {
-        if (m.action === "remove") files.delete(m.file_path);
-        else files.set(m.file_path, { path: m.file_path, content: m.content || "", ...(m.is_binary ? { is_binary: true } : {}) });
+        if (m.action === "remove") { files.delete(m.file_path); removed.add(m.file_path); continue; }
+        removed.delete(m.file_path);
+        files.set(m.file_path, { path: m.file_path, content: m.content || "", ...(m.is_binary ? { is_binary: true } : {}) });
       }
       drafted.add(name);
       const made = await createSkillDraft(userId, {
-        name, content: skill.content, description: skill.description || "", files: [...files.values()], ...(invocation ? { invocation } : {}),
+        name, content: skill.content, description: skill.description || "", files: [...files.values()], removeFiles: [...removed],
+        ...(invocation ? { invocation } : {}),
       }, { origin: "worker", actor: "model", sessionId, requestQuote: skill.request_quote ?? null });
       metrics.onUserSkillSave("draft", made.ok ? "ok" : made.error);
       if (made.ok) draftsMade.push(made.draft);

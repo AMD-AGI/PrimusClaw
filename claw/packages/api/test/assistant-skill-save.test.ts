@@ -24,8 +24,8 @@
  *   E9 a worker's save_skill: with the user's own request quoted from what they wrote to their assistant, saved now with a card in the
  *      assistant; without it, a draft whose card waits in the assistant, its file writes folded into the draft and not onto a skill
  *   E10 skill_list lists turned off and manual skills and the drafts; the write tools are the router's only, in the user's own chat
- *   E11 words that say not to ("不要存成技能", "don't delete it") ask for nothing; a worker's quote counts only from just before its
- *       item was started
+ *   E11 words that say not to ("不要存成技能", "don't delete it") ask for nothing; a worker's quote counts only from the request that
+ *       started its item: one said long before, or after the item started, is a draft
  *   E12 an Undo applies only to the skill as its change left it: a later change of the description alone makes it stale; and what
  *       it would put back passes the checks a save passes (a secret stored before them is not put back)
  *   E13 a worker's file writes on a skill of the user's that its turn did not save at their request: a draft, files and removals
@@ -441,6 +441,33 @@ describe("assistant: saving the user's personal skills from the conversation", {
     }
     assert.ok(!(await skills()).some((s) => s.skill_name === "release-notes"), "not saved");
     assert.equal((await w.q("SELECT 1 FROM claw_skill_drafts WHERE skill_name = 'release-notes'")).length, 1, "a draft instead");
+
+    // Said after the item started: not the request that started this worker's work.
+    Object.assign(consumer.completionPorts, {
+      maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {}, enqueueEvolutionJob: async () => {},
+      recordSkillFeedback: async () => {}, checkProbationGraduation: async () => {}, recordWorkerTurnEnd: async () => {},
+    });
+    consumer.tombstoneReader.has = async () => false;
+    try {
+      const item = await w.createItem(alice, "later");
+      await w.q("UPDATE claw_work_items SET created_at = NOW() - INTERVAL '5 minutes' WHERE item_id = $1", [item.itemId]);
+      const later = await message(alice, "把这个流程存成技能 later-skill");
+      await w.closeRun(later.task_id);
+      const run = await w.workerTurn(item.itemId);
+      await consumer.consumeEventDelivery({
+        subject: `events.${run.sid}`, seq: 2, ack: () => {}, nak: () => { throw new Error("nak"); },
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: run.sid, task_id: run.task_id, user_id: "alice", message_id: run.mid, prompt: "do it",
+          final_text: "done", failed: false, error_count: 0,
+          skills_to_save: [{ skill_name: "later-skill", content: "## Steps\n1. b", description: "y", request_quote: "把这个流程存成技能" }],
+        })),
+      } as any);
+    } finally {
+      Object.assign(consumer.completionPorts, original);
+      consumer.tombstoneReader.has = tombstone;
+    }
+    assert.ok(!(await skills()).some((s) => s.skill_name === "later-skill"), "not saved on a later message");
+    assert.equal((await w.q("SELECT 1 FROM claw_skill_drafts WHERE skill_name = 'later-skill'")).length, 1);
   });
 
   test("E12 an Undo applies only to the skill as its change left it, and puts back nothing a save would refuse", async () => {
@@ -502,5 +529,32 @@ describe("assistant: saving the user's personal skills from the conversation", {
     assert.deepEqual(await files(), ["scripts/run.sh=echo run", "templates/a.md=A2"]);
     assert.equal((await undo(String(pressed.result?.change_id))).body.data.undone, "restored_version");
     assert.deepEqual(await files(), ["templates/a.md=A", "templates/old.md=OLD"], "and Undo puts the files back");
+
+    // A new version drafted beside a removal of a file the skill has: Save removes it too.
+    Object.assign(consumer.completionPorts, {
+      maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {}, enqueueEvolutionJob: async () => {},
+      recordSkillFeedback: async () => {}, checkProbationGraduation: async () => {}, recordWorkerTurnEnd: async () => {},
+    });
+    consumer.tombstoneReader.has = async () => false;
+    try {
+      const item = await w.createItem(alice, "rewrite the skill");
+      const run = await w.workerTurn(item.itemId);
+      await consumer.consumeEventDelivery({
+        subject: `events.${run.sid}`, seq: 2, ack: () => {}, nak: () => { throw new Error("nak"); },
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: run.sid, task_id: run.task_id, user_id: "alice", message_id: run.mid, prompt: "do it",
+          final_text: "done", failed: false, error_count: 0,
+          skills_to_save: [{ skill_name: "standup-notes", content: `${STANDUP}\n4. 风险`, description: "站会" }],
+          skill_file_mutations: [{ action: "remove", skill_name: "standup-notes", file_path: "templates/old.md" }],
+        })),
+      } as any);
+    } finally {
+      Object.assign(consumer.completionPorts, original);
+      consumer.tombstoneReader.has = tombstone;
+    }
+    const [next] = await w.q("SELECT confirmation_id FROM claw_assistant_confirmations WHERE kind = 'skill_save' AND status = 'pending'");
+    const saved = await schedules.decideConfirmation({ userId: "alice", confirmationId: next.confirmation_id, decision: "allow", via: "button" });
+    assert.equal(saved.status, "done", JSON.stringify(saved));
+    assert.deepEqual(await files(), ["templates/a.md=A"], "the removal drafted with the new version is made by its Save");
   });
 });
