@@ -134,6 +134,21 @@ release version, and its `appVersion` stays `latest`.
   Not when the request lacks `user_skills_enabled`, acts as a user, or is a router's or observer's turn; off while
   `CLAW_USER_SKILLS_ENABLED` is off, the default (#810).
 
+## [0.4.1] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611130845` (commit c125d616). A patch release: one fix. No schema change, no new
+setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- A review someone else asked for whose merge GitHub refused for a reason the reviewer cannot clear no longer wakes the
+  reviewer as blocked: the branch conflicts with the base (`DIRTY`: the author has to resolve it), the branch rules
+  block it (`BLOCKED`: the author or CI has to meet them), or the pull request changes a CI workflow and the reviewer's
+  GitHub authorization lacks the `workflow` scope (it has to be merged by hand on GitHub). The item stays in progress
+  and says what it waits for, and the requester is told once per head commit, with what comes next.
+  New commits run the review once more in its session; with none within 24 hours the item goes to the reviewer as
+  blocked. A refusal on a head whose wait already ended needs the reviewer. A restart drops the wait (#816).
+
 ## [0.4.0] - 2026-11-12
 
 Image `docker.io/primussafe/claw:202611130054` (commit cf083e95). A MINOR release: personal skills get their own switch
