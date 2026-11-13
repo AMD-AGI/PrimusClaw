@@ -592,7 +592,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if first.EnvdAccessToken == "" || first.ClientID != first.SandboxID || first.Domain != first.SandboxID || first.Alias != "runner" {
 		t.Fatalf("first=%+v", first)
 	}
-	if first.TemplateID != "ar-01ja-runner-g1" || first.EnvdVersion != "0.1.0" {
+	if first.TemplateID != "ar-01ja-runner-g1" || first.EnvdVersion != "0.5.2" {
 		t.Fatalf("first=%+v", first)
 	}
 	created := runner.created[0]

@@ -28,7 +28,7 @@ process.env.AUTH_CLAW_TOKEN = "test-internal-token";
 if (!process.argv.includes("--self-check")) process.argv.push("--self-check");
 
 const { app } = await import("../src/index.js");
-const { spawnBackground, killShell, shutdownAllShells } =
+const { spawnBackground, pollOutput, killShell, waitForShellExit, shutdownRunShells, shutdownAllShells } =
   await import("../src/tools/shell/bg-manager.js");
 const { UNOWNED } = await import("../src/runtime/owner-context.js");
 
@@ -51,6 +51,22 @@ function ask(headers: Record<string, string>, body: unknown = {}) {
   });
 }
 
+/**
+ * Stop a case's shell and return only once the registry has seen it exit.
+ *
+ * `killShell` sends the signal and returns; the shell stays `running` until its
+ * process group is gone and the exit has been handled, and the route counts it
+ * for that whole window, as it should. A case that only signalled left its
+ * shell in the count of whichever case ran next, so the next count over the
+ * same scope was off by one whenever the exit landed after the request.
+ */
+async function stop(owner: string, run: string, id: string): Promise<void> {
+  killShell(owner, run, id);
+  const waited = waitForShellExit(owner, run, id, 10_000);
+  if (!(waited instanceof Promise)) return;
+  assert.notEqual(await waited, null, `shell ${id} did not exit after SIGTERM`);
+}
+
 test.after(async () => {
   await shutdownAllShells(200);
   await app.close();
@@ -63,7 +79,7 @@ test("the proved owner is answered with its own running count", async () => {
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
-    killShell(SESSION, "ktsk_1", "srv");
+    await stop(SESSION, "ktsk_1", "srv");
   }
 });
 
@@ -79,7 +95,7 @@ test("a body naming a scope is refused by name, never answered from", async () =
       assert.deepEqual(res.json(), { error: "scope_not_in_body", field });
     }
   } finally {
-    killShell(UNOWNED, "ktsk_1", "stray");
+    await stop(UNOWNED, "ktsk_1", "stray");
   }
 });
 
@@ -90,7 +106,7 @@ test("the unowned bucket is addressable, by proving it like any other scope", as
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), { running: 1 });
   } finally {
-    killShell(UNOWNED, "ktsk_1", "explicit");
+    await stop(UNOWNED, "ktsk_1", "explicit");
   }
 });
 
@@ -140,6 +156,35 @@ test("a proof for one owner cannot be presented for another", async () => {
     assert.equal(neighbour.statusCode, 200);
     assert.deepEqual(neighbour.json(), { running: 0 }, "another scope's work is not this scope's count");
   } finally {
-    killShell("owner-x", "ktsk_1", "x-shell");
+    await stop("owner-x", "ktsk_1", "x-shell");
   }
+});
+
+test("a shell that was signalled but has not exited is still counted", async () => {
+  // The order the cases above rely on, pinned without a race: this group
+  // ignores SIGTERM, so it is still running after the signal for as long as the
+  // case needs, and the count has to say so. Reporting it gone at the signal
+  // would mark a sandbox idle while its work is still holding it.
+  const owner = "owner-stopping";
+  spawnBackground(owner, "ktsk_1", "trap '' TERM; echo armed; sleep 60", "stubborn");
+  try {
+    // The signal must not overtake the trap, or the shell dies of it at once.
+    const armedBy = Date.now() + 10_000;
+    while (!pollOutput(owner, "ktsk_1", "stubborn").text.includes("armed")) {
+      assert.ok(Date.now() < armedBy, "the shell never reported its trap installed");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    killShell(owner, "ktsk_1", "stubborn");
+    const signalled = await ask(proving(owner));
+    assert.equal(signalled.statusCode, 200);
+    assert.deepEqual(signalled.json(), { running: 1 }, "a signalled shell that is still running is counted");
+  } finally {
+    // SIGTERM is ignored, so this is the path that ends it: the reap escalates
+    // to SIGKILL after its grace.
+    await shutdownRunShells(owner, "ktsk_1", 250);
+    const waited = waitForShellExit(owner, "ktsk_1", "stubborn", 10_000);
+    if (waited instanceof Promise) assert.notEqual(await waited, null, "the escalation ended the shell");
+  }
+  const after = await ask(proving(owner));
+  assert.deepEqual(after.json(), { running: 0 }, "an exited shell is not counted");
 });
