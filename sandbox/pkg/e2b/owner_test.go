@@ -214,11 +214,7 @@ func TestSAROffGrantKeyCreateChecksOwnerOnlyForAssertion(t *testing.T) {
 	for _, attest := range []bool{false, true} {
 		users := staticUsers{"u-123": {Found: true, Workspaces: []string{"lab"}}}
 		now := time.Now()
-		auth := usercr.NewFromReader(users, usercr.WithClock(func() time.Time { return now }))
-		plane, runner, keys := testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"lab"}, func(o *grant.Options) {
-			o.Authz = auth
-			o.AttestWorkloads = attest
-		})
+		plane, runner, keys := testPlaneSAROff(t, users, attest, usercr.WithClock(func() time.Time { return now }))
 		delete(users, "u-123")
 		// Past the 30s allow cache, the next create reads the User again.
 		now = now.Add(31 * time.Second)

@@ -296,11 +296,25 @@ ALLOW_INSECURE_NO_AUTH=true deploy/scripts/install.sh
 ```
 
 `ENABLE_WORKSPACE_SAR` defaults to false: workspace use is read from the SaFE User.
+A found User is reused for 30s and a missing User for 5s, so a removed member or
+administrator keeps access, and a new member waits, for up to 30s. A User read that
+cannot reach the API server is not reused and answers 503 `membership_unavailable`.
 Set it true only after `ENABLE_WORKLOAD_ASSERTION=true`, and set `RBAC_SUBJECT_PREFIX`
 to the same value as SaFE `rbac.subject_prefix`. `ENABLE_WORKLOAD_ASSERTION` defaults
 to false. The process exits for a missing `IDENTITY_TOKEN_URL` only when that switch
 is true. Turn SaFE `sandbox.admission` on last. A builtin identity has no Group
 subjects; the platform ClusterRole bindings apply when SaFE projects external groups.
+While SaFE uses builtin identity no caller gets a platform role from these bindings,
+so keep `ENABLE_WORKSPACE_SAR` off there.
+
+With `ENABLE_WORKSPACE_SAR=true` every review is a cluster-scoped SubjectAccessReview
+for user `<RBAC_SUBJECT_PREFIX><sub>` and groups `<RBAC_SUBJECT_PREFIX><group>`:
+
+| Question | Group | Resource | Verb | Name |
+|---|---|---|---|---|
+| May use workspace `<ws>` | `amd.com` | `workspaces` | `use` | `<ws>` |
+| Platform role `system-admin` | `runtime.agent-sandbox.io` | `sessions` | `delete` | empty |
+| Platform role `system-admin-readonly` | `runtime.agent-sandbox.io` | `sessions` | `list` | empty |
 
 The supported install path is the Helm-backed installer above. Files under
 `deploy/k8s/` and `deploy/k8s-kata/` are environment-specific templates: they

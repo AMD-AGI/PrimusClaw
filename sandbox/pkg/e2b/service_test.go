@@ -143,10 +143,10 @@ func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 }
 
 // testPlaneSAROff builds the default grant plane with the User authorizer and no workspace SAR.
-func testPlaneSAROff(t *testing.T, users staticUsers, attest bool) (*Service, *fakeRunner, map[string]string) {
+func testPlaneSAROff(t *testing.T, users staticUsers, attest bool, opts ...usercr.Option) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
 	return testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"lab"}, func(o *grant.Options) {
-		o.Authz = usercr.NewFromReader(users)
+		o.Authz = usercr.NewFromReader(users, opts...)
 		o.AttestWorkloads = attest
 	})
 }
