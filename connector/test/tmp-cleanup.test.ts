@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { processStart } from "../src/children.js";
 import { tmpdir } from "./support/tmp.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -32,8 +33,7 @@ const stillAlive = async (pid: number, by = 2_000): Promise<boolean> => {
 interface Run { status: number | null; signal: NodeJS.Signals | null; made: string[]; adapters: number[]; closed: number[]; started: number[]; left: string[]; out: string }
 
 /** The fixture ending as `end` says; with `closeStdout`, this side closes the pipe the fixture reports into once it has set up, as a runner that has left does. */
-async function run(end: string, closeStdout = false): Promise<Run> {
-  const tmp = tmpdir("tmpguard-");
+async function run(end: string, closeStdout = false, tmp = tmpdir("tmpguard-")): Promise<Run> {
   const report = path.join(tmpdir("tmpguard-report-"), "made.json");
   const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmp, TMP_FIXTURE_END: end, TMP_FIXTURE_REPORT: report };
   delete env.NODE_TEST_CONTEXT; // its own run, not a subtest reporting to this one
@@ -81,6 +81,41 @@ describe("temporary directories", { skip: process.platform !== "linux" && "reads
       await assertClean(r);
     });
   }
+  // A file SIGKILLed (with its group, by `timeout -s KILL` or an OOM kill) runs no cleanup of its own: it left every
+  // directory it had made in TMPDIR, hundreds for a few seconds of the suite, and its adapters running.
+  test("a test file SIGKILLed leaves one directory, which a file in that TMPDIR removes once it is stale, after killing its connector and adapters", async (t) => {
+    const killed = await run("SIGKILL");
+    t.after(() => { for (const pid of [...killed.adapters, ...killed.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
+    assert.equal(killed.signal, "SIGKILL", killed.out);
+    assert.equal(killed.adapters.length, 2, `the fixture started its two adapters\n${killed.out}`);
+    assert.equal(killed.left.length, 1, `left in TMPDIR: ${killed.left.join(", ")}`);
+    assert.match(killed.left[0], /^cc-run-\d+-\d+-[A-Za-z0-9]{6}$/);
+    for (const d of killed.made) assert.equal(path.basename(path.dirname(d)), killed.left[0], d);
+    const tmp = path.dirname(path.dirname(killed.made[0]));
+    // A file killed hard is taken for dead only once its directory has gone untouched for two minutes (it may be running
+    // in a pid namespace this one cannot see): until then the next file leaves it.
+    const soon = await run("pass", false, tmp);
+    t.after(() => { for (const pid of [...soon.adapters, ...soon.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
+    assert.equal(soon.status, 0, soon.out);
+    assert.deepEqual(soon.left, killed.left, `left in TMPDIR: ${soon.left.join(", ")}\n${soon.out}`);
+    const old = new Date(Date.now() - 600_000);
+    fs.utimesSync(path.join(tmp, killed.left[0]), old, old);
+    // That of a file still running (this one) is not touched, however long untouched; one that others may write in is not
+    // one mkdtemp made, so not one a test file made: what it records may not be the suite's, and it is left alone.
+    const running = path.join(tmp, `cc-run-${process.pid}-${processStart(process.pid)}-AAAAAA`);
+    const shared = path.join(tmp, `cc-run-${process.pid}-1-BBBBBB`);
+    for (const d of [running, shared]) fs.mkdirSync(path.join(d, "w-AAAAAA"), { recursive: true, mode: 0o700 });
+    fs.chmodSync(shared, 0o777);
+    for (const d of [running, shared]) fs.utimesSync(d, old, old);
+    const next = await run("pass", false, tmp);
+    t.after(() => { for (const pid of [...next.adapters, ...next.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
+    assert.equal(next.status, 0, next.out);
+    assert.deepEqual(next.left.sort(), [path.basename(running), path.basename(shared)].sort(), `left in TMPDIR: ${next.left.join(", ")}\n${next.out}`);
+    for (const d of killed.made) assert.equal(fs.existsSync(d), false, d);
+    for (const pid of killed.adapters) assert.equal(await stillAlive(pid), false, `adapter ${pid} of the killed file outlived the next one`);
+    // The connector its pid file names; the other two it started are recorded nowhere, which nothing can find.
+    assert.equal(await stillAlive(killed.started[2]), false, `the connector ${killed.started[2]} of the killed file outlived the next one`);
+  });
   // An interrupted runner leaves before its files: one that reported after that died of the EPIPE (exit code 7) with
   // no hook run, while the signal that came with the interruption was still to be handled.
   test("a test file whose report pipe was closed (its runner left) cleans up, then ends", async (t) => {
@@ -91,9 +126,9 @@ describe("temporary directories", { skip: process.platform !== "linux" && "reads
   });
 });
 
-/** The detached process and the one that ignores SIGTERM, which the fixture started and left to the file's cleanup. */
+/** The detached processes and the one that ignores SIGTERM, which the fixture started and left to the file's cleanup. */
 async function assertStartedGone(r: Run): Promise<void> {
-  assert.equal(r.started.length, 2, `the fixture started its two processes\n${r.out}`);
+  assert.equal(r.started.length, 3, `the fixture started its three processes\n${r.out}`);
   for (const pid of r.started) assert.equal(await stillAlive(pid), false, `process ${pid} the file started outlived it`);
 }
 
