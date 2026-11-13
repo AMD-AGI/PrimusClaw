@@ -43,6 +43,8 @@
  *       through the MCP service, as the router calls them
  *   E19 a skill written from a conversation names no skill the user deleted or undid; skill_list says which skills were removed,
  *       how (deleted or undone) and when
+ *   E20 a turn whose skill write was refused may say anything about it: the router can always explain a refusal, even in words the
+ *       guard would otherwise take for a suggestion; the same say before any refusal is refused
  *   E15 a draft made against an earlier version is not saved over a later one (stale), and an older card's Undo takes back nothing
  *       once the skill has changed again (off, on, off)
  */
@@ -754,5 +756,22 @@ describe("assistant: saving the user's personal skills from the conversation", {
       ["follow-up", "deleted"], ["format", "deleted"], ["deploy-prod", "deleted"], ["standup-notes", "undone"],
     ]);
     assert.ok(listed.body.deleted_lately.every((r: any) => Date.parse(r.removed_at) > 0));
+  });
+
+  test("E20 after a refused skill write the router can say why, in any words", async () => {
+    await save(alice, {});
+    const ask = "存不了：你已经有一模一样的技能 standup-notes 了。要不要我把它存成另一个名字的技能？";
+    const turn = await message(alice, "请把下面这个做法存成我的一个技能，名字叫 standup-copy");
+    const c = await connect(turn);
+    try {
+      const before = await call(c, "say", { text: ask });
+      assert.deepEqual([before.isError, before.body.error], [true, "skill_suggestion_needs_draft"], "no refusal yet: the guard holds");
+      const dup = await call(c, "skill_save", { name: "standup-copy", content: STANDUP, request_quote: "存成我的一个技能" });
+      assert.deepEqual([dup.isError, dup.body.error], [true, "duplicate"]);
+      const explained = await call(c, "say", { text: ask });
+      assert.equal(explained.isError, false, JSON.stringify(explained.body));
+    } finally { await c.close(); await w.closeRun(turn.task_id); }
+    const [note] = await w.q("SELECT skill_name, actor, detail FROM claw_skill_events WHERE op = 'refused' AND session_id = $1", [alice.routerSid]);
+    assert.deepEqual([note?.skill_name, note?.detail.reason], ["standup-copy", "duplicate"], "the refusal is noted for the turn");
   });
 });

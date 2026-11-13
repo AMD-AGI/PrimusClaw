@@ -21,7 +21,12 @@ const DONE_ZH = /(?:已|已经|之前|刚才|刚刚|早就)|(?:技能|skill)了/
 const OFFERS_ZH = /(?:要不要|要不|需不需要|需要我|是否|想不想|要我|我来|我可以|可以帮你|帮你|建议)|(?:吗|么|呢)\s*$/;
 /** A save-as phrase with something being made into a skill: save/turn/make/keep this … as/into a skill. */
 const SAVE_AS_SKILL_EN = /\b(?:save|turn|make|keep|store|add)\s+(?:this|that|it|these|them|the (?:steps|format|workflow|process|flow))\b(?:\s+[\w-]+){0,3}?\s+(?:into|as)\s+(?:a |an |one of your |your |my )?(?:new |personal |reusable )?skills?\b/i;
-const QUESTION_EN = /\b(?:want|like|shall|should|would|could|can|may)\b|\?\s*$/i;
+/** An offer form that starts the clause: "Want me to …", "Shall I …", "Would you like …", "Can I …". */
+const OFFER_START_EN = /^(?:(?:do you |would you |)want me to|shall i|should i|would you like|do you want|can i|could i|may i|let me know if you(?:'d| would) like)\b/i;
+/** A clause that says something cannot be done is never an offer ("I could not save this as a skill", "I can't …"). */
+const NEGATED_EN = /\b(?:not|no|never|cannot|unable)\b|n't\b/i;
+/** The same in Chinese: 无法, 不能, 没法, 没能, 失败. */
+const NEGATED_ZH = /(?:无法|不能|没法|没能|没有办法|不可以|失败)/;
 
 /**
  * Whether `text` asks the user, in words, whether to save something as a skill: a clause (split at every comma, stop and question
@@ -33,8 +38,8 @@ export function asksToSaveAsSkill(text: string): boolean {
   for (const m of s.matchAll(/([^，,。！!？?\n；;]+)([，,。！!？?\n；;]?)/g)) {
     const clause = m[1].trim();
     const ends = m[2] ?? "";
-    if (SAVE_AS_SKILL_EN.test(clause) && (QUESTION_EN.test(clause) || ends === "?" || ends === "？")) return true;
-    if (!SAVE_AS_SKILL_ZH.test(clause) || DONE_ZH.test(clause)) continue;
+    if (SAVE_AS_SKILL_EN.test(clause) && !NEGATED_EN.test(clause) && (OFFER_START_EN.test(clause) || ends === "?" || ends === "？")) return true;
+    if (!SAVE_AS_SKILL_ZH.test(clause) || DONE_ZH.test(clause) || NEGATED_ZH.test(clause)) continue;
     if (OFFERS_ZH.test(clause) || ends === "?" || ends === "？") return true;
   }
   return false;
@@ -42,7 +47,8 @@ export function asksToSaveAsSkill(text: string): boolean {
 
 /**
  * Why a say that asks whether to save a skill is refused, or null when it may go: personal skills off, or not such a say, or this turn
- * (of session `sid`, begun at `began`) already drafted or saved a skill.
+ * (of session `sid`, begun at `began`) already drafted or saved a skill, or had a skill write refused (the router must be able to tell
+ * the user why).
  */
 export async function textSkillSuggestion(
   q: Querier, sid: string, userId: string, began: Date | undefined, text: string,
@@ -52,7 +58,7 @@ export async function textSkillSuggestion(
   const { routerSkillsServe } = await import("./skill-tools.js");
   if (!(await routerSkillsServe(q, sid, userId))) return null;
   const done = (await q(
-    `SELECT 1 FROM claw_skill_events WHERE session_id = $1 AND op IN ('draft', 'create', 'update')
+    `SELECT 1 FROM claw_skill_events WHERE session_id = $1 AND op IN ('draft', 'create', 'update', 'refused')
        AND created_at >= COALESCE($2::timestamptz, NOW() - INTERVAL '15 minutes') LIMIT 1`,
     [sid, began ? new Date(began).toISOString() : null],
   )).rows.length > 0;

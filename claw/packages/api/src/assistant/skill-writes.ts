@@ -258,6 +258,11 @@ export function marksSkill(text: string, name: string): boolean {
   ).test(t);
 }
 
+/** Whether `text` holds `name` as a word of its own: "deploy" is not in "deploy-prod". */
+function namesWord(text: string, name: string): boolean {
+  return new RegExp(`(?<![a-z0-9_-])${escapeRe(name.toLowerCase())}(?![a-z0-9_-])`).test((text || "").normalize("NFKC").toLowerCase());
+}
+
 /**
  * A skill written from a conversation does not point at a skill the user removed lately (deleted, or a save they undid, in the last
  * `REMOVED_NAME_DAYS`): what the router remembers of an earlier turn is not theirs any more. Only a name marked as a skill counts
@@ -269,13 +274,40 @@ async function requireNoRemovedSkill(
   const text = texts.join("\n");
   const since = Date.now() - REMOVED_NAME_DAYS * 86_400_000;
   const named = (await removedSkills(userId)).find((r) =>
-    r.name !== name && Date.parse(r.removed_at) >= since && marksSkill(text, r.name) && !message.toLowerCase().includes(r.name.toLowerCase()));
+    r.name !== name && Date.parse(r.removed_at) >= since && marksSkill(text, r.name) && !namesWord(message, r.name));
   if (named) {
     refused(op, {
       error: "names_removed_skill",
       message: `the skill names ${named.name}, a skill the user ${named.how === "undone" ? "undid" : "deleted"}: write it without ${named.name}, from this conversation only`,
     });
   }
+}
+
+/**
+ * A refused write of a skill is noted for the turn (`claw_skill_events` op `refused`, this session): the router must be able to tell the
+ * user why, and the say guard (`skill-suggestion.ts`) lets every say of a turn that had a refused skill write go. Best effort: a note
+ * that cannot be written never turns the refusal into a fault.
+ */
+const SAVE_CHECK_REFUSALS = new Set(["secret", "injection", "invalid", "invalid_name", "too_large", "too_many_files", "full"]);
+
+function notingRefusals<A extends unknown[]>(
+  run: (claims: AssistantTokenClaims, ...args: A) => Promise<Record<string, unknown>>,
+): (claims: AssistantTokenClaims, ...args: A) => Promise<Record<string, unknown>> {
+  return async (claims, ...args) => {
+    try {
+      return await run(claims, ...args);
+    } catch (err) {
+      // (a refusal of the save's own checks is recorded by the save already: `recordRefusal`)
+      if (err instanceof ToolRefused && !SAVE_CHECK_REFUSALS.has(err.code)) {
+        await db.query(
+          `INSERT INTO claw_skill_events (user_id, skill_name, op, actor, session_id, detail)
+           SELECT s.user_id, $2, 'refused', 'model', $1, $3::jsonb FROM claw_sessions s WHERE s.session_id = $1`,
+          [claims.sid, String((args[0] as { name?: unknown } | undefined)?.name ?? "").slice(0, 200), JSON.stringify({ reason: err.code, tool: run.name })],
+        ).catch((e) => logger.warn({ err: (e as Error)?.message, sid: claims.sid }, "skill.refusal_note_failed"));
+      }
+      throw err;
+    }
+  };
 }
 
 /** `skill_list`: the user's skills (turned off and manual ones included) and the drafts waiting for their answer. Read-only. */
@@ -299,7 +331,7 @@ export async function skillList(claims: AssistantTokenClaims): Promise<Record<st
  * `skill_save`: the user asked for a skill to be saved (new, or a new version of one of theirs), or said yes to a draft (`draft_id`).
  * Saved now, with a card that says what was saved and offers Undo and Edit.
  */
-export async function skillSave(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export const skillSave = notingRefusals(async function skillSave(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { userId, content: message, lang } = await actingTurn(claims);
   const draftId = typeof args.draft_id === "string" ? args.draft_id.trim() : "";
   if (draftId) {
@@ -342,7 +374,7 @@ export async function skillSave(claims: AssistantTokenClaims, args: Record<strin
   }, { origin: "chat", actor: "model", sessionId: claims.sid, guard: stillActing(claims, userId) });
   if (!saved.ok) refused("create", saved);
   return announceSaved(claims, userId, lang, saved, name);
-}
+});
 
 async function announceSaved(
   claims: AssistantTokenClaims, userId: string, lang: CommandLanguage,
@@ -363,7 +395,7 @@ async function announceSaved(
 }
 
 /** `skill_draft`: a skill the assistant suggests on its own, shown as a draft with Save and Discard; nothing is saved until the user says so. */
-export async function skillDraft(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export const skillDraft = notingRefusals(async function skillDraft(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const userId = await liveTurn(claims);
   const name = nameOf(args.name);
   const content = text(args.content, "content");
@@ -393,10 +425,10 @@ export async function skillDraft(claims: AssistantTokenClaims, args: Record<stri
     note: "nothing is saved yet: the user was shown the draft on a card with Save and Discard, and the card is the question; do not ask it again "
       + `in words. If they say yes in words, call skill_save with draft_id ${out.draft.id} and their yes as request_quote.`,
   };
-}
+});
 
 /** `skill_update`: the user asked for a change to one of their skills. Saved now as its next version, with the card (Undo goes back). */
-export async function skillUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export const skillUpdate = notingRefusals(async function skillUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { userId, content: message, lang } = await actingTurn(claims);
   const name = nameOf(args.name);
   requireQuote(message, args.request_quote, (q) => asksToChangeSkill(q, name), "the user's words do not ask to change this skill");
@@ -412,10 +444,10 @@ export async function skillUpdate(claims: AssistantTokenClaims, args: Record<str
   }, { origin: "chat", actor: "model", sessionId: claims.sid, guard: stillActing(claims, userId) });
   if (!saved.ok) refused("update", saved);
   return announceSaved(claims, userId, lang, saved, name);
-}
+});
 
 /** `skill_disable` / `skill_enable`: the user asked to stop using one of their skills (kept), or to use it again. */
-export async function skillSetEnabled(claims: AssistantTokenClaims, args: Record<string, unknown>, enabled: boolean): Promise<Record<string, unknown>> {
+export const skillSetEnabled = notingRefusals(async function skillSetEnabled(claims: AssistantTokenClaims, args: Record<string, unknown>, enabled: boolean): Promise<Record<string, unknown>> {
   const { userId, content: message, lang } = await actingTurn(claims);
   const name = nameOf(args.name);
   const op = enabled ? "enable" : "disable";
@@ -427,10 +459,10 @@ export async function skillSetEnabled(claims: AssistantTokenClaims, args: Record
   const card = await cardNow(userId, name, enabled ? "enabled" : "disabled", { change_id: out.change_id, undo_expires_at: out.undo_expires_at });
   if (card) await showCard({ userId, sessionId: claims.sid, turnMessageId: claims.mid, lang, card, key: out.change_id! });
   return { ok: true, name, enabled, change_id: out.change_id, note: "done: the user was shown a card with Undo. Tell them in one line." };
-}
+});
 
 /** `skill_delete`: the user asked to delete one of their skills. Deleted now (every version), with a card whose Undo restores it. */
-export async function skillDelete(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export const skillDelete = notingRefusals(async function skillDelete(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { userId, content: message, lang } = await actingTurn(claims);
   const name = nameOf(args.name);
   requireQuote(message, args.request_quote, (q) => asksToAct(q, "delete", name), "the user's words do not ask to delete this skill");
@@ -443,10 +475,10 @@ export async function skillDelete(claims: AssistantTokenClaims, args: Record<str
     : { kind: "deleted", name, version: out.version, description: "", invocation: "auto", files: [], preview: "", change_id: out.change_id, undo_expires_at: out.undo_expires_at };
   await showCard({ userId, sessionId: claims.sid, turnMessageId: claims.mid, lang, card, key: out.change_id! });
   return { ok: true, name, deleted: true, change_id: out.change_id, note: "deleted: the user was shown a card whose Undo restores it. Tell them in one line." };
-}
+});
 
 /** `skill_undo`: the user asked to take back the last change of one of their skills (a save, an update, a delete, a turn-off). */
-export async function skillUndo(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+export const skillUndo = notingRefusals(async function skillUndo(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { userId, content: message } = await actingTurn(claims);
   const name = nameOf(args.name);
   requireQuote(message, args.request_quote, (q) => asksToAct(q, "undo", name), "the user's words do not ask to undo a change of this skill");
@@ -456,7 +488,7 @@ export async function skillUndo(claims: AssistantTokenClaims, args: Record<strin
   if (!out.ok) refused("undo", out);
   metrics.onUserSkillSave("undo", "ok");
   return { ok: true, name, undone: out.undone, version: out.version, note: "undone: tell the user in one line what it is now" };
-}
+});
 
 // --- A draft's card, answered (`schedules.ts`) -------------------------------------------------------------------------
 
