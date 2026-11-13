@@ -1,0 +1,85 @@
+{
+  "templates": [
+    {
+      "name": "measurement",
+      "perGpuCount": [1, 8],
+      "spec": {
+        "steps": [
+          {
+            "type": "run",
+            "args": [
+              "mkdir -p /app/in /app/out /app/work/scratch && (nohup sh -c 'e=\"${HYPERLOOM_RUNNER_CACHE:-/runner-cache}/${HYPERLOOM_SOURCE_SHA:-}\" d=\"${TMPDIR:-/tmp}/hl-start.$$\" o=\"${HYPERLOOM_OUT_DIR:-/out}\"; if [ -n \"${HYPERLOOM_SOURCE_SHA:-}\" ] && [ -n \"${HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256:-}\" ] && mkdir -m 700 \"$d\" && cp \"$e/manifest\" \"$e/bootstrap.sh\" \"$d/\" && printf '%s  %s\\n' \"$HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256\" \"$d/manifest\" | sha256sum -c - >&2 && h=$(sed -n 's/^  \"bootstrap_sha256\": \"\\([0-9a-f]\\{64\\}\\)\",*$/\\1/p' \"$d/manifest\") && [ -n \"$h\" ] && printf '%s  %s\\n' \"$h\" \"$d/bootstrap.sh\" | sha256sum -c - >&2; then exec sh \"$d/bootstrap.sh\" --spec-wait-sec 1800; fi; echo \"hyperloom-runner-bootstrap: bootstrap.sh or manifest of $e is missing or not the one HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256 pins\" >&2; mkdir -p \"$o\" && printf '%s\\n' '{\"error_class\": \"runner_start_failed\", \"message\": \"runner bootstrap, step verify, exit 1: bootstrap.sh or manifest of the cache entry is missing or not the one HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256 pins, or that or HYPERLOOM_SOURCE_SHA is not set\", \"state\": \"failed\"}' >\"$o/.status.json.tmp\" && mv \"$o/.status.json.tmp\" \"$o/status.json\"; exit 2' >/app/work/runner-boot.log 2>&1 &)"
+            ]
+          }
+        ],
+        "inputs": ["/in"],
+        "sealed": true,
+        "outputs": ["/out"],
+        "fromImage": "registry.example.test/library/runner@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "environment": [
+          {"name": "HYPERLOOM_SOURCE_SHA", "value": "0123456789abcdef0123456789abcdef01234567"},
+          {"name": "HYPERLOOM_RUNNER_CACHE", "value": "/data/shared/runner-cache"},
+          {"name": "HYPERLOOM_IN_DIR", "value": "/app/in"},
+          {"name": "HYPERLOOM_OUT_DIR", "value": "/app/out"},
+          {"name": "HYPERLOOM_SCRATCH_DIR", "value": "/app/work/scratch"},
+          {"name": "APP_REPO", "value": "/data/shared/src/app.git"},
+          {"name": "TOOLS_REPO", "value": "/data/shared/src/tools.git"},
+          {"name": "SERVER_READY_SEC", "value": "900"},
+          {"name": "HF_DATASETS_CACHE", "value": "/data/shared/hf/datasets"},
+          {"name": "HF_HUB_OFFLINE", "value": "1"},
+          {"name": "HF_DATASETS_OFFLINE", "value": "1"},
+          {"name": "JIT_CACHE", "value": "/data/shared/jit-cache"}
+        ],
+        "acceptedEnvs": [
+          "HYPERLOOM_SOURCE_SHA",
+          "HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256",
+          "HYPERLOOM_FRAMEWORK_SNAPSHOT",
+          "HYPERLOOM_FRAMEWORK_SESSION_SHA256"
+        ],
+        "imagePullPolicy": "IfNotPresent",
+        "imagePullSecrets": [{"name": "registry-pull"}],
+        "pendingTimeoutSec": 1800,
+        "image": "registry.example.test/library/sandbox@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    {
+      "name": "dev",
+      "perGpuCount": [1, 2, 4, 8],
+      "spec": {
+        "fromImage": "registry.example.test/library/sandbox@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sealed": false,
+        "acceptedEnvs": [
+          "HYPERLOOM_SOURCE_SHA",
+          "HYPERLOOM_RUNNER_CACHE_MANIFEST_SHA256",
+          "HYPERLOOM_FRAMEWORK_SNAPSHOT",
+          "HYPERLOOM_FRAMEWORK_SESSION_SHA256"
+        ],
+        "imagePullPolicy": "IfNotPresent",
+        "imagePullSecrets": [{"name": "registry-pull"}],
+        "pendingTimeoutSec": 1800
+      }
+    },
+    {
+      "name": "layers-cpu",
+      "spec": {
+        "fromImage": "registry.example.test/library/sandbox@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sealed": false,
+        "imagePullPolicy": "IfNotPresent",
+        "imagePullSecrets": [{"name": "registry-pull"}],
+        "pendingTimeoutSec": 900,
+        "resources": {
+          "requests": {"cpu": "1", "memory": "2Gi", "ephemeral-storage": "10Gi"},
+          "limits": {"cpu": "1", "memory": "2Gi", "ephemeral-storage": "10Gi"}
+        },
+        "layers": [
+          {
+            "image": "registry.example.test/library/host-layer@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "from": "/layer",
+            "mount": "/opt/hyperloom-host",
+            "readOnly": true
+          }
+        ]
+      }
+    }
+  ]
+}

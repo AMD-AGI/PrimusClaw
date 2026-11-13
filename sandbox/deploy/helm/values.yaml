@@ -64,7 +64,9 @@ controlplane:
     # namespace and does not rotate it.
     # ownerPolicyConfigMap names a ConfigMap whose key policy.json holds the
     # owner quota and template policy: the templates SaFE API keys may use,
-    # and the quotas. Without it, identity keys get 503 on the E2B API.
+    # and the quotas. deploy/owner-policy.example.json is the shape; replace
+    # its placeholders before use. Without the policy, identity keys get 503
+    # on the E2B API.
     # The policy is read at startup: a ConfigMap change needs a rollout restart.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners
