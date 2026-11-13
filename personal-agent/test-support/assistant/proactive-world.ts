@@ -109,7 +109,7 @@ export function world(
     clock,
     logger: silentLogger,
     publicEvent: (e) => e,
-    botName: "Clawy",
+    botName: "PrimusClaw Assistant",
     ...withoutWorld(options),
   };
   const proactive = new Proactive(deps);

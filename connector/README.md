@@ -21,7 +21,7 @@ contract is `claw/packages/protocol/src/remote-agents.ts`, compiled into this pa
 
 ## Fastest: pair from the chat (one command)
 
-In Clawy (or another chat client built on Claw), say **连接我的开发环境** ("connect my dev environment"). It answers one line
+In the personal agent (or another chat client built on Claw), say **连接我的开发环境** ("connect my dev environment"). It answers one line
 with a one-time code in it, for example:
 
 ```sh
@@ -144,11 +144,11 @@ installed (and, for `keepalive.sh`, something calling it); and Claw answering, i
 runs the adapter check of step 2. It exits 1 when something will stop sessions (`--json`: `ok` is the adapters' verdict,
 `machine_ok` and `environment` the machine's). The
 running connector repeats the machine checks with its own environment (in a child process, so a stalled disk cannot stall
-it) every 15 minutes, and at once when `doctor` runs (it signals the connector), and Clawy's `/agents` card shows what it found under the machine ("Codex is not signed in: run `codex login` on that machine").
+it) every 15 minutes, and at once when `doctor` runs (it signals the connector), and the chat client's `/agents` card shows what it found under the machine ("Codex is not signed in: run `codex login` on that machine").
 
-**6. See it in Clawy**
+**6. See it in the chat**
 
-In Clawy (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
+In the personal agent (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
 A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
 
 To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also

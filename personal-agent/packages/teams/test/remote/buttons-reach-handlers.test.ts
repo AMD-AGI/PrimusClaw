@@ -70,7 +70,7 @@ function moreCards(): Json[] {
           at: 0,
           lang: "en",
           hasModes: true,
-          bot: "Clawy",
+          bot: "PrimusClaw Assistant",
           view: windowState({ text: "y\n".repeat(80) }),
           approvals: [
             { actionId: "a", tool: "t", expiresAt: 0, buttons: remoteView.optionButtons(options, "s1", "a") },

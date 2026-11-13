@@ -18,7 +18,7 @@ import {
   type ReviewWorld,
 } from "../../../../test-support/review-world.js";
 
-const REVIEW_MODEL = "claude-opus-5.5"; // CLAWY_REVIEW_MODEL as a deployment sets it
+const REVIEW_MODEL = "claude-opus-5.5"; // PERSONAL_AGENT_REVIEW_MODEL as a deployment sets it
 
 function deployed(reviewModel = REVIEW_MODEL): ReviewWorld {
   const world = reviewWorld();
@@ -55,7 +55,7 @@ test("a model the request names wins over the review model", async () => {
 test("an empty review setting runs reviews on the chats own model", async () => {
   const world = deployed("");
   await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
-  // (no model asked for: the turn runs on the chat's own model, CLAWY_MODEL)
+  // (no model asked for: the turn runs on the chat's own model, PERSONAL_AGENT_MODEL)
   assert.equal(world.started[0]?.turn.reviewModel, "");
 });
 

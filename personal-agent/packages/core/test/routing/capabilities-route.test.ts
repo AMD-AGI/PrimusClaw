@@ -144,7 +144,11 @@ for (const c of CAPABILITIES.filter((x) => x.sayZh !== "" && !SERVICE.has(expect
               ?.startsWith(lang === "zh" ? "`unlink` 会断开" : "`unlink` would"),
           );
         else if (group && name === "help")
-          assert.ok(/^\*\*(Clawy 能帮你做什么|What Clawy can do for you)\*\*/u.test(said(w).at(-1) ?? ""));
+          assert.ok(
+            /^\*\*(PrimusClaw Assistant 能帮你做什么|What PrimusClaw Assistant can do for you)\*\*/u.test(
+              said(w).at(-1) ?? "",
+            ),
+          );
         else if (arg === null)
           assert.deepEqual(
             seen.map((s) => s[0]),
@@ -186,12 +190,12 @@ test("test_without_the_brief_a_brief_sentence_is_words_for_claw", async () => {
 });
 
 const REMOTE_WORDS: Readonly<Record<string, string>> = {
-  "回到 Clawy": "agent detach",
+  "回到 PrimusClaw Assistant": "agent detach",
   回来吧: "agent detach",
   "断开 agent": "agent detach",
   "不跟 agent 说了": "agent detach",
-  "back to Clawy": "agent detach",
-  "come back to Clawy": "agent detach",
+  "back to PrimusClaw Assistant": "agent detach",
+  "come back to PrimusClaw Assistant": "agent detach",
   "detach the agent": "agent detach",
   "看看我电脑上的 agent": "agents",
   "看看我的远程 agent": "agents",

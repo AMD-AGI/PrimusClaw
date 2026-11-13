@@ -16,7 +16,7 @@ import { DEFAULT_STYLE } from "../../src/config/style.js";
 const REFERENCE = {
   serviceUrl: "https://smba.trafficmanager.net/amer/",
   conversation: { id: "dm-a", conversationType: "personal", tenantId: "t1" },
-  bot: { id: "28:bot", name: "Clawy" },
+  bot: { id: "28:bot", name: "PrimusClaw Assistant" },
   user: { id: "29:aad-a", aadObjectId: "aad-a", name: "Alice" },
 };
 

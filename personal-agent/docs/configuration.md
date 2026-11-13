@@ -67,6 +67,18 @@ by their Microsoft Entra object id, in any case.
 | `METRICS_PORT` | `9090`           | `/metrics`; must differ from `PORT`.                 |
 | `PA_DB_PATH`   | `/data/state.db` | The SQLite database; its directory must be writable. |
 
+### Metrics
+
+`/metrics` (Prometheus text format) writes the worker's series under the `personal_agent_` prefix:
+`personal_agent_security_events_total`, `personal_agent_inbound_handled_total`, `personal_agent_inbound_failed_total`,
+`personal_agent_inbound_handle_ms_total`, `personal_agent_inbound_lag_max_ms`, `personal_agent_inbound_limited_total`,
+`personal_agent_event_handle_seconds`, `personal_agent_event_to_chat_seconds`, `personal_agent_files_dropped_total` and
+`personal_agent_build_info`. Earlier releases named the series after the bot's earlier default name, with the `clawy_`
+prefix. For one release every series except `personal_agent_build_info` is written twice, with the same values and
+help: under its new name and under its `clawy_` name, which is deprecated and removed in the next minor release. Move
+alert rules, dashboards and release gates to the `personal_agent_` names once a build that writes both is live; nothing
+goes blind in between.
+
 ## Secrets
 
 | Setting                     | Default  | Meaning                                                                                                                                                                            |
@@ -79,7 +91,22 @@ by their Microsoft Entra object id, in any case.
 With `keyvault` the vault entries are `personal-agent-encryption-keys` and `personal-agent-exchange-client-secret`. An entry
 missing under its name is read under its deprecated name (`clawy-encryption-keys`, `clawy-exchange-client-secret`), with a
 warning at start; only a missing entry falls back, a refused read stops the worker. Copy each secret to its new name; the
-deprecated names will be removed only in a release whose notes say so.
+deprecated names will be removed only in a release whose notes say so. Moving a vault over, as someone who may read and
+write its secrets (the feedback App key only where it is set):
+
+```sh
+umask 077 && file="$(mktemp)"   # (the value goes through a file only you can read, never a command line)
+for name in encryption-keys exchange-client-secret feedback-github-app-key; do
+  if value="$(az keyvault secret show --vault-name <your-vault-name> --name "clawy-$name" --query value -o tsv)"; then
+    printf '%s' "$value" > "$file"
+    az keyvault secret set --vault-name <your-vault-name> --name "personal-agent-$name" --file "$file" --output none
+  fi
+done
+rm -f "$file"; unset value
+```
+
+Restart the worker: the start-up warning no longer names a deprecated entry. Delete the `clawy-` entries once no running
+worker is of an earlier release (earlier releases read only those).
 
 ## How the worker reaches Teams
 

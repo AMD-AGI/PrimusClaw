@@ -24,7 +24,7 @@ import { teamsCaps } from "../../src/caps.js";
 
 type Json = Record<string, unknown>;
 
-const BOT = { id: "28:bot", name: "Clawy" };
+const BOT = { id: "28:bot", name: "PrimusClaw Assistant" };
 
 function isJson(value: unknown): value is Json {
   return typeof value === "object" && value !== null && !Array.isArray(value);

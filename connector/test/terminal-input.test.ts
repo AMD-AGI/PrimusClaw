@@ -516,7 +516,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.reason === "terminal_state_unknown"), "never held as a state it cannot read");
   });
 
-  // Yihan, 2026-11-10: "clawy本身不要做这个是否忙的判断了，收到消息就直接发." Whatever Claude Code is doing, the message is typed at once;
+  // The connector does not judge whether the terminal is busy: whatever Claude Code is doing, the message is typed at once;
   // one submitted while a turn runs is Claude Code's to queue, as one typed by the person at the terminal is.
   for (const c of [
     { name: "taken into the running turn at its next step (queued_command)", queue: "absorb" },
@@ -526,10 +526,10 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
       const work = tmpdir("cc-work-");
       const h = await Harness.create({
         work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
-        attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+        attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "assistant", updatedAt: "2026-11-10T03:00:00.000Z" }] },
       });
       hs.push(h);
-      // (busy for hours with background agents, as clawy: its row never says idle; and a main turn of its own runs, `esc to interrupt`)
+      // (busy for hours with background agents, as an assistant session can be: its row never says idle; and a main turn of its own runs, `esc to interrupt`)
       const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "10000", FAKE_QUEUE: c.queue });
       h.setLive([{ pid: t.pid, sessionId: REF, status: "busy", cwd: work }]);
       await until("its turn running on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"));
@@ -551,7 +551,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
     work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
-    attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+    attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "assistant", updatedAt: "2026-11-10T03:00:00.000Z" }] },
     });
     hs.push(h);
     const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "10000", FAKE_QUEUE: "absorb", FAKE_VERSION: "9.9.9" });
@@ -572,7 +572,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
       work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
-      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "assistant", updatedAt: "2026-11-10T03:00:00.000Z" }] },
     });
     hs.push(h);
     const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "15000", FAKE_DRAW_LAG_MS: "5000" });
@@ -592,7 +592,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
       work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalShowMs: 1_500 } as never,
-      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "assistant", updatedAt: "2026-11-10T03:00:00.000Z" }] },
     });
     hs.push(h);
     const t = terminal(work, h.attachDir, 300, { FAKE_IDLE_STATUS: "busy", FAKE_BUSY_MS: "15000", FAKE_DRAW_LAG_MS: "6000" });
@@ -831,7 +831,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
       work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
-      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "clawy", updatedAt: "2026-11-10T03:00:00.000Z" }] },
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "assistant", updatedAt: "2026-11-10T03:00:00.000Z" }] },
     });
     hs.push(h);
     const escs = path.join(tmpdir("cc-esc-"), "escs");
@@ -921,7 +921,7 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     // As Claude Code 2.1.285 and 2.1.322 drew them in a 120-column pane (2026-11-11; the words replaced): a row ends two columns
     // short of the rule. Refused before, so the message stayed in the box unsent ("the box does not hold exactly what was typed").
     const wide = (held: string[], rule = "─".repeat(120)) => `  ready\n${rule}\n❯ ${held[0]}\n${held.slice(1).map((l) => `  ${l}`).join("\n")}\n${rule}\n  ⏵⏵ bypass permissions on`;
-    const mixed = `Clawy “终端”│${"测".repeat(51)}`;   // (the ambiguous-width “ ” │ take one column each, as Claude Code draws them)
+    const mixed = `Agent “终端”│${"测".repeat(51)}`;   // (the ambiguous-width “ ” │ take one column each, as Claude Code draws them)
     assert.equal(enterGuard(wide([mixed, "试，对吗？"]), `${mixed}试，对吗？`), null, "117 columns, and the next character is wide");
     assert.equal(enterGuard(wide(["x".repeat(116), "x".repeat(14)]), "x".repeat(130)), null, "118 columns of one long word");
     assert.equal(enterGuard(wide([`${"x".repeat(111)}中中`, "中yyyy"]), `${"x".repeat(111)}中中中yyyy`), null);

@@ -180,7 +180,7 @@ test("not now closes the card asks nothing again and offers none that day", asyn
   assert.equal(asked, 0);
 });
 
-test("the consent says clawy reads github with it only where claw does", () => {
+test("the consent says the assistant reads github with it only where claw does", () => {
   const code = {
     deviceCode: "d",
     userCode: "ABCD-1234",
@@ -197,7 +197,7 @@ test("the consent says clawy reads github with it only where claw does", () => {
   assert.ok(!named.includes("{bot}"));
 });
 
-test("github status says whether clawy reads github with the binding", () => {
+test("github status says whether the assistant reads github with the binding", () => {
   assert.ok(
     readsLine({ readsWith: "binding", login: "", missing: "", bindingReads: true }, true).startsWith(
       "我用这个令牌读你的 GitHub",

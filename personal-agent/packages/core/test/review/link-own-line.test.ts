@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A link in a message Clawy sends ends its line: nothing comes after it on that line (`test_link_on_its_own_line`). Teams turns a
+ * A link in a message PrimusClaw Assistant sends ends its line: nothing comes after it on that line (`test_link_on_its_own_line`). Teams turns a
  * bare URL into a link by itself, and the link takes in what it can read as part of one ("打开 <url>，输入代码" linked the full-width
  * comma and the words after it, and the page that opened was a 404). So every URL is the last thing on its line: the rendered
  * messages are checked, and every string the packages build is scanned, so the next message that glues text to a link is caught
@@ -118,7 +118,7 @@ test("the message to an unlinked user puts the link on a line of its own", () =>
   for (const lang of ["zh", "en"] as const) {
     const text = linkText
       .in(lang)
-      .linkSteps({ lead: "", bot: "Clawy", page, notice: "AI notice", channel: "Microsoft Teams" });
+      .linkSteps({ lead: "", bot: "PrimusClaw Assistant", page, notice: "AI notice", channel: "Microsoft Teams" });
     assert.ok(
       text.split("\n").some((line) => line === page),
       lang,

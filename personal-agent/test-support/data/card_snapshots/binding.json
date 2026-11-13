@@ -41,7 +41,7 @@
         "items": [
          {
           "size": "Medium",
-          "text": "🔌 Connect Clawy",
+          "text": "🔌 Connect PrimusClaw Assistant",
           "type": "TextBlock",
           "weight": "Bolder",
           "wrap": true

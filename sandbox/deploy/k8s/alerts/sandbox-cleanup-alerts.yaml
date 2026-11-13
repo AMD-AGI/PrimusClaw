@@ -3,7 +3,7 @@
 #
 # Grafana alerts for sandbox cleanup failures, for the grafana-operator in
 # primus-safe (Grafana instance labelled dashboards=monitoring). Routed to the
-# same contact point as the Clawy rule group.
+# same contact point as the personal agent's rule group.
 #
 # Apply:    kubectl -n primus-safe apply -f sandbox-cleanup-alerts.yaml
 # Rollback: kubectl -n primus-safe delete grafanaalertrulegroup agent-sandbox-cleanup

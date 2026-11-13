@@ -33,7 +33,7 @@ export const COMMAND_CARDS = entries(
     "onboarding",
     () =>
       onboardingCard({
-        bot: "Clawy",
+        bot: "PrimusClaw Assistant",
         name: "Lin Mei",
         channelUserId: "29:abc",
         promptId: "pr-1",
@@ -46,7 +46,7 @@ export const COMMAND_CARDS = entries(
     "binding",
     () =>
       bindingCard({
-        bot: "Clawy",
+        bot: "PrimusClaw Assistant",
         confirmUrl: "https://claw.example.com/sign-in/confirm?c=xyz",
         lead: "",
         notice: AI_NOTICE.en,
@@ -57,7 +57,7 @@ export const COMMAND_CARDS = entries(
     "link",
     () =>
       linkCard({
-        bot: "Clawy",
+        bot: "PrimusClaw Assistant",
         who: "robin.lang@example.com",
         page: `${BASE}/primus-claw/teams-link`,
         notice: AI_NOTICE.en,

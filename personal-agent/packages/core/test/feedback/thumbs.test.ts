@@ -110,7 +110,7 @@ test("when the assistants session cannot be read the report goes without another
   assert.ok(world.log.lines.some((l) => l.message === "feedback: the assistant's session could not be read"));
 });
 
-test("clawys own thumbs on mobile vote and the comment replaces the vote", async () => {
+test("the assistants own thumbs on mobile vote and the comment replaces the vote", async () => {
   const world = linkedWorld();
   await tap(world, "dislike");
   await sendComment(world, "it answered another question");
@@ -193,7 +193,10 @@ test("a thumbs down files the same issue by either thumbs", async () => {
       await world.thumbs.settled();
       const [issue] = world.issues.issues;
       assert.ok(issue, `${chat} ${via}`);
-      assert.ok(issue.title.startsWith("[Clawy feedback] (thumbs down) it ignored my question"), `${chat} ${via}`);
+      assert.ok(
+        issue.title.startsWith("[PrimusClaw Assistant feedback] (thumbs down) it ignored my question"),
+        `${chat} ${via}`,
+      );
       assert.ok(issue.body.includes(`Chat: ${chat}`) && issue.body.includes(chat === "1:1" ? "sess-1" : "sess-g"));
       const reply = world.surface.outbox.find(
         (r) => r.op === "send" && r.message.body.type === "text" && r.message.body.text.startsWith("Thanks. I filed"),
@@ -242,7 +245,7 @@ test("without a comment the report says so like teams form does", async () => {
     await world.thumbs.settled();
     const [issue] = world.issues.issues;
     assert.ok(issue);
-    assert.ok(issue.title.startsWith("[Clawy feedback] (thumbs down, no comment)"));
+    assert.ok(issue.title.startsWith("[PrimusClaw Assistant feedback] (thumbs down, no comment)"));
     assert.ok(!issue.body.includes("typed but skipped"));
     assert.equal(world.settled.at(-1)?.card, "Thanks. I am filing your report.");
   }
@@ -295,7 +298,10 @@ test("a thumbs down files an issue and replies with its link", async () => {
   const world = linkedWorld();
   vote(world, "dislike", "the answer was wrong");
   await world.thumbs.settled();
-  assert.equal(world.issues.issues[0]?.title, "[Clawy feedback] (thumbs down) the answer was wrong — Alice");
+  assert.equal(
+    world.issues.issues[0]?.title,
+    "[PrimusClaw Assistant feedback] (thumbs down) the answer was wrong — Alice",
+  );
   assert.ok(texts(world).some((t) => t.includes("[#1](https://github.test/example-org/example-repo/issues/1)")));
 });
 

@@ -133,7 +133,7 @@ for (const [name, connection, saysToken] of [
   ["nothing", { readsWith: "", login: "", missing: "none", bindingReads: true }, false],
   ["older-claw", null, false],
 ] as const) {
-  test(`github status without a binding still says when clawy reads with a gh token (${name})`, async () => {
+  test(`github status without a binding still says when the assistant reads with a gh token (${name})`, async () => {
     const world = reviewWorld();
     world.identity.know("aad-a", "u-alice"); // (no binding)
     world.claw.connection = connection;

@@ -251,7 +251,7 @@ tests/test_connector_reasons.py::test_a_session_that_ends_while_idle_says_why_in
 tests/test_connector_reasons.py::test_a_session_claw_closed_with_its_machine_says_why_in_words -> packages/core/test/remote/e2e/connector-reasons.test.ts::a session claw closed with its machine says why in words
 tests/test_connector_reasons.py::test_a_revoked_connector_is_given_the_whole_login_command -> packages/core/test/remote/connector-reasons.test.ts::a revoked connector is given the whole login command
 tests/test_connector_reasons.py::test_a_message_waiting_for_its_terminal_says_why_in_the_chat_language -> packages/core/test/remote/e2e/connector-reasons.test.ts::a message waiting for its terminal says why in the chat language: terminal_working
-tests/test_session_window.py::test_the_chat_box_goes_to_clawy_and_the_card_to_the_session -> packages/core/test/remote/e2e/window.test.ts::the chat box goes to clawy and the card to the session
+tests/test_session_window.py::test_the_chat_box_goes_to_clawy_and_the_card_to_the_session -> packages/core/test/remote/e2e/window.test.ts::the chat box goes to the assistant and the card to the session
 tests/test_session_window.py::test_a_reply_quoting_the_session_card_goes_to_the_session -> packages/core/test/remote/e2e/window.test.ts::a reply quoting the session card goes to the session
 tests/test_session_window.py::test_mode_chat_sends_the_chat_box_to_the_session_and_mode_card_takes_it_back -> packages/core/test/remote/e2e/window.test.ts::mode chat sends the chat box to the session and mode card takes it back
 tests/test_session_window.py::test_a_worker_whose_default_is_chat_keeps_the_old_routing -> packages/core/test/remote/e2e/window.test.ts::a worker whose default is chat keeps the old routing

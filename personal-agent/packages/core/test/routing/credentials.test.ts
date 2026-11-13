@@ -31,7 +31,7 @@ const logger: Logger = {
 function config(exchangeForChat: boolean): RouterConfig {
   return {
     publicBaseUrl: PUBLIC,
-    botName: "Clawy",
+    botName: "PrimusClaw Assistant",
     pluginId: "",
     model: "",
     reviewModel: "",
@@ -48,7 +48,7 @@ function world(exchangeForChat: boolean, locale = "") {
   const { store, clock } = openTestStore();
   const exchange = new FakeExchange();
   const surface = new FakeSurface();
-  const views = new CommandViews("Clawy", PUBLIC, note);
+  const views = new CommandViews("PrimusClaw Assistant", PUBLIC, note);
   const credentials = new Credentials({ store, exchange, config: config(exchangeForChat), logger }, views);
   const chat = (who = ALICE) => new Chat(store, who, surface.conversation(personal()), "", locale);
   return { store, clock, exchange, surface, credentials, chat };
@@ -96,8 +96,8 @@ test("with chats on the linked key: the key, else the /link steps in the person'
   await zh.credentials.askToLink(zh.chat(), "You mentioned me in a group chat. ");
   await zh.credentials.askToLink(zh.chat(), "Another service. ");
   const [dm, other] = said(zh.surface);
-  assert.ok(dm?.startsWith("你在群聊里 @ 了我。要使用 Clawy") && !dm.includes(AI_NOTICE.en));
-  assert.ok(other?.startsWith("Another service. To use Clawy")); // (a lead of another service's: all English)
+  assert.ok(dm?.startsWith("你在群聊里 @ 了我。要使用 PrimusClaw Assistant") && !dm.includes(AI_NOTICE.en));
+  assert.ok(other?.startsWith("Another service. To use PrimusClaw Assistant")); // (a lead of another service's: all English)
 });
 
 test("with chats on the exchange: the token, else the key, else the binding card; a down service is said", async () => {
@@ -222,7 +222,7 @@ test("after an answer refused for want of a confirmed identity: the card, at mos
   // What was sent when is the store's: another worker on the same store (a restart, a replica) sends none either.
   const other = new Credentials(
     { store: w.store, exchange: w.exchange, config: config(true), logger },
-    new CommandViews("Clawy", PUBLIC, note),
+    new CommandViews("PrimusClaw Assistant", PUBLIC, note),
   );
   assert.equal(await other.identityAfterRefusal(w.chat()), false);
   assert.equal(cards(w.surface).length, 1);

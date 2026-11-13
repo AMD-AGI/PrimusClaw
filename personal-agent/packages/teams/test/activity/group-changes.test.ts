@@ -38,7 +38,7 @@ function handler(context: Recorder) {
       routed.push(event);
       return Promise.resolve();
     },
-    botName: "Clawy",
+    botName: "PrimusClaw Assistant",
     groupContext: context,
   });
   return { handle, routed };
@@ -103,7 +103,7 @@ test("an edited group message shows its new words, read as a message's are", asy
     id: "m-7",
     text: "the build is green now",
     from: USER_A,
-    recipient: { id: BOT, name: "Clawy" },
+    recipient: { id: BOT, name: "PrimusClaw Assistant" },
     conversation: GROUP,
     channelData: { eventType: "editMessage" },
   };

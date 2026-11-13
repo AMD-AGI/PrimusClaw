@@ -367,7 +367,7 @@ describe("the request scope", () => {
       expiresAt: store.now() + 600,
       envelope: {},
     });
-    const read = toInboundEvent(denyPress("1767225600123"), { botName: "Clawy", logger: silentLogger });
+    const read = toInboundEvent(denyPress("1767225600123"), { botName: "PrimusClaw Assistant", logger: silentLogger });
     assert.ok(read.ok && read.value !== undefined);
     await features.router.handle(read.value);
     await features.router.settled();

@@ -50,7 +50,11 @@ test("test_an_unlinked_mention_gets_a_card_for_them_and_a_one_to_one_message", a
   assert.ok(card !== undefined && card.channelUserId === "29:zed-teams" && card.name === "Zed" && card.dmSent);
   assert.ok(!JSON.stringify(card).includes("pull/9")); // (nothing the asker wrote)
   const [dm = ""] = texts(w, "personal:aad-z");
-  assert.ok(dm.startsWith("You mentioned me in a group chat. To use Clawy, connect your PrimusClaw account first."));
+  assert.ok(
+    dm.startsWith(
+      "You mentioned me in a group chat. To use PrimusClaw Assistant, connect your PrimusClaw account first.",
+    ),
+  );
   assert.ok(
     dm.includes("\nhttps://claw.example.com/primus-claw/teams-link\n") &&
       dm.includes("`/link CODE`") &&
@@ -115,7 +119,7 @@ test("test_pressing_the_button_is_the_persons_own_request_and_is_not_held_to_the
   assert.equal(texts(w, "personal:aad-z").length, 2);
   const update = w.surface.outbox.find((r) => r.op === "update");
   assert.ok(update?.op === "update" && update.message.body.type === "text");
-  assert.ok(update.message.body.text.includes("I sent you the steps in a 1:1 chat with Clawy."));
+  assert.ok(update.message.body.text.includes("I sent you the steps in a 1:1 chat with PrimusClaw Assistant."));
 });
 
 test("test_a_press_after_a_day_is_not_active", async () => {
@@ -171,7 +175,7 @@ test("test_the_request_runs_in_the_group_when_they_connect_within_15_minutes", a
   assert.deepEqual(w.turns.calls, [["create", "ak-zed", ASK]]);
   assert.equal(w.store.sessions.getSession(ZED.id, "g-1"), "sess-ak-zed");
   const group = texts(w, "g-1");
-  assert.equal(group[0], "Zed connected Clawy, so I am running their earlier request now.");
+  assert.equal(group[0], "Zed connected PrimusClaw Assistant, so I am running their earlier request now.");
   assert.ok(group.includes("THE ANSWER"));
   const [first = ""] = texts(w, "dm-aad-z");
   assert.ok(first.startsWith("Connected.") && first.includes("I am running your request from the group chat now"));

@@ -525,7 +525,7 @@
      {
       "isSubtle": true,
       "size": "Small",
-      "text": "在聊天框里打字是跟 Clawy 说；发给这个会话请用卡片上的输入框，或引用回复这张卡片。想让聊天框直接发给会话：/agent mode chat",
+      "text": "在聊天框里打字是跟 PrimusClaw Assistant 说；发给这个会话请用卡片上的输入框，或引用回复这张卡片。想让聊天框直接发给会话：/agent mode chat",
       "type": "TextBlock",
       "wrap": true
      },

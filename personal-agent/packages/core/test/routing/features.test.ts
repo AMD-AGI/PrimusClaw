@@ -183,11 +183,11 @@ function remoteWorld(window: "card" | "chat" = "chat") {
   return { w, prompts, agents, contexts, attachedKeys };
 }
 
-test("an attached chat talks to its agent; @Clawy and a message posted for the person stay the bot's", async () => {
+test("an attached chat talks to its agent; @PrimusClaw Assistant and a message posted for the person stay the bot's", async () => {
   const { w, prompts } = remoteWorld();
   link(w, ALICE.id, "ak");
   await w.router.handle(message("run the tests"));
-  await w.router.handle({ ...message("@Clawy what time is it"), namesBotFirst: true });
+  await w.router.handle({ ...message("@PrimusClaw Assistant what time is it"), namesBotFirst: true });
   await w.router.handle({ ...message("review o/r#1"), provenance: "on_behalf" });
   await w.router.settled();
   await w.router.handle(message("/stop"));
@@ -336,7 +336,7 @@ test("the bind button looks for the binding: not there yet, the card comes back;
   );
   assert.ok(
     lines.includes(
-      "note:Connect Clawy:I could not reach the Primus platform. Please try again in a minute. Press Confirm again then. [Confirm]",
+      "note:Connect PrimusClaw Assistant:I could not reach the Primus platform. Please try again in a minute. Press Confirm again then. [Confirm]",
     ),
   );
   assert.ok(lines.includes("note::Connected. Send me a message to get started, or /help for commands."));
@@ -460,7 +460,7 @@ test("files the channel gave no way to fetch count as files: no GitHub offer is 
   assert.deepEqual(offers, ["my PRs?"]);
   await w.router.handle({ ...message("", { kind: "group", conversation: "g-1" }), unreadableFiles: ["a.png"] });
   await w.router.settled();
-  assert.ok(!said(w).some((t) => t.startsWith("**What Clawy can do for you**")));
+  assert.ok(!said(w).some((t) => t.startsWith("**What PrimusClaw Assistant can do for you**")));
 });
 
 test("test_the_net_leaves_alone_what_it_must", async () => {

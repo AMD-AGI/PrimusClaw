@@ -21,7 +21,11 @@ export const BOT = "28:bot";
 export const CONV = "19:group@thread.v2";
 export const WHEN_MS = "1793695000000"; // 2026-11-03 08:36:40 UTC
 export const WHEN = "2026-11-03 08:36 UTC";
-export const MENTION = { type: "mention", text: "<at>Clawy</at>", mentioned: { id: BOT, name: "Clawy" } };
+export const MENTION = {
+  type: "mention",
+  text: "<at>PrimusClaw Assistant</at>",
+  mentioned: { id: BOT, name: "PrimusClaw Assistant" },
+};
 export const USER_A = { aadObjectId: "aad-a", name: "Alice", id: "29:a" };
 export const USER_B = { aadObjectId: "aad-b", name: "Bob", id: "29:b" };
 export const QUOTE = `Quoted message from Bob (${WHEN}):\n> The deploy failed on node 3`;
@@ -57,7 +61,7 @@ export function replyHtml(fields: ReplyHtml = {}): string {
   const senderId = fields.senderId ?? "8:orgid:bob";
   const messageId = fields.messageId ?? "m-100";
   const time = fields.time ?? WHEN_MS;
-  const own = fields.own ?? "@Clawy summarize this";
+  const own = fields.own ?? "@PrimusClaw Assistant summarize this";
   return (
     `<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="${messageId}">` +
     `<strong itemprop="mri" itemid="${senderId}">${sender}</strong><span itemprop="time" itemid="${time}"></span>` +
@@ -83,7 +87,7 @@ export function dm(text: string, parts: Parts = {}): Activity {
     from: user,
     entities: [...(parts.entities ?? [])],
     attachments: [...(parts.attachments ?? [])],
-    recipient: { id: BOT, name: "Clawy" },
+    recipient: { id: BOT, name: "PrimusClaw Assistant" },
     serviceUrl: "https://smba.test/",
     channelId: "msteams",
     conversation: { id: `conv-${user.aadObjectId}`, conversationType: "personal" },
@@ -99,7 +103,7 @@ export function grp(text: string, parts: Parts = {}): Activity {
     entities: [...((parts.mention ?? true) ? [MENTION] : []), ...(parts.entities ?? [])],
     attachments: [...(parts.attachments ?? [])],
     from: parts.user ?? USER_A,
-    recipient: { id: BOT, name: "Clawy" },
+    recipient: { id: BOT, name: "PrimusClaw Assistant" },
     serviceUrl: "https://smba.test/",
     channelId: "msteams",
     conversation: { id: CONV, conversationType: "groupChat" },
@@ -111,7 +115,7 @@ export function htmlAttachment(content: unknown): Json {
 }
 
 export function quotedGroup(textAfter = "summarize this", entity: Json = replyEntity()): Activity {
-  return grp(`<quoted messageId="m-100"/> <at>Clawy</at> ${textAfter}`, { entities: [entity] });
+  return grp(`<quoted messageId="m-100"/> <at>PrimusClaw Assistant</at> ${textAfter}`, { entities: [entity] });
 }
 
 export function quotedDm(textAfter = "summarize this", entity: Json = replyEntity()): Activity {

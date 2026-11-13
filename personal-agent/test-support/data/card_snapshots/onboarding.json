@@ -10,7 +10,7 @@
        "prompt": "pr-1"
       },
       "style": "positive",
-      "title": "Connect Clawy",
+      "title": "Connect PrimusClaw Assistant",
       "type": "Action.Execute",
       "verb": "primusclaw.onboard"
      }
@@ -36,7 +36,7 @@
         "items": [
          {
           "size": "Medium",
-          "text": "🔌 <at>Lin Mei</at>, connect Clawy once to use it here.",
+          "text": "🔌 <at>Lin Mei</at>, connect PrimusClaw Assistant once to use it here.",
           "type": "TextBlock",
           "weight": "Bolder",
           "wrap": true
@@ -51,7 +51,7 @@
       "type": "ColumnSet"
      },
      {
-      "text": "Press Connect Clawy and I will send you the steps. Your request waits 15 minutes, and I run it here as soon as you are connected.",
+      "text": "Press Connect PrimusClaw Assistant and I will send you the steps. Your request waits 15 minutes, and I run it here as soon as you are connected.",
       "type": "TextBlock",
       "wrap": true
      }

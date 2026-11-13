@@ -123,7 +123,7 @@
      {
       "isSubtle": true,
       "size": "Small",
-      "text": "What you type in the chat box goes to Clawy; to write to this session use the box on this card, or reply quoting this card. To send the chat box to the session instead: /agent mode chat",
+      "text": "What you type in the chat box goes to PrimusClaw Assistant; to write to this session use the box on this card, or reply quoting this card. To send the chat box to the session instead: /agent mode chat",
       "type": "TextBlock",
       "wrap": true
      },

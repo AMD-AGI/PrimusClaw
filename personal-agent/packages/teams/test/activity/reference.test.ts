@@ -12,7 +12,7 @@ import { restoreConversationRef } from "../../src/activity/reference.js";
 const PERSONAL = {
   serviceUrl: "https://smba.trafficmanager.net/emea/",
   conversation: { conversationType: "personal", tenantId: "tenant-1", id: "a:1Xyz-personal" },
-  bot: { id: "28:bot-app-id", name: "Clawy" },
+  bot: { id: "28:bot-app-id", name: "PrimusClaw Assistant" },
   user: { id: "29:1user", name: "Lin Mei", aadObjectId: "aad-lin" },
   activityId: "1731100000000",
   channelId: "msteams",
@@ -29,7 +29,7 @@ const GROUP = {
     id: "19:abc@thread.v2",
     name: "Ops",
   },
-  bot: { id: "28:bot-app-id", name: "Clawy" },
+  bot: { id: "28:bot-app-id", name: "PrimusClaw Assistant" },
   user: { id: "29:2user", name: "Robin", aadObjectId: "aad-robin" },
   activityId: "1731100000001",
   channelId: "msteams",

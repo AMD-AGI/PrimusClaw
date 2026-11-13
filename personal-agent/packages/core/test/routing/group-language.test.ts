@@ -116,15 +116,18 @@ test("rule 1: /lang alone says which it is, and a malformed one how to write it,
   await w.router.handle(gmsg("/lang"));
   assert.match(inGroup(w).at(-1) ?? "", /^This group has no language set/u);
   await w.router.handle(gmsg("/lang fr"));
-  assert.equal(inGroup(w).at(-1), "Usage: @Clawy /lang zh | en | auto (follow the asker).");
+  assert.equal(inGroup(w).at(-1), "Usage: @PrimusClaw Assistant /lang zh | en | auto (follow the asker).");
   await w.router.handle(gmsg("/lang zh"));
   await w.router.handle(gmsg("/lang"));
-  assert.equal(inGroup(w).at(-1), "这个群用中文回复。@Clawy /lang en 或 /lang auto 可改。");
+  assert.equal(inGroup(w).at(-1), "这个群用中文回复。@PrimusClaw Assistant /lang en 或 /lang auto 可改。");
   await w.router.handle(gmsg("/lang klingon"));
-  assert.equal(inGroup(w).at(-1), "用法：@Clawy /lang zh | en | auto（跟随提问者）。");
+  assert.equal(inGroup(w).at(-1), "用法：@PrimusClaw Assistant /lang zh | en | auto（跟随提问者）。");
   await w.router.handle(gmsg("/lang en"));
   await w.router.handle(gmsg("/lang"));
-  assert.equal(inGroup(w).at(-1), "This group is answered in English. @Clawy /lang zh or /lang auto changes it.");
+  assert.equal(
+    inGroup(w).at(-1),
+    "This group is answered in English. @PrimusClaw Assistant /lang zh or /lang auto changes it.",
+  );
 });
 
 // --- 2. in a group the group's setting decides, the answer and the fixed texts; a person's own choice does not ---------------

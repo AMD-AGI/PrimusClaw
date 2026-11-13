@@ -29,7 +29,7 @@ function urls(node: unknown): string[] {
 
 test("the link card puts the link on a line of its own", () => {
   const page = "https://claw.example.test/primus-claw/teams-link";
-  const shown = texts(linkCard({ bot: "Clawy", who: "Alice", page, notice: "AI notice" }));
+  const shown = texts(linkCard({ bot: "PrimusClaw Assistant", who: "Alice", page, notice: "AI notice" }));
   assert.ok(shown.some((t) => t.includes("teams-link")));
   assert.ok(
     shown.every((t) => textAfterLinks(t).length === 0),

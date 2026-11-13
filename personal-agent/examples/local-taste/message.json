@@ -5,7 +5,7 @@
   "serviceUrl": "http://127.0.0.1:3978/",
   "text": "__TEXT__",
   "from": { "id": "29:local-person", "aadObjectId": "00000000-0000-0000-0000-000000000001", "name": "Local Person" },
-  "recipient": { "id": "28:local-bot", "name": "Clawy" },
+  "recipient": { "id": "28:local-bot", "name": "PrimusClaw Assistant" },
   "conversation": {
     "id": "a:local-chat",
     "conversationType": "personal",

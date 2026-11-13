@@ -126,6 +126,10 @@ release version, and its `appVersion` stays `latest`.
   a client's name (for example "how is <name> doing") is no longer recognised as being about the assistant itself.
   Migration: the client sends its display name in `channel_context.assistant_name` on every message; the personal agent
   does so from its configured bot name (#837). Until a client does, its name is not known to the router (#834).
+- Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
+  it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
+  The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
+  The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
 ### Fixed
 

@@ -38,7 +38,7 @@ const SHAPES: readonly [string, Activity, string][] = [
   ["1:1, quotedReply entity", quotedDm(), `${QUOTE}\n\nsummarize this`],
   [
     "group, html attachment",
-    grp("<at>Clawy</at> summarize this", { attachments: [htmlAttachment(replyHtml())] }),
+    grp("<at>PrimusClaw Assistant</at> summarize this", { attachments: [htmlAttachment(replyHtml())] }),
     `${QUOTE}\n\nsummarize this`,
   ],
   [
@@ -48,25 +48,27 @@ const SHAPES: readonly [string, Activity, string][] = [
   ],
   [
     "group, blockquote in the text itself",
-    grp(replyHtml({ own: "<at>Clawy</at> summarize this" })),
+    grp(replyHtml({ own: "<at>PrimusClaw Assistant</at> summarize this" })),
     `${QUOTE}\n\nsummarize this`,
   ],
   ["1:1, blockquote in the text itself", dm(replyHtml({ own: "summarize this" })), `${QUOTE}\n\nsummarize this`],
   [
     "the bot's own reply is quoted (entity)",
-    quotedGroup("summarize this", replyEntity("Build 42 is green.", "Clawy", BOT)),
+    quotedGroup("summarize this", replyEntity("Build 42 is green.", "PrimusClaw Assistant", BOT)),
     `Quoted your earlier reply (${WHEN}):\n> Build 42 is green.\n\nsummarize this`,
   ],
   [
     "the bot's own reply is quoted (html: its id is the 28: form)",
     dm("and the second one?", {
-      attachments: [htmlAttachment(replyHtml({ sender: "Clawy", senderId: BOT, preview: "Build 42 is green." }))],
+      attachments: [
+        htmlAttachment(replyHtml({ sender: "PrimusClaw Assistant", senderId: BOT, preview: "Build 42 is green." })),
+      ],
     }),
     `Quoted your earlier reply (${WHEN}):\n> Build 42 is green.\n\nand the second one?`,
   ],
   [
     "the bot's id written without its 28: prefix",
-    quotedDm("summarize this", replyEntity("Build 42 is green.", "Clawy", "bot")),
+    quotedDm("summarize this", replyEntity("Build 42 is green.", "PrimusClaw Assistant", "bot")),
     `Quoted your earlier reply (${WHEN}):\n> Build 42 is green.\n\nsummarize this`,
   ],
   [
@@ -91,7 +93,7 @@ const SHAPES: readonly [string, Activity, string][] = [
   ],
   [
     "a quote with no text of the user's own is a request about it",
-    grp('<quoted messageId="m-100"/> <at>Clawy</at>', { entities: [replyEntity()] }),
+    grp('<quoted messageId="m-100"/> <at>PrimusClaw Assistant</at>', { entities: [replyEntity()] }),
     QUOTE,
   ],
   [
@@ -224,11 +226,14 @@ test("the placeholder is not part of what the user wrote", () => {
 // --- mentions --------------------------------------------------------------------------------------------------------
 
 test("a mention inside the quote is text and the bots own mention is read from the users part", () => {
-  const entity = replyEntity("<at>Clawy</at> and <at>Dana</at>, is node 3 up?");
-  const mine = grp('<quoted messageId="m-100"/> <at>Clawy</at> yes or no?', { entities: [entity] });
+  const entity = replyEntity("<at>PrimusClaw Assistant</at> and <at>Dana</at>, is node 3 up?");
+  const mine = grp('<quoted messageId="m-100"/> <at>PrimusClaw Assistant</at> yes or no?', { entities: [entity] });
   assert.ok(isMentioned(mine));
   assert.equal(messageText(mine), "yes or no?");
-  assert.equal(quoteBlockOf(mine, true), `Quoted message from Bob (${WHEN}):\n> Clawy and Dana, is node 3 up?`);
+  assert.equal(
+    quoteBlockOf(mine, true),
+    `Quoted message from Bob (${WHEN}):\n> PrimusClaw Assistant and Dana, is node 3 up?`,
+  );
   // the bot is named only inside the quote: that is not a mention of the bot
   const quoting = grp('<quoted messageId="m-100"/> thanks', { entities: [entity], mention: false });
   assert.ok(!isMentioned(quoting));
@@ -236,7 +241,7 @@ test("a mention inside the quote is text and the bots own mention is read from t
 
 test("a mention of someone else in the users part stays and the quote is apart", () => {
   const other = { type: "mention", text: "<at>Dana</at>", mentioned: { id: "29:dana", name: "Dana" } };
-  const a = grp('<quoted messageId="m-100"/> <at>Clawy</at> ask <at>Dana</at> about it', {
+  const a = grp('<quoted messageId="m-100"/> <at>PrimusClaw Assistant</at> ask <at>Dana</at> about it', {
     entities: [replyEntity(), other],
   });
   assert.equal(sent(a), `${QUOTE}\n\nask Dana about it`);
@@ -248,16 +253,18 @@ const SECRET = "ghp_" + "A1b2C3d4E5".repeat(4);
 
 test("a group masks credentials in the quote and a 1on1 chat does not", () => {
   const entity = replyEntity(`token is ${SECRET} ok`);
-  const group = quoteBlockOf(grp("<at>Clawy</at> hi", { entities: [entity] }), true);
+  const group = quoteBlockOf(grp("<at>PrimusClaw Assistant</at> hi", { entities: [entity] }), true);
   assert.ok(!group.includes(SECRET) && group.includes("[hidden]"));
   assert.ok(quoteBlockOf(dm("hi", { entities: [entity] })).includes(SECRET));
 });
 
 test("a group masks a credential in the authors name too and a 1on1 chat does not", () => {
   const entity = replyEntity("hello", `Eve ${SECRET}`);
-  assert.ok(!quoteBlockOf(grp("<at>Clawy</at> hi", { entities: [entity] }), true).includes(SECRET));
+  assert.ok(!quoteBlockOf(grp("<at>PrimusClaw Assistant</at> hi", { entities: [entity] }), true).includes(SECRET));
   assert.ok(
-    quoteBlockOf(grp("<at>Clawy</at> hi", { entities: [entity] }), true).includes("Quoted message from Eve [hidden] ("),
+    quoteBlockOf(grp("<at>PrimusClaw Assistant</at> hi", { entities: [entity] }), true).includes(
+      "Quoted message from Eve [hidden] (",
+    ),
   );
   const html = dm("hi", { attachments: [htmlAttachment(replyHtml({ sender: `Eve ${SECRET}` }))] });
   assert.ok(!quoteBlockOf(html, true).includes(SECRET) && quoteBlockOf(html).includes(SECRET));

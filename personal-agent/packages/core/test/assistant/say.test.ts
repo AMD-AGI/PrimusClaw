@@ -124,13 +124,16 @@ it("the head and the workers own replies come first and claws are not repeated",
   const { say } = planner();
   const [only] = say.messages(
     ALICE,
-    { type: "assistant.say", text: "ok", suggested_replies: ["Back to Clawy", "Next"] },
-    { head: "💬 **Clawy**", replies: [["Back to Clawy", "back to Clawy"]] },
+    { type: "assistant.say", text: "ok", suggested_replies: ["Back to PrimusClaw Assistant", "Next"] },
+    {
+      head: "💬 **PrimusClaw Assistant**",
+      replies: [["Back to PrimusClaw Assistant", "back to PrimusClaw Assistant"]],
+    },
   );
-  assert.equal(only?.body.type === "rich" ? only.body.markdown : "", "💬 **Clawy**\n\nok");
+  assert.equal(only?.body.type === "rich" ? only.body.markdown : "", "💬 **PrimusClaw Assistant**\n\nok");
   assert.deepEqual(only?.suggestions, [
-    { title: "Back to Clawy", value: "back to Clawy" },
-    { title: "Back to Clawy", value: "Back to Clawy" },
+    { title: "Back to PrimusClaw Assistant", value: "back to PrimusClaw Assistant" },
+    { title: "Back to PrimusClaw Assistant", value: "Back to PrimusClaw Assistant" },
     { title: "Next", value: "Next" },
   ]);
   const four = say.messages(

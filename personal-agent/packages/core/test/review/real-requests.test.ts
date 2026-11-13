@@ -89,7 +89,7 @@ for (const c of REQUESTS.filter((r) => !r.html)) {
       assert.equal(world.started.length, 0);
       assert.ok(said.includes(c.outcome[1]), said);
     }
-    // Nobody but the asker is @mentioned by Clawy: a reviewer named in a reply is plain text.
+    // Nobody but the asker is @mentioned by PrimusClaw Assistant: a reviewer named in a reply is plain text.
     const mentioned = world.surface.of(CONV).flatMap((r) => ("message" in r ? (r.message.mentions ?? []) : []));
     assert.ok(mentioned.every((m) => m.channelUserId === "29:a"));
   });

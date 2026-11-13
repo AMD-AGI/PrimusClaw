@@ -160,7 +160,7 @@ function stopPress(cardId: string) {
         },
       },
     },
-    { botName: "Clawy", logger: silentLogger },
+    { botName: "PrimusClaw Assistant", logger: silentLogger },
   );
   assert.ok(read.ok && read.value !== undefined);
   return read.value;
@@ -242,7 +242,7 @@ describe("the review service in the worker", () => {
 const ALICE_REFERENCE = {
   serviceUrl: "https://smba.trafficmanager.net/amer/",
   conversation: { id: "dm-a", conversationType: "personal", tenantId: "t1" },
-  bot: { id: "28:bot", name: "Clawy" },
+  bot: { id: "28:bot", name: "PrimusClaw Assistant" },
   user: { id: ALICE.channelUserId, aadObjectId: ALICE.id, name: ALICE.name },
 };
 

@@ -195,7 +195,7 @@ function lines(lang: Lang): string {
     remoteDomain.terminalClosedLine(lang),
     remoteDomain.readOnlyRefused(lang),
     remoteDomain.readOnlyRefused(lang, true),
-    remoteDomain.botLine(lang, "Clawy"),
+    remoteDomain.botLine(lang, "PrimusClaw Assistant"),
     remoteDomain.typedLine("修复一下", lang),
     ...remoteDomain.unsolicitedParts("cx-main", "做完了。", lang),
     ...remoteDomain.unsolicitedParts("cx-main", "做完了。", lang, true),
@@ -236,7 +236,7 @@ function statuses(lang: Lang): Record<string, Rendered> {
             lead: "说明",
             conversation: named,
             takeover: { connector_id: "c-on", agent_id: "cx", resume: "r-watch" },
-            bot: "Clawy",
+            bot: "PrimusClaw Assistant",
           }),
         ),
       );
@@ -255,7 +255,7 @@ function statuses(lang: Lang): Record<string, Rendered> {
         at: NOW,
         lang,
         terminal: true,
-        bot: "Clawy",
+        bot: "PrimusClaw Assistant",
       }),
     ),
   );
@@ -480,5 +480,6 @@ export function fixtureStrings(): Set<string> {
   walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), "m-a", "m-b", "#3 修复"]);
   for (const kind of ["claude", "codex", "cursor"]) found.add(remoteDomain.kindLabel(kind).label);
   found.add("Agent");
+  found.add("PrimusClaw Assistant"); // (the bot's name, which the lines and cards say as the deployment gives it)
   return found;
 }
