@@ -22,6 +22,9 @@ export const REVIEW_QUESTIONS = {
   lookAtSession: { en: (pr) => `Look at the review session of ${pr}`, zh: (pr) => `请看一下 ${pr} 的评审会话` },
   waitingForApproval: { en: (who) => `Waiting for ${who} to confirm the approval`, zh: (who) => `等 ${who} 确认批准` },
   waitingForMerge: { en: (who) => `Waiting for ${who} to confirm the merge`, zh: (who) => `等 ${who} 确认合入` },
+  waitingForAuthorConflict: { en: (pr) => `Waiting for the author to resolve the conflicts of ${pr}`, zh: (pr) => `等作者解决 ${pr} 的冲突` },
+  waitingForAuthorRules: { en: (pr) => `Waiting for the author or CI to meet the branch rules of ${pr}`, zh: (pr) => `等作者或 CI 满足 ${pr} 的分支保护规则` },
+  waitingForManualMerge: { en: (pr) => `Waiting for ${pr} to be merged by hand on GitHub`, zh: (pr) => `等有权限的人在 GitHub 上手动合入 ${pr}` },
 } satisfies Record<string, Template>;
 
 const ARG = "\u0000";

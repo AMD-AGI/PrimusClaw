@@ -22,7 +22,9 @@
  * session itself (no summary, question or session id).
  *
  * Started where a review item comes to need its owner: `syncReviewItem` (`review-items.ts`), which writes a review's "blocked" from the
- * facts of its session (a review session sends no worker report), and `ingestReport` for an item that does report. Both start it after
+ * facts of its session (a review session sends no worker report), and `ingestReport` for an item that does report. A merge someone else
+ * asked for that GitHub refused for one of these reasons no longer needs the reviewer (2026-11-12): `syncReviewItem` keeps the item in
+ * progress, waiting for the author (`params.author_waiting`), and starts this check from that state too. Both start it after
  * their commit and do not wait for it (`checkConflictLater`), so a slow read or notice never delays either.
  */
 import pino from "pino";
@@ -34,12 +36,19 @@ import { WORKFLOW_SCOPE_REFUSAL } from "../github-review/service.js";
 
 const logger = pino({ name: "assistant-review-conflict" });
 
+/**
+ * What happens next, as `followReviewItems` does it (`AuthorWait` in `review-items.ts`), and no more: new commits run the review once more,
+ * which may or may not merge them; a day without them hands it back to the reviewer. Never that it will be merged.
+ */
+const AFTER_ZH = "作者推送新提交后，评审会在新提交上自动再做一次；一天内没有新提交，会交回评审人处理。";
+const AFTER_EN = "Once the author pushes new commits, the review runs once more on them; if none come within a day, it goes back to the reviewer. ";
+
 /** What R is told, by language. */
 export function conflictText(pr: string, url: string, zh: boolean): string {
   return zh
-    ? `你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突。需要作者先解决冲突（合并或变基目标分支后推送），评审才能继续合入。${url}`
+    ? `你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突。需要作者先解决冲突（合并或变基目标分支后推送）。${AFTER_ZH}${url}`
     : `${pr}, which you asked to be reviewed and merged, cannot be merged: GitHub says its branch has conflicts with the base branch. The author `
-      + `has to resolve them (merge or rebase onto the base branch, then push) before the review can merge it. ${url}`;
+      + `has to resolve them (merge or rebase onto the base branch, then push). ${AFTER_EN}${url}`;
 }
 
 /** What R is told, by language, when GitHub refused the merge for the missing `workflow` scope. */
@@ -53,9 +62,9 @@ export function workflowScopeText(pr: string, url: string, zh: boolean): string 
 /** What R is told, by language, when GitHub's branch rules blocked the merge (merge state BLOCKED). */
 export function branchRulesText(pr: string, url: string, zh: boolean): string {
   return zh
-    ? `你请人评审并合入的 ${pr} 没能合入：GitHub 的分支保护规则挡住了合入（比如必需的检查还没通过，或者还缺必需的评审）。需要作者或 CI 先满足这些规则，之后才能合入。${url}`
+    ? `你请人评审并合入的 ${pr} 没能合入：GitHub 的分支保护规则挡住了合入（比如必需的检查还没通过，或者还缺必需的评审）。需要作者或 CI 先满足这些规则。${AFTER_ZH}${url}`
     : `${pr}, which you asked to be reviewed and merged, was not merged: GitHub's branch protection rules block the merge (for example a required `
-      + `check has not passed, or a required review is still missing). The author or CI has to meet those rules before it can be merged. ${url}`;
+      + `check has not passed, or a required review is still missing). The author or CI has to meet those rules. ${AFTER_EN}${url}`;
 }
 
 type Notice = "conflict" | "workflow_scope" | "branch_rules";
@@ -118,7 +127,9 @@ export async function tellRequesterOfConflict(itemId: string): Promise<boolean> 
     } | undefined;
     if (!item) return skipped("no_item");
     if (item.kind !== "review") return skipped("not_a_review");
-    if (item.board_state !== "needs_you") return skipped("not_needs_you", { boardState: item.board_state });
+    // A merge that waits for its author (`author_waiting`, `review-items.ts`) is in progress for the reviewer, and told to the one who asked.
+    const waitsForAuthor = item.board_state === "in_progress" && typeof item.params?.author_waiting === "string";
+    if (item.board_state !== "needs_you" && !waitsForAuthor) return skipped("not_needs_you", { boardState: item.board_state });
     if (String(item.params?.review_only ?? "false") === "true") return skipped("review_only");
     const requester = requestedByOfItem(item.params);
     if (!requester) return skipped("no_requested_by");
