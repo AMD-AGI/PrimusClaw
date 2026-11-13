@@ -103,6 +103,11 @@ const CASES: Readonly<Record<string, Drive>> = {
   "remoteAgents.events:after": (c, id) => c.remoteAgents.events("k", "s1", id),
   "remoteAgents.stream:sessionId": (c, id) => first(c.remoteAgents.stream("k", id, "e1")),
   "remoteAgents.stream:after": (c, id) => first(c.remoteAgents.stream("k", "s1", id)),
+  "skills.show:name": (c, id) => c.skills.show("k", id),
+  "skills.setEnabled:name": (c, id) => c.skills.setEnabled("k", id, false),
+  "skills.remove:name": (c, id) => c.skills.remove("k", id),
+  "skills.update:name": (c, id) => c.skills.update("k", id, { content: "c", description: "d" }),
+  "skills.undo:changeId": (c, id) => c.skills.undo("k", id),
 };
 
 /** The methods that take no id (or, `deliveryLink`, make no request), so that a new one has to be placed on purpose. */
@@ -134,6 +139,7 @@ const WITHOUT_ID = new Set([
   "remoteAgents.approvals",
   "remoteAgents.setApprovals",
   "remoteAgents.sessions",
+  "skills.list",
 ]);
 
 function answer(sent: Sent): Response {

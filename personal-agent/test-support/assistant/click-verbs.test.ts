@@ -28,6 +28,8 @@ import { APPROVAL_CARDS } from "../card-catalog/approval.js";
 import { ASSISTANT_CARDS, wi } from "../card-catalog/assistant.js";
 import { assistantRenderers, boardButtons } from "../../packages/teams/src/views/assistant/index.js";
 import { PROACTIVE_CARDS } from "../card-catalog/proactive.js";
+import { SKILL_CARDS } from "../card-catalog/skills.js";
+import { SKILL_VERB } from "../../packages/core/src/skills/views.js";
 
 interface Button {
   readonly card: string;
@@ -72,7 +74,9 @@ function moreCards(): ReadonlyArray<readonly [string, unknown]> {
 }
 
 const BUTTONS = [
-  ...[...APPROVAL_CARDS, ...ASSISTANT_CARDS, ...PROACTIVE_CARDS].map((entry) => [entry.id, entry.build()] as const),
+  ...[...APPROVAL_CARDS, ...ASSISTANT_CARDS, ...PROACTIVE_CARDS, ...SKILL_CARDS].map(
+    (entry) => [entry.id, entry.build()] as const,
+  ),
   ...moreCards(),
 ].flatMap(([id, card]) => [...buttonsIn(id, card)]);
 
@@ -144,6 +148,10 @@ function handlers(reached: string[]): ClickHandler[] {
         return true;
       },
     },
+    {
+      verbs: [SKILL_VERB],
+      withCredential: (click) => hit(click, `skill ${opOf(click.action.data)}`),
+    },
   ];
 }
 
@@ -214,6 +222,13 @@ it("a press on each kind of card reaches what answers it", async () => {
       "confirm deny",
     ],
     ["assistant choice", (b) => b.data["primusclaw"] === "assistant_choice", "choice"],
+    ["skill undo", (b) => b.data["primusclaw"] === SKILL_VERB && b.data["op"] === "undo", "skill undo"],
+    ["skill edit", (b) => b.data["primusclaw"] === SKILL_VERB && b.data["op"] === "edit", "skill edit"],
+    [
+      "skill save changes",
+      (b) => b.data["primusclaw"] === SKILL_VERB && b.data["op"] === "save_edit",
+      "skill save_edit",
+    ],
   ];
   for (const [what, which, outcome] of expected) {
     const button = BUTTONS.find(which);

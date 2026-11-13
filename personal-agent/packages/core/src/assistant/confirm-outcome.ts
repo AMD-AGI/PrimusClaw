@@ -14,6 +14,7 @@ import {
 } from "../locales/assistant-actions.js";
 import type { Lang } from "../locales/lang.js";
 import { devenvHideOutcome } from "./devenv-hide-outcome.js";
+import { skillText } from "../locales/skills.js";
 
 type Fields = Readonly<Record<string, unknown>>;
 
@@ -162,6 +163,21 @@ function triggerDone(create: boolean, out: Fields, lang: Lang): string {
   return t.scheduled({ name: or(trigger["name"], ""), schedule: or(trigger["schedule"], ""), tz, next });
 }
 
+/** What came of Save or Discard on a drafted skill's card: saved (which version), discarded, or why not. */
+export function skillSaveOutcome(status: string, out: Fields, lang: Lang): string {
+  const t = assistantActionText.in(lang);
+  const s = skillText.in(lang);
+  const result = fields(out["result"]);
+  if (status === "done" && truthy(out["answered_now"])) {
+    const version = typeof result["version"] === "number" ? result["version"] : 1;
+    return s.draftSaved({ name: or(result["name"], ""), version });
+  }
+  if (status === "done") return t.alreadyAnswered;
+  if (status === "denied") return s.draftDiscarded;
+  if (status === "expired") return t.expired;
+  return s.refused({ why: or(result["message"], or(result["error"], status)) });
+}
+
 /** What came of a press on a held write's card of `kind`, in one line: Claw's answer said plainly. */
 export function confirmOutcome(kind: string, out: Fields, lang: Lang): string {
   const t = assistantActionText.in(lang);
@@ -169,6 +185,7 @@ export function confirmOutcome(kind: string, out: Fields, lang: Lang): string {
   const create = kind === "trigger_create";
   if (kind === "devenv_send") return devenvSendOutcome(status, out, lang);
   if (kind === "devenv_hide") return devenvHideOutcome(status, out, lang);
+  if (kind === "skill_save") return skillSaveOutcome(status, out, lang);
   const comment = kind === "github_comment" ? commentOutcome(out, lang) : undefined;
   if (comment !== undefined) return comment;
   if (status === "done" && truthy(out["answered_now"])) return triggerDone(create, out, lang);

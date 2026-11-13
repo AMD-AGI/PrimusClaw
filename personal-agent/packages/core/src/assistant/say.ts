@@ -9,8 +9,9 @@
  *   cites as [n], and the replies to tap under the last of its messages when no card follows.
  * - When the event's item holds a result that waits, a card with Accept and Stop; when it holds a write for the person, a card
  *   that lets it through or not; when it puts a command to the person, a card with Run and Cancel; when it puts a choice to the
- *   person, a card with the options and Send (each recorded first, so its buttons mean something). A card holds the words only
- *   when they are short and not shown already.
+ *   person, a card with the options and Send; when it is about one of the person's skills, the skill's card with Undo and Edit,
+ *   or a draft's with Save and Discard (each recorded first, so its buttons mean something). A card holds the words only when they
+ *   are short and not shown already; a skill's card always does.
  * - Then a card for each file the item's worker delivered, with Claw's own download link.
  *
  * Every word of this worker's own is in the person's language, never in that of what was said.
@@ -26,7 +27,16 @@ import { replyParts } from "../turn/answer-parts.js";
 import { CITATIONS_MAX, citationsFromSources } from "./citations.js";
 import { assistantDeliveries } from "../turn/deliveries.js";
 import type { JsonObject } from "../json.js";
-import { PULL_LINK, SUGGESTIONS_MAX, choiceOf, confirmActionOf, confirmWriteOf, suggestedRepliesOf } from "./events.js";
+import {
+  PULL_LINK,
+  SUGGESTIONS_MAX,
+  choiceOf,
+  confirmActionOf,
+  confirmWriteOf,
+  skillCardOf,
+  suggestedRepliesOf,
+} from "./events.js";
+import { SKILL_UNDO_KIND } from "../skills/views.js";
 import { parseWorkItem } from "./item-of.js";
 import { fitsWorkCard, workEventText } from "./work-items.js";
 
@@ -146,9 +156,34 @@ export class SayPlanner {
     const inCard = said.inCard ? said.text : "";
     if (item?.canAccept)
       return { message: this.workCard(userId, item, said.text, inCard, said.lang), holdsWords: said.inCard };
+    // A personal skill's card says all its words say (what was saved, its buttons), so they are not said apart.
+    const skill = item === null ? this.skillCard(userId, event, said.text, said.lang) : undefined;
+    if (skill !== undefined) return { message: skill, holdsWords: true };
     const asked = item === null ? this.askCard(userId, event, inCard, said.lang) : undefined;
     if (asked !== undefined) return { message: asked, holdsWords: said.inCard };
     return this.choiceCard(userId, event, inCard, said.lang, said.inCard);
+  }
+
+  /**
+   * A personal skill the message is about (`skill_card`), recorded first: a draft is its held write (Save and Discard answer it as
+   * any held write is answered); anything done already records the change its Undo takes back. Undefined for none, and for a draft
+   * without its held write (it is then the plain held write's card).
+   */
+  private skillCard(userId: string, event: Event, text: string, lang: Lang): OutMessage | undefined {
+    const skill = skillCardOf(event);
+    if (skill === undefined) return undefined;
+    const buttons = this.deps.store.assistantButtons;
+    if (skill.kind === "draft") {
+      const held = confirmWriteOf(event);
+      if (held === undefined || held.kind !== "skill_save") return undefined;
+      const cardId = buttons.addConfirmCard(userId, held.confirmationId, held.kind, held.allowLabel);
+      return view(
+        { name: "skillCard", model: { skill, cardId, allowLabel: held.allowLabel, note: "", ended: false, lang } },
+        text,
+      );
+    }
+    const cardId = skill.changeId ? buttons.addConfirmCard(userId, skill.changeId, SKILL_UNDO_KIND, skill.name) : "";
+    return view({ name: "skillCard", model: { skill, cardId, allowLabel: "", note: "", ended: false, lang } }, text);
   }
 
   /** A write Claw holds for the person (Allow, Deny) or a command put to them (Run, Cancel), recorded first; undefined for none. */

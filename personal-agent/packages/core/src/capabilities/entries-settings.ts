@@ -98,7 +98,8 @@ export const SETTINGS_ENTRIES: readonly Capability[] = [
     sayZh: "你记得我什么",
     sayEn: "what do you remember about me",
     reaches: "memory",
-    covers: ["command:memory"],
+    // (`/skills`: the personal skills the person saved, the other thing Claw keeps of theirs; listed, turned off or on, deleted)
+    covers: ["command:memory", "command:skills"],
     action: true,
   }),
   capability({

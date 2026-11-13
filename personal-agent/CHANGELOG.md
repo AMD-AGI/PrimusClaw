@@ -15,6 +15,21 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`, `@primusclaw/personal-agent-teams`: the person's
+  personal skills in the chat. A message of the assistant about one (`skill_card` of `assistant.say`) is a card: what was
+  saved, changed, turned off or deleted, with **Undo** (the change taken back in Claw, once) and, for a saved one,
+  **Edit** (its description and SKILL.md in a form; Save changes saves the next version, with its own Undo); a draft the
+  assistant suggested is its held write's card with **Save** and **Discard**. `/skills` in a 1:1 chat lists the person's
+  skills and shows, turns off, turns on or deletes one, each answered with the skill's card and Undo; a group chat never
+  lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
+  `skillCard` and `skillEdit` views; the store is unchanged (a card's record is a held-write card of kind `skill_undo`).
+  Needs a Claw with the skill routes of personal skills saved from the conversation; on an older Claw `/skills` says
+  they are not available.
+
 ## 0.8.1
 
 A patch release: the worker's own settings get surface-neutral `PA_` names, and the older `TEAMS_` names still work, so

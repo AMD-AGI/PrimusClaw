@@ -1,0 +1,127 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-8",
+       "op": "undo",
+       "primusclaw": "assistant_skill"
+      },
+      "title": "撤销",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_undo"
+     },
+     {
+      "data": {
+       "card": "card-8",
+       "op": "edit",
+       "primusclaw": "assistant_skill"
+      },
+      "title": "修改",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_edit"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Good",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "✅ 已存为你的技能：standup-notes v1",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "facts": [
+       {
+        "title": "什⁠么⁠时⁠候⁠用",
+        "value": "写站会纪要时使用（standup、站会）"
+       },
+       {
+        "title": "附⁠带⁠文⁠件",
+        "value": "templates/notes.md"
+       }
+      ],
+      "type": "FactSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "以后相关的请求会自动用到它。",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "skill-preview-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "SKILL.md ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "skill-preview"
+       ],
+       "title": "SKILL.md",
+       "type": "Action.ToggleVisibility"
+      },
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "skill-preview",
+      "isVisible": false,
+      "items": [
+       {
+        "isSubtle": true,
+        "text": "## 何时用\n写站会纪要时。\n## 步骤\n1. 昨天完成\n2. 今天计划\n3. 阻塞",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

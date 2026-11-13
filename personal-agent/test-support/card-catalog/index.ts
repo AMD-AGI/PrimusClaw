@@ -13,6 +13,7 @@ import { FEEDBACK_CARDS } from "./feedback.js";
 import { PROACTIVE_CARDS } from "./proactive.js";
 import { REMOTE } from "./remote.js";
 import { REVIEW_CARDS } from "./review.js";
+import { SKILL_CARDS } from "./skills.js";
 import { TURN } from "./turn.js";
 
 export const CATALOG: readonly CatalogEntry[] = [
@@ -24,6 +25,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   ...TURN,
   ...REVIEW_CARDS,
   ...FEEDBACK_CARDS,
+  ...SKILL_CARDS,
 ];
 
 const BY_LINE: Readonly<Record<string, readonly string[]>> = {}; // (every line has registered its cards)
