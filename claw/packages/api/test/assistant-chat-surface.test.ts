@@ -35,12 +35,13 @@ test("CS2 another chat app is said generically and gets the generic reply-style 
   assert.deepEqual(readToolsOfPlugin(9, rows, chatSurface("slack").replyRules).pluginTools.map((t: any) => t.id), [22]);
 });
 
-test("CS3 the GitHub line tells a person without GitHub to bind it where they talk to Clawy", () => {
+test("CS3 the GitHub line tells a person without GitHub to bind it where they talk to the assistant, by the name its client gives", () => {
   const shown = { servers: [], github: [], githubBinding: true };
-  assert.match(renderRouterReadSection(shown), /sending \/github bind to Clawy in Teams \(/);
+  assert.match(renderRouterReadSection(shown), /sending \/github bind to the assistant in Teams \(/);
   const other = renderRouterReadSection({ ...shown, where: "in the chat" });
-  assert.match(other, /sending \/github bind to Clawy in the chat \(/);
+  assert.match(other, /sending \/github bind to the assistant in the chat \(/);
   assert.doesNotMatch(other, /Teams/);
+  assert.match(renderRouterReadSection({ ...shown, name: "Helper" }), /sending \/github bind to Helper in Teams \(/);
 });
 
 test("CS4 a turn's own message decides its channel, read beside its reply language; only a turn without one follows the latest", async () => {
@@ -48,10 +49,10 @@ test("CS4 a turn's own message decides its channel, read beside its reply langua
   const run: string[] = [];
   const querier = (rows: Array<[string, string | null]>) => async (text: string, params?: unknown[]) => {
     run.push(text);
-    assert.match(text, /^SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel FROM /);
+    assert.match(text, /^SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel, channel_context->>'assistant_name' AS assistant_name FROM /);
     if (text.endsWith("AND message_id = $2")) {
       const row = rows.find(([id]) => id === params?.[1]);
-      return { rows: row ? [{ chosen: "en", channel: row[1] }] : [] } as never;
+      return { rows: row ? [{ chosen: "en", channel: row[1], assistant_name: row[0] === "m4" ? "Helper" : null }] : [] } as never;
     }
     assert.match(text, /ORDER BY received_at DESC LIMIT 1$/); // (one row, as the reply language always read it)
     const latest = rows.at(-1);
@@ -72,4 +73,7 @@ test("CS4 a turn's own message decides its channel, read beside its reply langua
   // The reply language is what it was: read from the same row.
   assert.equal((await turnChannelTold(querier(rows), "s", "m4")).chosen, "en");
   assert.equal(await chosenReplyLanguage(querier(rows), "s", "m4"), "en");
+  // So is the name the client calls the assistant by; a row that names none names none.
+  assert.equal((await turnChannelTold(querier(rows), "s", "m4")).assistantName, "Helper");
+  assert.equal((await turnChannelTold(querier(rows), "s", "m3")).assistantName, undefined);
 });

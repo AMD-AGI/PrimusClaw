@@ -65,7 +65,7 @@ describe("assistant router read tools", { skip }, () => {
       await w.q("INSERT INTO tools (id, type, name, version, config) VALUES ($1, $2, $3, '1.0.0', $4::jsonb)", [t.id, t.type, t.name, JSON.stringify(t.config)]);
     }
     await w.q(
-      "INSERT INTO plugins (id, name, version, tools, is_public) VALUES ($1, 'Clawy', '1.0.0', $2::jsonb, true), (77, 'Other', '1.0.0', $3::jsonb, true)",
+      "INSERT INTO plugins (id, name, version, tools, is_public) VALUES ($1, 'Assistant', '1.0.0', $2::jsonb, true), (77, 'Other', '1.0.0', $3::jsonb, true)",
       [PLUGIN, JSON.stringify(TOOL_ROWS.map((t) => ({ id: t.id, version: "1.0.0" }))), JSON.stringify([{ id: 18, version: "1.0.0" }])],
     );
   });
@@ -170,18 +170,19 @@ describe("assistant router read tools", { skip }, () => {
   test("RT11 the reply-style rule and where the router is talked to follow the chat app the person writes from", async () => {
     const teams = await send(alice.routerSid, QUESTION);
     assert.deepEqual(teams.plugin_tools.map((t: any) => t.id), [17, 3, 26, 18], "no channel named: Teams' rule");
-    assert.match(teams.system_append, /In Teams people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in Teams\./);
+    assert.match(teams.system_append, /\nYou are PrimusClaw's \(Claw's\) assistant in Teams\./, "no name told: none made up");
+    assert.doesNotMatch(teams.system_append, /people call you/);
     // The person's latest message names the channel it came through. This turn's message has no row here (the test dispatches it
     // directly), so it follows that one, as a worker's report does; a message whose row names no channel stays Teams' (CS4).
     await w.q(
       `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context)
-       VALUES ($1, 'from-chatapp', 'alice', 'hi', '{"channel": "chatapp"}'::jsonb)`,
+       VALUES ($1, 'from-chatapp', 'alice', 'hi', '{"channel": "chatapp", "assistant_name": "Helper"}'::jsonb)`,
       [alice.routerSid],
     );
     try {
       const other = await send(alice.routerSid, QUESTION);
       assert.deepEqual(other.plugin_tools.map((t: any) => t.id), [22, 3, 26, 18], "the generic rule, not Teams'");
-      assert.match(other.system_append, /In the chat people call you Clawy: Clawy is you, PrimusClaw's \(Claw's\) assistant in the chat\./);
+      assert.match(other.system_append, /In the chat people call you Helper: Helper is you, PrimusClaw's \(Claw's\) assistant in the chat\./);
       assert.doesNotMatch(other.system_append, /in Teams|In Teams/);
     } finally { await w.q("DELETE FROM claw_assistant_messages WHERE message_id = 'from-chatapp'"); }
   });

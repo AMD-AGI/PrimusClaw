@@ -272,7 +272,7 @@ describe("assistant review tools", { skip }, () => {
     const byId = new Map(rows.map((r) => [r.message_id, r]));
     assert.deepEqual(byId.get(viaToken.message_id)?.attended_via, PERSON);
     assert.deepEqual(byId.get(viaToken.message_id)?.channel_context.people, [{ name: "Wei", user_id: "u-w" }]);
-    // How the message reached the chat is stored with it, for what counts the person's own messages apart (Clawy's failure mining).
+    // How the message reached the chat is stored with it, for what counts the person's own messages apart (a chat client's failure mining).
     assert.equal(byId.get(viaToken.message_id)?.channel_context.via, "on_behalf");
     assert.ok(!("via" in byId.get(viaCookie.message_id)!.channel_context), "a value outside the closed set is not stored");
     assert.equal(byId.get(viaKey.message_id)?.attended_via, null, "what the body says about attendance is not read");
@@ -378,10 +378,10 @@ describe("assistant review tools", { skip }, () => {
     assert.equal((out as Recorded).items.length, 2);
 
     // Review only, as the user, with a service's say recorded as the service.
-    const svc = { kind: "service", client_id: "clawy", act_sub: "sub-1" };
+    const svc = { kind: "service", client_id: "chat-client", act_sub: "sub-1" };
     const turn2 = await userTurn(alice, "只审 260", { via: svc });
     await rt.reviewStart(turn2, { prs: ["AMD-AGI/PrimusClaw#260"], merge: false });
-    assert.deepEqual(calls.start[1].user.delegation, { clientId: "clawy", actorSub: "sub-1" }, "a service's say is the service's, and is checked again");
+    assert.deepEqual(calls.start[1].user.delegation, { clientId: "chat-client", actorSub: "sub-1" }, "a service's say is the service's, and is checked again");
     assert.equal(calls.start[1].request.actingAs, null, "the user themself");
     assert.equal(calls.start[1].request.reviewOnly, true);
     assert.equal(calls.start[1].request.model, undefined);

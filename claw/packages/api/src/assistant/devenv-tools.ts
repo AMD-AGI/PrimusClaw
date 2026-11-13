@@ -710,7 +710,7 @@ const rootsOf = (agent: Row): string[] => {
  * The folder `cwd` names inside `root`, written as the root writes paths; null when it is not inside it. A POSIX root compares
  * exactly. A Windows root compares as Windows does: either separator, any case, a trailing separator or not; and the folder comes
  * back with the root's own spelling and separator (`c:/users/a/repo/api` under `C:\Users\a\repo` is `C:\Users\a\repo\api`), the
- * same rule Clawy's join_path keeps.
+ * same rule the chat client's join_path keeps.
  */
 function placeIn(cwd: string, root: string): string | null {
   if (!isWindowsPath(root)) {

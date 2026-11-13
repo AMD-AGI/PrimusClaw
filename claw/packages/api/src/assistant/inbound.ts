@@ -82,9 +82,9 @@ export interface ChannelAttached {
   busy: boolean;
   conversation?: string;
   /**
-   * Where the chat box goes while attached (Clawy's `/agent mode card|chat`): `card`, the chat box stays with the assistant and the
+   * Where the chat box goes while attached (the channel's `/agent mode card|chat`): `card`, the chat box stays with the assistant and the
    * session card's own text box (or a reply quoting that card) goes to the session; `chat`, what is typed goes to the session. Absent:
-   * not said (a Clawy from before it), read as `chat`.
+   * not said (a client from before it), read as `chat`.
    */
   chat_box?: "card" | "chat";
 }
@@ -108,8 +108,8 @@ function parseAttached(raw: unknown): ChannelAttached | null | undefined {
 
 /**
  * How the message reached the chat it came from, when not typed there by the person (`channel_context.via`). `on_behalf`: the channel
- * posted it into the person's own chat for them (Clawy's `POST /primus-claw-agent/on-behalf`, their coordinator's review request) and
- * then handed it on as typed. Stored with the message so that what counts the person's own messages (Clawy's daily failure mining) can
+ * posted it into the person's own chat for them (the client's on-behalf endpoint, their coordinator's review request) and
+ * then handed it on as typed. Stored with the message so that what counts the person's own messages (a client's daily failure mining) can
  * count these apart. A label the channel gives, kept to this closed set: it is read for counting only and widens nothing a turn may do.
  */
 export const CHANNEL_VIAS = ["on_behalf"] as const;
@@ -133,10 +133,29 @@ export interface ChannelContext {
   /** The session the chat is attached to (`ChannelAttached`); null: the channel says it is attached to none; absent: not said. */
   attached?: ChannelAttached | null;
   /**
-   * The language the person chose to be answered in, in the channel (Clawy's `/lang zh|en`); absent: they chose none (`/lang auto`, or a
+   * The language the person chose to be answered in, in the channel (its `/lang zh|en`); absent: they chose none (`/lang auto`, or a
    * channel from before it), and the language is read from what they write (`language.ts`). The sender's own choice, in a group as well.
    */
   reply_language?: ChosenLanguage;
+  /**
+   * The name the client's people call the assistant by in this channel (its display name, `assistantNameOf`); absent: the client
+   * names none, and the assistant is told of itself without a name. Claw names no client itself: a name is only ever the client's.
+   */
+  assistant_name?: string;
+}
+
+/** The longest assistant name kept; a longer one, or one with characters a name does not have, is no name. */
+export const ASSISTANT_NAME_MAX = 64;
+
+/**
+ * The assistant's name as a client sends it: letters, digits, spaces and `. _ ' -`, at most ASSISTANT_NAME_MAX characters once its
+ * runs of spaces are one. Anything else is no name (undefined), never a reason to refuse the message: the name goes into the prompt
+ * as words, so it can carry no markup, quote or line of its own.
+ */
+export function assistantNameOf(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const name = raw.replace(/\s+/g, " ").trim();
+  return name.length <= ASSISTANT_NAME_MAX && /^[\p{L}\p{N}](?:[\p{L}\p{N} ._'-]*[\p{L}\p{N}.])?$/u.test(name) ? name : undefined;
 }
 
 /**
@@ -208,32 +227,40 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const channelMessageId = str(c.channel_message_id);
   const attached = parseAttached(c.attached);
   const via = CHANNEL_VIAS.find((v) => v === c.via);
+  const assistantName = assistantNameOf(c.assistant_name);
   return {
     ...(channel ? { channel } : {}), ...(via ? { via } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
     people, actions, repos, handoffs, files: parseFiles(c.files),
     ...(attached !== undefined ? { attached } : {}),
     ...(isChosenLanguage(c.reply_language) ? { reply_language: c.reply_language } : {}),
+    ...(assistantName ? { assistant_name: assistantName } : {}),
   };
 }
 
 /**
  * What the channel told of the chat, as of the turn answering `messageId`: the language the person chose to be answered in
- * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included) and the channel the message came through
- * (`ChannelContext.channel`; undefined when it names none). Both from that message's row; a turn that answers no message of theirs
- * (a worker's report woke the assistant), or whose message has no row, follows their latest message to it.
+ * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included), the channel the message came through
+ * (`ChannelContext.channel`; undefined when it names none) and the name the client calls the assistant by there
+ * (`ChannelContext.assistant_name`; undefined when it names none). All from that message's row; a turn that answers no message of
+ * theirs (a worker's report woke the assistant), or whose message has no row, follows their latest message to it.
  */
 export async function turnChannelTold(
   q: Querier, sessionId: string, messageId: string | null,
-): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined }> {
-  const select = "SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel FROM claw_assistant_messages WHERE session_id = $1";
-  type Row = { chosen: unknown; channel: unknown };
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined; assistantName: string | undefined }> {
+  const select = "SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel, "
+    + "channel_context->>'assistant_name' AS assistant_name FROM claw_assistant_messages WHERE session_id = $1";
+  type Row = { chosen: unknown; channel: unknown; assistant_name?: unknown };
   let row: Row | undefined = messageId
     ? (await q(`${select} AND message_id = $2`, [sessionId, messageId])).rows[0] as Row | undefined
     : undefined;
   row ??= (await q(`${select} ORDER BY received_at DESC LIMIT 1`, [sessionId])).rows[0] as Row | undefined;
   const chosen = row?.chosen;
   const channel = row?.channel;
-  return { chosen: isChosenLanguage(chosen) ? chosen : null, channel: typeof channel === "string" && channel ? channel : undefined };
+  return {
+    chosen: isChosenLanguage(chosen) ? chosen : null,
+    channel: typeof channel === "string" && channel ? channel : undefined,
+    assistantName: assistantNameOf(row?.assistant_name),
+  };
 }
 
 /**

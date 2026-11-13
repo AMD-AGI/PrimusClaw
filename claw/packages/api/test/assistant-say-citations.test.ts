@@ -113,7 +113,7 @@ test("SC3 all of a message's sources fit the budget, and the longest message wit
     text, item: { item_id: "kwi_0123456789abcdef", seq: 12, title: "题".repeat(40), board_state: "needs_you", result_version: 3, can_accept: true },
     sources: out.sources,
   };
-  assert.ok(Buffer.byteLength(JSON.stringify(payload)) < 16384, "Clawy's /claw-events takes at most 16 KiB");
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) < 16384, "a chat client's /claw-events takes at most 16 KiB");
   // The longest text there is: 600 characters, each one JSON escapes to six bytes.
   const escaped = { ...payload, text: `${"\u0001".repeat(600 - 24)}[1][2][3][4][5][6][7][8]` };
   assert.ok(Buffer.byteLength(JSON.stringify(escaped)) < 16384, `${Buffer.byteLength(JSON.stringify(escaped))} bytes`);

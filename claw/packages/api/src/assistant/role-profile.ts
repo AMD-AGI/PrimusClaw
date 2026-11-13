@@ -227,13 +227,13 @@ async function replyLanguageOf(task: Record<string, unknown>, sessionId: string,
 
 /**
  * What the channel told with the message the turn answers (`turnChannelTold`): a worker's report answers none of the person's.
- * A turn with no words (one the system starts) reads nothing, as the reply language never did for it: nothing chosen, Teams.
+ * A turn with no words (one the system starts) reads nothing, as the reply language never did for it: nothing chosen, Teams, no name.
  */
 async function turnTold(
   task: Record<string, unknown>, sessionId: string, messageId: string,
-): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined }> {
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined; assistantName: string | undefined }> {
   const prompt = stringField(task, "prompt");
-  if (!prompt) return { chosen: null, channel: undefined };
+  if (!prompt) return { chosen: null, channel: undefined, assistantName: undefined };
   const report = prompt.startsWith(WORK_EVENT_PREFIX);
   return turnChannelTold((t, p) => db.query(t, p), sessionId, report ? null : messageId);
 }
@@ -348,7 +348,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     withSystemAppend(task, renderRouterPrompt(
       {
         servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding,
-        where: surface.where,
+        where: surface.where, ...(told.assistantName ? { name: told.assistantName } : {}),
       },
       { discipline },
     ));
@@ -374,7 +374,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const earlier = message ? await earlierFilesOf((t, p) => db.query(t, p), sessionId, messageId, files) : [];
     if (files.length || earlier.length) state.push(renderFilesState(files, earlier));
     // Which session the chat the message came from is attached to, when the channel said (`channel_context.attached`).
-    if (message?.context.attached !== undefined) state.push(renderAttachedState(message.context.attached));
+    if (message?.context.attached !== undefined) state.push(renderAttachedState(message.context.attached, message.context.assistant_name));
     if (files.length) {
       const images = promptImagesOf(files);
       if (images.length) task.prompt_images = images;
@@ -411,9 +411,10 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     }
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
-    // Who it is (Clawy, with claw_self_status) and how to count what a lookup returned: the same on every turn, so it stays cached.
+    // Who it is (by the name its client calls it, with claw_self_status) and how to count what a lookup returned: the same on every
+    // turn, so it stays cached.
     const self = selfStatusOn();
-    withSystemAppend(task, renderRouterSelfSection(self, surface.where));
+    withSystemAppend(task, renderRouterSelfSection(self, surface.where, told.assistantName));
     const proactive = {
       schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled(),
       jobKinds: jobHttpSources().map((k) => ({ kind: k.kind, description: k.description })),
