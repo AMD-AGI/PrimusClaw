@@ -111,6 +111,18 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill suggestion no longer depends on the model calling `skill_draft`.
+  When the user's message to their assistant states a way they always work ("我每次都按…写", "以后…都…", "always …",
+  "from now on …") and the turn saved and drafted nothing, the server drafts the skill from the conversation after the turn and
+  shows the same draft card (Save / Discard); nothing is saved until Save. Never in a group's conversation, never for a message
+  that was not the signed-in person's, at most one card per skill name per conversation, none for a day after a Discard there,
+  a few a day at most, and the model writing the draft may decline.
+- Every router turn is told what the user's skills are now, from the database: how many (or none), which were deleted or undone
+  lately, and how many are turned off or used only when named. The router's prompt says to trust this over anything the
+  conversation said earlier, so a skill deleted earlier in the same conversation is no longer reported as existing.
+
 ## [0.4.5] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131924` (commit 7e1f3ca8), released as `docker.io/rocm/primusclaw:claw-0.4.5`. A

@@ -263,6 +263,16 @@ function namesWord(text: string, name: string): boolean {
   return new RegExp(`(?<![a-z0-9_-])${escapeRe(name.toLowerCase())}(?![a-z0-9_-])`).test((text || "").normalize("NFKC").toLowerCase());
 }
 
+/** A skill the user deleted or undid lately that `texts` (a new skill's) names as a skill, other than `name` and one their `message` names. */
+export async function removedSkillNamed(
+  userId: string, name: string, texts: string[], message = "",
+): Promise<{ name: string; how: string } | null> {
+  const text = texts.join("\n");
+  const since = Date.now() - REMOVED_NAME_DAYS * 86_400_000;
+  return (await removedSkills(userId)).find((r) =>
+    r.name !== name && Date.parse(r.removed_at) >= since && marksSkill(text, r.name) && !namesWord(message, r.name)) ?? null;
+}
+
 /**
  * A skill written from a conversation does not point at a skill the user removed lately (deleted, or a save they undid, in the last
  * `REMOVED_NAME_DAYS`): what the router remembers of an earlier turn is not theirs any more. Only a name marked as a skill counts
@@ -271,10 +281,7 @@ function namesWord(text: string, name: string): boolean {
 async function requireNoRemovedSkill(
   userId: string, name: string, texts: string[], op: "create" | "draft" | "update", message = "",
 ): Promise<void> {
-  const text = texts.join("\n");
-  const since = Date.now() - REMOVED_NAME_DAYS * 86_400_000;
-  const named = (await removedSkills(userId)).find((r) =>
-    r.name !== name && Date.parse(r.removed_at) >= since && marksSkill(text, r.name) && !namesWord(message, r.name));
+  const named = await removedSkillNamed(userId, name, texts, message);
   if (named) {
     refused(op, {
       error: "names_removed_skill",
@@ -426,6 +433,20 @@ export const skillDraft = notingRefusals(async function skillDraft(claims: Assis
       + `in words. If they say yes in words, call skill_save with draft_id ${out.draft.id} and their yes as request_quote.`,
   };
 });
+
+/**
+ * A draft's card with Save and Discard in the user's assistant session (`sessionId`), kept for the turn `messageId`: the card
+ * `skill_draft` shows, for a draft the platform made (a worker's, or one drafted after a turn, `skill-auto-draft.ts`).
+ */
+export async function showDraftCard(userId: string, sessionId: string, messageId: string, d: SkillDraft): Promise<void> {
+  const lang: CommandLanguage = hasHan(`${d.description}${d.content}`) ? "zh" : "en";
+  const out = await inTransaction((q) => proposeConfirmation(q, { sid: sessionId, mid: messageId }, userId, "skill_save",
+    { draft_id: d.id, name: d.skill_name, description: d.description }, {
+      text: () => skillCardText(draftCard(d, ""), lang), allowLabel: lang === "zh" ? "保存" : "Save",
+      skillCard: (confirmationId) => draftCard(d, confirmationId),
+    }));
+  if (out.announce) await out.announce();
+}
 
 /** `skill_update`: the user asked for a change to one of their skills. Saved now as its next version, with the card (Undo goes back). */
 export const skillUpdate = notingRefusals(async function skillUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -678,12 +699,7 @@ export async function handleWorkerSkillWrites(
     try {
       const lang: CommandLanguage = hasHan(`${d.description}${d.content}`) ? "zh" : "en";
       if (router) {
-        const out = await inTransaction((q) => proposeConfirmation(q, { sid: router, mid: `skill-draft:${d.id}` }, userId, "skill_save",
-          { draft_id: d.id, name: d.skill_name, description: d.description }, {
-            text: () => skillCardText(draftCard(d, ""), lang), allowLabel: lang === "zh" ? "保存" : "Save",
-            skillCard: (confirmationId) => draftCard(d, confirmationId),
-          }));
-        if (out.announce) await out.announce();
+        await showDraftCard(userId, router, `skill-draft:${d.id}`, d);
       } else {
         // No assistant: the draft is confirmed on the skill routes (`/v1/users/me/skill-drafts/:id/confirm`).
         const card: AssistantSkillCard = { ...draftCard(d, ""), draft_id: d.id };

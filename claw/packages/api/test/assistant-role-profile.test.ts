@@ -364,7 +364,7 @@ describe("assistant role profile", { skip }, () => {
       const { result, published } = await send(alice.routerSid, "alice", { doorbell: false, content });
       const task = JSON.parse(published[0]);
       assert.equal(words(task.prompt), `${content}${line(language)}`);
-      assert.ok(task.prompt.endsWith(UNTRUSTED_CLOSE), "and the item list after it");
+      assert.ok(task.prompt.indexOf(UNTRUSTED_CLOSE) > task.prompt.indexOf(content), "and the item list after it");
       const [row] = await w.q("SELECT prompt, input FROM claw_tasks WHERE task_id = $1", [result.runId]);
       assert.equal(row.prompt, content, "the run row holds the user's words");
       assert.ok(!JSON.stringify(row.input).includes("Reply language"));
