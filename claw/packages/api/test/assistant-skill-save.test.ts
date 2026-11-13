@@ -639,7 +639,15 @@ describe("assistant: saving the user's personal skills from the conversation", {
     assert.deepEqual([other.isError, other.body.error], [true, "not_asked"]);
     const dont = await inTurn(alice, "don't delete weekly-report", "skill_delete", { name: "weekly-report", request_quote: "delete weekly-report" });
     assert.deepEqual([dont.isError, dont.body.error], [true, "not_asked"]);
+    const bang = await inTurn(alice, "不要！删掉 weekly-report", "skill_delete", { name: "weekly-report", request_quote: "删掉 weekly-report" });
+    assert.deepEqual([bang.isError, bang.body.error], [true, "not_asked"], "a refusal in the clause before the quote");
+    const should = await inTurn(alice, "我不应该删掉 weekly-report", "skill_delete", { name: "weekly-report", request_quote: "我不应该删掉 weekly-report" });
+    assert.deepEqual([should.isError, should.body.error], [true, "not_asked"]);
+    const readme = "Keep weekly-report as it is. Also update the README.";
+    const edit = await inTurn(alice, readme, "skill_update", { name: "weekly-report", content: "## x", request_quote: readme });
+    assert.deepEqual([edit.isError, edit.body.error], [true, "not_asked"], "a change verb about something else");
     assert.equal((await skills()).find((s) => s.skill_name === "weekly-report")?.deleted_at, null);
+    assert.equal((await skills()).find((s) => s.skill_name === "weekly-report")?.content, STANDUP);
 
     // A worker's copy of a skill the user already has, under another name.
     const consumer = await import("../src/events/consumer.js");

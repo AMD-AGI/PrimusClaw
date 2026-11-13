@@ -24,19 +24,30 @@ function said(text: string): string {
   return (text || "").normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-// A sentence that says not to: never a request, whatever else it says ("不要存成技能", "don't save this as a skill").
-const NEGATED = /(不要|不用|别|不必|无需|不需要|先不|不想|勿|不准|不许)/;
-const NEGATED_EN = /\b(don'?t|do not|never|no need|not now|without|stop me)\b/;
+// A sentence that says not to: never a request, whatever else it says. Strict by construction: any 不, 没, 别, 勿 or 莫 in Chinese
+// (不要, 不应该, 没让你, 别) and any no, not, never or n't in English (not asking, shouldn't, don't) makes it a no, once the few
+// compounds that are no negation (没问题, 不错) are taken out. A request with one of them costs the user one press of the card.
+const HARMLESS = /(没问题|不错)/g;
+const NEGATED = /[不没别勿莫]/;
+const NEGATED_EN = /\b(?:no|not|never|nor|none|nothing|without|nobody)\b|n't\b|\bdon'?t\b|\bdo not\b/;
 
 export function negated(s: string): boolean {
-  return NEGATED.test(s) || NEGATED_EN.test(s);
+  const t = said(s).replace(HARMLESS, " ");
+  return NEGATED.test(t) || NEGATED_EN.test(t);
 }
 
-/** The text just before a quote in a message ends in a negation ("不要" + "把这个存成技能"): the quote is then no request. */
+/**
+ * Whether the words before a quote in a message say not to: the last two clauses before it (split at any punctuation), so
+ * "不要" + "删掉 weekly-report", "不要！" + "删掉 weekly-report" and "我不应该" + "删掉 weekly-report" are all refusals. (An apostrophe
+ * splits nothing: "don't" stays one word.)
+ */
 export function negatedBefore(prefix: string): boolean {
-  const tail = said(prefix).slice(-12);
-  return /(不要|不用|别|不必|无需|不需要|先不|不想|勿)\s*$/.test(tail) || /\b(don'?t|do not|never)\s*$/.test(tail);
+  const clauses = said(prefix).split(/[，。！？；：、,.!?;:\n…—「」“”()（）]+/u).map((c) => c.trim()).filter(Boolean);
+  return negated(clauses.slice(-2).join(" "));
 }
+
+// A save asked about, not asked for: a hypothetical or a question about the phrase ("如果把它存成技能呢", "存成技能是什么意思").
+const HYPOTHETICAL = /(如果|假如|要是|假设|是什么意思|什么意思|是什么|会怎样|\bwhat if\b|\bif\b|\bwhat does\b|\bwhat is\b|\bwould it\b)/;
 
 // ---- A yes to a draft ------------------------------------------------------------------------------------------------
 
@@ -76,7 +87,7 @@ function savesNamed(s: string, name: string): boolean {
  */
 export function confirmsDraft(message: string, name: string): boolean {
   const s = said(message);
-  if (negated(s) || /[不没](?:行|可以|好|对|是|同意|确认|要|存|保存)/.test(s) || /\b(no|not|nope|nah|cancel|discard)\b/.test(s)) return false;
+  if (negated(s) || /\b(nope|nah|cancel|discard)\b/.test(s) || /(算了|取消|放弃|拒绝)/.test(s)) return false;
   const reply = bare(message);
   if (YES_REPLIES.has(reply) || YES_REPLIES.has(reply.replace(/(?<=[^a-z ]) | (?=[^a-z ])/g, ""))) return true;
   return !!name && (savesNamed(s, name) || (namesSkill(s, name) && asksToSaveSkill(s)));
@@ -99,7 +110,7 @@ const MAKE_A_SKILL_EN = /\bmake (?:this|that|it|these|them) (?:a|my|into a) (?:n
 /** Whether the words ask for something to be saved as a skill: a directed save phrase, and no negation. */
 export function asksToSaveSkill(quote: string): boolean {
   const s = said(quote);
-  if (negated(s)) return false;
+  if (negated(s) || HYPOTHETICAL.test(s)) return false;
   return SAVE_AS_ZH.test(s) || SAVE_INTO_ZH.test(s) || SAVE_AS_EN.test(s) || MAKE_A_SKILL_EN.test(s);
 }
 
@@ -128,7 +139,7 @@ const VERBS: Readonly<Record<Act, { zh: string; en: string }>> = {
 /** The verb right before the name (删掉 weekly-report, 删掉这个技能 weekly-report) or right after it (weekly-report 技能删掉吧). */
 function verbAtName(s: string, verbs: string, name: string): boolean {
   const n = escape(said(name));
-  const between = "\\s*(?:掉|了)?\\s*(?:我的|这个|那个|个人)?\\s*(?:技能|skill)?\\s*[「“\"'`]?\\s*";
+  const between = "\\s*(?:掉|了)?\\s*(?:一下|下)?\\s*(?:我的|这个|那个|个人)?\\s*(?:技能|skill)?\\s*[「“\"'`]?\\s*";
   const before = new RegExp(`(?:${verbs})${between}${n}(?![a-z0-9_-])`);
   const after = new RegExp(`(?<![a-z0-9_.-])${n}[」”"'\`]?\\s*(?:这个|那个)?\\s*(?:技能|skill)?\\s*(?:也|就|先|给我|帮我|请)?\\s*(?:${verbs})(?:掉|了|吧|啊|一下)*\\s*(?:$|[\\p{P}\\s])`, "u");
   return before.test(s) || after.test(s);
@@ -159,12 +170,21 @@ export function asksToAct(quote: string, act: Act, name: string): boolean {
   return !negated(act === "disable" ? s.replace(OFF_BY_NEGATION, " ") : s);
 }
 
-/** 修改, 改成, 改为, 改一下, 更新, 调整, 加上 a step, 去掉 a step: the verbs of a change (never 改天, never 改 alone). */
-const CHANGE_ZH = /(修改|改成|改为|改一下|改改|改下|更新|调整|替换成|换成|加上|加一步|加一条|去掉|删去|删掉第|补充|重写)/;
-const CHANGE_EN = /\b(change|update|edit|modify|replace|rewrite|adjust|rename)\b/;
+/** The verbs of a change: 修改, 改成, 改为, 改一下, 更新, 调整, 加上 a step, 去掉 a step (never 改天, never 改 alone). */
+const CHANGE_ZH = "修改|改成|改为|改一下|改改|改下|更新|调整|替换成|换成|加上|加一步|加一条|去掉|删去|删掉第|补充|重写";
+const CHANGE_EN = "change|update|edit|modify|replace|rewrite|adjust|rename";
 
-/** Whether the words ask for a change to the skill `name`: its name, a change verb, and no negation. */
+/**
+ * Whether the words ask for a change to the skill `name`: its name, and a change verb that applies to it: before the name
+ * (修改 weekly-report, update weekly-report), or after it in the same clause (把 weekly-report 技能的第三步改成…, weekly-report 加一步).
+ * A change verb in another clause ("Keep weekly-report as it is. Also update the README.") changes nothing of it. No negation.
+ */
 export function asksToChangeSkill(quote: string, name: string): boolean {
   const s = said(quote);
-  return namesSkill(s, name) && !negated(s) && (CHANGE_ZH.test(s) || CHANGE_EN.test(s));
+  if (!namesSkill(s, name) || negated(s)) return false;
+  const n = escape(said(name));
+  const before = new RegExp(`(?:${CHANGE_ZH})\\s*(?:一下)?\\s*(?:我的|这个|那个)?\\s*(?:技能|skill)?\\s*${n}(?![a-z0-9_-])`);
+  const after = new RegExp(`(?<![a-z0-9_.-])${n}(?![a-z0-9_-])[^\\p{P}\\n]{0,24}?(?:${CHANGE_ZH})`, "u");
+  const en = new RegExp(`\\b(?:${CHANGE_EN})\\s+(?:the |my |this )?(?:skill )?${n}(?![a-z0-9_-])`);
+  return before.test(s) || after.test(s) || en.test(s);
 }

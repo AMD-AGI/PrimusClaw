@@ -12,6 +12,9 @@
  *   I3 an act names this very skill with a verb of that act next to it: another skill's name, the word 技能 alone, an edit of a step
  *      (去掉 the third step), "open it to look" (打开), 改天 and a negation (except 别再用 / stop using) are not
  *   I4 a corpus of ordinary chat sentences: false for every gate
+ *   I5 any negation refuses (不应该, 没让你, "not asking", "shouldn't"), also in the clauses just before a quote ("不要！" + the
+ *      quote); a change verb in another clause than the skill's name changes nothing; a save asked about (如果…呢, 是什么意思) is no
+ *      request; "帮我删除一下 X" is a delete
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -116,3 +119,27 @@ test("I4 ordinary chat sentences ask for no write to a skill, through any gate",
     for (const act of ["delete", "disable", "enable", "undo"] as const) assert.equal(asksToAct(s, act, NAME), false, `${act}: ${s}`);
   }
 });
+
+test("I5 any negation refuses, before a quote too; a change applies to the named skill; a save asked about is no request", () => {
+  assert.equal(asksToAct(`我不应该删掉 ${NAME}`, "delete", NAME), false);
+  assert.equal(asksToAct(`I'm not asking you to delete ${NAME}`, "delete", NAME), false);
+  assert.equal(asksToAct(`you shouldn't delete ${NAME}`, "delete", NAME), false);
+  assert.equal(asksToAct(`没让你删掉 ${NAME}`, "delete", NAME), false);
+  assert.equal(asksToSaveSkill("不应该把这个存成技能"), false);
+  assert.equal(confirmsDraft(`不应该保存 ${DRAFT}`, DRAFT), false);
+  assert.equal(confirmsDraft("没问题", DRAFT), true, "没问题 is a yes");
+  for (const before of ["不要！", "我不应该", "not now. ", "不要，", "好的，不过别"]) assert.equal(negatedBefore(before), true, before);
+  for (const before of ["", "好的，", "请", "麻烦你，"]) assert.equal(negatedBefore(before), false, before);
+  assert.equal(asksToAct(`帮我删除一下 ${NAME}`, "delete", NAME), true);
+
+  assert.equal(asksToChangeSkill(`Keep ${NAME} as it is. Also update the README.`, NAME), false);
+  assert.equal(asksToChangeSkill(`${NAME} 挺好。README 改一下`, NAME), false);
+  assert.equal(asksToChangeSkill(`修改一下 ${NAME}`, NAME), true);
+  assert.equal(asksToChangeSkill(`把 ${NAME} 技能的第三步改成先拉 PR 列表`, NAME), true);
+
+  for (const asked of ["如果把它存成技能呢？", "“存成技能”是什么意思？", "what if I save this as a skill?", "存成技能是什么"]) {
+    assert.equal(asksToSaveSkill(asked), false, asked);
+  }
+  assert.equal(asksToSaveSkill("可以把这个存成技能吗？"), true, "a polite request is still one");
+});
+
