@@ -171,7 +171,7 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  freshSessionEvery, waitingCards, cardsLeftError, clearsSkillDrafts, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
+  freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
@@ -1337,7 +1337,8 @@ async function closeCards(): Promise<WaitingCard[] | null> {
  * draft with no card left (`DELETE /v1/users/me/skill-drafts/:id`, the skill routes' Discard). The drafts are the user's, not a
  * session's: the assistant is shown another case's waiting draft card in every session, and points the user at it instead of
  * answering the case (sa-eval cat-skills-deleted-006 on claw-v0.5.0 was told to type 批准 for cat-skills-suggest-005's card). An error
- * (`infra:`) when one could not be read or is still there after: the attempt is not graded.
+ * (`infra:`) when one could not be read or is still there after: the attempt is not graded. A draft the server makes later still from an
+ * earlier turn is waited for first (EVAL_SKILL_SETTLE_S), and one that comes anyway is caught after the attempt (`foreignSkillCardError`).
  */
 async function clearSkillDrafts(): Promise<void> {
   // The server drafts a skill after a turn has ended, in the background (`skill-auto-draft.ts`: one model call, retried, under about
@@ -1347,12 +1348,6 @@ async function clearSkillDrafts(): Promise<void> {
     log(`waiting ${Math.ceil(settle / 1000)} s for a skill the server may still draft from the last turns before clearing drafts`);
     await pause(settle);
   }
-  // Only a list read as a list: a 200 with anything else is no reading of the cards, and would leave one unseen.
-  const skillCardsNow = async (): Promise<WaitingCard[] | null> => {
-    const a = await api("GET", "/v1/assistant/confirmations");
-    if (a.status === 404) return [];
-    return a.status === 200 && Array.isArray(a.json?.data) ? skillDraftCards(waitingCards(a.json, null)) : null;
-  };
   const skillCards = await skillCardsNow();
   if (!skillCards) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
   if (skillCards.length && !SEND_TOKEN_CMD) {
@@ -1381,6 +1376,28 @@ async function clearSkillDrafts(): Promise<void> {
   const still = cardsAfter.length + draftsAfter.length;
   if (still) throw new Error(`infra: ${still} skill draft(s) or card(s) still wait for the identity after Discard: not graded`);
   if (skillCards.length || left.length) log(`cleared ${skillCards.length} skill draft card(s) and ${left.length} draft(s) left by another case`);
+}
+
+/** The skill draft cards waiting for the identity, read as a list or not at all (null): a 200 with anything else would leave one unseen. */
+async function skillCardsNow(): Promise<WaitingCard[] | null> {
+  const a = await api("GET", "/v1/assistant/confirmations");
+  if (a.status === 404) return [];
+  return a.status === 200 && Array.isArray(a.json?.data) ? skillDraftCards(waitingCards(a.json, null)) : null;
+}
+
+/**
+ * After an attempt of a skills case: a skill draft card waiting that its own turns did not show came from elsewhere after the clear (a
+ * draft the server made late from an earlier case's turn), and the assistant may have been shown it: the attempt is not graded (an
+ * `infra:` error, run again once). Erring that way: a card that came only after the attempt's turns is counted too.
+ */
+async function foreignSkillCardError(events: readonly LiveEvent[], messageIds: readonly string[]): Promise<string | null> {
+  const waiting = await skillCardsNow();
+  if (!waiting) return "infra: the skill draft cards could not be read after the attempt: not graded";
+  const own = cardsShownBy(events, messageIds);
+  const foreign = waiting.filter((w) => !own.has(w.id));
+  return foreign.length
+    ? `infra: ${foreign.length} skill draft card(s) not of this attempt appeared while it ran (a draft made late from an earlier turn): not graded`
+    : null;
 }
 
 /** When the run's last attempt's turns ended (its messages answered and graded), for `clearSkillDrafts`'s wait. */
@@ -1689,6 +1706,11 @@ async function main(): Promise<void> {
             CASE_CARDS.set(c.id, own);
           }
           if (waiting) a = { ...a, cardsWaiting: waiting.length };
+          if (MODE === "assistant" && clearsSkillDrafts(c) && !a.error && !preflightFailed) {
+            const mine = RUN_MESSAGES.filter((id) => !earlier.has(id));
+            const foreign = await foreignSkillCardError(session!.stream.events, mine).catch(() => "infra: the skill draft cards could not be read after the attempt: not graded");
+            if (foreign) a = { ...a, pass: false, error: foreign };
+          }
           // A say the server refused for its hourly cap is the run's failure, not the assistant's.
           const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
           if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };

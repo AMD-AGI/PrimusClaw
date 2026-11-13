@@ -77,7 +77,7 @@ import { silentTurnNotice, turnLostNotice } from "../src/assistant/router-turn-e
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
-  apiQuery, caseSays, cardsOf, clearsSkillDrafts, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, cardsShownBy, clearsSkillDrafts, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
@@ -1483,4 +1483,11 @@ test("S-skills a skills case clears the identity's waiting skill drafts and thei
     { data: { items: [{ id: "g1", kind: "skill_save", status: "pending" }] } },
   );
   assert.deepEqual(skillDraftCards(waiting).map((w) => w.id), ["c1"], "only the assistant's skill draft cards; a schedule or a review card stays");
+  // The cards an attempt's own turns showed; one shown in another turn (an earlier case's late draft) is not among them.
+  const shown = cardsShownBy([
+    say(1, "m1", "draft", { confirm_write: { confirmation_id: "c1", kind: "skill_save" }, skill_card: { kind: "draft" } }),
+    say(2, "old-turn", "late draft", { confirm_write: { confirmation_id: "c9", kind: "skill_save" } }),
+    say(3, "m1", "plain answer"),
+  ], ["m1"]);
+  assert.deepEqual([...shown], ["c1"]);
 });

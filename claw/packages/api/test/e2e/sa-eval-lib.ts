@@ -349,6 +349,17 @@ export function skillDraftIds(body: unknown): string[] {
   return (Array.isArray(d) ? d : []).map((x) => (typeof x?.id === "string" ? x.id : "")).filter(Boolean);
 }
 
+/** The cards this attempt's own turns showed (`confirm_write` on their says): the ids of their confirmations. */
+export function cardsShownBy(events: readonly LiveEvent[], messageIds: readonly string[]): Set<string> {
+  const turns = new Set(messageIds);
+  const out = new Set<string>();
+  for (const e of events) {
+    const id = e.data?.confirm_write?.confirmation_id;
+    if (e.data?.type === "AssistantSay" && turns.has(String(e.data.turn_message_id ?? "")) && typeof id === "string" && id) out.add(id);
+  }
+  return out;
+}
+
 /** The cards that ask the person to save a skill draft (Save / Discard). */
 export const skillDraftCards = (waiting: readonly WaitingCard[]): WaitingCard[] =>
   waiting.filter((w) => w.source === "assistant" && w.kind === "skill_save");
