@@ -111,6 +111,14 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill the assistant suggests on its own is a draft card, never a question
+  in words. `say` refuses a message that asks whether to save something as a skill until the turn has called `skill_draft`
+  (whose card, with Save and Discard, is the question), and the router's prompt and the tool's description say so. A skill
+  written from a conversation may not name a skill the user deleted or undid. `skill_list` adds `deleted_lately`: each skill
+  the user had and has no longer, deleted or undone, and when, so "does this skill exist" is answered as it is.
+
 ## [0.4.4] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131535` (commit ce688380). A patch release: personal skills are saved from the
