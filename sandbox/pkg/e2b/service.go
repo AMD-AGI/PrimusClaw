@@ -301,28 +301,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		return SandboxResponse{}, 0, err
 	}
-	if s.runner == nil {
-		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-		return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
-	}
-	// Placement outlives the HTTP request. A gateway close at 180s must not
-	// delete the Workload or spend the idempotency key while the pod is still pending.
-	// At the pending deadline a key that is not running yet is ended as pending_timeout
-	// before the runner is cancelled, so a replay never reports the Workload deletion
-	// that follows. A key a replay already adopted as running is left to the runner.
-	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancel()
-	expired := make(chan bool, 1)
-	timer := time.AfterFunc(pending, func() {
-		ended, err := s.grants.ExpirePending(context.WithoutCancel(ctx), grantID, sandboxID, pendingTimeoutError(pending, "").Error())
-		if err == nil && !ended {
-			expired <- false
-			return
-		}
-		expired <- true
-		cancel()
-	})
-	result, runErr := s.runner.Create(runCtx, CreateRequest{
+	result, err := s.place(ctx, grantID, sandboxID, pending, CreateRequest{
 		SandboxID:     sandboxID,
 		TemplateID:    tpl.ID,
 		Namespace:     s.namespace,
@@ -340,24 +319,8 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
 	})
-	timedOut := !timer.Stop() && <-expired
-	if runErr != nil {
-		if errors.Is(runErr, ErrTemplateMissing) {
-			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-			return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "template_unavailable", tpl.ID)
-		}
-		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
-		if timedOut {
-			failed = pendingTimeoutError(pending, runErr.Error())
-		}
-		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
-		return SandboxResponse{}, 0, failed
-	}
-	if timedOut {
-		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
-		failed := pendingTimeoutError(pending, "")
-		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
-		return SandboxResponse{}, 0, failed
+	if err != nil {
+		return SandboxResponse{}, 0, err
 	}
 	running := grant.RunningUpdate{
 		SandboxName: result.SandboxName,
@@ -381,6 +344,49 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	ref.State = runtimev1alpha1.SandboxRunning
 	ref.SandboxName = result.SandboxName
 	return createdResponse(ref, token), http.StatusCreated, nil
+}
+
+// place waits up to pending for the runner to start the sandbox.
+// A gateway close does not cancel the placement. At the deadline a sandbox that
+// is not running yet is ended as pending_timeout before the runner is cancelled.
+func (s *Service) place(ctx context.Context, grantID, sandboxID string, pending time.Duration, req CreateRequest) (CreateResult, error) {
+	if s.runner == nil {
+		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+		return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
+	}
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	expired := make(chan bool, 1)
+	timer := time.AfterFunc(pending, func() {
+		ended, err := s.grants.ExpirePending(context.WithoutCancel(ctx), grantID, sandboxID, pendingTimeoutError(pending, "").Error())
+		if err == nil && !ended {
+			expired <- false
+			return
+		}
+		expired <- true
+		cancel()
+	})
+	result, runErr := s.runner.Create(runCtx, req)
+	timedOut := !timer.Stop() && <-expired
+	if runErr != nil {
+		if errors.Is(runErr, ErrTemplateMissing) {
+			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+			return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "template_unavailable", req.TemplateID)
+		}
+		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		if timedOut {
+			failed = pendingTimeoutError(pending, runErr.Error())
+		}
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	if timedOut {
+		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
+		failed := pendingTimeoutError(pending, "")
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	return result, nil
 }
 
 // pendingTimeoutError reports a sandbox that was not running within its pending wait.

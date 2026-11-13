@@ -240,7 +240,7 @@ func isPendingTimeout(reason string) bool {
 func isCreateFailure(reason string) bool {
 	return reason == createFailedReason ||
 		strings.HasPrefix(reason, "sandbox_create_failed") ||
-		strings.HasPrefix(reason, "pending_timeout")
+		isPendingTimeout(reason)
 }
 
 // capReason cuts reason to endReasonLimit bytes without splitting a character.

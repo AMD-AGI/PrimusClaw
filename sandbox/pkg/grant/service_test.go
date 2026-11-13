@@ -662,6 +662,46 @@ func TestReconcileKeepsMissingPendingSandboxWithinTemplateWindow(t *testing.T) {
 	}
 }
 
+func TestReconcileEndsPresentPendingSandboxAtDeadline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, reclaimer := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	svc.exists = memExists{}
+	svc.reclaimer = reclaimer
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60, PendingTimeoutSec: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxPending {
+		t.Fatalf("pending sandbox ended early: %+v", view.Sandboxes[0])
+	}
+	clock = now.Add(90 * time.Second)
+	svc.ReapOnce(context.Background())
+	view, err = svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxEnded || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout") {
+		t.Fatalf("present pending sandbox was kept: %+v", view.Sandboxes[0])
+	}
+	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-1" {
+		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
 func TestExtendRejectsEarlierExpiry(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
