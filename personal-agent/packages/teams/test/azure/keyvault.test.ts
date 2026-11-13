@@ -235,7 +235,8 @@ test("a refused read fails at once naming the secret and the vaults code", async
   assert.deepEqual(sleeps, []);
 });
 
-test("a missing secret fails, under its name and under its deprecated name", async () => {
+test("a missing secret fails", async () => {
+  // (under its name and under its deprecated name)
   const fake = new FakeAzure();
   fake.vault.set("personal-agent-encryption-keys", [reply(404, { error: { code: "SecretNotFound" } })]);
   await assert.rejects(
