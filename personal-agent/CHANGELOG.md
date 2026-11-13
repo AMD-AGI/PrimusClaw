@@ -15,7 +15,16 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.9.0
+
+A minor release, because core's exported API changes incompatibly: `ClawPort` gains a required member, `skills`
+(`ClawSkillsPort`), so code that implements `ClawPort` itself must add it (the packaged Claw client does). It brings
+the person's personal skills into the chat (#825). The store is unchanged; nothing to do for a deployment of the
+published packages.
+
+**Claw:** the skill cards and `/skills` need the skill routes of claw-v0.4.4 and later (personal skills saved from the
+conversation, AMD-AGI/PrimusClaw#823). With an older Claw, `/skills` says they are not available, and nothing else
+changes.
 
 ### Added
 
@@ -28,7 +37,7 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
   `skillCard` and `skillEdit` views; the store is unchanged (a card's record is a held-write card of kind `skill_undo`).
   Needs a Claw with the skill routes of personal skills saved from the conversation; on an older Claw `/skills` says
-  they are not available.
+  they are not available (#825).
 
 ## 0.8.1
 
