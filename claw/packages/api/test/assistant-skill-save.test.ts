@@ -32,6 +32,12 @@
  *       folded in, the skill untouched until Save
  *   E14 through the tools: a no to a draft (不行, 不可以, 不好, 不对, 不是, not ok) saves nothing, a yes does; 不要关掉, 别关掉 and
  *       "don't turn off" turn nothing off, 别再用 does; 取消/恢复/restore of something else undoes nothing, 撤销 does
+ *   E16 the second review's sentences through the tools: a yes-like character in another sentence (运行, 这是, 对比, 存到, keep me
+ *       posted) saves no draft; a question about skills (这个技能存在吗, 作为参考) saves nothing; a quote about old-report deletes
+ *       nothing of weekly-report; a quote cut out of a sentence that says not to ("不要" + "把这个存成技能") asks for nothing; a worker's
+ *       copy of a skill the user has under another name is neither saved nor drafted
+ *   E17 a draft's approval command (批准 #ref) saves it through confirmation_answer, which the router has with personal skills even
+ *       when neither the schedule nor the review tools give it one
  *   E15 a draft made against an earlier version is not saved over a later one (stale), and an older card's Undo takes back nothing
  *       once the skill has changed again (off, on, off)
  */
@@ -587,7 +593,7 @@ describe("assistant: saving the user's personal skills from the conversation", {
       assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], other);
     }
     assert.equal((await skills()).find((s) => s.skill_name === "standup-notes")?.enabled, false, "still off: nothing undone");
-    const undoSaid = await inTurn(alice, "撤销刚才那个改动", "skill_undo", { name: "standup-notes", request_quote: "撤销刚才那个改动" });
+    const undoSaid = await inTurn(alice, "撤销 standup-notes 刚才的改动", "skill_undo", { name: "standup-notes", request_quote: "撤销 standup-notes 刚才的改动" });
     assert.deepEqual([undoSaid.isError, undoSaid.body.undone], [false, "enabled"], "撤销 alone takes back the turn-off");
   });
 
@@ -610,5 +616,71 @@ describe("assistant: saving the user's personal skills from the conversation", {
     const old = await undo(off1.body.change_id);
     assert.deepEqual([old.status, old.body.reason], [409, "changed"], "the first turn-off's card is no longer the last change");
     assert.equal((await skills())[0].enabled, false);
+  });
+
+  test("E16 a yes-like word in another sentence, a question about skills, another skill's name and a negated quote write nothing", async () => {
+    const drafted = await inTurn(alice, "任务完成了", "skill_draft", { name: "deploy-check", content: "## Steps\n1. look at CI" });
+    for (const said of ["帮我运行一下测试", "这是什么？", "对比一下这两个PR", "把它存到仓库里", "keep me posted on the build"]) {
+      const r = await inTurn(alice, said, "skill_save", { draft_id: drafted.body.draft_id, request_quote: said });
+      assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], said);
+    }
+    assert.ok(!(await skills()).some((s) => s.skill_name === "deploy-check"), "no draft saved");
+
+    for (const said of ["这个技能存在吗？", "我的技能作为参考就行"]) {
+      const r = await inTurn(alice, said, "skill_save", { name: "weekly-report", content: STANDUP, request_quote: said });
+      assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], said);
+    }
+    const cut = await inTurn(alice, "不要把这个存成技能", "skill_save", { name: "weekly-report", content: STANDUP, request_quote: "把这个存成技能" });
+    assert.deepEqual([cut.isError, cut.body.error], [true, "not_asked"], "a quote cut from a sentence that says not to");
+    assert.ok(!(await skills()).some((s) => s.skill_name === "weekly-report"));
+
+    await save(alice, { name: "weekly-report" });
+    const other = await inTurn(alice, "删掉 old-report 技能", "skill_delete", { name: "weekly-report", request_quote: "删掉 old-report 技能" });
+    assert.deepEqual([other.isError, other.body.error], [true, "not_asked"]);
+    const dont = await inTurn(alice, "don't delete weekly-report", "skill_delete", { name: "weekly-report", request_quote: "delete weekly-report" });
+    assert.deepEqual([dont.isError, dont.body.error], [true, "not_asked"]);
+    assert.equal((await skills()).find((s) => s.skill_name === "weekly-report")?.deleted_at, null);
+
+    // A worker's copy of a skill the user already has, under another name.
+    const consumer = await import("../src/events/consumer.js");
+    const { sc } = await import("../src/infra/nats.js");
+    const original = { ...consumer.completionPorts };
+    Object.assign(consumer.completionPorts, {
+      maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {}, enqueueEvolutionJob: async () => {},
+      recordSkillFeedback: async () => {}, checkProbationGraduation: async () => {}, recordWorkerTurnEnd: async () => {},
+    });
+    const tombstone = consumer.tombstoneReader.has;
+    consumer.tombstoneReader.has = async () => false;
+    try {
+      const item = await w.createItem(alice, "copy");
+      const run = await w.workerTurn(item.itemId);
+      await consumer.consumeEventDelivery({
+        subject: `events.${run.sid}`, seq: 1, ack: () => {}, nak: () => { throw new Error("nak"); },
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: run.sid, task_id: run.task_id, user_id: "alice", message_id: run.mid, prompt: "do it",
+          final_text: "done", failed: false, error_count: 0, skills_to_save: [{ skill_name: "standup-copy", content: STANDUP, description: "x" }],
+        })),
+      } as any);
+    } finally {
+      Object.assign(consumer.completionPorts, original);
+      consumer.tombstoneReader.has = tombstone;
+    }
+    assert.ok(!(await skills()).some((s) => s.skill_name === "standup-copy"));
+    assert.deepEqual(await w.q("SELECT 1 FROM claw_skill_drafts WHERE skill_name = 'standup-copy'"), [], "nor drafted");
+  });
+
+  test("E17 a draft's approval command saves it through confirmation_answer", async () => {
+    const drafted = await inTurn(alice, "任务完成了", "skill_draft", { name: "deploy-check", content: "## Steps\n1. look at CI" });
+    assert.equal(drafted.isError, false, JSON.stringify(drafted.body));
+    const [conf] = await w.q("SELECT confirmation_id FROM claw_assistant_confirmations WHERE kind = 'skill_save' AND status = 'pending'");
+    const ref = prompts.confirmationRef(conf.confirmation_id);
+    const turn = await message(alice, `批准 #${ref}`);
+    const c = await connect(turn);
+    try {
+      assert.ok((await c.listTools()).tools.some((t) => t.name === "confirmation_answer"), "the router can answer it");
+      const r = await call(c, "confirmation_answer", { decision: "allow" });
+      assert.equal(r.isError, false, JSON.stringify(r.body));
+    } finally { await c.close(); await w.closeRun(turn.task_id); }
+    assert.ok((await skills()).some((s) => s.skill_name === "deploy-check"), "saved by the approval command");
   });
 });

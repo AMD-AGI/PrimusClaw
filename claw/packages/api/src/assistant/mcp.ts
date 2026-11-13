@@ -126,7 +126,21 @@ function registerSkillRead(mcp: McpServer, claims: AssistantTokenClaims): void {
  * Saving and changing the user's personal skills (`skill-writes.ts`): the router only. A save, a change, a delete, a turn-off and an undo
  * are refused unless the turn answers the person's own signed-in message and quotes their request; a draft only shows a card.
  */
-function registerSkillWrites(mcp: McpServer, claims: AssistantTokenClaims): void {
+function registerSkillWrites(mcp: McpServer, claims: AssistantTokenClaims, answersConfirmations: boolean): void {
+  // A draft's card is answered by its approval command too (批准 #ref): through the schedule or review tools' confirmation_answer when
+  // those are on, else through this one.
+  if (answersConfirmations) {
+    mcp.tool(
+      "confirmation_answer",
+      "Answer a skill draft's card: allow only when the user's whole message is approve #<ref> (批准 #<ref>), deny when it is deny #<ref>.",
+      { decision: z.enum(["allow", "deny"]), confirmation_id: z.string().optional().describe("The id of the card.") },
+      (args) => answer(claims, "confirmation_answer", async () => {
+        const out = await scheduleConfirmationAnswer(claims, args);
+        if (!out) throw new ToolRefused("confirmation_not_found", "that is no waiting card: allow only when the user's whole message is approve #<ref> (批准 #<ref>) of a draft's card");
+        return out;
+      }),
+    );
+  }
   const quote = z.string().describe("The user's sentence that asks for this, copied exactly from their message.");
   const files = z.array(z.object({ path: z.string(), content: z.string() })).optional()
     .describe("Supporting files, each under references/, templates/, scripts/ or assets/ (for example scripts/check.sh).");
@@ -647,7 +661,7 @@ export function createAssistantMcpServer(
     // Not an observer's: it watches a group or a repository, where no one's personal skills are read.
     if (userSkills && claims.role === "router") {
       registerSkillRead(mcp, claims);
-      registerSkillWrites(mcp, claims);
+      registerSkillWrites(mcp, claims, !reviewTools && !assistantSchedulesOn());
     }
   } else {
     mcp.tool(

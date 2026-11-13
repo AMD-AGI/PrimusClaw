@@ -25,11 +25,11 @@ import pino from "pino";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { publishEvent } from "../events/store.js";
-import { quoteIsFrom } from "../memory/gates.js";
+import { normalizeText, quoteIsFrom } from "../memory/gates.js";
 import { humanMessages } from "../memory/service.js";
 import {
   confirmSkillDraft, createSkillDraft, deleteUserSkillRecorded, discardSkillDraft, latestUndoableChange, listUserSkills, pendingSkillDrafts,
-  refreshChangeAfter, sameSkillUnderAnotherName, saveUserSkillRecorded, setUserSkillEnabled, showUserSkill, undoSkillChange,
+  readSkillDraft, refreshChangeAfter, sameSkillUnderAnotherName, saveUserSkillRecorded, setUserSkillEnabled, showUserSkill, undoSkillChange,
   addSkillFile, updateSkillFile, removeSkillFile,
   type SkillDraft, type SkillWriteRefused,
 } from "../marketplace/skill-service.js";
@@ -37,7 +37,7 @@ import type { AssistantSkillCard } from "../notifications/assistant-events.js";
 import type { PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { recordSkillCard, type SayDeps } from "./outbound.js";
 import { proposeConfirmation } from "./schedules.js";
-import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft } from "./skill-intent.js";
+import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, negatedBefore } from "./skill-intent.js";
 import { routerSkillsServe } from "./skill-tools.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -209,12 +209,25 @@ function invocationOf(v: unknown): "auto" | "manual" | undefined {
 }
 
 /** The quote is the user's own words from the message this turn answers, and says what `says` asks for; else a refusal saying what to do. */
+/**
+ * The words of `message` just before `quote` in it: what a negation in front of the quote would be ("不要" + "把这个存成技能"). Found
+ * as written, else as the quote check normalises both (`normalizeText`); "" when the quote starts the message.
+ */
+export function textBefore(message: string, quote: string): string {
+  const at = message.indexOf(quote);
+  if (at >= 0) return message.slice(0, at);
+  const m = normalizeText(message);
+  const i = m.indexOf(normalizeText(quote));
+  return i > 0 ? m.slice(0, i) : "";
+}
+
 function requireQuote(content: string, quote: unknown, says: (q: string) => boolean, notSaid: string): string {
   const q = typeof quote === "string" ? quote : "";
   if (!quoteIsFrom(q, [content])) {
     throw new ToolRefused("quote_not_from_user", "request_quote must be the user's own words from the message you are answering, copied exactly");
   }
-  if (!says(q)) throw new ToolRefused("not_asked", notSaid);
+  // A quote cut out of a sentence that says not to ("不要" + "把这个存成技能", "don't" + "delete weekly-report") asks for nothing.
+  if (!says(q) || negatedBefore(textBefore(content, q))) throw new ToolRefused("not_asked", notSaid);
   return q;
 }
 
@@ -248,7 +261,16 @@ export async function skillSave(claims: AssistantTokenClaims, args: Record<strin
   const { userId, content: message, lang } = await actingTurn(claims);
   const draftId = typeof args.draft_id === "string" ? args.draft_id.trim() : "";
   if (draftId) {
-    requireQuote(message, args.request_quote, confirmsDraft, "the user's words do not say yes to the draft: ask them, or let them press Save on its card");
+    // The whole message, not a quote out of it: a yes is a short reply of its own, or a sentence that names the draft's skill and
+    // says to save it (`confirmsDraft`).
+    requireQuote(message, args.request_quote, () => true, "");
+    const draft = await readSkillDraft(userId, draftId);
+    if (!confirmsDraft(message, draft?.skill_name ?? "")) {
+      refused("create", {
+        error: "not_asked",
+        message: "the user's message is no yes to the draft: a yes is a short reply (好的, 可以, yes, ok, save it) or names the skill and says to save it; ask them, or let them press Save on its card",
+      });
+    }
     const saved = await inTransaction(async (q) => {
       const out = await confirmSkillDraft(userId, draftId, { actor: "model_confirmed", sessionId: claims.sid, query: q, guard: stillActing(claims, userId) });
       // Its card is answered too: a later press of Save is told it was saved already.
@@ -459,7 +481,8 @@ export async function handleWorkerSkillWrites(
     const quote = typeof s.request_quote === "string" ? s.request_quote : "";
     if (!quote || !asksToSaveSkill(quote)) return false;
     words ??= await userWordsFor(sessionId, userId).catch(() => []);
-    return quoteIsFrom(quote, words);
+    // Said by the user, and not cut out of a sentence that says not to.
+    return words.some((w) => quoteIsFrom(quote, [w]) && !negatedBefore(textBefore(w, quote)));
   };
   const drafted = new Set<string>();
   const saves: Array<{ name: string; change_id: string; created: boolean }> = [];
@@ -468,6 +491,14 @@ export async function handleWorkerSkillWrites(
     const name = typeof skill?.skill_name === "string" ? skill.skill_name : "";
     try {
       const invocation = skill.invocation === "manual" || skill.invocation === "auto" ? skill.invocation : undefined;
+      // The same skill the user has under another name: neither saved nor drafted, as the router's tools refuse it.
+      const same = await sameSkillUnderAnotherName(userId, name, skill.content, Array.isArray(skill.files) ? skill.files : []);
+      if (same) {
+        drafted.add(name);
+        metrics.onUserSkillSave("create", "duplicate");
+        logger.info({ skillName: name, sessionId, sameAs: same }, "skill.worker_duplicate");
+        continue;
+      }
       if (await explicit(skill)) {
         const saved = await saveUserSkillRecorded(userId, {
           name, content: skill.content, description: skill.description || "", files: Array.isArray(skill.files) ? skill.files : [], ...(invocation ? { invocation } : {}),
@@ -510,6 +541,8 @@ export async function handleWorkerSkillWrites(
     try {
       const now = await showUserSkill(userId, name);
       if (!now) {
+        // No current skill of the user's by that name (none, or one still on probation): nothing to draft from, and nothing applied.
+        drafted.add(name);
         logger.warn({ skill: name, sessionId }, "skill_file.mutation_failed");
         continue;
       }
