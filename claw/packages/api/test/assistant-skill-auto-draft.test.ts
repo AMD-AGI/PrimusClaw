@@ -15,6 +15,7 @@
  *      nor when the model writing it declines, or for a skill the user has
  *   D3 the router's state says what the user's skills are now, every turn: none, the ones deleted or undone lately (whatever the
  *      conversation said of them), and how many are turned off or manual, by count only
+ *   D6 a draft's card waiting is listed for the router as answered on its card, with no approval command to give the user
  *   D4 the deleted-then-asked-again case: a skill saved, then deleted in the same conversation; "以后我的会议纪要都是这个格式" gets a
  *      state that says it is gone and a new draft, never "you already have it"
  */
@@ -196,6 +197,19 @@ describe("assistant: skills drafted after a turn, and the skills a turn is told 
     }), ["turn_wrote_skill"]);
     assert.equal(asked.length, 0);
 
+    // The router took the statement for a request to save: skill_save is refused (not_asked) and saves nothing; the draft is still made.
+    await w.q("TRUNCATE claw_skill_events, claw_skill_drafts, claw_assistant_confirmations");
+    assert.deepEqual(await turn(P2, async (c) => {
+      const s = await call(c, "skill_save", { name: "meeting-notes", content: NOTES.content, request_quote: P2 });
+      assert.deepEqual([s.isError, s.body.error], [true, "not_asked"]);
+    }), ["drafted"]);
+    assert.deepEqual(await w.q("SELECT 1 FROM claw_skills"), [], "nothing saved by the refused call");
+    // A save refused for what the skill holds is the turn's answer about it: no draft after it.
+    await w.q("TRUNCATE claw_skill_events, claw_skill_drafts, claw_assistant_confirmations");
+    assert.deepEqual(await turn(P1, async (c) => {
+      const s = await call(c, "skill_draft", { name: "notes-format", content: `token: ${["ghp", "_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"].join("")}` });
+      assert.equal(s.isError, true, JSON.stringify(s.body));
+    }), ["turn_wrote_skill"]);
     // Not the person, signed in.
     await w.q("TRUNCATE claw_skill_events, claw_skill_drafts, claw_assistant_confirmations");
     assert.deepEqual(await turn(P1, async () => {}, { attended: false }), ["not_attended"]);
@@ -255,6 +269,15 @@ describe("assistant: skills drafted after a turn, and the skills a turn is told 
     assert.equal(asked[0].skills, "(none)", "the deleted skill is not among them");
     assert.deepEqual((await drafts()).map((d) => [d.skill_name, d.origin]), [["meeting-notes", "auto"]]);
     assert.equal(cards().at(-1)!.skill_card.kind, "draft");
+  });
+
+  test("D6 a draft's card waiting is told to the router as answered on its card, never as a command to type", async () => {
+    assert.deepEqual(await turn(P1), ["drafted"]);
+    // The cards-waiting block of the router's state (with scheduled tasks on), as the turn is given it.
+    const state = await schedules.renderScheduleState(alice.userId, "zh");
+    const line = state.split("\n").find((l) => l.includes("save the personal skill \"meeting-notes\"")) ?? "";
+    assert.match(line, /the user answers it on its card \(Save \/ Discard\); never ask them about it in words/, state);
+    assert.doesNotMatch(line, /批准 #|approve #/);
   });
 
   test("D5 the rule that the state, not the conversation, says what exists is in the router's skills prompt", () => {

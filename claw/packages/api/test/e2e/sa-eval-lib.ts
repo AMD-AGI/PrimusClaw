@@ -940,6 +940,8 @@ export interface Say {
   itemState: string | null;
   canAccept: boolean;
   confirm: boolean;
+  /** A personal skill's card (saved, or a draft with Save / Discard): what the card says, never the turn's answer. */
+  skillCard: boolean;
   fallback: boolean;
   /** The files the message hands the user (a worker's deliveries), with the item whose worker delivered each. */
   files: SaidFile[];
@@ -957,6 +959,7 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
     // A card the person presses: a channel's command to run (`confirm_action`), a write the router proposed (`confirm_write`), or a
     // write an item's worker holds for them (`held_write`, on the message saying the item needs them).
     confirm: !!e.data.confirm_action || !!e.data.confirm_write || !!e.data.held_write,
+    skillCard: !!e.data.skill_card,
     fallback: e.data.fallback === true,
     files: (Array.isArray(e.data.files) ? e.data.files : []).filter((f: any) => f && typeof f.name === "string").map((f: any) => ({
       name: String(f.name), content_type: String(f.content_type ?? ""), item_id: typeof f.item_id === "string" ? f.item_id : null,
@@ -1242,7 +1245,10 @@ export function finalSay(says: readonly Say[], messageIds: readonly string[], it
   const aboutItems = says.filter((s) => s.itemId !== null && items.has(s.itemId) && s.itemState !== "in_progress");
   if (aboutItems.length) return aboutItems.at(-1)!;
   const turns = new Set(messageIds);
-  return says.filter((s) => turns.has(s.turn)).at(-1) ?? null;
+  // A skill card the server shows after the turn (a draft it made from the turn) comes after the answer: the answer is the last
+  // say that is not one, and the card only when the turn said nothing else.
+  const own = says.filter((s) => turns.has(s.turn));
+  return own.filter((s) => !s.skillCard).at(-1) ?? own.at(-1) ?? null;
 }
 
 /**
