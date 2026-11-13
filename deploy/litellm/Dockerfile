@@ -3,7 +3,7 @@
 
 # Use the provided base image (includes pre-built UI)
 # v1.96.2 is the floor for Auto Router v2 + classifier context windows.
-FROM ghcr.io/berriai/litellm:v1.108.0@sha256:c560d317136880ea92d62334d4367ab10955b1af189dd3ea24f6551290b1d6c1
+FROM ghcr.io/berriai/litellm:v1.109.0@sha256:26aecfb02fb17ac6590f0549478561f9fbb3f69314317320b2e32a21beed4006
 
 WORKDIR /app
  
