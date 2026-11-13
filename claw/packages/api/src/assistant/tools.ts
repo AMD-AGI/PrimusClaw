@@ -274,6 +274,11 @@ async function sayOnce(
       );
     }
   }
+  // A skill suggested on its own is a draft with a card, never a question in words (`skill-suggestion.ts`).
+  if (typeof args.text === "string") {
+    const why = await (await import("./skill-suggestion.js")).textSkillSuggestion((t, p) => db.query(t, p), claims.sid, run?.began, args.text);
+    if (why) throw new ToolRefused("skill_suggestion_needs_draft", why);
+  }
   // A say in the turn an answer woke that names no item is about that item: recorded so, it is the say the silent sweep looks
   // for, and the answer is not announced a second time.
   const itemId = args.item_id?.trim() ? args.item_id : answerEventItemOf(run?.prompt);

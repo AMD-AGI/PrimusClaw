@@ -38,6 +38,11 @@
  *       copy of a skill the user has under another name is neither saved nor drafted
  *   E17 a draft's approval command (批准 #ref) saves it through confirmation_answer, which the router has with personal skills even
  *       when neither the schedule nor the review tools give it one
+ *   E18 a skill suggested on the assistant's own idea is a draft card, never a question in words: a say that asks whether to save a
+ *       skill (要不要把这种格式存成技能？) is refused until the turn has called skill_draft, then it goes; the same tools in one turn,
+ *       through the MCP service, as the router calls them
+ *   E19 a skill written from a conversation names no skill the user deleted or undid; skill_list says which skills were removed,
+ *       how (deleted or undone) and when
  *   E15 a draft made against an earlier version is not saved over a later one (stale), and an older card's Undo takes back nothing
  *       once the skill has changed again (off, on, off)
  */
@@ -690,5 +695,45 @@ describe("assistant: saving the user's personal skills from the conversation", {
       assert.equal(r.isError, false, JSON.stringify(r.body));
     } finally { await c.close(); await w.closeRun(turn.task_id); }
     assert.ok((await skills()).some((s) => s.skill_name === "deploy-check"), "saved by the approval command");
+  });
+
+  test("E18 a suggestion is a draft card: a say asking whether to save a skill is refused until skill_draft is called", async () => {
+    const turn = await message(alice, "帮我把今天的会议整理成纪要：讨论了发布节奏，结论是周四发，待办是写变更日志。我每次都按议题、结论、待办写");
+    const c = await connect(turn);
+    try {
+      const asked = await call(c, "say", { text: "整理好了。要不要把这种格式存成技能？以后直接用。" });
+      assert.deepEqual([asked.isError, asked.body.error], [true, "skill_suggestion_needs_draft"]);
+      assert.match(asked.body.message, /skill_draft/);
+      const drafted = await call(c, "skill_draft", {
+        name: "meeting-notes", description: "按议题、结论、待办写会议纪要（meeting notes / 会议纪要）", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办",
+      });
+      assert.equal(drafted.isError, false, JSON.stringify(drafted.body));
+      const after = await call(c, "say", { text: "整理好了。要不要把这种格式存成技能？我起草了一张卡片。" });
+      assert.equal(after.isError, false, JSON.stringify(after.body));
+      const plain = await call(c, "say", { text: "议题：发布节奏。结论：周四发。待办：写变更日志。" });
+      assert.equal(plain.isError, false, "an ordinary answer goes as it did");
+    } finally { await c.close(); await w.closeRun(turn.task_id); }
+    assert.equal((await w.q("SELECT 1 FROM claw_skill_drafts WHERE skill_name = 'meeting-notes'")).length, 1);
+    assert.ok(cards().some((e) => e.skill_card?.kind === "draft"), "the card is the question");
+  });
+
+  test("E19 a skill names no removed skill; skill_list says what was removed and how", async () => {
+    const first = await save(alice, {});
+    assert.equal((await undo(first.body.change_id)).body.data.undone, "deleted");
+    await save(alice, { name: "deploy-prod", content: "## x" });
+    await inTurn(alice, "删掉 deploy-prod 技能", "skill_delete", { name: "deploy-prod", request_quote: "删掉 deploy-prod 技能" });
+
+    const stale = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n站会请用 standup-notes 技能。" });
+    assert.deepEqual([stale.isError, stale.body.error], [true, "names_removed_skill"]);
+    assert.match(stale.body.message, /standup-notes/);
+    const drafted = await inTurn(alice, "好", "skill_draft", { name: "meeting-notes", content: "参考 deploy-prod 的做法" });
+    assert.deepEqual([drafted.isError, drafted.body.error], [true, "names_removed_skill"]);
+    const clean = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办" });
+    assert.equal(clean.isError, false, JSON.stringify(clean.body));
+
+    const listed = await inTurn(alice, "standup-notes 这个技能存在吗", "skill_list", {});
+    assert.deepEqual(listed.body.skills.map((s: any) => s.name), ["meeting-notes"]);
+    assert.deepEqual(listed.body.deleted_lately.map((r: any) => [r.name, r.how]), [["deploy-prod", "deleted"], ["standup-notes", "undone"]]);
+    assert.ok(listed.body.deleted_lately.every((r: any) => Date.parse(r.removed_at) > 0));
   });
 });

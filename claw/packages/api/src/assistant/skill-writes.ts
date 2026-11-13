@@ -29,7 +29,7 @@ import { normalizeText, quoteIsFrom } from "../memory/gates.js";
 import { humanMessages } from "../memory/service.js";
 import {
   confirmSkillDraft, createSkillDraft, deleteUserSkillRecorded, discardSkillDraft, latestUndoableChange, listUserSkills, pendingSkillDrafts,
-  readSkillDraft, refreshChangeAfter, sameSkillUnderAnotherName, saveUserSkillRecorded, setUserSkillEnabled, showUserSkill, undoSkillChange,
+  readSkillDraft, refreshChangeAfter, removedSkills, sameSkillUnderAnotherName, saveUserSkillRecorded, setUserSkillEnabled, showUserSkill, undoSkillChange,
   addSkillFile, updateSkillFile, removeSkillFile,
   type SkillDraft, type SkillWriteRefused,
 } from "../marketplace/skill-service.js";
@@ -37,7 +37,7 @@ import type { AssistantSkillCard } from "../notifications/assistant-events.js";
 import type { PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { recordSkillCard, type SayDeps } from "./outbound.js";
 import { proposeConfirmation } from "./schedules.js";
-import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, negatedBefore } from "./skill-intent.js";
+import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, namesSkill, negatedBefore } from "./skill-intent.js";
 import { routerSkillsServe } from "./skill-tools.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -238,10 +238,25 @@ function refused(op: Parameters<typeof metrics.onUserSkillSave>[0], r: { error: 
 
 // --- The router's tools ------------------------------------------------------------------------------------------------
 
+/**
+ * A skill written from a conversation names no skill the user no longer has (deleted, or undone): what the router remembers of an
+ * earlier turn is not theirs any more, and a new skill that points at one points at nothing. A refusal the router writes it again for.
+ */
+async function requireNoRemovedSkill(userId: string, name: string, texts: string[]): Promise<void> {
+  const text = texts.join("\n");
+  const named = (await removedSkills(userId)).find((r) => r.name !== name && namesSkill(text, r.name));
+  if (named) {
+    refused("create", {
+      error: "names_removed_skill",
+      message: `the skill names ${named.name}, a skill the user ${named.how === "undone" ? "undid" : "deleted"}: write it without ${named.name}, from this conversation only`,
+    });
+  }
+}
+
 /** `skill_list`: the user's skills (turned off and manual ones included) and the drafts waiting for their answer. Read-only. */
 export async function skillList(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
   const userId = await liveTurn(claims);
-  const [skills, drafts] = await Promise.all([listUserSkills(userId), pendingSkillDrafts(userId)]);
+  const [skills, drafts, removed] = await Promise.all([listUserSkills(userId), pendingSkillDrafts(userId), removedSkills(userId)]);
   return {
     ok: true,
     skills: skills.map((s) => ({
@@ -250,6 +265,8 @@ export async function skillList(claims: AssistantTokenClaims): Promise<Record<st
       last_used_at: s.last_used_at,
     })),
     drafts_waiting: drafts.map((d) => ({ draft_id: d.id, name: d.skill_name, description: d.description, drafted_at: d.created_at })),
+    // Skills the user had and has no longer: deleted by them, or a save they undid. Said as it is, never as a failure.
+    deleted_lately: removed.map((r) => ({ name: r.name, how: r.how, removed_at: r.removed_at })),
   };
 }
 
@@ -292,6 +309,7 @@ export async function skillSave(claims: AssistantTokenClaims, args: Record<strin
   const content = text(args.content, "content");
   const files = filesOf(args.files);
   const invocation = invocationOf(args.invocation);
+  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")]);
   const same = await sameSkillUnderAnotherName(userId, name, content, files);
   if (same) refused("create", { error: "duplicate", message: `the user already has exactly this skill, named ${same}: nothing was saved; tell them` });
   const saved = await saveUserSkillRecorded(userId, {
@@ -327,6 +345,7 @@ export async function skillDraft(claims: AssistantTokenClaims, args: Record<stri
   const files = filesOf(args.files);
   const invocation = invocationOf(args.invocation);
   const lang: CommandLanguage = hasHan(`${args.description ?? ""}${content}`) ? "zh" : "en";
+  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")]);
   const same = await sameSkillUnderAnotherName(userId, name, content, files);
   if (same) refused("draft", { error: "duplicate", message: `the user already has exactly this skill, named ${same}: no draft was made` });
   const out = await inTransaction(async (q) => {
@@ -359,6 +378,7 @@ export async function skillUpdate(claims: AssistantTokenClaims, args: Record<str
   const now = await showUserSkill(userId, name);
   if (!now) refused("update", { error: "not_found", message: `the user has no skill named ${name}` });
   const invocation = invocationOf(args.invocation);
+  await requireNoRemovedSkill(userId, name, [text(args.content, "content"), text(args.description, "description")]);
   const saved = await saveUserSkillRecorded(userId, {
     name,
     description: args.description === undefined || args.description === null ? now.description : text(args.description, "description"),
