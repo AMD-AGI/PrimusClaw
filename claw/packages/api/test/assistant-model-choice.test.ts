@@ -75,7 +75,7 @@ describe("assistant model choice", { skip }, () => {
       CLAW_GITHUB_REVIEW_ENABLED: "true",
       CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40),
       CLAW_ASSISTANT_REVIEW_ITEMS: "true",
-      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client",
     });
     mc = await import("../src/assistant/model-choice.js");
     fb = await import("../src/assistant/model-fallback.js");

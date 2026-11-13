@@ -47,7 +47,7 @@ describe("assistant schedules", { skip }, () => {
   before(async () => {
     w = await startWorld({
       CLAW_TRIGGERS_ENABLED: "true", CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_TRIGGER_TOOLS_TOKEN_KEY: "trigger-tools-test-key-0123456789abcdef",
-      CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600", TRIGGER_MAX_PER_USER: "3", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+      CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600", TRIGGER_MAX_PER_USER: "3", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client",
     });
     sch = await import("../src/assistant/schedules.js");
     inbound = await import("../src/assistant/inbound.js");
@@ -183,7 +183,7 @@ describe("assistant schedules", { skip }, () => {
     assert.equal(first.body.data.result.first_run_moved, undefined);
 
     assert.equal((await w.q("SELECT decided_via FROM claw_assistant_confirmations WHERE confirmation_id = $1", [out.confirmation_id]))[0].decided_via, "button");
-    const second = await press("alice", out.confirmation_id, "allow", { "x-test-client": "clawy" });
+    const second = await press("alice", out.confirmation_id, "allow", { "x-test-client": "chat-client" });
     assert.equal(second.status, 200, "the chat the operator named answers for the person");
     assert.equal(second.body.data.answered_now, false);
     assert.equal(second.body.data.status, "done");

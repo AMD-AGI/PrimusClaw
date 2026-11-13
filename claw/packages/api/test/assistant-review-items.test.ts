@@ -110,7 +110,7 @@ describe("assistant review items", { skip }, () => {
       CLAW_ASSISTANT_MAX_ACTIVE_ITEMS: "4",
       CLAW_GITHUB_REVIEWS_PER_TOKEN_PER_HOUR: "3",
       CLAW_GITHUB_REVIEWS_PER_HOUR: "5",
-      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client",
     });
     ri = await import("../src/assistant/review-items.js");
     ({ reviewResultsSettled } = await import("../src/assistant/review-result.js"));
@@ -308,7 +308,7 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([svc.status, svc.body.error], [403, "service_client_not_allowed"]);
     await nothingMade();
     assert.equal(checks.length, 0, "GitHub was not asked");
-    const allowed = await start("alice", { prs: [PR(254)] }, { "x-test-client": "clawy" });
+    const allowed = await start("alice", { prs: [PR(254)] }, { "x-test-client": "chat-client" });
     assert.equal(allowed.status, 200, "an allowed service, speaking for the user its token names");
   });
 

@@ -41,7 +41,7 @@ export function assistantCitationsOn(): boolean {
 
 /** The most addresses of the user's message a turn may confirm as sources by reading them (`userAddresses`). */
 export const USER_ADDRESSES_MAX = 20;
-/** An autolink as CommonMark writes one, `<https://…>` (Clawy writes a link's address so): the address is all of it. */
+/** An autolink as CommonMark writes one, `<https://…>` (a chat client writes a link's address so): the address is all of it. */
 const AUTOLINK = /<(https?:\/\/[^\s<>]*)>/gi;
 /** What separates the pieces of a message an address may run through: whitespace (as CommonMark counts it). An address also ends at `<`. */
 const SPACE = /[ \t\n\r\f\v]/;

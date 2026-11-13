@@ -4,8 +4,8 @@
 /**
  * How a message reached the chat it came from (`channel_context.via`, `parseChannelContext`).
  *
- * Measured 2026-11-08 (Clawy's daily failure mining): the review requests a person's coordinator posts into their 1:1 chat through
- * Clawy's on-behalf endpoint were stored like messages the person typed, and the day's "real user messages" (52) were all of them.
+ * Measured 2026-11-08 (a chat client's daily failure mining): the review requests a person's coordinator posts into their 1:1 chat
+ * through the client's on-behalf endpoint were stored like messages the person typed, and the day's "real user messages" (52) were all of them.
  *
  *   V1 `on_behalf` is kept; anything else (another word, another type, a padded or cased spelling) is dropped, and a channel that says
  *      nothing is read as typed (absent), as before
