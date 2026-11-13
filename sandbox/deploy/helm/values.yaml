@@ -63,9 +63,10 @@ controlplane:
     # client_secret; the identity provider creates that Secret once in this
     # namespace and does not rotate it.
     # ownerPolicyConfigMap names a ConfigMap whose key policy.json holds the
-    # owner quota and template policy: the templates SaFE API keys may use,
+    # owner quota and template policy: the templates identity keys may use,
     # and the quotas. It is used only when introspectUrl is set. Without it,
-    # identity keys get 503 on the E2B API; a policy that is rejected gives 500.
+    # identity keys get 503 owner_policy_not_applied on the E2B API; a rejected
+    # policy gives 500 owner_policy_invalid.
     # The policy is read at startup: a ConfigMap change needs a rollout restart.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners

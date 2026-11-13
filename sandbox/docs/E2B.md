@@ -153,6 +153,8 @@ from e2b import Sandbox
 | 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
 | 410    | `idempotency_key_spent` | Key already ended; the detail carries the reason  |
+| 500    | `owner_policy_invalid`  | Owner policy was rejected; the cause is in the control plane log |
+| 503    | `owner_policy_not_applied` | Owner policy is missing or not applied yet     |
 | 503    | `pending_timeout`       | Sandbox was not running within the pending timeout |
 | 503    | `identity_unavailable`  | Identity or the user record cannot be read        |
 

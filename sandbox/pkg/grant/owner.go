@@ -201,27 +201,31 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 		owners[id] = q
 	}
 	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
-	s.ownerFault.Store(nil)
+	s.ownerFault.Store(false)
 	return nil
 }
 
-// SetOwnerPolicyFault records why the owner policy cannot be applied, for a policy
-// that a retry will not fix. OwnerReady then reports it as a server error.
-func (s *Service) SetOwnerPolicyFault(err error) {
-	msg := err.Error()
-	s.ownerFault.Store(&msg)
+// ownerPolicyRejectedDetail is the only text a rejected owner policy returns.
+// The cause stays in the control plane log.
+const ownerPolicyRejectedDetail = "owner policy was rejected; see the control plane log"
+
+// SetOwnerPolicyFault records that the owner policy was rejected and will not apply
+// on retry. The error is logged by the caller and is not returned to API callers.
+func (s *Service) SetOwnerPolicyFault(_ error) {
+	s.ownerFault.Store(true)
 }
 
 // OwnerReady returns nil once an owner policy is applied. Otherwise it returns 503
-// while the policy is absent or pending, and 500 when it was rejected.
+// owner_policy_not_applied while the policy is absent or pending, and 500
+// owner_policy_invalid when it was rejected.
 func (s *Service) OwnerReady() error {
 	if s.owner.Load() != nil {
 		return nil
 	}
-	if msg := s.ownerFault.Load(); msg != nil {
-		return opErr(http.StatusInternalServerError, "owner_policy_invalid", *msg)
+	if s.ownerFault.Load() {
+		return opErr(http.StatusInternalServerError, "owner_policy_invalid", ownerPolicyRejectedDetail)
 	}
-	return opErr(http.StatusServiceUnavailable, "identity_unavailable", "owner policy is not applied")
+	return opErr(http.StatusServiceUnavailable, "owner_policy_not_applied", "owner policy is not applied")
 }
 
 // checkOwnerRole rejects a role that differs from the role of existing owner records.

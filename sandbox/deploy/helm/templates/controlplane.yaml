@@ -305,6 +305,9 @@ spec:
               value: {{ .Values.controlplane.config.registrySecret | quote }}
             {{- end }}
             {{- with .Values.controlplane.config.identity }}
+            {{- if and .tokenUrl (not .introspectUrl) }}
+            {{- fail "controlplane.config.identity.tokenUrl requires controlplane.config.identity.introspectUrl" }}
+            {{- end }}
             {{- if .introspectUrl }}
             - name: IDENTITY_CLIENT_ID
               valueFrom:

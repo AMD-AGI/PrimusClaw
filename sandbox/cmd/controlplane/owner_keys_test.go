@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,7 +26,6 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
 	t.Setenv("IDENTITY_CLIENT_ID", "id")
 	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
@@ -35,18 +35,27 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 		"no templates": `{"templates":[]}`,
 		"bad quota":    `{"templates":[{"name":"t"}],"default":{"maxSandboxes":-2}}`,
 	} {
-		t.Setenv("E2B_OWNER_POLICY", policy)
-		if client := ownerKeys(context.Background(), grants); client == nil || grants.OwnerRole() != "" {
-			t.Fatalf("%s: client=%v role=%q, want a client and no owner role", name, client, grants.OwnerRole())
-		}
-		if oe, ok := grants.OwnerReady().(*grant.OpError); !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" {
-			t.Fatalf("%s: OwnerReady = %v, want 500 owner_policy_invalid", name, grants.OwnerReady())
-		}
+		t.Run(name, func(t *testing.T) {
+			grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
+			t.Setenv("E2B_OWNER_POLICY", policy)
+			client, supplied := ownerKeys(context.Background(), grants)
+			if client == nil || !supplied || grants.OwnerRole() != "" {
+				t.Fatalf("client=%v supplied=%v role=%q, want a client, a supplied policy and no owner role", client, supplied, grants.OwnerRole())
+			}
+			oe, ok := grants.OwnerReady().(*grant.OpError)
+			if !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" || oe.Detail != "owner policy was rejected; see the control plane log" {
+				t.Fatalf("OwnerReady = %v, want 500 owner_policy_invalid with a fixed detail", grants.OwnerReady())
+			}
+			if strings.Contains(oe.Error(), policy) {
+				t.Fatalf("response %q contains the policy error", oe.Error())
+			}
+		})
 	}
 
+	grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 	t.Setenv("IDENTITY_CLIENT_SECRET", "")
 	t.Setenv("E2B_OWNER_POLICY", `{"templates":[{"name":"t"}]}`)
-	if client := ownerKeys(context.Background(), grants); client != nil {
+	if client, _ := ownerKeys(context.Background(), grants); client != nil {
 		t.Fatalf("missing secret: client=%v", client)
 	}
 }
@@ -77,7 +86,7 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if client := ownerKeys(ctx, grants); client == nil {
+	if client, supplied := ownerKeys(ctx, grants); client == nil || !supplied {
 		t.Fatal("identity keys disabled after a transient failure")
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -103,8 +112,15 @@ func TestOwnerKeysEnabledWithoutOwnerPolicy(t *testing.T) {
 	t.Setenv("E2B_OWNER_POLICY", "")
 	t.Setenv("E2B_OWNER_POLICY_FILE", "")
 
-	if client := ownerKeys(context.Background(), grants); client == nil {
+	client, supplied := ownerKeys(context.Background(), grants)
+	if client == nil {
 		t.Fatal("identity client disabled without an owner policy: SaFE API keys are matched as grant keys")
+	}
+	if supplied {
+		t.Fatal("empty owner policy env reported as supplied")
+	}
+	if oe, ok := grants.OwnerReady().(*grant.OpError); !ok || oe.Reason != "owner_policy_not_applied" {
+		t.Fatalf("OwnerReady = %v, want owner_policy_not_applied", grants.OwnerReady())
 	}
 	if role := grants.OwnerRole(); role != "" {
 		t.Fatalf("owner role = %q without an owner policy, want empty", role)
