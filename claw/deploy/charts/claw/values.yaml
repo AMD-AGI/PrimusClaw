@@ -4,10 +4,12 @@
 nameOverride: ""
 fullnameOverride: primus-claw
 
+# Released images: docker.io/rocm/primusclaw:claw-<version>, claw-latest the newest. A build of main is
+# docker.io/primussafe/claw:<build> (--set image.registry=docker.io/primussafe,image.repository=claw,image.tag=<build>).
 image:
-  registry: docker.io/primussafe
-  repository: claw
-  tag: latest
+  registry: docker.io/rocm
+  repository: primusclaw
+  tag: claw-latest
   pullPolicy: IfNotPresent
 
 tls:

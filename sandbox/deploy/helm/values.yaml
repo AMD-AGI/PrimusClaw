@@ -13,8 +13,8 @@ controlplane:
   enabled: true
   replicas: 1
   image:
-    repository: primussafe/agent-sandbox-controlplane
-    tag: latest                       # override per-release: --set controlplane.image.tag=<yyyymmddhhmm>
+    repository: docker.io/rocm/primusclaw
+    tag: agent-sandbox-controlplane-latest  # a release pins agent-sandbox-controlplane-<version>
     pullPolicy: IfNotPresent
   ports:
     router: 8080
@@ -35,7 +35,7 @@ controlplane:
   config:
     leaderElect: true
     extensions: true
-    envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
+    envdInjectorImage: "docker.io/rocm/primusclaw:agent-sandbox-envd-injector-latest"
     auditEnabled: true
     auditRetentionDays: 30
     sandboxImageRegistry: ""
