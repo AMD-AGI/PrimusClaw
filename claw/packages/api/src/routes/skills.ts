@@ -16,7 +16,7 @@ import {
 /** The HTTP status of each refusal a skill write can meet. */
 const REFUSAL_STATUS: Record<SkillWriteRefusal, number> = {
   invalid_name: 400, invalid: 400, too_large: 400, too_many_files: 400, secret: 400, injection: 400,
-  full: 409, not_found: 404,
+  full: 409, not_found: 404, stale: 409,
 };
 
 /** A refusal as the routes answer it: `error` is the message, as it always was; `reason` and `at` say which and where. */

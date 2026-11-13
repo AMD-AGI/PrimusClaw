@@ -6,7 +6,8 @@
  * named skill's whole text into the turn, so the model does not have to decide to read it (as Claude Code's `/skill-name` does).
  *
  * A name with a hyphen (`weekly-report`, the usual shape) is named wherever it stands as a word of its own. A one-word name (`report`)
- * is too common a word for that: it is named only when it is marked as a skill's name, `/report`, `` `report` ``, `「report」`,
+ * is too common a word for that: it is named only when it is marked as a skill's name, `/report` (at the start or after a space: a
+ * path or a link such as `src/report/x.ts` names nothing), `` `report` ``, `「report」`,
  * `"report"`, or written next to the word skill or 技能 (`report skill`, `技能 report`).
  */
 
@@ -27,7 +28,7 @@ function namedAt(text: string, name: string): number {
     return m ? m.index : -1;
   }
   const marked = new RegExp(
-    `(?:\\/${n}(?![${WORD}])|\`${n}\`|「${n}」|“${n}”|"${n}"|(?<![${WORD}])${n}\\s*(?:skill|技能)|(?:skill|技能)\\s*[:：]?\\s*${n}(?![${WORD}]))`,
+    `(?:(?<![^\\s])\\/${n}(?![${WORD}])|\`${n}\`|「${n}」|“${n}”|"${n}"|(?<![${WORD}])${n}\\s*(?:skill|技能)|(?:skill|技能)\\s*[:：]?\\s*${n}(?![${WORD}]))`,
     "i",
   );
   const m = marked.exec(text);

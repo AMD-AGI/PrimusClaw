@@ -33,3 +33,12 @@ test("in the order named, each once, at most two; nothing for an empty message o
   assert.deepEqual(namedUserSkills("use a.b now", NAMES), [], "a dot is not a wildcard, and a one-word name needs its mark");
   assert.deepEqual(namedUserSkills("use /a.b now", NAMES), ["a.b"]);
 });
+
+test("a /name inside a link or a path is no naming: only at the start or after a space", () => {
+  const names = ["docs", "review"];
+  assert.deepEqual(namedUserSkills("see https://github.com/acme/docs/tree/main", names), []);
+  assert.deepEqual(namedUserSkills("look at src/review/index.ts", names), []);
+  assert.deepEqual(namedUserSkills("/review this one", names), ["review"]);
+  assert.deepEqual(namedUserSkills("please /docs now", names), ["docs"]);
+});
+

@@ -54,7 +54,9 @@ export type SkillEventOp =
 
 /** Why a write was refused. */
 export type SkillWriteRefusal =
-  | "invalid_name" | "invalid" | "too_large" | "too_many_files" | "secret" | "injection" | "full" | "not_found";
+  | "invalid_name" | "invalid" | "too_large" | "too_many_files" | "secret" | "injection" | "full" | "not_found"
+  /** A draft made against a version of the skill that is no longer the current one. */
+  | "stale";
 
 export interface SkillWriteRefused {
   ok: false;
@@ -1164,6 +1166,12 @@ export async function undoSkillChange(
       if (!c) return { ok: false, error: "not_found", message: "no change of yours has that id" };
       if (c.undone_at) return { ok: false, error: "undone", message: "that change was undone already" };
       if (c.lapsed) return { ok: false, error: "expired", message: `a change can be undone for ${SKILL_UNDO_TTL_HOURS} hours, and that one is older` };
+      // Only the skill's last change: an older card's Undo (delete, recreate, delete again; off, on, off again) takes back nothing.
+      const later = (await q(
+        "SELECT 1 FROM claw_skill_changes WHERE user_id = $1 AND skill_name = $2 AND id <> $3 AND created_at > $4 LIMIT 1",
+        [userId, c.skill_name, changeId, c.created_at],
+      )).rows.length > 0;
+      if (later) return { ok: false, error: "changed", message: `the skill ${c.skill_name} has changed since, so that change is no longer the last one: nothing was undone` };
       const name: string = c.skill_name;
       const op = c.op as SkillChangeOp;
       const changed = (): UndoResult => ({ ok: false, error: "changed", message: `the skill ${name} has changed since, so that change is no longer the last one: nothing was undone` });
@@ -1362,6 +1370,16 @@ export async function confirmSkillDraft(
     )).rows[0];
     if (!draft) return { ok: false as const, error: "not_found" as const, message: "no draft of yours has that id (a draft lapses after a day)" };
     const d = draftOf(draft);
+    // Made against the skill as it was then (`replaces`, or no skill of that name): one changed since is not overwritten with it.
+    await lockUserSkills(q, userId);
+    const now = await visibleRow(q, userId, d.skill_name);
+    const then = d.replaces ? Number(d.replaces.replace(/^v/, "")) : null;
+    if ((now?.version ?? null) !== then) {
+      return {
+        ok: false as const, error: "stale" as const,
+        message: `the skill ${d.skill_name} changed since this draft was made (${now ? `now v${now.version}` : "it is gone"}): nothing was saved; ask the assistant to draft it again`,
+      };
+    }
     const saved = await saveUserSkillRecorded(userId, {
       name: d.skill_name, description: d.description, content: d.content, files: d.files, ...(d.invocation ? { invocation: d.invocation } : {}),
       ...(d.removeFiles ? { removeFiles: d.removeFiles } : {}),

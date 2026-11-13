@@ -30,6 +30,10 @@
  *       it would put back passes the checks a save passes (a secret stored before them is not put back)
  *   E13 a worker's file writes on a skill of the user's that its turn did not save at their request: a draft, files and removals
  *       folded in, the skill untouched until Save
+ *   E14 through the tools: a no to a draft (不行, 不可以, 不好, 不对, 不是, not ok) saves nothing, a yes does; 不要关掉, 别关掉 and
+ *       "don't turn off" turn nothing off, 别再用 does; 取消/恢复/restore of something else undoes nothing, 撤销 does
+ *   E15 a draft made against an earlier version is not saved over a later one (stale), and an older card's Undo takes back nothing
+ *       once the skill has changed again (off, on, off)
  */
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
@@ -556,5 +560,55 @@ describe("assistant: saving the user's personal skills from the conversation", {
     const saved = await schedules.decideConfirmation({ userId: "alice", confirmationId: next.confirmation_id, decision: "allow", via: "button" });
     assert.equal(saved.status, "done", JSON.stringify(saved));
     assert.deepEqual(await files(), ["templates/a.md=A"], "the removal drafted with the new version is made by its Save");
+  });
+
+  test("E14 a no to a draft saves nothing, a negated turn-off turns nothing off, a generic undo undoes nothing", async () => {
+    const drafted = await inTurn(alice, "任务完成了", "skill_draft", { name: "deploy-check", content: "## Steps\n1. look at CI" });
+    assert.equal(drafted.isError, false, JSON.stringify(drafted.body));
+    for (const no of ["不行", "不可以", "不好", "不对", "不是", "not ok"]) {
+      const r = await inTurn(alice, `${no}，谢谢你的建议`, "skill_save", { draft_id: drafted.body.draft_id, request_quote: `${no}，谢谢你的建议` });
+      assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], no);
+    }
+    assert.ok(!(await skills()).some((s) => s.skill_name === "deploy-check"), "nothing saved on a no");
+    const yes = await inTurn(alice, "好的，保存吧", "skill_save", { draft_id: drafted.body.draft_id, request_quote: "好的，保存吧" });
+    assert.equal(yes.isError, false, JSON.stringify(yes.body));
+
+    await save(alice, {});
+    for (const keep of ["不要关掉standup-notes", "别关掉 standup-notes 技能", "don't turn off standup-notes"]) {
+      const r = await inTurn(alice, keep, "skill_disable", { name: "standup-notes", request_quote: keep });
+      assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], keep);
+    }
+    assert.equal((await skills()).find((s) => s.skill_name === "standup-notes")?.enabled, true);
+    const off = await inTurn(alice, "别再用 standup-notes 了", "skill_disable", { name: "standup-notes", request_quote: "别再用 standup-notes 了" });
+    assert.equal(off.isError, false, JSON.stringify(off.body));
+
+    for (const other of ["取消明天的会议", "restore my laptop backup"]) {
+      const r = await inTurn(alice, other, "skill_undo", { name: "standup-notes", request_quote: other });
+      assert.deepEqual([r.isError, r.body.error], [true, "not_asked"], other);
+    }
+    assert.equal((await skills()).find((s) => s.skill_name === "standup-notes")?.enabled, false, "still off: nothing undone");
+    const undoSaid = await inTurn(alice, "撤销刚才那个改动", "skill_undo", { name: "standup-notes", request_quote: "撤销刚才那个改动" });
+    assert.deepEqual([undoSaid.isError, undoSaid.body.undone], [false, "enabled"], "撤销 alone takes back the turn-off");
+  });
+
+  test("E15 a stale draft is not saved; an older card's Undo takes back nothing after the skill changed again", async () => {
+    await save(alice, {});
+    const drafted = await inTurn(alice, "好", "skill_draft", { name: "standup-notes", content: `${STANDUP}\n4. 风险` });
+    assert.equal(drafted.isError, false, JSON.stringify(drafted.body));
+    await inTurn(alice, "把 standup-notes 技能改成五段", "skill_update", {
+      name: "standup-notes", content: `${STANDUP}\n5. 其他`, request_quote: "把 standup-notes 技能改成五段",
+    });
+    const [conf] = await w.q("SELECT confirmation_id FROM claw_assistant_confirmations WHERE kind = 'skill_save' AND status = 'pending'");
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: conf.confirmation_id, decision: "allow", via: "button" });
+    assert.deepEqual([pressed.status, pressed.result?.error], ["failed", "stale"]);
+    assert.ok((await skills())[0].content.endsWith("5. 其他"), "the later version stands");
+
+    const say = (text: string) => ({ name: "standup-notes", request_quote: text });
+    const off1 = await inTurn(alice, "停用 standup-notes", "skill_disable", say("停用 standup-notes"));
+    await inTurn(alice, "重新启用 standup-notes", "skill_enable", say("重新启用 standup-notes"));
+    await inTurn(alice, "停用 standup-notes", "skill_disable", say("停用 standup-notes"));
+    const old = await undo(off1.body.change_id);
+    assert.deepEqual([old.status, old.body.reason], [409, "changed"], "the first turn-off's card is no longer the last change");
+    assert.equal((await skills())[0].enabled, false);
   });
 });
