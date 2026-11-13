@@ -131,16 +131,28 @@ func TestCallerAuthMiddlewareRoleFromTokenWithoutAuthorizer(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"userRole":"`+RoleSystemAdmin+`"`)
 }
 
-func TestCallerAuthMiddlewareUserAuthorizerUpgradesRole(t *testing.T) {
-	engine := newAuthTestServerWith(t, defaultCaller, usercr.NewFromReader(userReader{user: usercr.User{Found: true, Admin: true}}))
+func TestCallerAuthMiddlewareUserAuthorizerRole(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		admin bool
+		want  string
+	}{
+		{"system-admin User upgrades the token role", true, RoleSystemAdmin},
+		{"plain User keeps the token role", false, "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := usercr.User{Found: true, Admin: tc.admin, Workspaces: []string{"lab"}}
+			engine := newAuthTestServerWith(t, defaultCaller, usercr.NewFromReader(userReader{user: user}))
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
-	req.Header.Set("Authorization", "Bearer ak-valid")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+			req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+			req.Header.Set("Authorization", "Bearer ak-valid")
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Body.String(), `"userRole":"`+RoleSystemAdmin+`"`)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Contains(t, rec.Body.String(), `"userRole":"`+tc.want+`"`)
+		})
+	}
 }
 
 func TestCallerAuthMiddlewareUserReadUnavailable(t *testing.T) {
