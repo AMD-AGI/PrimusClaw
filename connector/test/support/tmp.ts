@@ -10,6 +10,12 @@
  * hooks run (an uncaught error, `process.exit`) does the same, synchronously, on the process's `exit`; one interrupted by
  * SIGINT, SIGTERM or SIGHUP runs the whole cleanup first and then ends by that signal.
  *
+ * A file SIGKILLed with its whole process group (`timeout -s KILL`, an OOM kill, a tool that kills the tree) runs none
+ * of that. So its directories are not made in TMPDIR itself but in one directory of the file's own there, cc-run-*,
+ * named with the file's pid and start time; the next test file to make a directory in that TMPDIR removes every
+ * cc-run-* whose process is gone, after killing the connectors (connector.pid) and adapters (children.json) recorded
+ * in it, which would otherwise go on writing there. Such a run leaves one directory per file until then, not one per test.
+ *
  * Only the test files' own processes import this: it registers a hook with node:test, which a helper process a
  * test spawns must not do (support/run-fast.ts imports support/timing.ts, not the harness, for that reason).
  */
@@ -23,9 +29,60 @@ import { ChildRegistry, processStart } from "../../src/children.js";
 const made = new Set<string>();
 const closers: Array<() => unknown> = [];
 
+/** This file's directory in TMPDIR, which holds every directory `tmpdir` makes; null until the first is made. */
+let runDir: string | null = null;
+const RUN_PREFIX = "cc-run-";
+/** What names a run directory: its file's process, whose start time tells it from a later process given the same pid. */
+const RUN_NAME = /^cc-run-(\d+)-(\d+)-[A-Za-z0-9]{6}$/;
+
+/** Whether the process that made the run directory `name` is still running (where its start time cannot be read, any process with its pid). */
+function runOwnerAlive(name: string): boolean {
+  const m = RUN_NAME.exec(name);
+  if (!m) return true;
+  const pid = Number(m[1]);
+  if (pid === process.pid) return true;
+  if (process.platform === "linux") return processStart(pid) === m[2];
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** Whether `dir` is a directory (not a link to one) this user made and only this user can write in: one mkdtemp made. */
+function ownPrivateDir(dir: string): boolean {
+  try {
+    const st = fs.lstatSync(dir);
+    return st.isDirectory() && (process.getuid === undefined || st.uid === process.getuid()) && (st.mode & 0o022) === 0;
+  } catch { return false; }
+}
+
+/**
+ * Remove the run directories in TMPDIR whose file was killed before it could remove them, first killing the connectors
+ * and adapters recorded in them, which outlive such a file as well. Those of a running file, this one's included, are
+ * not touched, nor any this user did not make itself (in a shared TMPDIR, what it records must not be someone else's).
+ */
+function sweepDeadRuns(): void {
+  let names: string[] = [];
+  try { names = fs.readdirSync(os.tmpdir()); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(RUN_PREFIX) || !RUN_NAME.test(name) || runOwnerAlive(name)) continue;
+    const dir = path.join(os.tmpdir(), name);
+    if (!ownPrivateDir(dir)) continue;
+    try { killRecordedConnectors(dir, 4); } catch { /* the directory goes regardless */ }
+    try { killAdaptersUnder(dir, 4); } catch { /* the directory goes regardless */ }
+    forceRemove(dir);
+  }
+}
+
+function ensureRunDir(): string {
+  if (runDir && fs.existsSync(runDir)) return runDir;
+  sweepDeadRuns();
+  // Off Linux the name carries 0 for the start time, and the directory is removed once no process has its pid.
+  const start = process.platform === "linux" ? processStart(process.pid) ?? "0" : "0";
+  runDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_PREFIX}${process.pid}-${start}-`)));
+  return runDir;
+}
+
 /** A new directory under os.tmpdir() (TMPDIR), its real path, removed when the test file ends. */
 export const tmpdir = (prefix = "cc-"): string => {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(ensureRunDir(), prefix)));
   made.add(dir);
   return dir;
 };
@@ -66,15 +123,29 @@ function forceRemove(dir: string): void {
   try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* reported by liveTmpdirs */ }
 }
 
-/** Every children.json at most `depth` levels below `dir` (a connector home is `<dir>/state` or nested a little deeper). */
-function childrenFiles(dir: string, depth: number): string[] {
+/** Every file called `name` at most `depth` levels below `dir` (a connector home is `<dir>/state` or nested a little deeper). */
+function filesNamed(dir: string, depth: number, name = "children.json"): string[] {
   let entries: fs.Dirent[] = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
   return entries.flatMap((e) => {
     const p = path.join(dir, e.name);
-    if (e.isFile() && e.name === "children.json") return [p];
-    return e.isDirectory() && depth > 0 ? childrenFiles(p, depth - 1) : [];
+    if (e.isFile() && e.name === name) return [p];
+    return e.isDirectory() && depth > 0 ? filesNamed(p, depth - 1, name) : [];
   });
+}
+
+/**
+ * SIGKILL the connectors whose pid file (connector.pid: pid and start time) is under `dir` and still names a running
+ * process: one a test started in a process of its own outlives a file killed hard, and goes on writing into its home.
+ */
+function killRecordedConnectors(dir: string, depth: number): void {
+  for (const file of filesNamed(dir, depth, "connector.pid")) {
+    try {
+      const { pid, start } = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: unknown; start?: unknown };
+      if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid || typeof start !== "string" || start === "") continue;
+      if (processStart(pid) === start) process.kill(pid, "SIGKILL");
+    } catch { /* unreadable, or gone */ }
+  }
 }
 
 /**
@@ -83,15 +154,16 @@ function childrenFiles(dir: string, depth: number): string[] {
  * recycled pid is never hit), and never this file's process or its runner. Synchronous, for `exit`.
  */
 function killRecordedAdapters(): void {
-  for (const dir of made) {
-    for (const file of childrenFiles(dir, 3)) {
-      let reg: ChildRegistry;
-      try { reg = new ChildRegistry(file); } catch { continue; }
-      for (const r of reg.list()) {
-        if (!Number.isInteger(r.pgid) || r.pgid <= 1 || [process.pid, process.ppid].includes(r.pgid) || r.pid === process.pid) continue;
-        if (!reg.isOurs(r)) continue;
-        try { process.kill(-r.pgid, "SIGKILL"); } catch { /* gone */ }
-      }
+  for (const dir of made) killAdaptersUnder(dir);
+}
+function killAdaptersUnder(dir: string, depth = 3): void {
+  for (const file of filesNamed(dir, depth)) {
+    let reg: ChildRegistry;
+    try { reg = new ChildRegistry(file); } catch { continue; }
+    for (const r of reg.list()) {
+      if (!Number.isInteger(r.pgid) || r.pgid <= 1 || [process.pid, process.ppid].includes(r.pgid) || r.pid === process.pid) continue;
+      if (!reg.isOurs(r)) continue;
+      try { process.kill(-r.pgid, "SIGKILL"); } catch { /* gone */ }
     }
   }
 }
@@ -163,6 +235,8 @@ function removeAll(): void {
     forceRemove(dir);
     if (!fs.existsSync(dir)) made.delete(dir);
   }
+  // Empty unless something was left in it besides the directories above: rmdir, not rm -r, so that is reported.
+  if (runDir && made.size === 0) { try { fs.rmdirSync(runDir); } catch { /* reported by the CI step */ } }
 }
 
 /**

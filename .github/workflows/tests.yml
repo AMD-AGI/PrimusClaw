@@ -353,7 +353,7 @@ jobs:
             # being carried out after its connector had stopped).
             printf '%s\n' "$left" | head -50 | while IFS= read -r e; do
               echo "$e"
-              { find "$TMPDIR/$e" -maxdepth 4 -mindepth 1 -printf '  %P\n' | head -20; } || true
+              { find "$TMPDIR/$e" -maxdepth 5 -mindepth 1 -printf '  %P\n' | head -20; } || true
             done
             exit 1
           fi
