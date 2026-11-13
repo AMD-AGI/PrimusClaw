@@ -118,6 +118,20 @@ release version, and its `appVersion` stays `latest`.
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
+## [0.5.2] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140544` (commit 26e87d49), released as `docker.io/rocm/primusclaw:claw-0.5.2`. A patch
+release: the assistant answers the date and weekday in the user's time zone. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
+  turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
+  `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
+  else the default its quiet hours use), and Asia/Shanghai otherwise. Asked after midnight in Beijing, it said the UTC
+  weekday, with the right one only in a note (#847).
+
 ## [0.5.1] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611132353` (commit 7b9b4318), released as `docker.io/rocm/primusclaw:claw-0.5.1`. A patch
@@ -126,11 +140,6 @@ change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1
 
 ### Fixed
 
-- The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
-  turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
-  `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
-  else the default its quiet hours use), and Asia/Shanghai otherwise. Asked after midnight in Beijing, it said the UTC
-  weekday, with the right one only in a note.
 - Personal skills: a statement of how the user always works ("以后我的会议纪要都是这个格式") that the router took for a request to
   save (`skill_save`, refused as not asked, nothing saved) no longer stops the server's draft after the turn; a save refused for what
   the skill holds still does. A skill draft's card waiting for the user is listed to the router as answered on its card, without
