@@ -111,6 +111,12 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131057` (commit 61998b05). A patch release: personal skills reach the assistant's
+router and Brain, both only while `CLAW_USER_SKILLS_ENABLED` is on; with it off, the default, nothing changes. No schema
+change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
 ### Added
 
 - The assistant's router sees the user's personal skills: with `CLAW_USER_SKILLS_ENABLED`, a router turn of the
