@@ -552,13 +552,12 @@ if [[ -n "${INGRESS_HOST}" ]]; then
         --set-string "router.publicIngress.className=${INGRESS_CLASS}"
         --set-string "router.publicIngress.hosts[0]=${INGRESS_HOST}"
     )
-    # The chart refuses public /v1 paths without caller auth.
-    if [[ -z "${IDENTITY_INTROSPECT_URL:-}" ]]; then
-        HELM_ARGS+=(
-            --set "router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}"
-        )
-        warn "authentication disabled: the public Ingress serves the E2B routes only, not /v1/templates"
-    fi
+    # The chart refuses public /v1 paths without caller auth and a namespace
+    # selector, and this installer sets no selector.
+    HELM_ARGS+=(
+        --set "router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}"
+    )
+    warn "the public Ingress serves the E2B routes only; /v1/templates needs router.config.enableAuth and router.config.namespaceSelector"
     # An Ingress created by an older installer has no Helm ownership. Adopt it
     # before upgrade, or Helm refuses to take an object it did not create.
     if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public >/dev/null 2>&1; then

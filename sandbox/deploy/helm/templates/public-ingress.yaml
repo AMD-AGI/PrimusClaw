@@ -23,6 +23,9 @@
 {{- if and (hasPrefix "/v1/" $path) (not $.Values.router.config.enableAuth) }}
 {{- fail (printf "router.publicIngress path %q requires router.config.enableAuth: without caller auth the Workload Manager treats every /v1 request as system-admin" $raw) }}
 {{- end }}
+{{- if and (hasPrefix "/v1/" $path) (not $.Values.router.config.namespaceSelector) }}
+{{- fail (printf "router.publicIngress path %q requires router.config.namespaceSelector: without one the path would reach every namespace" $raw) }}
+{{- end }}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1

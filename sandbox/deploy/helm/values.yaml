@@ -181,9 +181,9 @@ router:
   # Public E2B routes on an existing host. Rendered with the release, so a
   # helm upgrade publishes them. Paths are absolute: E2B does not use a prefix.
   # Each path must be one of the defaults below or a path under one.
-  # /v1/templates requires router.config.enableAuth. Any authenticated caller
-  # may list and read templates through it; only system-admin may create,
-  # update or delete them.
+  # /v1/templates requires router.config.enableAuth and
+  # router.config.namespaceSelector. Through it an authenticated caller manages
+  # private templates in admitted namespaces; public templates need system-admin.
   publicIngress:
     enabled: false
     name: agent-sandbox-public

@@ -181,7 +181,8 @@ refused() {
 }
 
 auth=(--set router.config.enableAuth=true
-  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect)
+  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect
+  --set-string router.config.namespaceSelector=example.com/sandbox=enabled)
 
 render "$tmp/public.yaml" "${auth[@]}" \
   --set router.publicIngress.enabled=true \
@@ -200,6 +201,19 @@ refused public-v1-no-auth "requires router.config.enableAuth" \
   --set security.allowInsecureNoAuth=true \
   --set router.publicIngress.enabled=true \
   --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+
+# A public /v1 path without a selector would reach every namespace.
+refused public-v1-no-selector "requires router.config.namespaceSelector" \
+  --set router.config.enableAuth=true \
+  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+
+# The E2B paths alone need neither.
+render "$tmp/public-e2b.yaml" --set security.allowInsecureNoAuth=true \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com' \
+  --set 'router.publicIngress.paths={/sandboxes,/files}'
 
 # An Ingress without a selector would expose every namespace.
 refused no-selector "router.ingress.enabled requires router.config.namespaceSelector" \

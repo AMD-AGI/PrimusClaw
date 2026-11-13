@@ -215,12 +215,9 @@ grep -q 'keeping Helm-managed public Ingress https://sandbox.example.com' "$outp
 grep -qF -- '--set router.publicIngress.enabled=true' "$capture"
 grep -qF -- '--set-string router.publicIngress.hosts[0]=sandbox.example.com' "$capture"
 grep -q 'public Ingress is rendered by Helm at https://sandbox.example.com' "$output"
-grep -qF -- 'router.publicIngress.paths=' "$capture" && {
-  echo "installer narrowed the public paths with auth enabled" >&2
-  exit 1
-}
+grep -qF -- '--set router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}' "$capture"
 
-# Without caller auth the public Ingress serves the E2B routes only.
+# Without caller auth the public Ingress also serves the E2B routes only.
 rm -f "$capture"
 if ! env PATH="$tmp/bin:$PATH" \
   HELM_CAPTURE="$capture" \
