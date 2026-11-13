@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyMultiNodeExternalEnv, buildNodeList, MN_NODE_LIST_ENV } from "../src/sandbox/params.js";
+import { applyMultiNodeExternalEnv, buildNodeList, MN_NODE_LIST_ENV, usesTopologyHandoff } from "../src/sandbox/params.js";
 import type { MultiNodeContext, MultiNodeNodeList } from "../src/sandbox/multi-node/types.js";
 
 const RAYJOB_CTX: MultiNodeContext = {
@@ -175,7 +175,7 @@ test("no node list without router, prefill and decode hosts", () => {
     applyMultiNodeExternalEnv(env, { ...PD_CTX, ...missing });
     assert.equal(env[MN_NODE_LIST_ENV], undefined, JSON.stringify(missing));
   }
-  assert.equal(buildNodeList(INFERA_CTX), undefined, "infera is not a PD node list backend");
+  assert.equal(buildNodeList(INFERA_CTX), undefined, "an infera cluster without a launch request has no node list");
 });
 
 test("infera env exposes the SSH control plane and per-role pod IPs", () => {
@@ -207,4 +207,82 @@ test("aggregated infera reports worker IPs instead of prefill/decode", () => {
   });
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.4,10.0.0.5");
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+});
+
+const INFERA_PD_CTX: MultiNodeContext = {
+  ...INFERA_CTX,
+  sshPrivateKey: PD_CTX.sshPrivateKey,
+  routerIps: ["10.0.0.1"],
+  sshPorts: { "10.0.0.1": 2242, "10.0.0.2": 2222, "10.0.0.3": 2232 },
+  pdLaunch: { ...PD_CTX.pdLaunch!, framework: "sglang", mode: "disaggregated" },
+};
+
+test("infera hands an infera.engine.sglang cluster over as a node list behind its frontend", () => {
+  const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
+  applyMultiNodeExternalEnv(env, INFERA_PD_CTX);
+  assert.deepEqual(nodeListOf(env), {
+    framework: "sglang",
+    frontend: "infera",
+    model: "/models/DeepSeek-R1",
+    service_url: INFERA_CTX.serviceUrl,
+    mode: "disaggregated",
+    router: { host: "10.0.0.1", ssh_port: 2242 },
+    prefill: [{ host: "10.0.0.2", ssh_port: 2222 }],
+    decode: [{ host: "10.0.0.3", ssh_port: 2232 }],
+    gpus_per_node: 8,
+    launch_mode: "direct",
+    ssh: { port: 2222, user: "root", key_file: "/tmp/primus-claw-mn-ssh-key" },
+    transfer_backend: "mori",
+    topology: {
+      prefill: { tp: 8, ep: null, dp_attention: null },
+      decode: { tp: null, ep: null, dp_attention: null },
+    },
+    config: {
+      prefill_args: "--mem-fraction-static 0.8",
+      decode_args: "--mem-fraction-static 0.8 --max-running-requests 256",
+      router_args: "",
+    },
+  });
+  for (const name of ["TOPOLOGY_HANDOFF_FILE", "HYPERLOOM_MN_EXT_SERVICE_URL", "HYPERLOOM_MN_EXT_SSH_KEY"]) {
+    assert.equal(env[name], undefined, name);
+  }
+  assert.equal(usesTopologyHandoff(INFERA_PD_CTX), false);
+  assert.ok(!env[MN_NODE_LIST_ENV]!.includes("SECRETKEYBODY"), "the key is passed by path only");
+});
+
+test("aggregated infera names worker hosts and the server args as the workers' args", () => {
+  const nodeList = buildNodeList({
+    ...INFERA_PD_CTX,
+    routerIps: [],
+    prefillIps: [],
+    decodeIps: [],
+    workerIps: ["10.0.0.4", "10.0.0.5"],
+    sshPorts: { "10.0.0.4": 2222, "10.0.0.5": 2223 },
+    pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, mode: "aggregated" },
+  });
+  assert.ok(nodeList);
+  assert.equal(nodeList.mode, "aggregated");
+  assert.equal(nodeList.router, undefined);
+  assert.equal(nodeList.prefill, undefined);
+  assert.deepEqual(nodeList.worker, [
+    { host: "10.0.0.4", ssh_port: 2222 },
+    { host: "10.0.0.5", ssh_port: 2223 },
+  ]);
+  assert.deepEqual(nodeList.config, { worker_args: "--mem-fraction-static 0.8", router_args: "" });
+  assert.equal(nodeList.transfer_backend, undefined);
+  assert.equal(nodeList.topology, undefined);
+});
+
+test("infera without an sglang engine or its role pods keeps the topology handoff", () => {
+  for (const ctx of [
+    { ...INFERA_PD_CTX, pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, framework: "vllm" } },
+    { ...INFERA_PD_CTX, decodeIps: [] },
+    { ...INFERA_PD_CTX, pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, mode: "aggregated" as const } },
+  ]) {
+    const env: Record<string, string> = {};
+    applyMultiNodeExternalEnv(env, ctx, { legacyTopologyEnv: true });
+    assert.equal(env[MN_NODE_LIST_ENV], undefined);
+    assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "infera");
+    assert.equal(usesTopologyHandoff(ctx), true);
+  }
 });

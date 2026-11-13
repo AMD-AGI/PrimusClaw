@@ -831,16 +831,29 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
 
     const sshPortBase = inferaSshPortBase(displayName);
     const groups: RolePodGroups = discoverRolePods(detail, spec.pdMode, sshPortBase);
+    const pods = [...groups.frontend, ...groups.prefill, ...groups.decode, ...groups.worker];
     return {
       ...base,
       serviceUrl: `http://${host}:${inferaFrontendPort(displayName)}`,
       sshPrivateKey: keypair?.privateKeyPem,
       sshKeyPath: SANDBOX_SSH_KEY_PATH,
       sshPortBase,
+      sshPorts: Object.fromEntries(pods.map((p) => [p.podIp, p.sshPort])),
       routerIps: groups.frontend.map((p) => p.podIp),
       prefillIps: groups.prefill.map((p) => p.podIp),
       decodeIps: groups.decode.map((p) => p.podIp),
       workerIps: groups.worker.map((p) => p.podIp),
+      pdLaunch: {
+        model: spec.model,
+        framework: spec.framework,
+        mode: spec.pdMode,
+        kvTransferBackend: spec.kvTransferBackend,
+        prefillTp: spec.pdPrefillTp,
+        decodeTp: spec.pdDecodeTp,
+        serverArgs: spec.serverArgs,
+        prefillExtraArgs: spec.pdPrefillExtraArgs,
+        decodeExtraArgs: spec.pdDecodeExtraArgs,
+      },
     };
   }
 }
