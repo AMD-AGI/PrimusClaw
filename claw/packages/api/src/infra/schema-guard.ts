@@ -242,6 +242,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["id", "user_id", "skill_name", "description", "content", "files", "replaces", "request_quote", "origin", "created_at"],
   },
   {
+    table: "claw_skill_changes",
+    // A save, delete or turn-off at the user's request records here what an undo takes back, in the same transaction.
+    columns: ["id", "user_id", "skill_name", "op", "version_after", "sha_after", "previous", "session_id", "created_at", "undone_at"],
+  },
+  {
     table: "claw_memory_links",
     // An entry's citations (memory/links.ts), kept with every memory write and read by the router's turn recall.
     columns: ["user_id", "from_id", "rel", "name", "to_kind", "to_id", "created_by", "created_at"],

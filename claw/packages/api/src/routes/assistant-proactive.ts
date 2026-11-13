@@ -15,15 +15,15 @@
  * cookie: a model in any sandbox of theirs holds their key, and its own press is not theirs. A created trigger runs later on the
  * key of this request when it carries one, else on the key the person's messages last gave their assistant.
  *
- * Registered only while CLAW_ASSISTANT_ENABLED is on (the confirmations also need the router's schedule tools); otherwise the
- * paths do not exist.
+ * Registered only while CLAW_ASSISTANT_ENABLED is on (the confirmations also need the router's schedule tools, or personal skills,
+ * whose drafts are confirmed the same way); otherwise the paths do not exist.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { CLAW_ASSISTANT_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import { BRIEF_RANGES, briefLanguage, composeBrief, isBriefRange } from "../assistant/brief.js";
 import { assistantSchedulesOn, DecisionRefused, decideConfirmation, pendingConfirmations } from "../assistant/schedules.js";
 
@@ -38,6 +38,7 @@ function requireRealUser(req: FastifyRequest, reply: FastifyReply): NonNullable<
 
 export async function registerAssistantProactiveRoutes(
   app: FastifyInstance, enabled: boolean = CLAW_ASSISTANT_ENABLED, schedules: boolean = assistantSchedulesOn(),
+  userSkills: boolean = CLAW_USER_SKILLS_ENABLED,
 ): Promise<void> {
   if (!enabled) return;
 
@@ -54,7 +55,8 @@ export async function registerAssistantProactiveRoutes(
     return reply.send({ ok: true, data: brief });
   });
 
-  if (!schedules) return;
+  // The cards are the schedule tools', and the drafts of a personal skill the assistant suggested (`skill-writes.ts`).
+  if (!schedules && !userSkills) return;
 
   app.get("/v1/assistant/confirmations", async (req, reply) => {
     const user = requireRealUser(req, reply);

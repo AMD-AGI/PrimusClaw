@@ -677,6 +677,14 @@ export interface PendingSkill {
   description?: string;
   /** Optional sub-files passed in one call (rare — usually added separately). */
   files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+  /**
+   * The user's own words asking for this to be saved as a skill, copied exactly; absent when the model saves it on its own. The API saves
+   * at once only when they are the user's (from a message the user sent) and do ask for a skill; anything else is kept as a draft the
+   * user confirms first (`events/consumer.ts`).
+   */
+  request_quote?: string;
+  /** `manual`: used only when the user names it, never listed to the model. Absent keeps what the skill had (`auto` for a new one). */
+  invocation?: "auto" | "manual";
 }
 
 /** Sub-file mutation from add_skill_file / update_skill_file / remove_skill_file tools. */

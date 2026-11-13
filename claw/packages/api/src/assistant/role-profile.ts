@@ -402,10 +402,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (recall) state.push(recall.text);
     // The user's personal skills (`skill-tools.ts`): what skill_read is in the system prompt, the same on every turn; the list of them
     // with the message, so that saving or using one changes no system prompt.
-    const skills = await routerSkillParts(role.userId, sessionId);
+    const skills = await routerSkillParts(role.userId, sessionId, message?.content ?? "");
     if (skills) {
       withSystemAppend(task, skills.prompt);
       if (skills.list) state.push(skills.list);
+      // A skill the message names, whole, and the drafts waiting for the user's answer.
+      state.push(...skills.extra);
     }
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
@@ -441,7 +443,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
       ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(recall ? { turnRecall: recall.ids } : {}),
-      ...(skills ? { userSkills: ROUTER_SKILLS_PROMPT_VERSION, userSkillsListed: skills.list !== null } : {}),
+      ...(skills ? { userSkills: ROUTER_SKILLS_PROMPT_VERSION, userSkillsListed: skills.list !== null, ...(skills.named.length ? { userSkillsNamed: skills.named } : {}) } : {}),
       ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),

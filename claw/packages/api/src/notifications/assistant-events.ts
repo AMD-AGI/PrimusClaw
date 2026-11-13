@@ -25,6 +25,7 @@ export {
   type AssistantSayChoice,
   type AssistantSayPayload,
   type AssistantSaySource,
+  type AssistantSkillCard,
   type WorkItemNeedsYouPayload,
 } from "@claw/protocol";
 

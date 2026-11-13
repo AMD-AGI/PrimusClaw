@@ -84,7 +84,7 @@ import { startUploadSweeper } from "./sessions/upload-sweeper.js";
 import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
-import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts } from "./marketplace/skill-service.js";
+import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts, cleanupOldSkillChanges } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
 import { apiBackgroundLoops, logBackgroundOff, startBackgroundLoops } from "./startup/background.js";
@@ -447,6 +447,7 @@ async function main() {
     }
     if (CLAW_USER_SKILLS_ENABLED) {
       cleanupExpiredSkillDrafts().catch(err => logger.error({ err }, "skill_drafts.cleanup_failed"));
+      cleanupOldSkillChanges().catch(err => logger.error({ err }, "skill_changes.cleanup_failed"));
     }
     if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));

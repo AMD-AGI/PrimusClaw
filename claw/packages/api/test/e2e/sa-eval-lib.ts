@@ -11,7 +11,7 @@
  *
  *   id               unique, <pipeline>-<area>-<kind>-<nnn>
  *   pipeline         real | catalog | public | sim | team | capture   (where the case came from)
- *   area             safe | dispatron | autopilot | pulse | agent-board | github | review | merge | memory | items | settings | chitchat | general
+ *   area             safe | dispatron | autopilot | pulse | agent-board | github | review | merge | memory | skills | items | settings | chitchat | general
  *   lang             zh | en | mixed                                   (the user's language)
  *   turns            [{user, after_ms, files?}]                         one or more user messages; after_ms from the first; files
  *                    [{fixture, name?, media_type?}] are sent with the message as a channel sends them (uploaded to the assistant's

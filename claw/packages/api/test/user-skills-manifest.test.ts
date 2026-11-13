@@ -300,8 +300,9 @@ describe("personal skills: what a turn is told, and reads", { skip }, () => {
         subject: `events.${sessionId}`, seq: 1, ack: () => { acks++; }, nak: () => { throw new Error("nak"); },
         data: sc.encode(JSON.stringify({
           type: "exec_complete", session_id: sessionId, task_id: run.taskId, user_id: "alice", message_id: run.messageId,
-          prompt: "save it", final_text: "saved", failed: false, error_count: 0,
-          skills_to_save: [{ skill_name: name, content: "## Steps\n1. check", description: "Deployment checklist" }],
+          prompt: "save it as a skill", final_text: "saved", failed: false, error_count: 0,
+          // The user's own request, quoted: saved at once (without it, a draft: assistant-skill-save.test.ts).
+          skills_to_save: [{ skill_name: name, content: "## Steps\n1. check", description: "Deployment checklist", request_quote: "save it as a skill" }],
           skill_file_mutations: [{ action: "add", skill_name: "kept-skill", file_path: file, content: "notes" }],
         })),
       } as any);

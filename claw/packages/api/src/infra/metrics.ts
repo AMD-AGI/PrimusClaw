@@ -185,8 +185,18 @@ const userSkillReadTotal = new Counter({
   labelNames: ["role", "outcome"] as const,
   registers: [registry],
 });
+// Every write of a personal skill from a conversation (`assistant/skill-writes.ts`, a worker's save_skill): `op` the write (create,
+// update, draft, delete, disable, enable, undo), `outcome` ok, or why it was refused (secret, injection, full, invalid, duplicate, ...).
+const userSkillSaveTotal = new Counter({
+  name: "claw_user_skill_save_total",
+  help: "Writes of a personal skill from a conversation, by op and outcome.",
+  labelNames: ["op", "outcome"] as const,
+  registers: [registry],
+});
 if (!CLAW_USER_SKILLS_ENABLED) {
-  for (const name of ["claw_user_skill_listed_chars", "claw_user_skill_truncated_total", "claw_user_skill_read_total"]) registry.removeSingleMetric(name);
+  for (const name of ["claw_user_skill_listed_chars", "claw_user_skill_truncated_total", "claw_user_skill_read_total", "claw_user_skill_save_total"]) {
+    registry.removeSingleMetric(name);
+  }
 }
 
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
@@ -462,5 +472,8 @@ export const metrics = {
   },
   onUserSkillRead(role: "router", outcome: "ok" | "not_found" | "not_here"): void {
     userSkillReadTotal.inc({ role, outcome });
+  },
+  onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
+    userSkillSaveTotal.inc({ op, outcome });
   },
 };

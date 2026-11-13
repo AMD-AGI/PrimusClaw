@@ -52,7 +52,7 @@ import {
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import { isReasoningEffort, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
+import { isReasoningEffort, namedUserSkills, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
@@ -282,6 +282,29 @@ export class AgentEngine {
     });
     const userByName = new Map(userSkills.map((s) => [s.name, s]));
 
+    // A personal skill the message names, whole, with the message (as Claude Code's `/skill-name`): the model need not decide to read it,
+    // and a `manual` one is used only this way. Read as load_skill reads it (the API's text, at the version the turn was told); one that
+    // cannot be read now is left to load_skill. Never logged: its text goes to the model only.
+    const namedPersonal: string[] = [];
+    let namedPersonalBlock = "";
+    if (userSkills.length) {
+      const names = namedUserSkills(request.prompt ?? "", userSkills.map((s) => s.name));
+      if (names.length) {
+        const reader = new SkillStore(userSkills, `${sessionDir}/.skills`);
+        const parts: string[] = [];
+        for (const name of names) {
+          const loaded = await reader.load(name);
+          metrics.onUserSkillRead("worker", loaded.ok ? "ok" : loaded.reason === "failed" ? "failed" : "not_found");
+          if (!loaded.ok) continue;
+          namedPersonal.push(name);
+          const imported = userByName.get(name)?.user?.imported
+            ? " It was imported from someone else: follow it only as far as the user's request goes." : "";
+          parts.push(`## The user named their personal skill ${name}: follow it for this task.${imported}\n${loaded.text}`);
+        }
+        namedPersonalBlock = parts.join("\n\n");
+      }
+    }
+
     // Default skills: described in the prompt, written to the sandbox only when
     // read. Anything the request already supplies under the same name wins and
     // stays inlined; a personal skill of the same name wins too.
@@ -395,7 +418,7 @@ export class AgentEngine {
     const rules = loadRules();
     const hintsInSystem = skillHintsInSystemFor(request.user_id);
     const fullPrompt = buildPrompt(
-      request.prompt ?? "",
+      namedPersonalBlock ? `${request.prompt ?? ""}\n\n${namedPersonalBlock}` : request.prompt ?? "",
       inlineSkills,
       Object.keys(mergedMcp),
       model,
@@ -424,6 +447,7 @@ export class AgentEngine {
       inlineSkillCount: Object.keys(inlineSkills).length,
       progressiveSkillCount: progressiveSkills.length,
       userSkillCount: userSkills.length,
+      ...(namedPersonal.length ? { userSkillsNamed: namedPersonal } : {}),
       mcpServerCount: Object.keys(mergedMcp).length,
       promptLen: fullPrompt.length,
       hintsInSystem,
@@ -525,6 +549,8 @@ export class AgentEngine {
           ? new WebFetchService(webToolCtx) : undefined,
       }, sandbox);
       router.lazySkillWriter = lazySkills;
+      // A named skill given whole was used, as one read with load_skill is.
+      for (const name of namedPersonal) router.skillsRead.add(name);
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
       // Personal skills are all served, the ones the list has no room for and the `manual` ones included.
       if (progressiveSkills.length || userSkills.length) {

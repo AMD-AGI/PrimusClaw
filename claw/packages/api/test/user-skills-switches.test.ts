@@ -82,7 +82,7 @@ before(async () => {
   tombstoneReader.has = async () => false;
   const spy = (name: string) => async () => { calls.push(name); };
   Object.assign(completionPorts, {
-    saveUserSkill: async () => { calls.push("saveUserSkill"); return { ok: true, id: 1, version: 1, created: true }; },
+    handleWorkerSkillWrites: async () => { calls.push("saveUserSkill"); },
     recordSkillFeedback: spy("recordSkillFeedback"), checkProbationGraduation: spy("checkProbationGraduation"),
     maybeSummarize: async () => {}, maybeRecordTaskPattern: spy("maybeRecordTaskPattern"), enqueueEvolutionJob: spy("enqueueEvolutionJob"),
   });
