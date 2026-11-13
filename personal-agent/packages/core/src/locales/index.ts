@@ -15,5 +15,6 @@ export * from "./assistant-chat.js";
 export * from "./assistant-devenv-hide.js";
 export * from "./assistant-work-clicks.js";
 export * from "./assistant.js";
+export * from "./skills.js";
 export * from "./proactive-lines.js";
 export * from "./proactive.js";

@@ -26,6 +26,7 @@ export const CONFIRM_KINDS = [
   "devenv_send",
   "github_comment",
   "devenv_hide",
+  "skill_save",
 ] as const;
 
 /** The default replies under what the assistant said: (what the button says, what it sends). */
@@ -127,6 +128,69 @@ export function suggestedRepliesOf(
   }
   if (replies.length) return replies.slice(0, max);
   return [...ASSISTANT_SUGGESTED_REPLIES[lang ?? pickLang(text)]];
+}
+
+/** What a skill's card is about (`skill_card.kind`): done already, or a draft to save. */
+export const SKILL_CARD_KINDS = ["saved", "deleted", "disabled", "enabled", "draft"] as const;
+/** Code points of a skill's description on its card (Claw sends at most 300). */
+export const SKILL_DESCRIPTION_MAX = 300;
+/** Code points of the start of SKILL.md a card shows (Claw sends at most 1500). */
+export const SKILL_PREVIEW_MAX = 1500;
+/** The files a skill's card lists (Claw keeps at most 20). */
+export const SKILL_FILES_MAX = 20;
+
+/** One of the person's personal skills as an `assistant.say` shows it (`skill_card`). */
+export interface SkillCardEvent {
+  readonly kind: (typeof SKILL_CARD_KINDS)[number];
+  readonly name: string;
+  readonly version: number | null;
+  /** `saved`: a new skill (true) or a new version of one (false). */
+  readonly created: boolean;
+  readonly description: string;
+  readonly manual: boolean;
+  readonly files: readonly string[];
+  readonly preview: string;
+  /** What Undo takes back ("" none). */
+  readonly changeId: string;
+}
+
+/** A skill's name as a card shows it and a request path carries it: Claw's own names, nothing else. */
+const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+/** An id a button may carry (a change Claw made: a uuid). */
+const CHANGE_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+function clipped(value: unknown, max: number): string {
+  const all = Array.from(field(value));
+  return all.length > max ? `${all.slice(0, max - 1).join("")}…` : all.join("");
+}
+
+/**
+ * The skill an `assistant.say` is about (`skill_card`); undefined when it carries none this worker draws. Read whole or not at all:
+ * a name that is not one, or a kind it does not know, and there is no card (the words still say it).
+ */
+export function skillCardOf(event: Event): SkillCardEvent | undefined {
+  const card = record(event["skill_card"]);
+  if (event["type"] !== "assistant.say" || card === undefined) return undefined;
+  const kind = SKILL_CARD_KINDS.find((k) => k === card["kind"]);
+  const name = typeof card["name"] === "string" ? card["name"] : "";
+  if (kind === undefined || !SKILL_NAME.test(name)) return undefined;
+  const version = typeof card["version"] === "number" && Number.isSafeInteger(card["version"]) ? card["version"] : null;
+  const changeId = typeof card["change_id"] === "string" && CHANGE_ID.test(card["change_id"]) ? card["change_id"] : "";
+  const files = (Array.isArray(card["files"]) ? (card["files"] as unknown[]) : [])
+    .map((f) => record(f)?.["path"])
+    .filter((p): p is string => typeof p === "string" && p !== "" && cpLength(p) <= 200 && !p.includes("\n"))
+    .slice(0, SKILL_FILES_MAX);
+  return {
+    kind,
+    name,
+    version,
+    created: card["created"] === true,
+    description: pySplit(clipped(card["description"], SKILL_DESCRIPTION_MAX)).join(" "),
+    manual: card["invocation"] === "manual",
+    files,
+    preview: clipped(card["preview"], SKILL_PREVIEW_MAX),
+    changeId,
+  };
 }
 
 /** The fewest options a choice card shows (Claw sends from 2). */

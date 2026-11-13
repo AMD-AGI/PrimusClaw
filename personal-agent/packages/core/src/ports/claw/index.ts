@@ -4,6 +4,7 @@
 import type { ClawAssistantPort } from "./assistant.js";
 import type { ClawRemoteAgentsPort } from "./remote-agents.js";
 import type { ClawSessionsPort } from "./sessions.js";
+import type { ClawSkillsPort } from "./skills.js";
 import type {
   ClawMergeConfirmationsPort,
   ClawNotificationsPort,
@@ -15,6 +16,7 @@ import type { ClawWorkItemsPort } from "./work-items.js";
 export type * from "./assistant.js";
 export type * from "./remote-agents.js";
 export type * from "./sessions.js";
+export type * from "./skills.js";
 export type * from "./settings.js";
 export type * from "./work-items.js";
 
@@ -35,4 +37,6 @@ export interface ClawPort {
   readonly triggers: ClawTriggersPort;
   readonly mergeConfirmations: ClawMergeConfirmationsPort;
   readonly remoteAgents: ClawRemoteAgentsPort;
+  /** The person's personal skills: `/skills`, and the buttons of a skill's card. */
+  readonly skills: ClawSkillsPort;
 }

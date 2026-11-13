@@ -14,6 +14,7 @@ import { proactiveRenderers } from "./proactive/index.js";
 import type { Renderers } from "./registry.js";
 import { REMOTE_RENDERERS } from "./remote/index.js";
 import { REVIEW_RENDERERS } from "./review/index.js";
+import { skillRenderers } from "./skills/index.js";
 import { TURN_RENDERERS } from "./turn/index.js";
 
 export const RENDERERS: Renderers = {
@@ -26,6 +27,7 @@ export const RENDERERS: Renderers = {
   ...REVIEW_RENDERERS,
   ...FEEDBACK_RENDERERS,
   ...OBSERVE_RENDERERS,
+  ...skillRenderers,
 };
 
 export { renderView, type Renderer, type Renderers, type TeamsMessage } from "./registry.js";

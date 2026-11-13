@@ -63,6 +63,8 @@ export * from "./approvals/index.js";
 export * from "./assistant/index.js";
 export * from "./assistant/work-items.js";
 export type * from "./assistant/views.js";
+export * from "./skills/index.js";
+export type { SkillCardEvent } from "./assistant/events.js";
 export * from "./direct-chat/index.js";
 export * from "./proactive/index.js";
 export * from "./proactive/views.js";

@@ -4,7 +4,7 @@
 /**
  * Feedback, observing a group and the daily brief, as the Python worker builds them (`main.run`'s `FeedbackService`,
  * `Agent.__init__`'s `Observer`, `Agent._cmd_brief`): `/feedback` and the Report a problem card, the bot's and Teams' own
- * thumbs, reports that could not be filed retried, `/observe` in a group, and `/brief`.
+ * thumbs, reports that could not be filed retried, `/observe` in a group, and `/brief`; and `/skills`, the person's own skills.
  */
 import { createHash } from "node:crypto";
 
@@ -12,6 +12,7 @@ import type { JsonObject, OutMessage, UserRef } from "@primusclaw/personal-agent
 import {
   chatCredentialOf,
   DailyBrief,
+  SkillsCommand,
   FeedbackFlow,
   FeedbackReporting,
   FeedbackService,
@@ -69,6 +70,8 @@ export interface W8Parts {
   /** The recent messages of group chats, in memory, as background for an @mention. */
   readonly groupContext: GroupContext;
   readonly brief: DailyBrief;
+  /** Its commands: `/brief`, and `/skills` (the person's own skills, in their own chat). */
+  readonly commands: readonly [DailyBrief, SkillsCommand];
   /** The Report a problem card under a message of the person's that went wrong. */
   reportView(userId: string, scope: string): OutMessage;
 }
@@ -167,6 +170,7 @@ export function w8Parts(
     observer,
     groupContext,
     brief,
+    commands: [brief, new SkillsCommand({ store, skills: claw.skills, logger })],
     reportView: (userId, scope) => {
       const view = service.reportView(userId, scope);
       return reportMessage(view.promptId, view.group);

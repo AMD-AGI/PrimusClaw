@@ -392,7 +392,7 @@ export function buildFeatures(given: AssemblyBase): Features {
     personalInterceptors: [...(reviewHandlers?.personalInterceptors ?? []), w8.flow.interceptor],
     groupInterceptors,
     commands: [
-      w8.brief,
+      ...w8.commands,
       ...(switches.remoteAgents ? [new TerminalApprovalsCommand(base.claw.remoteAgents)] : []),
       ...(reviewHandlers?.commands ?? []),
     ],

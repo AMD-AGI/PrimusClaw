@@ -28,6 +28,7 @@ import {
   turn,
   WatchClicks,
   WorkCardClicks,
+  SkillCardClicks,
   WorkClicks,
 } from "@primusclaw/personal-agent";
 
@@ -185,6 +186,13 @@ export function assistantParts(base: AssemblyBase, inputs: AssistantInputs): Ass
   const watch = new WatchClicks({ store, claw: claw.workItems, exchange, logger });
   const linked = (userId: string): boolean => store.links.getKey(userId) !== null;
   const choices = new AssistantChoiceClicks({ store, deliver: (message) => hooks.typed(message), logger });
-  const clicks = [new WorkCardClicks(work, watch, exchange, linked, logger), actionClicks(actions), choices];
+  // (a personal skill's card: Undo, Edit and Save changes; its draft's Save and Discard are the held write's, in `actions`)
+  const skillCards = new SkillCardClicks({ store, skills: claw.skills, logger });
+  const clicks = [
+    new WorkCardClicks(work, watch, exchange, linked, logger),
+    actionClicks(actions),
+    choices,
+    skillCards,
+  ];
   return { subs, chat: assistant, board, receipts, directChat, actions, clicks };
 }

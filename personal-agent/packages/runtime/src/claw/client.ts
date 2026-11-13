@@ -9,6 +9,7 @@ import { StyleRule } from "./rule.js";
 import { HttpSessions } from "./sessions.js";
 import { HttpMergeConfirmations, HttpNotifications, HttpSettings, HttpTriggers } from "./settings.js";
 import { HttpWorkItems } from "./work-items.js";
+import { HttpSkills } from "./skills.js";
 
 /** What Claw's audit trail calls this client by default (`X-Claw-Client`). */
 export const DEFAULT_CLIENT_LABEL = "clawy";
@@ -46,5 +47,6 @@ export function createClawClient(options: ClawClientOptions): ClawPort {
     triggers: new HttpTriggers(http),
     mergeConfirmations: new HttpMergeConfirmations(http),
     remoteAgents: new HttpRemoteAgents(http, options.clientLabel ?? DEFAULT_CLIENT_LABEL),
+    skills: new HttpSkills(http),
   };
 }

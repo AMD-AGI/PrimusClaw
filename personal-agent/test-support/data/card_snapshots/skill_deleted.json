@@ -1,0 +1,52 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-8",
+       "op": "undo",
+       "primusclaw": "assistant_skill"
+      },
+      "title": "撤销",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_undo"
+     }
+    ],
+    "body": [
+     {
+      "items": [
+       {
+        "size": "Medium",
+        "text": "🗑️ 技能已删除：standup-notes",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "type": "Container"
+     },
+     {
+      "facts": [
+       {
+        "title": "什⁠么⁠时⁠候⁠用",
+        "value": "写站会纪要时使用（standup、站会）"
+       },
+       {
+        "title": "附⁠带⁠文⁠件",
+        "value": "templates/notes.md"
+       }
+      ],
+      "type": "FactSet"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

@@ -1,0 +1,123 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-8",
+       "op": "undo",
+       "primusclaw": "assistant_skill"
+      },
+      "title": "Undo",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_undo"
+     },
+     {
+      "data": {
+       "card": "card-8",
+       "op": "edit",
+       "primusclaw": "assistant_skill"
+      },
+      "title": "Edit",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_edit"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Good",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "✅ Skill updated: deploy-prod v3",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "facts": [
+       {
+        "title": "When to use",
+        "value": "Deploy to production with a canary first"
+       }
+      ],
+      "type": "FactSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "Used only when you name it.",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "skill-preview-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "SKILL.md ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "skill-preview"
+       ],
+       "title": "SKILL.md",
+       "type": "Action.ToggleVisibility"
+      },
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "skill-preview",
+      "isVisible": false,
+      "items": [
+       {
+        "isSubtle": true,
+        "text": "## Steps\n1. Canary\n2. Watch\n3. Roll out",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

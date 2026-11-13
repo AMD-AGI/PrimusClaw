@@ -26,6 +26,7 @@ export const PERSONAL_ONLY_COMMANDS = [
   "agent",
   "lang",
   "approvals",
+  "skills",
 ] as const;
 
 /**

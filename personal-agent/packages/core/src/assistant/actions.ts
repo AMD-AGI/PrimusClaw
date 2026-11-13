@@ -22,6 +22,7 @@ import { CONTEXT_TEXT_MAX } from "./chat.js";
 import { confirmOutcome } from "./confirm-outcome.js";
 import { refusal, unreachable } from "./failures.js";
 import { finish } from "./finish.js";
+import { SKILL_UNDO_KIND } from "../skills/views.js";
 
 /** The handoff a message declares for a review asked of someone else: started by the review line (W7), not here. */
 export const REVIEW_HANDOFF = "review_for_other";
@@ -157,7 +158,13 @@ export class AssistantActions {
     const data = click.action.data;
     const card = store.assistantButtons.getConfirmCard(pyStr(data["card"]));
     const op = data["op"];
-    if ((op !== "allow" && op !== "deny") || card === null || card.userId !== click.sender.id) {
+    // (a skill card's Undo record is no held write: its own buttons answer it, `skills/clicks.ts`)
+    if (
+      (op !== "allow" && op !== "deny") ||
+      card === null ||
+      card.userId !== click.sender.id ||
+      card.kind === SKILL_UNDO_KIND
+    ) {
       await finish(click, t.confirmGone);
       return;
     }
