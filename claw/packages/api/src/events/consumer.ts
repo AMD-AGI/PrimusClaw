@@ -25,6 +25,7 @@ import {
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
 import { handleWorkerSkillWrites } from "../assistant/skill-writes.js";
+import { maybeAutoDraft } from "../assistant/skill-auto-draft.js";
 import { appEventIdentity } from "./app-events.js";
 import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
@@ -1005,6 +1006,7 @@ export const completionPorts = {
   recordWorkerTurnEnd,
   releaseRunHolds,
   deliverUnsaidAnswer,
+  maybeAutoDraft,
   rerunOnFallback,
 };
 
@@ -1422,6 +1424,13 @@ async function handleComplete(
         await new Promise((resolve) => setTimeout(resolve, unsaidAnswerRetryDelayMs * attempt));
       }
     }
+  }
+  // 9c. A router turn whose message stated a way the user always works, and that saved or drafted no skill: the platform drafts one,
+  //     with its card (`skill-auto-draft.ts`), rather than leave the suggestion to the model. In the background: it is a model call,
+  //     and the completion is not held for it.
+  if (CLAW_ASSISTANT_ENABLED && CLAW_USER_SKILLS_ENABLED && endedRunIds.length && !rerun && !failed && !interrupted && messageId) {
+    void completionPorts.maybeAutoDraft({ sessionId, userId, messageId })
+      .catch((err) => logger.error({ err, sessionId }, "assistant.skill_auto_draft_failed"));
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");

@@ -26,7 +26,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { namedUserSkills } from "@claw/protocol";
 import {
-  pendingSkillDrafts, readUserSkill, readUserSkillFile, userSkillManifest, type UserSkillManifestEntry,
+  listUserSkills, pendingSkillDrafts, readUserSkill, readUserSkillFile, removedSkills, userSkillManifest, type UserSkillManifestEntry,
 } from "../marketplace/skill-service.js";
 import { ROUTER_SKILLS_PROMPT } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
@@ -133,6 +133,13 @@ export async function routerSkillParts(
   // Named in the message: its whole text with the message, as Claude Code's /skill-name is, so the router does not have to decide to read
   // it (a manual one is used only this way). A failed read costs the turn that text, never the turn.
   const extra: string[] = [];
+  // What the user's skills are now, every turn, from the database: the conversation may be out of date (a skill named earlier may
+  // have been deleted or undone since), and this is what says so. A failed read costs the turn this block, never the turn.
+  try {
+    extra.push(renderSkillFacts(await listUserSkills(userId), await removedSkills(userId)));
+  } catch (err) {
+    logger.error({ sessionId, code: (err as { code?: string })?.code ?? "" }, "assistant.skill_facts_read_failed");
+  }
   const named: string[] = [];
   for (const name of namedUserSkills(message, manifest.map((m) => m.name))) {
     try {
@@ -167,6 +174,29 @@ async function namedSkillBlock(userId: string, name: string): Promise<string | n
   const note = s.origin === "import" ? `${SKILL_NOTE} ${IMPORTED_NOTE}` : SKILL_NOTE;
   const files = s.files.length ? `\nIts files (read one with skill_read(name, path=...)): ${s.files.map((f) => f.path).join(", ")}` : "";
   return `## The user named their personal skill ${s.name} (v${s.version}): follow it for this message\n${note}${files}\n---\n${body}\n---`;
+}
+
+export const SKILL_FACTS_HEADING = "## What the user's personal skills are now";
+
+/**
+ * The router's facts of the user's skills for this turn: how many they have now (listed above when they apply on their own; the
+ * others are turned off or used only when named), and the ones deleted or undone lately, which are gone whatever the conversation said.
+ */
+export function renderSkillFacts(
+  skills: ReadonlyArray<{ enabled: boolean; invocation: string }>, removed: ReadonlyArray<{ name: string; removed_at: string; how: string }>,
+): string {
+  const total = skills.length;
+  const auto = skills.filter((s) => s.enabled && s.invocation !== "manual").length;
+  const lines = [SKILL_FACTS_HEADING];
+  lines.push(total === 0
+    ? "They have no personal skill now."
+    : `They have ${total} personal skill${total === 1 ? "" : "s"} now${total > auto ? ` (${total - auto} of them turned off or used only when named: skill_list shows them)` : ""}.`);
+  if (removed.length) {
+    const gone = removed.slice(0, 10).map((r) => `${r.name} (${r.how === "undone" ? "undone" : "deleted"} ${r.removed_at.slice(0, 16).replace("T", " ")}Z)`);
+    lines.push(`Gone lately, not theirs any more: ${gone.join(", ")}.`);
+  }
+  lines.push("This is the truth as of this message: never say a skill exists, or name one as theirs, from what the conversation said earlier.");
+  return lines.join("\n");
 }
 
 /** For the router's state: the user's drafts waiting for an answer, one line each, or null. */

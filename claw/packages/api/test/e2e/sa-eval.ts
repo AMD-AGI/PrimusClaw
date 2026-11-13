@@ -782,6 +782,12 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   if (SAY_GRACE_MS) {
     await waitFor(() => (turnsAnswered(saysOf(stream.events), messageIds, ME_USER_ID) ? true : undefined), Date.now() + SAY_GRACE_MS, 200);
   }
+  // A card the server shows after the turn's end (a skill it drafted from the turn): waited for, up to the case's card_wait_s.
+  if (c.card_wait_s && (c.cards === "confirm" || c.cards === "accept")) {
+    const want = c.cards;
+    await waitFor(() => (cardsOf(caseSays(saysOf(stream.events), [messageIds.at(-1)!], [])) === want ? true : undefined),
+      Date.now() + Math.min(c.card_wait_s, 120) * 1000, 500);
+  }
   // The case's items are only those its own turns started (read from their work_create / review_start answers): an item
   // someone else put on the board meanwhile (a review asked of this identity) is neither graded nor closed here.
   const started = turnCalls(stream.events, messageIds);

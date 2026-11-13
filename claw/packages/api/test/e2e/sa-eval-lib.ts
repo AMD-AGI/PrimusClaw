@@ -49,7 +49,8 @@
  *   notes            why the case exists
  * and, for this runner only (all optional): `rubric` (what a judge model grades, `EVAL_JUDGE_*`), `modes` (the modes the
  * case runs in, default both: a case that needs the assistant's own tools or items says `["assistant"]`), `needs` (one or
- * more variables it needs besides those its text names), `item_wait_s` (how long to wait for an item's result),
+ * more variables it needs besides those its text names), `item_wait_s` (how long to wait for an item's result), `card_wait_s` (how
+ * long after the last turn's end to wait for the card `cards` names, for one the server shows after the turn: a drafted skill's),
  * `items_closed` (every item the case started is closed when it is graded: an interrupt that stopped it), `blocked` (why
  * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
  * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
@@ -148,6 +149,7 @@ export interface EvalCase {
   modes?: Mode[];
   needs?: string | string[];
   item_wait_s?: number;
+  card_wait_s?: number;
   items_closed?: boolean;
   blocked?: string;
   may_deny?: boolean;
