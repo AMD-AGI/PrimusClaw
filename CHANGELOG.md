@@ -129,10 +129,11 @@ setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended
 
 ### Fixed
 
-- A review someone else asked for whose merge GitHub refused for a reason only the author can clear (the branch
-  conflicts with the base, `DIRTY`; the branch rules block it, `BLOCKED`; or the pull request changes a CI workflow and
-  the reviewer's GitHub authorization lacks the `workflow` scope) no longer wakes the reviewer as blocked: the item
-  stays in progress and says it waits for the author, and the requester is told once per head commit what comes next.
+- A review someone else asked for whose merge GitHub refused for a reason the reviewer cannot clear no longer wakes the
+  reviewer as blocked: the branch conflicts with the base (`DIRTY`: the author has to resolve it), the branch rules
+  block it (`BLOCKED`: the author or CI has to meet them), or the pull request changes a CI workflow and the reviewer's
+  GitHub authorization lacks the `workflow` scope (it has to be merged by hand on GitHub). The item stays in progress
+  and says what it waits for, and the requester is told once per head commit, with what comes next.
   New commits run the review once more in its session; with none within 24 hours the item goes to the reviewer as
   blocked. A refusal on a head whose wait already ended needs the reviewer. A restart drops the wait (#816).
 
