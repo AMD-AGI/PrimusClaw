@@ -81,7 +81,7 @@ import {
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
-  bareItemNumber, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
+  bareItemNumber, clockQuery, clockValue, clockValues, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
   cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards, memoryRows, memoriesMatching, newMemoryIds,
   TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody,
 } from "./e2e/sa-eval-lib.js";
@@ -1514,3 +1514,36 @@ test("S-skills a skills case clears the identity's waiting skill drafts and thei
     tc("skill_save", { name: "standup", content: "x" }),
   ], shown), ["skill_save of draft d-old", "confirmation_answer of card c9"]);
 });
+
+test("S-clock a date or weekday case is graded against the date and weekday in its zone when it is asked, and a wrong weekday fails", () => {
+  // 2026-11-13 16:40 UTC: Friday in UTC, already Saturday 00:40 in Asia/Shanghai (sa-eval public-general-irr-026).
+  const at = new Date("2026-11-13T16:40:00Z");
+  const weekday = { kind: "clock" as const, query: "weekday@Asia/Shanghai" };
+  assert.deepEqual(clockQuery(weekday), { what: "weekday", zone: "Asia/Shanghai" });
+  assert.equal(clockQuery({ kind: "clock", query: "weekday@Mars/Olympus" }), null);
+  assert.equal(clockQuery({ kind: "clock", query: "hour@UTC" }), null);
+  assert.equal(clockValue("weekday", "Asia/Shanghai", at), "星期六||周六||礼拜六||Saturday");
+  assert.equal(clockValue("weekday", "UTC", at), "星期五||周五||礼拜五||Friday");
+  assert.match(clockValue("date", "Asia/Shanghai", at), /^2026-11-14\|\|11月14日\|\|/);
+  assert.match(clockValue("weekday", "Asia/Shanghai", new Date("2026-11-14T16:40:00Z")), /星期天/, "Sunday's other name");
+  // Asked just before midnight in Shanghai and answered after: either day counts.
+  assert.deepEqual(clockValues(weekday, new Date("2026-11-13T15:59:00Z"), new Date("2026-11-13T16:02:00Z")),
+    ["星期五||周五||礼拜五||Friday||星期六||周六||礼拜六||Saturday"]);
+
+  const c = caseOf({ facts: [{ claim: "the weekday in Asia/Shanghai", oracle: weekday }], rubric: "the weekday" });
+  const values = [clockValues(weekday, at, new Date(at.getTime() + 20_000))];
+  // The deterministic check: a reply that reads well and names the wrong weekday fails, whatever the judge says.
+  const wrong = observed({ final: "今天是 **星期五**（UTC 时间 2026-11-13）。", factValues: values });
+  assert.ok(failed(c, wrong).includes("fact the weekday in Asia/Shanghai"), "the UTC weekday is the wrong answer");
+  assert.equal(verdictOf(c, grade(c, wrong), { pass: true }).pass, false, "a judge's PASS does not save it");
+  assert.deepEqual(failed(c, observed({ final: "今天是星期六。", factValues: values })), []);
+  assert.deepEqual(failed(c, observed({ final: "Today is Saturday, November 14.", factValues: values })), []);
+  // The judge is told the run's value as the truth, so a reply naming it only in a note can be failed.
+  const prompt = judgePrompt(c, c.turns, "今天是**星期五**（注：上海已是星期六）", [], values);
+  assert.match(prompt, /the weekday in Asia\/Shanghai: one of "星期六", "周六", "礼拜六", "Saturday"/);
+  assert.ok(!judgeFacts(c).length, "graded without a judge, not left to one");
+  // A clock the runner cannot work out is a problem of the case.
+  const bad = caseOf({ id: "bad", facts: [{ claim: "x", oracle: { kind: "clock", query: "weekday@Nowhere" } }] });
+  assert.ok(staticFindings([bad], { router: [], worker: [], baseline: [] }).problems.some((p) => p.kind === "bad-clock"));
+});
+

@@ -39,6 +39,10 @@
  *                    takes a regex's first group (or the match), `map:<from>=<to>;...` says a value in words (`true=merged`), and
  *                    `empty:<text>` stands for an empty list (`empty:none||没有`). A value with `||` is named when any one of its
  *                    alternatives is.
+ *                    A `clock` oracle is the date or the weekday when the case is asked, in a time zone: `weekday@Asia/Shanghai`,
+ *                    `date@America/Los_Angeles` (`clockQuery`). The runner works it out when it sends the case (and again at the end
+ *                    of its time to answer, either counting, so a case asked across midnight is not failed for it): the answer must
+ *                    name it, and the judge is told it as the truth.
  *                    A static or fixture value is a value to find in the answer (a number, a name); a description of what
  *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
  *                    judge, with the oracle's text as what it is checked against.
@@ -125,7 +129,7 @@ export function tokenRequestRefusal(method: string, path: string, body?: unknown
   return `${method} ${path.split("?")[0]} is not sent with the token`;
 }
 export interface Delivers { name?: string; type?: string }
-export interface Oracle { kind: "static" | "api" | "fixture"; value?: string; query?: string }
+export interface Oracle { kind: "static" | "api" | "fixture" | "clock"; value?: string; query?: string }
 export interface Fact { claim: string; oracle?: Oracle }
 
 export interface EvalCase {
@@ -633,6 +637,46 @@ export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
     args[k] = /^(-?\d+(\.\d+)?|true|false|null)$/.test(v) ? JSON.parse(v) : v;
   }
   return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, ...mcpTail };
+}
+
+/** A `clock` oracle's query: what (`weekday` or `date`) in which IANA zone, or null when it is not one this runtime can work out. */
+export function clockQuery(o: Oracle | undefined): { what: "weekday" | "date"; zone: string } | null {
+  if (o?.kind !== "clock") return null;
+  const m = /^(weekday|date)@([A-Za-z][A-Za-z0-9_+\-/]*)$/.exec((o.query ?? "").trim());
+  if (!m) return null;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: m[2]! }); } catch { return null; }
+  return { what: m[1] as "weekday" | "date", zone: m[2]! };
+}
+
+const ZH_DAYS = ["日", "一", "二", "三", "四", "五", "六"];
+const EN_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const EN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/** The ways an answer names the weekday or the date of `at` in `zone`, as one value of `||` alternatives (`names`). */
+export function clockValue(what: "weekday" | "date", zone: string, at: Date): string {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", weekday: "long" }).formatToParts(at);
+  const v = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  if (what === "weekday") {
+    const k = EN_DAYS.indexOf(v("weekday"));
+    const zh = ZH_DAYS[k]!;
+    const forms = [`星期${zh}`, `周${zh}`, `礼拜${zh}`, ...(k === 0 ? ["星期天", "周天", "礼拜天"] : []), EN_DAYS[k]!];
+    return forms.join("||");
+  }
+  const y = v("year"), m = Number(v("month")), d = Number(v("day"));
+  const mm = String(m).padStart(2, "0"), dd = String(d).padStart(2, "0");
+  const month = EN_MONTHS[m - 1]!;
+  return [`${y}-${mm}-${dd}`, `${m}月${d}日`, `${m}月${d}号`, `${month} ${d}`, `${d} ${month}`, `${month.slice(0, 3)} ${d}`].join("||");
+}
+
+/**
+ * A `clock` oracle's value for an attempt asked between `from` and `to`: what it is at either end (one value whose alternatives are
+ * both, when midnight fell between), or null when the query is not one (`clockQuery`).
+ */
+export function clockValues(o: Oracle | undefined, from: Date, to: Date): string[] | null {
+  const q = clockQuery(o);
+  if (!q) return null;
+  const alts = new Set([...clockValue(q.what, q.zone, from).split("||"), ...clockValue(q.what, q.zone, to).split("||")]);
+  return [[...alts].join("||")];
 }
 
 /** A GraphQL document that is one query: no mutation or subscription, whatever it is named. */
@@ -1748,7 +1792,8 @@ export interface Attempt {
 export const needsJudge = (c: EvalCase): boolean => !!c.rubric || judgeFacts(c).length > 0;
 
 /** A fact graded without a judge: a runnable oracle, or a static or fixture value. */
-const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined);
+const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || !!clockQuery(f.oracle)
+  || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.kind !== "clock" && f.oracle.value !== undefined);
 
 /**
  * What only a judge can grade, one line per fact: its claim and, where the oracle describes a read this runner cannot make,
@@ -1935,7 +1980,8 @@ export function planOf(cases: readonly EvalCase[], mode: Mode, env: Record<strin
     const filled = filledCase(c, env) ?? c;
     const facts = (filled.facts ?? []).map((f) => {
       const q = oracleQuery(f.oracle);
-      return q ? (q.via === "claw" ? "api" : q.via) : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
+      return q ? (q.via === "claw" ? "api" : q.via) : clockQuery(f.oracle) ? "clock"
+        : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
     });
     return [c.id, skip || `${c.turns.length} turn(s)`, `route=${c.route ?? "-"}`, `tools=${(c.tools_must ?? []).join(",") || "-"}`,
       `facts=${facts.join(",") || "-"}`, `budget=${JSON.stringify(c.latency_budget_s ?? {})}`].join("  ");
@@ -2008,7 +2054,7 @@ export function descriptiveValue(v: string): boolean {
     || /^(asks?|no|not|does|doesn't|states?|mentions?|lists?|names?|covers?|refuses?|declines?|offers?|says?|explains?|either|any|at least|reply|answer|regex)\b/i.test(t);
 }
 
-export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "blocked" | "judge-only" | "needs-vars"; detail: string }
+export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "bad-clock" | "blocked" | "judge-only" | "needs-vars"; detail: string }
 
 /**
  * What can be told about cases without running them. Problems (the check fails on them):
@@ -2036,6 +2082,8 @@ export function staticFindings(cases: readonly EvalCase[], arms: Arms, vars: Var
       // Runnable once its placeholders are filled, whatever they are filled with.
       else if (o?.kind === "api" && !oracleQuery({ ...o, query: (o.query ?? "").replace(PLACEHOLDER, "x") })) {
         notes.push({ id: c.id, kind: "judge-only", detail: `${f.claim}`.slice(0, 80) });
+      } else if (o?.kind === "clock" && !clockQuery(o)) {
+        problems.push({ id: c.id, kind: "bad-clock", detail: `${f.claim}: ${o.query ?? ""} (weekday@<zone> or date@<zone>)`.slice(0, 120) });
       }
     }
     if (c.blocked && armsOf(c, arms).every(({ allow }) => (c.tools_must ?? []).every((p) => reachable(p, allow)))) {

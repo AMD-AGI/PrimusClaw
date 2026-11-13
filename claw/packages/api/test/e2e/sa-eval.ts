@@ -169,7 +169,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, pacedPerHour, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
-  judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
+  judgePrompt, loadCases, messagesOf, clockValues, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
@@ -553,8 +553,14 @@ async function idle(sessionId: string, waitMs: number): Promise<boolean> {
 /** The values each fact expects, read now with the eval identity: the Claw API, GitHub, or a read tool of the plugin. */
 async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   const out: Array<string[] | null> = [];
+  // A clock fact is what the date or weekday is while the case is asked and answered: from now to the end of its last turn's time to
+  // answer (`clockValues`, either end counting).
+  const from = new Date();
+  const lastAt = Math.max(0, ...c.turns.map((t) => t.after_ms ?? 0));
+  const to = new Date(from.getTime() + lastAt + (c.latency_budget_s?.final ?? turnWaitMs(true) / 1000) * 1000);
   for (const [k, f] of (c.facts ?? []).entries()) {
     const o = f.oracle;
+    if (o?.kind === "clock") { out.push(clockValues(o, from, to)); continue; }
     const q = oracleQuery(o);
     if (!q) { out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null); continue; }
     // An oracle that could not be read (an error status, an outage, a server it may not call) says nothing about the answer:
