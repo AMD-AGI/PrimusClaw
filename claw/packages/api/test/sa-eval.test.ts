@@ -1484,4 +1484,3 @@ test("S-skills a skills case clears the identity's waiting skill drafts and thei
   );
   assert.deepEqual(skillDraftCards(waiting).map((w) => w.id), ["c1"], "only the assistant's skill draft cards; a schedule or a review card stays");
 });
-

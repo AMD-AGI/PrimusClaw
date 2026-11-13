@@ -1350,7 +1350,8 @@ async function clearSkillDrafts(): Promise<void> {
   const drafts = async (): Promise<string[] | null> => {
     const d = await api("GET", "/v1/users/me/skill-drafts");
     if (d.status === 404) return [];   // personal skills off: there is no draft
-    return d.status === 200 ? skillDraftIds(d.json) : null;
+    // A 200 whose body is no list of drafts is no reading of them: nothing would be cleared, and nothing seen left.
+    return d.status === 200 && Array.isArray(d.json?.data) ? skillDraftIds(d.json) : null;
   };
   const left = await drafts();
   if (!left) throw new Error("infra: the identity's skill drafts could not be read: not graded");
@@ -1627,7 +1628,6 @@ async function main(): Promise<void> {
           attemptsInSession++;
           preflightFailed = true;
           try {
-            if (MODE === "assistant" && clearsSkillDrafts(c)) await clearSkillDrafts();
             if (MODE === "assistant" && FRESH_ATTEMPT) {
               waiting = await closeCards();
               if (!waiting) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
@@ -1644,6 +1644,9 @@ async function main(): Promise<void> {
                 throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
               }
               preflightFailed = true;
+              // Skill drafts are cleared once no earlier turn is running: one past its attempt may still draft (its own skill_draft, or
+              // the server's draft after it ends).
+              if (clearsSkillDrafts(c)) await clearSkillDrafts();
             }
             memBefore = await memoriesBefore(filled);
             ATTEMPT_MEMORIES_BEFORE = memBefore;
