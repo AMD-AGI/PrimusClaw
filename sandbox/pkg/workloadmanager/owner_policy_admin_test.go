@@ -54,7 +54,7 @@ func newOwnerPolicyServer(t *testing.T, enableAuth bool) *Server {
 	cfg.EnableAuth = enableAuth
 	cfg.Identity = identity.NewClient(idp.URL, "agent-sandbox", "secret", "")
 	s := New(cfg, store.NewMemoryStore())
-	s.WithOwnerPolicyStore(grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants))
+	s.WithOwnerPolicyStore(grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, nil))
 	return s
 }
 
@@ -95,6 +95,15 @@ func TestOwnerPolicyAPIOnlySystemAdmin(t *testing.T) {
 		if w.Code != tc.want {
 			t.Fatalf("%s %s as %q = %d, want %d: %s", tc.method, tc.path, tc.token, w.Code, tc.want, w.Body.String())
 		}
+	}
+}
+
+func TestOwnerPolicyAPIWithoutStoreIs404(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := New(DefaultConfig(), store.NewMemoryStore())
+	w := serveOwnerPolicy(s, http.MethodGet, ownerPolicyTemplatesPath, "", "", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("no store = %d, want 404", w.Code)
 	}
 }
 

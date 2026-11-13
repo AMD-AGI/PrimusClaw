@@ -127,6 +127,8 @@ type Server struct {
 	builder    *builder.Builder // nil when image building not configured
 	// templateMembership lists the workspaces a caller may write templates in.
 	templateMembership TemplateMembership
+	// ownerPolicy is nil until the owner policy store is attached.
+	ownerPolicy *grant.OwnerPolicyStore
 }
 
 // TemplateMembership chooses the SaFE workspace of a template writer.
@@ -308,6 +310,9 @@ func (s *Server) setupRoutes() {
 	templates.GET("/:namespace/:name", s.handleTemplateGet)
 	templates.PUT("/:namespace/:name", s.handleTemplateUpdate)
 	templates.DELETE("/:namespace/:name", s.handleTemplateDelete)
+
+	// Owner policy templates: the templates identity keys may use.
+	s.mountOwnerPolicyRoutes(v1.Group("/admin/owner-policy/templates"))
 
 	// Sandbox policy management (§4.1 egress control) — stored on the SandboxPolicy CR.
 	// Dual-read, same wildcard rule as sessions: the SDK percent-encodes the
