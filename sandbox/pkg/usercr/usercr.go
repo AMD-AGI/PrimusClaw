@@ -96,21 +96,32 @@ const (
 	userAllowTTL = 30 * time.Second
 	// userDenyTTL is how long a missing User is reused.
 	userDenyTTL = 5 * time.Second
+	// userCacheSize is the most subjects kept. A new one past this drops one entry.
+	userCacheSize = 4096
+	// userReadTimeout bounds one User read shared by concurrent callers.
+	userReadTimeout = 5 * time.Second
 )
 
 // Authorizer decides workspace use from the token and the SaFE User.
 type Authorizer struct {
-	users  Reader
-	mu     sync.Mutex
-	cache  map[string]userCacheEntry
-	now    func() time.Time
-	flight singleflight.Group
+	users   Reader
+	mu      sync.Mutex
+	entries identity.TTL[cachedUser]
+	now     func() time.Time
+	flight  singleflight.Group
 }
 
-type userCacheEntry struct {
-	user  User
-	err   error
-	until time.Time
+type cachedUser struct {
+	user User
+	err  error
+}
+
+// Option changes how an Authorizer reads Users.
+type Option func(*Authorizer)
+
+// WithClock sets the clock used for cache expiry. Tests advance it past a TTL.
+func WithClock(now func() time.Time) Option {
+	return func(a *Authorizer) { a.now = now }
 }
 
 // New returns an authorizer that reads User objects through client.
@@ -119,47 +130,57 @@ func New(client dynamic.Interface) *Authorizer {
 }
 
 // NewFromReader returns an authorizer that reads users from r.
-func NewFromReader(r Reader) *Authorizer {
-	return &Authorizer{users: r}
+func NewFromReader(r Reader, opts ...Option) *Authorizer {
+	a := &Authorizer{users: r}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
+}
+
+// clock is the time cache expiry uses.
+func (a *Authorizer) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 // read returns the User. A found User is reused for 30s and a missing User for 5s. A read
-// that cannot reach the API server is not cached. Concurrent reads of one user share one call.
+// that cannot reach the API server is not cached. Concurrent reads of one user share one call,
+// and that call is not cancelled when the first request ends.
 func (a *Authorizer) read(ctx context.Context, userID string) (User, error) {
 	if a == nil || a.users == nil {
 		return User{}, fmt.Errorf("%w: User client is not configured", authz.ErrUnavailable)
 	}
-	now := time.Now()
-	if a.now != nil {
-		now = a.now()
-	}
+	now := a.clock()
 	a.mu.Lock()
-	if e, ok := a.cache[userID]; ok && now.Before(e.until) {
+	if e, ok := a.entries.Get(userID, now); ok {
 		a.mu.Unlock()
 		return e.user, e.err
 	}
 	a.mu.Unlock()
 	v, err, _ := a.flight.Do(userID, func() (any, error) {
-		u, err := a.users.Read(ctx, userID)
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), userReadTimeout)
+		defer cancel()
+		u, err := a.users.Read(rctx, userID)
 		if err != nil && errors.Is(err, authz.ErrUnavailable) {
-			return u, err
+			return cachedUser{}, err
 		}
 		ttl := userAllowTTL
 		if err != nil || !u.Found {
 			ttl = userDenyTTL
 		}
+		item := cachedUser{user: u, err: err}
 		a.mu.Lock()
-		if a.cache == nil {
-			a.cache = map[string]userCacheEntry{}
-		}
-		a.cache[userID] = userCacheEntry{user: u, err: err, until: now.Add(ttl)}
+		a.entries.Put(userID, item, now.Add(ttl), now, userCacheSize)
 		a.mu.Unlock()
-		return u, err
+		return item, err
 	})
 	if err != nil {
 		return User{}, err
 	}
-	return v.(User), nil
+	return v.(cachedUser).user, v.(cachedUser).err
 }
 
 // CanUseAllWorkspaces reports whether the token or the User is a system admin.

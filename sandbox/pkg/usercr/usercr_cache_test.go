@@ -76,6 +76,22 @@ func TestUserReadCache(t *testing.T) {
 	}
 }
 
+func TestUserReadIgnoresCallerCancel(t *testing.T) {
+	r := &countingReader{user: User{Found: true}, gate: make(chan struct{})}
+	a := NewFromReader(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.read(ctx, "u")
+		done <- err
+	}()
+	close(r.gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUserReadSharesOneCall(t *testing.T) {
 	r := &countingReader{user: User{Found: true}, gate: make(chan struct{})}
 	a := NewFromReader(r)
