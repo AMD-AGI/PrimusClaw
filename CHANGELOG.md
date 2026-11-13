@@ -129,6 +129,25 @@ release version, and its `appVersion` stays `latest`.
   `claw_skill_changes`, new metric `claw_user_skill_save_total`. With the switch off nothing changes: the router's
   request is byte for byte what it was, and the routes are as they were.
 
+## [0.4.3] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131319` (commit f44b5d0f). A patch release: a delivery link can send a signed-out
+browser to sign in (off unless `CLAW_BROWSER_SIGN_IN_URL` is set), and two dependency updates. No schema change.
+Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Added
+
+- A delivery link opened in a browser with no session can send it to sign in and back: with the new setting
+  `CLAW_BROWSER_SIGN_IN_URL` (for example `/login?redirect=`), `GET /v1/sessions/:id/deliveries/:deliveryId` that
+  carries no credential at all and whose `Accept` names `text/html` is answered 302 to that address with the link's
+  external path (the public path prefix from `CLAW_PUBLIC_URL`, else `X-Forwarded-Prefix`, included) URL-encoded at
+  the end, instead of the JSON 401. API clients, a credential that was presented and refused, and every other route
+  answer as before; unset, the default, nothing changes (#822).
+
+### Changed
+
+- Dependencies: `@hono/node-server` 2.1.5 to 2.1.8 (#817) and `hono` 4.13.13 to 4.13.18 (#820), lockfile only.
+
 ## [0.4.2] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131057` (commit 61998b05). A patch release: personal skills reach the assistant's

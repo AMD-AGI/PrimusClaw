@@ -11,19 +11,28 @@
  *          after it registered, with `onCleanup`, the stop of a process that children.json does not name (as a tmux
  *          server is), reported as `closed`
  *   EPIPE  as the signals, but the test only goes on writing its report: the other side closes the pipe it writes into
- * Every way it ends, it also leaves running two processes it started itself and registered nowhere (a detached one,
- * and one that ignores SIGTERM), reported as `started`. Before it ends it writes the directories it made, and the
+ *   SIGKILL  the process is killed in the middle of the test, so nothing of its own cleanup runs
+ * Before anything else, it leaves in its TMPDIR a stale run directory named with its own pid and another start time,
+ * which its own first `tmpdir` must remove. Every way it ends, it also leaves running two processes it started itself and registered nowhere (a detached one,
+ * and one that ignores SIGTERM), and a detached one named by a connector.pid as a connector's, reported as `started`. Before it ends it writes the directories it made, and the
  * adapters it started (one by a session, one below a wrapper that has exited), to TMP_FIXTURE_REPORT (outside that TMPDIR).
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import test from "node:test";
 import path from "node:path";
-import { ChildRegistry } from "../../src/children.js";
+import { ChildRegistry, processStart } from "../../src/children.js";
 import { Harness, tmpdir } from "./harness.js";
 import { liveTmpdirs, onCleanup } from "./tmp.js";
 
 const end = process.env.TMP_FIXTURE_END ?? "pass";
+
+// What an earlier file with this one's pid (since given out again) left when it was killed, untouched for long since:
+// this file's first directory removes it, though the pid is its own.
+const earlier = path.join(os.tmpdir(), `cc-run-${process.pid}-1-EARLYR`);
+fs.mkdirSync(path.join(earlier, "w-EARLYR"), { recursive: true, mode: 0o700 });
+fs.utimesSync(earlier, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
 
 test("the suite's setup", async () => {
   const attach = await Harness.create({ attach: { sessions: [] } });
@@ -59,7 +68,16 @@ test("the suite's setup", async () => {
   sleeper.unref();
   stubborn.unref();
   const started = [sleeper.pid!, stubborn.pid!];
-  const signal = end.startsWith("SIG") ? (end as NodeJS.Signals) : null;
+  // A connector a test started in a process of its own (its pid file in its home), which a file killed hard leaves running.
+  const connector = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  connector.unref();
+  const pidDir = path.join(tmpdir("cc-pid-"), "state");
+  fs.mkdirSync(pidDir, { recursive: true });
+  let start: string | null = null;
+  for (let i = 0; i < 50 && !start; i++) { start = processStart(connector.pid!); if (!start) await new Promise((r) => setTimeout(r, 20)); }
+  fs.writeFileSync(path.join(pidDir, "connector.pid"), JSON.stringify({ pid: connector.pid, start }));
+  started.push(connector.pid!);
+  const signal = end.startsWith("SIG") && end !== "SIGKILL" ? (end as NodeJS.Signals) : null;
   const closed: number[] = [];
   if (signal || end === "EPIPE") {
     // A daemon of the test's own, not in any children.json: only its closer stops it.
@@ -70,6 +88,7 @@ test("the suite's setup", async () => {
   }
   fs.writeFileSync(process.env.TMP_FIXTURE_REPORT!, JSON.stringify({ dirs: liveTmpdirs(), adapters, closed, started }));
   if (end === "exit") process.exit(3);
+  if (end === "SIGKILL") process.kill(process.pid, "SIGKILL");
   if (signal) {
     process.kill(process.pid, signal);
     await new Promise((r) => setTimeout(r, 60_000)); // ended by the signal well before this
