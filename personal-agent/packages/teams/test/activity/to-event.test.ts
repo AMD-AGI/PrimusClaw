@@ -35,7 +35,7 @@ test("a group message: who, where, the words, the mentions, the links and the qu
     locale: "zh-CN",
     conversation: { id: CONV, conversationType: "groupChat", tenantId: "t-1", name: "Release room" },
   };
-  const event = message(raw);
+  const event = message(raw, "Clawy"); // (a deployment that names its bot as the app is named)
   assert.equal(event.id, "g1");
   assert.deepEqual(event.sender, { id: "aad-a", channelUserId: "29:a", name: "Alice", email: "" });
   assert.equal(event.conversation.id, CONV);

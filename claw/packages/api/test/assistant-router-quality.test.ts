@@ -417,7 +417,7 @@ describe("router quality, the prompt", () => {
     // "how many" answered with the list, and a pull request that does not exist said so; router-read-v10 adds current facts read
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v22");
-    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v16");
+    assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v17");
     assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v28");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [

@@ -540,7 +540,7 @@ export function createAssistantMcpServer(
     if (selfStatusOn()) {
       mcp.tool(
         "claw_self_status",
-        "How you yourself (Clawy, the Claw assistant) have been running over the last day, for every user: messages received, how soon "
+        "How you yourself (the Claw assistant) have been running over the last day, for every user: messages received, how soon "
         + "the first reply came (p50, p90 in seconds), how many got no reply, router turns, work items and runs by how they ended, sandbox "
         + "failures and the version running. Counts only; it only reads.",
         { hours: z.number().int().min(1).max(168).optional().describe("The window in hours; 24 when left out.") },

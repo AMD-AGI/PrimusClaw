@@ -4,7 +4,7 @@
 /**
  * Which session the chat a message came from is attached to (`channel_context.attached`), as the router is told it.
  *
- * Measured 2026-11-07 (Clawy route-guard e2e): a Teams chat attached to a Claude session on a dev machine, and "@Clawy 这个聊天现在连着
+ * Measured 2026-11-07 (route-guard e2e): a Teams chat attached to a Claude session on a dev machine, and "@<assistant> 这个聊天现在连着
  * 哪个会话？" reached the assistant, which answered "没有连到任何开发机会话": nothing it was sent named the session.
  *
  *   AC1 the channel's field is kept bounded: a session id is required, phase is watching or attached, busy is a boolean, strings are one
@@ -47,7 +47,7 @@ describe("the router turn carries the attached session", { skip }, () => {
     alice = await w.user("alice");
   });
 
-  async function promptFor(context: unknown | undefined, content = "@Clawy 这个聊天现在连着哪个会话？"): Promise<string> {
+  async function promptFor(context: unknown | undefined, content = "@Helper 这个聊天现在连着哪个会话？"): Promise<string> {
     const turn = await w.routerTurn(alice);
     if (context !== undefined) {
       await w.q(
@@ -93,15 +93,19 @@ test("AC3 a chat whose session card is the window says the chat box comes to the
   const card = renderAttachedState(parsed);
   assert.ok(card.includes("chat box comes to you") && card.includes("card's own text box") && card.includes("/agent mode chat"), card);
   assert.ok(!card.includes("What the user types in this chat goes to that session"), card);
-  const chat = renderAttachedState(parseChannelContext({ attached: { ...ATTACHED, phase: "attached", chat_box: "chat" } }).attached!);
-  assert.ok(chat.includes("goes to that session") && chat.includes("starts with @Clawy"), chat);
+  const chatContext = parseChannelContext({ attached: { ...ATTACHED, phase: "attached", chat_box: "chat" }, assistant_name: "Helper" });
+  const chat = renderAttachedState(chatContext.attached!, chatContext.assistant_name);
+  assert.ok(chat.includes("goes to that session") && chat.includes('starts with "@Helper"'), chat);
+  // A client that names no assistant: the mention is said without a name, and no name is made up for it.
+  const unnamed = renderAttachedState(chatContext.attached!);
+  assert.ok(unnamed.includes("A message that @mentions you, and a request sent on the user's behalf, come to you instead"), unnamed);
   for (const junk of ["window", 1, true, null]) {
     assert.ok(!("chat_box" in parseChannelContext({ attached: { ...ATTACHED, chat_box: junk } }).attached!), String(junk));
   }
   const watching = renderAttachedState(parseChannelContext({ attached: { ...ATTACHED, chat_box: "card" } }).attached!);
   assert.ok(watching.includes("only watches") && watching.includes("chat box comes to you"), "a watched session takes nothing; the chat box is the assistant's");
-  const watchingChat = renderAttachedState(parseChannelContext({ attached: ATTACHED }).attached!);
-  assert.ok(watchingChat.includes("only watches") && watchingChat.includes("starts with @Clawy"), "chat mode: as before");
+  const watchingChat = renderAttachedState(parseChannelContext({ attached: ATTACHED }).attached!, "Helper");
+  assert.ok(watchingChat.includes("only watches") && watchingChat.includes('starts with "@Helper"'), "chat mode: as before");
 });
 
 test("AC2 the router is told which session, in words it can say back", async () => {

@@ -187,7 +187,7 @@ describe("the router writes itself, and a worker's words reach the user", { skip
   test("W4 github_comment posts nothing until the press, then exactly the comment shown, once; deny and refusals post nothing", async () => {
     await w.subscribe(alice.userId);
     const turn = await userTurn("看一下 https://github.com/AMD-AGI/PrimusClaw/pull/322，然后在这个 PR 上留一条评论");
-    const body = "`claw/packages/api/src/assistant/citations.ts:212` 用未脱敏的正文判定 cited，Clawy 收到的是脱敏后的正文，计数会偏高。";
+    const body = "`claw/packages/api/src/assistant/citations.ts:212` 用未脱敏的正文判定 cited，助理收到的是脱敏后的正文，计数会偏高。";
     const out = await sch.githubCommentTool(turn, { pr: "https://github.com/AMD-AGI/PrimusClaw/pull/322", body }) as Record<string, any>;
     assert.equal(out.done, false);
     assert.equal(out.pr, "AMD-AGI/PrimusClaw#322");

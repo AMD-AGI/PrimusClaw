@@ -258,7 +258,7 @@ export async function languageToAnswerIn(
 }
 
 /**
- * The languages a user can choose to be answered in, in their channel (Clawy's `/lang zh|en`), as the channel sends the choice
+ * The languages a user can choose to be answered in, in their channel (its `/lang zh|en`), as the channel sends the choice
  * (`channel_context.reply_language`), and the name the reply-language line gives each. `auto` is no choice: nothing is sent, and the
  * language is read from what the user writes, as above.
  */

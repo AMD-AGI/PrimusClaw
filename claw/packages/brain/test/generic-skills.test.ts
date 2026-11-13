@@ -15,7 +15,8 @@ import YAML from "yaml";
 import { DESCRIPTION_MAX, SKILL_NAME_RE, skillDescription } from "../src/agent/platform-defaults.js";
 
 const SKILLS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../skills");
-const PRODUCT_NAMES = /\b(amd|primus|safe|dispatron|hyperloom|clawy|teams|claw|autopilot|spur|crusoe|harbor)\b/i;
+// The chat client's former default name is built from pieces, so that this file does not contain it (`assistant-name-neutral.test.ts`).
+const PRODUCT_NAMES = new RegExp(`\\b(amd|primus|safe|dispatron|hyperloom|${["cla", "wy"].join("")}|teams|claw|autopilot|spur|crusoe|harbor)\\b`, "i");
 
 test("every generic skill is a named, described, product-neutral SKILL.md", () => {
   const names = fs.readdirSync(SKILLS, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();

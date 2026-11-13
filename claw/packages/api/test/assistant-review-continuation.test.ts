@@ -55,7 +55,7 @@ describe("assistant review continuation", { skip }, () => {
       CLAW_GITHUB_REVIEW_ENABLED: "true",
       CLAW_GITHUB_REVIEW_MCP_SECRET: MCP_SECRET,
       CLAW_ASSISTANT_REVIEW_ITEMS: "true",
-      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client",
     });
     ri = await import("../src/assistant/review-items.js");
     ({ mintSessionToolToken: mint } = await import("../src/github-review/token.js"));
