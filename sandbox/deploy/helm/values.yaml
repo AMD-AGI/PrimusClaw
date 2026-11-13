@@ -70,17 +70,37 @@ controlplane:
     # entry comes from the default or admin quota of that user.
     identity:
       introspectUrl: ""
-      # tokenUrl is the identity provider token endpoint. It is used only with
-      # identity keys: an identity-key create exchanges the caller's key there
-      # for an assertion bound to the Workload (RFC 8693, requested_token_type
-      # jwt) and copies it onto the Workload. assertionAudience and
-      # assertionDetailType are its aud and authorization_details type; they
-      # match the admission constraint.
+      # tokenUrl is the identity provider token endpoint. An identity-key sandbox
+      # exchanges the caller's key there for an assertion. With attestWorkloads,
+      # every sandbox create does, using the caller's key or the grant's platform
+      # key (RFC 8693, requested_token_type jwt). Off by default. Turn this on
+      # before rbac.workspaceSAR, and turn SaFE sandbox.admission on last.
+      # assertionAudience and assertionDetailType are its aud and
+      # authorization_details type; they match the admission constraint.
       tokenUrl: ""
+      attestWorkloads: false
       assertionAudience: "agent-sandbox-admission"
       assertionDetailType: "agent-sandbox-workload"
       clientSecret: "agent-sandbox-identity-client"
       ownerPolicyConfigMap: ""
+    # Workspace and platform permission come from SubjectAccessReview on the
+    # identity subject once workspaceSAR is true. Until then the platform role is
+    # read from the token and from the SaFE User, and the workspaces listed on the
+    # SaFE User decide workspace use. Turn this on after identity.attestWorkloads,
+    # and turn SaFE sandbox.admission on last.
+    # subjectPrefix is prepended to the identity user id and to each identity
+    # group (RBAC_SUBJECT_PREFIX); it must not be empty when workspaceSAR is true
+    # and must match the prefix SaFE uses for its RBAC projection. The platform
+    # ClusterRoles of this chart are bound to
+    # Group <subjectPrefix><adminGroup> and <subjectPrefix><viewerGroup>.
+    # adminGroup and viewerGroup are the identity group names, without the prefix.
+    # A builtin identity has no Group subjects, so those bindings apply when SaFE
+    # projects external groups. subjectPrefix must equal SaFE rbac.subject_prefix.
+    rbac:
+      subjectPrefix: "primus:"
+      adminGroup: system-admin
+      viewerGroup: system-admin-readonly
+      workspaceSAR: false
   # Graceful drain on rollout or eviction, in Kubernetes order:
   #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
   #     is removed from the Service endpoints and the gateway stops routing to
@@ -139,7 +159,9 @@ router:
     maxConcurrentRequests: 1000
     # false leaves the Router and Workload Manager with NO auth middleware at
     # all — not a weaker check, none. Set true in production; it requires
-    # controlplane.config.identity.introspectUrl and its client Secret.
+    # controlplane.config.identity.introspectUrl and its client Secret; the
+    # process exits when they are missing. controlplane.config.identity.attestWorkloads
+    # additionally requires controlplane.config.identity.tokenUrl.
     enableAuth: false
     # true makes a cluster Router accept /v1 only as invocations forwarded by the
     # managing Router and refuse the E2B control plane, which the managing
@@ -149,7 +171,6 @@ router:
     # SANDBOX_UPSTREAM_PUBLIC_KEY is set only on a cluster Router in multi-cluster
     # mode; a single-cluster deployment leaves it unset.
     upstreamOnly: ""
-    safeApiUrl: ""                # grant identity check (SAFE_API_URL); not used for /v1 auth
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
     # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
     # a namespace that does not match gets 403 namespace_not_admitted (not 404,
@@ -185,7 +206,6 @@ workloadmanager:
   config:
     # Mirrors router.config.enableAuth (the control plane copies it at startup).
     enableAuth: false
-    safeApiUrl: ""
     gcInterval: 15s
     defaultTTL: 24h
   extraEnv: []

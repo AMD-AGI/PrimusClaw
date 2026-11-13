@@ -29,7 +29,8 @@
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
 #   TEMPLATES_VARIANT=default                 # default | kata (both use default-templates.yaml)
 #   IDENTITY_INTROSPECT_URL=                  # set to enable /v1 authentication (recommended)
-#   SAFE_API_URL=                             # SaFE API URL for the grant identity check
+#   IDENTITY_TOKEN_URL=                       # token endpoint; the process exits only when ENABLE_WORKLOAD_ASSERTION=true and this is unset
+#   RBAC_SUBJECT_PREFIX=primus:               # prefix of identity users and groups in SubjectAccessReview
 #   ALLOW_INSECURE_NO_AUTH=false              # true = install WITHOUT auth (dev clusters only)
 #   EGRESS_ENABLED=true                       # enable EnvD egress enforcement
 #   EGRESS_EXTRA_BLOCKED_CIDRS=               # comma-separated additional CIDRs
@@ -525,18 +526,20 @@ fi
 # at all, so anyone who can reach them can create sandboxes and execute code
 # inside them. The control plane refuses to start in that state unless the risk is
 # acknowledged, and this installer will not pick a side on the operator's behalf.
-if [[ -n "${SAFE_API_URL:-}" ]]; then
-    HELM_ARGS+=(
-        --set "router.config.safeApiUrl=${SAFE_API_URL}"
-        --set "workloadmanager.config.safeApiUrl=${SAFE_API_URL}"
-    )
+if [[ -n "${RBAC_SUBJECT_PREFIX:-}" ]]; then
+    HELM_ARGS+=( --set-string "controlplane.config.rbac.subjectPrefix=${RBAC_SUBJECT_PREFIX}" )
 fi
+[[ "${ENABLE_WORKSPACE_SAR:-false}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.rbac.workspaceSAR=true" )
+[[ "${ENABLE_WORKLOAD_ASSERTION:-false}" == "true" ]] && HELM_ARGS+=( --set "controlplane.config.identity.attestWorkloads=true" )
 if [[ -n "${IDENTITY_INTROSPECT_URL:-}" ]]; then
     HELM_ARGS+=(
         --set "router.config.enableAuth=true"
         --set "workloadmanager.config.enableAuth=true"
         --set "controlplane.config.identity.introspectUrl=${IDENTITY_INTROSPECT_URL}"
     )
+    if [[ -n "${IDENTITY_TOKEN_URL:-}" ]]; then
+        HELM_ARGS+=( --set "controlplane.config.identity.tokenUrl=${IDENTITY_TOKEN_URL}" )
+    fi
     ok "authentication ENABLED against ${IDENTITY_INTROSPECT_URL}"
 elif [[ "${ALLOW_INSECURE_NO_AUTH:-false}" == "true" ]]; then
     HELM_ARGS+=( --set "security.allowInsecureNoAuth=true" )

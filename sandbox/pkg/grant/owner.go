@@ -21,6 +21,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 const (
@@ -440,64 +441,16 @@ func (s *Service) deleteDroppedOwnerTemplates(ctx context.Context, wanted map[st
 	return nil
 }
 
-// ReadOwnerUser reads the SaFE User of userID once. It returns nil when the
-// membership checker cannot read users. A read error is returned unchanged.
-func (s *Service) ReadOwnerUser(ctx context.Context, userID string) (*OwnerUser, error) {
-	reader, ok := s.membership.(UserReader)
-	if !ok || userID == "" {
-		return nil, nil
+// OwnerWorkspace picks the workspace for an identity-key sandbox.
+// The authorizer decides: workspace SAR requires a named workspace, and the User authorizer
+// may return the only workspace listed on the User.
+func (s *Service) OwnerWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	if s.authz == nil {
+		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "authorization client is not configured")
 	}
-	u, err := reader.ReadUser(ctx, userID)
+	ws, err := s.authz.ChooseWorkspace(ctx, tok, requested)
 	if err != nil {
-		return nil, err
+		return "", membershipErr(err, requested)
 	}
-	return &u, nil
-}
-
-// OwnerWorkspace picks the workspace for an identity-key sandbox. An admin must
-// request a workspace and may use any. A requested workspace of other users must
-// be listed on the User. Without a request, the user's only listed workspace is
-// used. user is the User read earlier in the request, or nil to read it here.
-func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, admin bool, user *OwnerUser) (string, error) {
-	if admin {
-		if requested == "" {
-			return "", opErr(http.StatusBadRequest, "workspace_required", "system-admin must set metadata agent-sandbox.io/workspace")
-		}
-		return requested, nil
-	}
-	if user == nil {
-		u, err := s.ReadOwnerUser(ctx, userID)
-		if _, ok := err.(*OpError); ok {
-			return "", err
-		}
-		if err != nil {
-			return "", opWrap(http.StatusServiceUnavailable, "membership_unavailable", "user is temporarily unreadable", err)
-		}
-		user = u
-	}
-	if requested != "" {
-		if user != nil {
-			if err := user.allows([]string{requested}); err != nil {
-				return "", err
-			}
-			return requested, nil
-		}
-		if s.membership == nil {
-			return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-		}
-		if err := s.membership.Check(ctx, userID, []string{requested}); err != nil {
-			return "", err
-		}
-		return requested, nil
-	}
-	if user == nil {
-		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	if !user.Found {
-		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
-	}
-	if len(user.Workspaces) != 1 {
-		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-	}
-	return user.Workspaces[0], nil
+	return ws, nil
 }

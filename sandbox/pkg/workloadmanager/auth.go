@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -51,9 +52,15 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		setVerifiedUser(c, tok)
+		role, err := authz.ResolveRole(s.cfg.Authz, c.Request.Context(), tok)
+		if err != nil {
+			log.Warn("WM: caller platform role unreadable", "userId", tok.Subject, "error", err)
+			abortCaller(c, authz.Unavailable)
+			return
+		}
+		setVerifiedUser(c, tok, role)
 		log.Debug("WM: auth OK", "userId", tok.Subject,
-			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
+			"role", role, "path", c.Request.URL.Path)
 		c.Next()
 	}
 }
@@ -64,8 +71,7 @@ func abortCaller(c *gin.Context, r identity.Rejection) {
 }
 
 // setVerifiedUser writes the verified identity to request headers and the Gin context.
-func setVerifiedUser(c *gin.Context, tok identity.Token) {
-	role := identity.PlatformRole(tok.Roles)
+func setVerifiedUser(c *gin.Context, tok identity.Token, role string) {
 	c.Request.Header.Set(UserIDHeader, tok.Subject)
 	c.Request.Header.Set(UserNameHeader, tok.Email)
 	c.Request.Header.Set(UserRoleHeader, role)

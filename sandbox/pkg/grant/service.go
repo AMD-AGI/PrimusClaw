@@ -54,21 +54,25 @@ type Recorder interface {
 
 // Service is the grant admin API backed by SandboxGrant CRs.
 type Service struct {
-	client     ctrlclient.Client
-	reader     ctrlclient.Reader
-	namespace  string
-	dataKey    []byte
-	authn      Authenticator
-	attest     AttestationChecker
-	identity   IdentityChecker
-	membership MembershipChecker
-	reclaimer  Reclaimer
-	exists     SandboxExists
-	promoter   PendingPromoter
-	record     Recorder
-	now        func() time.Time
-	owner      atomic.Pointer[ownerConfig]
-	writes     grantLocks
+	client    ctrlclient.Client
+	reader    ctrlclient.Reader
+	namespace string
+	dataKey   []byte
+	authn     Authenticator
+	attest    AttestationChecker
+	identity  Introspector
+	authz     Authorizer
+	reclaimer Reclaimer
+	exists    SandboxExists
+	promoter  PendingPromoter
+	record    Recorder
+	now       func() time.Time
+	owner     atomic.Pointer[ownerConfig]
+	writes    grantLocks
+	// attestWorkloads is true when every Workload carries an identity assertion.
+	attestWorkloads bool
+	// reviewOwner is true when a grant-key create must review the owner's workspace.
+	reviewOwner bool
 }
 
 // grantLocks serialises the read-modify-write of one grant inside this process,
@@ -105,18 +109,23 @@ func (s *Service) SetPromoter(p PendingPromoter) {
 
 // Options configures a Service.
 type Options struct {
-	Client     ctrlclient.Client
-	Reader     ctrlclient.Reader
-	Namespace  string
-	DataKey    []byte
-	Authn      Authenticator
-	Attest     AttestationChecker
-	Identity   IdentityChecker
-	Membership MembershipChecker
-	Reclaimer  Reclaimer
-	Exists     SandboxExists
-	Record     Recorder
-	Now        func() time.Time
+	Client    ctrlclient.Client
+	Reader    ctrlclient.Reader
+	Namespace string
+	DataKey   []byte
+	Authn     Authenticator
+	Attest    AttestationChecker
+	Identity  Introspector
+	Authz     Authorizer
+	Reclaimer Reclaimer
+	Exists    SandboxExists
+	Record    Recorder
+	Now       func() time.Time
+	// AttestWorkloads is true when every Workload carries an identity assertion.
+	AttestWorkloads bool
+	// ReviewOwner is true when a grant-key create reviews the owner's workspace.
+	// A User authorizer does not set this; workspace SAR does.
+	ReviewOwner bool
 }
 
 // New returns a grant service. Client and Namespace are required.
@@ -130,18 +139,20 @@ func New(opt Options) *Service {
 		reader = opt.Client
 	}
 	return &Service{
-		client:     opt.Client,
-		reader:     reader,
-		namespace:  opt.Namespace,
-		dataKey:    opt.DataKey,
-		authn:      opt.Authn,
-		attest:     opt.Attest,
-		identity:   opt.Identity,
-		membership: opt.Membership,
-		reclaimer:  opt.Reclaimer,
-		exists:     opt.Exists,
-		record:     opt.Record,
-		now:        now,
+		client:          opt.Client,
+		reader:          reader,
+		namespace:       opt.Namespace,
+		dataKey:         opt.DataKey,
+		authn:           opt.Authn,
+		attest:          opt.Attest,
+		identity:        opt.Identity,
+		authz:           opt.Authz,
+		reclaimer:       opt.Reclaimer,
+		exists:          opt.Exists,
+		record:          opt.Record,
+		now:             now,
+		attestWorkloads: opt.AttestWorkloads,
+		reviewOwner:     opt.ReviewOwner,
 	}
 }
 
@@ -167,20 +178,16 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err := s.attest.Check(req.Attestation, req); err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if s.identity == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "identity_unavailable", "SaFE client is not configured")
-	}
-	userName, err := s.identity.Check(ctx, req.PlatformKey, req.Owner.UserID)
+	tok, err := s.ownerToken(ctx, req.PlatformKey, req.Owner.UserID)
 	if err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if userName != "" {
-		req.Owner.UserName = userName
+	if tok.Username != "" {
+		req.Owner.UserName = tok.Username
+	} else if tok.Email != "" {
+		req.Owner.UserName = tok.Email
 	}
-	if s.membership == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	if err := s.membership.Check(ctx, req.Owner.UserID, req.Owner.Workspaces); err != nil {
+	if err := s.checkWorkspaces(ctx, tok, req.Owner.Workspaces); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	roles, expanded, stored, err := expandTemplates(req.Issuer.AppRunID, req.Roles, req.Templates)

@@ -18,6 +18,28 @@ const (
 	RoleDefault = "default"
 )
 
+// PlatformRole maps token roles to one platform role. system-admin wins over
+// system-admin-readonly. Anything else is default. This is the answer while
+// workspace SubjectAccessReview is off.
+func PlatformRole(roles []string) string {
+	admin, readonly := false, false
+	for _, role := range roles {
+		switch role {
+		case RoleSystemAdmin:
+			admin = true
+		case RoleSystemAdminReadonly:
+			readonly = true
+		}
+	}
+	if admin {
+		return RoleSystemAdmin
+	}
+	if readonly {
+		return RoleSystemAdminReadonly
+	}
+	return RoleDefault
+}
+
 // Rejection is the answer to a caller whose credential is not accepted.
 type Rejection struct {
 	Status  int
@@ -56,21 +78,4 @@ func RejectionFor(err error) Rejection {
 		Code:    "caller_auth_unavailable",
 		Message: "identity provider is unavailable",
 	}
-}
-
-// PlatformRole picks the highest-priority role from the introspected roles.
-// The roles are the platform roles the identity provider reads from its store (the
-// platform groups plus "default"), so they are taken as the caller's role.
-// Priority: system-admin > system-admin-readonly > default.
-func PlatformRole(roles []string) string {
-	best := RoleDefault
-	for _, r := range roles {
-		switch r {
-		case RoleSystemAdmin:
-			return RoleSystemAdmin
-		case RoleSystemAdminReadonly:
-			best = RoleSystemAdminReadonly
-		}
-	}
-	return best
 }
