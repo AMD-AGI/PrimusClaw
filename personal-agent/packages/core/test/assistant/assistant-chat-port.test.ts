@@ -56,7 +56,7 @@ it("no reply style rides on the message and no plugin without claw plugin id", a
   // (the context names only the surface the message came from)
   assert.deepEqual(
     [heard?.text, heard?.context, heard?.plugin, heard?.modelKey],
-    ["hello", { channel: "teams" }, undefined, ""],
+    ["hello", { channel: "teams", timezone: "Asia/Shanghai" }, undefined, ""],
   );
 });
 

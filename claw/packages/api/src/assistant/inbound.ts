@@ -29,6 +29,7 @@ import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
 import { messageSurface, recordSurfaceUsed } from "../notifications/surfaces.js";
 import { assistantNameOf } from "./assistant-name.js";
+import { timeZoneOf } from "./now.js";
 import { isChosenLanguage, type ChosenLanguage } from "./language.js";
 
 export { ASSISTANT_NAME_MAX, ASSISTANT_NAME_WORDS_MAX, assistantNameOf } from "./assistant-name.js";
@@ -145,6 +146,8 @@ export interface ChannelContext {
    * names none, and the assistant is told of itself without a name. Claw names no client itself: a name is only ever the client's.
    */
   assistant_name?: string;
+  /** The person's IANA time zone as their chat has it (`timeZoneOf`); absent: the chat names none (`now.ts` takes the default). */
+  timezone?: string;
 }
 
 /**
@@ -217,12 +220,14 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const attached = parseAttached(c.attached);
   const via = CHANNEL_VIAS.find((v) => v === c.via);
   const assistantName = assistantNameOf(c.assistant_name);
+  const timezone = timeZoneOf(c.timezone);
   return {
     ...(channel ? { channel } : {}), ...(via ? { via } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
     people, actions, repos, handoffs, files: parseFiles(c.files),
     ...(attached !== undefined ? { attached } : {}),
     ...(isChosenLanguage(c.reply_language) ? { reply_language: c.reply_language } : {}),
     ...(assistantName ? { assistant_name: assistantName } : {}),
+    ...(timezone ? { timezone } : {}),
   };
 }
 
