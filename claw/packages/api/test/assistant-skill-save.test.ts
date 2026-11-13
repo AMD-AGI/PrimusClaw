@@ -24,6 +24,12 @@
  *   E9 a worker's save_skill: with the user's own request quoted from what they wrote to their assistant, saved now with a card in the
  *      assistant; without it, a draft whose card waits in the assistant, its file writes folded into the draft and not onto a skill
  *   E10 skill_list lists turned off and manual skills and the drafts; the write tools are the router's only, in the user's own chat
+ *   E11 words that say not to ("不要存成技能", "don't delete it") ask for nothing; a worker's quote counts only from just before its
+ *       item was started
+ *   E12 an Undo applies only to the skill as its change left it: a later change of the description alone makes it stale; and what
+ *       it would put back passes the checks a save passes (a secret stored before them is not put back)
+ *   E13 a worker's file writes on a skill of the user's that its turn did not save at their request: a draft, files and removals
+ *       folded in, the skill untouched until Save
  */
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
@@ -390,5 +396,111 @@ describe("assistant: saving the user's personal skills from the conversation", {
     const group = await inTurn(bob, ASK, "skill_save", { name: "standup-notes", content: STANDUP, request_quote: "存成我的一个技能" });
     assert.deepEqual([group.isError, group.body.error], [true, "skills_not_here"]);
     assert.deepEqual(await skills("bob"), []);
+  });
+
+  test("E11 words that say not to ask for nothing; a worker's quote counts only from just before its item", async () => {
+    const intent = await import("../src/assistant/skill-intent.js");
+    assert.equal(intent.asksToSaveSkill("不要把这个存成技能"), false);
+    assert.equal(intent.asksToSaveSkill("don't save this as a skill"), false);
+    assert.equal(intent.asksToAct("别删 standup-notes 技能", "delete", "standup-notes"), false);
+    assert.equal(intent.asksToAct("先别用 standup-notes 这个技能了", "disable", "standup-notes"), true, "a turn-off said with 别");
+    const no = await save(alice, { request_quote: "不要把这个存成技能" }, "不要把这个存成技能");
+    assert.deepEqual([no.isError, no.body.error], [true, "not_asked"]);
+    await save(alice, {});
+    const keep = await inTurn(alice, "别删 standup-notes 技能", "skill_delete", { name: "standup-notes", request_quote: "别删 standup-notes 技能" });
+    assert.deepEqual([keep.isError, keep.body.error], [true, "not_asked"]);
+    assert.equal((await skills())[0].deleted_at, null);
+
+    // Asked two hours before the item was started: not the request that started it.
+    const consumer = await import("../src/events/consumer.js");
+    const { sc } = await import("../src/infra/nats.js");
+    const original = { ...consumer.completionPorts };
+    Object.assign(consumer.completionPorts, {
+      maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {}, enqueueEvolutionJob: async () => {},
+      recordSkillFeedback: async () => {}, checkProbationGraduation: async () => {}, recordWorkerTurnEnd: async () => {},
+    });
+    const tombstone = consumer.tombstoneReader.has;
+    consumer.tombstoneReader.has = async () => false;
+    try {
+      const old = await message(alice, "把发布说明的做法存成技能 release-notes");
+      await w.closeRun(old.task_id);
+      await w.q("UPDATE claw_assistant_messages SET received_at = NOW() - INTERVAL '2 hours' WHERE message_id = $1", [old.mid]);
+      const item = await w.createItem(alice, "release notes");
+      const run = await w.workerTurn(item.itemId);
+      await consumer.consumeEventDelivery({
+        subject: `events.${run.sid}`, seq: 1, ack: () => {}, nak: () => { throw new Error("nak"); },
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: run.sid, task_id: run.task_id, user_id: "alice", message_id: run.mid, prompt: "do it",
+          final_text: "done", failed: false, error_count: 0,
+          skills_to_save: [{ skill_name: "release-notes", content: "## Steps\n1. a", description: "x", request_quote: "把发布说明的做法存成技能" }],
+        })),
+      } as any);
+    } finally {
+      Object.assign(consumer.completionPorts, original);
+      consumer.tombstoneReader.has = tombstone;
+    }
+    assert.ok(!(await skills()).some((s) => s.skill_name === "release-notes"), "not saved");
+    assert.equal((await w.q("SELECT 1 FROM claw_skill_drafts WHERE skill_name = 'release-notes'")).length, 1, "a draft instead");
+  });
+
+  test("E12 an Undo applies only to the skill as its change left it, and puts back nothing a save would refuse", async () => {
+    const first = await save(alice, {});
+    const svc = await import("../src/marketplace/skill-service.js");
+    // The description alone changed since (Edit on a card): the save's Undo is stale.
+    const edited = await svc.saveUserSkillRecorded("alice", { name: "standup-notes", content: STANDUP, description: "站会纪要" }, { origin: "api", actor: "api" });
+    assert.ok(edited.ok && edited.changed);
+    assert.equal((await undo(first.body.change_id)).body.reason, "changed");
+
+    // A version stored before the checks, with a secret in it, is never put back.
+    await w.q("UPDATE claw_skills SET content = $1, content_sha = NULL WHERE skill_name = 'standup-notes'", [`token: ${FAKE_GH_TOKEN}`]);
+    const changed = await inTurn(alice, "把 standup-notes 技能改成新的步骤", "skill_update", {
+      name: "standup-notes", content: STANDUP, request_quote: "把 standup-notes 技能改成新的步骤",
+    });
+    assert.equal(changed.isError, false, JSON.stringify(changed.body));
+    const back = await undo(changed.body.change_id);
+    assert.deepEqual([back.status, back.body.reason], [409, "secret"]);
+    const [row] = await skills();
+    assert.equal(row.content, STANDUP, "the skill is as the update left it");
+  });
+
+  test("E13 a worker's file writes on a skill it did not save at the user's request are a draft; Save applies them", async () => {
+    await save(alice, { files: [{ path: "templates/a.md", content: "A" }, { path: "templates/old.md", content: "OLD" }] });
+    const consumer = await import("../src/events/consumer.js");
+    const { sc } = await import("../src/infra/nats.js");
+    const original = { ...consumer.completionPorts };
+    Object.assign(consumer.completionPorts, {
+      maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {}, enqueueEvolutionJob: async () => {},
+      recordSkillFeedback: async () => {}, checkProbationGraduation: async () => {}, recordWorkerTurnEnd: async () => {},
+    });
+    const tombstone = consumer.tombstoneReader.has;
+    consumer.tombstoneReader.has = async () => false;
+    try {
+      const item = await w.createItem(alice, "tidy the skill");
+      const run = await w.workerTurn(item.itemId);
+      await consumer.consumeEventDelivery({
+        subject: `events.${run.sid}`, seq: 1, ack: () => {}, nak: () => { throw new Error("nak"); },
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: run.sid, task_id: run.task_id, user_id: "alice", message_id: run.mid, prompt: "do it",
+          final_text: "done", failed: false, error_count: 0, skills_to_save: [],
+          skill_file_mutations: [
+            { action: "update", skill_name: "standup-notes", file_path: "templates/a.md", content: "A2" },
+            { action: "add", skill_name: "standup-notes", file_path: "scripts/run.sh", content: "echo run" },
+            { action: "remove", skill_name: "standup-notes", file_path: "templates/old.md" },
+          ],
+        })),
+      } as any);
+    } finally {
+      Object.assign(consumer.completionPorts, original);
+      consumer.tombstoneReader.has = tombstone;
+    }
+    const files = async () => (await w.q("SELECT file_path, content FROM claw_skill_files ORDER BY file_path")).map((f) => `${f.file_path}=${f.content}`);
+    assert.deepEqual(await files(), ["templates/a.md=A", "templates/old.md=OLD"], "untouched until the user says so");
+    const [conf] = await w.q("SELECT confirmation_id FROM claw_assistant_confirmations WHERE kind = 'skill_save' AND status = 'pending'");
+    assert.ok(conf, "a draft's card waits");
+    const pressed = await schedules.decideConfirmation({ userId: "alice", confirmationId: conf.confirmation_id, decision: "allow", via: "button" });
+    assert.equal(pressed.status, "done", JSON.stringify(pressed));
+    assert.deepEqual(await files(), ["scripts/run.sh=echo run", "templates/a.md=A2"]);
+    assert.equal((await undo(String(pressed.result?.change_id))).body.data.undone, "restored_version");
+    assert.deepEqual(await files(), ["templates/a.md=A", "templates/old.md=OLD"], "and Undo puts the files back");
   });
 });

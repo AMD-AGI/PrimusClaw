@@ -878,6 +878,8 @@ export interface UserSkillInput {
   files?: Array<{ path: string; content: string; is_binary?: boolean }>;
   /** `manual`: used only when the user names it, never listed. Absent: a new skill is `auto`, an existing one keeps its own. */
   invocation?: "auto" | "manual";
+  /** Supporting files to remove, by path (a confirmed draft of a worker's file writes). */
+  removeFiles?: string[];
 }
 
 export interface UserSkillSaveContext {
@@ -897,6 +899,7 @@ function normalizedInput(input: UserSkillInput): Required<Omit<UserSkillInput, "
     description: typeof input.description === "string" ? input.description.trim() : "",
     content: typeof input.content === "string" ? input.content : "",
     files: Array.isArray(input.files) ? input.files : [],
+    removeFiles: Array.isArray(input.removeFiles) ? input.removeFiles.filter((p) => typeof p === "string") : [],
     ...(input.invocation === "auto" || input.invocation === "manual" ? { invocation: input.invocation } : {}),
   };
 }
@@ -960,6 +963,9 @@ export async function saveUserSkill(userId: string, raw: UserSkillInput, ctx: Us
     for (const f of files) {
       if (await writeSkillFileRow(q, userId, saved.id, { file_path: f.path, content: f.content, is_binary: f.is_binary }, "upsert")) changed = true;
     }
+    for (const path of input.removeFiles) {
+      if ((await q("DELETE FROM claw_skill_files WHERE skill_id = $1 AND file_path = $2", [saved.id, path])).rowCount) changed = true;
+    }
     if (input.invocation) {
       const moved = await q("UPDATE claw_skills SET invocation = $1 WHERE id = $2 AND invocation IS DISTINCT FROM $1", [input.invocation, saved.id]);
       if (moved.rowCount) changed = true;
@@ -968,7 +974,7 @@ export async function saveUserSkill(userId: string, raw: UserSkillInput, ctx: Us
     const over = await skillCapacityProblem(q, saved.id);
     if (over) throw new SkillRefusal(over);
     if (!changed) return saved;
-    if (files.length) await refreshContentSha(q, saved.id);
+    if (files.length || input.removeFiles.length) await refreshContentSha(q, saved.id);
     await recordSkillEvent(q, {
       userId, skillName: name, version: saved.version, op: saved.created ? "create" : "update", actor: ctx.actor,
       sessionId: ctx.sessionId, detail: { origin: ctx.origin, files: files.map((f) => f.path), ...(input.invocation ? { invocation: input.invocation } : {}) },
@@ -1023,6 +1029,16 @@ async function stateOf(q: Querier, row: { id: number; description: string; invoc
   };
 }
 
+/**
+ * What a change left a skill as, for an undo to check it still is: SKILL.md and its files (their fingerprint), the description and
+ * the invocation. A later edit of any of them, the description alone included, makes the change no longer the last one.
+ */
+async function stateStamp(q: Querier, row: { id: number; description: string; invocation: string }): Promise<string | null> {
+  const snap = await readSkillSnapshot(q, row.id);
+  if (!snap) return null;
+  return createHash("sha256").update(`${snap.sha}\0${row.description}\0${row.invocation}`).digest("hex");
+}
+
 async function recordChange(q: Querier, c: {
   userId: string; name: string; op: SkillChangeOp; versionAfter?: number | null; shaAfter?: string | null; previous?: unknown; sessionId?: string | null;
 }): Promise<{ id: string; expiresAt: string }> {
@@ -1060,7 +1076,7 @@ export async function saveUserSkillRecorded(
     const saved = await saveUserSkill(userId, input, { ...ctx, query: q });
     if (!saved.ok || !saved.changed) return saved;
     const after = await visibleRow(q, userId, name);
-    const sha = after ? (await readSkillSnapshot(q, after.id))?.sha ?? null : null;
+    const sha = after ? await stateStamp(q, after) : null;
     const change = await recordChange(q, {
       userId, name, op: previous && !saved.created ? "update" : "create", versionAfter: after?.version ?? saved.version, shaAfter: sha,
       previous: previous && !saved.created ? previous.state : undefined, sessionId: ctx.sessionId,
@@ -1076,8 +1092,8 @@ export async function refreshChangeAfter(changeId: string): Promise<void> {
     const c = (await q("SELECT user_id, skill_name FROM claw_skill_changes WHERE id = $1 AND undone_at IS NULL FOR UPDATE", [changeId])).rows[0];
     if (!c) return;
     const row = await visibleRow(q, c.user_id, c.skill_name);
-    const snap = row ? await readSkillSnapshot(q, row.id) : null;
-    if (row && snap) await q("UPDATE claw_skill_changes SET version_after = $2, sha_after = $3 WHERE id = $1", [changeId, row.version, snap.sha]);
+    const stamp = row ? await stateStamp(q, row) : null;
+    if (row && stamp) await q("UPDATE claw_skill_changes SET version_after = $2, sha_after = $3 WHERE id = $1", [changeId, row.version, stamp]);
   });
 }
 
@@ -1126,7 +1142,7 @@ export async function setUserSkillEnabled(
 
 export type UndoResult =
   | { ok: true; op: SkillChangeOp; name: string; version: number | null; undone: "deleted" | "restored_version" | "restored" | "enabled" | "disabled" }
-  | { ok: false; error: "not_found" | "expired" | "undone" | "changed" | "full" | "too_large"; message: string };
+  | { ok: false; error: "not_found" | "expired" | "undone" | "changed" | "full" | "too_large" | "secret" | "injection"; message: string };
 
 /**
  * Take back one recorded change of the user's (`claw_skill_changes`): only theirs, only once, only within `SKILL_UNDO_TTL_HOURS`,
@@ -1156,13 +1172,19 @@ export async function undoSkillChange(
         recordSkillEvent(q, { userId, skillName: name, version, op: eop, actor: ctx.actor, sessionId: ctx.sessionId, detail: { undo: changeId, of: op } });
       let out: UndoResult;
       if (op === "create" || op === "update") {
-        if (!row || row.version !== Number(c.version_after) || (await readSkillSnapshot(q, row.id))?.sha !== c.sha_after) return changed();
+        if (!row || row.version !== Number(c.version_after) || (await stateStamp(q, row)) !== c.sha_after) return changed();
         if (op === "create") {
           await q("UPDATE claw_skills SET deleted_at = NOW() WHERE user_id = $1 AND skill_name = $2 AND deleted_at IS NULL", [userId, name]);
           await event("delete", row.version);
           out = { ok: true, op, name, version: row.version, undone: "deleted" };
         } else {
           const prev = c.previous as SkillState;
+          // What it goes back to passes the checks a save passes now: no secret, no instruction hijack.
+          const scanned = scanSkillParts([
+            { file: "description", text: prev.description ?? "" }, { file: "SKILL.md", text: prev.content },
+            ...(prev.files ?? []).filter((f) => !f.is_binary).map((f) => ({ file: f.path, text: f.content })),
+          ], { origin: "api" });
+          if (scanned) throw new SkillRefusal(scanned);
           const moved = (await q(
             `UPDATE claw_skills SET content = $2, description = $3, invocation = $4, version = version + 1, last_accessed = NOW()
               WHERE id = $1 RETURNING version`,
@@ -1207,7 +1229,8 @@ export async function undoSkillChange(
     });
   } catch (err) {
     if (err instanceof SkillRefusal) {
-      return { ok: false, error: err.refusal.error === "too_many_files" ? "too_large" : (err.refusal.error as "too_large"), message: err.refusal.message };
+      const error = err.refusal.error === "secret" || err.refusal.error === "injection" ? err.refusal.error : "too_large";
+      return { ok: false, error, message: err.refusal.message };
     }
     throw err;
   }
@@ -1246,6 +1269,8 @@ export interface SkillDraft {
   /** The skill a save would change, when the name is one the user has (its current version). */
   replaces: string | null;
   invocation?: "auto" | "manual";
+  /** Files a save of the draft removes (a worker's file writes on a skill the user has). */
+  removeFiles?: string[];
   origin: SkillOrigin;
   created_at: string;
 }
@@ -1253,10 +1278,13 @@ export interface SkillDraft {
 function draftOf(row: Record<string, any>): SkillDraft {
   const files = Array.isArray(row.files) ? row.files : [];
   const meta = files.find((f: any) => f && f.__invocation);
+  const removed = files.filter((f: any) => f && typeof f.__remove === "string").map((f: any) => String(f.__remove));
   return {
     id: String(row.id), user_id: row.user_id, skill_name: row.skill_name, description: row.description ?? "", content: row.content,
-    files: files.filter((f: any) => f && !f.__invocation).map((f: any) => ({ path: String(f.path), content: String(f.content ?? ""), ...(f.is_binary ? { is_binary: true } : {}) })),
+    files: files.filter((f: any) => f && !f.__invocation && f.__remove === undefined)
+      .map((f: any) => ({ path: String(f.path), content: String(f.content ?? ""), ...(f.is_binary ? { is_binary: true } : {}) })),
     replaces: row.replaces ?? null, ...(meta ? { invocation: meta.__invocation === "manual" ? "manual" as const : "auto" as const } : {}),
+    ...(removed.length ? { removeFiles: removed } : {}),
     origin: row.origin as SkillOrigin, created_at: new Date(row.created_at).toISOString(),
   };
 }
@@ -1285,9 +1313,10 @@ export async function createSkillDraft(
       return r;
     }
   }
-  // The invocation rides in `files` as a marker entry: the table has no column for it, and a draft is a short-lived row.
+  // The invocation and the files to remove ride in `files` as marker entries: the table has no column for them, and a draft is a
+  // short-lived row.
   const files = [...input.files.map((f) => ({ path: f.path, content: f.content, ...(f.is_binary ? { is_binary: true } : {}) })),
-    ...(input.invocation ? [{ __invocation: input.invocation }] : [])];
+    ...(input.invocation ? [{ __invocation: input.invocation }] : []), ...input.removeFiles.map((p) => ({ __remove: p }))];
   const row = (await q(
     `INSERT INTO claw_skill_drafts (id, user_id, skill_name, description, content, files, replaces, request_quote, origin)
      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9) RETURNING *`,
@@ -1335,6 +1364,7 @@ export async function confirmSkillDraft(
     const d = draftOf(draft);
     const saved = await saveUserSkillRecorded(userId, {
       name: d.skill_name, description: d.description, content: d.content, files: d.files, ...(d.invocation ? { invocation: d.invocation } : {}),
+      ...(d.removeFiles ? { removeFiles: d.removeFiles } : {}),
     }, { origin: d.origin, actor: ctx.actor, sessionId: ctx.sessionId, query: q });
     if (!saved.ok) return saved;
     await q("DELETE FROM claw_skill_drafts WHERE id = $1", [draftId]);

@@ -16,6 +16,13 @@ function said(text: string): string {
 }
 
 const SKILL_WORD_ZH = /(技能|skill)/;
+// A sentence that says not to: never a request, whatever else it says ("不要存成技能", "don't save this as a skill").
+const NEGATED = /(不要|不用|别|不必|无需|不需要|先不|不想|勿)/;
+const NEGATED_EN = /\b(don'?t|do not|never|no need|not now|without)\b/;
+
+function negated(s: string): boolean {
+  return NEGATED.test(s) || NEGATED_EN.test(s);
+}
 // Verbs that put something into a skill: 存/保存/存为/沉淀/记成/做成/整理成/总结成/写成/收藏/加为/添加为.
 const SAVE_VERB_ZH = /(存|保存|沉淀|记成|记为|记作|做成|整理成|总结成|写成|收藏|加为|添加为|变成|当成|作为)/;
 const SAVE_EN = /\b(save|store|keep|turn|make|record|add|create)\b[^.?!\n]{0,60}\b(skills?)\b/;
@@ -24,6 +31,7 @@ const AS_SKILL_EN = /\bas (?:a |an |my |our )?(?:new |personal |reusable |own )?
 /** Whether the words ask for something to be saved as a skill: a save verb and the word skill (技能) together. */
 export function asksToSaveSkill(quote: string): boolean {
   const s = said(quote);
+  if (negated(s)) return false;
   if (SKILL_WORD_ZH.test(s) && SAVE_VERB_ZH.test(s) && /[一-鿿]/.test(s)) return true;
   return SAVE_EN.test(s) || AS_SKILL_EN.test(s);
 }
@@ -43,7 +51,7 @@ const CHANGE_EN = /\b(change|update|edit|modify|replace|rewrite|adjust|add|remov
 export function asksToChangeSkill(quote: string, name: string): boolean {
   const s = said(quote);
   const about = (name && s.includes(name.toLowerCase())) || SKILL_WORD_ZH.test(s);
-  return about && (CHANGE_ZH.test(s) || CHANGE_EN.test(s));
+  return about && !negated(s) && (CHANGE_ZH.test(s) || CHANGE_EN.test(s));
 }
 
 const ACTS: Readonly<Record<"delete" | "disable" | "enable" | "undo", { zh: RegExp; en: RegExp }>> = {
@@ -57,5 +65,6 @@ const ACTS: Readonly<Record<"delete" | "disable" | "enable" | "undo", { zh: RegE
 export function asksToAct(quote: string, act: keyof typeof ACTS, name: string): boolean {
   const s = said(quote);
   const about = (name && s.includes(name.toLowerCase())) || SKILL_WORD_ZH.test(s) || act === "undo";
-  return about && (ACTS[act].zh.test(s) || ACTS[act].en.test(s));
+  // ("别再用" is how one turns a skill off: a negation is the request there, and refuses every other act.)
+  return about && (act === "disable" || !negated(s)) && (ACTS[act].zh.test(s) || ACTS[act].en.test(s));
 }

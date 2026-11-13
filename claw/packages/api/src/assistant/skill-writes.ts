@@ -54,8 +54,8 @@ export const skillWritePorts: { sayDeps: SayDeps; publishSessionEvent: (sessionI
 /** The lines of SKILL.md a card shows. */
 export const CARD_PREVIEW_LINES = 30;
 export const CARD_PREVIEW_CHARS = 1500;
-/** How far back a worker's quote of the user's request is looked for, in their messages to their assistant. */
-const WORKER_QUOTE_WINDOW_MIN = 60;
+/** How long before its item was started a worker's quote of the user's request may have been said (the request that started it). */
+const WORKER_QUOTE_WINDOW_MIN = 10;
 
 export function previewOf(content: string): string {
   const lines = (content || "").split(/\r?\n/).slice(0, CARD_PREVIEW_LINES).join("\n");
@@ -415,17 +415,20 @@ export async function decideSkillDraft(q: Querier, userId: string, params: Recor
 
 // --- A worker's save_skill ---------------------------------------------------------------------------------------------
 
-/** The user's own words a worker's request quote may come from: what they wrote to their assistant lately, or in this chat. */
+/**
+ * The user's own words a worker's request quote may come from: for a work item's worker, what they wrote to their assistant, signed
+ * in, from just before the item was started (the request that started it) until now; for a chat of their own, what they wrote there.
+ */
 async function userWordsFor(sessionId: string, userId: string): Promise<string[]> {
   const item = (await db.query(
-    "SELECT 1 FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2 LIMIT 1", [sessionId, userId],
-  ).catch(() => ({ rows: [] }))).rows[0];
+    "SELECT created_at FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2 LIMIT 1", [sessionId, userId],
+  ).catch(() => ({ rows: [] }))).rows[0] as { created_at: Date } | undefined;
   if (!item) return humanMessages(sessionId);
   return ((await db.query(
     `SELECT m.content FROM claw_assistant_messages m JOIN claw_assistants a ON a.session_id = m.session_id AND a.user_id = $1
-      WHERE m.user_id = $1 AND m.attended_via IS NOT NULL AND m.received_at > NOW() - make_interval(mins => $2::int)
+      WHERE m.user_id = $1 AND m.attended_via IS NOT NULL AND m.received_at >= $2::timestamptz - make_interval(mins => $3::int)
       ORDER BY m.received_at DESC LIMIT 20`,
-    [userId, WORKER_QUOTE_WINDOW_MIN],
+    [userId, new Date(item.created_at).toISOString(), WORKER_QUOTE_WINDOW_MIN],
   )).rows as Array<{ content: string }>).map((r) => r.content);
 }
 
@@ -441,7 +444,8 @@ async function assistantSessionOf(userId: string): Promise<string | null> {
 /**
  * What a worker's turn asked to save (`skills_to_save`, `skill_file_mutations`, from its completion), in a session the user's skills
  * serve. A skill whose `request_quote` is the user's own request to save it, from what they wrote, is saved now and shown with Undo and
- * Edit; any other is a draft the user confirms (its file writes go into the draft, never onto a skill of theirs). Shown in the user's
+ * Edit; any other is a draft the user confirms (its file writes go into the draft, never onto a skill of theirs), and so are file
+ * writes on a skill of theirs that this turn did not save at their request. Shown in the user's
  * assistant when they have one, else as a session event of this session. Never throws for one skill: each is logged and the next goes on.
  */
 export async function handleWorkerSkillWrites(
@@ -488,7 +492,40 @@ export async function handleWorkerSkillWrites(
     }
   }
 
-  // File writes on a skill the user has (or one just saved at their request): as before.
+  // File writes on a skill the user has, not asked for in this turn: a draft of the skill with them, which the user confirms first.
+  const savedHere = new Set(saves.map((s) => s.name));
+  const onTheirOwn = new Map<string, PendingSkillFileMutation[]>();
+  for (const m of mutations) {
+    if (drafted.has(m.skill_name) || savedHere.has(m.skill_name)) continue;
+    onTheirOwn.set(m.skill_name, [...(onTheirOwn.get(m.skill_name) ?? []), m]);
+  }
+  for (const [name, writes] of onTheirOwn) {
+    try {
+      const now = await showUserSkill(userId, name);
+      if (!now) {
+        logger.warn({ skill: name, sessionId }, "skill_file.mutation_failed");
+        continue;
+      }
+      const files = new Map<string, { path: string; content: string; is_binary?: boolean }>();
+      const removed = new Set<string>();
+      for (const m of writes) {
+        if (m.action === "remove") { files.delete(m.file_path); removed.add(m.file_path); continue; }
+        removed.delete(m.file_path);
+        files.set(m.file_path, { path: m.file_path, content: m.content || "", ...(m.is_binary ? { is_binary: true } : {}) });
+      }
+      drafted.add(name);
+      const made = await createSkillDraft(userId, {
+        name, content: now.content, description: now.description, files: [...files.values()], removeFiles: [...removed],
+      }, { origin: "worker", actor: "model", sessionId });
+      metrics.onUserSkillSave("draft", made.ok ? "ok" : made.error);
+      if (made.ok) draftsMade.push(made.draft);
+      logger.info({ skillName: name, sessionId, ok: made.ok, ...(made.ok ? { draftId: made.draft.id } : { reason: made.error }) }, "skill.worker_files_drafted");
+    } catch (err) {
+      logger.error({ err, sessionId, skillName: name }, "skill.save_failed");
+    }
+  }
+
+  // File writes on a skill just saved at the user's request in this turn: part of that save.
   const fileWrite = { actor: "model" as const, origin: "worker" as const, sessionId };
   for (const m of mutations) {
     if (drafted.has(m.skill_name)) continue;
