@@ -4,7 +4,7 @@
 /**
  * How a request's pull requests and reviewer are read (`github_review.py`'s `_bare_pulls`, `_repo_named`, `_read`): a number
  * with two repositories written is asked about; a name GitHub cannot be asked about with several owners is asked about; a
- * repository GitHub named once is not asked again; a model's reading Clawy cannot use is read by the rules instead.
+ * repository GitHub named once is not asked again; a model's reading PrimusClaw Assistant cannot use is read by the rules instead.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -71,7 +71,7 @@ test("a repository github named once is not asked about again", async () => {
   assert.equal(world.github.reads.filter((p) => p.split("/").length === 4).length, reads);
 });
 
-test("a model reading clawy cannot use is read by the rules instead", async () => {
+test("a model reading the assistant cannot use is read by the rules instead", async () => {
   const intent: IntentReader = {
     read: () => Promise.resolve({ intent: "maybe" }),
     readMode: () => Promise.resolve(undefined),

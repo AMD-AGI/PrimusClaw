@@ -95,5 +95,5 @@ export function sessions(input: Omit<remoteDomain.SessionsInput, "setup">): { ca
 
 /** The status card. */
 export function status(input: Omit<remoteDomain.StatusInput, "bot">): Json {
-  return cardOf(statusCard(remoteView.statusView({ ...input, bot: "Clawy" })));
+  return cardOf(statusCard(remoteView.statusView({ ...input, bot: "PrimusClaw Assistant" })));
 }

@@ -15,6 +15,9 @@ test("test_english_sentences_that_are_commands_set_the_language_help_reports", a
   await w.router.handle(message("turn memory on", { locale: "zh-CN" }));
   await w.router.handle(message("what can you do", { locale: "zh-CN" }));
   const shown = said(w).at(-1) ?? "";
-  assert.ok(shown.startsWith("**What Clawy can do for you**") && shown.includes("(now: English, auto)"), shown);
+  assert.ok(
+    shown.startsWith("**What PrimusClaw Assistant can do for you**") && shown.includes("(now: English, auto)"),
+    shown,
+  );
   assert.ok(!shown.includes("from Teams"), shown);
 });

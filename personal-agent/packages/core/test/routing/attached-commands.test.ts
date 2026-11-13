@@ -33,14 +33,14 @@ test("test_help_without_a_slash_is_the_help_and_not_the_agents_message", async (
   const { w, prompts } = attachedWorld();
   await w.router.handle(message("help"));
   assert.deepEqual(prompts, []);
-  assert.ok(said(w)[0]?.startsWith("**What Clawy can do for you**"));
+  assert.ok(said(w)[0]?.startsWith("**What PrimusClaw Assistant can do for you**"));
 });
 
 test("test_help_says_which_agent_the_chat_is_attached_to_and_how_to_leave", async () => {
   const { w } = attachedWorld();
   await w.router.handle(message("/help"));
   assert.ok(said(w)[0]?.includes("This chat is attached to Codex on dev-pod: what you say goes to it."));
-  assert.ok(said(w)[0]?.includes('Say "back to Clawy" to come back to me.'));
+  assert.ok(said(w)[0]?.includes('Say "back to PrimusClaw Assistant" to come back to me.'));
 });
 
 test("test_help_of_a_chat_that_is_not_attached_has_no_note_about_an_agent", async () => {
@@ -49,7 +49,7 @@ test("test_help_of_a_chat_that_is_not_attached_has_no_note_about_an_agent", asyn
   assert.ok(!said(w)[0]?.includes("This chat is attached to"));
 });
 
-test("test_every_menu_word_without_a_slash_is_answered_by_clawy_and_never_reaches_the_agent", async () => {
+test("test_every_menu_word_without_a_slash_is_answered_by_the_assistant_and_never_reaches_the_agent", async () => {
   const { w, prompts, agents, listed } = attachedWorld();
   for (const word of [
     "help",
@@ -99,7 +99,7 @@ test("test_a_sentence_that_starts_with_a_menu_word_still_goes_to_the_agent", asy
   );
 });
 
-test("test_the_slash_forms_of_clawys_commands_are_still_clawys_while_attached", async () => {
+test("test_the_slash_forms_of_the_assistants_commands_are_still_its_own_while_attached", async () => {
   const { w, prompts } = attachedWorld();
   await w.router.handle(message("/whoami"));
   await w.router.handle(message("/timezone"));
@@ -123,7 +123,7 @@ test("test_a_group_chat_reads_help_and_new_without_a_slash_too", async () => {
   await w.router.handle(message("help", { kind: "group", conversation: "g-1" }));
   w.store.sessions.setSession(ALICE.id, { sessionId: "s-g" }, "g-1");
   await w.router.handle(message("new", { kind: "group", conversation: "g-1" }));
-  assert.ok(said(w)[0]?.startsWith("**What Clawy can do for you**"));
+  assert.ok(said(w)[0]?.startsWith("**What PrimusClaw Assistant can do for you**"));
   assert.equal(said(w)[1], "Started a new session. What would you like to do?");
   assert.equal(w.store.sessions.getSession(ALICE.id, "g-1"), null);
 });

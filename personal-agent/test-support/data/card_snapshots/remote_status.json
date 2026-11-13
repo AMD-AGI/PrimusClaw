@@ -98,7 +98,7 @@
       "isSubtle": true,
       "size": "Small",
       "spacing": "Small",
-      "text": "要跟 Clawy 说：消息以 @Clawy 开头，或用 Clawy 的 / 命令；协调者代发的请求也由 Clawy 处理，不会发给这个会话。",
+      "text": "要跟 PrimusClaw Assistant 说：消息以 @PrimusClaw Assistant 开头，或用 PrimusClaw Assistant 的 / 命令；协调者代发的请求也由 PrimusClaw Assistant 处理，不会发给这个会话。",
       "type": "TextBlock",
       "wrap": true
      },

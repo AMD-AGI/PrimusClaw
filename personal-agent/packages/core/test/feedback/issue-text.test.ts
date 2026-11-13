@@ -17,19 +17,23 @@ import {
 } from "../../src/feedback/issue-text.js";
 import { code, fence } from "../../src/feedback/markdown.js";
 
-const WORDING = { botName: "Clawy", channelName: "Teams" };
+const WORDING = { botName: "PrimusClaw Assistant", channelName: "Teams" };
 const MASK = (text: string): string => text.replaceAll(/sk-[a-z0-9]+/g, "[hidden]");
 const N = "N";
 
 const TITLES: readonly (readonly [string, string, string])[] = [
-  ["the status card never updated", "Doe, Jordan", "[Clawy feedback] the status card never updated — Doe, Jordan"],
-  ["x".repeat(100), "Alice", `[Clawy feedback] ${"x".repeat(60)} — Alice`],
-  ["two\nlines\tand   gaps", "Alice", "[Clawy feedback] two lines and gaps — Alice"],
-  ["x".repeat(100), N.repeat(60), `[Clawy feedback] ${"x".repeat(40)} — ${N.repeat(60)}`],
-  ["short", N.repeat(100), `[Clawy feedback] short — ${N.repeat(59)}…`],
-  ["short", "Ali\nce\x00‮", "[Clawy feedback] short — Ali ce"],
-  ["short", "", "[Clawy feedback] short — unknown"],
-  ["short", "   ", "[Clawy feedback] short — unknown"],
+  [
+    "the status card never updated",
+    "Doe, Jordan",
+    "[PrimusClaw Assistant feedback] the status card never updated — Doe, Jordan",
+  ],
+  ["x".repeat(100), "Alice", `[PrimusClaw Assistant feedback] ${"x".repeat(60)} — Alice`],
+  ["two\nlines\tand   gaps", "Alice", "[PrimusClaw Assistant feedback] two lines and gaps — Alice"],
+  ["x".repeat(100), N.repeat(60), `[PrimusClaw Assistant feedback] ${"x".repeat(25)} — ${N.repeat(60)}`],
+  ["short", N.repeat(100), `[PrimusClaw Assistant feedback] short — ${N.repeat(59)}…`],
+  ["short", "Ali\nce\x00‮", "[PrimusClaw Assistant feedback] short — Ali ce"],
+  ["short", "", "[PrimusClaw Assistant feedback] short — unknown"],
+  ["short", "   ", "[PrimusClaw Assistant feedback] short — unknown"],
 ];
 
 test("the title suffix and its clipping", () => {
@@ -44,7 +48,7 @@ test("the title takes the first 60 characters of the text on one line then the r
   const words = Array.from({ length: 30 }, () => "word").join(" ");
   assert.equal(
     issueTitle(WORDING, `${"word ".repeat(30)}\nsecond line`, "Alice"),
-    `[Clawy feedback] ${words.slice(0, 60).trimEnd()} — Alice`,
+    `[PrimusClaw Assistant feedback] ${words.slice(0, 60).trimEnd()} — Alice`,
   );
 });
 
@@ -98,7 +102,7 @@ const REPORT: ReportText = {
 test("the issue body has the reporter, the text fenced, the scene, the session link and one marker", () => {
   assert.equal(
     issueBody(WORDING, "https://claw.test", REPORT),
-    "Reported by **Alice** (alice@example.com)\n\nReported from Teams through Clawy.\n\n### What went wrong\n\n" +
+    "Reported by **Alice** (alice@example.com)\n\nReported from Teams through PrimusClaw Assistant.\n\n### What went wrong\n\n" +
       "````\nit broke ```here```\n````\n\nSCENE\n\n### Claw session\n\n[sess-1](https://claw.test/primus-claw/sess-1)\n\n" +
       "<!-- clawy-feedback-id: 7-1762689600 -->\n",
   );

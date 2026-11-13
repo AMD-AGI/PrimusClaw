@@ -23,7 +23,9 @@ test("test_help_through_the_worker_in_a_1to1_chat_and_in_a_group", async () => {
   // (the chat app is the surface's: Teams' name, as the Python worker said it)
   const statement = (lang: string) => dataStatement(lang, false, undefined, "Microsoft Teams");
   assert.ok(en.includes(statement("en")) && zh.includes(statement("zh")) && group.includes(statement("en")));
-  assert.ok(group.startsWith("**What Clawy can do for you**") && group.includes("@mention Clawy"));
+  assert.ok(
+    group.startsWith("**What PrimusClaw Assistant can do for you**") && group.includes("@mention PrimusClaw Assistant"),
+  );
 });
 
 test("test_the_link_steps_an_unconnected_chat_gets_say_answers_are_ai_generated", async () => {

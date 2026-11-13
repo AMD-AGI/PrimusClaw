@@ -28,7 +28,7 @@ test("an answer carries the AI label, the people it names, Teams' thumbs, its re
       { id: "a", channelUserId: "29:a", name: "Lin Mei", email: "" },
       { id: "b", channelUserId: "29:b", name: "Robin", email: "" },
     ],
-    suggestions: [{ title: "Back to Clawy", value: "back to Clawy" }],
+    suggestions: [{ title: "Back to PrimusClaw Assistant", value: "back to PrimusClaw Assistant" }],
     citations: [
       {
         position: 1,
@@ -43,7 +43,7 @@ test("an answer carries the AI label, the people it names, Teams' thumbs, its re
   assert.equal(activity["text"], "<at>Lin Mei</at> <at>Robin</at> All green [1].");
   assert.deepEqual(activity["channelData"], { feedbackLoop: { type: "default" } });
   assert.deepEqual(activity["suggestedActions"], {
-    actions: [{ type: "imBack", title: "Back to Clawy", value: "back to Clawy" }],
+    actions: [{ type: "imBack", title: "Back to PrimusClaw Assistant", value: "back to PrimusClaw Assistant" }],
   });
   const entities = activity["entities"] as Array<Record<string, unknown>>;
   assert.deepEqual(

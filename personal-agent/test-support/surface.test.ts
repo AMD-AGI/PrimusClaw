@@ -77,7 +77,10 @@ test("fetchFile gives the bytes of a known file and refuses any other", async ()
 test("an envelope built by outgoing is sent only when delivered, as the send it stands for", async () => {
   const surface = new FakeSurface();
   const c = surface.conversation(testConversation("c1"));
-  const message = { ...textMessage("approve?"), suggestions: [{ title: "Back to Clawy", value: "back to Clawy" }] };
+  const message = {
+    ...textMessage("approve?"),
+    suggestions: [{ title: "Back to PrimusClaw Assistant", value: "back to PrimusClaw Assistant" }],
+  };
   const envelope = c.outgoing(message);
   assert.deepEqual(surface.outbox, []);
   const stored = JSON.parse(JSON.stringify(envelope)) as typeof envelope;

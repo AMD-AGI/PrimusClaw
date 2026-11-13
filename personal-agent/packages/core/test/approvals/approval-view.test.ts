@@ -18,9 +18,9 @@ import { credentialValues, isSensitiveName, maskValue, nameWords, scrub } from "
 import { answerLang, pickLang, writtenLang } from "../../src/language/detect.js";
 
 const TOOL = "mcp__ops__patch_plans_plan_id_labels";
-const INPUT = { plan_id: 85, labels: { "clawy-test": "1" }, reason: "clawy MCP verification" };
+const INPUT = { plan_id: 85, labels: { "eval-test": "1" }, reason: "MCP verification" };
 const FULL = {
-  summary: "Clawy 想给计划 85 (nightly-eval) 加标签 clawy-test=1；理由：clawy MCP verification",
+  summary: "助理想给计划 85 (nightly-eval) 加标签 eval-test=1；理由：MCP verification",
   summary_by: "model",
   tool_description: "Replace the labels of a plan.",
   intent: "我来给计划 85 加上验证标签。",
@@ -70,9 +70,9 @@ it("the card leads with what will change then the action then the arguments then
   assert.equal(view.description, "Replace the labels of a plan.");
   assert.deepEqual(view.args, [
     ["plan_id", "85"],
-    ["labels", '{"clawy-test":"1"}'],
+    ["labels", '{"eval-test":"1"}'],
   ]);
-  assert.equal(view.reason, "clawy MCP verification");
+  assert.equal(view.reason, "MCP verification");
   assert.ok(view.details.includes(TOOL) && view.details.includes('"plan_id": 85'));
 });
 
@@ -319,7 +319,7 @@ it("written lang says only what a sentence says", () => {
   assert.equal(writtenLang("tests failed again"), "en");
   assert.equal(writtenLang("LGTM"), undefined);
   assert.equal(writtenLang("AMD-AGI/PrimusClaw #228"), undefined);
-  assert.equal(writtenLang("Clawy review PR"), undefined);
+  assert.equal(writtenLang("Bot review PR"), undefined);
   assert.equal(writtenLang("gpt-6-luna please"), undefined);
 });
 

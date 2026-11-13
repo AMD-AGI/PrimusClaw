@@ -14,9 +14,9 @@ import { APPROVAL_CARDS } from "../../../test-support/card-catalog/approval.js";
 import { SID } from "../../../test-support/card-catalog/catalog.js";
 
 const TOOL = "mcp__ops__patch_plans_plan_id_labels";
-const INPUT = { plan_id: 85, labels: { "clawy-test": "1" }, reason: "clawy MCP verification" };
+const INPUT = { plan_id: 85, labels: { "eval-test": "1" }, reason: "MCP verification" };
 const FULL = {
-  summary: "Clawy 想给计划 85 (nightly-eval) 加标签 clawy-test=1；理由：clawy MCP verification",
+  summary: "助理想给计划 85 (nightly-eval) 加标签 eval-test=1；理由：MCP verification",
   summary_by: "model",
   tool_description: "Replace the labels of a plan.",
   intent: "我来给计划 85 加上验证标签。",
@@ -99,7 +99,7 @@ it("the card leads with what will change then the action then the arguments then
   assert.equal(body[1]?.["weight"], "Bolder");
   assert.ok(String(shown[2]).includes("模型生成"));
   assert.equal(shown[3], "操作：patch plans plan id labels (ops) — Replace the labels of a plan.");
-  assert.deepEqual(shown.slice(4, 7), ["plan_id: 85", 'labels: {"clawy-test":"1"}', "理由：clawy MCP verification"]);
+  assert.deepEqual(shown.slice(4, 7), ["plan_id: 85", 'labels: {"eval-test":"1"}', "理由：MCP verification"]);
   assert.ok(!blob(c).includes("我来给计划 85"));
 });
 

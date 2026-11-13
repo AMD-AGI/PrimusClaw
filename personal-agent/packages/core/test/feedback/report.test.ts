@@ -47,10 +47,14 @@ test("issue has the title label and a readable body with the scene", async () =>
   await say(world, "/feedback the card froze");
   const [issue] = world.issues.issues;
   assert.ok(issue);
-  assert.equal(issue.title, "[Clawy feedback] the card froze — Alice");
+  assert.equal(issue.title, "[PrimusClaw Assistant feedback] the card froze — Alice");
   assert.deepEqual(issue.labels, ["clawy-feedback"]);
   const body = issue.body;
-  assert.ok(body.startsWith("Reported by **Alice**\n\nReported from Teams through Clawy.\n\n### What went wrong\n\n"));
+  assert.ok(
+    body.startsWith(
+      "Reported by **Alice**\n\nReported from Teams through PrimusClaw Assistant.\n\n### What went wrong\n\n",
+    ),
+  );
   assert.ok(body.includes("```\nthe card froze\n```"));
   assert.ok(body.includes("- Reporter: `Alice` (SaFE user `u-1`)"));
   assert.ok(body.includes("- Chat: 1:1") && body.includes("- Plugin id: `2`"));
@@ -183,7 +187,7 @@ test("a bare feedback asks one question and the next message is the report", asy
   assert.equal(texts(world).at(-1), "What went wrong?");
   assert.equal(world.issues.issues.length, 0);
   assert.equal(await say(world, "the answer was cut off"), true);
-  assert.equal(world.issues.issues[0]?.title, "[Clawy feedback] the answer was cut off — Alice");
+  assert.equal(world.issues.issues[0]?.title, "[PrimusClaw Assistant feedback] the answer was cut off — Alice");
   assert.equal(await say(world, "just chatting"), false); // answered once: this goes on as a message
 });
 

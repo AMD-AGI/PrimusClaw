@@ -253,7 +253,7 @@ test("with a namespace both queues use the worker identity; without one the conn
     BASE["SERVICEBUS_SEND_CONNECTION_STRING"],
   ]);
   const identity = teamsSettingsFromEnv({
-    SERVICEBUS_NAMESPACE: "clawy.servicebus.windows.net",
+    SERVICEBUS_NAMESPACE: "personal-agent.servicebus.windows.net",
     WORKER_IDENTITY_CLIENT_ID: "w-1",
     WORKER_IDENTITY_SUBJECT: "system:serviceaccount:ns:w",
     BOT_TENANT_ID: "tenant-1",
@@ -263,7 +263,7 @@ test("with a namespace both queues use the worker identity; without one the conn
   const credential = workerCredential(identity, deps({ "/k.pem": KEY_PEM }));
   assert.ok(credential);
   const [inbound, outbound] = busConnections(identity, credential);
-  assert.deepEqual(inbound, { namespace: "clawy.servicebus.windows.net", credential });
+  assert.deepEqual(inbound, { namespace: "personal-agent.servicebus.windows.net", credential });
   assert.equal(inbound, outbound);
   assert.throws(() => busConnections(identity, undefined), StartupError);
   assert.equal(workerCredential(plain, deps()), undefined);

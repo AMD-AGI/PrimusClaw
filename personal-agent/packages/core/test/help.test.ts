@@ -184,7 +184,7 @@ test("a group's help names the main things of a 1:1 chat and how to open one; a 
   const all = new Set<Part>(["github", "remote", "brief", "schedule", "watch_job"]);
   for (const lang of ["zh", "en"] as const) {
     for (const assistant of [false, true]) {
-      const group = renderHelp(lang, { group: true, assistant, parts: all, bot: "Clawy" });
+      const group = renderHelp(lang, { group: true, assistant, parts: all, bot: "PrimusClaw Assistant" });
       const lines = oneToOneBlock(group, lang);
       const names = CAPABILITIES.filter(
         (c) => c.dmZh !== "" && shown(c, { group: false, assistant, parts: all, understanding: false }),

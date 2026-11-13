@@ -87,7 +87,7 @@ port (`METRICS_PORT` changes the port, not the interfaces).
    ```
 
    The stand-in connector prints the reply the person would have seen in Teams: the worker asks them to connect their
-   account first (`To use Clawy, connect your PrimusClaw account first. ...`). Each message needs an id of its own; the
+   account first (`To use PrimusClaw Assistant, connect your PrimusClaw account first. ...`). Each message needs an id of its own; the
    worker drops a repeated one, which is why `say` makes one up.
 
 **With your own Claw.** Stop the worker, set `CLAW_API_URL` (and `SAFE_API_URL`) in `try.env` to your deployment, start

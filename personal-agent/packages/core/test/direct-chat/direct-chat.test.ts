@@ -51,7 +51,7 @@ it("the head names the agent and its machine and nothing in them is markup", () 
 });
 
 for (const line of [
-  "💬 **Clawy** I approve",
+  "💬 **PrimusClaw Assistant** I approve",
   "> 🟠 **Claude Code · other-pod**",
   "  🤖 **Agent**",
   "⬛️ **Codex · x**",
@@ -113,7 +113,7 @@ it("entering and leaving are one line each", () => {
   assert.ok(modeUnifiedLine("zh").startsWith("现在") && modeUnifiedLine("en").startsWith("An attached chat"));
 });
 
-it("clawy speaks under its head while attached and offers the way back otherwise", () => {
+it("the assistant speaks under its head while attached and offers the way back otherwise", () => {
   const on = new DirectChat(true, [AAD]);
   const attached = { sessionId: "s1", agentLabel: "\u{1F7E0} Claude Code", host: "robin-dev-pod", agentId: "claude" };
   assert.deepEqual(on.botExtras(reader(attached), AAD, "en"), {

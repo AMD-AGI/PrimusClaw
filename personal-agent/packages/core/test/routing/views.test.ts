@@ -8,7 +8,7 @@ import { CONFIRM_BUTTON, CommandViews, repoButton, showButton } from "../../src/
 import { note } from "./fixtures.js";
 
 test("the router's cards carry what they say, and their buttons what comes back", () => {
-  const views = new CommandViews("Clawy", "https://claw.example.com", note);
+  const views = new CommandViews("PrimusClaw Assistant", "https://claw.example.com", note);
   const shapes = [
     views.link("a@example.com", "teams"),
     views.binding("https://id.test/c", "Hello. "),
@@ -25,9 +25,9 @@ test("the router's cards carry what they say, and their buttons what comes back"
     }),
   ].map((m) => (m.body.type === "view" ? `${m.body.view.name}:${m.body.fallbackText}` : m.body.type));
   assert.deepEqual(shapes, [
-    "link:Connect Clawy",
-    "binding:Connect Clawy",
-    "onboarding:Connect Clawy",
+    "link:Connect PrimusClaw Assistant",
+    "binding:Connect PrimusClaw Assistant",
+    "onboarding:Connect PrimusClaw Assistant",
     "repo:o/r",
     "session:s1",
   ]);
@@ -48,7 +48,7 @@ test("the router's cards carry what they say, and their buttons what comes back"
 });
 
 test("the link card sends the person to the console's page of their own channel", () => {
-  const views = new CommandViews("Clawy", "https://claw.example.com", note);
+  const views = new CommandViews("PrimusClaw Assistant", "https://claw.example.com", note);
   const pageOf = (m: ReturnType<CommandViews["link"]>) =>
     m.body.type === "view" ? (m.body.view.model as { page: string }).page : "";
   assert.equal(pageOf(views.link("a@example.com", "teams")), "https://claw.example.com/primus-claw/teams-link");

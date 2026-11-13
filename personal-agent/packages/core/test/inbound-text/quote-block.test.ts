@@ -61,7 +61,10 @@ test("line breaks of every kind are lines, blank ones keep their marker without 
 });
 
 test("a mention's markup inside a quote is text", () => {
-  assert.equal(quoteBlock([quote({ text: "<AT>Clawy</at> hi" })]), `Quoted message from Bob (${WHEN}):\n> Clawy hi`);
+  assert.equal(
+    quoteBlock([quote({ text: "<AT>PrimusClaw Assistant</at> hi" })]),
+    `Quoted message from Bob (${WHEN}):\n> PrimusClaw Assistant hi`,
+  );
 });
 
 test("a deleted quote and an empty one say so", () => {

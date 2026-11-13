@@ -39,7 +39,7 @@ test("a deployment's entry passes its plugin factory: it is called once and what
     GATE_RUN_ID: "main-test",
     TEAMS_GATE_CONNECTOR_URL: "http://127.0.0.1:9",
     // (with a refusal policy the fallback model may start; the on-behalf users still stop it, which ends the test)
-    CLAWY_FALLBACK_MODEL: "backup-model",
+    PERSONAL_AGENT_FALLBACK_MODEL: "backup-model",
     TEAMS_ON_BEHALF_USERS: "u-coordinator",
   };
   let built = 0;

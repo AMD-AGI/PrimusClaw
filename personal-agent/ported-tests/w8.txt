@@ -60,7 +60,7 @@ teams/tests/test_feedback_votes.py::test_teams_own_thumb_is_a_vote_on_that_answe
 teams/tests/test_feedback_votes.py::test_a_thumb_without_words_is_a_vote_without_a_reason -> packages/core/test/feedback/thumbs.test.ts::a thumb without words is a vote without a reason
 teams/tests/test_feedback_votes.py::test_a_thumb_in_a_group_is_a_vote_on_the_groups_session_with_the_comment_masked -> packages/core/test/feedback/thumbs.test.ts::a thumb in a group is a vote on the groups session with the comment masked
 teams/tests/test_feedback_votes.py::test_in_a_chat_that_talks_to_the_assistant_the_vote_is_on_the_assistants_session -> packages/core/test/feedback/thumbs.test.ts::in a chat that talks to the assistant the vote is on the assistants session
-teams/tests/test_feedback_votes.py::test_clawys_own_thumbs_on_mobile_vote_and_the_comment_replaces_the_vote -> packages/core/test/feedback/thumbs.test.ts::clawys own thumbs on mobile vote and the comment replaces the vote
+teams/tests/test_feedback_votes.py::test_clawys_own_thumbs_on_mobile_vote_and_the_comment_replaces_the_vote -> packages/core/test/feedback/thumbs.test.ts::the assistants own thumbs on mobile vote and the comment replaces the vote
 teams/tests/test_feedback_votes.py::test_skip_on_the_comment_card_does_not_vote_again -> packages/core/test/feedback/thumbs.test.ts::skip on the comment card does not vote again
 teams/tests/test_feedback_votes.py::test_a_vote_that_cannot_be_recorded_is_logged_and_the_report_still_goes -> packages/core/test/feedback/thumbs.test.ts::a vote that cannot be recorded is logged and the report still goes
 teams/tests/test_feedback_votes.py::test_the_message_a_thumb_is_stored_under -> packages/core/test/feedback/thumbs.test.ts::the message a thumb is stored under

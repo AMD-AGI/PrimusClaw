@@ -92,7 +92,14 @@ export function boardItems(): WorkItem[] {
       title: "排查 mi355x 训练任务 OOM",
       summary: "复现中：第 3 次运行",
     }),
-    wi({ ...running, itemId: "j", updatedAt: iso(9000), seq: 16, title: "写本周 Clawy 周报", summary: "已整理 12 条" }),
+    wi({
+      ...running,
+      itemId: "j",
+      updatedAt: iso(9000),
+      seq: 16,
+      title: "写本周 PrimusClaw Assistant 周报",
+      summary: "已整理 12 条",
+    }),
     wi({
       ...running,
       itemId: "k",

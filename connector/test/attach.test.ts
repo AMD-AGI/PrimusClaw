@@ -699,7 +699,7 @@ describe("which user turns of a terminal's transcript are a person's prompt (wha
   });
 
   test("a prompt that mentions or even starts with a harness tag is still the person's when the entry says so", () => {
-    const prose = "why does Clawy show <task-notification> blocks as typed in the terminal?";
+    const prose = "why does the chat show <task-notification> blocks as typed in the terminal?";
     assert.deepEqual(shown(user(prose, human)), [prose]);
     assert.deepEqual(shown(user(prose)), [prose], "an entry that says nothing: only the start of its text is looked at");
     assert.deepEqual(shown(user(`${NOTIFICATION}\nwhat does this mean?`, human)), [`${NOTIFICATION}\nwhat does this mean?`], "pasted at the terminal");

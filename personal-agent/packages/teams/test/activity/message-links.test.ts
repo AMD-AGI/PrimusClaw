@@ -66,7 +66,7 @@ const BOB = { type: "mention", text: "<at>Bob</at>", mentioned: { id: "29:bob", 
 
 /** A group request to review and merge, as Teams shows it: the words in `text`, the bot's mention and Bob's. */
 function ask(textAfter: string, attachments: readonly unknown[] = []): Activity {
-  return grp(`<at>Clawy</at> ${ASK} ${textAfter}`.trimEnd(), { entities: [BOB], attachments });
+  return grp(`<at>PrimusClaw Assistant</at> ${ASK} ${textAfter}`.trimEnd(), { entities: [BOB], attachments });
 }
 
 const SHAPES: readonly [string, Activity, string][] = [
@@ -89,8 +89,8 @@ const SHAPES: readonly [string, Activity, string][] = [
   ],
   [
     "a link in a group message",
-    grp("<at>Clawy</at> check fix the plugin check", {
-      attachments: [htmlOf('<at id="0">Clawy</at> check ' + anchor())],
+    grp("<at>PrimusClaw Assistant</at> check fix the plugin check", {
+      attachments: [htmlOf('<at id="0">PrimusClaw Assistant</at> check ' + anchor())],
     }),
     `check fix the plugin check <${PR}>`,
   ],
@@ -171,7 +171,9 @@ const UNCHANGED: readonly [string, Activity][] = [
   ],
   [
     "a plain address in a group",
-    grp(`<at>Clawy</at> review ${PR}`, { attachments: [htmlOf('<at id="0">Clawy</at> review ' + anchor(PR, PR))] }),
+    grp(`<at>PrimusClaw Assistant</at> review ${PR}`, {
+      attachments: [htmlOf('<at id="0">PrimusClaw Assistant</at> review ' + anchor(PR, PR))],
+    }),
   ],
 ];
 
@@ -346,7 +348,9 @@ test("the words a command is read from never carry an address", () => {
 const SECRET_URL = "https://example.test/doc?token=ghp_" + "A1b2C3d4E5".repeat(4);
 
 test("a group masks a credential in the address behind the words and a 1on1 chat does not", () => {
-  const group = grp("<at>Clawy</at> read the docs", { attachments: [htmlOf(anchor(SECRET_URL, "the docs"))] });
+  const group = grp("<at>PrimusClaw Assistant</at> read the docs", {
+    attachments: [htmlOf(anchor(SECRET_URL, "the docs"))],
+  });
   const one = dm("read the docs", { attachments: [htmlOf(anchor(SECRET_URL, "the docs"))] });
   assert.ok(!withLinksOf("read the docs", group).includes("ghp_"));
   assert.ok(withLinksOf("read the docs", group).includes("[hidden]"));

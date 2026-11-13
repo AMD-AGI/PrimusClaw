@@ -14,12 +14,12 @@ import { clickOf, link, message, said, world } from "./world.js";
 test("test_a_session_made_with_another_plugin_is_kept_and_records_the_new_plugin", async () => {
   const w = world({ config: { pluginId: "2" } });
   link(w, ALICE.id, "ak-alice");
-  w.store.sessions.setSession(ALICE.id, { sessionId: "old-clawy", pluginId: "5" });
+  w.store.sessions.setSession(ALICE.id, { sessionId: "old-session", pluginId: "5" });
   await w.router.handle(message("multibranch progress?"));
   await w.router.settled();
-  assert.deepEqual(w.turns.calls, [["send", "ak-alice", "old-clawy", "multibranch progress?"]]);
+  assert.deepEqual(w.turns.calls, [["send", "ak-alice", "old-session", "multibranch progress?"]]);
   assert.ok(!said(w).some((t) => t.includes("new session")));
-  assert.equal(w.store.sessions.getSession(ALICE.id), "old-clawy");
+  assert.equal(w.store.sessions.getSession(ALICE.id), "old-session");
   assert.equal(w.store.sessions.getSessionPlugin(ALICE.id), "2");
 });
 

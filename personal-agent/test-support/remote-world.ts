@@ -169,7 +169,7 @@ export class RemoteWorld {
       windowDefault: options.windowDefault ?? "chat",
       timings: options.timings ?? TEST_TIMINGS,
       watchTimings: TEST_TIMINGS,
-      botName: "Clawy",
+      botName: "PrimusClaw Assistant",
       streaming: options.streaming ?? false,
       ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
     };
@@ -339,7 +339,7 @@ export class RemoteWorld {
       name: "adaptiveCard/action",
       id: this.id("click"),
       from: { aadObjectId: user.id, id: user.channelUserId, name: user.name },
-      recipient: { id: "28:bot", name: "Clawy" },
+      recipient: { id: "28:bot", name: "PrimusClaw Assistant" },
       serviceUrl: "https://smba.test/",
       channelId: "msteams",
       conversation: { id: `conv-${user.id}`, conversationType: "personal" },

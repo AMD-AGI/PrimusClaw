@@ -253,7 +253,7 @@ export function makeWorld(options: WorldOptions = {}) {
       answerOf: (_turnId, events) =>
         events.map((e) => (e.name === "ResultMessage" ? pyStr(e.data["final_text"]) : "")).join(""),
     },
-    wording: { botName: "Clawy", channelName: "Teams" },
+    wording: { botName: "PrimusClaw Assistant", channelName: "Teams" },
     publicBaseUrl: PUBLIC,
     worker: { pluginId: "2", version: "1.0.0", workerImage: "abc1234", apiImage: "", brainImage: "" },
   });

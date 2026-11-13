@@ -80,7 +80,7 @@ it("the answer of a lost turn is sent in the chat after one line that says why",
   const event = completed(w.store.now());
   assert.equal(await w.deliver(event), "delivered");
   const said = sentTexts(w.surface.outbox).join("\n");
-  assert.ok(said.includes(`Clawy 重启打断了上一轮，这是你问的「${ASKED}」的回答`), said);
+  assert.ok(said.includes(`PrimusClaw Assistant 重启打断了上一轮，这是你问的「${ASKED}」的回答`), said);
   assert.ok(said.includes("model M is the best"), said);
   const answer = sentMessages(w.surface.outbox).find(
     (m) => m.body.type === "rich" && m.body.markdown.includes("model M is the best"),

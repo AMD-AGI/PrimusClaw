@@ -40,7 +40,7 @@ function one(url: string): unknown[] {
   return [{ n: 1, url, title: "t", kind: "web" }];
 }
 
-it("each cited source is a source card with clawys own summary", () => {
+it("each cited source is a source card with the assistants own summary", () => {
   // Reverse proof: taking the title as the summary, or numbering the cards by their place in the list instead of the
   // `n` the text writes.
   assert.deepEqual(citationsFromSources(TEXT, [...SOURCES].reverse()), [

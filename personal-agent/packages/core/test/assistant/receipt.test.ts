@@ -152,7 +152,7 @@ it("a receipt closes itself a minute before its channel would close the stream",
 
 it("words that do not grow or pass the limit are not shown", async () => {
   const { stream, receipt } = await opened();
-  receipt.head = "💬 **Clawy**";
+  receipt.head = "💬 **PrimusClaw Assistant**";
   receipt.showText("abc");
   await flushMicrotasks();
   receipt.showText("xyz");
@@ -160,7 +160,7 @@ it("words that do not grow or pass the limit are not shown", async () => {
   await flushMicrotasks();
   assert.deepEqual(
     stream.ops.map((o) => (o.op === "emit" ? o.text : o.op)),
-    ["💬 **Clawy**\n\nabc"],
+    ["💬 **PrimusClaw Assistant**\n\nabc"],
   );
 });
 

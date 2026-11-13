@@ -40,16 +40,16 @@ const FIXED: readonly (readonly [string, string])[] = [
 test("observation's texts are the Python worker's, byte for byte", () => {
   for (const [ours, python] of FIXED) assert.equal(ours, python);
   assert.equal(
-    T.noticeOn({ who: "Alice", bot: "Clawy" }),
-    "🔔 Alice 在本群打开了静默观察：之后本群的消息会交给 Alice 的助理，它只记录“本会做什么”，不会在群里发言，也不会做任何事；Alice 确认后才会执行其中某一条。任何人都可以 @Clawy /observe off 关闭。\nAlice turned on silent observation here: messages in this chat go to Alice's assistant, which only writes down what it would do and does nothing; Alice decides one by one. Anyone can turn it off with @Clawy /observe off.",
+    T.noticeOn({ who: "Alice", bot: "PrimusClaw Assistant" }),
+    "🔔 Alice 在本群打开了静默观察：之后本群的消息会交给 Alice 的助理，它只记录“本会做什么”，不会在群里发言，也不会做任何事；Alice 确认后才会执行其中某一条。任何人都可以 @PrimusClaw Assistant /observe off 关闭。\nAlice turned on silent observation here: messages in this chat go to Alice's assistant, which only writes down what it would do and does nothing; Alice decides one by one. Anyone can turn it off with @PrimusClaw Assistant /observe off.",
   );
   assert.equal(
-    T.isOn({ bot: "Clawy" }),
-    "本群开着静默观察（只记录，不行动）。任何人都可以 @Clawy /observe off 关闭。 / Observation is on here (recorded only, nothing is done).",
+    T.isOn({ bot: "PrimusClaw Assistant" }),
+    "本群开着静默观察（只记录，不行动）。任何人都可以 @PrimusClaw Assistant /observe off 关闭。 / Observation is on here (recorded only, nothing is done).",
   );
   assert.equal(
-    T.usage({ bot: "Clawy" }),
-    "用法：@Clawy /observe on | off | status / Usage: @Clawy /observe on | off | status",
+    T.usage({ bot: "PrimusClaw Assistant" }),
+    "用法：@PrimusClaw Assistant /observe on | off | status / Usage: @PrimusClaw Assistant /observe on | off | status",
   );
   assert.equal(
     T.clawFailed({ status: "503" }),

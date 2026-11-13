@@ -224,7 +224,7 @@ it("a run answered in the chat is dropped and a lost turns answer is sent with o
     assert.equal(await lost.proactive.handle(ALICE, lost.reference, finished), "delivered");
     const out = shown(lost.surface.outbox);
     assert.ok(
-      out[0]?.startsWith("send Clawy 重启打断了上一轮，这是你问的「看看构建为什么挂了」的回答："),
+      out[0]?.startsWith("send PrimusClaw Assistant 重启打断了上一轮，这是你问的「看看构建为什么挂了」的回答："),
       String(out[0]),
     );
     assert.deepEqual(lost.runs.changes, ["s1"]);

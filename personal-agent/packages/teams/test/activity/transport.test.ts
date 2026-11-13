@@ -7,6 +7,9 @@ import test from "node:test";
 import { messageText } from "../../src/activity/inbound/index.js";
 
 test("mention markup is stripped", () => {
-  const activity = { text: "<at>Clawy</at> /new", entities: [{ type: "mention", text: "<at>Clawy</at>" }] };
+  const activity = {
+    text: "<at>PrimusClaw Assistant</at> /new",
+    entities: [{ type: "mention", text: "<at>PrimusClaw Assistant</at>" }],
+  };
   assert.equal(messageText(activity), "/new");
 });

@@ -27,11 +27,11 @@ const CARD = { windowDefault: "card" } as const;
 
 // --- where what is typed goes --------------------------------------------------------------------------------------------------
 
-test("the chat box goes to clawy and the card to the session", () =>
+test("the chat box goes to the assistant and the card to the session", () =>
   remoteWorld(async (w) => {
     const sid = await windowed(w, answering());
     await w.say("今天有什么要我处理的？");
-    assert.deepEqual(w.toAssistant, ["今天有什么要我处理的？"], "the chat box is Clawy's");
+    assert.deepEqual(w.toAssistant, ["今天有什么要我处理的？"], "the chat box is PrimusClaw Assistant's");
     assert.deepEqual(prompts(w), []);
     await sendFromCard(w, sid, "run the tests");
     await w.idle();
@@ -39,7 +39,7 @@ test("the chat box goes to clawy and the card to the session", () =>
     assert.deepEqual(w.toAssistant, ["今天有什么要我处理的？"]);
     // the card says where each goes
     assert.ok(
-      cardWords(lastWindow(w)).includes("What you type in the chat box goes to Clawy"),
+      cardWords(lastWindow(w)).includes("What you type in the chat box goes to PrimusClaw Assistant"),
       cardWords(lastWindow(w)),
     );
   }, CARD));
@@ -50,7 +50,7 @@ test("a reply quoting the session card goes to the session", () =>
     await w.say("看一下 README", USER_A, [statusCardId(w)]);
     assert.deepEqual(prompts(w), ["看一下 README"], "only the words go, not the quoted card");
     assert.deepEqual(w.toAssistant, []);
-    // a quote of another message is Clawy's
+    // a quote of another message is PrimusClaw Assistant's
     await w.say("这是什么意思", USER_A, ["some-other-message"]);
     assert.deepEqual(w.toAssistant, ["这是什么意思"]);
     assert.deepEqual(prompts(w), ["看一下 README"]);
@@ -67,9 +67,9 @@ test("mode chat sends the chat box to the session and mode card takes it back", 
     assert.deepEqual(w.toAssistant, []);
     await w.say("/agent mode card");
     assert.equal(w.test.store.remoteState.attachedRemote(AAD)?.window, "card");
-    await w.say("hello clawy");
+    await w.say("hello there");
     assert.deepEqual(prompts(w), ["hello session"]);
-    assert.deepEqual(w.toAssistant, ["hello clawy"]);
+    assert.deepEqual(w.toAssistant, ["hello there"]);
     // the setting is the person's: the next attach takes it, whatever the worker's default
     w.settings.windowDefault = "chat";
     await w.say("/agent detach");

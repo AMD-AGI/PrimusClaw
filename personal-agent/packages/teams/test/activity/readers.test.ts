@@ -78,33 +78,36 @@ test("the client platform is letters and digits, at most sixteen (measured)", ()
 });
 
 test("the bot's mention, and a mention of another person", () => {
-  assert.ok(isMentioned(grp("<at>Clawy</at> hi")));
-  assert.ok(!isMentioned(grp("<at>Clawy</at> hi", { mention: false })));
-  assert.ok(!isMentioned({ ...grp("<at>Clawy</at> hi"), recipient: {} }), "no bot id: no mention of the bot");
+  assert.ok(isMentioned(grp("<at>PrimusClaw Assistant</at> hi")));
+  assert.ok(!isMentioned(grp("<at>PrimusClaw Assistant</at> hi", { mention: false })));
+  assert.ok(
+    !isMentioned({ ...grp("<at>PrimusClaw Assistant</at> hi"), recipient: {} }),
+    "no bot id: no mention of the bot",
+  );
   assert.ok(!isMentioned({ entities: [{ type: "mention", mentioned: "x" }], recipient: { id: BOT } }));
   assert.ok(isTargeted({ recipient: { is_targeted: true } }) && !isTargeted({ recipient: { isTargeted: "true" } }));
 });
 
 test("a message that starts by naming the bot (measured)", () => {
   const cases: readonly [string, string, boolean][] = [
-    ["Clawy", "@Clawy hi", true],
-    ["Clawy", "@CLAWY", true],
-    ["Clawy", "@clawy-bot", false],
-    ["Clawy", "@Clawyx", false],
-    ["Clawy", "@Clawy_", false],
-    ["Clawy", "@Clawyé", false],
-    ["Clawy", "@Clawy, hi", true],
-    ["Clawy", "<p>&nbsp;<at>Clawy</at> hi", true],
-    ["Clawy", "<P class='x'>\x1c<AT> @ Clawy </at>", true],
-    ["Clawy", "@ Clawy", true],
-    ["Clawy", "hi @Clawy", false],
-    ["Clawy", "<pre>@Clawy", false],
-    ["Clawy", "\ufeff@Clawy", false],
-    ["Clawy", "&NBSP;@Clawy", true],
+    ["Robin", "@Robin hi", true],
+    ["Robin", "@ROBIN", true],
+    ["Robin", "@robin-bot", false],
+    ["Robin", "@Robinx", false],
+    ["Robin", "@Robin_", false],
+    ["Robin", "@Robiné", false],
+    ["Robin", "@Robin, hi", true],
+    ["Robin", "<p>&nbsp;<at>Robin</at> hi", true],
+    ["Robin", "<P class='x'>\x1c<AT> @ Robin </at>", true],
+    ["Robin", "@ Robin", true],
+    ["Robin", "hi @Robin", false],
+    ["Robin", "<pre>@Robin", false],
+    ["Robin", "\ufeff@Robin", false],
+    ["Robin", "&NBSP;@Robin", true],
     ["Kiss", "@Kıſſ", true],
     ["Kiss", "@KİSS", true],
     ["Kiss", "@kiss", true],
-    ["Clawy", "<at>Clawy</at>", true],
+    ["Robin", "<at>Robin</at>", true],
   ];
   for (const [name, text, expected] of cases)
     assert.equal(addressedToBot({ text }, name), expected, `${name}: ${text}`);
@@ -134,7 +137,7 @@ test("message text: every mention goes when the bot's id is unknown, a mention w
 
 test("the mentions of a message, with where their words stand", () => {
   const dana = { type: "mention", text: "<at>Dana</at>", mentioned: { id: "29:d", name: "Dana" } };
-  const a = grp("  <at>Clawy</at> \u{1F600} Dana or <at>Dana</at>?", { entities: [dana, dana] });
+  const a = grp("  <at>PrimusClaw Assistant</at> \u{1F600} Dana or <at>Dana</at>?", { entities: [dana, dana] });
   assert.equal(messageText(a), "\u{1F600} Dana or Dana?");
   assert.deepEqual(
     mentionsOf(a).map((m) => [m.shown, m.offset]),
@@ -145,8 +148,8 @@ test("the mentions of a message, with where their words stand", () => {
   );
   assert.deepEqual(mentionsOf({ ...a, recipient: {} }), [], "no bot id: every mention is gone from the text");
   const empty = { type: "mention", text: "<at></at>", mentioned: { id: "29:e" } };
-  assert.deepEqual(mentionsOf(grp("<at>Clawy</at> hi <at></at>", { entities: [empty] })), []);
-  const held = grp("<at>Clawy</at> \ue000 <at>Dana</at>", { entities: [dana] });
+  assert.deepEqual(mentionsOf(grp("<at>PrimusClaw Assistant</at> hi <at></at>", { entities: [empty] })), []);
+  const held = grp("<at>PrimusClaw Assistant</at> \ue000 <at>Dana</at>", { entities: [dana] });
   assert.deepEqual(
     mentionsOf(held).map((m) => [m.shown, m.offset]),
     [["Dana", 2]],
@@ -257,9 +260,9 @@ test("a quote by the bot: by id, by the part after the prefix, by name only with
   assert.ok(isBotQuote(quote("28:BOT"), { id: "28:bot" }));
   assert.ok(isBotQuote(quote("bot"), { id: "28:bot" }));
   assert.ok(!isBotQuote(quote("28:"), { id: "29:" }));
-  assert.ok(isBotQuote(quote("", "clawy"), { id: "28:bot", name: " Clawy " }));
+  assert.ok(isBotQuote(quote("", "robin"), { id: "28:bot", name: " Robin " }));
   assert.ok(!isBotQuote(quote("", ""), { name: "" }));
-  assert.ok(!isBotQuote(quote("29:x", "Clawy"), { name: "Clawy" }));
+  assert.ok(!isBotQuote(quote("29:x", "Robin"), { name: "Robin" }));
 });
 
 test("the kinds of a list for a log line (measured)", () => {

@@ -26,7 +26,7 @@ function said(catalog: Catalog<Messages>, lang: "en" | "zh"): Map<string, string
     command: "cmd",
     version: "0.1.2",
     reason: "gone",
-    bot: "Clawy",
+    bot: "PrimusClaw Assistant",
     now: "",
   };
   return new Map(

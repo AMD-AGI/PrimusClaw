@@ -209,7 +209,7 @@ export interface WorldOptions {
 function configOf(overrides: Partial<RouterConfig> = {}): RouterConfig {
   return {
     publicBaseUrl: PUBLIC,
-    botName: "Clawy",
+    botName: "PrimusClaw Assistant",
     pluginId: "",
     model: "",
     reviewModel: "",

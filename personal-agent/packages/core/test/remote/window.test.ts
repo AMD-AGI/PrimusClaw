@@ -101,15 +101,19 @@ test("where typed text goes is said in the chat's language", () => {
   assert.ok(quotesWindow(["c2"], ["c1", "c2"]) && !quotesWindow(["c3"], ["c1", ""]) && !quotesWindow(["x"], [""]));
   assert.equal(sentLabel("quote", "en"), "You replied quoting the card: ");
   assert.equal(sentLabel("", "zh"), "你从卡片发的：");
-  assert.ok(chatBoxLine("card", "en", "Clawy").startsWith("What you type in the chat box goes to Clawy;"));
-  assert.ok(chatBoxLine("chat", "zh", "Clawy").startsWith("聊天框里打的字都发给这个会话"));
+  assert.ok(
+    chatBoxLine("card", "en", "PrimusClaw Assistant").startsWith(
+      "What you type in the chat box goes to PrimusClaw Assistant;",
+    ),
+  );
+  assert.ok(chatBoxLine("chat", "zh", "PrimusClaw Assistant").startsWith("聊天框里打的字都发给这个会话"));
   assert.equal(
-    modeSetLine("chat", "en", true, "Clawy"),
-    "Done: while a chat is attached, what you type goes to the session (this chat too, from now on). Messages that start with @Clawy still come to me.",
+    modeSetLine("chat", "en", true, "PrimusClaw Assistant"),
+    "Done: while a chat is attached, what you type goes to the session (this chat too, from now on). Messages that start with @PrimusClaw Assistant still come to me.",
   );
   assert.equal(
-    modeSetLine("card", "zh", false, "Clawy"),
-    "好的：接入会话后，聊天框留给 Clawy，发给会话用会话卡片上的输入框。",
+    modeSetLine("card", "zh", false, "PrimusClaw Assistant"),
+    "好的：接入会话后，聊天框留给 PrimusClaw Assistant，发给会话用会话卡片上的输入框。",
   );
 });
 
