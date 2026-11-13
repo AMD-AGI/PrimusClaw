@@ -523,6 +523,59 @@ func TestOwnerPolicyNotAppliedIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestNoOwnerPolicySkipsIntrospection checks that a key without the grant prefix is
+// answered 503 before introspection and the User read while no owner policy is applied.
+func TestNoOwnerPolicySkipsIntrospection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+
+	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
+	if oe, ok := err.(*grant.OpError); !ok || oe.Status != http.StatusServiceUnavailable || oe.Reason != "identity_unavailable" {
+		t.Fatalf("create err = %v, want 503 identity_unavailable", err)
+	}
+	if _, err := plane.List(context.Background(), "ak-alice", "", "", "", 0); opReason(err) != "identity_unavailable" {
+		t.Fatalf("list err = %v, want identity_unavailable", err)
+	}
+	if ids.calls != 0 {
+		t.Fatalf("introspection calls = %d, want 0 while no owner policy is applied", ids.calls)
+	}
+}
+
+// TestRejectedOwnerPolicyIsServerError checks that a policy a retry cannot fix is a 500
+// with the reason, and that applying a valid policy later clears it.
+func TestRejectedOwnerPolicyIsServerError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+
+	gs.SetOwnerPolicyFault(errors.New("at least one template is required"))
+	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
+	if oe, ok := err.(*grant.OpError); !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" {
+		t.Fatalf("create err = %v, want 500 owner_policy_invalid", err)
+	}
+	if ids.calls != 0 {
+		t.Fatalf("introspection calls = %d, want 0", ids.calls)
+	}
+
+	if err := gs.SetOwnerPolicy(context.Background(), samplePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.OwnerReady(); err != nil {
+		t.Fatalf("OwnerReady after a valid policy = %v, want nil", err)
+	}
+}
+
 func TestPartialQuotasInheritByRole(t *testing.T) {
 	tpl, err := json.Marshal(samplePolicy().Templates)
 	if err != nil {

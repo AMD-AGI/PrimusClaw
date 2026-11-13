@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -470,7 +471,7 @@ func main() {
 		}
 		if idClient != nil {
 			opts.Identity = idClient
-			if attester == nil {
+			if attester == nil && ownerPolicyConfigured() {
 				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
 			}
 		}
@@ -529,6 +530,7 @@ func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	policy, err := grant.OwnerPolicyFromEnv()
 	if err != nil {
 		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
+		grants.SetOwnerPolicyFault(err)
 		return client
 	}
 	if policy == nil {
@@ -542,11 +544,17 @@ func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	}
 	if !transientPolicyError(err) {
 		log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
+		grants.SetOwnerPolicyFault(err)
 		return client
 	}
 	log.Warn("owner policy was not applied, retrying", "error", err)
 	go retryOwnerPolicy(ctx, grants, *policy)
 	return client
+}
+
+// ownerPolicyConfigured reports whether an owner policy is set in the environment.
+func ownerPolicyConfigured() bool {
+	return strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY")) != "" || strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_FILE")) != ""
 }
 
 // transientPolicyError reports whether an owner policy error may clear on retry.
@@ -571,7 +579,8 @@ func retryOwnerPolicy(ctx context.Context, grants *grant.Service, policy grant.O
 			return
 		}
 		if !transientPolicyError(err) {
-			log.Error("identity keys disabled: owner policy was not applied", "error", err)
+			log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
+			grants.SetOwnerPolicyFault(err)
 			return
 		}
 		log.Warn("owner policy was not applied, retrying", "error", err, "delay", delay)

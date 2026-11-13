@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,9 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 		t.Setenv("E2B_OWNER_POLICY", policy)
 		if client := ownerKeys(context.Background(), grants); client == nil || grants.OwnerRole() != "" {
 			t.Fatalf("%s: client=%v role=%q, want a client and no owner role", name, client, grants.OwnerRole())
+		}
+		if oe, ok := grants.OwnerReady().(*grant.OpError); !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" {
+			t.Fatalf("%s: OwnerReady = %v, want 500 owner_policy_invalid", name, grants.OwnerReady())
 		}
 	}
 

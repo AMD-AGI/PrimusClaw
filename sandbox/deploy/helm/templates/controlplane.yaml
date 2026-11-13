@@ -319,7 +319,7 @@ spec:
             - name: IDENTITY_INTROSPECT_URL
               value: {{ .introspectUrl | quote }}
             {{- end }}
-            {{- if .ownerPolicyConfigMap }}
+            {{- if and .introspectUrl .ownerPolicyConfigMap }}
             - name: E2B_OWNER_POLICY
               valueFrom:
                 configMapKeyRef:
