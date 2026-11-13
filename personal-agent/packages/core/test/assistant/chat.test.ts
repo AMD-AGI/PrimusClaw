@@ -65,6 +65,7 @@ function world(options: Partial<AssistantChatOptions> & { streaming?: boolean; c
     users: new Set(),
     understanding: new Set(),
     pluginId: undefined,
+    assistantName: "",
     legacyTurn: () => legacy,
     files: undefined,
     onFilesDropped: (_path, count) => dropped.push(count),
@@ -293,6 +294,42 @@ it("stop answers in the chat's language", async () => {
     "我现在没有在忙。要停止某个任务，说「停止 #2」（编号见 /board），或者点它卡片下的「停止」。",
     "暂时连不上你的助理，请稍后再试。",
   ]);
+});
+
+it("the bot's configured name rides on every message to the assistant, trimmed; none configured sends none", async () => {
+  // A deployment that names its bot "Clawy": the assistant is told the name its people use, on both ways a message reaches it.
+  const w = world({ assistantName: " Clawy ", understanding: new Set([ALICE]) });
+  await route(w, "how is Clawy doing");
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", assistant_name: "Clawy" });
+  w.store.lang = "zh";
+  w.store.langSet = true;
+  await route(w, "Clawy最近运行如何", { attached: null });
+  assert.deepEqual(w.claw.heard[1]?.context, {
+    channel: "teams",
+    attached: null,
+    reply_language: "zh",
+    assistant_name: "Clawy",
+  });
+  const understood = {
+    userId: ALICE,
+    credential: "idt-token",
+    modelKey: "",
+    prompt: "how is Clawy doing",
+    context: { channel_message_id: "m-1" },
+    lang: "en" as const,
+    conversation: w.conversation,
+    files: [],
+  };
+  assert.equal(await w.chat.understand(understood), true);
+  assert.deepEqual(w.claw.heard[2]?.context, { channel_message_id: "m-1", reply_language: "zh", assistant_name: "Clawy" });
+  // A deployment left with the default name sends that name.
+  const unset = world({ assistantName: "PrimusClaw Assistant" });
+  await route(unset, "hello");
+  assert.deepEqual(unset.claw.heard[0]?.context, { channel: "teams", assistant_name: "PrimusClaw Assistant" });
+  // No name (or only spaces): nothing is sent, and the message is as it was.
+  const none = world({ assistantName: "  " });
+  await route(none, "hello");
+  assert.deepEqual(none.claw.heard[0]?.context, { channel: "teams" });
 });
 
 it("a person the assistant understands sends with their token and model key and is told when it cannot be reached", async () => {
