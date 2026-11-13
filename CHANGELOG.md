@@ -111,6 +111,13 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Changed
+
+- Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
+  it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
+  The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
+  The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
+
 ## [0.4.4] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131535` (commit ce688380). A patch release: personal skills are saved from the
