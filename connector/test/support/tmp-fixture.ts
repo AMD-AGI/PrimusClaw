@@ -12,12 +12,14 @@
  *          server is), reported as `closed`
  *   EPIPE  as the signals, but the test only goes on writing its report: the other side closes the pipe it writes into
  *   SIGKILL  the process is killed in the middle of the test, so nothing of its own cleanup runs
- * Every way it ends, it also leaves running two processes it started itself and registered nowhere (a detached one,
+ * Before anything else, it leaves in its TMPDIR a stale run directory named with its own pid and another start time,
+ * which its own first `tmpdir` must remove. Every way it ends, it also leaves running two processes it started itself and registered nowhere (a detached one,
  * and one that ignores SIGTERM), and a detached one named by a connector.pid as a connector's, reported as `started`. Before it ends it writes the directories it made, and the
  * adapters it started (one by a session, one below a wrapper that has exited), to TMP_FIXTURE_REPORT (outside that TMPDIR).
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import test from "node:test";
 import path from "node:path";
 import { ChildRegistry, processStart } from "../../src/children.js";
@@ -25,6 +27,12 @@ import { Harness, tmpdir } from "./harness.js";
 import { liveTmpdirs, onCleanup } from "./tmp.js";
 
 const end = process.env.TMP_FIXTURE_END ?? "pass";
+
+// What an earlier file with this one's pid (since given out again) left when it was killed, untouched for long since:
+// this file's first directory removes it, though the pid is its own.
+const earlier = path.join(os.tmpdir(), `cc-run-${process.pid}-1-EARLYR`);
+fs.mkdirSync(path.join(earlier, "w-EARLYR"), { recursive: true, mode: 0o700 });
+fs.utimesSync(earlier, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
 
 test("the suite's setup", async () => {
   const attach = await Harness.create({ attach: { sessions: [] } });

@@ -12,9 +12,10 @@
  *
  * A file SIGKILLed with its whole process group (`timeout -s KILL`, an OOM kill, a tool that kills the tree) runs none
  * of that. So its directories are not made in TMPDIR itself but in one directory of the file's own there, cc-run-*,
- * named with the file's pid and start time; the next test file to make a directory in that TMPDIR removes every
- * cc-run-* whose process is gone, after killing the connectors (connector.pid) and adapters (children.json) recorded
- * in it, which would otherwise go on writing there. Such a run leaves one directory per file until then, not one per test.
+ * named with the file's pid and start time and touched by the file while it runs. A test file making its first
+ * directory in that TMPDIR removes every cc-run-* whose process is gone and that has gone two minutes untouched, after
+ * killing the connectors (connector.pid) and adapters (children.json) recorded in it, which would otherwise go on
+ * writing there. Such a run leaves one directory per file until then, not one per test.
  *
  * Only the test files' own processes import this: it registers a hook with node:test, which a helper process a
  * test spawns must not do (support/run-fast.ts imports support/timing.ts, not the harness, for that reason).
@@ -35,14 +36,27 @@ const RUN_PREFIX = "cc-run-";
 /** What names a run directory: its file's process, whose start time tells it from a later process given the same pid. */
 const RUN_NAME = /^cc-run-(\d+)-(\d+)-[A-Za-z0-9]{6}$/;
 
-/** Whether the process that made the run directory `name` is still running (where its start time cannot be read, any process with its pid). */
+/** How often a file touches its run directory while it runs. */
+const HEARTBEAT_MS = 20_000;
+/** How long a run directory whose process cannot be found must have gone untouched before it is taken for a dead file's. */
+const STALE_MS = 2 * 60_000;
+
+/**
+ * Whether the process that made the run directory `name` is certainly still running: its pid has its start time (or, off
+ * Linux, any process has its pid). The converse proves nothing: a file in another pid namespace sharing TMPDIR cannot
+ * be seen, or its pid is some other process here, so a run is only taken for dead once its directory is also stale.
+ */
 function runOwnerAlive(name: string): boolean {
   const m = RUN_NAME.exec(name);
   if (!m) return true;
   const pid = Number(m[1]);
-  if (pid === process.pid) return true;
   if (process.platform === "linux") return processStart(pid) === m[2];
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** Whether the run directory `dir` has gone STALE_MS without its file's heartbeat (or anything made in it). */
+function stale(dir: string): boolean {
+  try { return Date.now() - fs.lstatSync(dir).mtimeMs > STALE_MS; } catch { return false; }
 }
 
 /** Whether `dir` is a directory (not a link to one) this user made and only this user can write in: one mkdtemp made. */
@@ -56,7 +70,8 @@ function ownPrivateDir(dir: string): boolean {
 /**
  * Remove the run directories in TMPDIR whose file was killed before it could remove them, first killing the connectors
  * and adapters recorded in them, which outlive such a file as well. Those of a running file, this one's included, are
- * not touched, nor any this user did not make itself (in a shared TMPDIR, what it records must not be someone else's).
+ * not touched (one whose process is not found here is left until its heartbeat has stopped for STALE_MS), nor any this
+ * user did not make itself (in a shared TMPDIR, what it records must not be someone else's).
  */
 function sweepDeadRuns(): void {
   let names: string[] = [];
@@ -64,7 +79,7 @@ function sweepDeadRuns(): void {
   for (const name of names) {
     if (!name.startsWith(RUN_PREFIX) || !RUN_NAME.test(name) || runOwnerAlive(name)) continue;
     const dir = path.join(os.tmpdir(), name);
-    if (!ownPrivateDir(dir)) continue;
+    if (!ownPrivateDir(dir) || !stale(dir)) continue;
     try { killRecordedConnectors(dir, 4); } catch { /* the directory goes regardless */ }
     try { killAdaptersUnder(dir, 4); } catch { /* the directory goes regardless */ }
     forceRemove(dir);
@@ -76,8 +91,10 @@ function ensureRunDir(): string {
   sweepDeadRuns();
   // Off Linux the name carries 0 for the start time, and the directory is removed once no process has its pid.
   const start = process.platform === "linux" ? processStart(process.pid) ?? "0" : "0";
-  runDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_PREFIX}${process.pid}-${start}-`)));
-  return runDir;
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_PREFIX}${process.pid}-${start}-`)));
+  runDir = dir;
+  setInterval(() => { try { const now = new Date(); fs.utimesSync(dir, now, now); } catch { /* removed */ } }, HEARTBEAT_MS).unref();
+  return dir;
 }
 
 /** A new directory under os.tmpdir() (TMPDIR), its real path, removed when the test file ends. */

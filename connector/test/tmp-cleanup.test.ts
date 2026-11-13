@@ -83,7 +83,7 @@ describe("temporary directories", { skip: process.platform !== "linux" && "reads
   }
   // A file SIGKILLed (with its group, by `timeout -s KILL` or an OOM kill) runs no cleanup of its own: it left every
   // directory it had made in TMPDIR, hundreds for a few seconds of the suite, and its adapters running.
-  test("a test file SIGKILLed leaves one directory, which the next file in that TMPDIR removes after killing its adapters", async (t) => {
+  test("a test file SIGKILLed leaves one directory, which a file in that TMPDIR removes once it is stale, after killing its connector and adapters", async (t) => {
     const killed = await run("SIGKILL");
     t.after(() => { for (const pid of [...killed.adapters, ...killed.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
     assert.equal(killed.signal, "SIGKILL", killed.out);
@@ -92,14 +92,21 @@ describe("temporary directories", { skip: process.platform !== "linux" && "reads
     assert.match(killed.left[0], /^cc-run-\d+-\d+-[A-Za-z0-9]{6}$/);
     for (const d of killed.made) assert.equal(path.basename(path.dirname(d)), killed.left[0], d);
     const tmp = path.dirname(path.dirname(killed.made[0]));
-    // That of a file still running (this one) is not touched; one named with a live pid but another start time is that
-    // of an earlier process whose pid was given out again, and goes; one that others may write in is not one mkdtemp
-    // made, so not one a test file made: what it records may not be the suite's, and it is left alone.
+    // A file killed hard is taken for dead only once its directory has gone untouched for two minutes (it may be running
+    // in a pid namespace this one cannot see): until then the next file leaves it.
+    const soon = await run("pass", false, tmp);
+    t.after(() => { for (const pid of [...soon.adapters, ...soon.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
+    assert.equal(soon.status, 0, soon.out);
+    assert.deepEqual(soon.left, killed.left, `left in TMPDIR: ${soon.left.join(", ")}\n${soon.out}`);
+    const old = new Date(Date.now() - 600_000);
+    fs.utimesSync(path.join(tmp, killed.left[0]), old, old);
+    // That of a file still running (this one) is not touched, however long untouched; one that others may write in is not
+    // one mkdtemp made, so not one a test file made: what it records may not be the suite's, and it is left alone.
     const running = path.join(tmp, `cc-run-${process.pid}-${processStart(process.pid)}-AAAAAA`);
-    const recycled = path.join(tmp, `cc-run-${process.pid}-1-AAAAAA`);
     const shared = path.join(tmp, `cc-run-${process.pid}-1-BBBBBB`);
-    for (const d of [running, recycled, shared]) fs.mkdirSync(path.join(d, "w-AAAAAA"), { recursive: true, mode: 0o700 });
+    for (const d of [running, shared]) fs.mkdirSync(path.join(d, "w-AAAAAA"), { recursive: true, mode: 0o700 });
     fs.chmodSync(shared, 0o777);
+    for (const d of [running, shared]) fs.utimesSync(d, old, old);
     const next = await run("pass", false, tmp);
     t.after(() => { for (const pid of [...next.adapters, ...next.started]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } });
     assert.equal(next.status, 0, next.out);
