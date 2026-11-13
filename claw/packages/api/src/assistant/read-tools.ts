@@ -22,7 +22,7 @@
  * model sees it. And of the plugin's rules, the chat app's reply-style rule is the router's too: how a reply is written.
  */
 import { GITHUB_MCP_SERVER, TRIGGER_MCP_PATH, TRIGGER_MCP_SERVER } from "@claw/protocol";
-import { CLAW_ASSISTANT_PLUGIN_ID, INTERNAL_BACKEND_URL } from "../config.js";
+import { CLAW_ASSISTANT_PLUGIN_ID, CLAW_USER_SKILLS_ENABLED, INTERNAL_BACKEND_URL } from "../config.js";
 import { githubMcpServers } from "../github-mcp/mcp.js";
 import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { verifyTriggerToken } from "../triggers/token.js";
@@ -80,6 +80,11 @@ export function readToolPatterns(server: string): string[] {
   return Object.hasOwn(ROUTER_READ_TOOLS, server) ? ROUTER_READ_TOOLS[server].map((t) => `mcp__${server}__${t}`) : [];
 }
 
+/** skill_read is the router's only while personal skills are on (`mcp.ts`); off, it is in neither list below. */
+function withUserSkills(tools: string[]): readonly string[] {
+  return CLAW_USER_SKILLS_ENABLED ? tools : tools.filter((t) => t !== "skill_read");
+}
+
 /**
  * The assistant's own tools a router turn may still call after it has read a read tool's result (`ExecuteRequest.read_taint`):
  * the ones that only speak or read (the brief, the user's scheduled tasks and watched jobs included: a weekly report asked for
@@ -91,9 +96,15 @@ export function readToolPatterns(server: string): string[] {
  * the user the exact comment on a card, and only their press posts it (`schedules.ts`); a draft is written from what was read, so it
  * must come after the reads. `devenv_pair` shows the user, in their own chat, a one-time code that connects nothing until they run
  * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs). `pr_state` only reads where a
- * pull request stands (`review-tools.ts`).
+ * pull request stands (`review-tools.ts`). `skill_read` reads one of the user's own personal skills (`skill-tools.ts`).
+ *
+ * None of them is a source of the rule (`read_taint.sources` is the lookups alone): what they read is the user's or Claw's own, so
+ * reading it never stops the turn from acting. `skill_read` above all: a router that read a skill must still start the work it
+ * describes. With CLAW_USER_SKILLS_ENABLED off the router has no skill_read, and the list is the one it was before it had one.
  */
-export const AFTER_READ_TOOLS = ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"] as const;
+export const AFTER_READ_TOOLS: readonly string[] = withUserSkills([
+  "say", "work_recall", "memory_recall", "skill_read", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state",
+]);
 
 /** The tool a router turn speaks with (`router-turn-end.ts`, `saidOnlyBeforeLookups`). */
 export const ROUTER_SPEAK_TOOL = "say";
@@ -102,9 +113,9 @@ export const ROUTER_SPEAK_TOOL = "say";
  * The assistant's own tools that only read: what a say written before it cannot have answered from (`saidOnlyBeforeLookups`). Named,
  * not derived from AFTER_READ_TOOLS, which also holds what speaks or drafts after a read (`deliver_text`, `github_comment`).
  */
-export const ROUTER_ASSISTANT_READS: readonly string[] = [
-  "work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
-];
+export const ROUTER_ASSISTANT_READS: readonly string[] = withUserSkills([
+  "work_recall", "memory_recall", "skill_read", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
+]);
 
 /**
  * The GitHub reads a router turn may call (`github-mcp/tools.ts`): finding and reading pull requests, issues, their checks and

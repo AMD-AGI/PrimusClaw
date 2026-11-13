@@ -553,7 +553,8 @@ export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIE
 export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
 // Personal skills, two switches.
 // CLAW_USER_SKILLS_ENABLED: a user's own skills are listed to the turns of their own conversations
-// (`request.user_skills`, sessions/user-skills.ts), and what such a turn saves (the save_skill tool and the
+// (`request.user_skills`, sessions/user-skills.ts; the assistant's router gets its own list with each message and the
+// skill_read tool, assistant/skill-tools.ts), and what such a turn saves (the save_skill tool and the
 // *_skill_file tools) is kept. Off: no skill is listed to a turn, Brain neither offers nor runs the skill-writing
 // tools, and what a worker sends to save is dropped. The skill routes (/v1/users/:id/skills) work
 // either way, as before: they are the user's own explicit writes, under the same checks.

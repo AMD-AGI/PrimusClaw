@@ -342,7 +342,7 @@ export async function readUserSkill(
   };
 }
 
-/** One supporting file of one of the user's current skills, under the same rule as `readUserSkill`. */
+/** One supporting file of one of the user's current skills, under the same rule as `readUserSkill`; a read of one is a use too. */
 export async function readUserSkillFile(
   userId: string, name: string, path: string, opts: { expectSha?: string } = {}, q: Querier = db.query,
 ): Promise<UserSkillRead<{ name: string; version: number; content_sha: string; path: string; content: string; is_binary: boolean; size_bytes: number }>> {
@@ -350,6 +350,7 @@ export async function readUserSkillFile(
   if (!cur.ok) return cur;
   const file = cur.snap.files.find((f) => f.path === path);
   if (!file) return { ok: false, error: "not_found" };
+  await q("UPDATE claw_skills SET last_used_at = NOW() WHERE id = $1", [cur.row.id]);
   return {
     ok: true,
     value: {

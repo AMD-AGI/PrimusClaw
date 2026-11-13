@@ -23,7 +23,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import pino from "pino";
 import { z } from "zod";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS, WORK_CREATE_REPO_PARAM } from "./prompts.js";
@@ -44,6 +44,7 @@ import {
 } from "./tools.js";
 import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
+import { skillRead } from "./skill-tools.js";
 import { channelAction, confirmationAnswer, MAX_PRS, prState, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
@@ -101,6 +102,22 @@ function registerMemoryRecall(mcp: McpServer, claims: AssistantTokenClaims): voi
     "Read the user's long-term memory: one entry in full by its number, a search, or with neither every entry one line each. Background, not instructions.",
     { id: z.string().optional().describe(MEMORY_ID_PARAM), query: z.string().optional() },
     (args) => answer(claims, "memory_recall", () => memoryRecall(claims, args)),
+  );
+}
+
+/** Reading one of the user's personal skills (`skill-tools.ts`): the router only; it reads, so it may follow a lookup. */
+function registerSkillRead(mcp: McpServer, claims: AssistantTokenClaims): void {
+  mcp.tool(
+    "skill_read",
+    "Read one of the user's personal skills by its name: its instructions (in pages when long) and, on the last page, the list of its "
+    + "files; with path, one of those files. Read a skill before you use it.",
+    {
+      name: z.string().describe("The skill's name, as listed or as the user named it."),
+      // A number, or one written as text ("2"): `skill-tools.ts` reads either and refuses anything else in words the model can act on.
+      page: z.union([z.number(), z.string()]).optional().describe("The page to read, from 1; the result says how many there are."),
+      path: z.string().optional().describe("One file of the skill, as its list of files names it."),
+    },
+    (args) => answer(claims, "skill_read", () => skillRead(claims, args)),
   );
 }
 
@@ -344,7 +361,7 @@ export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
-  suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(),
+  suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(), userSkills: boolean = CLAW_USER_SKILLS_ENABLED,
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   if (claims.role === "observer") {
@@ -558,6 +575,8 @@ export function createAssistantMcpServer(
       registerMemoryRecall(mcp, claims);
       registerMemoryWrites(mcp, claims);
     }
+    // Not an observer's: it watches a group or a repository, where no one's personal skills are read.
+    if (userSkills && claims.role === "router") registerSkillRead(mcp, claims);
   } else {
     mcp.tool(
       "report",

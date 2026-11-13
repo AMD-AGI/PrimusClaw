@@ -71,7 +71,7 @@ describe("assistant router read tools", { skip }, () => {
   });
   after(async () => { await w?.stop(); });
   beforeEach(async () => {
-    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_conversation_turns CASCADE");
+    await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_sessions, claw_conversation_turns, claw_skills CASCADE");
     alice = await w.user("alice");
     await w.q("UPDATE claw_sessions SET agent_status = 'idle', agent_gate_message_id = NULL");
   });
@@ -127,6 +127,8 @@ describe("assistant router read tools", { skip }, () => {
   });
 
   test(`RT2 a router turn asked "${QUESTION}" is offered the autopilot read tools and no skill`, async () => {
+    // A personal skill of the user's, with CLAW_USER_SKILLS_ENABLED off (as here): the router is told nothing of it.
+    await w.q("INSERT INTO claw_skills (user_id, skill_name, version, content, description, status) VALUES ('alice', 'autopilot-nodes', 1, 'c', 'count nodes', 'active')");
     const task = await send(alice.routerSid, QUESTION);
     assert.equal(task.plugin_id, PLUGIN);
     assert.deepEqual(task.plugin_tools.map((t: any) => t.id), [17, 3, 26, 18]);
@@ -135,7 +137,8 @@ describe("assistant router read tools", { skip }, () => {
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__get_nodes"), "by name: a tool autopilot does not list is not offered");
     assert.ok(!allows(task.tools_allowlist, "mcp__autopilot__apply_host_exclusion_add"));
     assert.equal(task.skip_platform_defaults, true, "no default MCP server and no default skill list");
-    // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain.
+    // After it has read one of their results the turn no longer acts for the person: only these are let through by Brain. With
+    // CLAW_USER_SKILLS_ENABLED off this is the list as it was before the router had skill_read, written out, not taken from the constant.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
       allow_after: ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
@@ -154,7 +157,13 @@ describe("assistant router read tools", { skip }, () => {
     assert.match(task.system_append, /work_create is for work that produces or changes something/);
     for (const text of [task.system_append, task.prompt]) {
       assert.ok(!text.includes("SKILL.md") && !text.includes("Platform Skills"), "no skill is named to the router");
+      assert.ok(!text.includes("autopilot-nodes") && !text.includes("skill_read") && !text.includes("personal skills"), "nor a personal skill");
     }
+    // Nor does the rest of the turn's reckoning know skill_read, and /metrics shows none of the personal-skill series.
+    const { ROUTER_ASSISTANT_READS } = await import("../src/assistant/read-tools.js");
+    assert.deepEqual(ROUTER_ASSISTANT_READS, ["work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state"]);
+    const { registry } = await import("../src/infra/metrics.js");
+    assert.doesNotMatch(await registry.metrics(), /claw_user_skill_/);
     assert.ok(task.prompt.startsWith(`${QUESTION}\n\n`), "the user's words first");
   });
 
