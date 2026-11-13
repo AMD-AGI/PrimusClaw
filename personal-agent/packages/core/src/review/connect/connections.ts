@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/** What /whoami says the person is connected to: SaFE, GitHub (what Clawy reads it with), the deployment's own lines, memory. */
+/** What /whoami says the person is connected to: SaFE, GitHub (what the bot reads it with), the deployment's own lines, memory. */
 
 import type { GithubConnection } from "../../claw/model.js";
 import type { GithubState } from "../../ports/github.js";
@@ -75,8 +75,8 @@ function withConnection(
         ? `已连接${who}，但 PrimusClaw 暂时用不了它读 GitHub`
         : `connected${who}, but PrimusClaw cannot read GitHub with it just now`;
     return zh
-      ? `已连接${who}（只用于代审；要让 Clawy 读你的 GitHub，在 PrimusClaw 设置里保存一个 GH_TOKEN）`
-      : `connected${who} (for reviews only; for Clawy to read your GitHub, keep a GH_TOKEN in your PrimusClaw settings)`;
+      ? `已连接${who}（只用于代审；要让我读你的 GitHub，在 PrimusClaw 设置里保存一个 GH_TOKEN）`
+      : `connected${who} (for reviews only; for me to read your GitHub, keep a GH_TOKEN in your PrimusClaw settings)`;
   }
   if (part && connection.bindingReads)
     return zh ? "未连接，发 `/github bind` 连接" : "not connected; send `/github bind` to connect it";
@@ -96,13 +96,13 @@ function githubWords(
   const who = login ? ` \`${login}\`` : "";
   if (connection?.readsWith === "binding") {
     return zh
-      ? `已连接${who}，Clawy 用它以你的身份读 GitHub（PR、CI、issue）`
-      : `connected${who}; Clawy reads your GitHub with it, as you (pull requests, CI, issues)`;
+      ? `已连接${who}，我用它以你的身份读 GitHub（PR、CI、issue）`
+      : `connected${who}; I read your GitHub with it, as you (pull requests, CI, issues)`;
   }
   if (connection?.readsWith === "env") {
     return zh
-      ? "已连接，Clawy 用你在 PrimusClaw 设置里保存的 GH_TOKEN 读 GitHub"
-      : "connected; Clawy reads your GitHub with the GH_TOKEN in your PrimusClaw settings";
+      ? "已连接，我用你在 PrimusClaw 设置里保存的 GH_TOKEN 读 GitHub"
+      : "connected; I read your GitHub with the GH_TOKEN in your PrimusClaw settings";
   }
   if (state === UNKNOWN) return zh ? "暂时读不到" : "could not be read just now";
   if (connection === null) return bindingOnly(state, who, known, part, zh);

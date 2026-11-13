@@ -13,6 +13,7 @@ import { RemoteTurnState } from "../../src/remote/turn-state.js";
 import { FakeClock } from "../../../../test-support/clock.js";
 import { openTestStore } from "../../../../test-support/store.js";
 import { TEST_TIMINGS, WORLD_ERRORS } from "../../../../test-support/remote-world.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 const CHAT = "aad-a";
 
@@ -63,6 +64,7 @@ function speakerThatHangs(cutOff: AbortSignal, reachable = true) {
       showPermission: () => new Promise<never>(() => undefined), // (the card's send never comes back either)
       lang: () => "en",
       direct: () => false,
+      botName: BOT_NAME,
     },
     turn,
     cutOff,

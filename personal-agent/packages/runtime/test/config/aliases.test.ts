@@ -16,6 +16,7 @@ import {
   ALIASED_SETTINGS,
   EnvReader,
   EnvSecretSource,
+  MODEL_SETTINGS,
   SETTING_ALIASES,
   legacySettings,
   readSettings,
@@ -52,12 +53,19 @@ function everySetting(prefix: "PA_" | "TEAMS_", which: 1 | 2): Record<string, st
 }
 
 describe("the worker's setting names", () => {
-  it("every PA_ name has the TEAMS_ name it replaces, and nothing else is aliased", () => {
-    assert.equal(SETTING_ALIASES.size, ALIASED_SETTINGS.length);
+  it("every PA_ name has the TEAMS_ name it replaces, every model setting its CLAWY_ name, and nothing else is aliased", () => {
+    assert.equal(SETTING_ALIASES.size, ALIASED_SETTINGS.length + MODEL_SETTINGS.length);
     for (const [neutral, legacy] of SETTING_ALIASES) {
+      if (neutral.startsWith("PERSONAL_AGENT_")) {
+        assert.ok((MODEL_SETTINGS as readonly string[]).includes(neutral.slice("PERSONAL_AGENT_".length)), neutral);
+        assert.equal(legacy, neutral.replace(/^PERSONAL_AGENT_/, "CLAWY_"));
+        continue;
+      }
       assert.match(neutral, /^PA_[A-Z_]+$/);
       assert.equal(legacy, neutral.replace(/^PA_/, "TEAMS_"));
     }
+    // (the bot's name has no earlier setting: it was not configurable)
+    assert.equal(SETTING_ALIASES.get("PERSONAL_AGENT_BOT_NAME"), undefined);
     // a surface's own settings keep the surface's prefix
     for (const own of ["TEAMS_STREAMING", "TEAMS_AI_LABEL", "TEAMS_GATE_ENTRY", "TEAMS_INSTALL_HINT_URL"]) {
       assert.equal(settingSource({ [own]: "x", ["PA_" + own.slice(6)]: "y" }, own), own);
@@ -153,7 +161,7 @@ describe("what a deployment with the older names sees", () => {
     assert.equal(
       line.message,
       "deprecated setting names: TEAMS_ENCRYPTION_KEYS (now PA_ENCRYPTION_KEYS), TEAMS_DIRECT_CHAT (now PA_DIRECT_CHAT); " +
-        "they still work, the PA_ names take precedence",
+        "they still work, the new names take precedence",
     );
     assert.ok(!logger.dump().includes("secret-key"));
     assert.ok(!logger.dump().includes("TEAMS_STREAMING"));
@@ -172,6 +180,71 @@ describe("what a deployment with the older names sees", () => {
     const quiet = new RecordingLogger();
     warnLegacySettings({ ...everySetting("PA_", 1), TEAMS_AI_LABEL: "on" }, quiet);
     assert.deepEqual(quiet.lines, []);
+  });
+});
+
+describe("the model settings under their earlier names", () => {
+  const models = (env: Env) => readSettings({ ...BASE, PA_ENCRYPTION_KEYS: "k", ...env }).models;
+
+  it("the PERSONAL_AGENT_ name wins over the CLAWY_ name it replaces", () => {
+    assert.deepEqual(
+      models({
+        PERSONAL_AGENT_MODEL: "new-chat",
+        CLAWY_MODEL: "old-chat",
+        PERSONAL_AGENT_FALLBACK_MODEL: "new-fallback",
+        CLAWY_FALLBACK_MODEL: "old-fallback",
+        PERSONAL_AGENT_REVIEW_MODEL: "new-review",
+        CLAWY_REVIEW_MODEL: "old-review",
+      }),
+      { chat: "new-chat", fallback: "new-fallback", review: "new-review" },
+    );
+  });
+
+  it("a CLAWY_ name alone still works, and one warning names it and its new name", () => {
+    const env = { CLAWY_MODEL: "old-chat", CLAWY_FALLBACK_MODEL: "old-fallback", CLAWY_REVIEW_MODEL: "old-review" };
+    assert.deepEqual(models(env), { chat: "old-chat", fallback: "old-fallback", review: "old-review" });
+    const logger = new RecordingLogger();
+    warnLegacySettings(env, logger);
+    assert.deepEqual(
+      logger.lines.map((l) => [l.level, l.message]),
+      [
+        [
+          "warn",
+          "deprecated setting names: CLAWY_MODEL (now PERSONAL_AGENT_MODEL), CLAWY_FALLBACK_MODEL (now " +
+            "PERSONAL_AGENT_FALLBACK_MODEL), CLAWY_REVIEW_MODEL (now PERSONAL_AGENT_REVIEW_MODEL); they still work, the " +
+            "new names take precedence",
+        ],
+      ],
+    );
+    // (the review intent model falls back to the chat model under either name)
+    const review = readSettings({
+      ...BASE,
+      PA_ENCRYPTION_KEYS: "k",
+      PA_EXCHANGE_ENABLED: "1",
+      PA_EXCHANGE_CLIENT_ID: "c",
+      PA_EXCHANGE_CLIENT_SECRET: "s",
+      PA_GITHUB_REVIEW_ENABLED: "1",
+      PA_GITHUB_REVIEW_OWNERS: "AMD-AGI",
+      CLAWY_MODEL: "old-chat",
+    });
+    assert.equal(review.githubReview.intentModel, "old-chat");
+  });
+
+  it("with neither name set no model is asked for, and nothing is said", () => {
+    assert.deepEqual(models({}), { chat: "", fallback: "", review: "" });
+    const logger = new RecordingLogger();
+    warnLegacySettings({ PERSONAL_AGENT_MODEL: "m" }, logger);
+    assert.deepEqual(logger.lines, []);
+  });
+});
+
+describe("the bot's name", () => {
+  const botName = (env: Env) => readSettings({ ...BASE, PA_ENCRYPTION_KEYS: "k", ...env }).botName;
+
+  it("is PERSONAL_AGENT_BOT_NAME, trimmed; unset or blank it is the default", () => {
+    assert.equal(botName({}), "PrimusClaw Assistant");
+    assert.equal(botName({ PERSONAL_AGENT_BOT_NAME: "  " }), "PrimusClaw Assistant");
+    assert.equal(botName({ PERSONAL_AGENT_BOT_NAME: " Clawy " }), "Clawy");
   });
 });
 

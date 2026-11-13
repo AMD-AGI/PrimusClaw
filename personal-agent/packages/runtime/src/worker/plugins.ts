@@ -53,8 +53,12 @@ export function platformPlugins(plugins: Plugins, deps: PlatformDeps): Plugins {
   const config = feedbackConfigFromEnv(env, secrets.get("FEEDBACK_GITHUB_APP_KEY") ?? "");
   const sink =
     plugins.feedbackSink === noFeedbackSink
-      ? (feedbackSink(config, { fetch: (url, init) => deps.fetch(url, init), clock: deps.now, log: logger }) ??
-        noFeedbackSink)
+      ? (feedbackSink(config, {
+          fetch: (url, init) => deps.fetch(url, init),
+          clock: deps.now,
+          log: logger,
+          botName: settings.botName,
+        }) ?? noFeedbackSink)
       : plugins.feedbackSink;
   // (Python main.run: "feedback: issues go to <repo>" or "not configured; reports are stored only")
   if (sink === noFeedbackSink) logger.info("feedback: not configured; reports are stored only");

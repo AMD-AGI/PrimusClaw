@@ -130,7 +130,7 @@ test("a status read while the identity service cannot exchange a token says what
   await command(world, "status");
   const text = said(world);
   assert.ok(text.includes("not known just now (PrimusClaw did not answer)"), text);
-  assert.ok(text.includes("Whether Clawy reads your GitHub with it: PrimusClaw could not be asked just now"), text);
+  assert.ok(text.includes("Whether I read your GitHub with it: PrimusClaw could not be asked just now"), text);
 });
 
 test("a choice that cannot be written for want of a token is said as not saved", async () => {

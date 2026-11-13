@@ -40,7 +40,7 @@ describe("settings", () => {
     assert.equal(s.publicBaseUrl, "https://claw.example.com");
     assert.equal(s.listenPort, 8080);
     assert.equal(s.metricsPort, 9090);
-    assert.deepEqual(s.claw, { pluginId: null, ruleToolId: null, clientLabel: "clawy" });
+    assert.deepEqual(s.claw, { pluginId: null, ruleToolId: null, clientLabel: "personal-agent" });
     assert.deepEqual(s.models, { chat: "", fallback: "", review: "" });
     assert.equal(s.githubReview.enabled, false);
     assert.equal(s.githubReview.clientId, "178c6fc778ccc68e1d6a");
@@ -95,9 +95,12 @@ describe("settings", () => {
 
   it("the fallback model is the deployment's and none by default", () => {
     assert.equal(settings().models.fallback, "");
-    assert.equal(settings({ CLAWY_FALLBACK_MODEL: "glm-5-3-with-fallback" }).models.fallback, "glm-5-3-with-fallback");
-    assert.equal(settings({ CLAWY_FALLBACK_MODEL: "" }).models.fallback, "");
-    assert.equal(settings({ CLAWY_FALLBACK_MODEL: " other-model " }).models.fallback, "other-model");
+    assert.equal(
+      settings({ PERSONAL_AGENT_FALLBACK_MODEL: "glm-5-3-with-fallback" }).models.fallback,
+      "glm-5-3-with-fallback",
+    );
+    assert.equal(settings({ PERSONAL_AGENT_FALLBACK_MODEL: "" }).models.fallback, "");
+    assert.equal(settings({ PERSONAL_AGENT_FALLBACK_MODEL: " other-model " }).models.fallback, "other-model");
   });
 
   it("the metrics port defaults to 9090 and never shares the public port", () => {

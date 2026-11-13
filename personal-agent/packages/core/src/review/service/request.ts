@@ -193,7 +193,7 @@ export class RequestReader {
     }));
     const raw = await this.deps.intent.read(key, full, listed, asking.channel);
     if (raw === undefined) return rules();
-    const verdict = checkIntent(raw, text, mentions, found, !asking.group);
+    const verdict = checkIntent(raw, text, mentions, found, !asking.group, this.deps.botName);
     if (verdict.kind === "unreadable") {
       this.deps.logger.info("the model's reading of a request was unreadable; the rules read it", { why: verdict.why });
       return rules();
@@ -214,7 +214,7 @@ export class RequestReader {
     const readName = bareName(ask.who);
     const nobody = !readName && (rulesName || ruled.again.some((w) => bareName(w)));
     const someoneElse = rulesName && readName && !namedWithin(ask.who, rulesName, mentions);
-    if (nobody || someoneElse) return { kind: "question", text: t.unsureWho };
+    if (nobody || someoneElse) return { kind: "question", text: t.unsureWho(this.deps.botName) };
     return { kind: "ask", ask };
   }
 }

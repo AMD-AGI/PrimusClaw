@@ -16,6 +16,7 @@ import { ATTEMPTS, KeyVaultSecretSource, keyVaultSourceFromEnv, vaultErrorCode }
 import {
   KEYVAULT_API_VERSION,
   KEYVAULT_SCOPE,
+  LEGACY_VAULT_NAMES,
   VAULT_NAMES,
   vaultUrl,
   wanted,
@@ -30,7 +31,7 @@ const TENANT = "00000000-0000-0000-0000-0000000000b2";
 const ISSUER = "https://oidc.example.com/prod";
 const CLIENT_ID = "11111111-2222-3333-4444-555555555555";
 const SUBJECT = "claw-teams-agent-kv";
-const VAULT = "https://clawy-test.vault.azure.net";
+const VAULT = "https://personal-agent-test.vault.azure.net";
 
 const pkcs8 = (): string =>
   generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" });
@@ -39,10 +40,10 @@ const APP_KEY_PEM = pkcs8();
 
 // Distinctive values, so a leak into a log line is found by a plain substring search.
 const VAULT_VALUES: Readonly<Record<string, string>> = {
-  "clawy-encryption-keys":
+  "personal-agent-encryption-keys":
     "VAULTKEY1-fernet-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=,VAULTKEY2-fernet-bbbbbbbbbbbbbbbbbbbb=",
-  "clawy-exchange-client-secret": "VAULT-exchange-secret-cccccccccccccccc",
-  "clawy-feedback-github-app-key": APP_KEY_PEM,
+  "personal-agent-exchange-client-secret": "VAULT-exchange-secret-cccccccccccccccc",
+  "personal-agent-feedback-github-app-key": APP_KEY_PEM,
 };
 const ACCESS_TOKEN = "kv-access-token-dddddddddddddddd";
 
@@ -71,7 +72,7 @@ class FakeAzure {
       this.tokenRequests.push(typeof init?.body === "string" ? init.body : "");
       return FakeAzure.answer(this.entra, this.tokenRequests.length, reply(200, ok()));
     }
-    assert.equal(url.hostname, "clawy-test.vault.azure.net");
+    assert.equal(url.hostname, "personal-agent-test.vault.azure.net");
     assert.equal(url.searchParams.get("api-version"), KEYVAULT_API_VERSION);
     const name = url.pathname.replace(/^\/secrets\//, "");
     this.reads.push(name);
@@ -166,8 +167,8 @@ test("keyvault reads every secret the configuration needs with one token for the
   assert.deepEqual(
     values,
     new Map([
-      ["TEAMS_ENCRYPTION_KEYS", VAULT_VALUES["clawy-encryption-keys"]],
-      ["TEAMS_EXCHANGE_CLIENT_SECRET", VAULT_VALUES["clawy-exchange-client-secret"]],
+      ["TEAMS_ENCRYPTION_KEYS", VAULT_VALUES["personal-agent-encryption-keys"]],
+      ["TEAMS_EXCHANGE_CLIENT_SECRET", VAULT_VALUES["personal-agent-exchange-client-secret"]],
       ["FEEDBACK_GITHUB_APP_KEY", APP_KEY_PEM.trim()],
     ]),
   );
@@ -184,10 +185,10 @@ test("only the secrets the configuration uses are read", async () => {
   let fake = new FakeAzure();
   const values = await load(fake, { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: VAULT });
   assert.deepEqual([...values.keys()], ["TEAMS_ENCRYPTION_KEYS"]);
-  assert.deepEqual(fake.reads, ["clawy-encryption-keys"]);
+  assert.deepEqual(fake.reads, ["personal-agent-encryption-keys"]);
   fake = new FakeAzure();
   await load(fake, vaultEnv({ FEEDBACK_GITHUB_INSTALLATION_ID: "" })); // the App is not configured: its key is not wanted
-  assert.ok(!fake.reads.includes("clawy-feedback-github-app-key"));
+  assert.ok(!fake.reads.includes("personal-agent-feedback-github-app-key"));
 });
 
 test("an environment value the vault replaces is named in a warning without its value", async () => {
@@ -214,7 +215,7 @@ test("an environment value the vault replaces is named in a warning without its 
 
 test("a refused read fails at once naming the secret and the vaults code", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-exchange-client-secret", [
+  fake.vault.set("personal-agent-exchange-client-secret", [
     reply(403, {
       error: {
         code: "Forbidden",
@@ -226,56 +227,121 @@ test("a refused read fails at once naming the secret and the vaults code", async
   const sleeps: number[] = [];
   await assert.rejects(
     load(fake, vaultEnv(), { sleeps }),
-    unavailable("Key Vault secret clawy-exchange-client-secret: Key Vault answered 403 (Forbidden: AccessDenied)"),
+    unavailable(
+      "Key Vault secret personal-agent-exchange-client-secret: Key Vault answered 403 (Forbidden: AccessDenied)",
+    ),
   );
-  assert.equal(fake.reads.filter((r) => r === "clawy-exchange-client-secret").length, 1);
+  assert.equal(fake.reads.filter((r) => r === "personal-agent-exchange-client-secret").length, 1);
   assert.deepEqual(sleeps, []);
 });
 
-test("a missing secret fails", async () => {
+test("a missing secret fails, under its name and under its deprecated name", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [reply(404, { error: { code: "SecretNotFound" } })]);
+  fake.vault.set("personal-agent-encryption-keys", [reply(404, { error: { code: "SecretNotFound" } })]);
   await assert.rejects(
     load(fake, vaultEnv()),
-    unavailable(/clawy-encryption-keys: Key Vault answered 404 \(SecretNotFound\)/),
+    unavailable(
+      "Key Vault secret personal-agent-encryption-keys: Key Vault answered 404 (SecretNotFound) " +
+        "(nor under its deprecated name clawy-encryption-keys)",
+    ),
   );
+  assert.deepEqual(fake.reads, ["personal-agent-encryption-keys", "clawy-encryption-keys"]);
+});
+
+// --- the names of an earlier release -------------------------------------------------------------------------------------
+
+test("a secret stored under its deprecated name alone is read, with one warning that names both names", async () => {
+  const fake = new FakeAzure();
+  const old = "VAULT-old-name-eeeeeeeeeeeeeeee";
+  fake.vault.set("personal-agent-encryption-keys", [reply(404, { error: { code: "SecretNotFound" } })]);
+  fake.vault.set("clawy-encryption-keys", [reply(200, { value: old })]);
+  fake.vault.set("personal-agent-exchange-client-secret", [reply(404, { error: { code: "SecretNotFound" } })]);
+  fake.vault.set("clawy-exchange-client-secret", [reply(200, { value: old })]);
+  const logger = new RecordingLogger();
+  const values = await load(fake, vaultEnv(), { logger });
+  assert.equal(values.get("TEAMS_ENCRYPTION_KEYS"), old);
+  assert.equal(values.get("TEAMS_EXCHANGE_CLIENT_SECRET"), old);
+  assert.equal(values.get("FEEDBACK_GITHUB_APP_KEY"), APP_KEY_PEM.trim());
+  const warnings = logger.lines.filter((l) => l.level === "warn").map((l) => l.message);
+  assert.deepEqual(warnings, [
+    "secrets: deprecated Key Vault secret names: clawy-encryption-keys (now personal-agent-encryption-keys), " +
+      "clawy-exchange-client-secret (now personal-agent-exchange-client-secret); they are still read when the new name " +
+      "is missing; store the secrets under the new names",
+  ]);
+  assert.ok(!logger.dump().includes(old));
+  assert.ok(
+    logger
+      .dump()
+      .includes("(clawy-encryption-keys, clawy-exchange-client-secret, personal-agent-feedback-github-app-key)"),
+  );
+});
+
+test("the new name wins: the deprecated one is not read when the new one is there", async () => {
+  const fake = new FakeAzure();
+  fake.vault.set("clawy-encryption-keys", [reply(200, { value: "VAULT-old-name-ffffffffffffffff" })]);
+  const logger = new RecordingLogger();
+  const values = await load(fake, { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: VAULT }, { logger });
+  assert.equal(values.get("TEAMS_ENCRYPTION_KEYS"), VAULT_VALUES["personal-agent-encryption-keys"]);
+  assert.deepEqual(fake.reads, ["personal-agent-encryption-keys"]);
+  assert.deepEqual(
+    logger.lines.filter((l) => l.level === "warn"),
+    [],
+  );
+});
+
+test("only a missing secret falls back: a refused one under the new name stops the start", async () => {
+  const fake = new FakeAzure();
+  fake.vault.set("personal-agent-encryption-keys", [reply(403, { error: { code: "Forbidden" } })]);
+  fake.vault.set("clawy-encryption-keys", [reply(200, { value: "VAULT-old-name-gggggggggggggggg" })]);
+  await assert.rejects(
+    load(fake, { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: VAULT }),
+    unavailable("Key Vault secret personal-agent-encryption-keys: Key Vault answered 403 (Forbidden)"),
+  );
+  assert.deepEqual(fake.reads, ["personal-agent-encryption-keys"]);
+});
+
+test("every secret has a new name and the deprecated name it replaces", () => {
+  for (const [name, vault] of Object.entries(VAULT_NAMES)) {
+    assert.match(vault, /^personal-agent-[a-z-]+$/);
+    assert.equal(own(LEGACY_VAULT_NAMES, name), vault.replace(/^personal-agent-/, "clawy-"));
+  }
 });
 
 test("an empty secret fails", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [reply(200, { value: "  " })]);
-  await assert.rejects(load(fake, vaultEnv()), unavailable(/clawy-encryption-keys is empty/));
+  fake.vault.set("personal-agent-encryption-keys", [reply(200, { value: "  " })]);
+  await assert.rejects(load(fake, vaultEnv()), unavailable(/personal-agent-encryption-keys is empty/));
 });
 
 test("a transient failure is tried again with backoff and then succeeds", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [reply(503), new TypeError("fetch failed"), reply(429), undefined]);
+  fake.vault.set("personal-agent-encryption-keys", [reply(503), new TypeError("fetch failed"), reply(429), undefined]);
   const sleeps: number[] = [];
   const values = await load(fake, vaultEnv(), { sleeps });
-  assert.equal(values.get("TEAMS_ENCRYPTION_KEYS"), VAULT_VALUES["clawy-encryption-keys"]);
+  assert.equal(values.get("TEAMS_ENCRYPTION_KEYS"), VAULT_VALUES["personal-agent-encryption-keys"]);
   assert.deepEqual(sleeps, [2, 4, 8]);
 });
 
 test("a vault that stays down fails after the last try", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [reply(500)]);
+  fake.vault.set("personal-agent-encryption-keys", [reply(500)]);
   const sleeps: number[] = [];
   await assert.rejects(
     load(fake, vaultEnv(), { sleeps }),
-    unavailable(/clawy-encryption-keys: Key Vault answered 500/),
+    unavailable(/personal-agent-encryption-keys: Key Vault answered 500/),
   );
-  assert.equal(fake.reads.filter((r) => r === "clawy-encryption-keys").length, ATTEMPTS);
+  assert.equal(fake.reads.filter((r) => r === "personal-agent-encryption-keys").length, ATTEMPTS);
   assert.deepEqual(sleeps, [2, 4, 8, 16]);
 });
 
 test("a read that runs past the deadline fails", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [reply(503)]);
+  fake.vault.set("personal-agent-encryption-keys", [reply(503)]);
   const clock = new FakeClock();
   const work = load(fake, vaultEnv(), { clock, deadlineMs: 50, realSleep: true });
   await assert.rejects(
     settle(clock, work, 10),
-    unavailable(/clawy-test\.vault\.azure\.net: the secrets were not read within 0\.05s/),
+    unavailable(/personal-agent-test\.vault\.azure\.net: the secrets were not read within 0\.05s/),
   );
   assert.equal(clock.pending, 0); // no timer or wait is left behind
 });
@@ -315,7 +381,7 @@ test("entra that stays unreachable fails after the last try", async () => {
 
 const CANNOT_WORK: readonly [string, Env, string][] = [
   ["no KEYVAULT_URL", { SECRETS_SOURCE: "keyvault" }, "needs KEYVAULT_URL"],
-  ["http", { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: "http://clawy.vault.azure.net" }, "needs KEYVAULT_URL"],
+  ["http", { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: "http://personal-agent.vault.azure.net" }, "needs KEYVAULT_URL"],
   ["not a vault", { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: "https://example.com" }, "needs KEYVAULT_URL"],
   [
     "no worker identity",
@@ -390,10 +456,10 @@ test("the source from the environment reads as the worker identity with the key 
 test("no secret value token or assertion reaches any log line", async () => {
   const logger = new RecordingLogger();
   const first = new FakeAzure();
-  first.vault.set("clawy-exchange-client-secret", [reply(503), undefined]);
+  first.vault.set("personal-agent-exchange-client-secret", [reply(503), undefined]);
   await load(first, vaultEnv(), { logger });
   const second = new FakeAzure();
-  second.vault.set("clawy-feedback-github-app-key", [reply(403, { error: { code: "Forbidden" } })]);
+  second.vault.set("personal-agent-feedback-github-app-key", [reply(403, { error: { code: "Forbidden" } })]);
   await assert.rejects(load(second, vaultEnv(), { logger }), SecretsUnavailable);
   const assertions = [first, second].flatMap((f) => f.tokenRequests.map((_, i) => f.form(i)["client_assertion"] ?? ""));
   assert.equal(assertions.length, 2);
@@ -401,7 +467,7 @@ test("no secret value token or assertion reaches any log line", async () => {
   for (const secret of [...Object.values(VAULT_VALUES), ACCESS_TOKEN, ...assertions, "BEGIN PRIVATE KEY"]) {
     assert.ok(secret && !text.includes(secret));
   }
-  assert.ok(text.includes("secrets: 3 read from Key Vault clawy-test.vault.azure.net"));
+  assert.ok(text.includes("secrets: 3 read from Key Vault personal-agent-test.vault.azure.net"));
   assert.ok(text.includes("attempt 1 of 5 failed (Key Vault answered 503); trying again"));
 });
 
@@ -431,23 +497,23 @@ test("the vault's error code is shown only from the expected shape", () => {
 test("an answer that is not json or has no string value is an empty secret", async () => {
   for (const answer of [() => new Response("not json", { status: 200 }), reply(200, { value: 5 }), reply(200, [])]) {
     const fake = new FakeAzure();
-    fake.vault.set("clawy-encryption-keys", [answer]);
+    fake.vault.set("personal-agent-encryption-keys", [answer]);
     await assert.rejects(
       load(fake, { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: VAULT }),
-      unavailable("Key Vault secret clawy-encryption-keys is empty or has no value"),
+      unavailable("Key Vault secret personal-agent-encryption-keys is empty or has no value"),
     );
   }
 });
 
 test("a redirect is a refusal, not followed and not retried", async () => {
   const fake = new FakeAzure();
-  fake.vault.set("clawy-encryption-keys", [
+  fake.vault.set("personal-agent-encryption-keys", [
     () => new Response(null, { status: 302, headers: { location: "https://elsewhere.example/" } }),
   ]);
   const sleeps: number[] = [];
   await assert.rejects(
     load(fake, { SECRETS_SOURCE: "keyvault", KEYVAULT_URL: VAULT }, { sleeps }),
-    unavailable("Key Vault secret clawy-encryption-keys: Key Vault answered 302"),
+    unavailable("Key Vault secret personal-agent-encryption-keys: Key Vault answered 302"),
   );
   assert.deepEqual(sleeps, []);
 });

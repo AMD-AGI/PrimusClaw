@@ -242,7 +242,7 @@ export class Deliveries {
     if (!words && assistantDeliveries(event).length === 0) return false;
     const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, this.clientLocale(), words);
     const reader = { remoteState: (u: string) => this.attached(u) };
-    const { head, replies } = this.deps.directChat.clawyExtras(reader, userId, lang);
+    const { head, replies } = this.deps.directChat.botExtras(reader, userId, lang);
     if (words && head) words = `${head}\n\n${words}`;
     // (in a chat that is an agent's window, attached to its session, nothing said earlier is edited: an addition comes as a
     // message of its own; a chat that is not attached edits as any other)

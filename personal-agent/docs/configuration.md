@@ -46,17 +46,18 @@ by their Microsoft Entra object id, in any case.
 
 ## Claw and the platform
 
-| Setting                | Default        | Meaning                                                                                                                        |
-| ---------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `CLAW_API_URL`         | required       | The Claw API.                                                                                                                  |
-| `SAFE_API_URL`         | required       | The platform API Claw runs on ([SaFE](https://github.com/AMD-AGI/Primus-SaFE)); its `/users/self` tells whose a linked key is. |
-| `PUBLIC_BASE_URL`      | required       | The worker's public origin; the exchange and credential URLs below default to paths under it.                                  |
-| `CLAW_PLUGIN_ID`       | none           | The Claw plugin new sessions are created with; unset creates plain sessions.                                                   |
-| `CLAW_RULE_TOOL_ID`    | none           | The Claw rule tool whose text rides on every message.                                                                          |
-| `CLAW_CLIENT_LABEL`    | `clawy`        | What Claw's audit trail calls this client.                                                                                     |
-| `CLAWY_MODEL`          | Claw's default | The model of chat turns.                                                                                                       |
-| `CLAWY_FALLBACK_MODEL` | none           | The model a turn is run once more on when it was refused for want of the person's own model key.                               |
-| `CLAWY_REVIEW_MODEL`   | none           | The model of pull request reviews.                                                                                             |
+| Setting                         | Default                | Meaning                                                                                                                                                                         |
+| ------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLAW_API_URL`                  | required               | The Claw API.                                                                                                                                                                   |
+| `SAFE_API_URL`                  | required               | The platform API Claw runs on ([SaFE](https://github.com/AMD-AGI/Primus-SaFE)); its `/users/self` tells whose a linked key is.                                                  |
+| `PUBLIC_BASE_URL`               | required               | The worker's public origin; the exchange and credential URLs below default to paths under it.                                                                                   |
+| `PERSONAL_AGENT_BOT_NAME`       | `PrimusClaw Assistant` | The name the bot goes by in this deployment: every text that names it, and what "@<name> ..." at the start of a message is read as. Set it to the name of the deployment's app. |
+| `CLAW_PLUGIN_ID`                | none                   | The Claw plugin new sessions are created with; unset creates plain sessions.                                                                                                    |
+| `CLAW_RULE_TOOL_ID`             | none                   | The Claw rule tool whose text rides on every message.                                                                                                                           |
+| `CLAW_CLIENT_LABEL`             | `personal-agent`       | What Claw's audit trail calls this client.                                                                                                                                      |
+| `PERSONAL_AGENT_MODEL`          | Claw's default         | The model of chat turns.                                                                                                                                                        |
+| `PERSONAL_AGENT_FALLBACK_MODEL` | none                   | The model a turn is run once more on when it was refused for want of the person's own model key.                                                                                |
+| `PERSONAL_AGENT_REVIEW_MODEL`   | none                   | The model of pull request reviews.                                                                                                                                              |
 
 ## Process and state
 
@@ -75,7 +76,10 @@ by their Microsoft Entra object id, in any case.
 | `PA_ENCRYPTION_KEYS`        | required | Comma separated Fernet keys; the first encrypts, all decrypt. At start, stored secrets are re-encrypted to the first. Generate one with `openssl rand -base64 32 \| tr '+/' '-_'`. |
 | `PA_EXCHANGE_CLIENT_SECRET` | —        | Required with `PA_EXCHANGE_ENABLED`.                                                                                                                                               |
 
-With `keyvault` the vault entries are `clawy-encryption-keys` and `clawy-exchange-client-secret`.
+With `keyvault` the vault entries are `personal-agent-encryption-keys` and `personal-agent-exchange-client-secret`. An entry
+missing under its name is read under its deprecated name (`clawy-encryption-keys`, `clawy-exchange-client-secret`), with a
+warning at start; only a missing entry falls back, a refused read stops the worker. Copy each secret to its new name; the
+deprecated names will be removed only in a release whose notes say so.
 
 ## How the worker reaches Teams
 
@@ -151,7 +155,7 @@ The worker identity signs with the `BOT_ASSERTION_*` key, issuer and tenant, but
 | `PA_EXCHANGE_FOR_CHAT`            | off                                          | Ordinary chats use the exchanged token too, instead of the linked key. Needs the exchange. A person still on their linked key gets the identity card after an answer refused for want of a confirmed identity: at most once in 24 hours, never once confirmed. |
 | `PA_GITHUB_REVIEW_ENABLED`        | off                                          | Review a colleague's pull request on their behalf. Needs the exchange.                                                                                                                                                                                         |
 | `PA_GITHUB_REVIEW_OWNERS`         | —                                            | Required when on: the GitHub owners whose pull requests are taken.                                                                                                                                                                                             |
-| `PA_REVIEW_INTENT_MODEL`          | `CLAWY_MODEL`                                | The model that reads a review request; empty reads it by rules alone.                                                                                                                                                                                          |
+| `PA_REVIEW_INTENT_MODEL`          | `PERSONAL_AGENT_MODEL`                       | The model that reads a review request; empty reads it by rules alone.                                                                                                                                                                                          |
 | `PA_GITHUB_CREDENTIAL_URL`        | `PUBLIC_BASE_URL/oauth/external-credentials` |                                                                                                                                                                                                                                                                |
 | `PA_GITHUB_CLIENT_ID`             | the GitHub CLI's public OAuth client         | The OAuth client of the device flow that connects a GitHub account.                                                                                                                                                                                            |
 
@@ -197,7 +201,7 @@ The public build records reports and files them nowhere: filing is a `FeedbackSi
 can build one with runtime's `feedbackConfigFromEnv` and `feedbackSink`, which read `FEEDBACK_REPO` (`owner/name`),
 `FEEDBACK_GITHUB_APP_ID`, `FEEDBACK_GITHUB_INSTALLATION_ID`, `FEEDBACK_GITHUB_KEY_FILE` and
 `FEEDBACK_GITHUB_TOKEN_FILE`. The secret loader already reads the App key (`FEEDBACK_GITHUB_KEY_FILE`, or the vault entry
-`clawy-feedback-github-app-key`) when both App ids are set, so leave them unset unless such a plugin uses them.
+`personal-agent-feedback-github-app-key`, deprecated name `clawy-feedback-github-app-key`) when both App ids are set, so leave them unset unless such a plugin uses them.
 
 ## The Teams ingress
 
@@ -250,6 +254,10 @@ TEAMS_DB_PATH (now PA_DB_PATH), ...`); a `TEAMS_` name set beside its `PA_` name
 Moving a deployment over is renaming the variables; the order does not matter, since the `PA_` name wins as soon as it
 is set. The `TEAMS_` names will be removed only in a release whose notes say so.
 
+The model settings were first named after the bot's earlier default name, with the `CLAWY_` prefix; they now carry
+`PERSONAL_AGENT_`, and the `CLAWY_` names are read the same way (the new name wins; an old name in use is named in the
+start-up warning). They are listed in the table below too.
+
 | Setting                            | Older name, still read                |
 | ---------------------------------- | ------------------------------------- |
 | `PA_DB_PATH`                       | `TEAMS_DB_PATH`                       |
@@ -289,3 +297,6 @@ is set. The `TEAMS_` names will be removed only in a release whose notes say so.
 | `PA_LIMIT_PR_MERGE`                | `TEAMS_LIMIT_PR_MERGE`                |
 | `PA_LIMIT_APPROVAL`                | `TEAMS_LIMIT_APPROVAL`                |
 | `PA_LIMIT_REMOTE_AGENT`            | `TEAMS_LIMIT_REMOTE_AGENT`            |
+| `PERSONAL_AGENT_MODEL`             | `CLAWY_MODEL`                         |
+| `PERSONAL_AGENT_FALLBACK_MODEL`    | `CLAWY_FALLBACK_MODEL`                |
+| `PERSONAL_AGENT_REVIEW_MODEL`      | `CLAWY_REVIEW_MODEL`                  |

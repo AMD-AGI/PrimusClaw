@@ -36,7 +36,7 @@ async function ask(
   return world.service.request(route(world, text, kind));
 }
 
-const ASK_WHO = "请指定由谁来 review 合入，例如 @Clawy 请 XX 帮我 review 合入 <PR>";
+const ASK_WHO = "请指定由谁来 review 合入，例如 @PrimusClaw Assistant 请 XX 帮我 review 合入 <PR>";
 
 test("a request that names nobody gets one question and nothing else", async () => {
   const world = reviewWorld();

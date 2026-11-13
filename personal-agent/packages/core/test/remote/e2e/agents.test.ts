@@ -65,7 +65,7 @@ test("agents lists my machines and nobody elses", () =>
         !text.includes("bobs-box"),
     );
     assert.deepEqual(new Set(w.server.keysSeen), new Set(["ak-alice"]));
-    assert.deepEqual(new Set(w.server.clientLabels), new Set(["clawy"])); // Claw's audit trail names this client
+    assert.deepEqual(new Set(w.server.clientLabels), new Set(["personal-agent"])); // Claw's audit trail names this client
   }));
 
 test("agents with no machine says how to connect one", () =>

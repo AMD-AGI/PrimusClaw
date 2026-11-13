@@ -27,10 +27,9 @@ export const remoteWindowText = defineCatalog({
     sentFromCard: "你从卡片发的：",
     chatBoxCard: (p) =>
       `在聊天框里打字是跟 ${p.bot} 说；发给这个会话请用卡片上的输入框，或引用回复这张卡片。想让聊天框直接发给会话：/agent mode chat`,
-    // (the last name stays Clawy, as the Python worker wrote it)
     chatBoxChat: (p) =>
       `聊天框里打的字都发给这个会话；以 @${p.bot} 开头的消息、${p.bot} 的 / 命令和协调者代发的请求仍由 ${p.bot} 处理。` +
-      "想让聊天框留给 Clawy：/agent mode card",
+      `想让聊天框留给 ${p.bot}：/agent mode card`,
     thisChatToo: "（这个聊天现在就按这个来）",
     modeSetCard: (p) => `好的：接入会话后，聊天框留给 ${p.bot}，发给会话用会话卡片上的输入框${p.now}。`,
     modeSetChat: (p) => `好的：接入会话后，聊天框里打的字都发给会话${p.now}。以 @${p.bot} 开头的仍然给我。`,

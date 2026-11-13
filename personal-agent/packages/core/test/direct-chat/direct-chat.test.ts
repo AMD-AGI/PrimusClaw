@@ -5,12 +5,12 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 
 import {
-  CLAWY_HEAD,
   DirectChat,
   OWN_SUFFIX,
   agentHead,
   agentReplies,
   backReply,
+  botHead,
   continuedHead,
   enteredLine,
   guardHeads,
@@ -24,6 +24,7 @@ import {
 import { neutral } from "../../src/text/neutral.js";
 
 const AAD = "aad-a";
+const BOT = "PrimusClaw Assistant";
 const HEAD = "\u{1F7E0} **Claude Code · robin-dev-pod**";
 
 function reader(state: AttachedState | undefined) {
@@ -71,11 +72,12 @@ it("signed parts head the first with who said it and the rest with where they ar
 });
 
 it("the way back and forth is a suggested reply", () => {
-  assert.deepEqual(agentReplies("zh"), [
+  assert.deepEqual(agentReplies("zh", BOT), [
     ["继续", "继续"],
-    ["回到 Clawy", "回到 Clawy"],
+    ["回到 PrimusClaw Assistant", "回到 PrimusClaw Assistant"],
   ]);
-  assert.deepEqual(backReply("fr"), ["Back to Clawy", "back to Clawy"]);
+  assert.deepEqual(backReply("fr", BOT), ["Back to PrimusClaw Assistant", "back to PrimusClaw Assistant"]);
+  assert.deepEqual(backReply("zh", "Robin"), ["回到 Robin", "回到 Robin"]);
   assert.deepEqual(returnReply("\u{1F7E0} Claude Code", "robin-dev-pod", "claude", "zh"), [
     "切回 Claude Code",
     "/agent attach robin-dev-pod/claude",
@@ -92,38 +94,49 @@ it("entering and leaving are one line each", () => {
     cwd: "/repo",
     mode: "plan",
     lang: "zh",
+    bot: BOT,
     unattended: true,
     lead: "x",
   });
   assert.ok(zh.startsWith("→ 现在发给 robin-dev-pod · Claude Code（`/repo`，plan 模式）。"));
   assert.ok(zh.includes("无人值守") && zh.endsWith("\n\nx"));
-  const en = enteredLine({ label: "Claude Code", host: "h", cwd: "", mode: "", lang: "en" });
+  assert.ok(
+    zh.includes("以 @PrimusClaw Assistant 开头的消息发给 PrimusClaw Assistant；点「回到 PrimusClaw Assistant」回来。"),
+  );
+  const en = enteredLine({ label: "Claude Code", host: "h", cwd: "", mode: "", lang: "en", bot: "Robin" });
   assert.equal(
     en,
-    '→ Your messages now go to h · Claude Code. Start a message with @Clawy to talk to Clawy; tap "Back to Clawy" to come back.',
+    '→ Your messages now go to h · Claude Code. Start a message with @Robin to talk to Robin; tap "Back to Robin" to come back.',
   );
-  assert.equal(leftLine("zh"), "→ 现在发给 Clawy。");
-  assert.equal(leftLine("en"), "→ Your messages go to Clawy now.");
+  assert.equal(leftLine("zh", BOT), "→ 现在发给 PrimusClaw Assistant。");
+  assert.equal(leftLine("en", "Robin"), "→ Your messages go to Robin now.");
   assert.ok(modeUnifiedLine("zh").startsWith("现在") && modeUnifiedLine("en").startsWith("An attached chat"));
 });
 
 it("clawy speaks under its head while attached and offers the way back otherwise", () => {
   const on = new DirectChat(true, [AAD]);
   const attached = { sessionId: "s1", agentLabel: "\u{1F7E0} Claude Code", host: "robin-dev-pod", agentId: "claude" };
-  assert.deepEqual(on.clawyExtras(reader(attached), AAD, "en"), {
-    head: CLAWY_HEAD,
-    replies: [["Back to Clawy", "back to Clawy"]],
+  assert.deepEqual(on.botExtras(reader(attached), AAD, "en"), {
+    head: "💬 **PrimusClaw Assistant**",
+    replies: [["Back to PrimusClaw Assistant", "back to PrimusClaw Assistant"]],
   });
-  assert.deepEqual(on.clawyExtras(reader({ ...attached, sessionId: "" }), AAD, "en"), {
+  const named = new DirectChat(true, [AAD], "Robin");
+  assert.deepEqual(named.botExtras(reader(attached), AAD, "zh"), {
+    head: botHead("Robin"),
+    replies: [["回到 Robin", "回到 Robin"]],
+  });
+  assert.equal(botHead("Robin"), "💬 **Robin**");
+  assert.equal(botHead("**"), `💬 **${BOT}**`);
+  assert.deepEqual(on.botExtras(reader({ ...attached, sessionId: "" }), AAD, "en"), {
     head: "",
     replies: [["Back to Claude Code", "/agent attach robin-dev-pod/claude"]],
   });
-  assert.deepEqual(on.clawyExtras(reader({ ...attached, sessionId: "", agentLabel: "" }), AAD, "en"), {
+  assert.deepEqual(on.botExtras(reader({ ...attached, sessionId: "", agentLabel: "" }), AAD, "en"), {
     head: "",
     replies: [],
   });
-  assert.deepEqual(on.clawyExtras(reader(undefined), AAD, "en"), { head: "", replies: [] });
-  assert.deepEqual(new DirectChat(false).clawyExtras(reader(attached), AAD, "en"), { head: "", replies: [] });
+  assert.deepEqual(on.botExtras(reader(undefined), AAD, "en"), { head: "", replies: [] });
+  assert.deepEqual(new DirectChat(false).botExtras(reader(attached), AAD, "en"), { head: "", replies: [] });
 });
 
 it("neutral text cannot build a link or a tag and is clipped after masking", () => {

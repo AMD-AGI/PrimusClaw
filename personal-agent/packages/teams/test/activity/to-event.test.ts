@@ -35,7 +35,7 @@ test("a group message: who, where, the words, the mentions, the links and the qu
     locale: "zh-CN",
     conversation: { id: CONV, conversationType: "groupChat", tenantId: "t-1", name: "Release room" },
   };
-  const event = message(raw);
+  const event = message(raw, "Clawy"); // (a deployment that names its bot as the app is named)
   assert.equal(event.id, "g1");
   assert.deepEqual(event.sender, { id: "aad-a", channelUserId: "29:a", name: "Alice", email: "" });
   assert.equal(event.conversation.id, CONV);
@@ -90,9 +90,16 @@ test("a one to one message has no conversation name and is not a mention", () =>
 test("a targeted message and a message that names the bot first", () => {
   const targeted = message({ ...grp("hi", { mention: false }), recipient: { id: BOT, isTargeted: true } });
   assert.deepEqual([targeted.mentioned, targeted.targeted], [false, true]);
-  assert.equal(message(dm("@Clawy what now")).namesBotFirst, true);
+  // A deployment that names nothing goes by the default name; one named "Clawy" by that name.
+  assert.equal(message(dm("@PrimusClaw Assistant what now")).namesBotFirst, true);
+  assert.equal(message(dm("@Clawy what now")).namesBotFirst, false);
+  assert.equal(message(dm("@Clawy what now"), "Clawy").namesBotFirst, true);
+  assert.equal(message(dm("@PrimusClaw Assistant what now"), "Clawy").namesBotFirst, false);
   assert.equal(message(dm("@Robin what now")).namesBotFirst, false);
   assert.equal(message(dm("@Robin what now"), "Robin").namesBotFirst, true);
+  // The bot's own @mention is still read by its Teams id, whatever the deployment calls it.
+  const byId = message(grp("<at>Some Other Name</at> hi"), "Clawy");
+  assert.deepEqual([byId.mentioned, byId.namesBotFirst], [true, false]);
 });
 
 test("the wire reference keeps python's keys in python's order", () => {

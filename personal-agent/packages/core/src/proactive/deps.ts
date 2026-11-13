@@ -87,7 +87,7 @@ export interface ProactiveDeps {
   readonly logger: Logger;
   /** A run's event as a card may show it (`publicRunEvent` bound to the public-error service): internal errors withheld. */
   readonly publicEvent: (event: JsonObject) => JsonObject;
-  /** The bot's display name (branding; "Clawy" by default). */
+  /** The bot's display name in this deployment (`Settings.botName`). */
   readonly botName: string;
   /**
    * The inbound event being handled, if any (Python CLIENT_LOCALE): held messages released while a message of the person's is

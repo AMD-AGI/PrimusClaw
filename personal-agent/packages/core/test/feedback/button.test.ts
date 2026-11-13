@@ -79,7 +79,7 @@ test("in a group only the asker can use the button", async () => {
   assert.ok(card.body.type === "view");
   assert.deepEqual(card.body.view, { name: "feedbackReport", model: { promptId: prompt, group: true } });
   await press(world, prompt, USER_A, CONV);
-  assert.ok(texts(world).at(-1)?.startsWith("What went wrong? Reply with @Clawy"));
+  assert.ok(texts(world).at(-1)?.startsWith("What went wrong? Reply with @PrimusClaw Assistant and"));
   assert.ok(
     world.store.feedback.hasFeedbackAsk(USER_A.id, CONV) && !world.store.feedback.hasFeedbackAsk(USER_B.id, CONV),
   );
@@ -87,6 +87,12 @@ test("in a group only the asker can use the button", async () => {
   await say(world, "it summarised the wrong thread", USER_A, CONV);
   assert.ok(world.issues.issues[0]?.body.includes("Chat: group"));
   assert.equal(offerOf(world), undefined);
+});
+
+test("in a group the button asks for an @mention of the bot by the deployment's name", async () => {
+  const world = linkedWorld({ botName: "Robin" });
+  await press(world, promptOf(world, CONV), USER_A, CONV);
+  assert.equal(texts(world).at(-1), "What went wrong? Reply with @Robin and what happened.");
 });
 
 test("a button that is no longer active closes its card", async () => {

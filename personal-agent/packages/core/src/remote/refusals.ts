@@ -13,6 +13,7 @@ import { type RemoteSentence, remoteAgentText } from "../locales/remote-agents.j
 import { offlineText } from "./machines.js";
 import type { Connector } from "./model.js";
 import { pyRstrip, pyStrip } from "../text/py-text.js";
+import { PERSISTED_IDEMPOTENCY_PREFIX } from "../legacy-names.js";
 
 /**
  * How a detail that may be internal is kept from a person (`public-error`): whether text looks internal, and logging it under
@@ -88,6 +89,6 @@ export interface KeyMaker {
 
 /** One key per inbound message, so a redelivered message queues one prompt (Claw accepts `[A-Za-z0-9._:-]{1,64}`). */
 export function idempotencyKey(keys: KeyMaker, userId: string, activityId: string): string {
-  if (!activityId) return `clawy-${keys.hexId()}`;
-  return `clawy-${keys.sha1Hex(`${userId}:${activityId}`)}`;
+  if (!activityId) return `${PERSISTED_IDEMPOTENCY_PREFIX}${keys.hexId()}`;
+  return `${PERSISTED_IDEMPOTENCY_PREFIX}${keys.sha1Hex(`${userId}:${activityId}`)}`;
 }

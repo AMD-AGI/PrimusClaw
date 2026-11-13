@@ -388,7 +388,7 @@ export class AssistantChat {
 
   /**
    * The person sees at once that their message was taken: the receipt under it, or (none can be opened) the typing indicator.
-   * Never fails the message. In a chat that is an agent's window the receipt's words start with Clawy's head.
+   * Never fails the message. In a chat that is an agent's window the receipt's words start with the bot's head.
    */
   private async acknowledge(handing: Handing): Promise<Receipt | undefined> {
     const { conversation } = handing;
@@ -400,7 +400,7 @@ export class AssistantChat {
       );
       if (receipt !== undefined) {
         receipt.awaitHandOver(); // (until the message is handed to Claw: `handingOver`)
-        receipt.head = this.o.directChat.clawyExtras(this.attachedReader(), handing.userId, handing.lang).head;
+        receipt.head = this.o.directChat.botExtras(this.attachedReader(), handing.userId, handing.lang).head;
         return receipt;
       }
       await conversation.typing();

@@ -12,7 +12,7 @@ import type { Lang } from "../locales/lang.js";
 import { remoteText } from "../locales/remote.js";
 import { type RemoteButton, remoteButton } from "../remote/actions.js";
 import { lit, plain } from "../remote/inert.js";
-import { clawyLine, whereLine } from "../remote/lines.js";
+import { botLine, whereLine } from "../remote/lines.js";
 import { pyStrip } from "../text/py-text.js";
 import { utcClock } from "../remote/time.js";
 
@@ -73,7 +73,7 @@ function attachedLines(input: StatusInput, lang: Lang): StatusLine[] {
   const words = remoteText.in(lang);
   const lines: StatusLine[] = [{ kind: "phase", text: words.status + phaseWords(input.phase, lang) }];
   if (input.unattended) lines.push({ kind: "unattended", text: words.unattendedNote });
-  lines.push({ kind: "assistant", text: clawyLine(lang, input.bot) });
+  lines.push({ kind: "assistant", text: botLine(lang, input.bot) });
   return lines;
 }
 

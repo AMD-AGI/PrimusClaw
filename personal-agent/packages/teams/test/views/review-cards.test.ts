@@ -64,6 +64,7 @@ const view = (fields: Partial<GithubConfirmView> = {}): GithubConfirmView => ({
   model: "",
   hint: false,
   installUrl: "",
+  bot: "PrimusClaw Assistant",
   base: "main",
   login: "",
   lang: "zh",

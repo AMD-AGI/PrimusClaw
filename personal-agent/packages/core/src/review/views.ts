@@ -20,6 +20,8 @@ export interface ReviewModeView {
   /** How to answer by typing, for a person whose clicks may not arrive ('' none). */
   readonly hint: string;
   readonly installUrl: string;
+  /** The bot's name in this deployment. */
+  readonly bot: string;
 }
 
 export interface GithubConfirmView {
@@ -38,6 +40,8 @@ export interface GithubConfirmView {
   readonly model: string;
   readonly hint: boolean;
   readonly installUrl: string;
+  /** The bot's name in this deployment. */
+  readonly bot: string;
   /** Where the merge lands ('' not read). */
   readonly base: string;
   readonly login: string;

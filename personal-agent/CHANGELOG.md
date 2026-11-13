@@ -15,6 +15,75 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+The bot's default display name changes from "Clawy" to "PrimusClaw Assistant", because the earlier name collides with
+third-party products, and the name becomes a deployment setting. The technical names that carried the earlier name
+(settings, Key Vault entries, metrics, the client label) move to `personal-agent` names; the old settings, entries and
+metric names keep working for now, the client label does not. What the store and filed issues already hold keeps its
+spelling: no migration of data.
+
+**Migration** (a deployment that wants nothing to change for its users sets the first two lines):
+
+1. `PERSONAL_AGENT_BOT_NAME=Clawy` (or the name of the deployment's app) keeps the name people see and type.
+2. `CLAW_CLIENT_LABEL=clawy` keeps the label Claw's audit trail records, if queries select on it.
+3. Rename `CLAWY_MODEL`, `CLAWY_FALLBACK_MODEL` and `CLAWY_REVIEW_MODEL` to `PERSONAL_AGENT_MODEL`,
+   `PERSONAL_AGENT_FALLBACK_MODEL` and `PERSONAL_AGENT_REVIEW_MODEL`, at any time.
+4. With `SECRETS_SOURCE=keyvault`, copy `clawy-encryption-keys`, `clawy-exchange-client-secret` and
+   `clawy-feedback-github-app-key` to `personal-agent-encryption-keys`, `personal-agent-exchange-client-secret` and
+   `personal-agent-feedback-github-app-key`, then remove the old entries after the next start logs no warning.
+5. Move alert rules, dashboards and release gates from the `clawy_*` metrics to the `personal_agent_*` ones once this
+   release is live; both are written by this release.
+
+### Added
+
+- `@primusclaw/personal-agent-runtime`: `PERSONAL_AGENT_BOT_NAME`, the name the bot goes by in this deployment (trimmed;
+  unset or blank: "PrimusClaw Assistant"), read once at start into `Settings.botName`. Every text that names the bot
+  takes it: help, the feedback questions, a group's `/context` and `/observe`, review requests and their questions and
+  prompts, the GitHub consent, the agent-window lines and their "Back to <name>" replies, the review cards' "Add <name>"
+  button, the feedback label's description. Whether a message starts by naming the bot ("@<name> ...") is read with it;
+  the bot's own @mention is still recognised by its Teams id, whatever it is called. "Back to <name>" detaches under the
+  configured name, the default name and the earlier name (buttons under cards already sent). No other behaviour depends on
+  the name: command words, metric labels and the client label do not.
+
+### Changed
+
+- **BREAKING:** the default display name is "PrimusClaw Assistant" (it was "Clawy"). A deployment that sets nothing now
+  answers to "@PrimusClaw Assistant" at the start of a message in an attached chat, not "@Clawy"; set
+  `PERSONAL_AGENT_BOT_NAME` to keep a name. Texts that named the bot where it speaks of itself (`/github status`,
+  `/whoami`, `/agent` help) now say "I".
+- **BREAKING:** `CLAW_CLIENT_LABEL` defaults to `personal-agent` (it was `clawy`): Claw's audit trail (`X-Claw-Client`)
+  records the new label from this release on. Set `CLAW_CLIENT_LABEL=clawy` to keep the old one.
+- **BREAKING (metrics):** every metric is renamed from `clawy_*` to `personal_agent_*` (`personal_agent_security_events_total`,
+  `personal_agent_inbound_handled_total`, `personal_agent_inbound_failed_total`, `personal_agent_inbound_handle_ms_total`,
+  `personal_agent_inbound_lag_max_ms`, `personal_agent_inbound_limited_total`, `personal_agent_event_handle_seconds`,
+  `personal_agent_event_to_chat_seconds`, `personal_agent_files_dropped_total`), same labels and values. For this release
+  `/metrics` writes every series under both names, so nothing goes blind while alert rules move.
+- **BREAKING (Key Vault):** the vault entries are `personal-agent-encryption-keys`, `personal-agent-exchange-client-secret`
+  and `personal-agent-feedback-github-app-key`. An entry the vault does not have under its new name is read under its old
+  `clawy-*` name, with one warning at start that names both; a refused read (403) of the new name still stops the worker.
+- **BREAKING (API)**, for code that uses the packages directly: `Settings.botName`, `ReviewDeps.botName`,
+  `FeedbackFlowDeps.botName`, `ObserverDeps.botName` and `SpeakerDeps.botName` are required; `contextInterceptor`,
+  `checkIntent`, `intentPrompt`, `modePrompt`, `answerPrompt`, `consentText`, `backReply`, `agentReplies`, `leftLine`,
+  `labelDescription` and the review texts that show an example request take the bot's name (`HOW_TO_ASK` is
+  `howToAsk(bot)`; `EnteredLine.bot`, `ReviewModeView.bot`, `GithubConfirmView.bot`); `CLAWY_HEAD` is `botHead(bot)`,
+  `DirectChat.clawyExtras` is `botExtras` (the name is the constructor's third argument), `clawyLine` is `botLine`;
+  runtime's `feedbackSink` and `GatewayIntentReader` take `botName`; Teams' `teamsTypedEvent` takes the name first. The
+  unused `HELP_LINES` and `GROUP_HELP_LINES` are removed.
+- The confirmation-setting card names the repository review configuration `.github/claw-review.yml`, the file Claw reads
+  first.
+
+### Deprecated
+
+- `CLAWY_MODEL`, `CLAWY_FALLBACK_MODEL` and `CLAWY_REVIEW_MODEL`: read when the `PERSONAL_AGENT_*` name is not set, named
+  in the start-up warning of deprecated setting names; the new name wins when both are set.
+- The `clawy_*` metric names: deprecated, removed in the next MINOR.
+- The `clawy-*` Key Vault entry names: read only when the new entry is missing.
+
+Kept as they were, because what is already stored or selected on uses them: the stored field `clawy_shown_whole` of a
+terminal's question, the `clawy-feedback` label and the hidden marker of filed feedback issues, the `clawy-` prefix of the
+idempotency key a redelivered message is recognised by, and the security log's logger name `clawy.security`.
+
 ## 0.9.0
 
 A minor release, because core's exported API changes incompatibly: `ClawPort` gains a required member, `skills`

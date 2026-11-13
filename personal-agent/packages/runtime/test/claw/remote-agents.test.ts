@@ -14,7 +14,7 @@ describe("remote agents", () => {
     assert.deepEqual(
       wire.sent.map((s) => [s.rawPath, s.headers.get("x-claw-client")]),
       [
-        ["/v1/remote-agents/connectors", "clawy"],
+        ["/v1/remote-agents/connectors", "personal-agent"],
         ["/v1/remote-agents/sessions", "my-agent"],
       ],
     );

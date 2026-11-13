@@ -1,7 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { BOT_NAME } from "../branding.js";
 import { ClawAnswerInvalid, ClawError, ClawUnreachable, errorKind } from "../claw/errors.js";
 import type { JsonObject } from "../json.js";
 import { OBSERVE_TEXT as T } from "../locales/observe.js";
@@ -46,6 +45,8 @@ export interface ObserverDeps {
   /** CLAW_PLUGIN_ID, named on the request an accepted suggestion becomes. */
   readonly pluginId: number | undefined;
   readonly log: Logger;
+  /** The bot's name in this deployment (`Settings.botName`). */
+  readonly botName: string;
 }
 
 type Finish = (text: string, again?: string) => Promise<void>;
@@ -92,8 +93,9 @@ export class Observer implements Observing {
     const { conversation } = route;
     const id = conversation.ref.id;
     const say = (text: string): Promise<void> => conversation.send(textMessage(text));
-    if (verb === "usage") await say(T.usage({ bot: BOT_NAME }));
-    else if (verb === "status") await say(this.deps.observe.groupObserver(id) ? T.isOn({ bot: BOT_NAME }) : T.notOn);
+    if (verb === "usage") await say(T.usage({ bot: this.deps.botName }));
+    else if (verb === "status")
+      await say(this.deps.observe.groupObserver(id) ? T.isOn({ bot: this.deps.botName }) : T.notOn);
     else if (verb === "off") {
       // anybody in the group may: it only takes something away
       await say(this.deps.observe.unobserveGroup(id) !== null ? T.noticeOff : T.notOn);
@@ -123,7 +125,7 @@ export class Observer implements Observing {
       name: route.message.conversationName,
     });
     this.deps.log.info("observe: turned on in a group");
-    return say(T.noticeOn({ who: sender.name || T.turnedOnBy, bot: BOT_NAME }));
+    return say(T.noticeOn({ who: sender.name || T.turnedOnBy, bot: this.deps.botName }));
   }
 
   /**

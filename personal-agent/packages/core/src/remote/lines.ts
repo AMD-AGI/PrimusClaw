@@ -159,8 +159,8 @@ export function backLine(lang: Lang): string {
 }
 
 /** Which messages of an attached chat stay with the assistant: said on the status card, where the person looks. */
-export function clawyLine(lang: Lang, bot: string): string {
-  return remoteText.in(lang).clawyLine({ bot });
+export function botLine(lang: Lang, bot: string): string {
+  return remoteText.in(lang).botLine({ bot });
 }
 
 /** How to connect a machine with the one command line Claw gave (`claw-connector pair`): run it there, it does the rest. */

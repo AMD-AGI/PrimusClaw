@@ -3,11 +3,11 @@
 
 /** What the asker is told while a review request is checked and started (Chinese, as the Python worker says it). */
 
-import { HOW_TO_ASK } from "./review-request.js";
+import { howToAsk } from "./review-request.js";
 
 export const reviewStartText = {
-  attachPulls: (unread: string) =>
-    `请附上要 review 合入的 PR（链接或 owner/repo#编号），例如 ${HOW_TO_ASK}` +
+  attachPulls: (unread: string, bot: string) =>
+    `请附上要 review 合入的 PR（链接或 owner/repo#编号），例如 ${howToAsk(bot)}` +
     (unread ? `（${unread} 没有当作 PR，因为不知道是哪个仓库的）` : ""),
   tooMany: (max: number, atOnce: number, count: number) =>
     `一次最多交给我 ${String(max)} 个 PR（前 ${String(atOnce)} 个立即开始，其余排队自动开始），这次有 ${String(count)} 个，所以一个也没有开始。请先发前 ${String(max)} 个，其余等前面开始后再发。`,
@@ -22,15 +22,16 @@ export const reviewStartText = {
   connectLead:
     "To review and merge pull requests I need to know which Primus account you are. / 代审需要先确认你的 Primus 账号。 ",
   platformDown: "我暂时联系不上 Primus 平台，没能确认你的身份，所以没有开始 review。请稍后再 @ 我一次。",
-  unsureWho: `我不确定你请的是谁，所以没有开始 review。请写出 reviewer 的名字，例如 ${HOW_TO_ASK}`,
-  unsureWhoFull: `我不确定你请的是谁，所以没有开始 review。请写出 reviewer 的全名，例如 ${HOW_TO_ASK}`,
+  unsureWho: (bot: string) => `我不确定你请的是谁，所以没有开始 review。请写出 reviewer 的名字，例如 ${howToAsk(bot)}`,
+  unsureWhoFull: (bot: string) =>
+    `我不确定你请的是谁，所以没有开始 review。请写出 reviewer 的全名，例如 ${howToAsk(bot)}`,
   githubUnknown: (who: string) => `暂时无法确认 ${who} 的 GitHub 绑定，请稍后再试。`,
   notAuthorized: (who: string, merge: boolean) =>
     `${who} 还没有授权我代 TA ${merge ? "review 合入" : "review"}（需要 TA 在 1:1 里发 \`/github auto-merge on\` 开启一次长期授权），我不会动用 TA 的 GitHub 账号，所以没有开始 review。请 ${who} 授权后再 @ 我一次。`,
-  reviewerNotLinked: (who: string) =>
-    `${who} 还没有在 Clawy 里连接自己的 Primus key（1:1 里发 \`/link\`），代 TA review 要用 TA 自己的账号和模型额度，所以没有开始 review。请 ${who} 先连接，然后再 @ 我一次。`,
-  reviewerNotConnected: (who: string) =>
-    `${who} 还没有通过 Primus 身份服务连接 Clawy，我没法以 TA 的身份开始，所以没有开始 review。请 ${who} 先在 1:1 里完成连接，然后再 @ 我一次。`,
+  reviewerNotLinked: (who: string, bot: string) =>
+    `${who} 还没有在 ${bot} 里连接自己的 Primus key（1:1 里发 \`/link\`），代 TA review 要用 TA 自己的账号和模型额度，所以没有开始 review。请 ${who} 先连接，然后再 @ 我一次。`,
+  reviewerNotConnected: (who: string, bot: string) =>
+    `${who} 还没有通过 Primus 身份服务连接 ${bot}，我没法以 TA 的身份开始，所以没有开始 review。请 ${who} 先在 1:1 里完成连接，然后再 @ 我一次。`,
   reviewerPlatformDown: (who: string) =>
     `我暂时联系不上 Primus 平台，没能确认 ${who} 的身份，所以没有开始 review。请稍后再 @ 我一次。`,
   modelsUnknown: (whose: string, model: string) =>
@@ -38,8 +39,8 @@ export const reviewStartText = {
   modelUnusable: (whose: string, model: string, listed: string, any: boolean) =>
     `${whose} key 用不了模型 ${model}，所以没有开始 review。` +
     (any ? `可以用的模型：${listed}。` : `${whose} key 目前没有可用的模型。`),
-  ownPull: (pull: string, who: string) =>
-    `${pull} 是 ${who} 自己提交的，作者不能 review 合入自己的 PR（自己的批准 GitHub 也不算数）。请另外指定一位 committer，例如 ${HOW_TO_ASK}`,
+  ownPull: (pull: string, who: string, bot: string) =>
+    `${pull} 是 ${who} 自己提交的，作者不能 review 合入自己的 PR（自己的批准 GitHub 也不算数）。请另外指定一位 committer，例如 ${howToAsk(bot)}`,
   ownPullShort: (who: string) => `${who} 自己提交的，作者不能 review 合入自己的 PR`,
   limited: (pull: string, zh: string, en: string) => `${pull} 没有开始 review：${zh}\n\n${en}`,
   limitedShort: "你发起 review 的次数达到了每人的上限，请稍后再试",

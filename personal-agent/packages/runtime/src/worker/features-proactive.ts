@@ -105,7 +105,7 @@ export function proactiveParts(
     logger: base.logger,
     publicEvent: (event: JsonObject) =>
       publicRunEvent(event, errors, (text) => looksLikeServiceError(text) || looksInternal(text)),
-    botName: "Clawy",
+    botName: settings.botName,
     ...(router === undefined ? {} : { identityAfterRefusal: identityAfterRefusal(base, router) }),
   };
   // (`showsAttached` stays false: the Python worker's /claw-events path runs its own Proactive, on which it is never set)
