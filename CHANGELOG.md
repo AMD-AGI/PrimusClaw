@@ -111,6 +111,13 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131535` (commit ce688380). A patch release: personal skills are saved from the
+conversation, with a card to undo or edit, while `CLAW_USER_SKILLS_ENABLED` is on. Schema: the new table
+`claw_skill_changes`, added at start-up. No new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4). Personal agent 0.9.0 shows the cards and `/skills`.
+
 ### Added
 
 - Personal skills are saved from the conversation (with `CLAW_USER_SKILLS_ENABLED`). When the user asks the assistant to
@@ -127,7 +134,7 @@ release version, and its `appVersion` stays `latest`.
   `GET /v1/users/:userId/skills?view=current`, `GET /v1/users/:userId/skills/:name?view=current`,
   `POST /v1/users/:userId/skills/:name/disable|enable`, and the drafts at `/v1/users/:userId/skill-drafts`. New table
   `claw_skill_changes`, new metric `claw_user_skill_save_total`. With the switch off nothing changes: the router's
-  request is byte for byte what it was, and the routes are as they were.
+  request is byte for byte what it was, and the routes are as they were (#823).
 
 ## [0.4.3] - 2026-11-13
 
