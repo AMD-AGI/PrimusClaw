@@ -828,6 +828,37 @@ func TestSandboxCreateAcceptsBearerAPIKey(t *testing.T) {
 	}
 }
 
+func TestSandboxCreatePrefersAPIKeyOverBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer not-a-platform-key")
+	req.Header.Set("X-API-KEY", keys["measurement"])
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("api key with bearer=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMissingSandboxCredentialNamesBothHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, _ := testPlane(t, 600, []int32{1}, 1)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "X-API-KEY") || !strings.Contains(w.Body.String(), "Authorization") {
+		t.Fatalf("missing=%d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestV2RoutesReachHandlers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc, _, keys := testPlane(t, 600, []int32{1}, 2)

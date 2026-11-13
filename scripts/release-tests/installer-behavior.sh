@@ -30,6 +30,17 @@ case "$*" in
       *) ;; # bare existence check
     esac
     ;;
+  *"get ingress agent-sandbox-public"*)
+    [[ -n "${MOCK_INGRESS_HOST:-}" ]] || exit 1
+    case "$*" in
+      *release-namespace*) printf '%s' "${NAMESPACE}" ;;
+      *release-name*) printf 'agent-sandbox' ;;
+      *managed-by*) printf 'Helm' ;;
+      *ingressClassName*) printf 'higress' ;;
+      *rules*) printf '%s' "${MOCK_INGRESS_HOST}" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   *"get secret envd-router-identity"*) exit 1 ;;
   *"get ns "*) exit 1 ;;
   *"get configmap"*)
@@ -184,5 +195,23 @@ if env "${ca_env[@]}" MOCK_CA_DATA='{"ca.crt":"hello"}' \
 fi
 grep -q 'ConfigMap sandboxes/org-ca holds no PEM certificate' "$output"
 [[ ! -e "$capture" ]] || { echo "certificate-less CA ConfigMap still reached Helm" >&2; exit 1; }
+
+rm -f "$capture"
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q 'keeping Helm-managed public Ingress https://sandbox.example.com' "$output"
+grep -qF -- '--set router.publicIngress.enabled=true' "$capture"
+grep -qF -- '--set-string router.publicIngress.hosts[0]=sandbox.example.com' "$capture"
 
 echo "installer behavior: ok"

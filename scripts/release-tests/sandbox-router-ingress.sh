@@ -131,6 +131,17 @@ elif case == "ingress":
     if len(namespace_rules()) != 1:
         fail("an enabled Ingress must come with namespace RBAC")
 
+elif case == "public":
+    ings = [d for d in kind("Ingress") if d["metadata"]["name"] == "agent-sandbox-public"]
+    if len(ings) != 1:
+        fail(f"expected the public Ingress, got {[d['metadata']['name'] for d in kind('Ingress')]}")
+    paths = [p["path"] for p in ings[0]["spec"]["rules"][0]["http"]["paths"]]
+    want = ["/sandboxes", "/v2/sandboxes", "/files", "/api/files", "/process.Process", "/filesystem.Filesystem", "/v1/templates"]
+    if paths != want:
+        fail(f"public paths {paths}")
+    if ings[0]["spec"]["rules"][0]["host"] != "sandbox.example.com":
+        fail("public host was not taken from values")
+
 else:
     fail("unknown case")
 print(f"  ok: {case}")
@@ -168,6 +179,18 @@ refused() {
   }
   echo "  ok: $name refused"
 }
+
+render "$tmp/public.yaml" \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+check "$tmp/public.yaml" public
+
+for path in / /v1 /v2 /api; do
+  refused "public-path=$path" "must name a specific route" \
+    --set router.publicIngress.enabled=true \
+    --set-string 'router.publicIngress.hosts[0]=sandbox.example.com' \
+    --set-string "router.publicIngress.paths[0]=$path"
+done
 
 # An Ingress without a selector would expose every namespace.
 refused no-selector "router.ingress.enabled requires router.config.namespaceSelector" \

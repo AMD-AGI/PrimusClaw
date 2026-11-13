@@ -1,30 +1,44 @@
 # SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if and .Values.controlplane.enabled .Values.router.publicIngress.enabled }}
-{{- if not .Values.router.publicIngress.hosts }}
+{{- if .Values.controlplane.enabled }}
+{{- with .Values.router.publicIngress }}
+{{- if .enabled }}
+{{- if not .hosts }}
 {{- fail "router.publicIngress.enabled requires at least one host" }}
+{{- end }}
+{{- range .paths }}
+{{- $raw := . | toString }}
+{{- $path := trimSuffix "/" $raw }}
+{{- $parts := splitList "/" (trimPrefix "/" $path) }}
+{{- $head := "" }}
+{{- if $parts }}
+{{- $head = index $parts 0 }}
+{{- end }}
+{{- if or (not (hasPrefix "/" $raw)) (eq $path "") (eq $path "/") (eq $path "/v1") (and (or (eq $head "v1") (eq $head "v2") (eq $head "api")) (lt (len $parts) 2)) }}
+{{- fail (printf "router.publicIngress path %q must name a specific route" $raw) }}
+{{- end }}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ required "router.publicIngress.name is required" .Values.router.publicIngress.name }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ required "router.publicIngress.name is required" .name }}
+  namespace: {{ $.Release.Namespace }}
   labels:
     app: agent-sandbox
     app.kubernetes.io/component: router
-    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
     higress.io/resource-definer: higress
-  {{- with .Values.router.publicIngress.annotations }}
+  {{- with .annotations }}
   annotations: {{ toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- with .Values.router.publicIngress.className }}
+  {{- with .className }}
   ingressClassName: {{ . }}
   {{- end }}
   rules:
-    {{- range .Values.router.publicIngress.hosts }}
+    {{- range .hosts }}
     - host: {{ . | quote }}
       http:
         paths:
@@ -38,4 +52,6 @@ spec:
                   number: {{ $.Values.controlplane.service.router.port }}
           {{- end }}
     {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

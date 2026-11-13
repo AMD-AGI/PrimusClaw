@@ -23,7 +23,7 @@
 #   ENVD_KEY_SRC_KUBECONFIG=                  # required when ENVD_KEY_SOURCE=copy
 #   ENVD_KEY_SRC_NAMESPACE=agent-sandbox-system
 #   INSTALL_RUNTIMECLASS=false                # apply Kata RuntimeClass (kata-qemu)
-#   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset skips the Ingress
+#   INGRESS_HOST=                             # existing public host, e.g. sandbox.example.com; unset keeps a Helm-owned Ingress and does not create one
 #   INGRESS_CLASS=higress                     # Ingress class for that host
 #   HIGRESS_NAMESPACE=higress-system          # namespace of the Higress gateway (INGRESS_CLASS=higress)
 #   INSTALL_DEFAULT_TEMPLATES=false           # apply CodeInterpreter examples
@@ -180,15 +180,13 @@ prompt_ingress_host() {
     read -r -p "Public host (for example sandbox.example.com, Enter to skip): " INGRESS_HOST || INGRESS_HOST=""
 }
 
-# apply_router_ingress mounts the router on an existing public host.
-# The host is whatever already resolves for that cluster, for example
-# sandbox.example.com. E2B uses absolute paths, so the routes are
-# /sandboxes and the data-plane prefixes, not a path prefix in front of them.
-# An unset host skips creation and installation continues.
+# apply_router_ingress applies the Higress idle timeout for a public host.
+# The Ingress object itself is rendered by the Helm release from
+# router.publicIngress. This function does not kubectl-apply that object.
 apply_router_ingress() {
     prompt_ingress_host
     if [[ -z "${INGRESS_HOST}" ]]; then
-        log "skipped router Ingress (INGRESS_HOST unset)"
+        log "public Ingress is unchanged (INGRESS_HOST unset)"
         return 0
     fi
     dns_name_ok "${INGRESS_HOST}" domain \
@@ -196,59 +194,38 @@ apply_router_ingress() {
     dns_name_ok "${INGRESS_CLASS}" domain \
         || dns_name_ok "${INGRESS_CLASS}" label \
         || err "INGRESS_CLASS must be a DNS label or name, got ${INGRESS_CLASS}"
-
-    local manifest path
-    manifest="$(mktemp /tmp/sandbox-ingress.XXXXXX.yaml)"
-    cat >"${manifest}" <<EOF
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: agent-sandbox-public
-  namespace: ${NAMESPACE}
-  labels:
-    app: agent-sandbox
-    higress.io/resource-definer: higress
-  annotations:
-    higress.io/route-priority: "100"
-    higress.io/ignore-path-case: "false"
-    higress.io/proxy-body-size: "0"
-    higress.io/proxy-buffering: "off"
-    higress.io/proxy-read-timeout: "3600"
-    higress.io/proxy-send-timeout: "3600"
-    higress.io/timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-spec:
-  ingressClassName: ${INGRESS_CLASS}
-  rules:
-  - host: ${INGRESS_HOST}
-    http:
-      paths:
-EOF
-    for path in /sandboxes /v2/sandboxes /files /api/files /process.Process /filesystem.Filesystem /v1/templates; do
-        cat >>"${manifest}" <<EOF
-      - path: ${path}
-        pathType: Prefix
-        backend:
-          service:
-            name: agent-sandbox-router
-            port:
-              number: 8080
-EOF
-    done
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        echo "  [dry-run] kubectl apply -f ${manifest}"
-        cat "${manifest}"
-    else
-        kubectl apply -f "${manifest}"
-    fi
-    rm -f "${manifest}"
-    ok "router Ingress https://${INGRESS_HOST}/sandboxes"
     if [[ "${INGRESS_CLASS}" == "higress" ]]; then
         apply_router_idle_timeout
     fi
+    ok "public Ingress is rendered by Helm at https://${INGRESS_HOST}"
+}
+
+# keep_helm_public_ingress copies the host of an Ingress this release already
+# owns when INGRESS_HOST is empty. Helm deletes a release object the new
+# render omits, so a re-run that does not name a host must keep the one it has.
+keep_helm_public_ingress() {
+    [[ -n "${INGRESS_HOST}" ]] && return 0
+    [[ "${DRY_RUN}" == "true" ]] && return 0
+    command -v kubectl >/dev/null 2>&1 || return 0
+    local managed release_name release_ns host class
+    managed="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+    [[ "${managed}" == "Helm" ]] || return 0
+    release_name="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null || true)"
+    release_ns="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null || true)"
+    [[ "${release_name}" == "${RELEASE}" && "${release_ns}" == "${NAMESPACE}" ]] || return 0
+    host="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)"
+    [[ -n "${host}" ]] || return 0
+    class="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.spec.ingressClassName}' 2>/dev/null || true)"
+    INGRESS_HOST="${host}"
+    if [[ -n "${class}" ]]; then
+        INGRESS_CLASS="${class}"
+    fi
+    log "keeping Helm-managed public Ingress https://${INGRESS_HOST}"
 }
 
 # Raises the Higress stream idle timeout on the router Ingress routes to 1800 s,
@@ -300,8 +277,7 @@ EOF
 # a half-broken install is still repaired. FORCE_SANDBOX=1 overrides.
 # CRDs are still applied: they are outside the Helm release, and a new CRD
 # (SandboxPolicy) has to land on an already-Ready cluster.
-# The router Ingress is applied too, so a re-run with INGRESS_HOST
-# publishes the paths without reinstalling the release.
+# The public Ingress stays with the Helm release. This path does not rewrite it.
 FORCE_SANDBOX="${FORCE_SANDBOX:-false}"
 if command -v kubectl >/dev/null 2>&1 \
    && [[ "${FORCE_SANDBOX}" != "1" && "${FORCE_SANDBOX}" != "true" && "${DRY_RUN}" != "true" ]]; then
@@ -313,7 +289,7 @@ if command -v kubectl >/dev/null 2>&1 \
        && "${INSTANCE}" == "${RELEASE}" \
        && "${DESIRED}" =~ ^[1-9][0-9]*$ \
        && "${READY_REPLICAS}" == "${DESIRED}" ]]; then
-        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs and router Ingress, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
+        ok "Sandbox Helm release ${RELEASE} is fully ready in ${NAMESPACE} — applying CRDs, then skipping the rest (set FORCE_SANDBOX=1 to reinstall)"
         section "CRDs"
         ensure_crds
         section "Router Ingress"
@@ -490,6 +466,7 @@ trap 'rm -f "${VALUES_FILE:-}"' EXIT
 # The public Ingress is part of the release. Ask for the host before helm runs
 # so a re-install publishes /v1/templates with the rest of the routes.
 prompt_ingress_host
+keep_helm_public_ingress
 if [[ -n "${INGRESS_HOST}" ]]; then
     dns_name_ok "${INGRESS_HOST}" domain \
         || err "INGRESS_HOST must be a lowercase DNS name, got ${INGRESS_HOST}"
@@ -725,7 +702,7 @@ cat <<EOF
 
   Notes:
     - Kata RuntimeClass alone is harmless; runtime binaries still require: sudo bash ${SCRIPT_DIR}/install-kata.sh (per worker node)
-    - Router Ingress is mounted on INGRESS_HOST at /sandboxes, /v1/templates, and the E2B data-plane paths. Leave INGRESS_HOST unset to skip it.
+    - The public Ingress is part of the Helm release. Paths come from router.publicIngress in the chart. Leave INGRESS_HOST unset to keep an existing Helm-owned Ingress; set it to publish one.
 
   Uninstall:
     DELETE_CRDS=true bash ${SCRIPT_DIR}/uninstall.sh

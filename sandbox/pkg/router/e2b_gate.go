@@ -97,8 +97,8 @@ func (s *Server) proxyE2B(c *gin.Context) {
 		s.rejectDirectCaller(c)
 		return
 	}
-	if identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader)) == "" {
-		writeGate(c, http.StatusUnauthorized, "invalid_key", "X-API-KEY is required")
+	if identity.E2BCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader)) == "" {
+		writeGate(c, http.StatusUnauthorized, "invalid_key", identity.MissingCredential.Message)
 		return
 	}
 	s.proxyToWM(c)

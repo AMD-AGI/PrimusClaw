@@ -177,9 +177,9 @@ func (h *Handler) ready(c *gin.Context) (string, bool) {
 }
 
 func apiKey(c *gin.Context) (string, bool) {
-	key := identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
+	key := identity.E2BCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
 	if key == "" {
-		writeErr(c, grant.Op(http.StatusUnauthorized, "invalid_key", "X-API-KEY is required"))
+		writeErr(c, grant.Op(http.StatusUnauthorized, "invalid_key", identity.MissingCredential.Message))
 		return "", false
 	}
 	return key, true

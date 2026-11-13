@@ -45,12 +45,23 @@ func BearerCredential(header string) string {
 }
 
 // RequestCredential returns the caller's credential. A bearer token wins when
-// both are present. The API key header is the credential E2B clients send.
+// both are present. /v1 uses this order: an access token is the primary
+// credential, and X-API-KEY is the fallback.
 func RequestCredential(authorization, apiKey string) string {
 	if credential := BearerCredential(authorization); credential != "" {
 		return credential
 	}
 	return strings.TrimSpace(apiKey)
+}
+
+// E2BCredential returns the API key when the client sent one. E2B clients send
+// X-API-KEY and may also send an access token as Authorization. These routes
+// resolve the API key. A bearer token is used only when X-API-KEY is empty.
+func E2BCredential(authorization, apiKey string) string {
+	if key := strings.TrimSpace(apiKey); key != "" {
+		return key
+	}
+	return BearerCredential(authorization)
 }
 
 // RejectionFor maps an Introspect error to the caller's answer: 401 for an

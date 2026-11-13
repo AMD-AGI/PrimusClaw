@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
@@ -186,6 +187,7 @@ func (s *Server) proxyRequest(c *gin.Context, targetURL string, sessionID string
 	outReq.Header.Del(e2b.HeaderSealed)
 	outReq.Header.Del(e2b.HeaderInputs)
 	outReq.Header.Del(e2b.HeaderOutputs)
+	outReq.Header.Del(identity.APIKeyHeader)
 	outReq.Header.Set("Authorization", "Bearer "+token)
 
 	// Execute upstream request

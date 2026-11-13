@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/net/http2"
 
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -34,12 +35,14 @@ type callerCredentialsKey struct{}
 
 type callerCredentials struct {
 	authorization string
+	apiKey        string
 	cookie        string
 }
 
-func withCallerCredentials(ctx context.Context, authorization, cookie string) context.Context {
+func withCallerCredentials(ctx context.Context, authorization, apiKey, cookie string) context.Context {
 	return context.WithValue(ctx, callerCredentialsKey{}, callerCredentials{
 		authorization: authorization,
+		apiKey:        apiKey,
 		cookie:        cookie,
 	})
 }
@@ -48,6 +51,9 @@ func forwardCallerCredentials(ctx context.Context, req *http.Request) {
 	credentials, _ := ctx.Value(callerCredentialsKey{}).(callerCredentials)
 	if credentials.authorization != "" {
 		req.Header.Set("Authorization", credentials.authorization)
+	}
+	if credentials.apiKey != "" {
+		req.Header.Set(identity.APIKeyHeader, credentials.apiKey)
 	}
 	if credentials.cookie != "" {
 		req.Header.Set("Cookie", credentials.cookie)

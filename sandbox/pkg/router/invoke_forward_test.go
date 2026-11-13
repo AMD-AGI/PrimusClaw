@@ -23,13 +23,14 @@ const forwardSession = "claw-brain-1"
 
 // forwardPair is a managing Router in front of one cluster Router and its sandbox.
 type forwardPair struct {
-	front     *httptest.Server
-	cluster   *httptest.Server
-	exec      *Server
-	global    *Server
-	envdHits  *atomic.Int32
-	envdPath  *atomic.Value
-	execIDHit *atomic.Int32
+	front      *httptest.Server
+	cluster    *httptest.Server
+	exec       *Server
+	global     *Server
+	envdHits   *atomic.Int32
+	envdPath   *atomic.Value
+	envdAPIKey *atomic.Value
+	execIDHit  *atomic.Int32
 }
 
 // newForwardPair builds a global Router that locates forwardSession on cluster cluster-a
@@ -37,11 +38,12 @@ type forwardPair struct {
 func newForwardPair(t *testing.T, caller string) *forwardPair {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	p := &forwardPair{envdHits: &atomic.Int32{}, envdPath: &atomic.Value{}, execIDHit: &atomic.Int32{}}
+	p := &forwardPair{envdHits: &atomic.Int32{}, envdPath: &atomic.Value{}, envdAPIKey: &atomic.Value{}, execIDHit: &atomic.Int32{}}
 
 	envd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.envdHits.Add(1)
 		p.envdPath.Store(r.URL.Path)
+		p.envdAPIKey.Store(r.Header.Get("X-API-KEY"))
 		_, _ = w.Write([]byte("from-envd"))
 	}))
 	t.Cleanup(envd.Close)
@@ -141,6 +143,66 @@ func TestForwardRemoteInvocationReachesClusterSandbox(t *testing.T) {
 	}
 	if p.execIDHit.Load() != 0 {
 		t.Fatal("cluster Router introspected a forwarded invocation")
+	}
+}
+
+func TestAPIKeyIsNotForwardedIntoTheSandbox(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	req, err := http.NewRequest(http.MethodPost,
+		p.front.URL+"/v1/namespaces/ws-a/code-interpreters/"+forwardSession+"/invocations/api/execute",
+		strings.NewReader(`{"command":["true"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-session-id", forwardSession)
+	req.Header.Set("X-API-KEY", "ak-owner")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "from-envd" {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if got, _ := p.envdAPIKey.Load().(string); got != "" {
+		t.Fatalf("API key reached envd: %q", got)
+	}
+}
+
+func TestProxyToClusterDropsAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var gotKey, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-API-KEY")
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	s := &Server{}
+	engine := gin.New()
+	engine.POST("/forward", func(c *gin.Context) {
+		c.Request.Header.Set("X-API-KEY", "ak-caller")
+		c.Request.Header.Set("Authorization", "Bearer caller")
+		s.proxyToCluster(c, upstream.URL, "cluster-a", "hop-token")
+	})
+	front := httptest.NewServer(engine)
+	defer front.Close()
+	resp, err := http.Post(front.URL+"/forward", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if gotKey != "" {
+		t.Fatalf("API key reached cluster router: %q", gotKey)
+	}
+	if gotAuth != "Bearer hop-token" {
+		t.Fatalf("hop token=%q", gotAuth)
 	}
 }
 
