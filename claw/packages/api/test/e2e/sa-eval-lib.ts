@@ -668,6 +668,49 @@ export function clockValue(what: "weekday" | "date", zone: string, at: Date): st
   return [`${y}-${mm}-${dd}`, `${m}月${d}日`, `${m}月${d}号`, `${month} ${d}`, `${d} ${month}`, `${month.slice(0, 3)} ${d}`].join("||");
 }
 
+const ZH_DAY_FORMS = ZH_DAYS.map((z, k) => [`星期${z}`, `周${z}`, `礼拜${z}`, ...(k === 0 ? ["星期天", "周天", "礼拜天"] : [])]);
+const NEGATED_BEFORE = /(不是|并非|而非|\bnot\s+|n't\s+)$/i;
+
+/**
+ * The weekday (0 Sunday .. 6 Saturday) or the date (`MM-DD`) a reply gives as its answer: the first one it names that is not said not
+ * to be it ("不是周六", "not Friday"), or null when it names none. A date is read as a whole (`November 1` is not in `November 14`).
+ */
+export function clockAnswer(what: "weekday" | "date", text: string): string | null {
+  const t = (text || "").normalize("NFKC");
+  const found: Array<{ at: number; value: string; end: number }> = [];
+  if (what === "weekday") {
+    ZH_DAY_FORMS.forEach((forms, k) => {
+      for (const f of forms) for (const m of t.matchAll(new RegExp(f, "g"))) found.push({ at: m.index!, end: m.index! + f.length, value: String(k) });
+    });
+    EN_DAYS.forEach((d, k) => {
+      for (const m of t.matchAll(new RegExp(`\\b${d}\\b`, "gi"))) found.push({ at: m.index!, end: m.index! + d.length, value: String(k) });
+    });
+  } else {
+    const md = (m: number, d: number) => (m >= 1 && m <= 12 && d >= 1 && d <= 31 ? `${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}` : null);
+    const month = (name: string) => EN_MONTHS.findIndex((x) => x.slice(0, 3).toLowerCase() === name.slice(0, 3).toLowerCase()) + 1;
+    const MONTH = `(${EN_MONTHS.map((x) => `${x.slice(0, 3)}(?:${x.slice(3)})?\\.?`).join("|")})`;
+    const add = (m: RegExpMatchArray, v: string | null) => { if (v) found.push({ at: m.index!, end: m.index! + m[0].length, value: v }); };
+    for (const m of t.matchAll(/(?<!\d)\d{4}[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/g)) add(m, md(Number(m[1]), Number(m[2])));
+    for (const m of t.matchAll(/(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号](?!\d)/g)) add(m, md(Number(m[1]), Number(m[2])));
+    for (const m of t.matchAll(new RegExp(`\\b${MONTH}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?!\\d)`, "gi"))) add(m, md(month(m[1]!), Number(m[2])));
+    for (const m of t.matchAll(new RegExp(`(?<!\\d)(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b`, "gi"))) add(m, md(month(m[2]!), Number(m[1])));
+  }
+  found.sort((a, b) => a.at - b.at || b.end - a.end);
+  for (const f of found) {
+    if (NEGATED_BEFORE.test(t.slice(Math.max(0, f.at - 12), f.at))) continue;
+    return f.value;
+  }
+  return null;
+}
+
+/** The answers a clock fact's value allows, in `clockAnswer`'s form, read back from its alternatives. */
+export function clockAllowed(what: "weekday" | "date", value: string): Set<string> {
+  const alts = value.split("||");
+  return new Set(what === "weekday"
+    ? alts.map((a) => EN_DAYS.indexOf(a)).filter((k) => k >= 0).map(String)
+    : alts.map((a) => /^\d{4}-(\d{2}-\d{2})$/.exec(a)?.[1]).filter((x): x is string => !!x));
+}
+
 /**
  * A `clock` oracle's value for an attempt asked between `from` and `to`: what it is at either end (one value whose alternatives are
  * both, when midnight fell between), or null when the query is not one (`clockQuery`).
@@ -1655,6 +1698,13 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     const want = values.slice(0, 10);
     // An oracle's value is the identity's own data: the result says only how many were expected, never what.
     const detail = f.oracle?.kind === "api" ? `expected ${want.length} oracle value(s)` : `expected ${want.join(", ").slice(0, 80)}`;
+    // A clock fact: the weekday or date the reply gives as its answer (the first it names, not negated) is the one of the run.
+    const clock = clockQuery(f.oracle);
+    if (clock) {
+      const given = clockAnswer(clock.what, o.final);
+      out.push({ name, pass: want.length > 0 && given !== null && clockAllowed(clock.what, want[0]!).has(given), detail: `${detail}; answered ${given ?? "none"}` });
+      return;
+    }
     out.push({ name, pass: want.length > 0 && want.every((v) => names(o.final, v)), detail });
   });
   if (c.cards) {

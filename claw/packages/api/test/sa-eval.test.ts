@@ -81,7 +81,7 @@ import {
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
-  bareItemNumber, clockQuery, clockValue, clockValues, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
+  bareItemNumber, clockAnswer, clockQuery, clockValue, clockValues, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
   cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards, memoryRows, memoriesMatching, newMemoryIds,
   TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody,
 } from "./e2e/sa-eval-lib.js";
@@ -1538,6 +1538,26 @@ test("S-clock a date or weekday case is graded against the date and weekday in i
   assert.equal(verdictOf(c, grade(c, wrong), { pass: true }).pass, false, "a judge's PASS does not save it");
   assert.deepEqual(failed(c, observed({ final: "今天是星期六。", factValues: values })), []);
   assert.deepEqual(failed(c, observed({ final: "Today is Saturday, November 14.", factValues: values })), []);
+  // The answer is the first weekday the reply gives, not one it names anywhere: the right one only in a note, or said not to be the
+  // day, is a wrong answer (review round 1's probe: "今天不是周六，而是星期天" passed a substring check).
+  for (const reply of ["今天是 **星期五**（UTC），上海已是星期六。", "今天不是周六，而是星期天。", "It's not Saturday, it's Sunday.", "今天是周五。"]) {
+    assert.ok(failed(c, observed({ final: reply, factValues: values })).includes("fact the weekday in Asia/Shanghai"), reply);
+  }
+  for (const reply of ["今天是星期六（UTC 还是星期五）。", "今天礼拜六。", "Saturday."]) {
+    assert.deepEqual(failed(c, observed({ final: reply, factValues: values })), [], reply);
+  }
+  assert.equal(clockAnswer("weekday", "今天是星期天"), "0");
+  assert.equal(clockAnswer("weekday", "no day here"), null);
+  // A date is read whole: November 14 is not November 1, and 11月14日 is not 11月1日.
+  const date = { kind: "clock" as const, query: "date@Asia/Shanghai" };
+  const nov1 = [clockValues(date, new Date("2026-10-31T16:40:00Z"), new Date("2026-10-31T16:41:00Z"))];
+  const d = caseOf({ facts: [{ claim: "the date", oracle: date }] });
+  for (const reply of ["Today is November 14.", "今天是11月14日。", "今天是 2026-11-14"]) {
+    assert.ok(failed(d, observed({ final: reply, factValues: nov1 })).includes("fact the date"), reply);
+  }
+  for (const reply of ["Today is November 1.", "Today is Sunday, 1st November 2026.", "今天是11月1日，星期日。", "今天是 2026-11-01", "Nov. 1"]) {
+    assert.deepEqual(failed(d, observed({ final: reply, factValues: nov1 })), [], reply);
+  }
   // The judge is told the run's value as the truth, so a reply naming it only in a note can be failed.
   const prompt = judgePrompt(c, c.turns, "今天是**星期五**（注：上海已是星期六）", [], values);
   assert.match(prompt, /the weekday in Asia\/Shanghai: one of "星期六", "周六", "礼拜六", "Saturday"/);

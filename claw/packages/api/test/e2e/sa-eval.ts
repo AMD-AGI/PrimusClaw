@@ -557,7 +557,8 @@ async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   // answer (`clockValues`, either end counting).
   const from = new Date();
   const lastAt = Math.max(0, ...c.turns.map((t) => t.after_ms ?? 0));
-  const to = new Date(from.getTime() + lastAt + (c.latency_budget_s?.final ?? turnWaitMs(true) / 1000) * 1000);
+  // Ten minutes more for what may delay the sending itself (an upload, another oracle's read): near midnight, either day counts.
+  const to = new Date(from.getTime() + lastAt + (c.latency_budget_s?.final ?? turnWaitMs(true) / 1000) * 1000 + 600_000);
   for (const [k, f] of (c.facts ?? []).entries()) {
     const o = f.oracle;
     if (o?.kind === "clock") { out.push(clockValues(o, from, to)); continue; }
