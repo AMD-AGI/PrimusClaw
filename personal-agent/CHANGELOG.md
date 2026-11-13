@@ -15,7 +15,13 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.10.0
+
+A minor release, because behaviour changes for a deployment that sets nothing (the default display name, the client
+label, the metric and Key Vault names, all below) and `AssistantChatOptions.assistantName` becomes required (#837).
+
+**Claw:** the assistant learns the name from `channel_context.assistant_name`, which claw-v0.4.6 and later read (from
+then on Claw names no client itself). An older Claw ignores the field and nothing else changes.
 
 The bot's default display name changes from "Clawy" to "PrimusClaw Assistant", because the earlier name collides with
 third-party products, and the name becomes a deployment setting. The technical names that carried the earlier name
