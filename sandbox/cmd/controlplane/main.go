@@ -512,10 +512,11 @@ func main() {
 // ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
 var ownerPolicyRetry = time.Second
 
-// ownerKeys enables identity provider keys when both the introspection client and
-// the owner policy are configured. It returns nil when either is absent or
-// invalid, so grant keys keep working. A policy that fails for a transient
-// reason is retried in the background; identity keys get 503 until it applies.
+// ownerKeys returns the identity client when the introspection client is configured,
+// so identity keys are checked by introspection. The owner policy sets the quotas and
+// templates of those keys: while it is missing, invalid or not applied, identity keys
+// get 503 on the E2B API, and grant keys keep working. A policy that fails for a
+// transient reason is retried in the background.
 func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	client, err := identity.FromEnv()
 	if err != nil {
@@ -527,12 +528,12 @@ func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	}
 	policy, err := grant.OwnerPolicyFromEnv()
 	if err != nil {
-		log.Error("identity keys disabled: owner policy is invalid", "error", err)
-		return nil
+		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
+		return client
 	}
 	if policy == nil {
-		log.Warn("identity keys disabled: owner policy is not configured")
-		return nil
+		log.Warn("identity keys await owner policy: owner policy is not configured")
+		return client
 	}
 	err = grants.SetOwnerPolicy(ctx, *policy)
 	if err == nil {
@@ -540,8 +541,8 @@ func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 		return client
 	}
 	if !transientPolicyError(err) {
-		log.Error("identity keys disabled: owner policy was not applied", "error", err)
-		return nil
+		log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
+		return client
 	}
 	log.Warn("owner policy was not applied, retrying", "error", err)
 	go retryOwnerPolicy(ctx, grants, *policy)

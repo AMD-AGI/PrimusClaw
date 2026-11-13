@@ -35,8 +35,8 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 		"bad quota":    `{"templates":[{"name":"t"}],"default":{"maxSandboxes":-2}}`,
 	} {
 		t.Setenv("E2B_OWNER_POLICY", policy)
-		if client := ownerKeys(context.Background(), grants); client != nil || grants.OwnerRole() != "" {
-			t.Fatalf("%s: identity keys enabled", name)
+		if client := ownerKeys(context.Background(), grants); client == nil || grants.OwnerRole() != "" {
+			t.Fatalf("%s: client=%v role=%q, want a client and no owner role", name, client, grants.OwnerRole())
 		}
 	}
 
@@ -82,5 +82,27 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 			t.Fatal("owner policy was not applied after retries")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestOwnerKeysEnabledWithoutOwnerPolicy checks that the identity client is kept
+// when the introspection client is configured and the owner policy is absent.
+func TestOwnerKeysEnabledWithoutOwnerPolicy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
+	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
+	t.Setenv("IDENTITY_CLIENT_ID", "id")
+	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
+	t.Setenv("E2B_OWNER_POLICY", "")
+	t.Setenv("E2B_OWNER_POLICY_FILE", "")
+
+	if client := ownerKeys(context.Background(), grants); client == nil {
+		t.Fatal("identity client disabled without an owner policy: SaFE API keys are matched as grant keys")
+	}
+	if role := grants.OwnerRole(); role != "" {
+		t.Fatalf("owner role = %q without an owner policy, want empty", role)
 	}
 }

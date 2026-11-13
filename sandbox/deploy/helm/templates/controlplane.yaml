@@ -319,20 +319,20 @@ spec:
             - name: IDENTITY_INTROSPECT_URL
               value: {{ .introspectUrl | quote }}
             {{- end }}
-            {{- if and .introspectUrl .ownerPolicyConfigMap }}
+            {{- if .ownerPolicyConfigMap }}
             - name: E2B_OWNER_POLICY
               valueFrom:
                 configMapKeyRef:
                   name: {{ .ownerPolicyConfigMap | quote }}
                   key: policy.json
-            {{- if .tokenUrl }}
+            {{- end }}
+            {{- if and .introspectUrl .tokenUrl }}
             - name: IDENTITY_TOKEN_URL
               value: {{ .tokenUrl | quote }}
             - name: IDENTITY_ASSERTION_AUDIENCE
               value: {{ .assertionAudience | quote }}
             - name: IDENTITY_ASSERTION_DETAIL_TYPE
               value: {{ .assertionDetailType | quote }}
-            {{- end }}
             {{- end }}
             {{- end }}
             {{- with .Values.router.extraEnv }}
