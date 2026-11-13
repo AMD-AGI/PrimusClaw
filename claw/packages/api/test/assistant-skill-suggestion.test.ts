@@ -28,6 +28,7 @@ test("S2 telling what was saved, an answer about skills and an ordinary answer a
     "已存为你的个人技能「meeting-notes」v1。", "已保存为技能，点「撤销」可撤回。", "你现在没有个人技能。", "standup-notes 已删除，你之前撤销了它。",
     "议题：发布节奏。结论：周四发。待办：写变更日志。", "这个技能存在吗？你可以用 /skills 看。", "Saved as your skill meeting-notes v1.",
     "I saved it. Press Undo to take it back.", "要不要我现在跑一下测试？", "Do you want me to run the tests?",
+    "已保存为技能「weekly-report」。截止日期是周五吗？",
   ]) {
     assert.equal(asksToSaveAsSkill(said), false, said);
   }

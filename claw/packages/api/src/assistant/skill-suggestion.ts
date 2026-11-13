@@ -20,7 +20,11 @@ export function asksToSaveAsSkill(text: string): boolean {
   const s = (text || "").normalize("NFKC");
   if (ASKS_EN.test(s)) return true;
   if (!SAVE_AS_SKILL_ZH.test(s)) return false;
-  return ASKS_ZH.test(s) || /[?？]/.test(s.slice(s.search(SAVE_AS_SKILL_ZH)));
+  if (ASKS_ZH.test(s)) return true;
+  // A question mark in the same sentence as the save phrase ("把它存成技能？"), not in a later one ("已保存为技能。截止是周五吗？").
+  const from = s.slice(s.search(SAVE_AS_SKILL_ZH));
+  const sentence = from.split(/[。！!\n]/)[0] ?? "";
+  return /[?？]/.test(sentence);
 }
 
 /**

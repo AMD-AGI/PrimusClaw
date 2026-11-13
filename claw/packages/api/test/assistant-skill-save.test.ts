@@ -708,7 +708,8 @@ describe("assistant: saving the user's personal skills from the conversation", {
         name: "meeting-notes", description: "按议题、结论、待办写会议纪要（meeting notes / 会议纪要）", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办",
       });
       assert.equal(drafted.isError, false, JSON.stringify(drafted.body));
-      const after = await call(c, "say", { text: "整理好了。要不要把这种格式存成技能？我起草了一张卡片。" });
+      // The card is the question now; a say after the draft goes (the router is told not to repeat the question).
+      const after = await call(c, "say", { text: "整理好了，格式的草稿在卡片上，点「保存」就存下来。" });
       assert.equal(after.isError, false, JSON.stringify(after.body));
       const plain = await call(c, "say", { text: "议题：发布节奏。结论：周四发。待办：写变更日志。" });
       assert.equal(plain.isError, false, "an ordinary answer goes as it did");
@@ -728,12 +729,15 @@ describe("assistant: saving the user's personal skills from the conversation", {
     assert.match(stale.body.message, /standup-notes/);
     const drafted = await inTurn(alice, "好", "skill_draft", { name: "meeting-notes", content: "参考 deploy-prod 的做法" });
     assert.deepEqual([drafted.isError, drafted.body.error], [true, "names_removed_skill"]);
-    const clean = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办" });
+    // A one-word name is a skill's name only where it is marked as one: "this format" is a word, not the removed skill format.
+    await save(alice, { name: "format", content: "## f" });
+    await inTurn(alice, "删掉 format 技能", "skill_delete", { name: "format", request_quote: "删掉 format 技能" });
+    const clean = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办\nUse this format for every meeting." });
     assert.equal(clean.isError, false, JSON.stringify(clean.body));
 
     const listed = await inTurn(alice, "standup-notes 这个技能存在吗", "skill_list", {});
     assert.deepEqual(listed.body.skills.map((s: any) => s.name), ["meeting-notes"]);
-    assert.deepEqual(listed.body.deleted_lately.map((r: any) => [r.name, r.how]), [["deploy-prod", "deleted"], ["standup-notes", "undone"]]);
+    assert.deepEqual(listed.body.deleted_lately.map((r: any) => [r.name, r.how]), [["format", "deleted"], ["deploy-prod", "deleted"], ["standup-notes", "undone"]]);
     assert.ok(listed.body.deleted_lately.every((r: any) => Date.parse(r.removed_at) > 0));
   });
 });

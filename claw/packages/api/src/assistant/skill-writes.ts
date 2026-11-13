@@ -37,7 +37,8 @@ import type { AssistantSkillCard } from "../notifications/assistant-events.js";
 import type { PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { recordSkillCard, type SayDeps } from "./outbound.js";
 import { proposeConfirmation } from "./schedules.js";
-import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, namesSkill, negatedBefore } from "./skill-intent.js";
+import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, negatedBefore } from "./skill-intent.js";
+import { namedUserSkills } from "@claw/protocol";
 import { routerSkillsServe } from "./skill-tools.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -244,7 +245,9 @@ function refused(op: Parameters<typeof metrics.onUserSkillSave>[0], r: { error: 
  */
 async function requireNoRemovedSkill(userId: string, name: string, texts: string[]): Promise<void> {
   const text = texts.join("\n");
-  const named = (await removedSkills(userId)).find((r) => r.name !== name && namesSkill(text, r.name));
+  // Named as `namedUserSkills` reads a name: a one-word name only where it is marked as a skill's (`format` in "use this format" is
+  // a word, not the removed skill format).
+  const named = (await removedSkills(userId)).find((r) => r.name !== name && namedUserSkills(text, [r.name]).length > 0);
   if (named) {
     refused("create", {
       error: "names_removed_skill",
@@ -365,8 +368,8 @@ export async function skillDraft(claims: AssistantTokenClaims, args: Record<stri
   if (out.announce) await out.announce();
   return {
     ok: true, draft_id: out.draft.id, name, saved: false,
-    note: "nothing is saved yet: the user was shown the draft with Save and Discard. Ask them in one line whether to save it; if they say yes in words, "
-      + `call skill_save with draft_id ${out.draft.id} and their yes as request_quote.`,
+    note: "nothing is saved yet: the user was shown the draft on a card with Save and Discard, and the card is the question; do not ask it again "
+      + `in words. If they say yes in words, call skill_save with draft_id ${out.draft.id} and their yes as request_quote.`,
   };
 }
 
