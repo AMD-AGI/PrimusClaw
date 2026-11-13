@@ -753,7 +753,8 @@ export async function syncWorkspaceToS3(
   // restoring from the shared disk gave different workspaces, and S3 was
   // carrying gigabytes of ROCm kernel objects and compile caches that are
   // regenerated on first use. `.skills/` is the one deliberate difference and
-  // is still uploaded; see that module for why.
+  // is still uploaded, all but the user's personal skills under it; see that
+  // module for why.
   //
   // Fenced on both sides so the prune can tell a complete listing from a
   // curtailed one; see LS_BEGIN. The trailing `echo` also keeps the shell's

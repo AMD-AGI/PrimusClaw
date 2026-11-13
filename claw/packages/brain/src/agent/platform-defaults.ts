@@ -11,7 +11,8 @@ import { metrics } from "../infra/metrics.js";
 import { downloadSkill } from "../tools/resolve.js";
 import { lookupTool, type LookupFailure } from "../tools/lookup.js";
 export { platformToolsBase } from "../tools/lookup.js";
-import { uploadDirToSandbox } from "../sandbox/write.js";
+import { listRegularFiles, uploadDirToSandbox, writeFileToSandbox } from "../sandbox/write.js";
+import { PERSONAL_SKILLS_DIR } from "../workspace/excludes.js";
 import { createPrivateStagingRoot } from "../tasks/plugin-from-message.js";
 import { ENV_PLACEHOLDER_NAME_RE } from "../clients/mcp-config.js";
 import type { HandsClient } from "../clients/hands.js";
@@ -48,8 +49,21 @@ export interface DefaultSkill {
   /**
    * A skill that came with the request's plugin rather than from the platform
    * defaults. Its write must not fail quietly: see `LazyDefaultSkills.ensure`.
+   * `user`: one of the user's personal skills (`agent/user-skills.ts`), staged from the API when first used and
+   * written to `.skills/.personal-skills/<name>/`; its write must not fail quietly either.
    */
-  source?: "plugin" | "repo";
+  source?: "plugin" | "repo" | "user";
+  /** A personal skill's identity as the turn was told it (`request.user_skills`). */
+  user?: {
+    version: number;
+    contentSha: string;
+    /** Imported from somewhere else (`origin: import`): marked as third-party text wherever the model sees it. */
+    imported: boolean;
+    /** Use only when the user names it: never listed. */
+    manual: boolean;
+    /** What of the same name it replaces in this turn, said in the list. */
+    shadows?: "platform" | "repository";
+  };
   /**
    * Where the skill's files already are in the sandbox, for a skill that came with the bound
    * repository: its scripts run from there, and it is never written to `.skills/`.
@@ -391,6 +405,11 @@ export class LazyDefaultSkills {
    */
   private writing = new Map<string, Promise<boolean>>();
   private lastHands: HandsClient | null = null;
+  /**
+   * The files of personal skills this run has written, by sandbox (paths as written), so the run can take them out
+   * again (`removePersonal`).
+   */
+  private personalWritten = new Map<HandsClient, Set<string>>();
 
   constructor(
     private skills: DefaultSkill[],
@@ -423,7 +442,9 @@ export class LazyDefaultSkills {
     if (!pending.length) return;
     const named = pending.filter((s) => text.includes(s.name));
     const namesAWrittenSkill = this.skills.some((s) => this.written.has(s.name) && text.includes(s.name));
-    const todo = named.length ? named : namesAWrittenSkill ? [] : pending;
+    // A personal skill is written only when a call names it: a bare `ls .skills` must not fetch and write every skill
+    // the user has.
+    const todo = named.length ? named : namesAWrittenSkill ? [] : pending.filter((s) => s.source !== "user");
     const failedPlugin: string[] = [];
     for (const s of todo) {
       let write = this.writing.get(s.name);
@@ -434,14 +455,42 @@ export class LazyDefaultSkills {
         const clear = () => { if (this.writing.get(s.name) === settled) this.writing.delete(s.name); };
         void settled.then(clear, clear);
       }
-      if (!(await write) && s.source === "plugin") failedPlugin.push(s.name);
+      if (!(await write) && (s.source === "plugin" || s.source === "user")) failedPlugin.push(s.name);
     }
     if (failedPlugin.length) {
+      const kind = todo.some((s) => s.source === "plugin" && failedPlugin.includes(s.name)) ? "plugin" : "personal";
       throw new Error(
-        `Failed to write plugin skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
+        `Failed to write ${kind} skill ${failedPlugin.map((n) => `'${n}'`).join(", ")} into the sandbox; `
         + `this call was not run. Repeat it to retry the write.`,
       );
     }
+  }
+
+  /**
+   * Take the user's personal skills out of every sandbox this run wrote one into. A sandbox outlives the run (it is
+   * kept for the session's next message), and a copy left there would be readable by a later turn that is not served
+   * the skill: one after the user turned it off or deleted it, or after the session stopped being one that gets them.
+   * The next turn that needs one writes it again. Best effort; never throws.
+   *
+   * Removed with bash. Where the sandbox runs the model's commands under an identity of their own
+   * (HANDS_CHILD_UID_MIN/MAX), that identity cannot remove what the sandbox's `write` created; then every file under
+   * `.personal-skills` (as the shell lists them, which it can, and every one this run wrote) is overwritten with nothing
+   * through `write`, which can, so no text of a skill is left either way, an earlier run's included.
+   */
+  async removePersonal(): Promise<void> {
+    const dir = path.posix.join(this.sessionDir, ".skills", PERSONAL_SKILLS_DIR);
+    for (const [hands, files] of this.personalWritten) {
+      try {
+        await removeSandboxDir(hands, dir);
+        continue;
+      } catch (err) {
+        logger.info({ err: (err as Error).message }, "skill.user_remove_by_shell_failed");
+      }
+      const failed = await emptySandboxFiles(hands, dir, [...files].map((f) => path.posix.isAbsolute(f) ? f : path.posix.join("/workspace", f)));
+      if (failed) logger.warn({ failed }, "skill.user_empty_failed");
+      else logger.info({ files: files.size }, "skill.user_emptied_in_sandbox");
+    }
+    this.personalWritten.clear();
   }
 
   /** One skill's upload; reports a failure and resolves false rather than throwing. */
@@ -449,9 +498,33 @@ export class LazyDefaultSkills {
     const rel = this.sessionDir === "/workspace" ? "" : this.sessionDir.replace(/^\/workspace\/?/, "").replace(/^\/+/, "");
     const t0 = Date.now();
     const plugin = s.source === "plugin";
+    const user = s.source === "user";
     try {
-      const base = rel ? path.posix.join(rel, ".skills", s.name) : path.posix.join(".skills", s.name);
+      const sub = user ? path.posix.join(".skills", PERSONAL_SKILLS_DIR, s.name) : path.posix.join(".skills", s.name);
+      const base = rel ? path.posix.join(rel, sub) : sub;
+      // A personal skill is staged from the API on first use; the first write may be that use.
+      if (user && !fs.existsSync(s.localDir) && s.restage) s.localDir = await s.restage();
+      if (user) {
+        // From a clean directory where the sandbox lets one remove it: a copy an earlier run left (it may have ended
+        // before it could take it out) can hold a file this version no longer has. Where it cannot (see
+        // `removePersonal`), the write goes on over what is there.
+        if (!this.personalWritten.has(hands)) this.personalWritten.set(hands, new Set());
+        const skillDir = path.posix.join(this.sessionDir, sub);
+        try {
+          await removeSandboxDir(hands, skillDir);
+        } catch (err) {
+          // What cannot be removed is emptied: no file of an older version keeps its text.
+          logger.info({ name: s.name, err: (err as Error).message }, "skill.user_clean_before_write_failed");
+          const failed = await emptySandboxFiles(hands, skillDir, []);
+          if (failed) logger.warn({ name: s.name, failed }, "skill.user_empty_failed");
+        }
+      }
       const attempt = async () => {
+        if (user) {
+          // Recorded before the upload: a part-written skill is taken out too.
+          const mine = this.personalWritten.get(hands)!;
+          for (const f of listRegularFiles(s.localDir)) mine.add(path.posix.join(base, path.relative(s.localDir, f).split(path.sep).join("/")));
+        }
         const up = await uploadDirToSandbox(hands, s.localDir, base);
         const shippable = up.total - up.skipped;
         if (up.failed > 0 || (shippable > 0 && up.uploaded === 0) || up.total === 0) throw new Error("upload failed");
@@ -470,9 +543,19 @@ export class LazyDefaultSkills {
       // Plugin skills are not platform defaults: they stay out of the
       // platform-default metrics, as they stay out of its events below.
       if (plugin) logger.info({ name: s.name, toolId: s.toolId, elapsedMs: Date.now() - t0 }, "skill.plugin_written_to_sandbox");
-      else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
+      else if (user) {
+        logger.info({ name: s.name, elapsedMs: Date.now() - t0 }, "skill.user_written_to_sandbox");
+        metrics.onUserSkillStaged("written");
+      } else metrics.onPlatformSkillLazyWrite("ok", (Date.now() - t0) / 1000, coldSandbox);
       return true;
     } catch (err) {
+      if (user) {
+        // The name and the reason only: never what the skill says.
+        logger.warn({ name: s.name, err: (err as Error).message }, "skill.user_write_failed");
+        metrics.onUserSkillStaged("write_failed");
+        await this.onEvent?.({ type: "toolUsed", tool: "load_skill", actionId: `user_skill_write_${s.name}`, status: "error", brief: `Failed to write personal skill: ${s.name}` });
+        return false;
+      }
       if (plugin) {
         logger.warn({ name: s.name, toolId: s.toolId, err: (err as Error).message }, "skill.plugin_write_failed");
         await this.onEvent?.({ type: "toolUsed", tool: "download_skill", actionId: `plugin_skill_${s.toolId}`, status: "error", brief: `Failed to write plugin skill: ${s.name}` });
@@ -485,4 +568,42 @@ export class LazyDefaultSkills {
       return false;
     }
   }
+}
+
+/** `rm -rf` of one directory in the sandbox; throws when the sandbox says it failed. */
+async function removeSandboxDir(hands: HandsClient, dir: string): Promise<void> {
+  const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
+  const out = await hands.callTool("bash", { command: `rm -rf -- ${quoted} && echo CLAW_RM_OK`, timeout: 30 });
+  if (!String(out).includes("CLAW_RM_OK")) throw new Error(`could not remove ${dir}`);
+}
+
+/**
+ * Overwrite with nothing every file under `dir` in the sandbox (as its shell lists them) and every path in `known`
+ * (absolute), through the sandbox's `write`; a write that fails is tried once more. Returns how many could not be
+ * emptied. A listing that fails leaves `known`.
+ */
+export async function emptySandboxFiles(hands: HandsClient, dir: string, known: string[]): Promise<number> {
+  const targets = new Set(known);
+  const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
+  try {
+    const out = String(await hands.callTool("bash", { command: `echo CLAW_LS_BEGIN; find ${quoted} -type f 2>/dev/null; echo CLAW_LS_END`, timeout: 30 }));
+    const begin = out.indexOf("CLAW_LS_BEGIN\n");
+    const end = out.lastIndexOf("CLAW_LS_END");
+    if (begin >= 0 && end > begin) {
+      for (const line of out.slice(begin + "CLAW_LS_BEGIN\n".length, end).split("\n")) {
+        if (line.startsWith(`${dir}/`)) targets.add(line);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, "skill.user_list_failed");
+  }
+  let failed = 0;
+  for (const file of targets) {
+    try {
+      await writeFileToSandbox(hands, file, "");
+    } catch {
+      try { await writeFileToSandbox(hands, file, ""); } catch { failed++; }
+    }
+  }
+  return failed;
 }

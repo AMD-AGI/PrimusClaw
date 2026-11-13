@@ -24,7 +24,12 @@ import {
   tarExcludeArgs,
   findExcludeArgs,
   TOOL_RESULTS_DIR,
+  PERSONAL_SKILLS_DIR,
 } from "../src/workspace/excludes.js";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 test("the destinations differ over .skills and nothing else", () => {
   const shared = new Set(sharedDiskExcludes());
@@ -110,4 +115,21 @@ test("every pattern survives into every syntax", () => {
     assert.ok(tar.includes(`'${p}'`), `tar missing ${p}`);
     assert.ok(find.includes(p), `find missing ${p}`);
   }
+});
+
+test("the user's personal skills are in no snapshot: the S3 listing's own find leaves them out, and keeps the rest of .skills", () => {
+  // A personal skill is the user's own, served to their own turns; the archive is a copy of the session. Run the
+  // upload's real predicates over a real tree.
+  const root = tmpDir("personal-skills-excl-");
+  const ws = path.join(root, "workspace");
+  for (const rel of [".skills/.personal-skills/weekly-report/SKILL.md", ".skills/.personal-skills/weekly-report/scripts/run.sh",
+    ".skills/fleet-default/SKILL.md", "work/report.md", "sub/.skills/.personal-skills/x/SKILL.md"]) {
+    fs.mkdirSync(path.dirname(path.join(ws, rel)), { recursive: true });
+    fs.writeFileSync(path.join(ws, rel), "x");
+  }
+  const r = spawnSync("bash", ["-c", `find ${ws} -type f ${findExcludeArgs(s3Excludes())}`], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const found = r.stdout.trim().split("\n").map((f) => path.relative(ws, f)).sort();
+  assert.deepEqual(found, [".skills/fleet-default/SKILL.md", "work/report.md"]);
+  assert.ok(sharedDiskExcludes().includes(PERSONAL_SKILLS_DIR), "nor in the shared-filesystem snapshot");
 });
