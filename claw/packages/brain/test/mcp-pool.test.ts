@@ -11,6 +11,7 @@
  *   R3  servers connect side by side, not one after another
  *   R4  a server not ready within the budget is left out of the turn (`deferred`), keeps connecting, and the next turn offers it
  *       without connecting again
+ *   R4c a server the run cannot work without (`required`) is waited for past the budget, up to its own; the others are not
  *   R5  health: a stale connection is listed again beside the turn (which does not wait for it), and one whose session is gone
  *       is reopened before any call needs it; a call the server answers 404 (session gone) is sent again on a new connection
  *   R6  a failure is remembered for the backoff: the next turn does not wait on the server again
@@ -136,6 +137,45 @@ test("R4b without a pool a deferred connection is closed when it finishes, and n
     assert.deepEqual(t1.deferred.map((d) => d.name), ["slow"]);
     await t1.closeAll();
   } finally { await sleep(700); await slow.close(); }
+});
+
+test("R4c a required server is waited for past the budget, up to its own; the others are not held for it", async () => {
+  const slow = await startCountingServer({ initDelayMs: 700 });
+  const other = await startCountingServer({ initDelayMs: 700 });
+  const pool = newPool();
+  try {
+    const started = Date.now();
+    const t1 = await connectPlatformMcp({ github_review: spec(slow.url), other: spec(other.url) },
+      { pool, userId: "alice", budgetMs: 200, required: ["github_review"], requiredBudgetMs: 5_000 });
+    const ms = Date.now() - started;
+    assert.ok(ms >= 600 && ms < 3_000, `the turn waited ${ms} ms for a required server that answers in 700 ms`);
+    assert.deepEqual(t1.schemas.map((t) => t.name), ["mcp__github_review__echo"]);
+    assert.deepEqual(t1.deferred.map((d) => d.name), ["other"], "a server that is not required is still left out past the budget");
+    assert.match(t1.deferred[0]!.reason, /within 200 ms/);
+    assert.equal(await t1.clients.get("github_review")!.callTool("echo", {}), "ran echo");
+    await t1.closeAll();
+  } finally { await pool.closeAll(); await slow.close(); await other.close(); }
+
+  // Past its own budget a required server is deferred too, said with that budget, and the turn does not wait for ever.
+  const slower = await startCountingServer({ initDelayMs: 1_500 });
+  try {
+    const started = Date.now();
+    const t2 = await connectPlatformMcp({ github_review: spec(slower.url) }, { budgetMs: 100, required: ["github_review"], requiredBudgetMs: 400 });
+    const ms = Date.now() - started;
+    assert.ok(ms >= 350 && ms < 1_200, `the turn waited ${ms} ms for a required server with a 400 ms budget`);
+    assert.deepEqual(t2.deferred.map((d) => d.name), ["github_review"]);
+    assert.match(t2.deferred[0]!.reason, /within 400 ms/);
+    await t2.closeAll();
+  } finally { await sleep(1_300); await slower.close(); }
+
+  // A required budget shorter than the budget is the budget.
+  const s3 = await startCountingServer({ initDelayMs: 300 });
+  try {
+    const t3 = await connectPlatformMcp({ github_review: spec(s3.url) }, { budgetMs: 1_000, required: ["github_review"], requiredBudgetMs: 50 });
+    assert.deepEqual(t3.deferred, []);
+    assert.deepEqual(t3.schemas.map((t) => t.name), ["mcp__github_review__echo"]);
+    await t3.closeAll();
+  } finally { await s3.close(); }
 });
 
 test("R5 a stale connection is checked beside the turn, a slow check does not hold it, and a lost session is reopened", async () => {

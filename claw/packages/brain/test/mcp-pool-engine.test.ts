@@ -9,6 +9,8 @@
  *   E1  a user's second turn opens no new connection; another user's turn opens its own
  *   E2  a server slower than the budget is not waited for: the turn goes on without its tools and tells the model so, and
  *       the user's next turn offers them without connecting again
+ *   E3  a review session's review tools (`github_review`) are waited for past that budget (MCP_REQUIRED_CONNECT_BUDGET_MS):
+ *       a cold connection no longer ends the review with no tool to call
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,6 +18,7 @@ import { startWorld, fakeHands, baseRequest } from "./support/platform-defaults-
 import { startCountingServer } from "./support/mcp-counting-server.js";
 
 process.env.MCP_CONNECT_BUDGET_MS = "400";
+process.env.MCP_REQUIRED_CONNECT_BUDGET_MS = "5000";
 const world = await startWorld();
 const { AgentEngine } = await import("../src/agent/engine.js");
 let n = 0;
@@ -64,6 +67,20 @@ test("E2 a server slower than the budget is left out of the turn and offered on 
     assert.doesNotMatch(t2.body, /Unavailable this turn/);
     assert.equal(slow.initializes, 1);
   } finally { await slow.close(); await fast.close(); }
+});
+
+test("E3 a review session's review tools are waited for past the budget; another slow server beside them is not", async () => {
+  const review = await startCountingServer({ initDelayMs: 1_200 });
+  const slow = await startCountingServer({ initDelayMs: 3_000 });
+  try {
+    const servers = { github_review: { type: "http", url: review.url, token: "k" }, slow: { type: "http", url: slow.url, token: "k" } };
+    const t1 = await run("pool-dave", servers);
+    assert.ok(t1.ms >= 1_100 && t1.ms < 2_900, `the turn took ${t1.ms} ms: the review tools answer in 1200 ms, the other server in 3000 ms`);
+    assert.ok(toolNames(t1.body).includes("mcp__github_review__echo"), "the review tools were left out of the turn");
+    assert.ok(!toolNames(t1.body).includes("mcp__slow__echo"));
+    assert.match(t1.body, /Unavailable this turn: MCP server\(s\) slow \(did not answer within 400 ms/);
+    assert.doesNotMatch(t1.body, /github_review \(did not answer/);
+  } finally { await review.close(); await slow.close(); }
 });
 
 test.after(async () => { await world.close(); });

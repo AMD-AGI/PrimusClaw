@@ -497,6 +497,13 @@ export interface ConnectPlatformMcpOptions {
    * offers its tools. Absent or 0: wait for every server however long it takes.
    */
   budgetMs?: number;
+  /**
+   * Servers the run cannot work without (a review session's review tools): each is waited for up to `requiredBudgetMs` instead of
+   * `budgetMs`, and is deferred only past that. The others still wait no longer than `budgetMs`.
+   */
+  required?: readonly string[];
+  /** How long a `required` server is waited for; never less than `budgetMs`. Absent or 0: however long it takes. */
+  requiredBudgetMs?: number;
 }
 
 const TIMED_OUT = Symbol("mcp_connect_budget");
@@ -562,24 +569,31 @@ export async function connectPlatformMcp(
     }
   }
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  const deadlineOf = (ms: number): Promise<typeof TIMED_OUT> => (ms
+    ? new Promise<typeof TIMED_OUT>((resolve) => { timers.push(setTimeout(() => resolve(TIMED_OUT), ms)); })
+    : new Promise<never>(() => {}));
   const budget = opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : 0;
-  const deadline = budget
-    ? new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), budget); })
-    : new Promise<never>(() => {});
+  // A server the run cannot work without waits longer (or, with no budget for it, as long as it takes), never shorter than the rest.
+  const requiredBudget = !budget ? 0 : opts.requiredBudgetMs && opts.requiredBudgetMs > 0 ? Math.max(opts.requiredBudgetMs, budget) : 0;
+  const required = new Set(opts.required ?? []);
+  const budgetOf = (name: string): number => (required.has(name) ? requiredBudget : budget);
+  const deadline = deadlineOf(budget);
+  const requiredDeadline = required.size && requiredBudget !== budget ? deadlineOf(requiredBudget) : deadline;
   const outcomes = await Promise.all(leases.map((l) => Promise.race([
     l.ready.then(() => null, (err: unknown) => ({ err })),
-    deadline,
+    required.has(l.name) ? requiredDeadline : deadline,
   ])));
-  if (timer) clearTimeout(timer);
+  for (const t of timers) clearTimeout(t);
 
   leases.forEach((l, i) => {
     const { name, spec, filter, entry } = l;
     const outcome = outcomes[i];
     if (outcome === TIMED_OUT && !(entry.kind === "ready" && entry.verifiedAt > 0)) {
       // Not ready within the budget: this run goes on without it, and the connect goes on without the run.
-      logger.warn({ name, url: spec.url, budgetMs: budget, pooled: !!pool }, "mcp_client.connect_deferred");
-      deferred.push({ name, reason: `did not answer within ${budget} ms; its tools are offered again from the next turn` });
+      const waited = budgetOf(name);
+      logger.warn({ name, url: spec.url, budgetMs: waited, required: required.has(name), pooled: !!pool }, "mcp_client.connect_deferred");
+      deferred.push({ name, reason: `did not answer within ${waited} ms; its tools are offered again from the next turn` });
       l.ready.then(
         () => logger.info({ name, ms: Date.now() - started }, "mcp_client.deferred_connected"),
         (err: unknown) => logger.warn({ name, ms: Date.now() - started, err: connectFailureReason(err) }, "mcp_client.deferred_failed"),

@@ -48,7 +48,7 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, skillHintsInSystemFor, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_REQUIRED_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, skillHintsInSystemFor, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
@@ -57,7 +57,7 @@ import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
-import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
+import { applyReviewProfileBackstop, isReviewProfile, REVIEW_SERVER_NAME, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
 
@@ -455,11 +455,16 @@ export class AgentEngine {
 
     // The user's connections from earlier turns are reused (`mcp-pool.ts`), the servers are connected side by side, and the run
     // waits at most MCP_CONNECT_BUDGET_MS for them: a server not ready by then is left out of this turn and offered on the next.
+    // A review session's review tools are the exception (MCP_REQUIRED_CONNECT_BUDGET_MS): the API offers them only to a session that
+    // acts as a user to review one pull request, its turn can do nothing without them, and it has no next turn to wait for (a cold
+    // connection past 2 s once ended a requested review with no tool call at all and woke the reviewer for it).
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp, {
           pool: MCP_POOL_ENABLED ? mcpPool : undefined,
           userId: request.user_id,
           budgetMs: MCP_CONNECT_BUDGET_MS,
+          required: REVIEW_SERVER_NAME in mergedMcp ? [REVIEW_SERVER_NAME] : [],
+          requiredBudgetMs: MCP_REQUIRED_CONNECT_BUDGET_MS,
         })
       : { clients: new Map(), schemas: [], failed: [], deferred: [], closeAll: async () => {} };
     // A server that is down is said, to the user as a progress line and to the

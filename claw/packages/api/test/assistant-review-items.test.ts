@@ -1159,7 +1159,8 @@ describe("assistant review items", { skip }, () => {
           const f = { ...base, reviewOnly, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, writes: [wr(tool, "refused", code)] };
           assert.equal(ri.unchangedReview(f as never), false, `${tool} ${code}`);
           const st = ri.reviewState(f as never);
-          assert.equal(st.boardState, "needs_you", `${tool} refused ${code} (review only: ${reviewOnly})`);
+          // (GitHub saying the pull request is merged ends the item, whichever write it answered: N32)
+          assert.equal(st.boardState, code === "already_merged" ? "done" : "needs_you", `${tool} refused ${code} (review only: ${reviewOnly})`);
           assert.ok(!/no new commits/.test(st.summary), st.summary);
         }
       }
@@ -1169,6 +1170,54 @@ describe("assistant review items", { skip }, () => {
     // Every status the confirmations table allows is in the table above.
     const statuses = new Set(cases.flatMap(([, f]) => ((f.confirmations ?? []) as Array<{ status: string }>).map((x) => x.status)));
     assert.deepEqual([...statuses].sort(), ["denied", "expired", "merged", "merging", "pending", "queued", "refused", "stale", "submitted"]);
+  });
+
+  test("M3 a review run again on new commits is judged by what it did on them, and GitHub's already_merged ends it (N32, PrimusClaw#810)", () => {
+    const [A, B] = ["a".repeat(40), "b".repeat(40)];
+    const base = {
+      ownerUserId: "bob", actingAs: "bob", actingAsName: "Bob B", reviewOnly: false, pr: PR(810), confirmations: [], turn: "finished" as const,
+      ownReview: false, requestedBy: "alice", turns: 2, authorWaitEnded: { reason: "rerun" as const, headSha: A }, reviewCalls: 6,
+    };
+    const wr = (tool: string, result: string, detail: string, at: number, headSha: string, mergeState: string | null = null) => ({ tool, result, detail, at, headSha, mergeState });
+    const firstHead = [wr("gh_review_submit", "ok", "submitted", 1, A), wr("gh_pr_merge", "refused", "merge_state_not_clean", 2, A, "DIRTY")];
+    const onB = [wr("gh_review_submit", "refused", "second_pass_required", 3, B), wr("gh_review_submit", "refused", "ci_not_green", 4, B)];
+    // What the incident had: the run on B ended with GitHub saying the pull request was merged. Done, accepted; nobody is asked.
+    for (const tool of ["gh_review_submit", "gh_pr_merge"]) {
+      const s = ri.reviewState({ ...base, writes: [...firstHead, ...onB, wr(tool, "refused", "already_merged", 5, B)] } as never);
+      assert.deepEqual([s.boardState, s.boardState === "done" && s.outcome, s.summary], ["done", "accepted", "AMD-AGI/PrimusClaw#810 was merged on GitHub"], tool);
+    }
+    // Without it, the run on B is what is judged: never the first head's conflict, which the author already cleared.
+    const onlyB = ri.reviewState({ ...base, writes: [...firstHead, ...onB] } as never);
+    assert.equal(onlyB.boardState, "needs_you");
+    assert.doesNotMatch(onlyB.summary, /merge_state_not_clean|refused/);
+    assert.equal(onlyB.summary, "the review of AMD-AGI/PrimusClaw#810 ended without posting anything");
+    // The run on B approved and merged: done. Its merge refused on a conflict again: waits for the author again (AW2).
+    assert.equal(ri.reviewState({ ...base, writes: [...firstHead, wr("gh_review_submit", "ok", "submitted", 3, B), wr("gh_pr_merge", "ok", "merged", 4, B)] } as never).boardState, "done");
+    const again = ri.reviewState({ ...base, writes: [...firstHead, wr("gh_review_submit", "ok", "submitted", 3, B), wr("gh_pr_merge", "refused", "merge_state_not_clean", 4, B, "DIRTY")] } as never);
+    assert.deepEqual([again.boardState, again.boardState === "in_progress" && again.authorWait], ["in_progress", "conflict"]);
+    // The control: with no write on a newer head, the first head's refusal is still what the item stands at.
+    const control = ri.reviewState({ ...base, writes: firstHead } as never);
+    assert.deepEqual([control.boardState, control.summary], ["needs_you", "the merge of AMD-AGI/PrimusClaw#810 was refused: merge_state_not_clean"]);
+  });
+
+  test("M4 a turn that called no review tool is run once more, and a second one ends told to whoever asked, not the reviewer (N31, PrimusClaw#846)", () => {
+    const base = {
+      ownerUserId: "bob", actingAs: "bob", actingAsName: "Bob B", reviewOnly: false, pr: PR(846), confirmations: [], writes: [], turn: "finished" as const,
+      ownReview: false, requestedBy: "alice", turns: 1, reviewCalls: 0, emptyRerun: null,
+    };
+    const first = ri.reviewState(base as never);
+    assert.deepEqual([first.boardState, first.boardState === "in_progress" && first.rerun, first.summary],
+      ["in_progress", "no_review_call", "the review of AMD-AGI/PrimusClaw#846 called no review tool: running it once more"]);
+    const second = ri.reviewState({ ...base, turns: 2, emptyRerun: "rerun" } as never);
+    assert.deepEqual([second.boardState, second.boardState === "done" && second.outcome, second.boardState === "done" && second.result],
+      ["done", "stopped", "not_run"]);
+    assert.equal(ri.reviewState({ ...base, emptyRerun: "not_queued" } as never).boardState, "done");
+    // A review that called a tool, failed, or was stopped by the server is judged as before.
+    assert.equal(ri.reviewState({ ...base, reviewCalls: 1 } as never).boardState, "needs_you");
+    assert.equal(ri.reviewState({ ...base, turn: "failed" } as never).boardState, "needs_you");
+    assert.equal(ri.reviewState({ ...base, halted: { reason: "turn_budget_used", message: "x" } } as never).boardState, "needs_you");
+    // A turn that is not the first, with no re-run of this kind behind it (another way it was run again), is the reviewer's, as before.
+    assert.equal(ri.reviewState({ ...base, turns: 2 } as never).boardState, "needs_you");
   });
 
   test("M2 the state is written to the item: needs-you wakes the assistant once, done does not, a repeat writes nothing", async () => {
@@ -2026,7 +2075,8 @@ describe("assistant review items", { skip }, () => {
     const { UNCHANGED_HEAD_SQL } = ri;
     // Every code, a submit or a merge, and a call still unfinished: no unchanged fact, no re-run proof, still the reviewer's.
     for (const [tool, result, detail] of [
-      ...writeRefusalCodes().flatMap((code) => [["gh_review_submit", "refused", code], ["gh_pr_merge", "refused", code]]),
+      // (already_merged ends the item, which is done after it: asked last, below)
+      ...writeRefusalCodes().filter((code) => code !== "already_merged").flatMap((code) => [["gh_review_submit", "refused", code], ["gh_pr_merge", "refused", code]]),
       ["gh_review_submit", "started", ""], ["gh_pr_merge", "started", ""],
     ] as Array<[string, string, string]>) {
       await w.q("UPDATE claw_github_audit SET tool = $2, result = $3, detail = $4 WHERE id = $1", [write, tool, result, detail]);
@@ -2041,6 +2091,16 @@ describe("assistant review items", { skip }, () => {
     await w.q("DELETE FROM claw_github_audit WHERE id = $1", [write]);
     assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 1);
     assert.notEqual(await proofForReviewAfterGreenCi({ query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never, sid, words), null);
+    // A write GitHub answered already_merged: not unchanged either, and the item ends as merged rather than asking bob (N32).
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, write)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_review_submit', '{"event":"APPROVE"}', 'refused', 'already_merged', false)`,
+      [sid, HEAD],
+    );
+    assert.equal((await w.q(UNCHANGED_HEAD_SQL, [sid, "bob"])).length, 0);
+    await ri.syncReviewItem(it.item_id);
+    const merged = await w.item(it.item_id);
+    assert.deepEqual([merged.board_state, merged.outcome, merged.summary], ["done", "accepted", "AMD-AGI/PrimusClaw#254 was merged on GitHub"]);
   });
 
   test("AW1 a merge someone else asked for that GitHub refused on a conflict, branch rules or the workflow scope waits for the author: the reviewer is not woken, the sweep closes it once merged", async () => {
@@ -2210,5 +2270,127 @@ describe("assistant review items", { skip }, () => {
     assert.equal(again.status, 200, JSON.stringify(again.body));
     const fresh = await w.item(again.body.data.item.item_id);
     assert.deepEqual([fresh.params.author_waiting, fresh.params.author_wait_ended], [undefined, undefined]);
+  });
+
+  test("AW4 the review run again on new commits finds the pull request merged by its author: the item ends merged and the reviewer is not woken (N32, PrimusClaw#810)", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    const words = await firstTurnWords(sid);
+    const [A, B] = ["a".repeat(40), "b".repeat(40)];
+    await audit(sid, "gh_review_submit", "ok", "submitted", "bob");
+    await refusedOnConflict(sid, A);
+    await ri.sweepReviewItems();
+    assert.equal((await w.item(it.item_id)).params.author_waiting, "conflict");
+    let head = A;
+    await followed(async () => ({ status: "waiting", reason: "approval_missing", head_sha: head } as never));
+    try {
+      // The author rebased: the review runs once more on B.
+      head = B;
+      await ri.followReviewItems(Date.now() + 100_000);
+      const queued = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [sid]);
+      assert.deepEqual(queued.map((q: { content: string }) => q.content), [words]);
+      assert.equal((await w.item(it.item_id)).params.author_wait_ended?.reason, "rerun");
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    // The second turn on B: its approval refused for a second pass, then for CI, and then the author merged with the first approval, so
+    // the third try was refused already_merged.
+    await turnRan(sid);
+    for (const [detail, secs] of [["second_pass_required", 1], ["ci_not_green", 2], ["already_merged", 3]] as const) {
+      await w.q(
+        `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, result, detail, write, at)
+         VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_review_submit', '{"event":"APPROVE"}', 'refused', $3, false, NOW() + make_interval(secs => $4::int))`,
+        [sid, B, detail, secs],
+      );
+    }
+    await ri.sweepReviewItems();
+    await conflictChecksSettled();
+    const item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "accepted", "AMD-AGI/PrimusClaw#254 was merged on GitHub"]);
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken for a merged pull request");
+  });
+
+  test("NC1 a requested review whose turn called no review tool runs once more by itself; a second such turn is told to the one who asked, never to the reviewer (N31, PrimusClaw#846)", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    // The first turn ended having called no review tool (the tools did not connect in time). Only the server's own follow-up is recorded.
+    const words = await firstTurnWords(sid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
+       VALUES ('alice', 'alice', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_pr_follow', 'ok', 'open')`,
+      [sid, "a".repeat(40)],
+    );
+    w.drains.length = 0;
+    await ri.sweepReviewItems();
+    let item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.summary, item.params.empty_rerun?.reason], ["in_progress", "reviewing AMD-AGI/PrimusClaw#254", "rerun"]);
+    const queued = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [sid]);
+    assert.deepEqual(queued.map((q: { content: string }) => q.content), [words], "the same words once more, in the same session");
+    assert.ok(w.drains.some((d) => d.sessionId === sid), "the session is started");
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken");
+    // A second sweep queues nothing more.
+    await ri.sweepReviewItems();
+    assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 1);
+    // The proof is never had twice: the item is marked, and a second turn is past the one it allows.
+    const { proofForReviewAfterNoCall } = await import("../src/github-review/acting-session.js");
+    const query = { query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never;
+    assert.equal(await proofForReviewAfterNoCall(query, sid, words), null);
+    // The second turn called no review tool either: the item ends, alice is told to ask again, bob is not woken.
+    await turnRan(sid);
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.outcome, item.summary],
+      ["done", "stopped", "the review of AMD-AGI/PrimusClaw#254 could not run: no review tool was called"]);
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken");
+    assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0, "never a third turn");
+    const told = (await toldTo("alice")).filter((t) => /AMD-AGI\/PrimusClaw#254/.test(t) && /not reviewed|没审成/.test(t));
+    assert.equal(told.length, 1, (await toldTo("alice")).join("\n---\n"));
+    assert.match(told[0]!, /ask for the review again|再请一次评审/);
+    assert.equal((await toldTo("bob")).filter((t) => /not reviewed|没审成/.test(t)).length, 0, "bob is told nothing of it");
+  });
+
+  test("NC2 a turn that called a review tool, or a turn that is not the first, is not run again this way; the proof asks every fact", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    const words = await firstTurnWords(sid);
+    const { proofForReviewAfterNoCall } = await import("../src/github-review/acting-session.js");
+    const query = { query: (t: string, p?: unknown[]) => w.h.app.db.db.query(t, p) } as never;
+    // The control: one completed turn with these words, no call, nothing held, the item open and unmarked.
+    assert.notEqual(await proofForReviewAfterNoCall(query, sid, words), null);
+    assert.equal(await proofForReviewAfterNoCall(query, sid, `${words} `), null, "other words");
+    // A held confirmation, then a read: each is a call, and no proof.
+    const conf = await confirmation(sid, "denied", "merge", "bob");
+    assert.equal(await proofForReviewAfterNoCall(query, sid, words), null, "a confirmation");
+    await w.q("DELETE FROM claw_github_confirmations WHERE confirmation_id = $1", [conf]);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_pr_get', 'ok', 'ok')`,
+      [sid, "c".repeat(40)],
+    );
+    assert.equal(await proofForReviewAfterNoCall(query, sid, words), null, "a read");
+    await ri.sweepReviewItems();
+    const item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.params.empty_rerun], ["needs_you", undefined], "a review that read and posted nothing is the reviewer's, as before");
+    assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0);
+    assert.equal((await w.pending(bob.routerSid)).length, 1);
+    // A failed turn is not this either.
+    const r2 = await start("alice", { prs: [PR(257)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    const sid2 = (await w.item(r2.body.data.items[0].item_id)).worker_session_id as string;
+    const [row] = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1 ORDER BY id LIMIT 1", [sid2]);
+    await turnRan(sid2, "failed");
+    await w.q("UPDATE claw_tasks SET prompt = $2 WHERE session_id = $1 AND origin = 'chat'", [sid2, row.content]);
+    assert.equal(await proofForReviewAfterNoCall(query, sid2, row.content as string), null, "a failed turn");
   });
 });
