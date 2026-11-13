@@ -111,13 +111,26 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131924` (commit 7e1f3ca8), released as `docker.io/rocm/primusclaw:claw-0.4.5`. A
+patch release: a skill the assistant suggests is always a draft card, and the deployment defaults name the released
+images. No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Changed
+
+- Deployment defaults pull the released images from `docker.io/rocm/primusclaw`: the Claw chart's image is
+  `docker.io/rocm/primusclaw:claw-latest` (was `docker.io/primussafe/claw:latest`), and `claw/deploy` without `REGISTRY`
+  pulls `docker.io/rocm/primusclaw:<TAG>` with `TAG` defaulting to `claw-latest`; with `REGISTRY` set it is
+  `$REGISTRY/claw:<TAG>` as before. A build of main stays `docker.io/primussafe/claw:<build>` (#836).
+
 ### Fixed
 
 - Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill the assistant suggests on its own is a draft card, never a question
   in words. `say` refuses a message that asks whether to save something as a skill until the turn has called `skill_draft`
   (whose card, with Save and Discard, is the question), and the router's prompt and the tool's description say so. A skill
   written from a conversation may not name a skill the user deleted or undid. `skill_list` adds `deleted_lately`: each skill
-  the user had and has no longer, deleted or undone, and when, so "does this skill exist" is answered as it is.
+  the user had and has no longer, deleted or undone, and when, so "does this skill exist" is answered as it is (#835).
 
 ## [0.4.4] - 2026-11-13
 
