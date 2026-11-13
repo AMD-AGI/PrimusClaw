@@ -321,7 +321,11 @@ it("the bot's configured name rides on every message to the assistant, trimmed; 
     files: [],
   };
   assert.equal(await w.chat.understand(understood), true);
-  assert.deepEqual(w.claw.heard[2]?.context, { channel_message_id: "m-1", reply_language: "zh", assistant_name: "Clawy" });
+  assert.deepEqual(w.claw.heard[2]?.context, {
+    channel_message_id: "m-1",
+    reply_language: "zh",
+    assistant_name: "Clawy",
+  });
   // A deployment left with the default name sends that name.
   const unset = world({ assistantName: "PrimusClaw Assistant" });
   await route(unset, "hello");
