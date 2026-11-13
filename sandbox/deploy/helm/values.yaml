@@ -67,7 +67,9 @@ controlplane:
     # and the quotas. It is used only when introspectUrl is set. Without it,
     # identity keys get 503 owner_policy_not_applied on the E2B API; a rejected
     # policy gives 500 owner_policy_invalid.
-    # The policy is read at startup: a ConfigMap change needs a rollout restart.
+    # Every replica reloads the ConfigMap every 15 seconds and applies a changed
+    # policy. A system-admin manages its templates through
+    # /v1/admin/owner-policy/templates, which rewrites the ConfigMap.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners
     # entry comes from the default or admin quota of that user.
