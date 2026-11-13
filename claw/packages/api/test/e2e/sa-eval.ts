@@ -86,6 +86,9 @@
  *                     server's own reply a moment after its turn ends, and that reply is what the person is shown. The server's
  *                     "on it" line said while the turn worked is not that reply: the wait goes on until another say of the turn
  *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
+ *   EVAL_SKILL_SETTLE_S
+ *                     seconds a skills case waits from the end of the run's last turns before it clears the identity's skill drafts
+ *                     (default 200): the server may still be drafting one from those turns, in the background, after they ended
  *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
  *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
  *                     names the first one's error; a recording of the first try is dropped); 0 runs each attempt once. In the
@@ -336,6 +339,7 @@ function tokenApi(method: string, path: string, body?: unknown): ReturnType<type
   return api(method, path, body, sendToken(), { "x-api-key": KEY });
 }
 const GAP_MS = int("EVAL_GAP_S", 0, 0, 3_600) * 1000;
+const SKILL_SETTLE_MS = int("EVAL_SKILL_SETTLE_S", 200, 0, 900) * 1000;
 const INFRA_RETRY = int("EVAL_INFRA_RETRY", 1, 0, 1) === 1;
 const SAY_GRACE_MS = int("EVAL_SAY_GRACE_S", 5, 0, 120) * 1000;
 
@@ -1336,9 +1340,21 @@ async function closeCards(): Promise<WaitingCard[] | null> {
  * (`infra:`) when one could not be read or is still there after: the attempt is not graded.
  */
 async function clearSkillDrafts(): Promise<void> {
-  const cards = await cardsNow();
-  if (!cards) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
-  const skillCards = skillDraftCards(cards);
+  // The server drafts a skill after a turn has ended, in the background (`skill-auto-draft.ts`: one model call, retried, under about
+  // three minutes): the session is idle by then, so the clear first waits that long from the end of the run's last turns.
+  const settle = LAST_TURNS_END + SKILL_SETTLE_MS - Date.now();
+  if (settle > 0) {
+    log(`waiting ${Math.ceil(settle / 1000)} s for a skill the server may still draft from the last turns before clearing drafts`);
+    await pause(settle);
+  }
+  // Only a list read as a list: a 200 with anything else is no reading of the cards, and would leave one unseen.
+  const skillCardsNow = async (): Promise<WaitingCard[] | null> => {
+    const a = await api("GET", "/v1/assistant/confirmations");
+    if (a.status === 404) return [];
+    return a.status === 200 && Array.isArray(a.json?.data) ? skillDraftCards(waitingCards(a.json, null)) : null;
+  };
+  const skillCards = await skillCardsNow();
+  if (!skillCards) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
   if (skillCards.length && !SEND_TOKEN_CMD) {
     throw new Error(`infra: ${skillCards.length} skill draft card(s) wait for the identity and discarding one is the person's answer (EVAL_SEND_TOKEN_CMD): not graded`);
   }
@@ -1360,12 +1376,15 @@ async function clearSkillDrafts(): Promise<void> {
     const r = await api("DELETE", `/v1/users/me/skill-drafts/${encodeURIComponent(id)}`).catch(() => null);
     log(`skill draft waiting before the case: Discard answered ${r?.status ?? "nothing"}`);
   }
-  const [cardsAfter, draftsAfter] = await Promise.all([cardsNow(), drafts()]);
+  const [cardsAfter, draftsAfter] = await Promise.all([skillCardsNow(), drafts()]);
   if (!cardsAfter || !draftsAfter) throw new Error("infra: the identity's skill drafts could not be read again after Discard: not graded");
-  const still = skillDraftCards(cardsAfter).length + draftsAfter.length;
+  const still = cardsAfter.length + draftsAfter.length;
   if (still) throw new Error(`infra: ${still} skill draft(s) or card(s) still wait for the identity after Discard: not graded`);
   if (skillCards.length || left.length) log(`cleared ${skillCards.length} skill draft card(s) and ${left.length} draft(s) left by another case`);
 }
+
+/** When the run's last attempt's turns ended (its messages answered and graded), for `clearSkillDrafts`'s wait. */
+let LAST_TURNS_END = 0;
 
 /** Triggers the run made for a case's setup and has not seen gone: deleted after their attempt, and again at the end. */
 const SETUP_TRIGGERS = new Set<string>();
@@ -1659,6 +1678,7 @@ async function main(): Promise<void> {
             if (setup.length) await removeSetup(setup);
             ATTEMPT_MEMORIES_BEFORE = null;
             if (memBefore) await removeAttemptMemories(memBefore, c.id);
+            if (MODE === "assistant" && !preflightFailed) LAST_TURNS_END = Date.now();
           }
           // The cards this attempt made: those waiting now that did not before it. A card it made that could not be read stays unseen,
           // and the next attempt is graded as without it (the same as before this runner closed cards at all).
