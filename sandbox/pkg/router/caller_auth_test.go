@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
+	"sigs.k8s.io/agent-sandbox/pkg/usercr"
 )
 
 // introspectAnswer writes an RFC 7662 answer for an active key owned by sub. The roles are also the groups.
@@ -166,6 +168,42 @@ func TestCallerAuth_AccessTokenIsIntrospected(t *testing.T) {
 func TestCallerAuth_RoleReviewUnavailable(t *testing.T) {
 	s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-admin", "", "system-admin"))
 	s.cfg.Authz = authz.NewClient(adminGroupReviewer{down: true}, "primus:")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer ak-valid-key")
+	s.engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "membership_unavailable")
+}
+
+// userReader answers every User read with user and err.
+type userReader struct {
+	user usercr.User
+	err  error
+}
+
+func (r userReader) Read(context.Context, string) (usercr.User, error) { return r.user, r.err }
+
+func TestCallerAuth_UserAuthorizerUpgradesRole(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-123", "", "default"))
+	s.cfg.Authz = usercr.NewFromReader(userReader{user: usercr.User{Found: true, Admin: true}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer ak-valid-key")
+	s.engine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]string
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "system-admin", resp["headerUserRole"])
+}
+
+func TestCallerAuth_UserReadUnavailable(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-123", "", "default"))
+	s.cfg.Authz = usercr.NewFromReader(userReader{err: fmt.Errorf("%w: apiserver down", authz.ErrUnavailable)})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
