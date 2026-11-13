@@ -38,7 +38,6 @@ import type { PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { recordSkillCard, type SayDeps } from "./outbound.js";
 import { proposeConfirmation } from "./schedules.js";
 import { asksToAct, asksToChangeSkill, asksToSaveSkill, confirmsDraft, negatedBefore } from "./skill-intent.js";
-import { namedUserSkills } from "@claw/protocol";
 import { routerSkillsServe } from "./skill-tools.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -239,17 +238,40 @@ function refused(op: Parameters<typeof metrics.onUserSkillSave>[0], r: { error: 
 
 // --- The router's tools ------------------------------------------------------------------------------------------------
 
+/** How long a removed skill stays one a new skill may not name. */
+const REMOVED_NAME_DAYS = 30;
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * A skill written from a conversation names no skill the user no longer has (deleted, or undone): what the router remembers of an
- * earlier turn is not theirs any more, and a new skill that points at one points at nothing. A refusal the router writes it again for.
+ * Whether `text` names `name` as a skill: marked as one (`/name`, `name` in quotes or backticks, 「name」, "name skill", "name 技能",
+ * "skill name", "技能 name"), never as a word in prose ("Send a follow-up email" does not name the skill follow-up).
  */
-async function requireNoRemovedSkill(userId: string, name: string, texts: string[]): Promise<void> {
+export function marksSkill(text: string, name: string): boolean {
+  const t = (text || "").normalize("NFKC").toLowerCase();
+  const n = escapeRe(name.toLowerCase());
+  const W = "a-z0-9_-";
+  return new RegExp(
+    `(?:(?<![^\\s])/${n}(?![${W}])|[\`"'“「]${n}[\`"'”」]|(?<![${W}])${n}\\s*(?:skill|技能)|(?:skill|技能)\\s*[:：]?\\s*${n}(?![${W}]))`,
+  ).test(t);
+}
+
+/**
+ * A skill written from a conversation does not point at a skill the user removed lately (deleted, or a save they undid, in the last
+ * `REMOVED_NAME_DAYS`): what the router remembers of an earlier turn is not theirs any more. Only a name marked as a skill counts
+ * (`marksSkill`), and never one the user's own message of this turn names: they may mean it. A refusal the router writes it again for.
+ */
+async function requireNoRemovedSkill(
+  userId: string, name: string, texts: string[], op: "create" | "draft" | "update", message = "",
+): Promise<void> {
   const text = texts.join("\n");
-  // Named as `namedUserSkills` reads a name: a one-word name only where it is marked as a skill's (`format` in "use this format" is
-  // a word, not the removed skill format).
-  const named = (await removedSkills(userId)).find((r) => r.name !== name && namedUserSkills(text, [r.name]).length > 0);
+  const since = Date.now() - REMOVED_NAME_DAYS * 86_400_000;
+  const named = (await removedSkills(userId)).find((r) =>
+    r.name !== name && Date.parse(r.removed_at) >= since && marksSkill(text, r.name) && !message.toLowerCase().includes(r.name.toLowerCase()));
   if (named) {
-    refused("create", {
+    refused(op, {
       error: "names_removed_skill",
       message: `the skill names ${named.name}, a skill the user ${named.how === "undone" ? "undid" : "deleted"}: write it without ${named.name}, from this conversation only`,
     });
@@ -312,7 +334,7 @@ export async function skillSave(claims: AssistantTokenClaims, args: Record<strin
   const content = text(args.content, "content");
   const files = filesOf(args.files);
   const invocation = invocationOf(args.invocation);
-  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")]);
+  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")], "create", message);
   const same = await sameSkillUnderAnotherName(userId, name, content, files);
   if (same) refused("create", { error: "duplicate", message: `the user already has exactly this skill, named ${same}: nothing was saved; tell them` });
   const saved = await saveUserSkillRecorded(userId, {
@@ -348,7 +370,7 @@ export async function skillDraft(claims: AssistantTokenClaims, args: Record<stri
   const files = filesOf(args.files);
   const invocation = invocationOf(args.invocation);
   const lang: CommandLanguage = hasHan(`${args.description ?? ""}${content}`) ? "zh" : "en";
-  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")]);
+  await requireNoRemovedSkill(userId, name, [content, text(args.description, "description")], "draft");
   const same = await sameSkillUnderAnotherName(userId, name, content, files);
   if (same) refused("draft", { error: "duplicate", message: `the user already has exactly this skill, named ${same}: no draft was made` });
   const out = await inTransaction(async (q) => {
@@ -381,7 +403,7 @@ export async function skillUpdate(claims: AssistantTokenClaims, args: Record<str
   const now = await showUserSkill(userId, name);
   if (!now) refused("update", { error: "not_found", message: `the user has no skill named ${name}` });
   const invocation = invocationOf(args.invocation);
-  await requireNoRemovedSkill(userId, name, [text(args.content, "content"), text(args.description, "description")]);
+  await requireNoRemovedSkill(userId, name, [text(args.content, "content"), text(args.description, "description")], "update", message);
   const saved = await saveUserSkillRecorded(userId, {
     name,
     description: args.description === undefined || args.description === null ? now.description : text(args.description, "description"),

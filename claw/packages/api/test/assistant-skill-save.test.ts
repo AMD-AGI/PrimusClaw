@@ -724,10 +724,10 @@ describe("assistant: saving the user's personal skills from the conversation", {
     await save(alice, { name: "deploy-prod", content: "## x" });
     await inTurn(alice, "删掉 deploy-prod 技能", "skill_delete", { name: "deploy-prod", request_quote: "删掉 deploy-prod 技能" });
 
-    const stale = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n站会请用 standup-notes 技能。" });
+    const stale = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n站会请用 standup-notes 技能。" }, "请把会议纪要的做法存成我的一个技能");
     assert.deepEqual([stale.isError, stale.body.error], [true, "names_removed_skill"]);
     assert.match(stale.body.message, /standup-notes/);
-    const drafted = await inTurn(alice, "好", "skill_draft", { name: "meeting-notes", content: "参考 deploy-prod 的做法" });
+    const drafted = await inTurn(alice, "好", "skill_draft", { name: "meeting-notes", content: "参考 deploy-prod 技能的做法" });
     assert.deepEqual([drafted.isError, drafted.body.error], [true, "names_removed_skill"]);
     // A one-word name is a skill's name only where it is marked as one: "this format" is a word, not the removed skill format.
     await save(alice, { name: "format", content: "## f" });
@@ -735,9 +735,24 @@ describe("assistant: saving the user's personal skills from the conversation", {
     const clean = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办\nUse this format for every meeting." });
     assert.equal(clean.isError, false, JSON.stringify(clean.body));
 
+    // A removed name in prose is a word ("Send a follow-up email"), and one the user names now is theirs to mean.
+    await save(alice, { name: "follow-up", content: "## f" });
+    await inTurn(alice, "删掉 follow-up 技能", "skill_delete", { name: "follow-up", request_quote: "删掉 follow-up 技能" });
+    const prose = await save(alice, { name: "meeting-notes", content: "## 步骤\n1. 议题\n2. 结论\n3. 待办\n4. Send a follow-up email." });
+    assert.equal(prose.isError, false, JSON.stringify(prose.body));
+    const meant = await inTurn(alice, "把 meeting-notes 技能改一下：会后用 standup-notes 技能同步", "skill_update", {
+      name: "meeting-notes", content: "## 步骤\n会后用 standup-notes 技能同步", request_quote: "把 meeting-notes 技能改一下",
+    });
+    assert.equal(meant.isError, false, JSON.stringify(meant.body));
+    // An unproven auto-skill the platform demoted was never the user's: not listed as one they removed.
+    await w.q(`INSERT INTO claw_skills (user_id, skill_name, version, content, description, status, source, deleted_at)
+      VALUES ('alice', 'auto-thing', 1, 'c', 'd', 'probation', 'auto', NOW())`);
+
     const listed = await inTurn(alice, "standup-notes 这个技能存在吗", "skill_list", {});
     assert.deepEqual(listed.body.skills.map((s: any) => s.name), ["meeting-notes"]);
-    assert.deepEqual(listed.body.deleted_lately.map((r: any) => [r.name, r.how]), [["format", "deleted"], ["deploy-prod", "deleted"], ["standup-notes", "undone"]]);
+    assert.deepEqual(listed.body.deleted_lately.map((r: any) => [r.name, r.how]), [
+      ["follow-up", "deleted"], ["format", "deleted"], ["deploy-prod", "deleted"], ["standup-notes", "undone"],
+    ]);
     assert.ok(listed.body.deleted_lately.every((r: any) => Date.parse(r.removed_at) > 0));
   });
 });

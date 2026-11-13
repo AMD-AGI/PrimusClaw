@@ -11,28 +11,46 @@
 import { CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import type { Querier } from "../infra/db.js";
 
-const SAVE_AS_SKILL_ZH = /(?:存|保存|沉淀|记|做|整理|总结|写|加|收藏|归纳)\s*(?:成|为|作|下来|起来)[^。！？!?\n]{0,12}?(?:技能|skill)/i;
-const ASKS_ZH = /(?:要不要|要不|需不需要|需要|是否|想不想|想要|可以|能不能|建议|帮你)[^。！？!?\n]{0,30}?(?:存|保存|沉淀|记|做|整理|总结|写|加|收藏|归纳)\s*(?:成|为|作|下来|起来)[^。！？!?\n]{0,12}?(?:技能|skill)|(?:技能|skill)[^。！？!?\n]{0,6}?(?:吗|么|呢)/i;
-const ASKS_EN = /\b(?:want|like|shall|should|would|could)\b[^.?!\n]{0,60}\b(?:save|turn|make|keep|store)\b[^.?!\n]{0,60}\bskills?\b[^.!\n]*\?/i;
+// Leaning towards letting a say through: a missed nudge costs the user one card, a refused answer costs them the answer.
 
-/** Whether `text` asks the user, in words, whether to save something as a skill. */
+/** A save-into-a-skill phrase in Chinese: 存成/保存为/沉淀成/做成 … 技能. */
+const SAVE_AS_SKILL_ZH = /(?:存|保存|沉淀|记|做|整理|总结|写|加|收藏|归纳)\s*(?:成|为|作)[^，,。！!？?\n；;]{0,12}?(?:技能|skill)/i;
+/** The same phrase said of something done already (已经存成技能了, 之前把它存成技能了): a statement, not an offer. */
+const DONE_ZH = /(?:已|已经|之前|刚才|刚刚|早就)|(?:技能|skill)了/i;
+/** What makes a clause an offer or a question to the user. */
+const OFFERS_ZH = /(?:要不要|要不|需不需要|需要我|是否|想不想|要我|我来|我可以|可以帮你|帮你|建议)|(?:吗|么|呢)\s*$/;
+/** A save-as phrase with something being made into a skill: save/turn/make/keep this … as/into a skill. */
+const SAVE_AS_SKILL_EN = /\b(?:save|turn|make|keep|store|add)\s+(?:this|that|it|these|them|the (?:steps|format|workflow|process|flow))\b(?:\s+[\w-]+){0,3}?\s+(?:into|as)\s+(?:a |an |one of your |your |my )?(?:new |personal |reusable )?skills?\b/i;
+const QUESTION_EN = /\b(?:want|like|shall|should|would|could|can|may)\b|\?\s*$/i;
+
+/**
+ * Whether `text` asks the user, in words, whether to save something as a skill: a clause (split at every comma, stop and question
+ * mark) that holds a save-into-a-skill phrase, is not about something saved already, and offers or asks.
+ */
 export function asksToSaveAsSkill(text: string): boolean {
   const s = (text || "").normalize("NFKC");
-  if (ASKS_EN.test(s)) return true;
-  if (!SAVE_AS_SKILL_ZH.test(s)) return false;
-  if (ASKS_ZH.test(s)) return true;
-  // A question mark in the same sentence as the save phrase ("把它存成技能？"), not in a later one ("已保存为技能。截止是周五吗？").
-  const from = s.slice(s.search(SAVE_AS_SKILL_ZH));
-  const sentence = from.split(/[。！!\n]/)[0] ?? "";
-  return /[?？]/.test(sentence);
+  // Each clause with the mark that ends it: "要不要把它存成技能？" is a question; "已保存为技能，截止是周五吗？" holds none.
+  for (const m of s.matchAll(/([^，,。！!？?\n；;]+)([，,。！!？?\n；;]?)/g)) {
+    const clause = m[1].trim();
+    const ends = m[2] ?? "";
+    if (SAVE_AS_SKILL_EN.test(clause) && (QUESTION_EN.test(clause) || ends === "?" || ends === "？")) return true;
+    if (!SAVE_AS_SKILL_ZH.test(clause) || DONE_ZH.test(clause)) continue;
+    if (OFFERS_ZH.test(clause) || ends === "?" || ends === "？") return true;
+  }
+  return false;
 }
 
 /**
  * Why a say that asks whether to save a skill is refused, or null when it may go: personal skills off, or not such a say, or this turn
  * (of session `sid`, begun at `began`) already drafted or saved a skill.
  */
-export async function textSkillSuggestion(q: Querier, sid: string, began: Date | undefined, text: string): Promise<string | null> {
+export async function textSkillSuggestion(
+  q: Querier, sid: string, userId: string, began: Date | undefined, text: string,
+): Promise<string | null> {
   if (!CLAW_USER_SKILLS_ENABLED || !asksToSaveAsSkill(text)) return null;
+  // Where the user's skills are not served (a group's session), skill_draft cannot help: the say goes as it is.
+  const { routerSkillsServe } = await import("./skill-tools.js");
+  if (!(await routerSkillsServe(q, sid, userId))) return null;
   const done = (await q(
     `SELECT 1 FROM claw_skill_events WHERE session_id = $1 AND op IN ('draft', 'create', 'update')
        AND created_at >= COALESCE($2::timestamptz, NOW() - INTERVAL '15 minutes') LIMIT 1`,

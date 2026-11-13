@@ -18,6 +18,7 @@ test("S1 a question or an offer to save as a skill is caught", () => {
     "要不要把这种格式存成技能？", "整理好了。要不要把这种格式存成技能？以后直接用。", "需要我把它保存为技能吗？", "是否把这个流程沉淀成技能？",
     "我可以帮你把这个做法存成一个技能，要吗？", "要把它存成技能吗", "这个格式要不要做成你的个人技能？", "建议把这个流程整理成技能，以后直接用？",
     "Do you want me to save this format as a skill?", "Would you like to turn this into a skill?", "Shall I save it as one of your skills?",
+    "Can I save this as a skill?", "整理好了，要不要把这种格式存成技能？",
   ]) {
     assert.equal(asksToSaveAsSkill(asked), true, asked);
   }
@@ -28,7 +29,10 @@ test("S2 telling what was saved, an answer about skills and an ordinary answer a
     "已存为你的个人技能「meeting-notes」v1。", "已保存为技能，点「撤销」可撤回。", "你现在没有个人技能。", "standup-notes 已删除，你之前撤销了它。",
     "议题：发布节奏。结论：周四发。待办：写变更日志。", "这个技能存在吗？你可以用 /skills 看。", "Saved as your skill meeting-notes v1.",
     "I saved it. Press Undo to take it back.", "要不要我现在跑一下测试？", "Do you want me to run the tests?",
-    "已保存为技能「weekly-report」。截止日期是周五吗？",
+    "已保存为技能「weekly-report」。截止日期是周五吗？", "已保存为你的个人技能，截止日期是周五吗？",
+    // The review's: questions about a skill the user has, and statements about one saved before.
+    "Would you like me to turn off the weekly-report skill?", "Should I keep using your meeting-notes skill for this?",
+    "Do you want to make this skill manual?", "已经存成技能了，要现在用它试一下吗？", "你之前把它存成技能了，要我现在启用它吗？",
   ]) {
     assert.equal(asksToSaveAsSkill(said), false, said);
   }
