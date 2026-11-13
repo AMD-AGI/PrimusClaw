@@ -33,7 +33,7 @@ Browser / MCP Client
 | Helm         | 3.x (`helm repo add nats https://nats-io.github.io/k8s/helm/charts/`) |
 | PostgreSQL   | PGO-managed cluster in `primus-claw` with Secret `primus-claw-pguser-postgres` |
 | MinIO        | Running in `minio` namespace, accessible at `minio.minio.svc.cluster.local:9000`, with the `S3_BUCKET` bucket (default `claw`) already created — no script creates it |
-| Container image | `<REGISTRY>/claw:<TAG>` built and pushed      |
+| Container image | A release, `docker.io/rocm/primusclaw:claw-<version>` (the default), or `<REGISTRY>/claw:<TAG>` of your own, built and pushed |
 | Ingress      | Higress ingress controller installed                     |
 | Sandbox namespace | The namespace named by `secret.sandboxNamespace` must already exist. Sandboxes without a request-supplied `workspace_id` are created there by the agent-sandbox router; the chart does not create it, and install fails early if it is missing. Defaults to `default`. |
 
@@ -43,8 +43,10 @@ Browser / MCP Client
 # 1. Copy/fill per-env values (contains secrets; do not commit)
 cp deploy/values.example.env deploy/values.primus-claw.env
 
-# 2. Deploy everything
-REGISTRY=myregistry.com/claw TAG=v1.0.0 bash deploy/deploy.sh
+# 2. Deploy everything: the release docker.io/rocm/primusclaw:claw-0.4.4
+TAG=claw-0.4.4 bash deploy/deploy.sh
+#    or an image of your own, myregistry.com/team/claw:v1.0.0
+REGISTRY=myregistry.com/team TAG=v1.0.0 bash deploy/deploy.sh
 ```
 
 ### Upgrade Note: BYOK Verification Protocol
