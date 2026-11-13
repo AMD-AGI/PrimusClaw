@@ -48,7 +48,7 @@ export function renderRouterSelfSection(selfStatus: boolean, where: string = cha
       : `You are PrimusClaw's (Claw's) assistant ${where}. A question about you, about the assistant or about Claw itself is about you: it is not a job, a plan, a repository or a board to look up.`,
   ];
   if (selfStatus) {
-    const asked = name ? `${name}最近运行如何, 你最近稳定吗, how is ${name} doing` : "你最近运行如何, 你最近稳定吗, how are you doing";
+    const asked = n ? `${n}最近运行如何, 你最近稳定吗, how is ${n} doing` : "你最近运行如何, 你最近稳定吗, how are you doing";
     const who = n ? `${n}, Claw` : "the assistant, Claw";
     const never = n ? `never ask the user what ${n} is` : "never ask the user what you are";
     lines.push(
