@@ -55,6 +55,9 @@
  *       `workflow` scope waits for the author: the item stays in progress and says so, the reviewer is not woken, the one who asked is
  *       told, and the sweep closes the item once the pull request is merged; any other refusal, and the owner's own review, still need
  *       the reviewer (2026-11-12: PrimusClaw#770, #784, #806)
+ *   AW2 the wait ends when the pull request gets new commits: the review is run once more on them in its session (the same words, no
+ *       wake for the reviewer); a second wait whose head moves again cannot be run a third time and goes to the reviewer
+ *   AW3 a wait nobody ends within a day goes to the reviewer; a restart carries neither the wait's mark nor its end over
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -2105,5 +2108,107 @@ describe("assistant review items", { skip }, () => {
     );
     await ri.syncReviewItem(ownItem.item_id);
     assert.deepEqual([(await w.item(ownItem.item_id)).board_state, (await w.item(ownItem.item_id)).last_report_kind], ["needs_you", "blocked"]);
+  });
+
+  /** A merge of PR 254 the session tried as bob and GitHub refused on DIRTY, at `head`. */
+  async function refusedOnConflict(sessionId: string, head: string, at = "NOW()"): Promise<void> {
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail, merge_state, at)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/PrimusClaw', 254, $2, 'gh_pr_merge', 'refused', 'merge_state_not_clean', 'DIRTY', ${at})`,
+      [sessionId, head],
+    );
+  }
+
+  test("AW2 new commits end the wait for the author: the review runs once more on them, and a second move goes to the reviewer", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    const words = await firstTurnWords(sid);
+    const [A, B, C] = ["a".repeat(40), "b".repeat(40), "c".repeat(40)];
+    await audit(sid, "gh_review_submit", "ok", "submitted", "bob");
+    await refusedOnConflict(sid, A);
+    await ri.sweepReviewItems();
+    assert.equal((await w.item(it.item_id)).params.author_waiting, "conflict");
+    let head = A;
+    const seen = await followed(async () => ({ status: "waiting", reason: "approval_missing", head_sha: head } as never));
+    try {
+      let now = Date.now();
+      // The same head: nothing changes.
+      await ri.followReviewItems(now);
+      assert.equal(seen.length, 1);
+      assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0);
+      assert.equal((await w.item(it.item_id)).board_state, "in_progress");
+      // The author resolved the conflict and pushed: the same words once more in the same session, and bob is not woken.
+      head = B;
+      now += 100_000;
+      w.drains.length = 0;
+      await ri.followReviewItems(now);
+      const queued = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [sid]);
+      assert.deepEqual(queued.map((q: { content: string }) => q.content), [words], "the same words once more, in the same session");
+      assert.deepEqual(w.drains.map((d) => d.sessionId), [sid]);
+      let item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.summary, item.params.author_waiting, item.params.author_wait_ended?.reason, item.params.author_wait_ended?.head_sha],
+        ["in_progress", "reviewing AMD-AGI/PrimusClaw#254", undefined, "rerun", A]);
+      assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken");
+      // A second look at the new head queues nothing more.
+      now += 100_000;
+      await ri.followReviewItems(now);
+      assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 1);
+      // The second turn ran: it approved B, and its merge was refused on a conflict again. It waits for the author once more.
+      await turnRan(sid);
+      await audit(sid, "gh_review_submit", "ok", "submitted", "bob");
+      await refusedOnConflict(sid, B, "NOW() + INTERVAL '1 second'");
+      await ri.sweepReviewItems();
+      item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.params.author_waiting], ["in_progress", "conflict"]);
+      // New commits again: the one re-run was used, so the item goes to bob, who is woken.
+      head = C;
+      now += 100_000;
+      await ri.followReviewItems(now);
+      assert.equal(await count("claw_pending_messages", `session_id = '${sid}'`), 0, "never a third turn from the server");
+      item = await w.item(it.item_id);
+      assert.deepEqual([item.board_state, item.last_report_kind, item.summary, item.pending_question, item.params.author_waiting],
+        ["needs_you", "blocked", "AMD-AGI/PrimusClaw#254 got new commits, but the review could not run again", "Review AMD-AGI/PrimusClaw#254 again?", undefined]);
+      assert.equal((await w.pending(bob.routerSid)).length, 1, "bob is woken");
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+  });
+
+  test("AW3 a wait for the author nobody ends within a day goes to the reviewer; a restart carries neither the mark nor the end over", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const r = await start("alice", { prs: [PR(254)], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    await turnRan(sid);
+    await audit(sid, "gh_review_submit", "ok", "submitted", "bob");
+    await refusedOnConflict(sid, "a".repeat(40));
+    await ri.sweepReviewItems();
+    const seen = await followed(async () => ({ status: "waiting", reason: "approval_missing", head_sha: "a".repeat(40) } as never));
+    try {
+      // Within the day: still waiting.
+      await ri.followReviewItems(Date.now() + ri.AUTHOR_WAIT_MS - 60_000);
+      assert.equal((await w.item(it.item_id)).board_state, "in_progress");
+      assert.equal(seen.length, 1);
+      // Past it: the reviewer's, whatever GitHub would answer (not even asked).
+      await ri.followReviewItems(Date.now() + ri.AUTHOR_WAIT_MS + 200_000);
+      assert.equal(seen.length, 1, "a wait past its day ends without a look");
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    const item = await w.item(it.item_id);
+    assert.deepEqual([item.board_state, item.last_report_kind, item.summary, item.params.author_waiting, item.params.author_wait_ended?.reason],
+      ["needs_you", "blocked", "nothing cleared the block on AMD-AGI/PrimusClaw#254 within a day", undefined, "timeout"]);
+    assert.equal((await w.pending(bob.routerSid)).length, 1, "bob is woken");
+    // A restart of an item marked as waiting, with an ended wait: the new item carries neither.
+    await w.q("UPDATE claw_work_items SET params = params || '{\"author_waiting\": \"conflict\"}'::jsonb WHERE item_id = $1", [it.item_id]);
+    const again = await call("bob", `/v1/assistant/reviews/${it.item_id}/restart`, {});
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    const fresh = await w.item(again.body.data.item.item_id);
+    assert.deepEqual([fresh.params.author_waiting, fresh.params.author_wait_ended], [undefined, undefined]);
   });
 });

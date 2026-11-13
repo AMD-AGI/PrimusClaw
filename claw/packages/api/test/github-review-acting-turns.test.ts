@@ -377,8 +377,8 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
   // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
   // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
-  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 4,
-    "four places make a proof: the create's check, the first message's re-run, a queued review's first message, and a review run again once CI is green");
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 5,
+    "five places make a proof: the create's check, the first message's re-run, a queued review's first message, a review run again once CI is green, and a review run again once its author pushed");
   assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
     "the re-run's proof only for a session whose one turn failed with the same words");
   const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
@@ -399,6 +399,13 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "and waiting is exactly the two cases: an own review held by CI, or an unchanged re-review that tried no write at all");
   const greenProof = [...found.keys()].filter((f) => /\bproofForReviewAfterGreenCi\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(greenProof, ["assistant/review-items.ts"], "only the review items ask for the green-CI re-run's proof");
+  // A review someone asked of the owner whose merge waited for the pull request's author (a conflict, the branch rules, the workflow scope):
+  // its same words once more after new commits. Made only for one completed turn with those words and nothing queued, whose item is open,
+  // asked by someone, and still marked as waiting for the author.
+  assert.match(actingSession, /AND w\.board_state = 'in_progress'\s*AND w\.params \? 'requested_by' AND w\.params \? 'author_waiting'\) AS waiting/,
+    "the author re-run's proof only for an open requested review still marked as waiting for its author");
+  const authorProof = [...found.keys()].filter((f) => /\bproofForReviewAfterAuthor\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(authorProof, ["assistant/review-items.ts"], "only the review items ask for the author re-run's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
   assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
   const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));

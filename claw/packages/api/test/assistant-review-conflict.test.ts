@@ -100,6 +100,9 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     let told = await toldAlice();
     assert.equal(told.length, 1, JSON.stringify(told));
     assert.match(told[0].text, /^你请人评审并合入的 AMD-AGI\/demo#7 合不进去：GitHub 显示这个分支和目标分支有冲突。需要作者先解决冲突/);
+    // What comes next is what the sweep does, and never a promise of a merge.
+    assert.match(told[0].text, /作者推送新提交后，评审会在新提交上自动再做一次；一天内没有新提交，会交回评审人处理。/);
+    assert.doesNotMatch(told[0].text, /才能继续合入|之后才能合入/);
     assert.match(told[0].text, /https:\/\/github\.com\/AMD-AGI\/demo\/pull\/7$/);
     // Blocked again on the same head: not told twice.
     await blocked(item);
@@ -116,6 +119,8 @@ describe("a review stopped by a conflict tells the one who asked", { skip }, () 
     told = await toldAlice();
     assert.equal(told.length, 3);
     assert.match(told[2].text, /^AMD-AGI\/demo#7, which you asked to be reviewed and merged, cannot be merged: GitHub says its branch has conflicts/);
+    assert.match(told[2].text, /Once the author pushes new commits, the review runs once more on them; if none come within a day, it goes back to the reviewer\./);
+    assert.doesNotMatch(told[2].text, /before the review can merge it|before it can be merged/);
     // Nothing of this goes to bob through this path: his own notices are his item's.
     assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
   });
