@@ -6,8 +6,12 @@ package usercr
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
+	"time"
 
+	"golang.org/x/sync/singleflight"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -87,9 +91,26 @@ func isSystemAdmin(obj *unstructured.Unstructured) bool {
 	return contains(roles, identity.RoleSystemAdmin)
 }
 
+const (
+	// userAllowTTL is how long a found User is reused.
+	userAllowTTL = 30 * time.Second
+	// userDenyTTL is how long a missing User is reused.
+	userDenyTTL = 5 * time.Second
+)
+
 // Authorizer decides workspace use from the token and the SaFE User.
 type Authorizer struct {
-	users Reader
+	users  Reader
+	mu     sync.Mutex
+	cache  map[string]userCacheEntry
+	now    func() time.Time
+	flight singleflight.Group
+}
+
+type userCacheEntry struct {
+	user  User
+	err   error
+	until time.Time
 }
 
 // New returns an authorizer that reads User objects through client.
@@ -102,12 +123,43 @@ func NewFromReader(r Reader) *Authorizer {
 	return &Authorizer{users: r}
 }
 
-// read returns the User. A missing reader is unavailable.
+// read returns the User. A found User is reused for 30s and a missing User for 5s. A read
+// that cannot reach the API server is not cached. Concurrent reads of one user share one call.
 func (a *Authorizer) read(ctx context.Context, userID string) (User, error) {
 	if a == nil || a.users == nil {
 		return User{}, fmt.Errorf("%w: User client is not configured", authz.ErrUnavailable)
 	}
-	return a.users.Read(ctx, userID)
+	now := time.Now()
+	if a.now != nil {
+		now = a.now()
+	}
+	a.mu.Lock()
+	if e, ok := a.cache[userID]; ok && now.Before(e.until) {
+		a.mu.Unlock()
+		return e.user, e.err
+	}
+	a.mu.Unlock()
+	v, err, _ := a.flight.Do(userID, func() (any, error) {
+		u, err := a.users.Read(ctx, userID)
+		if err != nil && errors.Is(err, authz.ErrUnavailable) {
+			return u, err
+		}
+		ttl := userAllowTTL
+		if err != nil || !u.Found {
+			ttl = userDenyTTL
+		}
+		a.mu.Lock()
+		if a.cache == nil {
+			a.cache = map[string]userCacheEntry{}
+		}
+		a.cache[userID] = userCacheEntry{user: u, err: err, until: now.Add(ttl)}
+		a.mu.Unlock()
+		return u, err
+	})
+	if err != nil {
+		return User{}, err
+	}
+	return v.(User), nil
 }
 
 // CanUseAllWorkspaces reports whether the token or the User is a system admin.

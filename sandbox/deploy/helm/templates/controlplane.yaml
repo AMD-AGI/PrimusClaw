@@ -306,8 +306,8 @@ spec:
             {{- if and .Values.controlplane.config.rbac.workspaceSAR (not (.Values.controlplane.config.rbac.subjectPrefix | trim)) }}
             {{- fail "controlplane.config.rbac.workspaceSAR requires controlplane.config.rbac.subjectPrefix" }}
             {{- end }}
-            {{- if and .Values.controlplane.config.identity.attestWorkloads (not .Values.controlplane.config.identity.tokenUrl) }}
-            {{- fail "controlplane.config.identity.attestWorkloads requires controlplane.config.identity.tokenUrl" }}
+            {{- if and .Values.controlplane.config.identity.attestWorkloads (not (and .Values.controlplane.config.identity.introspectUrl .Values.controlplane.config.identity.tokenUrl)) }}
+            {{- fail "controlplane.config.identity.attestWorkloads requires controlplane.config.identity.introspectUrl and controlplane.config.identity.tokenUrl" }}
             {{- end }}
             {{- if .Values.router.config.enableAuth }}
             {{- if not .Values.controlplane.config.identity.introspectUrl }}
