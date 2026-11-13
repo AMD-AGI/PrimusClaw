@@ -86,6 +86,9 @@
  *                     server's own reply a moment after its turn ends, and that reply is what the person is shown. The server's
  *                     "on it" line said while the turn worked is not that reply: the wait goes on until another say of the turn
  *   EVAL_GAP_S        seconds between the end of one case and the start of the next (default 0)
+ *   EVAL_SKILL_SETTLE_S
+ *                     seconds a skills case waits from the end of the run's last turns before it clears the identity's skill drafts
+ *                     (default 200): the server may still be drafting one from those turns, in the background, after they ended
  *   EVAL_INFRA_RETRY  1 (default): an attempt that ended in an error of the run (not a grade: a missed stream, a read or a judge
  *                     that failed, a turn that did not end) is run again once, and the second try is the one reported (`retried`
  *                     names the first one's error; a recording of the first try is dropped); 0 runs each attempt once. In the
@@ -102,7 +105,11 @@
  *                     the assistant is shown them in every session, and answers a case asked again with "it is already waiting"
  *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
  *                     `deny`; once more after the last attempt); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
- *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
+ *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`.
+ *                     Every assistant-mode attempt first clears the skill drafts waiting for the identity and their cards
+ *                     (`clearSkillDrafts`: the card's Discard with EVAL_SEND_TOKEN_CMD's token, then the skill routes' Discard for a
+ *                     draft with no card), whatever this setting: drafts are the user's, shown in every session; and after it, a skill
+ *                     draft card it did not show, or a draft it answered and did not make, makes it an infra error (not graded).
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -165,7 +172,7 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
+  freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
@@ -333,6 +340,7 @@ function tokenApi(method: string, path: string, body?: unknown): ReturnType<type
   return api(method, path, body, sendToken(), { "x-api-key": KEY });
 }
 const GAP_MS = int("EVAL_GAP_S", 0, 0, 3_600) * 1000;
+const SKILL_SETTLE_MS = int("EVAL_SKILL_SETTLE_S", 200, 0, 900) * 1000;
 const INFRA_RETRY = int("EVAL_INFRA_RETRY", 1, 0, 1) === 1;
 const SAY_GRACE_MS = int("EVAL_SAY_GRACE_S", 5, 0, 120) * 1000;
 
@@ -1323,6 +1331,83 @@ async function closeCards(): Promise<WaitingCard[] | null> {
   return cardsNow();
 }
 
+/**
+ * Before each attempt (assistant mode): every skill draft left waiting for the identity (by another case, or an earlier attempt) is
+ * discarded, as the person would: its card's Discard
+ * (`deny` on the card's decision route, with EVAL_SEND_TOKEN_CMD's token: the person's answer, which discards the draft too), then any
+ * draft with no card left (`DELETE /v1/users/me/skill-drafts/:id`, the skill routes' Discard). The drafts are the user's, not a
+ * session's: the assistant is shown another case's waiting draft card in every session, and points the user at it instead of
+ * answering the case (sa-eval cat-skills-deleted-006 on claw-v0.5.0 was told to type 批准 for cat-skills-suggest-005's card). An error
+ * (`infra:`) when one could not be read or is still there after: the attempt is not graded. A draft the server makes later still from an
+ * earlier turn is waited for first (EVAL_SKILL_SETTLE_S), and one that comes anyway is caught after the attempt (`foreignSkillCardError`).
+ */
+async function clearSkillDrafts(settleFirst: boolean): Promise<void> {
+  // The server drafts a skill after a turn has ended, in the background (`skill-auto-draft.ts`: one model call, retried, under about
+  // three minutes): the session is idle by then, so a skills case's clear first waits that long from the end of the run's last turns.
+  // Any other case does not wait: a draft that lands anyway is caught after the attempt (`foreignSkillCardError`).
+  const settle = settleFirst ? LAST_TURNS_END + SKILL_SETTLE_MS - Date.now() : 0;
+  if (settle > 0) {
+    log(`waiting ${Math.ceil(settle / 1000)} s for a skill the server may still draft from the last turns before clearing drafts`);
+    await pause(settle);
+  }
+  const skillCards = await skillCardsNow();
+  if (!skillCards) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
+  if (skillCards.length && !SEND_TOKEN_CMD) {
+    throw new Error(`infra: ${skillCards.length} skill draft card(s) wait for the identity and discarding one is the person's answer (EVAL_SEND_TOKEN_CMD): not graded`);
+  }
+  for (const w of skillCards) {
+    live();
+    const r = await tokenApi("POST", `/v1/assistant/confirmations/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }).catch(() => null);
+    log(`skill draft card waiting before the case: Discard answered ${r?.status ?? "nothing"}`);
+  }
+  const drafts = async (): Promise<string[] | null> => {
+    const d = await api("GET", "/v1/users/me/skill-drafts");
+    if (d.status === 404) return [];   // personal skills off: there is no draft
+    // A 200 whose body is no list of drafts is no reading of them: nothing would be cleared, and nothing seen left.
+    return d.status === 200 && Array.isArray(d.json?.data) ? skillDraftIds(d.json) : null;
+  };
+  const left = await drafts();
+  if (!left) throw new Error("infra: the identity's skill drafts could not be read: not graded");
+  for (const id of left) {
+    live();
+    const r = await api("DELETE", `/v1/users/me/skill-drafts/${encodeURIComponent(id)}`).catch(() => null);
+    log(`skill draft waiting before the case: Discard answered ${r?.status ?? "nothing"}`);
+  }
+  const [cardsAfter, draftsAfter] = await Promise.all([skillCardsNow(), drafts()]);
+  if (!cardsAfter || !draftsAfter) throw new Error("infra: the identity's skill drafts could not be read again after Discard: not graded");
+  const still = cardsAfter.length + draftsAfter.length;
+  if (still) throw new Error(`infra: ${still} skill draft(s) or card(s) still wait for the identity after Discard: not graded`);
+  if (skillCards.length || left.length) log(`cleared ${skillCards.length} skill draft card(s) and ${left.length} draft(s) left by another case`);
+}
+
+/** The skill draft cards waiting for the identity, read as a list or not at all (null): a 200 with anything else would leave one unseen. */
+async function skillCardsNow(): Promise<WaitingCard[] | null> {
+  const a = await api("GET", "/v1/assistant/confirmations");
+  if (a.status === 404) return [];
+  return a.status === 200 && Array.isArray(a.json?.data) ? skillDraftCards(waitingCards(a.json, null)) : null;
+}
+
+/**
+ * After an attempt of a skills case: a skill draft card waiting that its own turns did not show came from elsewhere after the clear (a
+ * draft the server made late from an earlier case's turn), and the assistant may have been shown it: the attempt is not graded (an
+ * `infra:` error, run again once). Erring that way: a card that came only after the attempt's turns is counted too.
+ */
+async function foreignSkillCardError(events: readonly LiveEvent[], messageIds: readonly string[], calls: readonly ToolCall[]): Promise<string | null> {
+  const own = cardsShownBy(events, messageIds);
+  // One the attempt answered (saved or discarded) is no longer waiting: its own calls say so.
+  const answered = foreignDraftAnswers(calls, own);
+  if (answered.length) return `infra: the attempt answered a skill draft it did not make (${answered.join(", ")}): not graded`;
+  const waiting = await skillCardsNow();
+  if (!waiting) return "infra: the skill draft cards could not be read after the attempt: not graded";
+  const foreign = waiting.filter((w) => !own.has(w.id));
+  return foreign.length
+    ? `infra: ${foreign.length} skill draft card(s) not of this attempt appeared while it ran (a draft made late from an earlier turn): not graded`
+    : null;
+}
+
+/** When the run's last attempt's turns ended (its messages answered and graded), for `clearSkillDrafts`'s wait. */
+let LAST_TURNS_END = 0;
+
 /** Triggers the run made for a case's setup and has not seen gone: deleted after their attempt, and again at the end. */
 const SETUP_TRIGGERS = new Set<string>();
 
@@ -1600,6 +1685,9 @@ async function main(): Promise<void> {
                 throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
               }
               preflightFailed = true;
+              // Skill drafts are cleared before every case (they are the user's, shown in every session), once no earlier turn is
+              // running: one past its attempt may still draft (its own skill_draft, or the server's draft after it ends).
+              await clearSkillDrafts(clearsSkillDrafts(c));
             }
             memBefore = await memoriesBefore(filled);
             ATTEMPT_MEMORIES_BEFORE = memBefore;
@@ -1612,6 +1700,7 @@ async function main(): Promise<void> {
             if (setup.length) await removeSetup(setup);
             ATTEMPT_MEMORIES_BEFORE = null;
             if (memBefore) await removeAttemptMemories(memBefore, c.id);
+            if (MODE === "assistant" && !preflightFailed) LAST_TURNS_END = Date.now();
           }
           // The cards this attempt made: those waiting now that did not before it. A card it made that could not be read stays unseen,
           // and the next attempt is graded as without it (the same as before this runner closed cards at all).
@@ -1622,6 +1711,12 @@ async function main(): Promise<void> {
             CASE_CARDS.set(c.id, own);
           }
           if (waiting) a = { ...a, cardsWaiting: waiting.length };
+          if (MODE === "assistant" && !a.error && !preflightFailed) {
+            const mine = RUN_MESSAGES.filter((id) => !earlier.has(id));
+            const calls = turnCalls(session!.stream.events, mine);
+            const foreign = await foreignSkillCardError(session!.stream.events, mine, calls).catch(() => "infra: the skill draft cards could not be read after the attempt: not graded");
+            if (foreign) a = { ...a, pass: false, error: foreign };
+          }
           // A say the server refused for its hourly cap is the run's failure, not the assistant's.
           const refused = MODE === "assistant" && !a.error ? capRefusedSays(session!.stream.events, caseStart, earlier) : 0;
           if (refused) a = { ...a, pass: false, error: `infra: ${refused} say(s) refused by the hourly cap (say_rate_limited)` };

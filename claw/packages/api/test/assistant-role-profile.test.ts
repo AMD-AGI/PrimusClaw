@@ -18,6 +18,8 @@
  *   A9  a router turn's message carries the reply-language line on every route, and what is stored is the user's words
  *   A9c the same turn once it has completed: the conversation holds the user's words, not the request Brain ran
  *   A10 a worker's report that wakes the router carries the language the user last wrote in, and nothing when none is known
+ *   A12 the turn's state says what now is for the user in their time zone (their chat's, else Asia/Shanghai), pinned to a UTC time
+ *       whose weekday differs from Beijing's
  *   A10b a language the user chose in their channel (`channel_context.reply_language`) is the line's, whatever the message is in; a
  *        report follows the choice of their latest message; a channel that sends none (an old client, `/lang auto`) changes nothing
  *   A11 the router's item list names each item by its id and its number, and a report's header does as well
@@ -500,6 +502,32 @@ describe("assistant role profile", { skip }, () => {
     await sent("帮我把 CI 修好", {});
     assert.equal(words(JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: report })).published[0]).prompt),
       report, "no choice now, and the conversation's own turns hold none of the user's words: no line, as before");
+  });
+
+  test("A12 the turn's state says what now is for the user, in their time zone, at a UTC time whose weekday differs from Beijing's", async () => {
+    const { routerClock } = await import("../src/assistant/now.js");
+    const clock = routerClock.now;
+    routerClock.now = () => new Date("2026-11-13T16:40:00Z");
+    let at = 0;
+    const stateFor = async (context: Record<string, unknown>) => {
+      const messageId = `claw-now-${++at}`;
+      await w.q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context, received_at)
+         VALUES ($1, $2, 'alice', '今天是星期几？', $3::jsonb, NOW() + make_interval(secs => $4))`,
+        [alice.routerSid, messageId, JSON.stringify(context), at],
+      );
+      const prompt = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "今天是星期几？", messageId })).published[0]).prompt as string;
+      return prompt.split(`\n\n${TURN_STATE_HEADER}\n\n`)[1] ?? "";
+    };
+    try {
+      const none = await stateFor({});
+      assert.match(none, /Now, for the user: Saturday 2026-11-14 00:40 in Asia\/Shanghai \(their chat names no time zone, so the default one\); 2026-11-13 16:40 UTC\./);
+      assert.match(none, /now is 2026-11-13 16:40 UTC/, "the item list keeps its UTC clock");
+      const la = await stateFor({ timezone: "America/Los_Angeles" });
+      assert.match(la, /Now, for the user: Friday 2026-11-13 08:40 in America\/Los_Angeles \(the user's time zone, as their chat says\)/);
+    } finally {
+      routerClock.now = clock;
+    }
   });
 
   test("A10 a report that wakes the router carries the language the user last wrote in", async () => {

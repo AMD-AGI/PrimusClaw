@@ -14,6 +14,7 @@ import type { Lang } from "../locales/lang.js";
 import { assistantChatText } from "../locales/assistant-chat.js";
 import { commandText } from "../locales/commands.js";
 import { replyLanguageContext } from "../language/chosen.js";
+import { zoneOf } from "../proactive/quiet.js";
 import { answerLang } from "../language/detect.js";
 import type { ClawAssistantPort, ClawSessionsPort } from "../ports/claw/index.js";
 import type { Clock } from "../ports/clock.js";
@@ -160,6 +161,14 @@ export class AssistantChat {
     return name ? { assistant_name: name } : {};
   }
 
+  /**
+   * The person's time zone, as the message's `channel_context` carries it: the one they set (`/timezone`), else the default their quiet
+   * hours use. Claw answers "what day is it" in it, not in UTC.
+   */
+  private zone(userId: string): { timezone: string } {
+    return { timezone: zoneOf(this.o.store.prefs.getPrefs(userId)) };
+  }
+
   private langOf(userId: string, text: string): Lang {
     return answerLang(this.o.store.prefs.getPrefs(userId).lang, this.o.clientLocale?.() ?? "", text);
   }
@@ -198,6 +207,7 @@ export class AssistantChat {
           : {}),
         ...this.chosenLanguage(request.userId),
         ...this.named(),
+        ...this.zone(request.userId),
       };
       await ready();
       return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
@@ -293,7 +303,14 @@ export class AssistantChat {
         const attached = request.attached === undefined ? {} : { attached: attachedOf(request.attached) };
         // (the surface the message came from: Claw sends the turn's replies back there, not to another surface of the person's)
         const channel = { channel: request.conversation.caps.channel };
-        const context = { ...channel, ...files, ...attached, ...this.chosenLanguage(request.userId), ...this.named() };
+        const context = {
+          ...channel,
+          ...files,
+          ...attached,
+          ...this.chosenLanguage(request.userId),
+          ...this.named(),
+          ...this.zone(request.userId),
+        };
         await ready();
         return this.o.claw.assistant.send(request.credential, sessionId, request.prompt, {
           ...(Object.keys(context).length ? { context } : {}),

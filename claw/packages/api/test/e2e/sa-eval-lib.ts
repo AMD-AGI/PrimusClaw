@@ -341,6 +341,53 @@ export function waitingCards(assistantBody: unknown, githubBody: unknown): Waiti
 }
 
 /**
+ * A case that reads or makes the identity's personal skills: before it, the clear first waits for a draft the server may still make from
+ * the turns before (`EVAL_SKILL_SETTLE_S`). Every case of the assistant mode clears the drafts and checks after itself; only these wait.
+ */
+export const clearsSkillDrafts = (c: Pick<EvalCase, "area">): boolean => c.area === "skills";
+
+/**
+ * The attempt's own calls that answered a skill draft it did not make or show: a `skill_save` with a `draft_id` no `skill_draft` of the
+ * attempt answered with, or a `confirmation_answer` about a skill whose card none of the attempt's says carried (`shown`). Such a draft
+ * came from elsewhere (an earlier case's, drafted late), and the attempt answered it: it was graded with another case's leftover.
+ */
+export function foreignDraftAnswers(calls: readonly ToolCall[], shown: ReadonlySet<string>): string[] {
+  const own = new Set<string>();
+  for (const c of calls) {
+    if (/(^|__)skill_draft$/.test(c.name) && c.ok === true) for (const m of c.result.matchAll(/"draft_id"\s*:\s*"([^"]+)"/g)) own.add(m[1]!);
+  }
+  const out: string[] = [];
+  for (const c of calls) {
+    const draft = typeof c.input?.draft_id === "string" ? c.input.draft_id : "";
+    if (/(^|__)skill_save$/.test(c.name) && draft && !own.has(draft)) out.push(`skill_save of draft ${draft}`);
+    const card = typeof c.input?.confirmation_id === "string" ? c.input.confirmation_id : "";
+    if (/(^|__)confirmation_answer$/.test(c.name) && card && !shown.has(card) && /skill/i.test(c.result)) out.push(`confirmation_answer of card ${card}`);
+  }
+  return out;
+}
+
+/** The ids of the drafts in `GET /v1/users/me/skill-drafts`'s body (`data`); what is not a list is none. */
+export function skillDraftIds(body: unknown): string[] {
+  const d = (body as { data?: unknown } | null)?.data;
+  return (Array.isArray(d) ? d : []).map((x) => (typeof x?.id === "string" ? x.id : "")).filter(Boolean);
+}
+
+/** The cards this attempt's own turns showed (`confirm_write` on their says): the ids of their confirmations. */
+export function cardsShownBy(events: readonly LiveEvent[], messageIds: readonly string[]): Set<string> {
+  const turns = new Set(messageIds);
+  const out = new Set<string>();
+  for (const e of events) {
+    const id = e.data?.confirm_write?.confirmation_id;
+    if (e.data?.type === "AssistantSay" && turns.has(String(e.data.turn_message_id ?? "")) && typeof id === "string" && id) out.add(id);
+  }
+  return out;
+}
+
+/** The cards that ask the person to save a skill draft (Save / Discard). */
+export const skillDraftCards = (waiting: readonly WaitingCard[]): WaitingCard[] =>
+  waiting.filter((w) => w.source === "assistant" && w.kind === "skill_save");
+
+/**
  * Why an attempt is not graded on its cards, or null: the case expects a card, and a card an earlier attempt of the same case made (`own`:
  * the cards that appeared during those attempts) is still waiting. The assistant then says that write is already waiting and shows none,
  * so a miss would be the run's, not the assistant's. Every other card waiting (another case's, one from before the run) is said

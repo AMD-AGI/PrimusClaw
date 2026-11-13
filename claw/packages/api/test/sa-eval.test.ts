@@ -77,7 +77,7 @@ import { silentTurnNotice, turnLostNotice } from "../src/assistant/router-turn-e
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
-  apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
@@ -1480,4 +1480,37 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
   // However it asks, a reply that started an item or put a card is no clarification.
   assert.deepEqual(graded("请说明一下要开哪个题", { route: "item" }), ["route=clarify"]);
   assert.deepEqual(graded("请说明一下要开哪个题", { route: "confirm" }), ["route=clarify"]);
+});
+
+test("S-skills a skills case clears the identity's waiting skill drafts and their cards; nothing else is touched", () => {
+  assert.equal(clearsSkillDrafts({ area: "skills" }), true);
+  assert.equal(clearsSkillDrafts({ area: "memory" }), false);
+  assert.deepEqual(skillDraftIds({ ok: true, data: [{ id: "d1", skill_name: "meeting-notes" }, { id: 7 }, null, { id: "d2" }] }), ["d1", "d2"]);
+  assert.deepEqual(skillDraftIds({ ok: false }), []);
+  assert.deepEqual(skillDraftIds(null), []);
+  const waiting = waitingCards(
+    { data: [{ confirmation_id: "c1", kind: "skill_save" }, { confirmation_id: "c2", kind: "trigger_create" }] },
+    { data: { items: [{ id: "g1", kind: "skill_save", status: "pending" }] } },
+  );
+  assert.deepEqual(skillDraftCards(waiting).map((w) => w.id), ["c1"], "only the assistant's skill draft cards; a schedule or a review card stays");
+  // The cards an attempt's own turns showed; one shown in another turn (an earlier case's late draft) is not among them.
+  const shown = cardsShownBy([
+    say(1, "m1", "draft", { confirm_write: { confirmation_id: "c1", kind: "skill_save" }, skill_card: { kind: "draft" } }),
+    say(2, "old-turn", "late draft", { confirm_write: { confirmation_id: "c9", kind: "skill_save" } }),
+    say(3, "m1", "plain answer"),
+  ], ["m1"]);
+  assert.deepEqual([...shown], ["c1"]);
+  // A draft the attempt answered without making or showing it came from elsewhere; its own draft, and a card it showed, are its own.
+  const tc = (name: string, input: Record<string, unknown>, result = "{}") => ({ id: name, name: `mcp__assistant__${name}`, input, ok: true, result, at: 0 });
+  assert.deepEqual(foreignDraftAnswers([
+    tc("skill_draft", { name: "meeting-notes" }, '{"ok":true,"draft_id":"d-own"}'),
+    tc("skill_save", { draft_id: "d-own" }),
+    tc("confirmation_answer", { confirmation_id: "c1", decision: "allow" }, '{"saved skill":"x"}'),
+  ], shown), []);
+  assert.deepEqual(foreignDraftAnswers([
+    tc("skill_save", { draft_id: "d-old" }),
+    tc("confirmation_answer", { confirmation_id: "c9", decision: "allow" }, '{"result":{"name":"meeting-notes","skill":true}}'),
+    tc("confirmation_answer", { confirmation_id: "m7", decision: "allow" }, '{"merged":true}'),
+    tc("skill_save", { name: "standup", content: "x" }),
+  ], shown), ["skill_save of draft d-old", "confirmation_answer of card c9"]);
 });

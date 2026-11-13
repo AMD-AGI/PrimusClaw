@@ -28,12 +28,15 @@ class Store {
   now = 1_700_000_000;
   lang = "";
   langSet = false;
+  timezone = "";
   userIds = new Map([[ALICE, "u-a"]]);
   sessions = new Map<string, string>();
   slices(): ChatStore {
     return {
       now: () => this.now,
-      prefs: { getPrefs: () => ({ lang: this.lang, langSet: this.langSet }) as Prefs } as unknown as ChatStore["prefs"],
+      prefs: {
+        getPrefs: () => ({ lang: this.lang, langSet: this.langSet, timezone: this.timezone }) as Prefs,
+      } as unknown as ChatStore["prefs"],
       sessions: { getSession: (u: string) => this.sessions.get(u) ?? null } as unknown as ChatStore["sessions"],
       remoteState: { getRemote: () => null } as unknown as ChatStore["remoteState"],
       links: { clawUserIdOf: (u: string) => this.userIds.get(u) ?? null },
@@ -118,7 +121,7 @@ it("a message goes to the assistant as typed and nothing waits for the answer", 
   assert.equal(await route(w, "看看 SaFE 节点"), true);
   assert.deepEqual(
     w.claw.heard.map((h) => [h.key, h.sessionId, h.text, h.context, h.plugin]),
-    [["ak-alice", "asst-ak-alice", "看看 SaFE 节点", { channel: "teams" }, undefined]],
+    [["ak-alice", "asst-ak-alice", "看看 SaFE 节点", { channel: "teams", timezone: "Asia/Shanghai" }, undefined]],
   );
   assert.deepEqual(w.surface.outbox[0], {
     op: "stream.open",
@@ -140,10 +143,14 @@ it("without a stream the typing indicator acknowledges the message", async () =>
 it("the plugin id and the attached session ride on the message", async () => {
   const w = world({ pluginId: 7 });
   await route(w, "which session is this chat on", { attached: { label: "Claude", busy: true, n: 3 } });
-  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", attached: { label: "Claude", busy: true } });
+  assert.deepEqual(w.claw.heard[0]?.context, {
+    channel: "teams",
+    attached: { label: "Claude", busy: true },
+    timezone: "Asia/Shanghai",
+  });
   assert.equal(w.claw.heard.at(0)?.plugin, 7);
   await route(w, "again", { attached: null });
-  assert.deepEqual(w.claw.heard[1]?.context, { channel: "teams", attached: null });
+  assert.deepEqual(w.claw.heard[1]?.context, { channel: "teams", attached: null, timezone: "Asia/Shanghai" });
 });
 
 it("the language the person chose rides on the message, whatever it is written in; none chosen sends nothing", async () => {
@@ -152,26 +159,31 @@ it("the language the person chose rides on the message, whatever it is written i
   w.store.lang = "en";
   w.store.langSet = true;
   await route(w, "看看 SaFE 节点");
-  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", reply_language: "en" });
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", reply_language: "en", timezone: "Asia/Shanghai" });
   // /lang zh, a message in English, beside the attached session.
   w.store.lang = "zh";
   await route(w, "check the nodes", { attached: null });
-  assert.deepEqual(w.claw.heard[1]?.context, { channel: "teams", attached: null, reply_language: "zh" });
+  assert.deepEqual(w.claw.heard[1]?.context, {
+    channel: "teams",
+    attached: null,
+    reply_language: "zh",
+    timezone: "Asia/Shanghai",
+  });
   // /lang auto (a language learnt from what they write is no choice): no language is sent, and Claw reads the message as before.
   w.store.langSet = false;
   await route(w, "看看 SaFE 节点");
-  assert.deepEqual(w.claw.heard[2]?.context, { channel: "teams" });
+  assert.deepEqual(w.claw.heard[2]?.context, { channel: "teams", timezone: "Asia/Shanghai" });
   // A choice of a language the agent does not speak is none.
   w.store.lang = "fr";
   w.store.langSet = true;
   await route(w, "regarde les nœuds");
-  assert.deepEqual(w.claw.heard[3]?.context, { channel: "teams" });
+  assert.deepEqual(w.claw.heard[3]?.context, { channel: "teams", timezone: "Asia/Shanghai" });
 });
 
 it("a message names the surface it came from, so Claw sends the turn's replies back there and not to another surface", async () => {
   const w = world({ caps: { channel: "slack", name: "Slack", shortName: "Slack" } });
   await route(w, "deploy the fix");
-  assert.deepEqual(w.claw.heard[0]?.context, { channel: "slack" });
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "slack", timezone: "Asia/Shanghai" });
 });
 
 it("a claw without the assistant keeps the old path and is not asked again for a minute", async () => {
@@ -296,11 +308,25 @@ it("stop answers in the chat's language", async () => {
   ]);
 });
 
+it("the person's time zone rides on every message to the assistant: the one they set, else the default their quiet hours use", async () => {
+  // None set, or one this runtime does not know: Asia/Shanghai, as quiet hours read it. Claw answers "what day is it" in it.
+  const w = world();
+  await route(w, "今天是星期几？");
+  assert.equal(w.claw.heard[0]?.context?.["timezone"], "Asia/Shanghai");
+  w.store.timezone = "Mars/Olympus";
+  await route(w, "what day is it");
+  assert.equal(w.claw.heard[1]?.context?.["timezone"], "Asia/Shanghai");
+  // /timezone America/Los_Angeles: theirs.
+  w.store.timezone = "America/Los_Angeles";
+  await route(w, "what day is it");
+  assert.equal(w.claw.heard[2]?.context?.["timezone"], "America/Los_Angeles");
+});
+
 it("the bot's configured name rides on every message to the assistant, trimmed; none configured sends none", async () => {
   // A deployment that names its bot "Clawy": the assistant is told the name its people use, on both ways a message reaches it.
   const w = world({ assistantName: " Clawy ", understanding: new Set([ALICE]) });
   await route(w, "how is Clawy doing");
-  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", assistant_name: "Clawy" });
+  assert.deepEqual(w.claw.heard[0]?.context, { channel: "teams", assistant_name: "Clawy", timezone: "Asia/Shanghai" });
   w.store.lang = "zh";
   w.store.langSet = true;
   await route(w, "Clawy最近运行如何", { attached: null });
@@ -309,6 +335,7 @@ it("the bot's configured name rides on every message to the assistant, trimmed; 
     attached: null,
     reply_language: "zh",
     assistant_name: "Clawy",
+    timezone: "Asia/Shanghai",
   });
   const understood = {
     userId: ALICE,
@@ -325,15 +352,20 @@ it("the bot's configured name rides on every message to the assistant, trimmed; 
     channel_message_id: "m-1",
     reply_language: "zh",
     assistant_name: "Clawy",
+    timezone: "Asia/Shanghai",
   });
   // A deployment left with the default name sends that name.
   const unset = world({ assistantName: "PrimusClaw Assistant" });
   await route(unset, "hello");
-  assert.deepEqual(unset.claw.heard[0]?.context, { channel: "teams", assistant_name: "PrimusClaw Assistant" });
+  assert.deepEqual(unset.claw.heard[0]?.context, {
+    channel: "teams",
+    assistant_name: "PrimusClaw Assistant",
+    timezone: "Asia/Shanghai",
+  });
   // No name (or only spaces): nothing is sent, and the message is as it was.
   const none = world({ assistantName: "  " });
   await route(none, "hello");
-  assert.deepEqual(none.claw.heard[0]?.context, { channel: "teams" });
+  assert.deepEqual(none.claw.heard[0]?.context, { channel: "teams", timezone: "Asia/Shanghai" });
 });
 
 it("a person the assistant understands sends with their token and model key and is told when it cannot be reached", async () => {
@@ -352,13 +384,17 @@ it("a person the assistant understands sends with their token and model key and 
   assert.equal(await w.chat.understand(request), true);
   assert.deepEqual(
     [w.claw.heard[0]?.key, w.claw.heard[0]?.modelKey, w.claw.heard[0]?.context],
-    ["idt-token", "ak-alice", { channel_message_id: "m-1" }],
+    ["idt-token", "ak-alice", { channel_message_id: "m-1", timezone: "Asia/Shanghai" }],
   );
   // The language they chose goes beside the chat's context.
   w.store.lang = "zh";
   w.store.langSet = true;
   assert.equal(await w.chat.understand({ ...request, prompt: "review #12 please" }), true);
-  assert.deepEqual(w.claw.heard[1]?.context, { channel_message_id: "m-1", reply_language: "zh" });
+  assert.deepEqual(w.claw.heard[1]?.context, {
+    channel_message_id: "m-1",
+    reply_language: "zh",
+    timezone: "Asia/Shanghai",
+  });
   w.store.langSet = false;
   w.claw.fail.set("send", new ClawError(403));
   assert.equal(await w.chat.understand({ ...request, credential: "ak-alice", modelKey: "" }), false);

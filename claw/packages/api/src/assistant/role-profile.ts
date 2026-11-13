@@ -60,6 +60,7 @@ import { disciplineOn } from "./discipline.js";
 import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
 import { routerCite } from "./citations.js";
 import { routerSkillParts } from "./skill-tools.js";
+import { renderNowState, routerClock } from "./now.js";
 import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
 const logger = pino({ name: "assistant-role" });
@@ -362,13 +363,16 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const replyLanguage = await replyLanguageOf(task, sessionId, told.chosen);
     const commands = commandLanguage(replyLanguage);
     const asked = await askedOfOthersManifest(role.userId);
-    const state = [renderRouterItems(await routerManifest(role.userId), asked, new Date(), asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
+    const now = routerClock.now();
+    const state = [renderRouterItems(await routerManifest(role.userId), asked, now, asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
     // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
     const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
     if (held) state.push(held);
     // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
     // reads them from this session's uploads), since it has no sandbox to open them in.
     const message = await turnMessage((t, p) => db.query(t, p), sessionId, messageId);
+    // What now is for the person, in their time zone (`now.ts`): a date or a weekday they ask about is theirs, not UTC's.
+    state.push(renderNowState(now, message?.context.timezone));
     const files = message?.context.files ?? [];
     // And what they sent earlier in the conversation, which a new item gets too (`earlierFilesOf`): a follow-up is about those.
     const earlier = message ? await earlierFilesOf((t, p) => db.query(t, p), sessionId, messageId, files) : [];
