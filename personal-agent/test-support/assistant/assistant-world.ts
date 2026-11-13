@@ -170,6 +170,7 @@ export class AssistantWorld {
       users,
       understanding,
       pluginId: this.options.pluginId,
+      assistantName: "",
       legacyTurn: (aadId) => this.legacy.has(aadId),
       files: this.options.files,
       onFilesDropped: (path, count) => this.dropped.push([path, count]),

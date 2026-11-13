@@ -45,6 +45,10 @@ spelling: no migration of data.
   the bot's own @mention is still recognised by its Teams id, whatever it is called. "Back to <name>" detaches under the
   configured name, the default name and the earlier name (buttons under cards already sent). No other behaviour depends on
   the name: command words, metric labels and the client label do not.
+- Each message to the assistant carries the configured name as `channel_context.assistant_name`, so the assistant knows
+  the name its people call it by (for example in "how is <name> doing") now that Claw names no client itself. Claw
+  keeps a name of letters, digits, spaces and `_ ' -` of at most 32 characters and 4 words, and ignores any other.
+  `AssistantChatOptions.assistantName` is required (API, for code that uses core directly; "" sends no name).
 
 ### Changed
 

@@ -110,6 +110,7 @@ function assistantChat(
     users: settings.assistant.users,
     understanding: settings.assistant.understandingUsers,
     pluginId: settings.claw.pluginId ?? undefined,
+    assistantName: settings.botName,
     legacyTurn: (aadId) => hooks.legacyTurn(aadId),
     files: messageFiles(base.surface),
     onFilesDropped: (path, count) => {
