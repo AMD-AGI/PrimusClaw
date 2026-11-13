@@ -22,9 +22,9 @@ A minor release, because core's exported API changes incompatibly: `ClawPort` ga
 the person's personal skills into the chat (#825). The store is unchanged; nothing to do for a deployment of the
 published packages.
 
-**Claw:** the skill cards and `/skills` need the skill routes of claw-v0.4.4 and later (personal skills saved from the
-conversation, AMD-AGI/PrimusClaw#823). With an older Claw, `/skills` says they are not available, and nothing else
-changes.
+**Claw:** the skill cards and `/skills` need claw-v0.4.4 or later (personal skills saved from the conversation,
+AMD-AGI/PrimusClaw#823) with `CLAW_USER_SKILLS_ENABLED=true`. Against an older Claw, or with that setting off, `/skills`
+answers that the skills could not be read, or lists none; nothing else changes.
 
 ### Added
 
@@ -36,8 +36,8 @@ changes.
   skills and shows, turns off, turns on or deletes one, each answered with the skill's card and Undo; a group chat never
   lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
   `skillCard` and `skillEdit` views; the store is unchanged (a card's record is a held-write card of kind `skill_undo`).
-  Needs a Claw with the skill routes of personal skills saved from the conversation; on an older Claw `/skills` says
-  they are not available (#825).
+  Needs claw-v0.4.4 or later with `CLAW_USER_SKILLS_ENABLED=true` (see above); a Claw without the skill routes is
+  told by `/skills` that they are not available (#825).
 
 ## 0.8.1
 
