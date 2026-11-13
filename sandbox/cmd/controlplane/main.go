@@ -473,6 +473,12 @@ func main() {
 			if attester == nil && policySupplied {
 				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
 			}
+			if name := grant.OwnerPolicyConfigMapFromEnv(); name != "" {
+				store := grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), wmCfg.Namespace, name, grants)
+				apiServer.WithOwnerPolicyStore(store)
+				go store.Run(ctx, ownerPolicySyncInterval)
+				log.Info("owner policy admin API enabled", "configmap", name)
+			}
 		}
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
@@ -511,6 +517,9 @@ func main() {
 
 // ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
 var ownerPolicyRetry = time.Second
+
+// ownerPolicySyncInterval is how often each replica reloads the owner policy ConfigMap.
+const ownerPolicySyncInterval = 15 * time.Second
 
 // ownerKeys returns the identity client when the introspection client is configured,
 // so identity keys are checked by introspection. The second result is true when an

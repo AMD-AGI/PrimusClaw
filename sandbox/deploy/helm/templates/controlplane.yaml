@@ -26,6 +26,15 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "create", "update", "patch"]
+  {{- with .Values.controlplane.config.identity }}
+  {{- if and .introspectUrl .ownerPolicyConfigMap }}
+  # The owner policy admin API reads and rewrites the policy ConfigMap.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .ownerPolicyConfigMap | quote }}]
+    verbs: ["get", "update"]
+  {{- end }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -328,6 +337,8 @@ spec:
                 configMapKeyRef:
                   name: {{ .ownerPolicyConfigMap | quote }}
                   key: policy.json
+            - name: E2B_OWNER_POLICY_CONFIGMAP
+              value: {{ .ownerPolicyConfigMap | quote }}
             {{- end }}
             {{- if and .introspectUrl .tokenUrl }}
             - name: IDENTITY_TOKEN_URL
