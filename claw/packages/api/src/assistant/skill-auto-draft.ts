@@ -109,10 +109,12 @@ async function autoDraft({ sessionId, userId, messageId }: { sessionId: string; 
   if (!msg) return "no_message";
   if (!msg.attendedVia) return "not_attended";
   if (!statesRecurringWay(msg.content)) return "no_preference";
-  // The turn wrote a skill itself (saved, drafted, or tried and was refused): it said what it had to.
+  // The turn wrote a skill itself (saved, drafted, or tried and was refused for what the skill holds): it said what it had to. A save
+  // refused because the message asked for none (`not_asked`: the router took "以后…都这个格式" for a request to save) wrote nothing and
+  // is no answer about a skill: the draft is still due (measured 2026-11-13, sa-eval cat-skills-deleted-006 on claw-v0.5.0).
   const wrote = (await q(
     `SELECT 1 FROM claw_skill_events WHERE user_id = $1 AND session_id = $2 AND created_at >= $3
-        AND op IN ('draft', 'create', 'update', 'refused') LIMIT 1`,
+        AND (op IN ('draft', 'create', 'update') OR (op = 'refused' AND COALESCE(detail->>'reason', '') <> 'not_asked')) LIMIT 1`,
     [userId, sessionId, msg.receivedAt],
   )).rows.length > 0;
   if (wrote) return "turn_wrote_skill";

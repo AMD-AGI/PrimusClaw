@@ -125,6 +125,16 @@ test("S2 final answer, what was shown, cards", () => {
   assert.equal(finalSay(says, ["m1"], ["i1"])?.text, "here is the result");
   assert.equal(finalSay(says, ["m1"], [])?.text, "on it");
   assert.equal(finalSay(says, ["nope"], []), null);
+  // A skill draft's card the server shows after the turn is the card, not the answer: the answer before it is final, and the card
+  // still counts as a card (cat-skills-suggest-en-007 on claw-v0.5.0 was graded on the card's own text).
+  const drafted = saysOf([
+    say(1, "m2", "Topics: release cadence. Decisions: ship Thursday. Action items: changelog."),
+    say(2, "m2", 'I drafted a personal skill "meeting-notes"; nothing is saved yet.', {
+      skill_card: { kind: "draft", name: "meeting-notes" }, confirm_write: { confirmation_id: "c9", kind: "skill_save" } }),
+  ]);
+  assert.match(finalSay(drafted, ["m2"], [])?.text ?? "", /^Topics:/);
+  assert.equal(cardsOf(drafted), "confirm");
+  assert.equal(finalSay([drafted[1]!], ["m2"], [])?.skillCard, true, "only a card: the card");
   const mine = caseSays(says, ["m1"], ["i1"]);
   assert.deepEqual(mine.map((s) => s.at), [1, 3, 4]);
   assert.equal(cardsOf(mine), "accept");
