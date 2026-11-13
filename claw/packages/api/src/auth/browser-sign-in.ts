@@ -15,9 +15,11 @@
  * Deliberately narrow, so nothing an API client sees changes:
  *   - only that one route, and only GET;
  *   - only when the request carries no credential at all (no Authorization, no
- *     x-api-key, no Token cookie): a credential that was presented and refused
- *     keeps its JSON answer, and a browser holding a session the platform no
- *     longer accepts is not bounced between sign-in and here;
+ *     x-api-key, no Token cookie, no `?token=` query parameter, which this route
+ *     does not accept but a caller may have sent): a credential that was
+ *     presented and refused keeps its JSON answer, and a browser holding a
+ *     session the platform no longer accepts is not bounced between sign-in
+ *     and here;
  *   - only for a browser navigation, i.e. an Accept header that names text/html;
  *   - off unless CLAW_BROWSER_SIGN_IN_URL is set.
  *
@@ -84,7 +86,7 @@ function publicPathPrefix(headers: FastifyRequest["headers"], env: Record<string
  * `pathname` is the request path without its query, as the auth hook has it.
  */
 export function browserSignInRedirect(
-  req: Pick<FastifyRequest, "method" | "headers" | "cookies">,
+  req: Pick<FastifyRequest, "method" | "headers" | "cookies" | "query">,
   pathname: string,
   env: Record<string, string | undefined> = process.env,
 ): string | null {
@@ -94,6 +96,8 @@ export function browserSignInRedirect(
   if (req.headers.authorization || req.headers["x-api-key"]) return null;
   const cookies = req.cookies as Record<string, string | undefined> | undefined;
   if (cookies?.Token) return null;
+  const query = req.query as Record<string, unknown> | undefined;
+  if (query && Object.hasOwn(query, "token")) return null;
   if (!acceptsHtml(req.headers.accept)) return null;
   return signIn + encodeURIComponent(publicPathPrefix(req.headers, env) + pathname);
 }

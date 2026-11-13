@@ -75,7 +75,7 @@ test("B1 a signed-out browser is sent to sign in, with the external path as the 
 });
 
 test("B1 the return target keeps the path as the browser sent it, and carries no query", async () => {
-  const res = await get("/v1/sessions/s%20x/deliveries/d-1?foo=bar&token=x", { accept: "TEXT/HTML" });
+  const res = await get("/v1/sessions/s%20x/deliveries/d-1?foo=bar", { accept: "TEXT/HTML" });
   assert.equal(res.statusCode, 302);
   assert.equal(res.headers.location, `/login?redirect=${encodeURIComponent("/claw-api/v1/sessions/s%20x/deliveries/d-1")}`);
 });
@@ -122,6 +122,9 @@ test("B4 a signed-in browser reaches the route; a refused or non-cookie credenti
 
   // A credential this API does not recognise is still a credential: no redirect.
   assertJson401(await get(LINK, { accept: BROWSER_ACCEPT, authorization: "Basic dXNlcjpwdw==" }), "other scheme");
+  // Nor is a `?token=` key, which this route does not accept: it keeps its JSON 401.
+  assertJson401(await get(`${LINK}?token=ak-alice`, { accept: BROWSER_ACCEPT }), "query token");
+  assertJson401(await get(`${LINK}?token=`, { accept: BROWSER_ACCEPT }), "empty query token");
 });
 
 test("B5 other routes and other methods are JSON 401 for a browser too", async () => {
@@ -150,7 +153,7 @@ test("acceptsHtml reads media types, not substrings", () => {
 });
 
 test("browserSignInRedirect is null for HEAD, which a browser does not navigate with", () => {
-  const req = { method: "HEAD", headers: { accept: BROWSER_ACCEPT }, cookies: {} };
+  const req = { method: "HEAD", headers: { accept: BROWSER_ACCEPT }, cookies: {}, query: {} };
   assert.equal(browserSignInRedirect(req as never, LINK, { CLAW_BROWSER_SIGN_IN_URL: "/login?redirect=" }), null);
   assert.equal(
     browserSignInRedirect({ ...req, method: "GET" } as never, LINK, { CLAW_BROWSER_SIGN_IN_URL: "/login?redirect=" }),
