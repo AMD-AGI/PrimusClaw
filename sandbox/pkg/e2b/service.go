@@ -105,6 +105,9 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 		return caller{grantID: grantID, role: role}, err
 	}
+	if err := s.grants.OwnerReady(); err != nil {
+		return caller{}, err
+	}
 	token, err := s.identity.Introspect(ctx, apiKey)
 	if errors.Is(err, identity.ErrInactive) {
 		return caller{}, grant.Op(http.StatusUnauthorized, "invalid_key", "key is not active")

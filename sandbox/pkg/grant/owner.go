@@ -129,7 +129,8 @@ type ownerConfig struct {
 }
 
 // OwnerPolicyFromEnv reads E2B_OWNER_POLICY, or the file named by E2B_OWNER_POLICY_FILE.
-// A nil policy means identity keys are not accepted.
+// A nil policy means none is configured: identity keys are checked by introspection
+// and answered 503 until a policy is applied.
 func OwnerPolicyFromEnv() (*OwnerPolicy, error) {
 	var raw []byte
 	if path := strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_FILE")); path != "" {
@@ -200,7 +201,31 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 		owners[id] = q
 	}
 	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
+	s.ownerFault.Store(false)
 	return nil
+}
+
+// ownerPolicyRejectedDetail is the only text a rejected owner policy returns.
+// The cause stays in the control plane log.
+const ownerPolicyRejectedDetail = "owner policy was rejected; see the control plane log"
+
+// SetOwnerPolicyFault records that the owner policy was rejected and will not apply
+// on retry. The error is logged by the caller and is not returned to API callers.
+func (s *Service) SetOwnerPolicyFault(_ error) {
+	s.ownerFault.Store(true)
+}
+
+// OwnerReady returns nil once an owner policy is applied. Otherwise it returns 503
+// owner_policy_not_applied while the policy is absent or pending, and 500
+// owner_policy_invalid when it was rejected.
+func (s *Service) OwnerReady() error {
+	if s.owner.Load() != nil {
+		return nil
+	}
+	if s.ownerFault.Load() {
+		return opErr(http.StatusInternalServerError, "owner_policy_invalid", ownerPolicyRejectedDetail)
+	}
+	return opErr(http.StatusServiceUnavailable, "owner_policy_not_applied", "owner policy is not applied")
 }
 
 // checkOwnerRole rejects a role that differs from the role of existing owner records.
@@ -222,7 +247,7 @@ func validQuota(q OwnerQuota) bool {
 	return q.MaxSandboxes >= -1 && q.MaxGPUs >= -1 && q.MaxSandboxSeconds >= 0
 }
 
-// OwnerRole returns the role used by identity keys, or "" when they are disabled.
+// OwnerRole returns the role used by identity keys, or "" while no owner policy is applied.
 func (s *Service) OwnerRole() string {
 	if cfg := s.owner.Load(); cfg != nil {
 		return cfg.role
@@ -239,10 +264,10 @@ func OwnerGrantName(userID string) string {
 // EnsureOwner returns the owner quota record of userID, creating it on first use
 // and updating its caps when the policy or the admin role changed.
 func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admin bool) (string, error) {
-	cfg := s.owner.Load()
-	if cfg == nil {
-		return "", opErr(http.StatusServiceUnavailable, "identity_unavailable", "owner policy is not applied")
+	if err := s.OwnerReady(); err != nil {
+		return "", err
 	}
+	cfg := s.owner.Load()
 	if userID == "" {
 		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")
 	}
@@ -272,8 +297,8 @@ func (s *Service) EnsureOwner(ctx context.Context, userID, userName string, admi
 // OwnerRecord returns the owner quota record of userID without creating it.
 // It returns "" when the record does not exist.
 func (s *Service) OwnerRecord(ctx context.Context, userID string) (string, error) {
-	if s.owner.Load() == nil {
-		return "", opErr(http.StatusServiceUnavailable, "identity_unavailable", "owner policy is not applied")
+	if err := s.OwnerReady(); err != nil {
+		return "", err
 	}
 	if userID == "" {
 		return "", opErr(http.StatusUnauthorized, "invalid_key", "key has no subject")

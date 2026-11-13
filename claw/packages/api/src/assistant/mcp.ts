@@ -167,7 +167,7 @@ function registerSkillWrites(mcp: McpServer, claims: AssistantTokenClaims, answe
   );
   mcp.tool(
     "skill_draft",
-    "Suggest saving a personal skill, on your own idea: nothing is saved; the user is shown the draft with Save and Discard.",
+    "Suggest saving a personal skill, on your own idea: nothing is saved; the user is shown the draft with Save and Discard. Use it instead of asking in words whether to save a skill: the card is the question.",
     { ...skill, name: z.string().describe("A short kebab-case English slug."), content: z.string().describe("The whole SKILL.md.") },
     (args) => answer(claims, "skill_draft", () => skillDraft(claims, args)),
   );

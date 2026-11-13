@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -520,6 +521,64 @@ func TestOwnerPolicyNotAppliedIsUnavailable(t *testing.T) {
 	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
 	if oe, ok := err.(*grant.OpError); !ok || oe.Status != http.StatusServiceUnavailable {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestNoOwnerPolicySkipsIntrospection checks that a key without the grant prefix is
+// answered 503 before introspection and the User read while no owner policy is applied.
+func TestNoOwnerPolicySkipsIntrospection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+
+	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
+	if oe, ok := err.(*grant.OpError); !ok || oe.Status != http.StatusServiceUnavailable || oe.Reason != "owner_policy_not_applied" {
+		t.Fatalf("create err = %v, want 503 owner_policy_not_applied", err)
+	}
+	if _, err := plane.List(context.Background(), "ak-alice", "", "", "", 0); opReason(err) != "owner_policy_not_applied" {
+		t.Fatalf("list err = %v, want owner_policy_not_applied", err)
+	}
+	if ids.calls != 0 {
+		t.Fatalf("introspection calls = %d, want 0 while no owner policy is applied", ids.calls)
+	}
+}
+
+// TestRejectedOwnerPolicyIsServerError checks that a policy a retry cannot fix is a 500
+// with the reason, and that applying a valid policy later clears it.
+func TestRejectedOwnerPolicyIsServerError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
+	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
+
+	const cause = "at least one template is required"
+	gs.SetOwnerPolicyFault(errors.New(cause))
+	_, _, err := plane.Create(context.Background(), "ak-alice", CreateBody{TemplateID: "runner"})
+	oe, ok := err.(*grant.OpError)
+	if !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" || oe.Detail != "owner policy was rejected; see the control plane log" {
+		t.Fatalf("create err = %v, want 500 owner_policy_invalid with a fixed detail", err)
+	}
+	if strings.Contains(oe.Error(), cause) {
+		t.Fatalf("response %q contains the policy error", oe.Error())
+	}
+	if ids.calls != 0 {
+		t.Fatalf("introspection calls = %d, want 0", ids.calls)
+	}
+
+	if err := gs.SetOwnerPolicy(context.Background(), samplePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.OwnerReady(); err != nil {
+		t.Fatalf("OwnerReady after a valid policy = %v, want nil", err)
 	}
 }
 

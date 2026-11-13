@@ -120,10 +120,20 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
-- Claw no longer names any chat client: the assistant's prompts, the `claw_self_status` tool description, comments
-  and docs no longer carry a client's name, which collided with third-party products. A client that sends no
-  `assistant_name` gets a router told only that it is PrimusClaw's assistant; a client that wants its users' name for
-  the assistant recognised (for example in "how is <name> doing") now sends it (#834).
+- **Breaking:** Claw no longer names any chat client: the assistant's prompts, the `claw_self_status` tool description,
+  comments and docs no longer carry a client's name, which collided with third-party products. A client that sends no
+  `assistant_name` gets a router told only that it is PrimusClaw's assistant, so a question that names the assistant by
+  a client's name (for example "how is <name> doing") is no longer recognised as being about the assistant itself.
+  Migration: the client sends its display name in `channel_context.assistant_name` on every message; the personal agent
+  does so from its configured bot name (#837). Until a client does, its name is not known to the router (#834).
+
+### Fixed
+
+- Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill the assistant suggests on its own is a draft card, never a question
+  in words. `say` refuses a message that asks whether to save something as a skill until the turn has called `skill_draft`
+  (whose card, with Save and Discard, is the question), and the router's prompt and the tool's description say so. A skill
+  written from a conversation may not name a skill the user deleted or undid. `skill_list` adds `deleted_lately`: each skill
+  the user had and has no longer, deleted or undone, and when, so "does this skill exist" is answered as it is.
 
 ## [0.4.4] - 2026-11-13
 

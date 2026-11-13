@@ -271,15 +271,15 @@ func (r *CodeInterpreterReconciler) deleteSandboxWarmPool(ctx context.Context, c
 // envdInjectorImage returns the EnvD injector image from ENVD_INJECTOR_IMAGE.
 // Used by runc pods (initContainer injection).
 //
-// The fallback is a moving tag, which is deliberate only as a development
-// convenience: no versioned release of this image has been published, so there
-// is no fixed tag to point at. Every deployment manifest in deploy/ sets
-// ENVD_INJECTOR_IMAGE explicitly, and any real deployment should do the same.
+// The fallback is the moving tag of the newest release on docker.io/rocm/primusclaw,
+// a development convenience only. Every deployment manifest in deploy/ sets
+// ENVD_INJECTOR_IMAGE explicitly, and any real deployment should do the same,
+// pinned to agent-sandbox-envd-injector-<version> or a digest.
 func envdInjectorImage() string {
 	if img := os.Getenv("ENVD_INJECTOR_IMAGE"); img != "" {
 		return img
 	}
-	return "primussafe/agent-sandbox-envd-injector:latest"
+	return "docker.io/rocm/primusclaw:agent-sandbox-envd-injector-latest"
 }
 
 // runtimePathEntries is the PATH every sandbox had while the pod spec set it:

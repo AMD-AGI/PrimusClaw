@@ -19,7 +19,7 @@ To run your own from the published packages or image, start with the [quick star
 your own machine without Teams in about five minutes, then a Teams deployment and a connected developer machine.
 
 > **Status.** Released as 0.x: the npm packages, the Teams ingress's Function package and the
-> `docker.io/primussafe/personal-agent-teams` image (see
+> `docker.io/rocm/primusclaw:personal-agent-teams-<version>` image (see
 > [CHANGELOG.md](CHANGELOG.md)). Configuration and plugin interfaces may still change between minor releases.
 
 ## Packages
@@ -295,6 +295,13 @@ image. Then, each behind a GitHub environment's required reviewers:
   (`DOCKER_USERNAME`/`DOCKER_PASSWORD`) are only given to `docker.io`; another registry needs
   `PERSONAL_AGENT_REGISTRY_USERNAME`/`PERSONAL_AGENT_REGISTRY_PASSWORD`, and without credentials the job fails rather
   than push anywhere else. While the switch is off, a release publishes the packages only.
+
+Once the release succeeds, [image-relay.yml](../.github/workflows/image-relay.yml) copies the image named on that
+`Image:` line, by digest and unchanged, to `docker.io/rocm/primusclaw-private:personal-agent-teams-X.Y.Z`, behind the
+`image-publish` reviewers. AMD's publication scan publishes it from there to `docker.io/rocm/primusclaw` under the same
+digest, so the attestation above holds for it too. Claw releases (`claw-vX.Y.Z`) are relayed the same way, from the
+build their notes name. The copy needs `ROCM_STAGING_USERNAME`/`ROCM_STAGING_TOKEN` in the `image-publish`
+environment; without them the job says so and copies nothing.
 
 `workflow_dispatch` with `dry-run` on (the default) runs the `package` job on any ref and publishes nothing; a pull
 request that changes the workflow does the same. [`scripts/release-workflow-check.sh`](scripts/release-workflow-check.sh),

@@ -18,9 +18,9 @@
 #
 # Usage:
 #   deploy/upgrade.sh \
-#     --claw-image docker.io/primussafe/claw:TAG \
-#     --sandbox-image docker.io/primussafe/agent-sandbox-controlplane:TAG \
-#     --envd-image docker.io/primussafe/agent-sandbox-envd-injector:TAG
+#     --claw-image docker.io/rocm/primusclaw:claw-VERSION \
+#     --sandbox-image docker.io/rocm/primusclaw:agent-sandbox-controlplane-VERSION \
+#     --envd-image docker.io/rocm/primusclaw:agent-sandbox-envd-injector-VERSION
 #
 # Optional:
 #   --sandbox-namespace agent-sandbox-system

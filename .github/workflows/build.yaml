@@ -299,6 +299,7 @@ jobs:
         run: bash .github/scripts/image-scan.sh "$NAME" "$RUNNER_TEMP/image-scan/$NAME.tar"
 
       - name: Push with Buildah
+        id: push
         if: github.event_name != 'pull_request' && matrix.push != 'no'
         env:
           DOCKERIO_REPOSITORY: docker.io/primussafe
@@ -309,5 +310,101 @@ jobs:
           echo "Pushing ${{ matrix.name }} to ${DOCKERIO_REPOSITORY}..."
           buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
           buildah tag ${{ matrix.name }}:${DATE_TIME} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push --digestfile "$RUNNER_TEMP/version-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push --digestfile "$RUNNER_TEMP/build-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          version_digest="$(cat "$RUNNER_TEMP/version-digest")" build_digest="$(cat "$RUNNER_TEMP/build-digest")"
+          for d in "$version_digest" "$build_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported digest \"$d\""; exit 1; }
+          done
+          echo "${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME} is ${build_digest}"
+          {
+            echo "repository=${DOCKERIO_REPOSITORY}/${{ matrix.name }}"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      # The digests go to the attest job: only that job, which runs no repository code, may sign with the workflow's
+      # OIDC identity.
+      - name: Hand the pushed digests to the attest job
+        if: steps.push.outcome == 'success'
+        env:
+          REPOSITORY: ${{ steps.push.outputs.repository }}
+          BUILD_DIGEST: ${{ steps.push.outputs.build-digest }}
+          VERSION_DIGEST: ${{ steps.push.outputs.version-digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image-digest"
+          printf '%s\n' "$REPOSITORY" > "$RUNNER_TEMP/image-digest/repository"
+          printf '%s\n' "$BUILD_DIGEST" > "$RUNNER_TEMP/image-digest/build-digest"
+          printf '%s\n' "$VERSION_DIGEST" > "$RUNNER_TEMP/image-digest/version-digest"
+
+      - name: Upload the pushed digests
+        if: steps.push.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.name }}
+          path: ${{ runner.temp }}/image-digest/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Signs the build provenance of each pushed image, as the personal agent's release does for its image. The build tag
+  # is what deployments pin and what a release relays by digest to the ROCm staging repository (image-relay.yml); a
+  # copy that keeps the digest keeps the attestation valid for it. This job checks out and runs nothing from the
+  # repository and never runs for a pull request, so the OIDC permission is never given to code a pull request
+  # controls. `gh attestation verify oci://<image>@<digest> --repo AMD-AGI/PrimusClaw` checks it.
+  attest:
+    name: Attest pushed images
+    needs: [detect-changes, build]
+    if: always() && github.event_name != 'pull_request' && needs.detect-changes.outputs.matrix != '' && needs.detect-changes.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write # sign the attestation
+      attestations: write # store it
+    steps:
+      # A leg whose build failed, or an image this workflow never pushes, uploaded no digests; that leg attests nothing.
+      - name: Fetch the pushed digests
+        id: fetch
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-digest-${{ matrix.name }}
+          path: ${{ runner.temp }}/image-digest
+
+      - name: Read the pushed digests
+        id: digests
+        if: steps.fetch.outcome == 'success'
+        env:
+          NAME: ${{ matrix.name }}
+          DIR: ${{ runner.temp }}/image-digest
+        run: |
+          set -euo pipefail
+          repository="$(cat "$DIR/repository")" build_digest="$(cat "$DIR/build-digest")" version_digest="$(cat "$DIR/version-digest")"
+          [ "$repository" = "docker.io/primussafe/$NAME" ] || { echo "::error::unexpected repository \"$repository\""; exit 1; }
+          for d in "$build_digest" "$version_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest \"$d\""; exit 1; }
+          done
+          {
+            echo "repository=$repository"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest the image's provenance
+        if: steps.digests.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.digests.outputs.repository }}
+          subject-digest: ${{ steps.digests.outputs.build-digest }}
+
+      # The two tags are two pushes of one image and normally one digest; should they differ, the other is attested too.
+      - name: Attest the version tag's provenance
+        if: steps.digests.outcome == 'success' && steps.digests.outputs.version-digest != steps.digests.outputs.build-digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.digests.outputs.repository }}
+          subject-digest: ${{ steps.digests.outputs.version-digest }}
