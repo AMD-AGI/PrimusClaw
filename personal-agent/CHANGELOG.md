@@ -23,11 +23,12 @@ answers in UTC as before).
 
 ### Fixed
 
-- `@primusclaw/personal-agent`: every message to the assistant carries the person's time zone as
+- `@primusclaw/personal-agent`: a message the person writes to the assistant carries their time zone as
   `channel_context.timezone`: the one they set with `/timezone`, else the default their quiet hours use. Claw tells the
   router what now is in that zone (the local date, weekday and time, with UTC beside it), so questions about the date,
   the weekday, the time or tomorrow ("今天星期几", "今天几号") are answered in the person's zone: asked after midnight in
-  Beijing, the answer is the local day, not the UTC one (#847).
+  Beijing, the answer is the local day, not the UTC one. An observer suggestion the person accepts is sent without it,
+  and Claw takes Asia/Shanghai for it (#847).
 
 ## 0.10.0
 
