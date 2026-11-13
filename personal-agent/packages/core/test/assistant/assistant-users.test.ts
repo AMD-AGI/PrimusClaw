@@ -177,5 +177,5 @@ it("a message the assistant understands carries the plugin too", async () => {
   assert.equal(taken, true);
   const [heard] = w.claw.heard;
   assert.equal(heard?.plugin, 9);
-  assert.deepEqual(heard.context, { channel_message_id: "m-1" });
+  assert.deepEqual(heard.context, { channel_message_id: "m-1", timezone: "Asia/Shanghai" });
 });
