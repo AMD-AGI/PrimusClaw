@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -212,8 +213,15 @@ func TestSAROffIdentityKeyUsesTheUserCR(t *testing.T) {
 func TestSAROffGrantKeyCreateChecksOwnerOnlyForAssertion(t *testing.T) {
 	for _, attest := range []bool{false, true} {
 		users := staticUsers{"u-123": {Found: true, Workspaces: []string{"lab"}}}
-		plane, runner, keys := testPlaneSAROff(t, users, attest)
+		now := time.Now()
+		auth := usercr.NewFromReader(users, usercr.WithClock(func() time.Time { return now }))
+		plane, runner, keys := testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"lab"}, func(o *grant.Options) {
+			o.Authz = auth
+			o.AttestWorkloads = attest
+		})
 		delete(users, "u-123")
+		// Past the 30s allow cache, the next create reads the User again.
+		now = now.Add(31 * time.Second)
 		_, _, err := plane.Create(context.Background(), keys["dev"], CreateBody{TemplateID: "runner"})
 		if !attest && err != nil {
 			t.Fatalf("switches off: create rechecked the owner: %v", err)
