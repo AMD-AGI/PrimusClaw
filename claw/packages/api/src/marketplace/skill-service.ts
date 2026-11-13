@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { UserSkillManifestEntry } from "@claw/protocol";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
@@ -876,6 +876,8 @@ export interface UserSkillInput {
   content: string;
   /** Supporting files to write with it: each added, or replaced when the skill has it. Files not named are kept. */
   files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+  /** `manual`: used only when the user names it, never listed. Absent: a new skill is `auto`, an existing one keeps its own. */
+  invocation?: "auto" | "manual";
 }
 
 export interface UserSkillSaveContext {
@@ -888,21 +890,29 @@ export interface UserSkillSaveContext {
   query?: Querier;
 }
 
+/** The fields of a user's save, read as given: `name`, `description`, `content`, `files`, `invocation`. */
+function normalizedInput(input: UserSkillInput): Required<Omit<UserSkillInput, "invocation">> & { invocation?: "auto" | "manual" } {
+  return {
+    name: typeof input.name === "string" ? input.name : "",
+    description: typeof input.description === "string" ? input.description.trim() : "",
+    content: typeof input.content === "string" ? input.content : "",
+    files: Array.isArray(input.files) ? input.files : [],
+    ...(input.invocation === "auto" || input.invocation === "manual" ? { invocation: input.invocation } : {}),
+  };
+}
+
 /**
- * Save a skill a user asked for, from any path (the skill routes, the save_skill tool, a confirmed draft): the name
- * rule for a new name, the size limits, no secret, no instruction hijack, room for a new skill. SKILL.md, the files
- * and the audit event are written together or not at all; a refusal writes only its own audit event, and never what
- * it refused.
+ * Every check of a user's save that needs no lock: the name rule for a new name, the size limits, no secret, no instruction hijack.
+ * The refusal, recorded, or null. Shared by a save and a draft, so a draft that could never be saved is never shown.
  */
-export async function saveUserSkill(userId: string, input: UserSkillInput, ctx: UserSkillSaveContext): Promise<SaveSkillResult> {
-  const name = typeof input.name === "string" ? input.name : "";
+async function precheckUserSkill(
+  userId: string, input: ReturnType<typeof normalizedInput>, ctx: Pick<UserSkillSaveContext, "origin" | "actor" | "sessionId" | "allowInjection" | "query">,
+): Promise<SkillWriteRefused | null> {
+  const { name, description, content, files } = input;
   const refuse = async (r: SkillWriteRefused): Promise<SkillWriteRefused> => {
     await recordRefusal(userId, name, ctx.actor, ctx.sessionId, r);
     return r;
   };
-  const description = typeof input.description === "string" ? input.description.trim() : "";
-  const content = typeof input.content === "string" ? input.content : "";
-  const files = Array.isArray(input.files) ? input.files : [];
   if (!name) return refuse({ ok: false, error: "invalid_name", message: "skill_name required" });
   if (!content.trim()) return refuse({ ok: false, error: "invalid", message: "content required" });
   const known = (await (ctx.query ?? db.query)(
@@ -928,7 +938,20 @@ export async function saveUserSkill(userId: string, input: UserSkillInput, ctx: 
     [{ file: "description", text: description }, { file: "SKILL.md", text: content }],
     { origin: ctx.origin, allowInjection: ctx.allowInjection },
   );
-  if (scanned) return refuse(scanned);
+  return scanned ? refuse(scanned) : null;
+}
+
+/**
+ * Save a skill a user asked for, from any path (the skill routes, the save_skill tool, a confirmed draft): the name
+ * rule for a new name, the size limits, no secret, no instruction hijack, room for a new skill. SKILL.md, the files
+ * and the audit event are written together or not at all; a refusal writes only its own audit event, and never what
+ * it refused.
+ */
+export async function saveUserSkill(userId: string, raw: UserSkillInput, ctx: UserSkillSaveContext): Promise<SaveSkillResult> {
+  const input = normalizedInput(raw);
+  const { name, description, content, files } = input;
+  const pre = await precheckUserSkill(userId, input, ctx);
+  if (pre) return pre;
 
   const out = await writeSkillTx(ctx.query, async (q) => {
     const saved = await saveSkill(name, userId, content, "manual", ctx.sessionId ?? undefined, description, { query: q, origin: ctx.origin });
@@ -937,6 +960,10 @@ export async function saveUserSkill(userId: string, input: UserSkillInput, ctx: 
     for (const f of files) {
       if (await writeSkillFileRow(q, userId, saved.id, { file_path: f.path, content: f.content, is_binary: f.is_binary }, "upsert")) changed = true;
     }
+    if (input.invocation) {
+      const moved = await q("UPDATE claw_skills SET invocation = $1 WHERE id = $2 AND invocation IS DISTINCT FROM $1", [input.invocation, saved.id]);
+      if (moved.rowCount) changed = true;
+    }
     // SKILL.md and the files it already has, together: a longer SKILL.md alone can pass the total.
     const over = await skillCapacityProblem(q, saved.id);
     if (over) throw new SkillRefusal(over);
@@ -944,12 +971,435 @@ export async function saveUserSkill(userId: string, input: UserSkillInput, ctx: 
     if (files.length) await refreshContentSha(q, saved.id);
     await recordSkillEvent(q, {
       userId, skillName: name, version: saved.version, op: saved.created ? "create" : "update", actor: ctx.actor,
-      sessionId: ctx.sessionId, detail: { origin: ctx.origin, files: files.map((f) => f.path) },
+      sessionId: ctx.sessionId, detail: { origin: ctx.origin, files: files.map((f) => f.path), ...(input.invocation ? { invocation: input.invocation } : {}) },
     });
     return { ...saved, changed };
   });
-  if (!out.ok) return refuse(out);
+  if (!out.ok) {
+    await recordRefusal(userId, name, ctx.actor, ctx.sessionId, out);
+    return out;
+  }
   return out;
+}
+
+// ===== Changes the user can take back (claw_skill_changes) =====
+
+/** How long a change of a skill made at the user's request can be undone. */
+export const SKILL_UNDO_TTL_HOURS = 24;
+/** How long a change is kept at all (an undo past `SKILL_UNDO_TTL_HOURS` is refused as lapsed). */
+const SKILL_CHANGE_KEEP_DAYS = 7;
+
+export type SkillChangeOp = "create" | "update" | "delete" | "disable" | "enable";
+
+/** A skill as an update found it, whole: what undoing the update puts back. */
+interface SkillState {
+  content: string;
+  description: string;
+  invocation: "auto" | "manual";
+  files: Array<{ path: string; content: string; is_binary: boolean }>;
+}
+
+/** The visible row of a skill (active or probation, not deleted), the highest version, with what an undo checks against. */
+async function visibleRow(q: Querier, userId: string, name: string): Promise<
+  { id: number; version: number; description: string; invocation: "auto" | "manual"; enabled: boolean; status: string } | null
+> {
+  const row = (await q(
+    `SELECT id, version, description, invocation, enabled, status FROM claw_skills
+      WHERE user_id = $1 AND skill_name = $2 AND status IN ('active', 'probation') AND deleted_at IS NULL
+      ORDER BY version DESC LIMIT 1`,
+    [userId, name],
+  )).rows[0];
+  return row
+    ? { id: Number(row.id), version: Number(row.version), description: row.description ?? "", invocation: row.invocation === "manual" ? "manual" : "auto", enabled: row.enabled !== false, status: row.status }
+    : null;
+}
+
+async function stateOf(q: Querier, row: { id: number; description: string; invocation: "auto" | "manual" }): Promise<{ state: SkillState; sha: string } | null> {
+  const snap = await readSkillSnapshot(q, row.id);
+  if (!snap) return null;
+  return {
+    state: { content: snap.content, description: row.description, invocation: row.invocation, files: snap.files.map((f) => ({ path: f.path, content: f.content, is_binary: f.is_binary })) },
+    sha: snap.sha,
+  };
+}
+
+async function recordChange(q: Querier, c: {
+  userId: string; name: string; op: SkillChangeOp; versionAfter?: number | null; shaAfter?: string | null; previous?: unknown; sessionId?: string | null;
+}): Promise<{ id: string; expiresAt: string }> {
+  const id = randomUUID();
+  const row = (await q(
+    `INSERT INTO claw_skill_changes (id, user_id, skill_name, op, version_after, sha_after, previous, session_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+     RETURNING created_at + make_interval(hours => $9::int) AS expires_at`,
+    [id, c.userId, c.name, c.op, c.versionAfter ?? null, c.shaAfter ?? null, c.previous === undefined ? null : JSON.stringify(c.previous), c.sessionId ?? null, SKILL_UNDO_TTL_HOURS],
+  )).rows[0];
+  return { id, expiresAt: new Date(row.expires_at).toISOString() };
+}
+
+/** What a recorded write answers beside the save: the change an undo takes back, and until when. */
+export interface RecordedChange { change_id: string; undo_expires_at: string }
+
+export interface RecordedSaveContext extends UserSkillSaveContext {
+  /** Run first inside the transaction that writes; what it throws is thrown and nothing is written (the assistant asks there again that the turn is still the user's). */
+  guard?: (q: Querier) => Promise<void>;
+}
+
+/**
+ * `saveUserSkill`, recorded so the user can undo it (`undoSkillChange`): a new skill (or one brought back) is deleted again, a new
+ * version goes back to the skill as it was. A save that changed nothing records nothing. In the caller's transaction when given one.
+ */
+export async function saveUserSkillRecorded(
+  userId: string, input: UserSkillInput, ctx: RecordedSaveContext,
+): Promise<SaveSkillResult | (Extract<SaveSkillResult, { ok: true }> & RecordedChange)> {
+  const name = typeof input.name === "string" ? input.name : "";
+  const run = async (q: Querier) => {
+    await ctx.guard?.(q);
+    await lockUserSkills(q, userId);
+    const before = name ? await visibleRow(q, userId, name) : null;
+    const previous = before ? await stateOf(q, before) : null;
+    const saved = await saveUserSkill(userId, input, { ...ctx, query: q });
+    if (!saved.ok || !saved.changed) return saved;
+    const after = await visibleRow(q, userId, name);
+    const sha = after ? (await readSkillSnapshot(q, after.id))?.sha ?? null : null;
+    const change = await recordChange(q, {
+      userId, name, op: previous && !saved.created ? "update" : "create", versionAfter: after?.version ?? saved.version, shaAfter: sha,
+      previous: previous && !saved.created ? previous.state : undefined, sessionId: ctx.sessionId,
+    });
+    return { ...saved, change_id: change.id, undo_expires_at: change.expiresAt };
+  };
+  return ctx.query ? run(ctx.query) : inTransaction(run);
+}
+
+/** A skill's state after a change was recorded (a worker's file writes after its save): an undo then takes back the whole of it. */
+export async function refreshChangeAfter(changeId: string): Promise<void> {
+  await inTransaction(async (q) => {
+    const c = (await q("SELECT user_id, skill_name FROM claw_skill_changes WHERE id = $1 AND undone_at IS NULL FOR UPDATE", [changeId])).rows[0];
+    if (!c) return;
+    const row = await visibleRow(q, c.user_id, c.skill_name);
+    const snap = row ? await readSkillSnapshot(q, row.id) : null;
+    if (row && snap) await q("UPDATE claw_skill_changes SET version_after = $2, sha_after = $3 WHERE id = $1", [changeId, row.version, snap.sha]);
+  });
+}
+
+export type SkillChangeResult =
+  | ({ ok: true; name: string; version: number | null; changed: boolean; rows?: number } & Partial<RecordedChange>)
+  | { ok: false; error: "not_found" | "full"; message: string };
+
+/** Soft-delete every version of a skill, recorded so the user can restore it (`undoSkillChange`). */
+export async function deleteUserSkillRecorded(
+  userId: string, name: string, ctx: { actor: SkillActor; sessionId?: string | null; guard?: (q: Querier) => Promise<void> },
+): Promise<SkillChangeResult> {
+  return inTransaction(async (q) => {
+    await ctx.guard?.(q);
+    await lockUserSkills(q, userId);
+    const result = await q(
+      // The time as Postgres keeps it (microseconds), so a restore finds exactly these rows.
+      "UPDATE claw_skills SET deleted_at = NOW() WHERE skill_name = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING version, deleted_at::text AS deleted_at",
+      [name, userId],
+    );
+    if (!result.rowCount) return { ok: false, error: "not_found", message: `no skill named ${name}` };
+    const version = Math.max(...result.rows.map((r: any) => Number(r.version)));
+    await recordSkillEvent(q, { userId, skillName: name, version, op: "delete", actor: ctx.actor, sessionId: ctx.sessionId });
+    const change = await recordChange(q, {
+      userId, name, op: "delete", versionAfter: version, previous: { deleted_at: String(result.rows[0].deleted_at) }, sessionId: ctx.sessionId,
+    });
+    return { ok: true, name, version, changed: true, rows: result.rowCount ?? 0, change_id: change.id, undo_expires_at: change.expiresAt };
+  });
+}
+
+/** Turn a skill off (kept, not used) or on again, recorded so the user can turn it back. The same state again changes nothing. */
+export async function setUserSkillEnabled(
+  userId: string, name: string, enabled: boolean, ctx: { actor: SkillActor; sessionId?: string | null; guard?: (q: Querier) => Promise<void> },
+): Promise<SkillChangeResult> {
+  return inTransaction(async (q) => {
+    await ctx.guard?.(q);
+    await lockUserSkills(q, userId);
+    const row = await visibleRow(q, userId, name);
+    if (!row) return { ok: false, error: "not_found", message: `no skill named ${name}` };
+    if (row.enabled === enabled) return { ok: true, name, version: row.version, changed: false };
+    await q("UPDATE claw_skills SET enabled = $3 WHERE user_id = $1 AND skill_name = $2 AND deleted_at IS NULL", [userId, name, enabled]);
+    await recordSkillEvent(q, { userId, skillName: name, version: row.version, op: enabled ? "enable" : "disable", actor: ctx.actor, sessionId: ctx.sessionId });
+    const change = await recordChange(q, { userId, name, op: enabled ? "enable" : "disable", versionAfter: row.version, sessionId: ctx.sessionId });
+    return { ok: true, name, version: row.version, changed: true, change_id: change.id, undo_expires_at: change.expiresAt };
+  });
+}
+
+export type UndoResult =
+  | { ok: true; op: SkillChangeOp; name: string; version: number | null; undone: "deleted" | "restored_version" | "restored" | "enabled" | "disabled" }
+  | { ok: false; error: "not_found" | "expired" | "undone" | "changed" | "full" | "too_large"; message: string };
+
+/**
+ * Take back one recorded change of the user's (`claw_skill_changes`): only theirs, only once, only within `SKILL_UNDO_TTL_HOURS`,
+ * and only while the skill is still as the change left it (a later save, or a later undo, makes it `changed`). Audited as the
+ * delete, rollback, restore, enable or disable it is.
+ */
+export async function undoSkillChange(
+  userId: string, changeId: string, ctx: { actor: SkillActor; sessionId?: string | null; guard?: (q: Querier) => Promise<void> },
+): Promise<UndoResult> {
+  try {
+    return await inTransaction(async (q) => {
+      await ctx.guard?.(q);
+      await lockUserSkills(q, userId);
+      const c = (await q(
+        `SELECT *, created_at < NOW() - make_interval(hours => $3::int) AS lapsed FROM claw_skill_changes
+          WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [changeId, userId, SKILL_UNDO_TTL_HOURS],
+      )).rows[0];
+      if (!c) return { ok: false, error: "not_found", message: "no change of yours has that id" };
+      if (c.undone_at) return { ok: false, error: "undone", message: "that change was undone already" };
+      if (c.lapsed) return { ok: false, error: "expired", message: `a change can be undone for ${SKILL_UNDO_TTL_HOURS} hours, and that one is older` };
+      const name: string = c.skill_name;
+      const op = c.op as SkillChangeOp;
+      const changed = (): UndoResult => ({ ok: false, error: "changed", message: `the skill ${name} has changed since, so that change is no longer the last one: nothing was undone` });
+      const row = await visibleRow(q, userId, name);
+      const event = async (eop: SkillEventOp, version: number | null) =>
+        recordSkillEvent(q, { userId, skillName: name, version, op: eop, actor: ctx.actor, sessionId: ctx.sessionId, detail: { undo: changeId, of: op } });
+      let out: UndoResult;
+      if (op === "create" || op === "update") {
+        if (!row || row.version !== Number(c.version_after) || (await readSkillSnapshot(q, row.id))?.sha !== c.sha_after) return changed();
+        if (op === "create") {
+          await q("UPDATE claw_skills SET deleted_at = NOW() WHERE user_id = $1 AND skill_name = $2 AND deleted_at IS NULL", [userId, name]);
+          await event("delete", row.version);
+          out = { ok: true, op, name, version: row.version, undone: "deleted" };
+        } else {
+          const prev = c.previous as SkillState;
+          const moved = (await q(
+            `UPDATE claw_skills SET content = $2, description = $3, invocation = $4, version = version + 1, last_accessed = NOW()
+              WHERE id = $1 RETURNING version`,
+            [row.id, prev.content, prev.description ?? "", prev.invocation === "manual" ? "manual" : "auto"],
+          )).rows[0];
+          await q("DELETE FROM claw_skill_files WHERE skill_id = $1", [row.id]);
+          for (const f of prev.files ?? []) {
+            await q(
+              `INSERT INTO claw_skill_files (skill_id, user_id, file_path, content, is_binary, size_bytes) VALUES ($1, $2, $3, $4, $5, $6)`,
+              [row.id, userId, f.path, f.content, !!f.is_binary, Buffer.byteLength(f.content, "utf8")],
+            );
+          }
+          const over = await skillCapacityProblem(q, row.id);
+          if (over) throw new SkillRefusal(over);
+          await refreshContentSha(q, row.id);
+          await event("rollback", Number(moved.version));
+          out = { ok: true, op, name, version: Number(moved.version), undone: "restored_version" };
+        }
+      } else if (op === "delete") {
+        if (row) return changed();
+        const count = Number((await q(
+          "SELECT COUNT(DISTINCT skill_name) AS n FROM claw_skills WHERE user_id = $1 AND deleted_at IS NULL", [userId],
+        )).rows[0].n);
+        if (count >= USER_SKILL_MAX) return { ok: false, error: "full", message: `skills are full (${count}/${USER_SKILL_MAX}): delete one first, then undo` };
+        const back = await q(
+          "UPDATE claw_skills SET deleted_at = NULL WHERE user_id = $1 AND skill_name = $2 AND deleted_at = $3::timestamptz RETURNING version",
+          [userId, name, (c.previous as { deleted_at?: string } | null)?.deleted_at ?? null],
+        );
+        if (!back.rowCount) return changed();
+        const version = Math.max(...back.rows.map((r: any) => Number(r.version)));
+        await event("restore", version);
+        out = { ok: true, op, name, version, undone: "restored" };
+      } else {
+        const wasEnabled = op === "enable";
+        if (!row || row.enabled !== wasEnabled) return changed();
+        await q("UPDATE claw_skills SET enabled = $3 WHERE user_id = $1 AND skill_name = $2 AND deleted_at IS NULL", [userId, name, !wasEnabled]);
+        await event(wasEnabled ? "disable" : "enable", row.version);
+        out = { ok: true, op, name, version: row.version, undone: wasEnabled ? "disabled" : "enabled" };
+      }
+      await q("UPDATE claw_skill_changes SET undone_at = NOW() WHERE id = $1", [changeId]);
+      return out;
+    });
+  } catch (err) {
+    if (err instanceof SkillRefusal) {
+      return { ok: false, error: err.refusal.error === "too_many_files" ? "too_large" : (err.refusal.error as "too_large"), message: err.refusal.message };
+    }
+    throw err;
+  }
+}
+
+/**
+ * The last change of a skill, when the user can still undo it (not undone, not lapsed), or null. Only the last: an undo takes back one
+ * step, and "undo" said again after it is not a walk further back through the skill's history.
+ */
+export async function latestUndoableChange(userId: string, name: string): Promise<{ id: string; op: SkillChangeOp } | null> {
+  const row = (await db.query(
+    `SELECT id, op, undone_at, created_at >= NOW() - make_interval(hours => $3::int) AS fresh FROM claw_skill_changes
+      WHERE user_id = $1 AND skill_name = $2 ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [userId, name, SKILL_UNDO_TTL_HOURS],
+  )).rows[0];
+  return row && !row.undone_at && row.fresh ? { id: String(row.id), op: row.op as SkillChangeOp } : null;
+}
+
+/** Changes older than a week are deleted: nothing can undo them by then. */
+export async function cleanupOldSkillChanges(): Promise<number> {
+  const result = await db.query(
+    "DELETE FROM claw_skill_changes WHERE created_at < NOW() - make_interval(days => $1::int)", [SKILL_CHANGE_KEEP_DAYS],
+  );
+  return result.rowCount ?? 0;
+}
+
+// ===== Drafts: a skill the assistant suggested, saved only when the user confirms it =====
+
+export interface SkillDraft {
+  id: string;
+  user_id: string;
+  skill_name: string;
+  description: string;
+  content: string;
+  files: Array<{ path: string; content: string; is_binary?: boolean }>;
+  /** The skill a save would change, when the name is one the user has (its current version). */
+  replaces: string | null;
+  invocation?: "auto" | "manual";
+  origin: SkillOrigin;
+  created_at: string;
+}
+
+function draftOf(row: Record<string, any>): SkillDraft {
+  const files = Array.isArray(row.files) ? row.files : [];
+  const meta = files.find((f: any) => f && f.__invocation);
+  return {
+    id: String(row.id), user_id: row.user_id, skill_name: row.skill_name, description: row.description ?? "", content: row.content,
+    files: files.filter((f: any) => f && !f.__invocation).map((f: any) => ({ path: String(f.path), content: String(f.content ?? ""), ...(f.is_binary ? { is_binary: true } : {}) })),
+    replaces: row.replaces ?? null, ...(meta ? { invocation: meta.__invocation === "manual" ? "manual" as const : "auto" as const } : {}),
+    origin: row.origin as SkillOrigin, created_at: new Date(row.created_at).toISOString(),
+  };
+}
+
+/**
+ * Keep a skill the assistant suggested as a draft (`claw_skill_drafts`), checked as a save is (so a draft that could never be saved,
+ * a secret in it above all, is refused and never shown), and room for it when the name is new. Audited as `draft`.
+ */
+export async function createSkillDraft(
+  userId: string, raw: UserSkillInput, ctx: { origin: SkillOrigin; actor: SkillActor; sessionId?: string | null; requestQuote?: string | null; query?: Querier },
+): Promise<{ ok: true; draft: SkillDraft } | SkillWriteRefused> {
+  const input = normalizedInput(raw);
+  const pre = await precheckUserSkill(userId, input, { ...ctx, allowInjection: false });
+  if (pre) return pre;
+  const q = ctx.query ?? db.query;
+  const current = (await q(
+    `SELECT version FROM claw_skills WHERE user_id = $1 AND skill_name = $2 AND status IN ('active', 'probation') AND deleted_at IS NULL
+      ORDER BY version DESC LIMIT 1`,
+    [userId, input.name],
+  )).rows[0];
+  if (!current) {
+    const count = Number((await q("SELECT COUNT(DISTINCT skill_name) AS n FROM claw_skills WHERE user_id = $1 AND deleted_at IS NULL", [userId])).rows[0].n);
+    if (count >= USER_SKILL_MAX) {
+      const r: SkillWriteRefused = { ok: false, error: "full", message: `skills are full (${count}/${USER_SKILL_MAX}). Nothing was saved; delete or update an existing skill first.` };
+      await recordRefusal(userId, input.name, ctx.actor, ctx.sessionId, r);
+      return r;
+    }
+  }
+  // The invocation rides in `files` as a marker entry: the table has no column for it, and a draft is a short-lived row.
+  const files = [...input.files.map((f) => ({ path: f.path, content: f.content, ...(f.is_binary ? { is_binary: true } : {}) })),
+    ...(input.invocation ? [{ __invocation: input.invocation }] : [])];
+  const row = (await q(
+    `INSERT INTO claw_skill_drafts (id, user_id, skill_name, description, content, files, replaces, request_quote, origin)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9) RETURNING *`,
+    [randomUUID(), userId, input.name, input.description, input.content, JSON.stringify(files),
+      current ? `v${current.version}` : null, ctx.requestQuote ?? null, ctx.origin],
+  )).rows[0];
+  await recordSkillEvent(q, {
+    userId, skillName: input.name, version: current ? Number(current.version) : null, op: "draft", actor: ctx.actor, sessionId: ctx.sessionId,
+    detail: { origin: ctx.origin, draft_id: row.id, files: input.files.map((f) => f.path) },
+  });
+  return { ok: true, draft: draftOf(row) };
+}
+
+/** One of the user's drafts that has not lapsed, or null. */
+export async function readSkillDraft(userId: string, draftId: string, q: Querier = db.query): Promise<SkillDraft | null> {
+  const row = (await q(
+    `SELECT * FROM claw_skill_drafts WHERE id = $1 AND user_id = $2 AND created_at >= NOW() - make_interval(hours => $3::int)`,
+    [draftId, userId, SKILL_DRAFT_TTL_HOURS],
+  )).rows[0];
+  return row ? draftOf(row) : null;
+}
+
+/** The user's drafts that have not lapsed, oldest first. */
+export async function pendingSkillDrafts(userId: string): Promise<SkillDraft[]> {
+  return ((await db.query(
+    `SELECT * FROM claw_skill_drafts WHERE user_id = $1 AND created_at >= NOW() - make_interval(hours => $2::int) ORDER BY created_at, id`,
+    [userId, SKILL_DRAFT_TTL_HOURS],
+  )).rows as Array<Record<string, any>>).map(draftOf);
+}
+
+/**
+ * Save a draft the user confirmed: as a save of theirs (every check again, recorded so it can be undone), and the draft is gone. A
+ * lapsed or unknown draft is `not_found`. In the caller's transaction when given one (a card's decision).
+ */
+export async function confirmSkillDraft(
+  userId: string, draftId: string, ctx: { actor: SkillActor; sessionId?: string | null; query?: Querier; guard?: (q: Querier) => Promise<void> },
+): Promise<SkillWriteRefused | (Extract<SaveSkillResult, { ok: true }> & Partial<RecordedChange> & { draft: SkillDraft })> {
+  const run = async (q: Querier) => {
+    await ctx.guard?.(q);
+    const draft = (await q(
+      `SELECT * FROM claw_skill_drafts WHERE id = $1 AND user_id = $2 AND created_at >= NOW() - make_interval(hours => $3::int) FOR UPDATE`,
+      [draftId, userId, SKILL_DRAFT_TTL_HOURS],
+    )).rows[0];
+    if (!draft) return { ok: false as const, error: "not_found" as const, message: "no draft of yours has that id (a draft lapses after a day)" };
+    const d = draftOf(draft);
+    const saved = await saveUserSkillRecorded(userId, {
+      name: d.skill_name, description: d.description, content: d.content, files: d.files, ...(d.invocation ? { invocation: d.invocation } : {}),
+    }, { origin: d.origin, actor: ctx.actor, sessionId: ctx.sessionId, query: q });
+    if (!saved.ok) return saved;
+    await q("DELETE FROM claw_skill_drafts WHERE id = $1", [draftId]);
+    return { ...saved, draft: d };
+  };
+  return ctx.query ? run(ctx.query) : inTransaction(run);
+}
+
+/** Drop a draft the user said no to. Whether there was one. */
+export async function discardSkillDraft(userId: string, draftId: string, q: Querier = db.query): Promise<boolean> {
+  return ((await q("DELETE FROM claw_skill_drafts WHERE id = $1 AND user_id = $2", [draftId, userId])).rowCount ?? 0) > 0;
+}
+
+/** The user's current skill whose SKILL.md and files are exactly these, under another name: the same skill saved twice. */
+export async function sameSkillUnderAnotherName(
+  userId: string, name: string, content: string, files: Array<{ path: string; content: string; is_binary?: boolean }>,
+): Promise<string | null> {
+  const sha = skillContentSha(content, files);
+  const row = (await db.query(
+    `SELECT skill_name FROM claw_skills
+      WHERE user_id = $1 AND content_sha = $2 AND skill_name <> $3 AND status IN ('active', 'probation') AND deleted_at IS NULL
+      ORDER BY skill_name LIMIT 1`,
+    [userId, sha, name],
+  )).rows[0];
+  return row?.skill_name ?? null;
+}
+
+/** One of the user's skills as a list shows it: the current version of each name, turned off ones included. */
+export interface UserSkillListEntry {
+  name: string;
+  version: number;
+  description: string;
+  enabled: boolean;
+  invocation: "auto" | "manual";
+  origin: SkillOrigin | null;
+  last_used_at: string | null;
+  files: number;
+}
+
+/** Every skill the user has now (not deleted), each name once at its current version, by name. */
+export async function listUserSkills(userId: string): Promise<UserSkillListEntry[]> {
+  const rows = (await db.query(
+    `SELECT DISTINCT ON (s.skill_name) s.skill_name, s.version, s.description, s.enabled, s.invocation, s.origin, s.last_used_at,
+            (SELECT COUNT(*) FROM claw_skill_files f WHERE f.skill_id = s.id) AS files
+       FROM claw_skills s
+      WHERE s.user_id = $1 AND s.status = 'active' AND s.deleted_at IS NULL
+      ORDER BY s.skill_name, s.version DESC`,
+    [userId],
+  )).rows as Array<Record<string, any>>;
+  return rows.map((r) => ({
+    name: r.skill_name, version: Number(r.version), description: r.description ?? "", enabled: r.enabled !== false,
+    invocation: r.invocation === "manual" ? "manual" : "auto", origin: (r.origin as SkillOrigin | null) ?? null,
+    last_used_at: r.last_used_at ? new Date(r.last_used_at).toISOString() : null, files: Number(r.files),
+  }));
+}
+
+/** One of the user's skills now, whole, turned off or not (for showing it to them, never for a turn): null when there is none. */
+export async function showUserSkill(userId: string, name: string): Promise<(UserSkillListEntry & { content: string; file_list: Array<{ path: string; size_bytes: number; is_binary: boolean }> }) | null> {
+  const row = await visibleRow(db.query, userId, name);
+  if (!row || row.status !== "active") return null;
+  const snap = await readSkillSnapshot(db.query, row.id);
+  if (!snap) return null;
+  const entry = (await listUserSkills(userId)).find((e) => e.name === name);
+  if (!entry) return null;
+  return { ...entry, content: snap.content, file_list: snap.files.map((f) => ({ path: f.path, size_bytes: f.size_bytes, is_binary: f.is_binary })) };
 }
 
 export async function getSkillFiles(userId: string, skillName: string): Promise<Array<{ file_path: string; size_bytes: number; is_binary: boolean; updated_at: string }>> {

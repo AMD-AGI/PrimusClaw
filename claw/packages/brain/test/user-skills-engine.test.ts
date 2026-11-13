@@ -482,3 +482,40 @@ test("P14 where the sandbox's shell cannot remove the copy, the write goes on, a
     `${ROOT}/weekly-report/scripts/collect.sh`,
   ], "when the run ends: every file there, this run's and an earlier one's");
 });
+
+test("P15 a skill the message names is given whole with the message, a manual one too, and reported used; one not named is not", async () => {
+  resetStore();
+  const okBefore = await counter("claw_user_skill_read_total", { role: "worker", outcome: "ok" });
+  const named = await run({ prompt: "Follow the user's personal skill deploy-now to ship v2" }, [{ text: "done" }]);
+  assert.ok(named.prompt.includes("## The user named their personal skill deploy-now: follow it for this task."));
+  assert.ok(named.prompt.includes("DEPLOY-BODY-MARKER"), "its whole text, though manual and never listed");
+  assert.equal(named.prompt.includes("WR-BODY-MARKER"), false, "not one that was not named");
+  assert.deepEqual(named.result.skillsUsed, { "deploy-now": 2 }, "used, at the turn's version");
+  assert.equal(await counter("claw_user_skill_read_total", { role: "worker", outcome: "ok" }) - okBefore, 1);
+  assert.equal(named.logs.includes("DEPLOY-BODY-MARKER"), false, "never logged");
+
+  resetStore();
+  const imported = await run({ prompt: "draft the notes with `pr-notes`" }, [{ text: "done" }]);
+  assert.ok(imported.prompt.includes("It was imported from someone else"));
+  const plain = await run({ prompt: "ship v2 to production" }, [{ text: "done" }]);
+  assert.equal(plain.prompt.includes("DEPLOY-BODY-MARKER"), false);
+  assert.deepEqual(reads.filter((b) => b.name === "deploy-now" && b.message_id === "m-turn").length, 0, "nothing read for a message that names none");
+  const off = await run({ prompt: "use deploy-now", user_skills_enabled: false }, [{ text: "done" }]);
+  assert.equal(off.prompt.includes("DEPLOY-BODY-MARKER"), false, "none where the API did not send the skills");
+});
+
+test("P16 save_skill hands the user's quoted request on, and says it is not saved yet", async () => {
+  resetStore();
+  const r = await run({}, [
+    { tool: "save_skill", input: { skill_name: "standup-notes", description: "standup", content: "## Steps\n1. a", request_quote: "save this as a skill", invocation: "manual" } },
+    { tool: "save_skill", input: { skill_name: "release-notes", description: "release", content: "## Steps\n1. b" } },
+    { text: "done" },
+  ]);
+  assert.deepEqual((r.result as any).pendingSkills.map((s: any) => [s.skill_name, s.request_quote ?? null, s.invocation ?? null]), [
+    ["standup-notes", "save this as a skill", "manual"], ["release-notes", null, null],
+  ]);
+  const [, afterQuoted, afterDraft] = r.bodies;
+  assert.ok(afterQuoted.includes("will be saved when this turn ends if request_quote is the user's own request"));
+  assert.ok(afterDraft.includes("is a draft"));
+  for (const body of r.bodies) assert.equal(body.includes("will be used automatically in future tasks"), false, "never told it is saved");
+});

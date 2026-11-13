@@ -111,6 +111,24 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- Personal skills are saved from the conversation (with `CLAW_USER_SKILLS_ENABLED`). When the user asks the assistant to
+  save something as a skill ("save this as a skill", 存成技能), the router saves it itself with the new tool `skill_save`,
+  quoting the user's request, which must come from the message it answers and ask for a save; the user gets a card
+  (`skill_card` on `assistant.say`) with what was saved and Undo and Edit. A skill the assistant suggests on its own
+  (`skill_draft`), or a worker's `save_skill` without the user's own request quoted (`request_quote`), is a draft: a
+  card with Save and Discard (a `skill_save` confirmation), saved only when the user presses Save, types the approval
+  command, or says yes. `skill_list`, `skill_update`, `skill_disable`, `skill_enable`, `skill_delete` and `skill_undo`
+  manage them; every change is undoable for a day (`POST /v1/users/:userId/skill-changes/:id/undo`). The same skill
+  under another name is refused as a duplicate. A secret or an instruction to override the agent is refused on every
+  path, with where it is. A skill the message names (`weekly-report`, `/report`) is given whole with the message, in a
+  router's turn and a worker's, so a `manual` skill is used. New routes for a chat's `/skills` command:
+  `GET /v1/users/:userId/skills?view=current`, `GET /v1/users/:userId/skills/:name?view=current`,
+  `POST /v1/users/:userId/skills/:name/disable|enable`, and the drafts at `/v1/users/:userId/skill-drafts`. New table
+  `claw_skill_changes`, new metric `claw_user_skill_save_total`. With the switch off nothing changes: the router's
+  request is byte for byte what it was, and the routes are as they were.
+
 ## [0.4.2] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131057` (commit 61998b05). A patch release: personal skills reach the assistant's

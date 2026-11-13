@@ -24,8 +24,9 @@ import pino from "pino";
 import { CLAW_USER_SKILLS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
+import { namedUserSkills } from "@claw/protocol";
 import {
-  readUserSkill, readUserSkillFile, userSkillManifest, type UserSkillManifestEntry,
+  pendingSkillDrafts, readUserSkill, readUserSkillFile, userSkillManifest, type UserSkillManifestEntry,
 } from "../marketplace/skill-service.js";
 import { ROUTER_SKILLS_PROMPT } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
@@ -115,17 +116,66 @@ export function renderRouterSkills(skills: readonly UserSkillManifestEntry[]): {
  * session is not one they serve. A failed read of the list costs the turn its list, never the turn, and keeps the section, so the
  * system prompt does not change because of it.
  */
-export async function routerSkillParts(userId: string, sessionId: string): Promise<{ prompt: string; list: string | null } | null> {
+export async function routerSkillParts(
+  userId: string, sessionId: string, message = "",
+): Promise<{ prompt: string; list: string | null; named: string[]; extra: string[] } | null> {
   if (!CLAW_USER_SKILLS_ENABLED) return null;
   if (!(await routerSkillsServe((t, p) => db.query(t, p), sessionId, userId))) return null;
+  let manifest: UserSkillManifestEntry[];
   try {
-    const rendered = renderRouterSkills(await userSkillManifest(userId));
-    metrics.onUserSkillListed("router", rendered ? [...rendered.text].length : 0, (rendered?.unlisted ?? 0) > 0);
-    return { prompt: ROUTER_SKILLS_PROMPT, list: rendered?.text ?? null };
+    manifest = await userSkillManifest(userId);
   } catch (err) {
     logger.error({ sessionId, userId, code: (err as { code?: string })?.code ?? "" }, "assistant.skills_list_failed");
-    return { prompt: ROUTER_SKILLS_PROMPT, list: null };
+    return { prompt: ROUTER_SKILLS_PROMPT, list: null, named: [], extra: [] };
   }
+  const rendered = renderRouterSkills(manifest);
+  metrics.onUserSkillListed("router", rendered ? [...rendered.text].length : 0, (rendered?.unlisted ?? 0) > 0);
+  // Named in the message: its whole text with the message, as Claude Code's /skill-name is, so the router does not have to decide to read
+  // it (a manual one is used only this way). A failed read costs the turn that text, never the turn.
+  const extra: string[] = [];
+  const named: string[] = [];
+  for (const name of namedUserSkills(message, manifest.map((m) => m.name))) {
+    try {
+      const block = await namedSkillBlock(userId, name);
+      if (block) { extra.push(block); named.push(name); }
+    } catch (err) {
+      logger.error({ sessionId, skill: name, code: (err as { code?: string })?.code ?? "" }, "assistant.skill_named_read_failed");
+    }
+  }
+  try {
+    const drafts = await renderSkillDrafts(userId);
+    if (drafts) extra.push(drafts);
+  } catch (err) {
+    logger.error({ sessionId, code: (err as { code?: string })?.code ?? "" }, "assistant.skill_drafts_read_failed");
+  }
+  return { prompt: ROUTER_SKILLS_PROMPT, list: rendered?.text ?? null, named, extra };
+}
+
+/** The most of a named skill's SKILL.md given with the message: one page of `skill_read`. */
+export const NAMED_SKILL_MAX_CHARS = SKILL_READ_PAGE_CHARS;
+
+/** A skill the user named, whole (its first page when long), for the turn's state. A read is a use. */
+async function namedSkillBlock(userId: string, name: string): Promise<string | null> {
+  const out = await readUserSkill(userId, name);
+  metrics.onUserSkillRead("router", out.ok ? "ok" : "not_found");
+  if (!out.ok) return null;
+  const s = out.value;
+  const chars = [...s.content];
+  const body = chars.length > NAMED_SKILL_MAX_CHARS
+    ? `${chars.slice(0, NAMED_SKILL_MAX_CHARS).join("")}\n[... more: skill_read(${JSON.stringify(s.name)}, page=2)]`
+    : s.content;
+  const note = s.origin === "import" ? `${SKILL_NOTE} ${IMPORTED_NOTE}` : SKILL_NOTE;
+  const files = s.files.length ? `\nIts files (read one with skill_read(name, path=...)): ${s.files.map((f) => f.path).join(", ")}` : "";
+  return `## The user named their personal skill ${s.name} (v${s.version}): follow it for this message\n${note}${files}\n---\n${body}\n---`;
+}
+
+/** For the router's state: the user's drafts waiting for an answer, one line each, or null. */
+async function renderSkillDrafts(userId: string): Promise<string | null> {
+  const drafts = await pendingSkillDrafts(userId);
+  if (!drafts.length) return null;
+  const lines = drafts.map((d) => `- draft_id ${d.id} | ${d.skill_name}: ${JSON.stringify((d.description || "").replace(/\s+/g, " ").slice(0, 120))}`);
+  return "Skill drafts waiting for the user's Save (nothing saved yet; when the user says yes to one in words, call skill_save with its "
+    + `draft_id and their yes quoted as request_quote):\n${lines.join("\n")}`;
 }
 
 function pageOf(v: unknown): number {

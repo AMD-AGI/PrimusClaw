@@ -71,11 +71,52 @@ export interface AssistantConfirmWrite {
   confirmation_id: string;
   /** The short id the person may type back. */
   ref: string;
-  /** `devenv_send`: an instruction for an agent on the person's own machine (`assistant/devenv-tools.ts`). */
-  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide";
+  /**
+   * `devenv_send`: an instruction for an agent on the person's own machine (`assistant/devenv-tools.ts`). `skill_save`: a personal skill
+   * the assistant drafted on its own, saved only when the person lets it through (`assistant/skill-writes.ts`); its message carries
+   * `skill_card` with what would be saved.
+   */
+  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;
+}
+
+/**
+ * A personal skill as a message shows it (`assistant/skill-writes.ts`): what was just saved, changed, turned off or deleted at the
+ * person's request, or what the assistant drafted for them to confirm. The message's text says the same in words, for a channel that
+ * draws no card. Everything here is the person's own skill, so it goes only to their own conversation, never a group's.
+ *
+ *  - `saved` (a skill created, or a new version of one), `deleted`, `disabled`, `enabled`: done already. `change_id` is what an Undo
+ *    button takes back, `POST /v1/users/me/skill-changes/{change_id}/undo` made as the person, until `undo_expires_at`: a created skill
+ *    is deleted again, an update goes back to the version before, a delete is restored, a turn off or on is turned back. An Edit
+ *    button changes the skill as it is now (`GET` then `PUT /v1/users/me/skills/{name}`).
+ *  - `draft`: nothing is saved yet. The message also carries `confirm_write` (kind `skill_save`); its two buttons are Save (`allow`)
+ *    and Discard (`deny`) on that confirmation.
+ */
+export interface AssistantSkillCard {
+  kind: "saved" | "deleted" | "disabled" | "enabled" | "draft";
+  name: string;
+  /** The version now (for `draft`, the version a save would make; null when not known). */
+  version: number | null;
+  /** `saved`: true for a new skill (or one brought back), false for a new version of one the person had. */
+  created?: boolean;
+  /** When to use it, in the person's words: what decides whether it is used without being named. */
+  description: string;
+  /** `manual`: used only when the person names it. */
+  invocation: "auto" | "manual";
+  files: Array<{ path: string; size_bytes: number }>;
+  /** The first lines of SKILL.md (at most 30 lines and 1500 characters), for the card to show; empty for `deleted`. */
+  preview: string;
+  change_id?: string;
+  undo_expires_at?: string;
+  /** `draft`: the confirmation its Save and Discard answer, the same as `confirm_write.confirmation_id`. */
+  confirmation_id?: string;
+  /**
+   * `draft` shown where the user has no assistant (a session event of the chat a worker saved from): no confirmation, the draft itself,
+   * saved with `POST /v1/users/me/skill-drafts/{draft_id}/confirm` and dropped with `DELETE` on the same path.
+   */
+  draft_id?: string;
 }
 
 /**
@@ -187,6 +228,8 @@ export interface AssistantSayPayload extends AssistantEventBase {
    */
   choices?: AssistantSayChoice;
   confirm_write?: AssistantConfirmWrite;
+  /** A personal skill the message is about (`AssistantSkillCard`); present only with `CLAW_USER_SKILLS_ENABLED`. */
+  skill_card?: AssistantSkillCard;
   /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
   files?: AssistantFile[];
   /** Present on a development environment session's own message: which session, and which of its three kinds of news. */

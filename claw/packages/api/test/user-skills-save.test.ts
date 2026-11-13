@@ -287,11 +287,12 @@ describe("personal skills: save", { skip }, () => {
         subject: `events.${sessionId}`, seq: 1, ack: () => { acks++; }, nak: () => { throw new Error("nak"); },
         data: sc.encode(JSON.stringify({
           type: "exec_complete", session_id: sessionId, task_id: "run-k10", user_id: "alice", message_id: "m-1",
-          prompt: "save it", final_text: "saved", failed: false, error_count: 0,
+          prompt: "save the deploy check as a skill", final_text: "saved", failed: false, error_count: 0,
+          // Each asked for in the user's own words, quoted: saved at once, under every check (without it, a draft: assistant-skill-save.test.ts).
           skills_to_save: [
             { skill_name: "deploy-check", content: "## Steps\n1. check", description: "Deployment checklist",
-              files: [{ path: "scripts/check.sh", content: "echo ok" }] },
-            { skill_name: "leaky", content: `token: ${FAKE_GH_TOKEN}`, description: "x" },
+              files: [{ path: "scripts/check.sh", content: "echo ok" }], request_quote: "save the deploy check as a skill" },
+            { skill_name: "leaky", content: `token: ${FAKE_GH_TOKEN}`, description: "x", request_quote: "save the deploy check as a skill" },
           ],
           skill_file_mutations: [{ action: "add", skill_name: "deploy-check", file_path: "references/notes.md", content: "notes" }],
         })),
