@@ -160,6 +160,7 @@ describe("assistant: skills drafted after a turn, and the skills a turn is told 
     assert.equal(asked.length, 1);
     assert.equal(asked[0].message, P1);
     assert.match(asked[0].conversation, /我每次都按议题、结论、待办写/, "written from the conversation");
+    assert.match(asked[0].conversation, /assistant: 议题：发布节奏。/, "with the turn's answer");
     assert.equal(asked[0].skills, "(none)", "told the skills the user has now");
     assert.deepEqual((await drafts()).map((d) => [d.skill_name, d.origin]), [["meeting-notes", "auto"]]);
     assert.deepEqual(await w.q("SELECT 1 FROM claw_skills"), [], "nothing saved");
@@ -177,7 +178,13 @@ describe("assistant: skills drafted after a turn, and the skills a turn is told 
 
   test("D2 kept rare: one card per conversation per skill, none when the turn wrote one, none unasked", async () => {
     assert.deepEqual(await turn(P1), ["drafted"]);
+    // Context of a later preference: an item's report and a say of another session are not the conversation.
+    await w.q(`INSERT INTO claw_assistant_says (say_id, user_id, item_id, text, created_at, session_id)
+      VALUES (gen_random_uuid(), 'alice', 'kwi_other', 'ITEM REPORT TEXT', NOW(), NULL),
+             (gen_random_uuid(), 'alice', NULL, 'OTHER SESSION TEXT', NOW(), 'some-other-session')`);
+    asked = [];
     assert.deepEqual(await turn("以后会议纪要都按这个来"), ["drafted_here"], "the same skill again in this conversation");
+    assert.ok(!/ITEM REPORT TEXT|OTHER SESSION TEXT/.test(asked[0]?.conversation ?? ""), asked[0]?.conversation);
     assert.equal(cards().length, 1);
 
     // The turn drafted it itself: the model is not asked.

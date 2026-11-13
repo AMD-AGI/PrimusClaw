@@ -168,10 +168,15 @@ async function conversationOf(sessionId: string, userId: string, messageId: stri
   )).rows as Array<{ content: string; at: Date }>;
   if (!users.length) return "";
   const since = users[users.length - 1].at;
+  // The assistant's own answers in this conversation up to the next message after the turn's: not a report about an item, not one
+  // shown in another session, not one of a later turn.
   const says = (await db.query(
-    `SELECT text AS content, created_at AS at FROM claw_assistant_says WHERE user_id = $1 AND created_at >= $2 AND NOT fallback
+    `SELECT text AS content, created_at AS at FROM claw_assistant_says
+      WHERE user_id = $1 AND created_at >= $2 AND NOT fallback AND item_id IS NULL AND (session_id IS NULL OR session_id = $4)
+        AND created_at < COALESCE((SELECT MIN(m.received_at) FROM claw_assistant_messages m WHERE m.session_id = $4
+              AND m.received_at > (SELECT received_at FROM claw_assistant_messages WHERE session_id = $4 AND message_id = $5)), 'infinity')
       ORDER BY created_at DESC LIMIT $3`,
-    [userId, since, CONTEXT_MESSAGES],
+    [userId, since, CONTEXT_MESSAGES, sessionId, messageId],
   )).rows as Array<{ content: string; at: Date }>;
   return [...users.map((m) => ({ ...m, who: "user" })), ...says.map((m) => ({ ...m, who: "assistant" }))]
     .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
