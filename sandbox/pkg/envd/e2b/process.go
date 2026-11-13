@@ -49,6 +49,7 @@ type proc struct {
 	trunc  bool
 	exited bool
 	code   int
+	last   time.Time
 }
 
 func newProc(pid int, tag string, cfg processConfig, cmd Command) *proc {
@@ -60,6 +61,12 @@ func newProc(pid int, tag string, cfg processConfig, cmd Command) *proc {
 func (p *proc) add(c chunk) {
 	p.mu.Lock()
 	if c.data != nil {
+		// Output from a detached descendant after the end event is drained, not kept.
+		if p.exited {
+			p.mu.Unlock()
+			return
+		}
+		p.last = time.Now()
 		if p.bytes >= maxCapture {
 			p.trunc = true
 			p.mu.Unlock()
@@ -163,10 +170,93 @@ func (s *processes) startOne(req startRequest) (*proc, error) {
 		if cmd.Exit != nil {
 			code = <-cmd.Exit
 		}
-		wg.Wait()
+		closed := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(closed)
+		}()
+		p.closeInput()
+		p.awaitOutput(closed)
 		p.finish(code, "")
 	}()
 	return p, nil
+}
+
+// Bounds on the output wait after the command exits. A descendant the command
+// detached can hold the output pipes open for as long as it runs, so the
+// stream ends without waiting for them to close.
+const (
+	OutputQuietPeriod    = 100 * time.Millisecond
+	OutputFirstByteGrace = 500 * time.Millisecond
+	OutputQuietCeiling   = 2 * time.Second
+)
+
+type outputClock struct {
+	now   func() time.Time
+	sleep func(time.Duration)
+}
+
+// WaitForOutput returns once drained closes, or once output written before the
+// wait has had a quiet period. A write older than the wait counts from the
+// start, so the quiet period is measured after the exit. Nothing written is
+// bounded by OutputFirstByteGrace. The wait never exceeds OutputQuietCeiling.
+func WaitForOutput(drained <-chan struct{}, lastWrite func() time.Time) {
+	waitForOutput(drained, lastWrite, outputClock{})
+}
+
+func waitForOutput(drained <-chan struct{}, lastWrite func() time.Time, clock outputClock) {
+	now := time.Now
+	if clock.now != nil {
+		now = clock.now
+	}
+	sleep := time.Sleep
+	if clock.sleep != nil {
+		sleep = clock.sleep
+	}
+	started := now()
+	deadline := started.Add(OutputQuietCeiling)
+	for now().Before(deadline) {
+		select {
+		case <-drained:
+			return
+		default:
+		}
+		at := lastWrite()
+		if at.IsZero() {
+			if now().Sub(started) >= OutputFirstByteGrace {
+				return
+			}
+		} else {
+			if at.Before(started) {
+				at = started
+			}
+			if now().Sub(at) >= OutputQuietPeriod {
+				return
+			}
+		}
+		sleep(10 * time.Millisecond)
+	}
+}
+
+// awaitOutput waits for the process output pipes using the shared quiet period.
+func (p *proc) awaitOutput(closed <-chan struct{}) {
+	waitForOutput(closed, func() time.Time {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.last
+	}, outputClock{})
+}
+
+// closeInput closes the process stdin pipe. The copy into the shim otherwise
+// stays blocked and the supervisor is never reaped.
+func (p *proc) closeInput() {
+	p.mu.Lock()
+	w := p.cmd.Stdin
+	p.cmd.Stdin = nil
+	p.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
+	}
 }
 
 func (p *proc) done() bool {
@@ -269,7 +359,11 @@ func (s *processes) writeInput(sel selector, data []byte) error {
 	}
 	p.mu.Lock()
 	w := p.cmd.Stdin
+	exited := p.exited
 	p.mu.Unlock()
+	if exited {
+		return rpcErr("not_found", "process not found")
+	}
 	if w == nil {
 		return rpcErr("failed_precondition", "stdin is closed")
 	}
