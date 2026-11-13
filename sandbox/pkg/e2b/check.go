@@ -12,6 +12,7 @@ import (
 	"time"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/envd/e2b/envdversion"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 )
 
@@ -20,9 +21,13 @@ const (
 	defaultPendingWait       = 15 * time.Minute
 	// maxPendingTimeoutSec is the largest caller pending wait, one day.
 	maxPendingTimeoutSec int64 = 24 * 60 * 60
-	envdVersion                = "0.1.0"
 	defaultListLimit           = 100
 )
+
+// envdVersion is the envd version reported on create and connect. It is the
+// version the EnvD of this tree serves, so the SDK enables exactly the features
+// EnvD implements (envdversion.Gates).
+const envdVersion = envdversion.Version
 
 const metadataPrefix = "agent-sandbox.io/"
 
