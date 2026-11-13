@@ -8,7 +8,7 @@
 <br>
 [![npm: @primusclaw/personal-agent](https://img.shields.io/npm/v/%40primusclaw%2Fpersonal-agent?label=%40primusclaw%2Fpersonal-agent)](https://www.npmjs.com/package/@primusclaw/personal-agent)
 [![npm: @primusclaw/connector](https://img.shields.io/npm/v/%40primusclaw%2Fconnector?label=%40primusclaw%2Fconnector)](https://www.npmjs.com/package/@primusclaw/connector)
-[![Docker image](https://img.shields.io/docker/v/primussafe/personal-agent-teams?sort=semver&label=personal-agent-teams%20image)](https://hub.docker.com/r/primussafe/personal-agent-teams)
+[![Container images: docker.io/rocm/primusclaw](https://img.shields.io/badge/images-docker.io%2Frocm%2Fprimusclaw-blue)](https://hub.docker.com/r/rocm/primusclaw/tags)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 PrimusClaw is an open platform for running LLM agents on infrastructure you
@@ -29,10 +29,10 @@ sessions on that machine, using outbound HTTPS only.
 
 | Component | What it is | Path | How it ships | Docs |
 |---|---|---|---|---|
-| **Claw** | Agent orchestration platform: API, Brain (agent loop) and Hands (in-sandbox tool server), in TypeScript | [`claw/`](claw) | Container image `docker.io/primussafe/claw` (one image, three roles), Helm chart in [`claw/deploy/charts/claw`](claw/deploy/charts/claw) | [`claw/README.md`](claw/README.md) |
-| **Personal agent** | Personal chat assistant on Claw: channel-neutral core, Node runtime, Microsoft Teams channel | [`personal-agent/`](personal-agent) | npm: [`@primusclaw/personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent), [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime), [`-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams); image `docker.io/primussafe/personal-agent-teams` | [`personal-agent/README.md`](personal-agent/README.md) |
+| **Claw** | Agent orchestration platform: API, Brain (agent loop) and Hands (in-sandbox tool server), in TypeScript | [`claw/`](claw) | Container image `docker.io/rocm/primusclaw:claw-<version>` (one image, three roles), Helm chart in [`claw/deploy/charts/claw`](claw/deploy/charts/claw) | [`claw/README.md`](claw/README.md) |
+| **Personal agent** | Personal chat assistant on Claw: channel-neutral core, Node runtime, Microsoft Teams channel | [`personal-agent/`](personal-agent) | npm: [`@primusclaw/personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent), [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime), [`-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams); image `docker.io/rocm/primusclaw:personal-agent-teams-<version>` | [`personal-agent/README.md`](personal-agent/README.md) |
 | **Connector** | `claw-connector` CLI: connects the coding agents on a developer machine to Claw | [`connector/`](connector) | npm: [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector) | [`connector/README.md`](connector/README.md) |
-| **Agent Sandbox** | Kubernetes control plane for the per-session sandbox pods; a fork of `kubernetes-sigs/agent-sandbox`, in Go, Apache-2.0 | [`sandbox/`](sandbox) | Container images `docker.io/primussafe/agent-sandbox-controlplane` and `docker.io/primussafe/agent-sandbox-envd-injector`, Helm chart in [`sandbox/deploy/helm`](sandbox/deploy/helm) | [`sandbox/README.md`](sandbox/README.md) |
+| **Agent Sandbox** | Kubernetes control plane for the per-session sandbox pods; a fork of `kubernetes-sigs/agent-sandbox`, in Go, Apache-2.0 | [`sandbox/`](sandbox) | Container images `docker.io/rocm/primusclaw:agent-sandbox-controlplane-<version>` and `docker.io/rocm/primusclaw:agent-sandbox-envd-injector-<version>`, Helm chart in [`sandbox/deploy/helm`](sandbox/deploy/helm) | [`sandbox/README.md`](sandbox/README.md) |
 | **Stack installer** | Installs Agent Sandbox, Claw and an optional LiteLLM gateway in one command | [`deploy/`](deploy) | Scripts and Helm chart in this repository | [`deploy/README.md`](deploy/README.md) |
 
 ## Architecture
@@ -136,13 +136,13 @@ describes each one. Keep the filled-in file outside any repository.
 To put the personal agent on another chat app than Teams, see
 [`personal-agent/docs/adding-a-surface.md`](personal-agent/docs/adding-a-surface.md).
 
-From the image published with release 0.1.1 (it runs as uid 65534; the state
+From the published image, here release 0.9.0 (it runs as uid 65534; the state
 volume must be writable by it):
 
 ```bash
 docker run --env-file /path/outside/the/repo/worker.env \
   -v personal-agent-data:/data \
-  docker.io/primussafe/personal-agent-teams:0.1.1
+  docker.io/rocm/primusclaw:personal-agent-teams-0.9.0
 ```
 
 To build the same image from a checkout instead, run
