@@ -20,11 +20,11 @@ import {
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
 import {
-  saveUserSkill, recordSkillFeedback,
-  addSkillFile, updateSkillFile, removeSkillFile,
+  recordSkillFeedback,
   maybeRecordTaskPattern,
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
+import { handleWorkerSkillWrites } from "../assistant/skill-writes.js";
 import { appEventIdentity } from "./app-events.js";
 import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
@@ -995,7 +995,7 @@ export const eventNotificationPorts = {
  * substituted). Production reads every one from here.
  */
 export const completionPorts = {
-  saveUserSkill,
+  handleWorkerSkillWrites,
   recordSkillFeedback,
   checkProbationGraduation,
   maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
@@ -1159,47 +1159,11 @@ async function handleComplete(
         mutations: skillFileMutations.length,
       }, CLAW_USER_SKILLS_ENABLED ? "skill.write_skipped_session_not_served" : "skill.write_skipped_flag_off");
     }
-  } else {
-    // 4. Process explicit save_skill events (from Brain's save_skill tool).
-    // Skills saved via tool are user-vouched, so source='manual' (skip probation). Every check a user's save passes
-    // (name, size, secret, instruction hijack, room) is saveUserSkill's; a refusal is audited there.
-    for (const skill of skillsToSave) {
-      try {
-        const saved = await completionPorts.saveUserSkill(userId, {
-          name: skill.skill_name, content: skill.content, description: skill.description || "",
-          files: Array.isArray(skill.files) ? skill.files : [],
-        }, { origin: "worker", actor: "model", sessionId });
-        if (saved.ok) logger.info({ skillName: skill.skill_name, sessionId, version: saved.version }, "skill.saved");
-        else logger.warn({ skillName: skill.skill_name, sessionId, reason: saved.error }, "skill.save_refused");
-      } catch (err) {
-        logger.error({ err, sessionId }, "skill.save_failed");
-      }
-    }
-
-    // 4.5. Process sub-file mutations (E2: add/update/remove_skill_file)
-    const fileWrite = { actor: "model" as const, origin: "worker" as const, sessionId };
-    for (const m of skillFileMutations) {
-      try {
-        let r;
-        if (m.action === "add") {
-          r = await addSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary }, fileWrite);
-        } else if (m.action === "update") {
-          r = await updateSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary }, fileWrite);
-        } else if (m.action === "remove") {
-          r = await removeSkillFile(userId, m.skill_name, m.file_path, fileWrite);
-        } else {
-          logger.warn({ action: m.action }, "skill_file.unknown_action");
-          continue;
-        }
-        if (r.ok) {
-          logger.info({ skill: m.skill_name, action: m.action, path: m.file_path }, "skill_file.mutation_applied");
-        } else {
-          logger.warn({ skill: m.skill_name, action: m.action, path: m.file_path, err: r.error }, "skill_file.mutation_failed");
-        }
-      } catch (err) {
-        logger.error({ err, skill: m.skill_name, action: m.action }, "skill_file.mutation_error");
-      }
-    }
+  } else if (skillWrites) {
+    // 4 + 4.5. A skill the user asked for in their own words (its request_quote) is saved now and shown with Undo; any other is a
+    // draft the user confirms first, its file writes folded in (`assistant/skill-writes.ts`). Every check a user's save passes is
+    // saveUserSkill's; a refusal is audited there.
+    await completionPorts.handleWorkerSkillWrites(sessionId, userId, skillsToSave, skillFileMutations);
   }
 
   // 5. Check pending messages (synchronous — must not be delayed by LLM calls).

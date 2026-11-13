@@ -25,7 +25,7 @@ import { createHash, randomUUID } from "node:crypto";
 import pino from "pino";
 import { readTrustedSessionCredentials } from "../auth/sealed-session-credentials.js";
 import {
-  CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, TRIGGER_MAX_PER_USER,
+  CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_USER_SKILLS_ENABLED, TRIGGER_MAX_PER_USER,
   TRIGGER_MIN_INTERVAL_MINUTES,
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -41,6 +41,7 @@ import { GithubClient } from "../github-review/github.js";
 import { briefRangeFor } from "./brief.js";
 import { turnMessage } from "./inbound.js";
 import { recordWriteConfirm, type SayDeps } from "./outbound.js";
+import type { AssistantSkillCard } from "../notifications/assistant-events.js";
 import { confirmationRef, toldNote } from "./prompts.js";
 import { toldRefs } from "./told.js";
 import { approvalCommand } from "./review-tools.js";
@@ -65,8 +66,11 @@ export const ROUTER_PROMPT_MAX = 1500;
  * (`githubCommentTool`), posted as the user only when they press it.
  */
 export type ScheduleKind = "trigger_create" | "trigger_cancel" | "github_comment";
-/** Every write a card holds: those above, and an instruction for an agent on the user's machine (`devenv-tools.ts`). */
-export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide";
+/**
+ * Every write a card holds: those above, an instruction for an agent on the user's machine (`devenv-tools.ts`), and a personal skill the
+ * assistant drafted on its own (`skill-writes.ts`).
+ */
+export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide" | "skill_save";
 /** The longest comment the router puts on a card: the card shows all of it, since the user approves exactly what is posted. */
 export const ROUTER_COMMENT_MAX = 4000;
 
@@ -190,8 +194,8 @@ async function propose(
  * the user's limit of open cards. Done only by `decideConfirmation`, when they press it or type its approval command.
  */
 export async function proposeConfirmation(
-  q: Querier, claims: AssistantTokenClaims, userId: string, kind: ConfirmKind, params: Record<string, unknown>,
-  render: { text: (ref: string) => string; allowLabel: string },
+  q: Querier, claims: Pick<AssistantTokenClaims, "sid" | "mid">, userId: string, kind: ConfirmKind, params: Record<string, unknown>,
+  render: { text: (ref: string) => string; allowLabel: string; skillCard?: (confirmationId: string) => AssistantSkillCard },
 ): Promise<{ row: Record<string, any>; announce: (() => Promise<void>) | null; subscribers: number }> {
   const pending = Number((await q(
     "SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()", [userId],
@@ -219,6 +223,7 @@ export async function proposeConfirmation(
   const ref = confirmationRef(id);
   const card = await recordWriteConfirm(q, {
     userId, sessionId: claims.sid, text: render.text(ref), turnMessageId: claims.mid,
+    ...(render.skillCard ? { skillCard: render.skillCard(id) } : {}),
     confirm: {
       confirmation_id: id, ref, kind, allow_label: render.allowLabel, expires_at: new Date(row.expires_at).toISOString(),
     },
@@ -402,7 +407,7 @@ export class DecisionRefused extends Error {
 
 export interface DecisionOutcome {
   confirmation_id: string;
-  kind: ScheduleKind;
+  kind: ConfirmKind;
   /** done | denied | expired | failed: what this answer, or the one before it, came to. */
   status: string;
   /** False when the confirmation had been answered (or had lapsed) before: nothing was done now. */
@@ -441,7 +446,13 @@ export async function decideConfirmation(input: {
       [row.confirmation_id, status, result === null ? null : JSON.stringify(result), input.via],
     )).rows[0] as Record<string, any>;
     if (row.lapsed) return outcome(await close("expired", null), false);
-    if (input.decision === "deny") return outcome(await close("denied", null), true);
+    if (input.decision === "deny") {
+      if (row.kind === "skill_save") {
+        const { decideSkillDraft } = await import("./skill-writes.js");
+        await decideSkillDraft(q, input.userId, row.params as Record<string, unknown>, false);
+      }
+      return outcome(await close("denied", null), true);
+    }
     if (row.kind === "github_comment") {
       const posted = await githubCommentPorts.post(input.userId, row.params as CommentParams);
       logger.info({ userId: input.userId, via: input.via, ok: "url" in posted }, "assistant.github_comment_decided");
@@ -453,6 +464,13 @@ export async function decideConfirmation(input: {
       const { sendConfirmed } = await import("./devenv-tools.js");
       const sent = await sendConfirmed(input.userId, String(row.confirmation_id), row.params as Record<string, unknown>);
       return outcome(await close(sent.ok ? "done" : "failed", sent), true);
+    }
+    if (row.kind === "skill_save") {
+      // A personal skill the assistant drafted, saved as the card showed it (`skill-writes.ts`, loaded here to keep the modules acyclic):
+      // every check of a save again, and a refusal fails the card with nothing saved.
+      const { decideSkillDraft } = await import("./skill-writes.js");
+      const done = await decideSkillDraft(q, input.userId, row.params as Record<string, unknown>, input.decision === "allow");
+      return outcome(await close(done.ok ? "done" : "failed", done), true);
     }
     if (row.kind === "devenv_hide") {
       // Conversations hidden or shown again in the lists, and the chat's sessions disconnected, as the card showed them.
@@ -505,7 +523,7 @@ export async function pendingConfirmations(userId: string): Promise<Array<Record
 export async function scheduleConfirmationAnswer(
   claims: AssistantTokenClaims, args: { decision: "allow" | "deny"; confirmation_id?: string },
 ): Promise<Record<string, unknown> | null> {
-  if (claims.role !== "router" || !assistantSchedulesOn()) return null;
+  if (claims.role !== "router" || !(assistantSchedulesOn() || CLAW_USER_SKILLS_ENABLED)) return null;
   const q: Querier = (text, params) => db.query(text, params);
   const { userId } = await assertLiveRun(q, claims);
   const mine = (await q(
@@ -619,6 +637,8 @@ export function describeCard(kind: string, params: Record<string, unknown> | nul
       return `post a comment as the user's GitHub account on ${oneLine(p.repo, 100)}#${String(p.number ?? "")} (no scheduled task): ${JSON.stringify(oneLine(p.body, 120))}`;
     case "devenv_send":
       return `send to ${JSON.stringify(oneLine(p.agent_id, 40))} on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${JSON.stringify(oneLine(p.text, 120))}`;
+    case "skill_save":
+      return `save the personal skill ${JSON.stringify(oneLine(p.name, 64))} the assistant drafted (no scheduled task): ${JSON.stringify(oneLine(p.description, 120))}`;
     case "devenv_hide": {
       const n = (k: string) => (Array.isArray(p[k]) ? (p[k] as unknown[]).length : 0);
       return `on the machine ${JSON.stringify(oneLine(p.machine, 60))}: hide ${n("hide")} conversation(s) from the lists, show ${n("show")} again, disconnect ${n("close")} session(s)`;

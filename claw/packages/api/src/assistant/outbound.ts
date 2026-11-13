@@ -38,6 +38,7 @@ import {
   type AssistantSayChoice,
   type AssistantSayPayload,
   type AssistantSaySource,
+  type AssistantSkillCard,
   type WorkItemNeedsYouPayload,
 } from "../notifications/assistant-events.js";
 import { deterministicEventId, enqueue, kickDelivery, onDelivered } from "../notifications/outbox.js";
@@ -196,6 +197,8 @@ type ToStore =
     /** A development environment session's own message (`remote-items.ts`). */
     remote?: AssistantRemoteNotice;
     needsIdentity?: boolean;
+    /** A personal skill the message is about (`skill-writes.ts`). */
+    skillCard?: AssistantSkillCard;
   })
   | (ToStoreBase & { type: "work_item.needs_you"; item: ItemRow; heldWrite?: AssistantHeldWrite });
 
@@ -216,7 +219,13 @@ function payloadOf(m: ToStore, createdAt: Date | string): AssistantSayPayload | 
       ...((m.noticeOfTurn ?? m.turnMessageId) ? { turn_message_id: m.noticeOfTurn ?? m.turnMessageId } : {}),
       ...(m.remote ? { remote: redactedRemote(m.remote) } : {}),
       ...(m.needsIdentity ? { needs_identity: true as const } : {}),
+      ...(m.skillCard ? { skill_card: redactedSkillCard(m.skillCard) } : {}),
     };
+}
+
+/** A skill's card as a receiver gets it: its words are masked as the message's text is, so a card never shows a key the text hid. */
+function redactedSkillCard(c: AssistantSkillCard): AssistantSkillCard {
+  return { ...c, description: redact(c.description), preview: redact(c.preview), files: c.files.map((f) => ({ path: redact(f.path), size_bytes: f.size_bytes })) };
 }
 
 /** A session's notice as a receiver gets it: what the agent and its connector wrote is redacted as the text is. */
@@ -354,6 +363,7 @@ async function sendSayEvent(
     ...(payload.type === "assistant.say" && payload.replaces ? { replaces: payload.replaces } : {}),
     ...(payload.type === "assistant.say" && payload.remote ? { remote: payload.remote } : {}),
     ...(payload.type === "assistant.say" && payload.needs_identity ? { needs_identity: true } : {}),
+    ...(payload.type === "assistant.say" && payload.skill_card ? { skill_card: payload.skill_card } : {}),
     // A write the item's worker holds for the person: the card a channel draws from its `approval.requested`, for a reader of the session.
     ...(payload.type === "work_item.needs_you" && payload.held_write ? { held_write: payload.held_write } : {}),
     fallback: payload.type === "work_item.needs_you",
@@ -1154,10 +1164,14 @@ export async function recordActionConfirm(
  * confirmation: `null` when it was stored before. `announce` after the commit.
  */
 export async function recordWriteConfirm(
-  q: Querier, input: { userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite; turnMessageId?: string }, deps: SayDeps = {},
+  q: Querier, input: {
+    userId: string; sessionId: string; text: string; confirm: AssistantConfirmWrite; turnMessageId?: string;
+    /** What a `skill_save` card would save (`skill-writes.ts`). */
+    skillCard?: AssistantSkillCard;
+  }, deps: SayDeps = {},
 ): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
   const stored = await store(q, {
-    type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
+    type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm, ...(input.skillCard ? { skillCard: input.skillCard } : {}),
     sayId: deterministicEventId("assistant.confirm_write", input.userId, input.confirm.confirmation_id),
     userId: input.userId, sessionId: input.sessionId, text: input.text,
     ...(input.turnMessageId ? { sourceTurn: input.turnMessageId } : {}),
@@ -1167,6 +1181,26 @@ export async function recordWriteConfirm(
   // evaluation) sees the card as the answer to that message (G0 2026-11-07, cat-github-wr-001: a github_comment card was stored and
   // shown, and read as no card because its event named no turn). Only the event: the delivery's payload, which `turnFirstSay` matches
   // a later say against, is unchanged.
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps, input.turnMessageId) };
+}
+
+/**
+ * A message about one of the user's personal skills (`skill-writes.ts`): in the system's own words, carrying the skill's card, and for a
+ * draft the confirmation its Save and Discard answer. Stored in the caller's transaction, as a fallback (not counted against the say limit,
+ * not taken for the turn having spoken), once per `key`: `null` when it was stored before. `announce` after the commit.
+ */
+export async function recordSkillCard(
+  q: Querier, input: {
+    userId: string; sessionId: string; text: string; card: AssistantSkillCard; key: string; confirm?: AssistantConfirmWrite; turnMessageId?: string;
+  }, deps: SayDeps = {},
+): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: null, skillCard: input.card, ...(input.confirm ? { confirmWrite: input.confirm } : {}),
+    sayId: deterministicEventId("assistant.skill_card", input.userId, input.key),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+    ...(input.turnMessageId ? { sourceTurn: input.turnMessageId } : {}),
+  });
+  if (!stored) return null;
   return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps, input.turnMessageId) };
 }
 

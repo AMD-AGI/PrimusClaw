@@ -45,6 +45,7 @@ import {
 import { modelChoiceOn } from "./model-choice.js";
 import { assistantMemoryOn, memoryForget, memoryRecall, memorySave, memoryUndo, memoryUpdate } from "./memory-tools.js";
 import { skillRead } from "./skill-tools.js";
+import { skillDelete, skillDraft, skillList, skillSave, skillSetEnabled, skillUndo, skillUpdate } from "./skill-writes.js";
 import { channelAction, confirmationAnswer, MAX_PRS, prState, reviewModeSet, reviewRestart, reviewStart } from "./review-tools.js";
 import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
@@ -118,6 +119,88 @@ function registerSkillRead(mcp: McpServer, claims: AssistantTokenClaims): void {
       path: z.string().optional().describe("One file of the skill, as its list of files names it."),
     },
     (args) => answer(claims, "skill_read", () => skillRead(claims, args)),
+  );
+}
+
+/**
+ * Saving and changing the user's personal skills (`skill-writes.ts`): the router only. A save, a change, a delete, a turn-off and an undo
+ * are refused unless the turn answers the person's own signed-in message and quotes their request; a draft only shows a card.
+ */
+function registerSkillWrites(mcp: McpServer, claims: AssistantTokenClaims, answersConfirmations: boolean): void {
+  // A draft's card is answered by its approval command too (批准 #ref): through the schedule or review tools' confirmation_answer when
+  // those are on, else through this one.
+  if (answersConfirmations) {
+    mcp.tool(
+      "confirmation_answer",
+      "Answer a skill draft's card: allow only when the user's whole message is approve #<ref> (批准 #<ref>), deny when it is deny #<ref>.",
+      { decision: z.enum(["allow", "deny"]), confirmation_id: z.string().optional().describe("The id of the card.") },
+      (args) => answer(claims, "confirmation_answer", async () => {
+        const out = await scheduleConfirmationAnswer(claims, args);
+        if (!out) throw new ToolRefused("confirmation_not_found", "that is no waiting card: allow only when the user's whole message is approve #<ref> (批准 #<ref>) of a draft's card");
+        return out;
+      }),
+    );
+  }
+  const quote = z.string().describe("The user's sentence that asks for this, copied exactly from their message.");
+  const files = z.array(z.object({ path: z.string(), content: z.string() })).optional()
+    .describe("Supporting files, each under references/, templates/, scripts/ or assets/ (for example scripts/check.sh).");
+  const invocation = z.enum(["auto", "manual"]).optional()
+    .describe("manual: used only when the user names it, never on its own. Only when the user says so.");
+  const skill = {
+    name: z.string().optional().describe("A short kebab-case English slug, such as weekly-report."),
+    description: z.string().optional().describe("What it does, when to use it and the words that call for it, in the user's language (at most 300 characters)."),
+    content: z.string().optional().describe("The whole SKILL.md: when to use it, what to ask for, the steps, the output format, the pitfalls, when not to use it."),
+    files, invocation,
+  };
+  mcp.tool(
+    "skill_list",
+    "List every personal skill of the user's (turned off and manual ones included) and the skill drafts waiting for their answer.",
+    {},
+    () => answer(claims, "skill_list", () => skillList(claims)),
+  );
+  mcp.tool(
+    "skill_save",
+    "Save a personal skill because the user asked you to (\"save this as a skill\", 存成技能): saved now, and the user is shown a card with Undo "
+    + "and Edit. A name the user already has becomes its next version. Or, with draft_id, save a draft the user said yes to.",
+    { ...skill, request_quote: quote, draft_id: z.string().optional().describe("A draft the user said yes to: only draft_id and request_quote.") },
+    (args) => answer(claims, "skill_save", () => skillSave(claims, args)),
+  );
+  mcp.tool(
+    "skill_draft",
+    "Suggest saving a personal skill, on your own idea: nothing is saved; the user is shown the draft with Save and Discard.",
+    { ...skill, name: z.string().describe("A short kebab-case English slug."), content: z.string().describe("The whole SKILL.md.") },
+    (args) => answer(claims, "skill_draft", () => skillDraft(claims, args)),
+  );
+  mcp.tool(
+    "skill_update",
+    "Change one of the user's personal skills because they asked: what you pass replaces it (content, description, invocation; files are added "
+    + "or replaced), saved now as its next version, with a card whose Undo goes back.",
+    { ...skill, name: z.string().describe("The skill's name."), request_quote: quote },
+    (args) => answer(claims, "skill_update", () => skillUpdate(claims, args)),
+  );
+  mcp.tool(
+    "skill_disable",
+    "Turn one of the user's personal skills off because they asked: kept, never used, until turned on again.",
+    { name: z.string(), request_quote: quote },
+    (args) => answer(claims, "skill_disable", () => skillSetEnabled(claims, args, false)),
+  );
+  mcp.tool(
+    "skill_enable",
+    "Turn one of the user's personal skills back on because they asked.",
+    { name: z.string(), request_quote: quote },
+    (args) => answer(claims, "skill_enable", () => skillSetEnabled(claims, args, true)),
+  );
+  mcp.tool(
+    "skill_delete",
+    "Delete one of the user's personal skills because they asked; the card's Undo restores it for a day.",
+    { name: z.string(), request_quote: quote },
+    (args) => answer(claims, "skill_delete", () => skillDelete(claims, args)),
+  );
+  mcp.tool(
+    "skill_undo",
+    "Take back the last change of one of the user's personal skills because they asked (a save, an update, a delete, a turn-off), within a day.",
+    { name: z.string(), request_quote: quote },
+    (args) => answer(claims, "skill_undo", () => skillUndo(claims, args)),
   );
 }
 
@@ -576,7 +659,10 @@ export function createAssistantMcpServer(
       registerMemoryWrites(mcp, claims);
     }
     // Not an observer's: it watches a group or a repository, where no one's personal skills are read.
-    if (userSkills && claims.role === "router") registerSkillRead(mcp, claims);
+    if (userSkills && claims.role === "router") {
+      registerSkillRead(mcp, claims);
+      registerSkillWrites(mcp, claims, !reviewTools && !assistantSchedulesOn());
+    }
   } else {
     mcp.tool(
       "report",

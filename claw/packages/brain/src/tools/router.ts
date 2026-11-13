@@ -689,12 +689,19 @@ export class ToolRouter {
       if (blocked) {
         return refuse(outcome, `Error: skill '${skillName}' not saved — blocked by safety check (${blocked}).`);
       }
+      const quote = typeof input.request_quote === "string" ? input.request_quote : "";
+      const invocation = input.invocation === "manual" || input.invocation === "auto" ? input.invocation : undefined;
       this.pendingSkills.push({
         skill_name: skillName,
         content,
         description: input.description as string,
+        ...(quote ? { request_quote: quote } : {}),
+        ...(invocation ? { invocation } : {}),
       });
-      return `Skill '${skillName}' saved. It will be used automatically in future tasks.`;
+      // Not "saved": the API decides when the turn ends. The user's own request, quoted, is saved then; anything else is a draft they confirm.
+      return quote
+        ? `Skill '${skillName}' will be saved when this turn ends if request_quote is the user's own request to save it; the user is then shown a card with Undo. If it is not, they are shown it as a draft to confirm. Do not tell them it is saved for certain: say it is on its way to them as a card.`
+        : `Skill '${skillName}' is a draft: when this turn ends the user is shown it with Save and Discard, and it is saved only if they press Save. Tell them so; do not say it is saved.`;
     }
     if (name === "add_skill_file") {
       const skillName = input.skill_name as string || "";
@@ -848,11 +855,13 @@ export class ToolRouter {
   private allToolSchemas(): ToolSchema[] {
     return [
       ...MEMORY_TOOL_SCHEMAS,
-      { name: "save_skill", description: "Save the current approach as a reusable skill (the main SKILL.md). Use when: (1) user explicitly asks to save a workflow, (2) you completed a complex multi-step task with reusable value. To attach supporting scripts/templates/docs to this skill, follow up with add_skill_file. Write content and description in the user's language.", input_schema: {
+      { name: "save_skill", description: "Save the current approach as one of the user's personal skills (the main SKILL.md). Use when: (1) the user explicitly asks to save a workflow as a skill: pass their words as request_quote and it is saved, with a card they can undo; (2) you completed a complex multi-step task with reusable value: leave request_quote out and it becomes a draft the user confirms first. To attach supporting scripts/templates/docs to this skill, follow up with add_skill_file. Write content and description in the user's language.", input_schema: {
         type: "object", properties: {
           skill_name: { type: "string", description: "Short kebab-case English slug, e.g. 'react-scaffold' (name is always English for consistency, content/description follow user language)" },
           description: { type: "string", description: "2-4 sentences: what the skill does, when to use it, when NOT to use it" },
           content: { type: "string", description: `Full SKILL.md text with ## Goal, ## Steps, ## Notes (max ${SKILL_MD_MAX_CHARS} chars)` },
+          request_quote: { type: "string", description: "Only when the user asked to save this as a skill: their sentence that asks for it, copied exactly from what they wrote. Never made up." },
+          invocation: { type: "string", enum: ["auto", "manual"], description: "manual: used only when the user names it. Only when the user says so." },
         }, required: ["skill_name", "content", "description"],
       }},
       { name: "add_skill_file", description: "Attach a supporting file to an existing skill (script, template, reference doc). Use after save_skill when the skill needs accompanying assets the Agent can later read or execute. file_path must start with one of: references/, templates/, scripts/, assets/", input_schema: {

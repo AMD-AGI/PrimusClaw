@@ -91,7 +91,7 @@ beforeEach(async () => {
   calls = [];
   const spy = (name: string, result: unknown = undefined) => async () => { calls.push(name); return result; };
   Object.assign(completionPorts, originalPorts, {
-    saveUserSkill: spy("saveUserSkill", { ok: true, id: 1, version: 1, created: true }),
+    handleWorkerSkillWrites: spy("handleWorkerSkillWrites"),
     recordSkillFeedback: spy("recordSkillFeedback"),
     checkProbationGraduation: spy("checkProbationGraduation"),
     maybeSummarize: spy("maybeSummarize"),
@@ -138,7 +138,7 @@ async function consume(event: Record<string, unknown>): Promise<void> {
 }
 
 const SIDE_EFFECTS = [
-  "saveUserSkill", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
+  "handleWorkerSkillWrites", "recordSkillFeedback", "checkProbationGraduation", "maybeSummarize",
   "maybeRecordTaskPattern", "enqueueEvolutionJob", "recordRunFinished",
 ];
 

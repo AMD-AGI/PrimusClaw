@@ -662,6 +662,46 @@ func TestReconcileKeepsMissingPendingSandboxWithinTemplateWindow(t *testing.T) {
 	}
 }
 
+func TestReconcileEndsPresentPendingSandboxAtDeadline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, reclaimer := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	svc.exists = memExists{}
+	svc.reclaimer = reclaimer
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60, PendingTimeoutSec: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxPending {
+		t.Fatalf("pending sandbox ended early: %+v", view.Sandboxes[0])
+	}
+	clock = now.Add(90 * time.Second)
+	svc.ReapOnce(context.Background())
+	view, err = svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxEnded || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout") {
+		t.Fatalf("present pending sandbox was kept: %+v", view.Sandboxes[0])
+	}
+	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-1" {
+		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
 func TestExtendRejectsEarlierExpiry(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
@@ -898,6 +938,37 @@ func TestTimeoutCannotOutliveGrant(t *testing.T) {
 	}
 	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 100); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The lifetime cap of a timeout change counts from the time the sandbox was first running.
+func TestTimeoutCapCountsFromRunning(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(2 * time.Hour))
+	req.MaxSandboxSeconds = 600
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(400 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{SandboxName: "sbx-1"}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(500 * time.Second)
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 500); err != nil {
+		t.Fatalf("timeout within the cap from running: %v", err)
+	}
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 501); !IsReason(err, "timeout_not_allowed") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -1150,6 +1221,36 @@ func TestIssueRejectsReservedAppRunID(t *testing.T) {
 		if err := validateIssue(req, now); err != nil {
 			t.Fatalf("%s: err = %v", appRunID, err)
 		}
+	}
+}
+
+// A Workload deletion observed after the pending deadline does not replace
+// the pending_timeout reason.
+func TestFailSandboxKeepsPendingTimeout(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{
+		"pending_timeout: not running after 1s (pendingTimeoutSec=1)",
+		"sandbox_create_failed: workload sbx-1 is being deleted: phase NotReady: In queue",
+	} {
+		if err := svc.FailSandbox(context.Background(), req.GrantID, "sbx-1", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil || len(view.Sandboxes) != 1 || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout: ") {
+		t.Fatalf("sandboxes=%+v err=%v", view.Sandboxes, err)
 	}
 }
 

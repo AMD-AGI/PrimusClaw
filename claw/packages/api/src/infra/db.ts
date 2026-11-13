@@ -1883,6 +1883,24 @@ export async function initDb(): Promise<void> {
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_user ON claw_skill_drafts(user_id, created_at)");
     await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_created ON claw_skill_drafts(created_at)");
+    // A change to a personal skill that the user can take back for a while (`undoSkillChange`): what it was before (`previous`, for an
+    // update the whole skill, for a delete when it was deleted) and what it is after, so an undo applies only to the skill as the change
+    // left it. Kept a week.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_changes (
+        id             TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        skill_name     TEXT NOT NULL,
+        op             TEXT NOT NULL CHECK (op IN ('create', 'update', 'delete', 'disable', 'enable')),
+        version_after  INT,
+        sha_after      TEXT,
+        previous       JSONB,
+        session_id     TEXT,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        undone_at      TIMESTAMPTZ
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_changes_user ON claw_skill_changes(user_id, skill_name, created_at)");
 
     // Soft-delete support
     const addDeleted = async (table: string) => {

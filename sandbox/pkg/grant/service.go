@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -451,6 +452,7 @@ func (s *Service) ReapOnce(ctx context.Context) {
 		}
 		if g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.promotePending(ctx, g)
+			s.expireOverduePending(ctx, g)
 		}
 		if s.exists != nil && g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.dropMissing(ctx, g)
@@ -512,6 +514,43 @@ func (s *Service) Run(ctx context.Context, every time.Duration) {
 			s.ReapOnce(ctx)
 		}
 	}
+}
+
+// expireOverduePending ends a pending sandbox whose deadline has passed and the Workload is still present.
+// The deadline is StartedAt plus PendingTimeoutSec on the grant, so it holds after a restart.
+func (s *Service) expireOverduePending(ctx context.Context, g *runtimev1alpha1.SandboxGrant) {
+	if s == nil || s.exists == nil {
+		return
+	}
+	now := s.now()
+	for _, ref := range g.Status.Sandboxes {
+		if !pendingPastDeadline(ref, now) {
+			continue
+		}
+		present, err := s.exists.Exists(ctx, SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID})
+		if err != nil || !present {
+			continue
+		}
+		reason := "pending_timeout: not running after " + strconv.FormatInt(ref.PendingTimeoutSec, 10) + "s"
+		ended, err := s.ExpirePending(ctx, g.Name, ref.ID, reason)
+		if err != nil || !ended {
+			continue
+		}
+		if s.reclaimer == nil {
+			continue
+		}
+		if err := s.reclaimer.Reclaim(ctx, SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID}); err != nil {
+			log.Warn("pending sandbox reclaim failed", "grant", g.Name, "sandbox", ref.ID, "error", err)
+		}
+	}
+}
+
+// pendingPastDeadline reports whether a pending sandbox has a deadline and that deadline has passed.
+func pendingPastDeadline(ref runtimev1alpha1.GrantSandboxRef, now time.Time) bool {
+	if ref.State != runtimev1alpha1.SandboxPending || ref.PendingTimeoutSec <= 0 || ref.StartedAt.IsZero() {
+		return false
+	}
+	return !now.Before(ref.StartedAt.Time.Add(time.Duration(ref.PendingTimeoutSec) * time.Second))
 }
 
 // promotePending asks the control plane to adopt a pending sandbox that is already running.

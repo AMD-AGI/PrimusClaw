@@ -90,6 +90,8 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		return e2b.CreateResult{}, fmt.Errorf("safe workload client is not configured")
 	}
 
+	// The lifetime counts from the time the sandbox is running, not from the create.
+	running := time.Now()
 	info := &store.SandboxInfo{
 		Kind:         sandboxKind,
 		SessionID:    req.SandboxID,
@@ -98,8 +100,8 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		PodIP:        podIP,
 		PodPort:      port,
 		CreatedAt:    now,
-		LastActivity: now,
-		ExpiresAt:    now.Add(ttl),
+		LastActivity: running,
+		ExpiresAt:    running.Add(ttl),
 		Status:       "running",
 		UserID:       req.UserID,
 		UserName:     req.UserName,

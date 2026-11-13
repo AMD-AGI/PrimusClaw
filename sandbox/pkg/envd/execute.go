@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
+	"sigs.k8s.io/agent-sandbox/pkg/envd/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/envd/egress"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -274,54 +275,24 @@ func awaitTrackedExit(exitCh <-chan int, timer *time.Timer, stop func()) {
 }
 
 // How long the output path must stay silent before a response is built from it.
-const outputQuietPeriod = 100 * time.Millisecond
+const outputQuietPeriod = e2b.OutputQuietPeriod
 
 // Ceiling on that wait. Descendants the command detached hold the same pipe and
 // may keep writing, so neither the drain signal nor silence is guaranteed to
 // arrive, and the response has to be bounded regardless.
-const outputQuietCeiling = 2 * time.Second
+const outputQuietCeiling = e2b.OutputQuietCeiling
 
 // How long to wait for a first byte when nothing has been written yet. Long
 // enough for output the exit status overtook to land, short of the ceiling so a
 // silent command that detached a child does not pay all of it.
-const outputFirstByteGrace = 500 * time.Millisecond
+const outputFirstByteGrace = e2b.OutputFirstByteGrace
 
 // awaitOutputQuiet resynchronises the exit status with the output it overtook.
-//
-// The exit status travels on its own descriptor while output travels through a
-// pipe and a copy goroutine, so the status routinely overtakes the last bytes
-// the command wrote.
-//
-// `drained` closing is the real answer: it is the point at which the supervisor
-// has been reaped and os/exec has joined the copy goroutines, so nothing can
-// arrive afterwards. It cannot be waited on alone, because a detached
-// descendant inherits the same pipe and holds it open for as long as it runs --
-// which is why silence and a ceiling remain underneath it.
-//
-// Silence is only evidence once something has been written. A buffer that has
-// received nothing carries a zero timestamp, and the age of a zero timestamp is
-// quiet by any measure; treating that as completion is what answered with an
-// exit status and no output. Nothing written is bounded by
-// outputFirstByteGrace instead.
+// The wait is the one the e2b stream uses: a drained supervisor ends it, a write
+// older than the exit still pays the quiet period, and nothing written is
+// bounded by the first-byte grace.
 func awaitOutputQuiet(drained <-chan struct{}, lastWrite func() time.Time) {
-	started := time.Now()
-	deadline := started.Add(outputQuietCeiling)
-	for time.Now().Before(deadline) {
-		select {
-		case <-drained:
-			return
-		default:
-		}
-		at := lastWrite()
-		if at.IsZero() {
-			if time.Since(started) >= outputFirstByteGrace {
-				return
-			}
-		} else if time.Since(at) >= outputQuietPeriod {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	e2b.WaitForOutput(drained, lastWrite)
 }
 
 // finalizeTimedOutCommand stops the tracked tree and always reports 124,

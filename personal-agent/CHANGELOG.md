@@ -15,7 +15,16 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.9.0
+
+A minor release, because core's exported API changes incompatibly: `ClawPort` gains a required member, `skills`
+(`ClawSkillsPort`), so code that implements `ClawPort` itself must add it (the packaged Claw client does). It brings
+the person's personal skills into the chat (#825). The store is unchanged; nothing to do for a deployment of the
+published packages.
+
+**Claw:** the skill cards and `/skills` need claw-v0.4.4 or later (personal skills saved from the conversation,
+AMD-AGI/PrimusClaw#823) with `CLAW_USER_SKILLS_ENABLED=true`. Against an older Claw, or with that setting off, `/skills`
+answers that the skills could not be read, or lists none; nothing else changes.
 
 ### Added
 
@@ -24,11 +33,11 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   saved, changed, turned off or deleted, with **Undo** (the change taken back in Claw, once) and, for a saved one,
   **Edit** (its description and SKILL.md in a form; Save changes saves the next version, with its own Undo); a draft the
   assistant suggested is its held write's card with **Save** and **Discard**. `/skills` in a 1:1 chat lists the person's
-  skills and shows, turns off, turns on or deletes one, each answered with the skill's card and Undo; a group chat never
-  lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
+  skills and shows one (its description, SKILL.md and files), or turns one off, turns it on or deletes it, each of
+  these three answered with the skill's card and Undo; a group chat never lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
   `skillCard` and `skillEdit` views; the store is unchanged (a card's record is a held-write card of kind `skill_undo`).
-  Needs a Claw with the skill routes of personal skills saved from the conversation; on an older Claw `/skills` says
-  they are not available.
+  Needs claw-v0.4.4 or later with `CLAW_USER_SKILLS_ENABLED=true` (see above); a Claw without the skill routes is
+  told by `/skills` that they are not available (#825).
 
 ## 0.8.1
 

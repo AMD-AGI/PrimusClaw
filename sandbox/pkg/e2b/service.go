@@ -217,6 +217,11 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
+	pending, err := pendingWait(tpl.Pending, body.Metadata[pendingTimeoutMetadata])
+	if err != nil {
+		s.grants.AuditDenied(ctx, grantID, "", err)
+		return SandboxResponse{}, 0, err
+	}
 	var workspace string
 	if who.owner {
 		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
@@ -278,7 +283,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Namespace:         s.namespace,
 		GPUs:              tpl.GPUs,
 		TimeoutSec:        timeoutSec,
-		PendingTimeoutSec: int64(tpl.Pending / time.Second),
+		PendingTimeoutSec: int64(pending / time.Second),
 		IdempotencyKey:    metadata[idempotencyMetadataKey],
 		AccessTokenHash:   hash,
 		Metadata:          metadata,
@@ -299,15 +304,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		return SandboxResponse{}, 0, err
 	}
-	if s.runner == nil {
-		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-		return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
-	}
-	// Placement outlives the HTTP request. A gateway close at 180s must not
-	// delete the Workload or spend the idempotency key while the pod is still pending.
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tpl.Pending)
-	defer cancel()
-	result, runErr := s.runner.Create(runCtx, CreateRequest{
+	result, err := s.place(ctx, grantID, sandboxID, pending, CreateRequest{
 		SandboxID:     sandboxID,
 		TemplateID:    tpl.ID,
 		Namespace:     s.namespace,
@@ -325,17 +322,8 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
 	})
-	if runErr != nil {
-		if errors.Is(runErr, ErrTemplateMissing) {
-			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-			return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "template_unavailable", tpl.ID)
-		}
-		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			failed = grant.Op(http.StatusServiceUnavailable, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
-		}
-		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
-		return SandboxResponse{}, 0, failed
+	if err != nil {
+		return SandboxResponse{}, 0, err
 	}
 	running := grant.RunningUpdate{
 		SandboxName: result.SandboxName,
@@ -359,6 +347,59 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	ref.State = runtimev1alpha1.SandboxRunning
 	ref.SandboxName = result.SandboxName
 	return createdResponse(ref, token), http.StatusCreated, nil
+}
+
+// place waits up to pending for the runner to start the sandbox.
+// A gateway close does not cancel the placement. At the deadline a sandbox that
+// is not running yet is ended as pending_timeout before the runner is cancelled.
+func (s *Service) place(ctx context.Context, grantID, sandboxID string, pending time.Duration, req CreateRequest) (CreateResult, error) {
+	if s.runner == nil {
+		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+		return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
+	}
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	expired := make(chan bool, 1)
+	timer := time.AfterFunc(pending, func() {
+		ended, err := s.grants.ExpirePending(context.WithoutCancel(ctx), grantID, sandboxID, pendingTimeoutError(pending, "").Error())
+		if err == nil && !ended {
+			expired <- false
+			return
+		}
+		expired <- true
+		cancel()
+	})
+	result, runErr := s.runner.Create(runCtx, req)
+	timedOut := !timer.Stop() && <-expired
+	if runErr != nil {
+		if errors.Is(runErr, ErrTemplateMissing) {
+			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+			return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "template_unavailable", req.TemplateID)
+		}
+		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		if timedOut {
+			failed = pendingTimeoutError(pending, runErr.Error())
+		}
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	if timedOut {
+		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
+		failed := pendingTimeoutError(pending, "")
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	return result, nil
+}
+
+// pendingTimeoutError reports a sandbox that was not running within its pending wait.
+// cause is the last state the runner observed, when known.
+func pendingTimeoutError(pending time.Duration, cause string) *grant.OpError {
+	detail := "not running after " + pending.String() + " (pendingTimeoutSec=" + strconv.FormatInt(int64(pending/time.Second), 10) + ")"
+	if cause != "" {
+		detail += ": " + cause
+	}
+	return grant.Op(http.StatusServiceUnavailable, "pending_timeout", detail)
 }
 
 // spentDetail is the 410 body of a spent key: the sandbox id, then the stored end reason.
@@ -722,7 +763,8 @@ func createdResponse(ref runtimev1alpha1.GrantSandboxRef, token string) SandboxR
 	}
 }
 
-// detail is the SandboxDetail body. endAt is the expiry, startedAt plus the
+// detail is the SandboxDetail body. startedAt is the time the sandbox was
+// first running, else its create time; endAt is the expiry, startedAt plus the
 // sandbox timeout, and state is running. cpuCount and memoryMB meet the
 // schema minimum when the template does not set them.
 func (s *Service) detail(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) SandboxResponse {
@@ -733,7 +775,10 @@ func (s *Service) detail(ctx context.Context, grantID string, ref runtimev1alpha
 		}
 	}
 	cpu, mem, disk := sandboxSize(spec)
-	started := ref.StartedAt.Time
+	started := ref.RunningAt.Time
+	if started.IsZero() {
+		started = ref.StartedAt.Time
+	}
 	if started.IsZero() {
 		started = time.Now()
 	}

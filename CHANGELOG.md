@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.2 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.8.1 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.9.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -110,6 +110,31 @@ the chart package (templates, default values and metadata); it is not a Claw
 release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
+
+## [0.4.4] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131535` (commit ce688380). A patch release: personal skills are saved from the
+conversation, with a card to undo or edit, while `CLAW_USER_SKILLS_ENABLED` is on. Schema: the new table
+`claw_skill_changes`, added at start-up. No new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4). Personal agent 0.9.0 shows the cards and `/skills`.
+
+### Added
+
+- Personal skills are saved from the conversation (with `CLAW_USER_SKILLS_ENABLED`). When the user asks the assistant to
+  save something as a skill ("save this as a skill", 存成技能), the router saves it itself with the new tool `skill_save`,
+  quoting the user's request, which must come from the message it answers and ask for a save; the user gets a card
+  (`skill_card` on `assistant.say`) with what was saved and Undo and Edit. A skill the assistant suggests on its own
+  (`skill_draft`), or a worker's `save_skill` without the user's own request quoted (`request_quote`), is a draft: a
+  card with Save and Discard (a `skill_save` confirmation), saved only when the user presses Save, types the approval
+  command, or says yes. `skill_list`, `skill_update`, `skill_disable`, `skill_enable`, `skill_delete` and `skill_undo`
+  manage them; every change is undoable for a day (`POST /v1/users/:userId/skill-changes/:id/undo`). The same skill
+  under another name is refused as a duplicate. A secret or an instruction to override the agent is refused on every
+  path, with where it is. A skill the message names (`weekly-report`, `/report`) is given whole with the message, in a
+  router's turn and a worker's, so a `manual` skill is used. New routes for a chat's `/skills` command:
+  `GET /v1/users/:userId/skills?view=current`, `GET /v1/users/:userId/skills/:name?view=current`,
+  `POST /v1/users/:userId/skills/:name/disable|enable`, and the drafts at `/v1/users/:userId/skill-drafts`. New table
+  `claw_skill_changes`, new metric `claw_user_skill_save_total`. With the switch off nothing changes: the router's
+  request is byte for byte what it was, and the routes are as they were (#823).
 
 ## [0.4.3] - 2026-11-13
 

@@ -56,14 +56,18 @@ func (s *Server) startE2BCommand(argv []string, dir string, env map[string]strin
 			_ = stdinR.Close()
 		}
 	}()
-	return e2brpc.Command{
+	cmd := e2brpc.Command{
 		PID:    pid,
 		Stdout: stdoutR,
 		Stderr: stderrR,
-		Stdin:  stdinW,
 		Exit:   exitCh,
 		Stop:   stop,
-	}, nil
+	}
+	// A nil *io.PipeWriter stored in the interface is not a nil Stdin, and Write panics.
+	if withStdin {
+		cmd.Stdin = stdinW
+	}
+	return cmd, nil
 }
 
 // childEnv builds the environment passed to an E2B command.
