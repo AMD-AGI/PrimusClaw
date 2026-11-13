@@ -19,7 +19,7 @@ To run your own from the published packages or image, start with the [quick star
 your own machine without Teams in about five minutes, then a Teams deployment and a connected developer machine.
 
 > **Status.** Released as 0.x: the npm packages, the Teams ingress's Function package and the
-> `docker.io/primussafe/personal-agent-teams` image (see
+> `docker.io/rocm/primusclaw:personal-agent-teams-<version>` image (see
 > [CHANGELOG.md](CHANGELOG.md)). Configuration and plugin interfaces may still change between minor releases.
 
 ## Packages
