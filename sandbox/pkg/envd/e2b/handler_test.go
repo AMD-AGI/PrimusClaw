@@ -459,18 +459,21 @@ func execStarter(ws string) Starter {
 			}
 			exitCh <- code
 		}()
-		return Command{
+		started := Command{
 			PID:    cmd.Process.Pid,
 			Stdout: stdoutR,
 			Stderr: stderrR,
-			Stdin:  stdinW,
 			Exit:   exitCh,
 			Stop: func() {
 				if cmd.Process != nil {
 					_ = cmd.Process.Kill()
 				}
 			},
-		}, nil
+		}
+		if withStdin {
+			started.Stdin = stdinW
+		}
+		return started, nil
 	}
 }
 
