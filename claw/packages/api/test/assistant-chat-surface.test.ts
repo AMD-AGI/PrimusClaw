@@ -41,7 +41,7 @@ test("CS3 the GitHub line tells a person without GitHub to bind it where they ta
   const other = renderRouterReadSection({ ...shown, where: "in the chat" });
   assert.match(other, /sending \/github bind to the assistant in the chat \(/);
   assert.doesNotMatch(other, /Teams/);
-  assert.match(renderRouterReadSection({ ...shown, name: "Helper" }), /sending \/github bind to Helper in Teams \(/);
+  assert.match(renderRouterReadSection({ ...shown, name: "Helper" }), /sending \/github bind to "Helper" in Teams \(/);
 });
 
 test("CS4 a turn's own message decides its channel, read beside its reply language; only a turn without one follows the latest", async () => {

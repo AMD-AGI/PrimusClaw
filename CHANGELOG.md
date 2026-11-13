@@ -114,9 +114,9 @@ release version, and its `appVersion` stays `latest`.
 ### Added
 
 - `channel_context.assistant_name` on an inbound assistant message: the name a client's people call the assistant by
-  (letters, digits, spaces and `. _ ' -`, at most 64 characters; anything else is dropped, never refused). The router
-  is told it is that assistant, by that name, in its self section (`router-self-v2`), the GitHub binding line
-  (`router-read-v17`) and the attached-chat line (#834).
+  (letters, digits, spaces and `_ ' -`, at most 32 characters and 4 words; anything else, sentence punctuation
+  included, is dropped, never refused). The router is told it is that assistant, by that name quoted as a name only,
+  in its self section (`router-self-v2`), the GitHub binding line (`router-read-v17`) and the attached-chat line (#834).
 
 ### Changed
 

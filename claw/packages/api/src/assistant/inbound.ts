@@ -28,7 +28,10 @@ import { redactStoredText, redactStoredValue } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
 import { messageSurface, recordSurfaceUsed } from "../notifications/surfaces.js";
+import { assistantNameOf } from "./assistant-name.js";
 import { isChosenLanguage, type ChosenLanguage } from "./language.js";
+
+export { ASSISTANT_NAME_MAX, ASSISTANT_NAME_WORDS_MAX, assistantNameOf } from "./assistant-name.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
 const logger = pino({ name: "assistant-inbound" });
@@ -142,21 +145,6 @@ export interface ChannelContext {
    * names none, and the assistant is told of itself without a name. Claw names no client itself: a name is only ever the client's.
    */
   assistant_name?: string;
-}
-
-/** The longest assistant name kept; a longer one, or one with characters a name does not have, is no name. */
-export const ASSISTANT_NAME_MAX = 64;
-
-/**
- * The assistant's name as a client sends it: letters, digits, plain spaces and `. _ ' -`, at most ASSISTANT_NAME_MAX characters
- * once its runs of spaces are one; a tab or line break makes it no name. Anything else is no name (undefined), never a reason to
- * refuse the message: the name goes into the prompt as words, so it can carry no markup, quote or line of its own.
- */
-export function assistantNameOf(raw: unknown): string | undefined {
-  // A line break (or any other control or separator but the plain space) is never part of a name: it is no name.
-  if (typeof raw !== "string" || /[^\S ]/u.test(raw)) return undefined;
-  const name = raw.replace(/ +/g, " ").trim();
-  return name.length <= ASSISTANT_NAME_MAX && /^[\p{L}\p{N}](?:[\p{L}\p{N} ._'-]*[\p{L}\p{N}.])?$/u.test(name) ? name : undefined;
 }
 
 /**

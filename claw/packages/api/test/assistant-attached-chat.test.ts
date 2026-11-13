@@ -95,7 +95,7 @@ test("AC3 a chat whose session card is the window says the chat box comes to the
   assert.ok(!card.includes("What the user types in this chat goes to that session"), card);
   const chatContext = parseChannelContext({ attached: { ...ATTACHED, phase: "attached", chat_box: "chat" }, assistant_name: "Helper" });
   const chat = renderAttachedState(chatContext.attached!, chatContext.assistant_name);
-  assert.ok(chat.includes("goes to that session") && chat.includes("starts with @Helper"), chat);
+  assert.ok(chat.includes("goes to that session") && chat.includes('starts with "@Helper"'), chat);
   // A client that names no assistant: the mention is said without a name, and no name is made up for it.
   const unnamed = renderAttachedState(chatContext.attached!);
   assert.ok(unnamed.includes("A message that @mentions you, and a request sent on the user's behalf, come to you instead"), unnamed);
@@ -105,7 +105,7 @@ test("AC3 a chat whose session card is the window says the chat box comes to the
   const watching = renderAttachedState(parseChannelContext({ attached: { ...ATTACHED, chat_box: "card" } }).attached!);
   assert.ok(watching.includes("only watches") && watching.includes("chat box comes to you"), "a watched session takes nothing; the chat box is the assistant's");
   const watchingChat = renderAttachedState(parseChannelContext({ attached: ATTACHED }).attached!, "Helper");
-  assert.ok(watchingChat.includes("only watches") && watchingChat.includes("starts with @Helper"), "chat mode: as before");
+  assert.ok(watchingChat.includes("only watches") && watchingChat.includes('starts with "@Helper"'), "chat mode: as before");
 });
 
 test("AC2 the router is told which session, in words it can say back", async () => {
