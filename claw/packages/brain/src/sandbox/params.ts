@@ -15,12 +15,12 @@
  * construct a real `sandbox_spec`.
  */
 import type { ExecuteRequest, SandboxSpec, SandboxSpecCreate, SandboxSpecUse } from "@claw/protocol";
-import { TOPOLOGY_HANDOFF_SCHEMA, type TopologyHandoffV1 } from "@claw/protocol";
+import { backendRequiresDisaggregatedPd, TOPOLOGY_HANDOFF_SCHEMA, type TopologyHandoffV1 } from "@claw/protocol";
 import { LEGACY_TOPOLOGY_ENV } from "../config.js";
 import { normalizeWorkloadResourcesEntry } from "./workload-resources.js";
 import { isReviewProfile } from "../agent/review-profile.js";
 // Type-only: avoids a runtime import cycle (ensure.ts -> sandbox/ensure-hands.ts -> sandbox/params.ts).
-import type { MultiNodeContext } from "./multi-node/types.js";
+import type { MultiNodeContext, MultiNodeNodeList, NodeListRoleTopology } from "./multi-node/types.js";
 import { writeSandboxFiles, type SandboxExec, type SandboxFile } from "./multi-node/sandbox-key.js";
 
 /** Decision Brain takes about sandbox provisioning at task entry. */
@@ -169,13 +169,17 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * and create a second cluster. The caller's key is left alone: it reaches the
  * sandbox as `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, which the LLM gateway and
  * other sandbox callers authenticate with. Hyperloom keys the hand-off purely off
- * `HYPERLOOM_MN_EXT_SERVICE_URL`, so no credential variable selects the mode.
+ * `HYPERLOOM_MN_EXT_SERVICE_URL` (atomesh, sglangrouter and an infera
+ * cluster with a node list: `HYPERLOOM_MN_NODE_LIST`), so no credential
+ * variable selects the mode.
  *
  * The backends drive the cluster through different control planes: rayjob talks
  * to the head over Ray Dashboard REST (:8265) / GCS (:6379) and needs no pod
  * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
- * private key, and atomesh and sglangrouter serve on the router Service and, when
- * a key was derived, also hand over SSH to their prefill and decode pods.
+ * private key, and atomesh and sglangrouter hand their whole cluster over --
+ * service and engine URLs included -- as one node list (`HYPERLOOM_MN_NODE_LIST`).
+ * An infera cluster of `infera.engine.sglang` engines is handed over as a node
+ * list too; any other infera cluster keeps the topology handoff.
  * Only the variables the active backend reads are set, since Hyperloom infers
  * the mode from which ones are present.
  *
@@ -193,12 +197,13 @@ export function applyMultiNodeExternalEnv(
   opts: { legacyTopologyEnv?: boolean } = {},
 ): void {
   delete env.SAFE_API_URL;
+  if (usesNodeList(ctx)) {
+    applyPdClusterEnv(env, ctx);
+    return;
+  }
   // The handoff file is the contract; its content and the files it points at are
   // written once the sandbox is healthy (see `buildTopologyHandoff`).
   env.TOPOLOGY_HANDOFF_FILE = TOPOLOGY_HANDOFF_PATH;
-  // Engine URLs are not part of the handoff file; Hyperloom reads them from the env.
-  if (ctx.prefillUrl) env.HYPERLOOM_MN_EXT_PREFILL_URL = ctx.prefillUrl;
-  if (ctx.decodeUrl) env.HYPERLOOM_MN_EXT_DECODE_URL = ctx.decodeUrl;
 
   if (!(opts.legacyTopologyEnv ?? LEGACY_TOPOLOGY_ENV)) return;
 
@@ -215,18 +220,6 @@ export function applyMultiNodeExternalEnv(
     return;
   }
 
-  // atomesh and sglangrouter: the optimizer SSHes into the router, prefill and
-  // decode to relaunch each in place; every pod shares one sshd port.
-  if (ctx.backend === "atomesh" || ctx.backend === "sglangrouter") {
-    if (!hasSshKeyFile(ctx)) return;
-    env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath!;
-    if (ctx.sshPortBase) env.HYPERLOOM_MN_EXT_SSH_PORT = String(ctx.sshPortBase);
-    if (ctx.routerIps?.length) env.HYPERLOOM_MN_EXT_ROUTER_IPS = ctx.routerIps.join(",");
-    if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
-    if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
-    return;
-  }
-
   // infera: the optimizer SSHes into the GPU pods to relaunch the engine, so it
   // needs the key path plus at least one role's pod IPs.
   if (ctx.sshKeyPath) env.HYPERLOOM_MN_EXT_SSH_KEY = ctx.sshKeyPath;
@@ -235,6 +228,139 @@ export function applyMultiNodeExternalEnv(
   if (ctx.prefillIps?.length) env.HYPERLOOM_MN_EXT_PREFILL_IPS = ctx.prefillIps.join(",");
   if (ctx.decodeIps?.length) env.HYPERLOOM_MN_EXT_DECODE_IPS = ctx.decodeIps.join(",");
   if (ctx.workerIps?.length) env.HYPERLOOM_MN_EXT_WORKER_IPS = ctx.workerIps.join(",");
+}
+
+/** The variable that carries the InferenceSuite node list as JSON. */
+export const MN_NODE_LIST_ENV = "HYPERLOOM_MN_NODE_LIST";
+/** The user the PD pods' sshd accepts the cluster key for. */
+const PD_SSH_USER = "root";
+const DEFAULT_SSH_PORT = 22;
+const NODE_LIST_FRAMEWORK = { atomesh: "atom", sglangrouter: "sglang" } as const;
+/** The router image each PD backend's router pod runs. */
+const NODE_LIST_FRONTEND = { atomesh: "atomesh", sglangrouter: "sglang-router" } as const;
+/** The only Infera engine the node list launches. */
+const INFERA_NODE_LIST_FRAMEWORK = "sglang";
+
+/** atomesh, sglangrouter and a node-list infera cluster: the whole cluster hand-off is the node list. */
+function applyPdClusterEnv(env: Record<string, string>, ctx: MultiNodeContext): void {
+  const nodeList = buildNodeList(ctx);
+  if (nodeList) env[MN_NODE_LIST_ENV] = JSON.stringify(nodeList);
+}
+
+/** The operator-fixed TP of one role, or `null`. */
+function roleTopology(tp: number): NodeListRoleTopology {
+  return { tp: tp > 0 ? tp : null, ep: null, dp_attention: null };
+}
+
+/** `serverArgs` then the role's own args, as one string. */
+function roleArgs(serverArgs: string, extraArgs: string): string {
+  return [serverArgs.trim(), extraArgs.trim()].filter(Boolean).join(" ");
+}
+
+/** Host entries of `ips`, each with its own sshd port when `ports` names one. */
+function nodeListHosts(ips: string[], ports?: Record<string, number>): Array<{ host: string; ssh_port?: number }> {
+  return ips.map((host) => (ports?.[host] ? { host, ssh_port: ports[host] } : { host }));
+}
+
+/**
+ * The InferenceSuite node list for an infera cluster of `infera.engine.sglang`
+ * engines behind the platform's frontend, or `undefined` for another engine, a
+ * missing launch request, or a mode without its pod IPs. Disaggregated clusters
+ * name prefill and decode hosts, aggregated ones worker hosts; every host
+ * carries its own sshd port. The engines are spawned over SSH beside the idle
+ * pod process, so the launch mode is `direct`.
+ */
+function buildInferaNodeList(ctx: MultiNodeContext): MultiNodeNodeList | undefined {
+  const pd = ctx.pdLaunch;
+  if (!pd || pd.framework !== INFERA_NODE_LIST_FRAMEWORK) return undefined;
+  const mode = pd.mode ?? "disaggregated";
+  const disaggregated = mode === "disaggregated";
+  if (disaggregated ? !ctx.prefillIps?.length || !ctx.decodeIps?.length : !ctx.workerIps?.length) return undefined;
+  const nodeList: MultiNodeNodeList = {
+    framework: INFERA_NODE_LIST_FRAMEWORK,
+    frontend: "infera",
+    model: pd.model,
+    service_url: ctx.serviceUrl,
+    mode,
+    gpus_per_node: ctx.gpusPerNode,
+    launch_mode: "direct",
+  };
+  const router = ctx.routerIps?.[0];
+  if (router) nodeList.router = nodeListHosts([router], ctx.sshPorts)[0];
+  if (disaggregated) {
+    nodeList.prefill = nodeListHosts(ctx.prefillIps!, ctx.sshPorts);
+    nodeList.decode = nodeListHosts(ctx.decodeIps!, ctx.sshPorts);
+  } else {
+    nodeList.worker = nodeListHosts(ctx.workerIps!, ctx.sshPorts);
+  }
+  if (hasSshKeyFile(ctx)) {
+    nodeList.ssh = { port: ctx.sshPortBase || DEFAULT_SSH_PORT, user: PD_SSH_USER, key_file: ctx.sshKeyPath! };
+  }
+  if (disaggregated) {
+    if (pd.kvTransferBackend) nodeList.transfer_backend = pd.kvTransferBackend;
+    if (pd.prefillTp > 0 || pd.decodeTp > 0) {
+      nodeList.topology = { prefill: roleTopology(pd.prefillTp), decode: roleTopology(pd.decodeTp) };
+    }
+    const prefillArgs = roleArgs(pd.serverArgs, pd.prefillExtraArgs);
+    const decodeArgs = roleArgs(pd.serverArgs, pd.decodeExtraArgs);
+    if (prefillArgs || decodeArgs) {
+      nodeList.config = { prefill_args: prefillArgs, decode_args: decodeArgs, router_args: "" };
+    }
+  } else if (pd.serverArgs.trim()) {
+    nodeList.config = { worker_args: pd.serverArgs.trim(), router_args: "" };
+  }
+  return nodeList;
+}
+
+/**
+ * The InferenceSuite node list for an atomesh or sglangrouter cluster, or
+ * `undefined` when the cluster has no router, prefill or decode pod IP or no
+ * PD launch request. The SSH block is set exactly when the key file is written,
+ * and holds its path only; the pods are relaunched in place. An infera cluster
+ * gets the node list `buildInferaNodeList` builds.
+ */
+export function buildNodeList(ctx: MultiNodeContext): MultiNodeNodeList | undefined {
+  if (ctx.backend === "infera") return buildInferaNodeList(ctx);
+  if (ctx.backend !== "atomesh" && ctx.backend !== "sglangrouter") return undefined;
+  const pd = ctx.pdLaunch;
+  const router = ctx.routerIps?.[0];
+  if (!pd || !router || !ctx.prefillIps?.length || !ctx.decodeIps?.length) return undefined;
+  const nodeList: MultiNodeNodeList = {
+    framework: NODE_LIST_FRAMEWORK[ctx.backend],
+    frontend: NODE_LIST_FRONTEND[ctx.backend],
+    model: pd.model,
+    service_url: ctx.serviceUrl,
+    router: { host: router },
+    prefill: ctx.prefillIps.map((host) => ({ host })),
+    decode: ctx.decodeIps.map((host) => ({ host })),
+    gpus_per_node: ctx.gpusPerNode,
+    launch_mode: "in_place",
+  };
+  if (ctx.prefillUrl) nodeList.prefill_url = ctx.prefillUrl;
+  if (ctx.decodeUrl) nodeList.decode_url = ctx.decodeUrl;
+  if (hasSshKeyFile(ctx)) {
+    nodeList.ssh = { port: ctx.sshPortBase || DEFAULT_SSH_PORT, user: PD_SSH_USER, key_file: ctx.sshKeyPath! };
+  }
+  if (pd.kvTransferBackend) nodeList.transfer_backend = pd.kvTransferBackend;
+  if (pd.prefillTp > 0 || pd.decodeTp > 0) {
+    nodeList.topology = { prefill: roleTopology(pd.prefillTp), decode: roleTopology(pd.decodeTp) };
+  }
+  const prefillArgs = roleArgs(pd.serverArgs, pd.prefillExtraArgs);
+  const decodeArgs = roleArgs(pd.serverArgs, pd.decodeExtraArgs);
+  if (prefillArgs || decodeArgs) {
+    nodeList.config = { prefill_args: prefillArgs, decode_args: decodeArgs, router_args: "" };
+  }
+  return nodeList;
+}
+
+/** True when the cluster is handed over as a node list: always for atomesh and sglangrouter, for infera when one builds. */
+export function usesNodeList(ctx: MultiNodeContext): boolean {
+  return backendRequiresDisaggregatedPd(ctx.backend) || (ctx.backend === "infera" && buildNodeList(ctx) !== undefined);
+}
+
+/** True when the backend hands its cluster over through the topology handoff file. */
+export function usesTopologyHandoff(ctx: MultiNodeContext): boolean {
+  return !usesNodeList(ctx);
 }
 
 /**
@@ -302,17 +428,6 @@ export function buildTopologyHandoff(ctx: MultiNodeContext): TopologyHandoffBuil
     // is usable by `ssh -o UserKnownHostsFile=...` without the reader creating it.
     files.push({ path: infera.known_hosts_file, content: "", mode: "600" });
     handoff.infera = infera;
-  } else if (hasSshKeyFile(ctx)) {
-    const cluster: NonNullable<TopologyHandoffV1["cluster"]> = {
-      ssh_key_file: ctx.sshKeyPath,
-      prefill_ips: [...(ctx.prefillIps ?? [])],
-      decode_ips: [...(ctx.decodeIps ?? [])],
-    };
-    if (ctx.routerIps?.length) cluster.router_ips = [...ctx.routerIps];
-    if (ctx.sshPortBase) cluster.ssh_port = ctx.sshPortBase;
-    cluster.known_hosts_file = TOPOLOGY_KNOWN_HOSTS_PATH;
-    files.push({ path: cluster.known_hosts_file, content: "", mode: "600" });
-    handoff.cluster = cluster;
   }
 
   files.push({

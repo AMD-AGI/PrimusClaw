@@ -8,6 +8,7 @@ import {
   applyMultiNodeExternalEnv,
   buildTopologyHandoff,
   hasSshKeyFile,
+  usesTopologyHandoff,
   writeTopologyHandoff,
   TOPOLOGY_HANDOFF_DIR,
   TOPOLOGY_HANDOFF_PATH,
@@ -96,7 +97,7 @@ test("infera with empty role lists: file keeps empty arrays, legacy vars stay un
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.9");
 });
 
-test("atomesh and sglangrouter hand off the router service and no control-plane block", () => {
+test("atomesh and sglangrouter use no topology handoff file", () => {
   for (const backend of ["atomesh", "sglangrouter"] as const) {
     const ctx: MultiNodeContext = {
       backend,
@@ -107,58 +108,12 @@ test("atomesh and sglangrouter hand off the router service and no control-plane 
       gpusPerNode: 8,
       serviceUrl: `http://msg1-${backend}.ws.svc.cluster.local:8000`,
     };
-    const { env, handoff, files } = build(ctx);
-    assert.equal(handoff.backend, backend);
-    assert.equal(handoff.service_url, ctx.serviceUrl);
-    assert.equal(handoff.ray, undefined);
-    assert.equal(handoff.infera, undefined);
-    assert.deepEqual(validateTopologyHandoff(handoff), []);
-    assert.deepEqual(files.map((f) => f.path), [DOC]);
-    assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, ctx.serviceUrl);
-    assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, undefined);
-    assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+    const env: Record<string, string> = {};
+    applyMultiNodeExternalEnv(env, ctx, { legacyTopologyEnv: true });
+    assert.equal(usesTopologyHandoff(ctx), false, backend);
+    assert.equal(env.TOPOLOGY_HANDOFF_FILE, undefined, backend);
   }
-});
-
-test("atomesh and sglangrouter with an SSH control plane hand off a cluster block and the legacy SSH env", () => {
-  for (const backend of ["atomesh", "sglangrouter"] as const) {
-    const ctx: MultiNodeContext = {
-      backend,
-      provider: "safe",
-      name: "msg1",
-      namespace: "ws",
-      nodeCount: 2,
-      gpusPerNode: 8,
-      serviceUrl: "http://msg1.ws.svc.cluster.local:8000",
-      prefillUrl: "http://msg1-prefill.ws.svc.cluster.local:8010",
-      decodeUrl: "http://msg1-decode.ws.svc.cluster.local:8020",
-      sshPrivateKey: PEM,
-      sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
-      sshPortBase: 25032,
-      routerIps: ["172.16.0.9"],
-      prefillIps: ["10.0.0.2"],
-      decodeIps: ["10.0.0.3"],
-    };
-    const { env, handoff, byPath } = build(ctx);
-    const c = handoff.cluster;
-    assert.ok(c, backend);
-    assert.equal(c.ssh_key_file, ctx.sshKeyPath);
-    assert.equal(c.ssh_port, 25032);
-    assert.equal(c.known_hosts_file, `${TOPOLOGY_HANDOFF_DIR}/known_hosts`);
-    assert.deepEqual(c.router_ips, ["172.16.0.9"]);
-    assert.deepEqual(c.prefill_ips, ["10.0.0.2"]);
-    assert.deepEqual(c.decode_ips, ["10.0.0.3"]);
-    assert.equal(handoff.infera, undefined);
-    assert.deepEqual(validateTopologyHandoff(handoff), [], backend);
-    assert.equal(byPath.get(c.known_hosts_file!)?.mode, "600");
-    assert.ok(!byPath.get(DOC)!.content.includes("SECRETKEYBODY"));
-    assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, ctx.sshKeyPath);
-    assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, "25032");
-    assert.equal(env.HYPERLOOM_MN_EXT_ROUTER_IPS, "172.16.0.9");
-    assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, "10.0.0.2");
-    assert.equal(env.HYPERLOOM_MN_EXT_DECODE_IPS, "10.0.0.3");
-    assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, undefined);
-  }
+  assert.ok(usesTopologyHandoff(RAYJOB) && usesTopologyHandoff(INFERA));
 });
 
 test("handoff documents validate against the schema", () => {

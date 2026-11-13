@@ -335,10 +335,10 @@ export const APP_PLATFORM_ENV = {
 const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(Object.values(APP_PLATFORM_ENV));
 /**
  * Families the platform and Agent Sandbox own wholesale: `E2B_*`, `AWS_*`, the
- * multi-node variables Brain injects (`HYPERLOOM_MN_EXT_*`, `INFERENCE_OPTIMIZER_*`).
+ * multi-node variables Brain injects (`HYPERLOOM_MN_*`, `INFERENCE_OPTIMIZER_*`).
  * (`CLAW_*`, `HANDS_*` and `BASH_FUNC_*` come from the user-env rules below.)
  */
-const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "HYPERLOOM_MN_EXT_", "INFERENCE_OPTIMIZER_"] as const;
+const RESERVED_ENV_PREFIXES = ["E2B_", "AWS_", "HYPERLOOM_MN_", "INFERENCE_OPTIMIZER_"] as const;
 
 /** RFC 7230 `token`: what a header name may be made of. */
 const HTTP_HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;

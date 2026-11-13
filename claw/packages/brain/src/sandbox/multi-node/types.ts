@@ -42,6 +42,8 @@ export interface MultiNodeContext {
   sshKeyPath?: string;
   /** infera: SSH base port, decode pods role-offset; atomesh/sglangrouter: the one port of every pod. */
   sshPortBase?: number;
+  /** infera: the sshd port of each pod, by pod IP. */
+  sshPorts?: Record<string, number>;
   /** atomesh/sglangrouter: router pod IPs. */
   routerIps?: string[];
   /** PD: prefill pod IPs, rank order. */
@@ -54,6 +56,76 @@ export interface MultiNodeContext {
   prefillUrl?: string;
   /** atomesh/sglangrouter: decode engine Service URL. */
   decodeUrl?: string;
+  /** atomesh/sglangrouter/infera: what the prompt asked of the launch, carried into the node list. */
+  pdLaunch?: PdLaunchRequest;
+}
+
+/** The prompt's launch settings, as the cluster was created with them. */
+export interface PdLaunchRequest {
+  /** `--model`. */
+  model: string;
+  /** infera: `--framework`, the engine the GPU pods run. */
+  framework?: string;
+  /** infera: `--pd-mode`; atomesh and sglangrouter are always disaggregated. */
+  mode?: "aggregated" | "disaggregated";
+  /** `--pd-transfer-backend`, the KV transfer backend the cluster runs. */
+  kvTransferBackend: string;
+  /** `--pd-prefill-tp`; 0 when the prompt does not fix it. */
+  prefillTp: number;
+  /** `--pd-decode-tp`; 0 when the prompt does not fix it. */
+  decodeTp: number;
+  /** `--server-args`, for both roles. */
+  serverArgs: string;
+  /** `--pd-prefill-extra-args`. */
+  prefillExtraArgs: string;
+  /** `--pd-decode-extra-args`. */
+  decodeExtraArgs: string;
+}
+
+/** One role's parallelism the operator fixed; `null` leaves it to the launch source. */
+export interface NodeListRoleTopology {
+  tp: number | null;
+  ep: number | null;
+  dp_attention: boolean | null;
+}
+
+/** One host of the node list; `ssh_port` when its sshd listens on a port of its own. */
+export interface NodeListHost {
+  host: string;
+  ssh_port?: number;
+}
+
+/**
+ * The InferenceSuite multi-node node list (`inference_suite.multinode` input
+ * contract): the cluster's service and engine URLs, serving mode, hosts per
+ * role (prefill and decode when disaggregated, worker when aggregated), SSH
+ * access, GPUs per node and the operator's optional topology and args. Holds
+ * the SSH key by path only.
+ */
+export interface MultiNodeNodeList {
+  framework: "sglang" | "atom";
+  /** The router the router pod runs; `infera` is the platform's frontend, which the suite never launches. */
+  frontend: "sglang-router" | "atomesh" | "infera";
+  model: string;
+  /** Router Service URL the client and accuracy eval target. */
+  service_url: string;
+  /** Absent means disaggregated. */
+  mode?: "aggregated" | "disaggregated";
+  /** Prefill engine Service URL; its port is the one the engines listen on. */
+  prefill_url?: string;
+  /** Decode engine Service URL; its port is the one the engines listen on. */
+  decode_url?: string;
+  /** Required unless the frontend is `infera`. */
+  router?: NodeListHost;
+  prefill?: NodeListHost[];
+  decode?: NodeListHost[];
+  worker?: NodeListHost[];
+  gpus_per_node: number;
+  ssh?: { port: number; user: string; key_file: string };
+  transfer_backend?: string;
+  topology?: { prefill?: NodeListRoleTopology; decode?: NodeListRoleTopology; worker?: NodeListRoleTopology };
+  launch_mode: "direct" | "in_place";
+  config?: { prefill_args?: string; decode_args?: string; worker_args?: string; router_args: string };
 }
 
 export interface MultiNodeEnsureOptions {

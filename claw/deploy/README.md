@@ -65,6 +65,14 @@ still set while `LEGACY_TOPOLOGY_ENV` is `true` (the default). Do not set
 file: the released reader does not read it yet, so turning the flag off breaks
 multi-node runs.
 
+atomesh and sglangrouter sandboxes receive neither the file nor those variables.
+They get the whole cluster as one JSON node list in `HYPERLOOM_MN_NODE_LIST`
+(the InferenceSuite multi-node input: framework, model, the router service URL
+and the prefill / decode engine URLs, router / prefill / decode hosts, GPUs per
+node, SSH port, user and key path, transfer backend, optional per-role topology
+and args, `launch_mode: in_place`), and no other multi-node variable. A
+Hyperloom that does not read the node list cannot drive these clusters.
+
 ### Upgrade Note: Multi-Node Default Timeout
 
 The multi-node workload lifetime used when a request carries no timeout is now
