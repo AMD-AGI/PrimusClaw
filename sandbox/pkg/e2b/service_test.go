@@ -30,6 +30,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 type fakeRunner struct {
@@ -842,6 +843,22 @@ func TestSandboxCreatePrefersAPIKeyOverBearer(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("api key with bearer=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreateAcceptsIdentityKeyAsBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1", Email: "alice@example.com"}}}
+	plane, _, _ := ownerPlane(t, ids, samplePolicy())
+	r := gin.New()
+	NewHandler(plane).Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"runner","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer ak-alice")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated || ids.calls != 1 {
+		t.Fatalf("identity bearer=%d calls=%d %s", w.Code, ids.calls, w.Body.String())
 	}
 }
 

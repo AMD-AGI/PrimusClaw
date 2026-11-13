@@ -31,10 +31,6 @@ func proxyToUpstream(t *testing.T, upstreamURL string) *gin.Engine {
 	return engine
 }
 
-// The incident this labelling exists for: EnvD rejects the Router's own JWT,
-// the status is passed through untouched, and the operator reads a 401 as "the
-// user's credential expired" -- when the caller's credential never reached the
-// sandbox, because proxyRequest overwrites Authorization before sending.
 func TestProxyRequestDropsAPIKey(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Empty(t, r.Header.Get("X-API-KEY"))
@@ -50,6 +46,10 @@ func TestProxyRequestDropsAPIKey(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
+// The incident this labelling exists for: EnvD rejects the Router's own JWT,
+// the status is passed through untouched, and the operator reads a 401 as "the
+// user's credential expired" -- when the caller's credential never reached the
+// sandbox, because proxyRequest overwrites Authorization before sending.
 func TestEnvDRejectionIsLabelledAsTheRoutersOwnCredential(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -282,13 +282,15 @@ func (s *Server) setupRoutes() {
 
 	// Template management endpoints — CRUD for CodeInterpreter CRD objects.
 	// Allows clients to manage templates without direct kubectl access.
+	// Any caller may read templates; only system-admin may write them.
 	templates := v1.Group("/templates")
-	templates.POST("", s.handleTemplateCreate)
-	templates.POST("/stream", s.handleTemplateCreateStream)
+	templateAdmin := requireSystemAdmin("only system-admin can create, update or delete templates")
+	templates.POST("", templateAdmin, s.handleTemplateCreate)
+	templates.POST("/stream", templateAdmin, s.handleTemplateCreateStream)
 	templates.GET("", s.handleTemplateList)
 	templates.GET("/:namespace/:name", s.handleTemplateGet)
-	templates.PUT("/:namespace/:name", s.handleTemplateUpdate)
-	templates.DELETE("/:namespace/:name", s.handleTemplateDelete)
+	templates.PUT("/:namespace/:name", templateAdmin, s.handleTemplateUpdate)
+	templates.DELETE("/:namespace/:name", templateAdmin, s.handleTemplateDelete)
 
 	// Sandbox policy management (§4.1 egress control) — stored on the SandboxPolicy CR.
 	// Dual-read, same wildcard rule as sessions: the SDK percent-encodes the

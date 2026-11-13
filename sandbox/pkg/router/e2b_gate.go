@@ -97,7 +97,7 @@ func (s *Server) proxyE2B(c *gin.Context) {
 		s.rejectDirectCaller(c)
 		return
 	}
-	if identity.E2BCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader)) == "" {
+	if identity.E2BKey(c.Request.Header) == "" {
 		writeGate(c, http.StatusUnauthorized, "invalid_key", identity.MissingCredential.Message)
 		return
 	}
@@ -137,6 +137,7 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 			if sandboxID != "" {
 				req.Header.Set("x-session-id", sandboxID)
 			}
+			req.Header.Del(identity.APIKeyHeader)
 			// Sealed policy travels in the signed token. Drop any client headers.
 			req.Header.Del(e2b.HeaderSealed)
 			req.Header.Del(e2b.HeaderInputs)

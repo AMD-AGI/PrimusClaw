@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -36,9 +37,14 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 		c.Request.Header.Del(UserNameHeader)
 		c.Request.Header.Del(UserRoleHeader)
 
-		credential := identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
+		credential := identity.CallerCredential(c.Request.Header)
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
+			return
+		}
+		// A grant key is valid only on the E2B routes and must not leave the cluster.
+		if e2b.IsGrantKey(credential) {
+			abortCaller(c, identity.RejectionFor(identity.ErrInactive))
 			return
 		}
 

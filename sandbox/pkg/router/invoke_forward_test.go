@@ -362,6 +362,44 @@ func TestUpstreamOnlyRejectsDirectE2B(t *testing.T) {
 	}
 }
 
+func TestProxyE2BCredentialGate(t *testing.T) {
+	p := newForwardPair(t, "u1")
+	hits := &atomic.Int32{}
+	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(wm.Close)
+	p.global.cfg.WorkloadManagerURL = wm.URL
+
+	for _, tc := range []struct {
+		name, authorization string
+		want                int
+	}{
+		{name: "bearer only", authorization: "Bearer ak-owner", want: http.StatusCreated},
+		{name: "no credential", want: http.StatusUnauthorized},
+	} {
+		req, err := http.NewRequest(http.MethodPost, p.front.URL+"/sandboxes", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.authorization != "" {
+			req.Header.Set("Authorization", tc.authorization)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s status=%d want %d", tc.name, resp.StatusCode, tc.want)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("workload manager hits=%d, want 1", hits.Load())
+	}
+}
+
 func TestManagingRouterServesE2BLocally(t *testing.T) {
 	p := newForwardPair(t, "u1")
 	clusterWM := &atomic.Int32{}

@@ -25,7 +25,7 @@ type Rejection struct {
 	Message string
 }
 
-// APIKeyHeader is the header an E2B or SaFE client uses for its API key.
+// APIKeyHeader is the header an E2B or platform client uses for its API key.
 const APIKeyHeader = "X-API-KEY"
 
 // MissingCredential is the answer to a request without a bearer credential or an API key.
@@ -44,24 +44,24 @@ func BearerCredential(header string) string {
 	return strings.TrimSpace(parts[1])
 }
 
-// RequestCredential returns the caller's credential. A bearer token wins when
-// both are present. /v1 uses this order: an access token is the primary
-// credential, and X-API-KEY is the fallback.
-func RequestCredential(authorization, apiKey string) string {
-	if credential := BearerCredential(authorization); credential != "" {
+// CallerCredential returns the credential of a /v1 request. A bearer token
+// wins when both are present: an access token is the primary credential, and
+// X-API-KEY is the fallback.
+func CallerCredential(h http.Header) string {
+	if credential := BearerCredential(h.Get("Authorization")); credential != "" {
 		return credential
 	}
-	return strings.TrimSpace(apiKey)
+	return strings.TrimSpace(h.Get(APIKeyHeader))
 }
 
-// E2BCredential returns the API key when the client sent one. E2B clients send
-// X-API-KEY and may also send an access token as Authorization. These routes
-// resolve the API key. A bearer token is used only when X-API-KEY is empty.
-func E2BCredential(authorization, apiKey string) string {
-	if key := strings.TrimSpace(apiKey); key != "" {
+// E2BKey returns the credential of an E2B request. E2B clients send X-API-KEY
+// and may also send an access token as Authorization. X-API-KEY wins, and a
+// bearer token is used only when X-API-KEY is empty.
+func E2BKey(h http.Header) string {
+	if key := strings.TrimSpace(h.Get(APIKeyHeader)); key != "" {
 		return key
 	}
-	return BearerCredential(authorization)
+	return BearerCredential(h.Get("Authorization"))
 }
 
 // RejectionFor maps an Introspect error to the caller's answer: 401 for an

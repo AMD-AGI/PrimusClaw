@@ -3,7 +3,7 @@
 
 // Caller authentication middleware for the Router (default on; --enable-auth=false to disable).
 // A caller presents "Authorization: Bearer <credential>" or "X-API-KEY": a platform API key
-// (ak-...) or an access token issued by the identity provider for this service. The credential
+// or an access token issued by the identity provider for this service. The credential
 // is validated through identity provider token introspection (RFC 7662).
 package router
 
@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -60,7 +61,7 @@ func bearerCredential(c *gin.Context) string {
 
 // callerCredential returns the bearer token, or the X-API-KEY when no bearer is present.
 func callerCredential(c *gin.Context) string {
-	return identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
+	return identity.CallerCredential(c.Request.Header)
 }
 
 // abortCaller records the rejection and answers it.
@@ -80,6 +81,11 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 		credential := callerCredential(c)
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
+			return
+		}
+		// A grant key is valid only on the E2B routes and must not leave the cluster.
+		if e2b.IsGrantKey(credential) {
+			abortCaller(c, identity.RejectionFor(identity.ErrInactive))
 			return
 		}
 

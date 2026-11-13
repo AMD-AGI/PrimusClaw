@@ -26,6 +26,8 @@ The data plane uses the `envdAccessToken` returned at create or connect. The SDK
 | SaFE API key (`ak-...`) | SaFE console       | Owner quota of the caller; templates from the owner policy |
 | Grant key (`e2b_...`)   | Claw sandbox grant | Role quota and templates of the grant                      |
 
+A key is sent as `X-API-Key` or as `Authorization: Bearer <key>`. On the E2B routes `X-API-Key` wins when both are present. On the `/v1` management routes the order is reversed: the bearer token wins and `X-API-Key` is the fallback. A grant key is refused on `/v1` and is never sent to the identity provider.
+
 A SaFE API key is checked with RFC 7662 token introspection at the identity provider. The first create or timeout call creates an owner record for the caller. Before that, list returns no sandboxes and get, connect, and kill return 404.
 
 ## Workspace

@@ -7,16 +7,21 @@
 {{- if not .hosts }}
 {{- fail "router.publicIngress.enabled requires at least one host" }}
 {{- end }}
+{{- $allowed := list "/sandboxes" "/v2/sandboxes" "/files" "/api/files" "/process.Process" "/filesystem.Filesystem" "/v1/templates" }}
 {{- range .paths }}
 {{- $raw := . | toString }}
 {{- $path := trimSuffix "/" $raw }}
-{{- $parts := splitList "/" (trimPrefix "/" $path) }}
-{{- $head := "" }}
-{{- if $parts }}
-{{- $head = index $parts 0 }}
+{{- $ok := false }}
+{{- range $allowed }}
+{{- if or (eq $path .) (hasPrefix (printf "%s/" .) $path) }}
+{{- $ok = true }}
 {{- end }}
-{{- if or (not (hasPrefix "/" $raw)) (eq $path "") (eq $path "/") (eq $path "/v1") (and (or (eq $head "v1") (eq $head "v2") (eq $head "api")) (lt (len $parts) 2)) }}
-{{- fail (printf "router.publicIngress path %q must name a specific route" $raw) }}
+{{- end }}
+{{- if not $ok }}
+{{- fail (printf "router.publicIngress path %q must name a specific route: one of %s, or a path below one" $raw (join ", " $allowed)) }}
+{{- end }}
+{{- if and (hasPrefix "/v1/" $path) (not $.Values.router.config.enableAuth) }}
+{{- fail (printf "router.publicIngress path %q requires router.config.enableAuth: without caller auth the Workload Manager treats every /v1 request as system-admin" $raw) }}
 {{- end }}
 {{- end }}
 ---

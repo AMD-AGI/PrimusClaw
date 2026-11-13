@@ -86,6 +86,12 @@ func New(opt Options) *Service {
 // grantKeyPrefix marks a key issued by the grant API.
 const grantKeyPrefix = "e2b_"
 
+// IsGrantKey reports whether key was issued by the grant API. Such keys are
+// resolved in the cluster and are never sent to the identity provider.
+func IsGrantKey(key string) bool {
+	return strings.HasPrefix(key, grantKeyPrefix)
+}
+
 // caller is the grant and role an API key resolves to. user is the SaFE User
 // read during lookup, or nil when it was not read.
 type caller struct {
@@ -101,7 +107,7 @@ type caller struct {
 // The owner record is created or updated only when write is set; otherwise a missing
 // record leaves grantID empty.
 func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller, error) {
-	if s.identity == nil || strings.HasPrefix(apiKey, grantKeyPrefix) {
+	if s.identity == nil || IsGrantKey(apiKey) {
 		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 		return caller{grantID: grantID, role: role}, err
 	}

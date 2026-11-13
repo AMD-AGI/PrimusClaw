@@ -16,6 +16,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -144,7 +145,7 @@ func (s *Server) forwardDataPlane(c *gin.Context, sandboxID, base string, ref ru
 		Director: func(req *http.Request) {
 			req.URL = target
 			req.Host = target.Host
-			req.Header.Del("X-API-KEY")
+			req.Header.Del(identity.APIKeyHeader)
 			req.Header.Del("X-Access-Token")
 			req.Header.Del(e2b.HeaderSealed)
 			req.Header.Del(e2b.HeaderInputs)

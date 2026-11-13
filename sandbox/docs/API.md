@@ -56,6 +56,8 @@ Source: `pkg/router/server.go`
 | PATCH  | `/v1/sandbox/sessions/{id}/policy`        | Update egress policy                     |
 | GET    | `/v1/sandbox/sessions/{id}/logs`          | Get session logs                         |
 
+Any authenticated caller may list and get templates. Creating, updating and deleting a template requires the `system-admin` role; other callers get 403.
+
 ### Create a template (minimal)
 
 ```http

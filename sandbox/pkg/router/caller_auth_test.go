@@ -134,6 +134,23 @@ func TestCallerAuth_BearerWinsOverAPIKeyHeader(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"userId":"uid-bearer"`)
 }
 
+func TestCallerAuth_GrantKeyStaysInCluster(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("a grant key must not reach the identity provider")
+	})
+	for _, header := range []string{"X-API-KEY", "Authorization"} {
+		value := "e2b_secret"
+		if header == "Authorization" {
+			value = "Bearer " + value
+		}
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+		req.Header.Set(header, value)
+		s.engine.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, header)
+	}
+}
+
 func TestCallerAuth_ValidKey(t *testing.T) {
 	var calls atomic.Int32
 	s, _ := newTestRouterWithAuth(t, func(w http.ResponseWriter, r *http.Request) {

@@ -33,6 +33,7 @@ case "$*" in
   *"get ingress agent-sandbox-public"*)
     [[ -n "${MOCK_INGRESS_HOST:-}" ]] || exit 1
     case "$*" in
+      *managed-by*release-name*) printf 'Helm|agent-sandbox|%s' "${NAMESPACE}" ;;
       *release-namespace*) printf '%s' "${NAMESPACE}" ;;
       *release-name*) printf 'agent-sandbox' ;;
       *managed-by*) printf 'Helm' ;;
@@ -213,5 +214,57 @@ fi
 grep -q 'keeping Helm-managed public Ingress https://sandbox.example.com' "$output"
 grep -qF -- '--set router.publicIngress.enabled=true' "$capture"
 grep -qF -- '--set-string router.publicIngress.hosts[0]=sandbox.example.com' "$capture"
+grep -q 'public Ingress is rendered by Helm at https://sandbox.example.com' "$output"
+grep -qF -- 'router.publicIngress.paths=' "$capture" && {
+  echo "installer narrowed the public paths with auth enabled" >&2
+  exit 1
+}
+
+# Without caller auth the public Ingress serves the E2B routes only.
+rm -f "$capture"
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=sandbox.example.com \
+  ALLOW_INSECURE_NO_AUTH=true \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -qF -- '--set router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}' "$capture"
+
+# The fast path does not run Helm, so a host the release does not serve fails.
+if env PATH="$tmp/bin:$PATH" \
+  MOCK_READY=true \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=other.example.com \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  echo "fast path reported a host the release does not serve" >&2
+  exit 1
+fi
+grep -q 'Rerun with FORCE_SANDBOX=1' "$output"
+grep -q 'public Ingress is rendered by Helm' "$output" && {
+  echo "fast path printed success for an unrendered host" >&2
+  exit 1
+}
+
+if ! env PATH="$tmp/bin:$PATH" \
+  MOCK_READY=true \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=sandbox.example.com \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q 'public Ingress is rendered by Helm at https://sandbox.example.com' "$output"
 
 echo "installer behavior: ok"

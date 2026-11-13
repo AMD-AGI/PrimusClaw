@@ -9,6 +9,8 @@
 package workloadmanager
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
@@ -75,6 +77,17 @@ func canViewAll(c *gin.Context) bool {
 // canWriteAll returns true if the user can modify/delete any resource (system-admin only).
 func canWriteAll(c *gin.Context) bool {
 	return resolveRole(c) == RoleSystemAdmin
+}
+
+// requireSystemAdmin answers 403 with message unless the caller is a full system-admin.
+func requireSystemAdmin(message string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !canWriteAll(c) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": message})
+			return
+		}
+		c.Next()
+	}
 }
 
 // currentUserID returns the authenticated user ID from the request.

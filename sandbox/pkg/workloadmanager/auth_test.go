@@ -88,6 +88,39 @@ func TestCallerAuthMiddlewareAcceptsAPIKeyHeader(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"userId":"key-user"`)
 }
 
+func TestCallerAuthMiddlewareBearerWinsOverAPIKeyHeader(t *testing.T) {
+	engine := newAuthTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		assert.Equal(t, "ak-bearer", r.PostForm.Get("token"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"active": true, "sub": "bearer-user", "roles": []string{"default"}})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer ak-bearer")
+	req.Header.Set("X-API-KEY", "ak-header")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"userId":"bearer-user"`)
+}
+
+func TestCallerAuthMiddlewareKeepsGrantKeysInCluster(t *testing.T) {
+	engine := newAuthTestServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("a grant key must not reach the identity provider")
+	})
+	for _, set := range []func(*http.Request){
+		func(r *http.Request) { r.Header.Set("X-API-KEY", "e2b_secret") },
+		func(r *http.Request) { r.Header.Set("Authorization", "Bearer e2b_secret") },
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+		set(req)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	}
+}
+
 func TestCallerAuthMiddlewareRejectsInactiveCredential(t *testing.T) {
 	engine := newAuthTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": false})

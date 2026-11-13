@@ -180,20 +180,43 @@ prompt_ingress_host() {
     read -r -p "Public host (for example sandbox.example.com, Enter to skip): " INGRESS_HOST || INGRESS_HOST=""
 }
 
-# apply_router_ingress applies the Higress idle timeout for a public host.
-# The Ingress object itself is rendered by the Helm release from
-# router.publicIngress. This function does not kubectl-apply that object.
-apply_router_ingress() {
-    prompt_ingress_host
-    if [[ -z "${INGRESS_HOST}" ]]; then
-        log "public Ingress is unchanged (INGRESS_HOST unset)"
-        return 0
-    fi
+# validate_ingress_host checks INGRESS_HOST and INGRESS_CLASS when a host is set.
+validate_ingress_host() {
+    [[ -n "${INGRESS_HOST}" ]] || return 0
     dns_name_ok "${INGRESS_HOST}" domain \
         || err "INGRESS_HOST must be a lowercase DNS name, got ${INGRESS_HOST}"
     dns_name_ok "${INGRESS_CLASS}" domain \
         || dns_name_ok "${INGRESS_CLASS}" label \
         || err "INGRESS_CLASS must be a DNS label or name, got ${INGRESS_CLASS}"
+}
+
+# helm_ingress_field prints a jsonpath field of the public Ingress when this
+# release owns it, and nothing otherwise.
+helm_ingress_field() {
+    command -v kubectl >/dev/null 2>&1 || return 0
+    local owner
+    owner="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
+        -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}|{.metadata.annotations.meta\.helm\.sh/release-name}|{.metadata.annotations.meta\.helm\.sh/release-namespace}' \
+        2>/dev/null || true)"
+    [[ "${owner}" == "Helm|${RELEASE}|${NAMESPACE}" ]] || return 0
+    kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public -o jsonpath="$1" 2>/dev/null || true
+}
+
+# apply_router_ingress applies the Higress idle timeout for a public host.
+# The Ingress object itself is rendered by the Helm release from
+# router.publicIngress. It reports success only when that Ingress serves the host.
+apply_router_ingress() {
+    if [[ -z "${INGRESS_HOST}" ]]; then
+        log "public Ingress is unchanged (INGRESS_HOST unset)"
+        return 0
+    fi
+    validate_ingress_host
+    if [[ "${DRY_RUN}" != "true" ]]; then
+        local hosts
+        hosts=" $(helm_ingress_field '{.spec.rules[*].host}') "
+        [[ "${hosts}" == *" ${INGRESS_HOST} "* ]] \
+            || err "the Helm release does not serve INGRESS_HOST=${INGRESS_HOST}. Rerun with FORCE_SANDBOX=1 to render the public Ingress for it."
+    fi
     if [[ "${INGRESS_CLASS}" == "higress" ]]; then
         apply_router_idle_timeout
     fi
@@ -206,21 +229,10 @@ apply_router_ingress() {
 keep_helm_public_ingress() {
     [[ -n "${INGRESS_HOST}" ]] && return 0
     [[ "${DRY_RUN}" == "true" ]] && return 0
-    command -v kubectl >/dev/null 2>&1 || return 0
-    local managed release_name release_ns host class
-    managed="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
-        -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
-    [[ "${managed}" == "Helm" ]] || return 0
-    release_name="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
-        -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null || true)"
-    release_ns="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
-        -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null || true)"
-    [[ "${release_name}" == "${RELEASE}" && "${release_ns}" == "${NAMESPACE}" ]] || return 0
-    host="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
-        -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)"
+    local host class
+    host="$(helm_ingress_field '{.spec.rules[0].host}')"
     [[ -n "${host}" ]] || return 0
-    class="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public \
-        -o jsonpath='{.spec.ingressClassName}' 2>/dev/null || true)"
+    class="$(helm_ingress_field '{.spec.ingressClassName}')"
     INGRESS_HOST="${host}"
     if [[ -n "${class}" ]]; then
         INGRESS_CLASS="${class}"
@@ -464,16 +476,10 @@ PY
 trap 'rm -f "${VALUES_FILE:-}"' EXIT
 
 # The public Ingress is part of the release. Ask for the host before helm runs
-# so a re-install publishes /v1/templates with the rest of the routes.
+# so the host is rendered with the release.
 prompt_ingress_host
 keep_helm_public_ingress
-if [[ -n "${INGRESS_HOST}" ]]; then
-    dns_name_ok "${INGRESS_HOST}" domain \
-        || err "INGRESS_HOST must be a lowercase DNS name, got ${INGRESS_HOST}"
-    dns_name_ok "${INGRESS_CLASS}" domain \
-        || dns_name_ok "${INGRESS_CLASS}" label \
-        || err "INGRESS_CLASS must be a DNS label or name, got ${INGRESS_CLASS}"
-fi
+validate_ingress_host
 
 # Build helm --set args
 HELM_ARGS=(
@@ -546,6 +552,13 @@ if [[ -n "${INGRESS_HOST}" ]]; then
         --set-string "router.publicIngress.className=${INGRESS_CLASS}"
         --set-string "router.publicIngress.hosts[0]=${INGRESS_HOST}"
     )
+    # The chart refuses public /v1 paths without caller auth.
+    if [[ -z "${IDENTITY_INTROSPECT_URL:-}" ]]; then
+        HELM_ARGS+=(
+            --set "router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}"
+        )
+        warn "authentication disabled: the public Ingress serves the E2B routes only, not /v1/templates"
+    fi
     # An Ingress created by an older installer has no Helm ownership. Adopt it
     # before upgrade, or Helm refuses to take an object it did not create.
     if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public >/dev/null 2>&1; then

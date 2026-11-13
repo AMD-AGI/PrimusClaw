@@ -180,17 +180,26 @@ refused() {
   echo "  ok: $name refused"
 }
 
-render "$tmp/public.yaml" \
+auth=(--set router.config.enableAuth=true
+  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect)
+
+render "$tmp/public.yaml" "${auth[@]}" \
   --set router.publicIngress.enabled=true \
   --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
 check "$tmp/public.yaml" public
 
-for path in / /v1 /v2 /api; do
-  refused "public-path=$path" "must name a specific route" \
+for path in / /v1 /v2 /api /internal /internal/v1/grants /metrics /v1/namespaces /v1/code-interpreter /v1/sandbox /v1/templatesx; do
+  refused "public-path=$path" "must name a specific route" "${auth[@]}" \
     --set router.publicIngress.enabled=true \
     --set-string 'router.publicIngress.hosts[0]=sandbox.example.com' \
     --set-string "router.publicIngress.paths[0]=$path"
 done
+
+# Without caller auth the Workload Manager treats /v1 callers as system-admin.
+refused public-v1-no-auth "requires router.config.enableAuth" \
+  --set security.allowInsecureNoAuth=true \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
 
 # An Ingress without a selector would expose every namespace.
 refused no-selector "router.ingress.enabled requires router.config.namespaceSelector" \
