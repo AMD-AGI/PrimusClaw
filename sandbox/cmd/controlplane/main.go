@@ -462,7 +462,11 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		idClient, policySupplied := ownerKeys(ctx, grants)
+		var policyStore *grant.OwnerPolicyStore
+		if name := grant.OwnerPolicyConfigMapFromEnv(); name != "" {
+			policyStore = grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), wmCfg.Namespace, name, grants, leaderCheck(mgr.Elected()))
+		}
+		idClient, policySupplied := ownerKeys(ctx, grants, policyStore)
 		opts := e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
@@ -473,11 +477,10 @@ func main() {
 			if attester == nil && policySupplied {
 				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
 			}
-			if name := grant.OwnerPolicyConfigMapFromEnv(); name != "" {
-				store := grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), wmCfg.Namespace, name, grants)
-				apiServer.WithOwnerPolicyStore(store)
-				go store.Run(ctx, ownerPolicySyncInterval)
-				log.Info("owner policy admin API enabled", "configmap", name)
+			if policyStore != nil {
+				apiServer.WithOwnerPolicyStore(policyStore)
+				go policyStore.Run(ctx, ownerPolicySyncInterval)
+				log.Info("owner policy admin API enabled", "configmap", grant.OwnerPolicyConfigMapFromEnv())
 			}
 		}
 		plane := e2b.New(opts)
@@ -521,13 +524,27 @@ var ownerPolicyRetry = time.Second
 // ownerPolicySyncInterval is how often each replica reloads the owner policy ConfigMap.
 const ownerPolicySyncInterval = 15 * time.Second
 
+// leaderCheck reports whether this replica holds the manager's leader lease.
+// The manager exits when it loses the lease, so the answer never goes back to false.
+func leaderCheck(elected <-chan struct{}) func() bool {
+	return func() bool {
+		select {
+		case <-elected:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 // ownerKeys returns the identity client when the introspection client is configured,
 // so identity keys are checked by introspection. The second result is true when an
 // owner policy was supplied. A missing policy answers identity keys with 503
 // owner_policy_not_applied; a rejected policy answers 500 owner_policy_invalid.
 // Grant keys keep working. A policy that fails for a transient reason is retried
-// in the background.
-func ownerKeys(ctx context.Context, grants *grant.Service) (*identity.Client, bool) {
+// in the background. With a policy store the policy is applied in memory only:
+// the store registers the templates from the leader and retries failures.
+func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPolicyStore) (*identity.Client, bool) {
 	client, err := identity.FromEnv()
 	if err != nil {
 		log.Error("identity keys disabled: identity client config is invalid", "error", err)
@@ -546,6 +563,15 @@ func ownerKeys(ctx context.Context, grants *grant.Service) (*identity.Client, bo
 	if policy == nil {
 		log.Warn("identity keys await owner policy: owner policy is not configured")
 		return client, false
+	}
+	if store != nil {
+		if err := grants.ApplyOwnerPolicy(ctx, *policy, false); err != nil {
+			log.Warn("owner policy was not applied; the policy store retries", "error", err)
+			return client, true
+		}
+		store.MarkApplied(os.Getenv("E2B_OWNER_POLICY"))
+		log.Info("identity keys enabled", "role", grants.OwnerRole())
+		return client, true
 	}
 	err = grants.SetOwnerPolicy(ctx, *policy)
 	if err == nil {

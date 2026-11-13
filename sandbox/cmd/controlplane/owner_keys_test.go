@@ -38,7 +38,7 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 			t.Setenv("E2B_OWNER_POLICY", policy)
-			client, supplied := ownerKeys(context.Background(), grants)
+			client, supplied := ownerKeys(context.Background(), grants, nil)
 			if client == nil || !supplied || grants.OwnerRole() != "" {
 				t.Fatalf("client=%v supplied=%v role=%q, want a client, a supplied policy and no owner role", client, supplied, grants.OwnerRole())
 			}
@@ -55,7 +55,7 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 	grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 	t.Setenv("IDENTITY_CLIENT_SECRET", "")
 	t.Setenv("E2B_OWNER_POLICY", `{"templates":[{"name":"t"}]}`)
-	if client, _ := ownerKeys(context.Background(), grants); client != nil {
+	if client, _ := ownerKeys(context.Background(), grants, nil); client != nil {
 		t.Fatalf("missing secret: client=%v", client)
 	}
 }
@@ -86,7 +86,7 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if client, supplied := ownerKeys(ctx, grants); client == nil || !supplied {
+	if client, supplied := ownerKeys(ctx, grants, nil); client == nil || !supplied {
 		t.Fatal("identity keys disabled after a transient failure")
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -95,6 +95,36 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 			t.Fatal("owner policy was not applied after retries")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestOwnerKeysWithStoreAppliesInMemory checks that a replica with a policy store
+// applies the startup policy without registering templates or starting a retry.
+func TestOwnerKeysWithStoreAppliesInMemory(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	grants := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system"})
+	store := grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false })
+	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
+	t.Setenv("IDENTITY_CLIENT_ID", "id")
+	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
+	t.Setenv("E2B_OWNER_POLICY", `{"templates":[{"name":"t","perGpuCount":[1],"spec":{"fromImage":"harbor.example/runner@sha256:0123456789abcdef"}}]}`)
+
+	if client, supplied := ownerKeys(context.Background(), grants, store); client == nil || !supplied {
+		t.Fatal("identity keys disabled with a policy store")
+	}
+	if grants.OwnerRole() == "" {
+		t.Fatal("startup policy was not applied")
+	}
+	var cis runtimev1alpha1.CodeInterpreterList
+	if err := cl.List(context.Background(), &cis); err != nil {
+		t.Fatal(err)
+	}
+	if len(cis.Items) != 0 {
+		t.Fatalf("startup registered %d templates; the store leader does that", len(cis.Items))
 	}
 }
 
@@ -112,7 +142,7 @@ func TestOwnerKeysEnabledWithoutOwnerPolicy(t *testing.T) {
 	t.Setenv("E2B_OWNER_POLICY", "")
 	t.Setenv("E2B_OWNER_POLICY_FILE", "")
 
-	client, supplied := ownerKeys(context.Background(), grants)
+	client, supplied := ownerKeys(context.Background(), grants, nil)
 	if client == nil {
 		t.Fatal("identity client disabled without an owner policy: SaFE API keys are matched as grant keys")
 	}

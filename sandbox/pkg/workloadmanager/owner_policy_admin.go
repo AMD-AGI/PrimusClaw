@@ -4,7 +4,6 @@
 package workloadmanager
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -19,30 +18,32 @@ import (
 // templates identity keys may create sandboxes from.
 const ownerPolicyTemplatesPath = "/v1/admin/owner-policy/templates"
 
-// OwnerPolicyTemplateRequest is the body of PUT /v1/admin/owner-policy/templates/{name}.
-type OwnerPolicyTemplateRequest struct {
-	Name        string          `json:"name,omitempty"`
-	PerGPUCount []int32         `json:"perGpuCount"`
-	Spec        json.RawMessage `json:"spec"`
+// WithOwnerPolicyStore attaches the store behind the owner policy template API.
+// Without a store the API answers 404.
+func (s *Server) WithOwnerPolicyStore(store *grant.OwnerPolicyStore) *Server {
+	s.ownerPolicy = store
+	return s
 }
 
-// WithOwnerPolicyStore serves the owner policy template API from store.
-// Every route requires caller auth and the system-admin role.
-func (s *Server) WithOwnerPolicyStore(store *grant.OwnerPolicyStore) *Server {
-	if store == nil || s.router == nil {
-		return s
+// mountOwnerPolicyRoutes registers the owner policy template API on g, a
+// group under /v1. Every route requires caller auth and the system-admin role.
+func (s *Server) mountOwnerPolicyRoutes(g *gin.RouterGroup) {
+	g.Use(s.requireOwnerPolicyStore(), s.requireVerifiedSystemAdmin())
+	g.GET("", s.handleOwnerPolicyList)
+	g.GET("/:name", s.handleOwnerPolicyGet)
+	g.PUT("/:name", s.handleOwnerPolicyPut)
+	g.DELETE("/:name", s.handleOwnerPolicyDelete)
+}
+
+// requireOwnerPolicyStore answers 404 when no owner policy store is attached.
+func (s *Server) requireOwnerPolicyStore() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.ownerPolicy == nil {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "owner policy API is not configured", "code": "owner_policy_api_disabled"})
+			return
+		}
+		c.Next()
 	}
-	g := s.router.Group(ownerPolicyTemplatesPath, s.loggingMiddleware())
-	if s.cfg.EnableAuth {
-		g.Use(s.callerAuthMiddleware())
-	}
-	g.Use(s.requireVerifiedSystemAdmin())
-	h := ownerPolicyHandler{store: store}
-	g.GET("", h.list)
-	g.GET("/:name", h.get)
-	g.PUT("/:name", h.put)
-	g.DELETE("/:name", h.delete)
-	return s
 }
 
 // requireVerifiedSystemAdmin answers 403 unless caller auth is enabled and the
@@ -57,28 +58,24 @@ func (s *Server) requireVerifiedSystemAdmin() gin.HandlerFunc {
 	}
 }
 
-type ownerPolicyHandler struct {
-	store *grant.OwnerPolicyStore
-}
-
-// list returns every template of the owner policy.
-func (h ownerPolicyHandler) list(c *gin.Context) {
-	templates, err := h.store.Templates(c.Request.Context())
+// handleOwnerPolicyList returns every stored template and whether this replica applied them.
+func (s *Server) handleOwnerPolicyList(c *gin.Context) {
+	out, err := s.ownerPolicy.Templates(c.Request.Context())
 	if err != nil {
 		writeOwnerPolicyErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"templates": templates})
+	c.JSON(http.StatusOK, out)
 }
 
-// get returns one template of the owner policy.
-func (h ownerPolicyHandler) get(c *gin.Context) {
-	templates, err := h.store.Templates(c.Request.Context())
+// handleOwnerPolicyGet returns one stored template.
+func (s *Server) handleOwnerPolicyGet(c *gin.Context) {
+	out, err := s.ownerPolicy.Templates(c.Request.Context())
 	if err != nil {
 		writeOwnerPolicyErr(c, err)
 		return
 	}
-	for _, tpl := range templates {
+	for _, tpl := range out.Templates {
 		if tpl.Name == c.Param("name") {
 			c.JSON(http.StatusOK, tpl)
 			return
@@ -87,20 +84,21 @@ func (h ownerPolicyHandler) get(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "template not found: " + c.Param("name"), "code": "template_not_found"})
 }
 
-// put adds or replaces one template and applies the new policy.
-func (h ownerPolicyHandler) put(c *gin.Context) {
-	var req OwnerPolicyTemplateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+// handleOwnerPolicyPut adds or replaces one template, then applies the stored policy.
+// The name comes from the path; a body name must match it.
+func (s *Server) handleOwnerPolicyPut(c *gin.Context) {
+	var tpl grant.TemplateRequest
+	if err := c.ShouldBindJSON(&tpl); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error(), "code": "invalid_template"})
 		return
 	}
 	name := c.Param("name")
-	if req.Name != "" && req.Name != name {
+	if tpl.Name != "" && tpl.Name != name {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body name differs from path name", "code": "invalid_template"})
 		return
 	}
-	tpl := grant.TemplateRequest{Name: name, PerGPUCount: req.PerGPUCount, Spec: req.Spec}
-	if err := h.store.PutTemplate(c.Request.Context(), tpl); err != nil {
+	tpl.Name = name
+	if err := s.ownerPolicy.PutTemplate(c.Request.Context(), tpl); err != nil {
 		writeOwnerPolicyErr(c, err)
 		return
 	}
@@ -108,10 +106,10 @@ func (h ownerPolicyHandler) put(c *gin.Context) {
 	c.JSON(http.StatusOK, tpl)
 }
 
-// delete removes one template and applies the new policy.
-func (h ownerPolicyHandler) delete(c *gin.Context) {
+// handleOwnerPolicyDelete removes one template, then applies the stored policy.
+func (s *Server) handleOwnerPolicyDelete(c *gin.Context) {
 	name := c.Param("name")
-	if err := h.store.DeleteTemplate(c.Request.Context(), name); err != nil {
+	if err := s.ownerPolicy.DeleteTemplate(c.Request.Context(), name); err != nil {
 		writeOwnerPolicyErr(c, err)
 		return
 	}

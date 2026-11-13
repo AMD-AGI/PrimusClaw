@@ -80,7 +80,7 @@ curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: applicati
   -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
 ```
 
-A write applies the new policy before it rewrites the ConfigMap, so a rejected policy is not stored and returns the error. The last template cannot be removed. Every replica reloads the ConfigMap every 15 seconds; a caller's template list follows on the next create.
+A write validates the new policy, stores it in the ConfigMap, and then applies it. A rejected policy is not stored and returns the error. The last template cannot be removed. Every replica reloads the ConfigMap every 15 seconds and applies it; only the leader replica creates, updates and deletes the template objects, so a new template can take up to one sync to appear on a follower. A caller's template list follows on the next create. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy; a rejected policy is tried again every 5 minutes.
 
 ## Quotas
 

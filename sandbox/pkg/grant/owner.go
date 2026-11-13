@@ -152,21 +152,51 @@ func OwnerPolicyFromEnv() (*OwnerPolicy, error) {
 	return &p, nil
 }
 
-// SetOwnerPolicy validates the policy and registers its templates.
+// SetOwnerPolicy validates the policy, registers its templates, and applies it.
 func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
+	return s.ApplyOwnerPolicy(ctx, p, true)
+}
+
+// ValidateOwnerPolicy checks the policy. It changes neither the cluster nor
+// the applied policy.
+func (s *Service) ValidateOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
+	_, err := s.prepareOwnerPolicy(ctx, p)
+	return err
+}
+
+// ApplyOwnerPolicy validates the policy and makes it the applied policy.
+// With registerTemplates it also creates, updates and deletes the owner
+// CodeInterpreters, which every replica shares; one replica at a time may do that.
+func (s *Service) ApplyOwnerPolicy(ctx context.Context, p OwnerPolicy, registerTemplates bool) error {
+	cfg, err := s.prepareOwnerPolicy(ctx, p)
+	if err != nil {
+		return err
+	}
+	if registerTemplates {
+		if err := s.upsertOwnerTemplates(ctx, cfg.templates); err != nil {
+			return err
+		}
+	}
+	s.owner.Store(cfg)
+	s.ownerFault.Store(false)
+	return nil
+}
+
+// prepareOwnerPolicy validates the policy and resolves it. It only reads the cluster.
+func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*ownerConfig, error) {
 	role := p.Role
 	if role == "" {
 		role = defaultOwnerRole
 	}
 	if !roleLabel(role) {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "role "+role+" is not a workload display name")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "role "+role+" is not a workload display name")
 	}
 	if len(p.Templates) == 0 {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "at least one template is required")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "at least one template is required")
 	}
 	for id, q := range p.Owners {
 		if id == "" || !validQuota(q) {
-			return opErr(http.StatusBadRequest, "invalid_owner_policy", "owner "+id+" quota is invalid")
+			return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "owner "+id+" quota is invalid")
 		}
 	}
 	quota, admin := defaultUserQuota, defaultAdminQuota
@@ -177,10 +207,10 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 		admin = p.Admin.over(defaultAdminQuota)
 	}
 	if !validQuota(quota) || !validQuota(admin) {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
 	}
 	if err := s.checkOwnerRole(ctx, role); err != nil {
-		return err
+		return nil, err
 	}
 	names := make([]string, 0, len(p.Templates))
 	for _, tpl := range p.Templates {
@@ -188,20 +218,46 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	}
 	roles, _, stored, err := expandTemplates(ownerAppRunID, map[string]RoleRequest{role: {Templates: names}}, p.Templates)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.resolveTemplateGPUCounts(ctx, ownerAppRunID, stored); err != nil {
-		return err
+		return nil, err
 	}
-	if err := s.upsertOwnerTemplates(ctx, stored); err != nil {
-		return err
+	if err := s.checkOwnerTemplateNames(ctx, stored); err != nil {
+		return nil, err
 	}
 	owners := make(map[string]OwnerQuota, len(p.Owners))
 	for id, q := range p.Owners {
 		owners[id] = q
 	}
-	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
-	s.ownerFault.Store(false)
+	return &ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners}, nil
+}
+
+// checkOwnerTemplateNames rejects a template spec that is not JSON and a
+// template name held by a CodeInterpreter the owner policy does not own.
+func (s *Service) checkOwnerTemplateNames(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
+	for _, tpl := range templates {
+		_, ok, err := templateFromSpec(tpl.Spec)
+		if err != nil {
+			return opWrap(http.StatusBadRequest, "invalid_owner_policy", "template spec is not JSON", err)
+		}
+		if !ok {
+			continue
+		}
+		for _, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
+			existing := &runtimev1alpha1.CodeInterpreter{}
+			err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
+			}
+			if !ownedByGrant(existing, ownerTemplatesID) {
+				return opErr(http.StatusConflict, "template_exists", name)
+			}
+		}
+	}
 	return nil
 }
 
