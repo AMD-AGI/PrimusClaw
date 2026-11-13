@@ -163,6 +163,10 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write # sign the provenance attestation of a pushed image
+      attestations: write # store it
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
@@ -299,6 +303,7 @@ jobs:
         run: bash .github/scripts/image-scan.sh "$NAME" "$RUNNER_TEMP/image-scan/$NAME.tar"
 
       - name: Push with Buildah
+        id: push
         if: github.event_name != 'pull_request' && matrix.push != 'no'
         env:
           DOCKERIO_REPOSITORY: docker.io/primussafe
@@ -309,5 +314,33 @@ jobs:
           echo "Pushing ${{ matrix.name }} to ${DOCKERIO_REPOSITORY}..."
           buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
           buildah tag ${{ matrix.name }}:${DATE_TIME} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push --digestfile "$RUNNER_TEMP/version-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push --digestfile "$RUNNER_TEMP/build-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          version_digest="$(cat "$RUNNER_TEMP/version-digest")" build_digest="$(cat "$RUNNER_TEMP/build-digest")"
+          for d in "$version_digest" "$build_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported digest \"$d\""; exit 1; }
+          done
+          echo "${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME} is ${build_digest}"
+          {
+            echo "repository=${DOCKERIO_REPOSITORY}/${{ matrix.name }}"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      # The build tag is what deployments and releases name, and what a release relays by digest to the ROCm staging
+      # repository (image-relay.yml); a copy that keeps the digest keeps this attestation valid for it too.
+      # `gh attestation verify oci://<image>@<digest> --repo AMD-AGI/PrimusClaw` checks it.
+      - name: Attest the image's provenance
+        if: steps.push.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.build-digest }}
+
+      # The two tags are two pushes of one image and normally one digest; should they differ, the other is attested too.
+      - name: Attest the version tag's provenance
+        if: steps.push.outcome == 'success' && steps.push.outputs.version-digest != steps.push.outputs.build-digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.version-digest }}

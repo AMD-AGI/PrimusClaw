@@ -72,6 +72,10 @@ jobs:
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write # sign the provenance attestation of a pushed image
+      attestations: write # store it
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
@@ -144,6 +148,7 @@ jobs:
         run: bash .github/scripts/image-scan.sh "$NAME" "$RUNNER_TEMP/image-scan/$NAME.tar"
 
       - name: Push sandbox image
+        id: push
         if: github.event_name != 'pull_request'
         env:
           REPOSITORY: docker.io/primussafe
@@ -154,8 +159,33 @@ jobs:
           echo "Pushing ${{ matrix.name }} to ${REPOSITORY}..."
           buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
           buildah tag ${{ matrix.name }}:${DATE_TIME} ${REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
-          buildah push ${REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
-          buildah push ${REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push --digestfile "$RUNNER_TEMP/version-digest" ${REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push --digestfile "$RUNNER_TEMP/build-digest" ${REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          version_digest="$(cat "$RUNNER_TEMP/version-digest")" build_digest="$(cat "$RUNNER_TEMP/build-digest")"
+          for d in "$version_digest" "$build_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported digest \"$d\""; exit 1; }
+          done
+          {
+            echo "repository=${REPOSITORY}/${{ matrix.name }}"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      # As in build.yaml: the build tag's digest is what deployments pin and a release relays (image-relay.yml).
+      # `gh attestation verify oci://<image>@<digest> --repo AMD-AGI/PrimusClaw` checks it.
+      - name: Attest the image's provenance
+        if: steps.push.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.build-digest }}
+
+      - name: Attest the version tag's provenance
+        if: steps.push.outcome == 'success' && steps.push.outputs.version-digest != steps.push.outputs.build-digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.version-digest }}
 
       - name: Record image tags
         env:

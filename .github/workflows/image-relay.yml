@@ -1,0 +1,238 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Release image relay
+
+# Copies a release's image, by digest and unchanged, into the ROCm staging repository docker.io/rocm/primusclaw-private.
+# From there AMD's image publication pipeline scans it and copies it to the public docker.io/rocm/primusclaw. A source
+# under rocm/* is copied byte for byte, so the image published on rocm/primusclaw has the digest that was built,
+# attested and run; a source anywhere else is pulled and pushed again and comes out with a new digest, which is why the
+# relay exists. Nothing is rebuilt here: the digest copied is the one the release names.
+#
+#   release claw-vX.Y.Z published         the build its notes name (docker.io/primussafe/claw:<build>) -> claw-X.Y.Z
+#   Personal agent release succeeded      the image line its publish-image job added to the notes of personal-agent-vX.Y.Z
+#                                         (docker.io/primussafe/personal-agent-teams:X.Y.Z@sha256:...)
+#                                         -> personal-agent-teams-X.Y.Z
+#   workflow_dispatch                     either of the above for an existing tag, re-run by hand; for a claw-v tag also
+#                                         the agent-sandbox images that ship with it, given by digest
+#                                         -> agent-sandbox-controlplane-X.Y.Z, agent-sandbox-envd-injector-X.Y.Z
+#
+# Anything else (another tag, a release whose notes name no image, a pull request's dry run) resolves to nothing, and
+# nothing is asked of the environment. The copy job runs in the environment image-publish, behind its reviewers, and is
+# the only job that holds a credential. Until ROCM_STAGING_USERNAME and ROCM_STAGING_TOKEN exist in that environment it
+# says so and copies nothing.
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["Personal agent release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to relay: claw-vX.Y.Z or personal-agent-vX.Y.Z"
+        required: true
+        type: string
+      controlplane-digest:
+        description: "claw-v tags only: sha256 digest of docker.io/primussafe/agent-sandbox-controlplane to relay with it"
+        required: false
+        type: string
+      envd-injector-digest:
+        description: "claw-v tags only: sha256 digest of docker.io/primussafe/agent-sandbox-envd-injector to relay with it"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One relay at a time, never cancelled: two runs for one tag copy the same digest to the same tag.
+concurrency:
+  group: image-relay
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve the release's images
+    if: >-
+      github.repository == 'AMD-AGI/PrimusClaw'
+      && (github.event_name != 'workflow_run'
+          || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      copies: ${{ steps.resolve.outputs.copies }}
+    steps:
+      - name: Install skopeo
+        run: command -v skopeo >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y skopeo; }
+
+      # The tag, the notes and the inputs are attacker-shaped text: they reach the shell through the environment and
+      # are matched against fixed shapes before anything is built from them.
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+          CONTROLPLANE_DIGEST: ${{ inputs.controlplane-digest }}
+          ENVD_INJECTOR_DIGEST: ${{ inputs.envd-injector-digest }}
+        run: |
+          set -euo pipefail
+          staging=docker.io/rocm/primusclaw-private
+          case "$EVENT" in
+            release) tag="$RELEASE_TAG" ;;
+            workflow_run) tag="$RUN_BRANCH" ;;
+            *) tag="$INPUT_TAG" ;;
+          esac
+          copies='[]'
+          add() { copies="$(jq -c --arg s "$1" --arg d "$2" '. + [{source: $s, destination: $d}]' <<<"$copies")"; }
+          digest_of() { skopeo inspect --no-tags --format '{{.Digest}}' "docker://$1"; }
+          sha='sha256:[0-9a-f]{64}'
+
+          if [[ "$tag" =~ ^claw-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            component=claw
+          elif [[ "$tag" =~ ^personal-agent-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            component=personal-agent-teams
+          else
+            echo "$tag is not a claw-v or personal-agent-v release tag; nothing to relay"
+            echo "copies=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="${BASH_REMATCH[1]}"
+          if [ "$EVENT" = workflow_run ] && [ "$component" != personal-agent-teams ]; then
+            echo "the Personal agent release ran for $tag; nothing to relay"
+            echo "copies=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT" = workflow_dispatch ] && [ "$component" != claw ] && [ -n "$CONTROLPLANE_DIGEST$ENVD_INJECTOR_DIGEST" ]; then
+            echo "::error::agent-sandbox digests ship with a claw-v tag, not $tag"
+            exit 1
+          fi
+          notes="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+
+          if [ "$component" = claw ]; then
+            # The notes name the build the release is, docker.io/primussafe/claw:<build>; exactly one, or nothing is
+            # relayed, since the right one cannot be told apart.
+            mapfile -t builds < <(grep -oE 'docker\.io/primussafe/claw:[0-9]{12}' <<<"$notes" | sort -u)
+            if [ "${#builds[@]}" -ne 1 ]; then
+              echo "::error::the notes of $tag name ${#builds[@]} claw builds (docker.io/primussafe/claw:<build>); expected exactly one"
+              exit 1
+            fi
+            source_digest="$(digest_of "${builds[0]}")"
+            [[ "$source_digest" =~ ^$sha$ ]] || { echo "::error::${builds[0]} resolved to \"$source_digest\""; exit 1; }
+            echo "$tag: ${builds[0]} is $source_digest"
+            add "docker.io/primussafe/claw@$source_digest" "$staging:claw-$version"
+            for pair in "agent-sandbox-controlplane=$CONTROLPLANE_DIGEST" "agent-sandbox-envd-injector=$ENVD_INJECTOR_DIGEST"; do
+              name="${pair%%=*}" digest="${pair#*=}"
+              [ -n "$digest" ] || continue
+              [[ "$digest" =~ ^$sha$ ]] || { echo "::error::the $name digest is not sha256:<64 hex>"; exit 1; }
+              found="$(digest_of "docker.io/primussafe/$name@$digest")"
+              [ "$found" = "$digest" ] || { echo "::error::docker.io/primussafe/$name@$digest does not exist"; exit 1; }
+              add "docker.io/primussafe/$name@$digest" "$staging:$name-$version"
+            done
+          else
+            # publish-image names the image it pushed and attested: Image: `<repository>:X.Y.Z@sha256:...`.
+            image_re="Image: \`docker\\.io/primussafe/personal-agent-teams:${version//./\\.}@($sha)\`"
+            mapfile -t digests < <(grep -oE "$image_re" <<<"$notes" | grep -oE "$sha" | sort -u)
+            if [ "${#digests[@]}" -eq 0 ]; then
+              echo "the notes of $tag name no pushed image (its image publish is off, or did not run); nothing to relay"
+              echo "copies=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "${#digests[@]}" -ne 1 ]; then
+              echo "::error::the notes of $tag name ${#digests[@]} different image digests; expected one"
+              exit 1
+            fi
+            add "docker.io/primussafe/personal-agent-teams@${digests[0]}" "$staging:personal-agent-teams-$version"
+          fi
+          jq . <<<"$copies"
+          echo "copies=$copies" >> "$GITHUB_OUTPUT"
+
+  relay:
+    name: Copy to the ROCm staging repository
+    needs: resolve
+    if: needs.resolve.outputs.copies != '' && needs.resolve.outputs.copies != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: image-publish
+    permissions:
+      contents: read
+    steps:
+      - name: The relay credential is set
+        id: credential
+        env:
+          RELAY_USERNAME: ${{ secrets.ROCM_STAGING_USERNAME }}
+          RELAY_TOKEN: ${{ secrets.ROCM_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELAY_USERNAME" ] && [ -n "$RELAY_TOKEN" ]; then
+            echo "set=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ROCM_STAGING_USERNAME or ROCM_STAGING_TOKEN is not set in the image-publish environment; nothing is relayed"
+            echo "set=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install skopeo
+        if: steps.credential.outputs.set == 'true'
+        run: command -v skopeo >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y skopeo; }
+
+      # Source and destination are both on docker.io under different accounts, so each has its own auth file. The
+      # source is public; its login only keeps the pull out of the anonymous rate limit.
+      - name: Log in
+        if: steps.credential.outputs.set == 'true'
+        env:
+          SOURCE_AUTH: ${{ runner.temp }}/source-auth.json
+          RELAY_AUTH: ${{ runner.temp }}/relay-auth.json
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          RELAY_USERNAME: ${{ secrets.ROCM_STAGING_USERNAME }}
+          RELAY_TOKEN: ${{ secrets.ROCM_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo '{"auths":{}}' > "$SOURCE_AUTH"
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_PASSWORD" ]; then
+            printf '%s' "$DOCKERHUB_PASSWORD" | skopeo login --authfile "$SOURCE_AUTH" --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          fi
+          printf '%s' "$RELAY_TOKEN" | skopeo login --authfile "$RELAY_AUTH" --username "$RELAY_USERNAME" --password-stdin docker.io
+
+      # --preserve-digests refuses any copy that would change the digest, and the destination is read back and compared
+      # as well, so what lands under the tag is the digest resolved above or the job fails.
+      - name: Copy by digest
+        if: steps.credential.outputs.set == 'true'
+        env:
+          COPIES: ${{ needs.resolve.outputs.copies }}
+          SOURCE_AUTH: ${{ runner.temp }}/source-auth.json
+          RELAY_AUTH: ${{ runner.temp }}/relay-auth.json
+        run: |
+          set -euo pipefail
+          staging_re='^docker\.io/rocm/primusclaw-private:[a-z0-9-]+-[0-9]+\.[0-9]+\.[0-9]+$'
+          source_re='^docker\.io/primussafe/[a-z0-9-]+@sha256:[0-9a-f]{64}$'
+          {
+            echo "## Relayed to the ROCm staging repository"
+            echo ""
+            echo "| Source | Staging tag |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r source destination; do
+            [[ "$source" =~ $source_re ]] || { echo "::error::unexpected source \"$source\""; exit 1; }
+            [[ "$destination" =~ $staging_re ]] || { echo "::error::unexpected destination \"$destination\""; exit 1; }
+            digest="${source#*@}"
+            echo "copying $source to $destination"
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              --src-authfile "$SOURCE_AUTH" --dest-authfile "$RELAY_AUTH" \
+              "docker://$source" "docker://$destination"
+            landed="$(skopeo inspect --no-tags --authfile "$RELAY_AUTH" --format '{{.Digest}}' "docker://$destination")"
+            if [ "$landed" != "$digest" ]; then
+              echo "::error::$destination is $landed, not $digest"
+              exit 1
+            fi
+            echo "| \`$source\` | \`$destination\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r '.[] | [.source, .destination] | @tsv' <<<"$COPIES")
+
+      - name: Log out
+        if: always()
+        env:
+          SOURCE_AUTH: ${{ runner.temp }}/source-auth.json
+          RELAY_AUTH: ${{ runner.temp }}/relay-auth.json
+        run: rm -f "$SOURCE_AUTH" "$RELAY_AUTH"
