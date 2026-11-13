@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Caller authentication middleware for the Router (default on; --enable-auth=false to disable).
-// A caller presents "Authorization: Bearer <credential>": a platform API key (ak-...) or an
-// access token issued by the identity provider for this service. The credential is
-// validated through identity provider token introspection (RFC 7662).
+// A caller presents "Authorization: Bearer <credential>" or "X-API-KEY": a platform API key
+// (ak-...) or an access token issued by the identity provider for this service. The credential
+// is validated through identity provider token introspection (RFC 7662).
 package router
 
 import (
@@ -58,13 +58,18 @@ func bearerCredential(c *gin.Context) string {
 	return identity.BearerCredential(c.GetHeader("Authorization"))
 }
 
+// callerCredential returns the bearer token, or the X-API-KEY when no bearer is present.
+func callerCredential(c *gin.Context) string {
+	return identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
+}
+
 // abortCaller records the rejection and answers it.
 func abortCaller(c *gin.Context, r identity.Rejection) {
 	recordCallerAuthRejection(c, r.Status)
 	c.AbortWithStatusJSON(r.Status, gin.H{"error": r.Message, "code": r.Code})
 }
 
-// callerAuthMiddleware verifies the caller's bearer credential through identity introspection.
+// callerAuthMiddleware verifies the caller's credential through identity introspection.
 // A missing or inactive credential is 401; an identity provider that cannot answer is 503.
 func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -72,7 +77,7 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		credential := bearerCredential(c)
+		credential := callerCredential(c)
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
 			return

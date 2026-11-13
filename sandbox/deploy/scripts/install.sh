@@ -227,7 +227,7 @@ spec:
     http:
       paths:
 EOF
-    for path in /sandboxes /v2/sandboxes /files /api/files /process.Process /filesystem.Filesystem; do
+    for path in /sandboxes /v2/sandboxes /files /api/files /process.Process /filesystem.Filesystem /v1/templates; do
         cat >>"${manifest}" <<EOF
       - path: ${path}
         pathType: Prefix
@@ -487,6 +487,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
 PY
 trap 'rm -f "${VALUES_FILE:-}"' EXIT
 
+# The public Ingress is part of the release. Ask for the host before helm runs
+# so a re-install publishes /v1/templates with the rest of the routes.
+prompt_ingress_host
+if [[ -n "${INGRESS_HOST}" ]]; then
+    dns_name_ok "${INGRESS_HOST}" domain \
+        || err "INGRESS_HOST must be a lowercase DNS name, got ${INGRESS_HOST}"
+    dns_name_ok "${INGRESS_CLASS}" domain \
+        || dns_name_ok "${INGRESS_CLASS}" label \
+        || err "INGRESS_CLASS must be a DNS label or name, got ${INGRESS_CLASS}"
+fi
+
 # Build helm --set args
 HELM_ARGS=(
     upgrade --install "${RELEASE}" "${CHART_DIR}"
@@ -550,6 +561,27 @@ else
     or acknowledge an unauthenticated development install:
         ALLOW_INSECURE_NO_AUTH=true $0
     See the 'Production hardening' section of sandbox/README.md."
+fi
+
+if [[ -n "${INGRESS_HOST}" ]]; then
+    HELM_ARGS+=(
+        --set "router.publicIngress.enabled=true"
+        --set-string "router.publicIngress.className=${INGRESS_CLASS}"
+        --set-string "router.publicIngress.hosts[0]=${INGRESS_HOST}"
+    )
+    # An Ingress created by an older installer has no Helm ownership. Adopt it
+    # before upgrade, or Helm refuses to take an object it did not create.
+    if [[ "${DRY_RUN}" != "true" ]] && kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public >/dev/null 2>&1; then
+        MANAGED_INGRESS="$(kubectl -n "${NAMESPACE}" get ingress agent-sandbox-public -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+        if [[ "${MANAGED_INGRESS}" != "Helm" ]]; then
+            kubectl -n "${NAMESPACE}" annotate ingress agent-sandbox-public \
+                meta.helm.sh/release-name="${RELEASE}" \
+                meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite
+            kubectl -n "${NAMESPACE}" label ingress agent-sandbox-public \
+                app.kubernetes.io/managed-by=Helm --overwrite
+            ok "adopted existing router Ingress into Helm release ${RELEASE}"
+        fi
+    fi
 fi
 
 # Run helm with retries. Output is teed to a log so the real helm exit code is
@@ -693,7 +725,7 @@ cat <<EOF
 
   Notes:
     - Kata RuntimeClass alone is harmless; runtime binaries still require: sudo bash ${SCRIPT_DIR}/install-kata.sh (per worker node)
-    - Router Ingress is mounted on INGRESS_HOST at /sandboxes and the E2B data-plane paths. Leave INGRESS_HOST unset to skip it.
+    - Router Ingress is mounted on INGRESS_HOST at /sandboxes, /v1/templates, and the E2B data-plane paths. Leave INGRESS_HOST unset to skip it.
 
   Uninstall:
     DELETE_CRDS=true bash ${SCRIPT_DIR}/uninstall.sh

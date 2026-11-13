@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.controlplane.enabled .Values.router.publicIngress.enabled }}
+{{- if not .Values.router.publicIngress.hosts }}
+{{- fail "router.publicIngress.enabled requires at least one host" }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ required "router.publicIngress.name is required" .Values.router.publicIngress.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agent-sandbox
+    app.kubernetes.io/component: router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    higress.io/resource-definer: higress
+  {{- with .Values.router.publicIngress.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.router.publicIngress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    {{- range .Values.router.publicIngress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          {{- range $.Values.router.publicIngress.paths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-sandbox-router
+                port:
+                  number: {{ $.Values.controlplane.service.router.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

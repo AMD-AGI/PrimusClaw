@@ -26,17 +26,17 @@ const (
 	UserNameHeader = "userName"
 )
 
-// callerAuthMiddleware verifies the caller's bearer credential on every /v1/ request.
-// Caller-supplied identity and role headers are erased first and set only from a
-// verified credential. A missing or inactive credential is 401; an identity
-// provider that cannot answer is 503.
+// callerAuthMiddleware verifies the caller's credential on every /v1/ request.
+// The credential is an Authorization bearer token or an X-API-KEY. Caller-supplied
+// identity and role headers are erased first and set only from a verified credential.
+// A missing or inactive credential is 401; an identity provider that cannot answer is 503.
 func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Request.Header.Del(UserIDHeader)
 		c.Request.Header.Del(UserNameHeader)
 		c.Request.Header.Del(UserRoleHeader)
 
-		credential := identity.BearerCredential(c.GetHeader("Authorization"))
+		credential := identity.RequestCredential(c.GetHeader("Authorization"), c.GetHeader(identity.APIKeyHeader))
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
 			return

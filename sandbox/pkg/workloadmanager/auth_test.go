@@ -68,6 +68,26 @@ func TestCallerAuthMiddlewareOverwritesSpoofedRole(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"userRole":"default"`)
 }
 
+func TestCallerAuthMiddlewareAcceptsAPIKeyHeader(t *testing.T) {
+	engine := newAuthTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		assert.Equal(t, "ak-header", r.PostForm.Get("token"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"active": true,
+			"sub":    "key-user",
+			"roles":  []string{"default"},
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("X-API-KEY", "ak-header")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"userId":"key-user"`)
+}
+
 func TestCallerAuthMiddlewareRejectsInactiveCredential(t *testing.T) {
 	engine := newAuthTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": false})

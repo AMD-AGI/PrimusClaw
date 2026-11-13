@@ -178,6 +178,33 @@ router:
     host: ""                      # empty = match any host
     path: /v1/namespaces/         # must start with /v1/namespaces/ (the chart refuses anything wider)
     annotations: {}
+  # Public E2B routes on an existing host. Rendered with the release, so a
+  # helm upgrade publishes them. Paths are absolute: E2B does not use a prefix.
+  publicIngress:
+    enabled: false
+    name: agent-sandbox-public
+    className: higress
+    hosts: []
+    paths:
+      - /sandboxes
+      - /v2/sandboxes
+      - /files
+      - /api/files
+      - /process.Process
+      - /filesystem.Filesystem
+      - /v1/templates
+    annotations:
+      higress.io/route-priority: "100"
+      higress.io/ignore-path-case: "false"
+      higress.io/proxy-body-size: "0"
+      higress.io/proxy-buffering: "off"
+      higress.io/proxy-read-timeout: "3600"
+      higress.io/proxy-send-timeout: "3600"
+      higress.io/timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   extraEnv: []
 
 # ── Workload Manager (merged into controlplane; only config/extraEnv are consumed) ──

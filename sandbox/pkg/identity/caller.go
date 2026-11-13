@@ -25,11 +25,14 @@ type Rejection struct {
 	Message string
 }
 
-// MissingCredential is the answer to a request without a bearer credential.
+// APIKeyHeader is the header an E2B or SaFE client uses for its API key.
+const APIKeyHeader = "X-API-KEY"
+
+// MissingCredential is the answer to a request without a bearer credential or an API key.
 var MissingCredential = Rejection{
 	Status:  http.StatusUnauthorized,
 	Code:    "caller_credentials_missing",
-	Message: "authentication required: use Authorization: Bearer <API key or access token>",
+	Message: "authentication required: use Authorization: Bearer <API key or access token> or X-API-KEY",
 }
 
 // BearerCredential returns the credential of an "Authorization: Bearer" header value, or "".
@@ -39,6 +42,15 @@ func BearerCredential(header string) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
+}
+
+// RequestCredential returns the caller's credential. A bearer token wins when
+// both are present. The API key header is the credential E2B clients send.
+func RequestCredential(authorization, apiKey string) string {
+	if credential := BearerCredential(authorization); credential != "" {
+		return credential
+	}
+	return strings.TrimSpace(apiKey)
 }
 
 // RejectionFor maps an Introspect error to the caller's answer: 401 for an
