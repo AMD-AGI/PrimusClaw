@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -153,5 +155,128 @@ func TestChooseWorkspaceRequiresAName(t *testing.T) {
 	c := NewClient(&recordingReviewer{}, "primus:")
 	if _, err := c.ChooseWorkspace(context.Background(), identity.Token{Subject: "u-1"}, ""); !errors.Is(err, ErrWorkspaceRequired) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// countingReviewer allows every review, counts calls, and fails while err is set.
+type countingReviewer struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+	gate  chan struct{}
+}
+
+func (r *countingReviewer) Create(_ context.Context, sar *authorizationv1.SubjectAccessReview, _ metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	r.mu.Lock()
+	r.calls++
+	err := r.err
+	r.mu.Unlock()
+	if r.gate != nil {
+		<-r.gate
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := sar.DeepCopy()
+	out.Status.Allowed = sar.Spec.ResourceAttributes.Name != "denied"
+	return out, nil
+}
+
+func (r *countingReviewer) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func TestAllowedCachesAllowFor30sAndDenyFor5s(t *testing.T) {
+	rec := &countingReviewer{}
+	c := NewClient(rec, "primus:")
+	now := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+	tok := identity.Token{Subject: "u-1"}
+
+	for _, ws := range []string{"lab", "denied"} {
+		if _, err := c.CanUseWorkspace(ctx, tok, ws); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rec.count() != 2 {
+		t.Fatalf("calls=%d", rec.count())
+	}
+	now = now.Add(denyTTL - time.Second)
+	_, _ = c.CanUseWorkspace(ctx, tok, "lab")
+	_, _ = c.CanUseWorkspace(ctx, tok, "denied")
+	if rec.count() != 2 {
+		t.Fatalf("both answers are cached before the deny TTL: calls=%d", rec.count())
+	}
+	now = now.Add(time.Second)
+	if ok, _ := c.CanUseWorkspace(ctx, tok, "denied"); ok || rec.count() != 3 {
+		t.Fatalf("a deny is asked again after its TTL: ok=%v calls=%d", ok, rec.count())
+	}
+	if _, _ = c.CanUseWorkspace(ctx, tok, "lab"); rec.count() != 3 {
+		t.Fatalf("an allow is still cached: calls=%d", rec.count())
+	}
+	now = now.Add(allowTTL)
+	if ok, _ := c.CanUseWorkspace(ctx, tok, "lab"); !ok || rec.count() != 4 {
+		t.Fatalf("an allow is asked again after its TTL: ok=%v calls=%d", ok, rec.count())
+	}
+}
+
+func TestAllowedDoesNotCacheAnUnavailableReview(t *testing.T) {
+	rec := &countingReviewer{err: errors.New("apiserver down")}
+	c := NewClient(rec, "primus:")
+	ctx := context.Background()
+	tok := identity.Token{Subject: "u-1"}
+	if _, err := c.CanUseWorkspace(ctx, tok, "lab"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	rec.mu.Lock()
+	rec.err = nil
+	rec.mu.Unlock()
+	if ok, err := c.CanUseWorkspace(ctx, tok, "lab"); err != nil || !ok || rec.count() != 2 {
+		t.Fatalf("ok=%v err=%v calls=%d", ok, err, rec.count())
+	}
+}
+
+func TestAllowedSharesOneCallAcrossConcurrentCallers(t *testing.T) {
+	rec := &countingReviewer{gate: make(chan struct{})}
+	c := NewClient(rec, "primus:")
+	tok := identity.Token{Subject: "u-1", Groups: []string{"team"}}
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make(chan bool, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, _ := c.CanUseWorkspace(context.Background(), tok, "lab")
+			results <- ok
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for rec.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(rec.gate)
+	wg.Wait()
+	close(results)
+	for ok := range results {
+		if !ok {
+			t.Fatal("a caller did not get the shared answer")
+		}
+	}
+	if rec.count() != 1 {
+		t.Fatalf("calls=%d", rec.count())
+	}
+}
+
+func TestAllowedDeniesAnEmptySubjectWithoutAReview(t *testing.T) {
+	rec := &countingReviewer{}
+	c := NewClient(rec, "primus:")
+	ok, err := c.Allowed(context.Background(), "", []string{"system-admin"}, workspaceUse("lab"))
+	if ok || err != nil || rec.count() != 0 {
+		t.Fatalf("ok=%v err=%v calls=%d", ok, err, rec.count())
 	}
 }

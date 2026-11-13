@@ -186,19 +186,30 @@ type userReader struct {
 
 func (r userReader) Read(context.Context, string) (usercr.User, error) { return r.user, r.err }
 
-func TestCallerAuth_UserAuthorizerUpgradesRole(t *testing.T) {
-	s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-123", "", "default"))
-	s.cfg.Authz = usercr.NewFromReader(userReader{user: usercr.User{Found: true, Admin: true}})
+func TestCallerAuth_UserAuthorizerRole(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		admin bool
+		want  string
+	}{
+		{"system-admin User upgrades the token role", true, "system-admin"},
+		{"plain User keeps the token role", false, "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestRouterWithAuth(t, introspectAnswer("uid-123", "", "default"))
+			s.cfg.Authz = usercr.NewFromReader(userReader{user: usercr.User{Found: true, Admin: tc.admin, Workspaces: []string{"lab"}}})
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
-	req.Header.Set("Authorization", "Bearer ak-valid-key")
-	s.engine.ServeHTTP(w, req)
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+			req.Header.Set("Authorization", "Bearer ak-valid-key")
+			s.engine.ServeHTTP(w, req)
 
-	require.Equal(t, http.StatusOK, w.Code)
-	var resp map[string]string
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "system-admin", resp["headerUserRole"])
+			require.Equal(t, http.StatusOK, w.Code)
+			var resp map[string]string
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.Equal(t, tc.want, resp["headerUserRole"])
+		})
+	}
 }
 
 func TestCallerAuth_UserReadUnavailable(t *testing.T) {
