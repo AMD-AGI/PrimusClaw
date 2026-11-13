@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 const (
 	defaultTimeoutSec  int64 = 300
 	defaultPendingWait       = 15 * time.Minute
-	envdVersion              = "0.1.0"
-	defaultListLimit         = 100
+	// maxPendingTimeoutSec is the largest caller pending wait, one day.
+	maxPendingTimeoutSec int64 = 24 * 60 * 60
+	envdVersion                = "0.1.0"
+	defaultListLimit           = 100
 )
 
 const metadataPrefix = "agent-sandbox.io/"
@@ -38,6 +41,10 @@ const sameNodeMetadata = metadataPrefix + "same-node"
 // avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
+// pendingTimeoutMetadata is the caller's pending wait in seconds. It replaces
+// the template pendingTimeoutSec for this create.
+const pendingTimeoutMetadata = metadataPrefix + "pending-timeout"
+
 // workspaceMetadata selects the SaFE workspace of an identity-key sandbox.
 const workspaceMetadata = metadataPrefix + "workspace"
 
@@ -54,6 +61,7 @@ const scopeAll = "all"
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
 	"avoid-nodes":     {},
+	"pending-timeout": {},
 	"priority":        {},
 	"workspace":       {},
 }
@@ -145,6 +153,21 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested+" matches more than one gpu size")
 	}
 	return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested)
+}
+
+// pendingWait is the time a create waits for the sandbox to run: the caller's
+// pending-timeout metadata in seconds when set, else the template wait.
+func pendingWait(template time.Duration, raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return template, nil
+	}
+	sec, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || sec <= 0 || sec > maxPendingTimeoutSec {
+		return 0, grant.Op(http.StatusBadRequest, "invalid_sandbox",
+			pendingTimeoutMetadata+" must be a whole number of seconds from 1 to "+strconv.FormatInt(maxPendingTimeoutSec, 10))
+	}
+	return time.Duration(sec) * time.Second, nil
 }
 
 func resolvedFrom(id, alias string, gpus int32, body specBody) resolvedTemplate {
