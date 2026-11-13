@@ -77,7 +77,7 @@ import { silentTurnNotice, turnLostNotice } from "../src/assistant/router-turn-e
 import {
   BUILTIN_TOOLS, CAPABILITY_DENIAL, SELF_INABILITY, fill, oracleMcpTarget, filledCase, judgeFacts, judgePrompt, missingVars, oracleMayRun, oracleQuery, placeholdersOf, reachable, staticFindings,
   type Arms,
-  apiQuery, caseSays, cardsOf, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
+  apiQuery, caseSays, cardsOf, clearsSkillDrafts, skillDraftCards, skillDraftIds, filesFrom, forRecording, heldCallRan, heldRequest, holdAnswers, identityRefusal, itemsStartedBy, needsJudge, parseRecordings, planOf, verdictOf, cleanupOf, finalSay, grade, loadCases, names, parseCases, passed, pick, routeOf, saysOf, scrub, select,
   sseFrames, toolPattern, totals, turnCalls, turnsOf, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Observed,
   assistantInUse, capRefusedSays, countedSays, judgeVerdict, countedSaysOf, deleteSessionConfirmed, endedTurns, mergeSays, messagesOf, pacedPerHour, parseSayLog, sayWaitMs, storedTurnEnds, streamMissed, turnEnded, turnAckSayId, turnsAnswered,
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
@@ -1471,3 +1471,17 @@ test("S39 route=clarify: a question, a request for what is missing, or a choice"
   assert.deepEqual(graded("请说明一下要开哪个题", { route: "item" }), ["route=clarify"]);
   assert.deepEqual(graded("请说明一下要开哪个题", { route: "confirm" }), ["route=clarify"]);
 });
+
+test("S-skills a skills case clears the identity's waiting skill drafts and their cards; nothing else is touched", () => {
+  assert.equal(clearsSkillDrafts({ area: "skills" }), true);
+  assert.equal(clearsSkillDrafts({ area: "memory" }), false);
+  assert.deepEqual(skillDraftIds({ ok: true, data: [{ id: "d1", skill_name: "meeting-notes" }, { id: 7 }, null, { id: "d2" }] }), ["d1", "d2"]);
+  assert.deepEqual(skillDraftIds({ ok: false }), []);
+  assert.deepEqual(skillDraftIds(null), []);
+  const waiting = waitingCards(
+    { data: [{ confirmation_id: "c1", kind: "skill_save" }, { confirmation_id: "c2", kind: "trigger_create" }] },
+    { data: { items: [{ id: "g1", kind: "skill_save", status: "pending" }] } },
+  );
+  assert.deepEqual(skillDraftCards(waiting).map((w) => w.id), ["c1"], "only the assistant's skill draft cards; a schedule or a review card stays");
+});
+

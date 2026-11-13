@@ -102,7 +102,10 @@
  *                     the assistant is shown them in every session, and answers a case asked again with "it is already waiting"
  *                     instead of a card. Closing a card is the person's answer, so it is done with EVAL_SEND_TOKEN_CMD's token (a
  *                     `deny`; once more after the last attempt); without one they stay, and an attempt of a case that expects a card while one an earlier attempt of
- *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`
+ *                     the same case made still waits is the run's error, not a grade. Each attempt records `cardsWaiting`.
+ *                     A skills case (area skills) clears, before each attempt, the skill drafts waiting for the identity and their
+ *                     cards (`clearSkillDrafts`: the card's Discard with EVAL_SEND_TOKEN_CMD's token, then the skill routes' Discard
+ *                     for a draft with no card), whatever this setting: drafts are the user's, shown in every session.
  *   EVAL_SEND_TOKEN_CMD
  *                     assistant mode: a command (as EVAL_VARS_CMD: no shell) that prints a signed-in access token of the key's own identity (an identity
  *                     provider's, for the Claw API): the run's messages are sent with it, as a person's channel sends them, so a
@@ -165,7 +168,7 @@ import {
   judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
-  freshSessionEvery, waitingCards, cardsLeftError, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
+  freshSessionEvery, waitingCards, cardsLeftError, clearsSkillDrafts, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
@@ -1323,6 +1326,46 @@ async function closeCards(): Promise<WaitingCard[] | null> {
   return cardsNow();
 }
 
+/**
+ * Before each attempt of a skills case: every skill draft left waiting for the identity (by another case, or an earlier attempt) is
+ * discarded, as the person would: its card's Discard
+ * (`deny` on the card's decision route, with EVAL_SEND_TOKEN_CMD's token: the person's answer, which discards the draft too), then any
+ * draft with no card left (`DELETE /v1/users/me/skill-drafts/:id`, the skill routes' Discard). The drafts are the user's, not a
+ * session's: the assistant is shown another case's waiting draft card in every session, and points the user at it instead of
+ * answering the case (sa-eval cat-skills-deleted-006 on claw-v0.5.0 was told to type 批准 for cat-skills-suggest-005's card). An error
+ * (`infra:`) when one could not be read or is still there after: the attempt is not graded.
+ */
+async function clearSkillDrafts(): Promise<void> {
+  const cards = await cardsNow();
+  if (!cards) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");
+  const skillCards = skillDraftCards(cards);
+  if (skillCards.length && !SEND_TOKEN_CMD) {
+    throw new Error(`infra: ${skillCards.length} skill draft card(s) wait for the identity and discarding one is the person's answer (EVAL_SEND_TOKEN_CMD): not graded`);
+  }
+  for (const w of skillCards) {
+    live();
+    const r = await tokenApi("POST", `/v1/assistant/confirmations/${encodeURIComponent(w.id)}/decision`, { decision: "deny" }).catch(() => null);
+    log(`skill draft card waiting before the case: Discard answered ${r?.status ?? "nothing"}`);
+  }
+  const drafts = async (): Promise<string[] | null> => {
+    const d = await api("GET", "/v1/users/me/skill-drafts");
+    if (d.status === 404) return [];   // personal skills off: there is no draft
+    return d.status === 200 ? skillDraftIds(d.json) : null;
+  };
+  const left = await drafts();
+  if (!left) throw new Error("infra: the identity's skill drafts could not be read: not graded");
+  for (const id of left) {
+    live();
+    const r = await api("DELETE", `/v1/users/me/skill-drafts/${encodeURIComponent(id)}`).catch(() => null);
+    log(`skill draft waiting before the case: Discard answered ${r?.status ?? "nothing"}`);
+  }
+  const [cardsAfter, draftsAfter] = await Promise.all([cardsNow(), drafts()]);
+  if (!cardsAfter || !draftsAfter) throw new Error("infra: the identity's skill drafts could not be read again after Discard: not graded");
+  const still = skillDraftCards(cardsAfter).length + draftsAfter.length;
+  if (still) throw new Error(`infra: ${still} skill draft(s) or card(s) still wait for the identity after Discard: not graded`);
+  if (skillCards.length || left.length) log(`cleared ${skillCards.length} skill draft card(s) and ${left.length} draft(s) left by another case`);
+}
+
 /** Triggers the run made for a case's setup and has not seen gone: deleted after their attempt, and again at the end. */
 const SETUP_TRIGGERS = new Set<string>();
 
@@ -1584,6 +1627,7 @@ async function main(): Promise<void> {
           attemptsInSession++;
           preflightFailed = true;
           try {
+            if (MODE === "assistant" && clearsSkillDrafts(c)) await clearSkillDrafts();
             if (MODE === "assistant" && FRESH_ATTEMPT) {
               waiting = await closeCards();
               if (!waiting) throw new Error("infra: the cards waiting for the identity's answer could not be read: not graded");

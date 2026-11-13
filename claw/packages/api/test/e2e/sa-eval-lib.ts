@@ -340,6 +340,19 @@ export function waitingCards(assistantBody: unknown, githubBody: unknown): Waiti
   return out;
 }
 
+/** A case that reads or makes the identity's personal skills: its drafts and their cards left by another case are cleared before it. */
+export const clearsSkillDrafts = (c: Pick<EvalCase, "area">): boolean => c.area === "skills";
+
+/** The ids of the drafts in `GET /v1/users/me/skill-drafts`'s body (`data`); what is not a list is none. */
+export function skillDraftIds(body: unknown): string[] {
+  const d = (body as { data?: unknown } | null)?.data;
+  return (Array.isArray(d) ? d : []).map((x) => (typeof x?.id === "string" ? x.id : "")).filter(Boolean);
+}
+
+/** The cards that ask the person to save a skill draft (Save / Discard). */
+export const skillDraftCards = (waiting: readonly WaitingCard[]): WaitingCard[] =>
+  waiting.filter((w) => w.source === "assistant" && w.kind === "skill_save");
+
 /**
  * Why an attempt is not graded on its cards, or null: the case expects a card, and a card an earlier attempt of the same case made (`own`:
  * the cards that appeared during those attempts) is still waiting. The assistant then says that write is already waiting and shows none,
