@@ -111,6 +111,24 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Changed
+
+- Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
+  it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
+  The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
+  The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
+
+## [0.5.0] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611132114` (commit 7e25dd5a), released as `docker.io/rocm/primusclaw:claw-0.5.0`. A
+minor release, because it is incompatible for a chat client that sends no `channel_context.assistant_name`: Claw no longer
+names any client, so a question that names the assistant by a client's name is no longer recognised as being about the
+assistant until the client sends its name (#834). **Migration:** send the client's display name as
+`channel_context.assistant_name` on every message to the assistant (personal agent 0.10.0 does, from its configured bot
+name). Also: a stated way of working is drafted as a skill after the turn, and every router turn is told which skills exist
+now (#840). No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended
+0.1.4).
+
 ### Added
 
 - `channel_context.assistant_name` on an inbound assistant message: the name a client's people call the assistant by
@@ -126,10 +144,6 @@ release version, and its `appVersion` stays `latest`.
   a client's name (for example "how is <name> doing") is no longer recognised as being about the assistant itself.
   Migration: the client sends its display name in `channel_context.assistant_name` on every message; the personal agent
   does so from its configured bot name (#837). Until a client does, its name is not known to the router (#834).
-- Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
-  it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
-  The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
-  The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
 ### Fixed
 
@@ -138,10 +152,10 @@ release version, and its `appVersion` stays `latest`.
   "from now on …") and the turn saved and drafted nothing, the server drafts the skill from the conversation after the turn and
   shows the same draft card (Save / Discard); nothing is saved until Save. Never in a group's conversation, never for a message
   that was not the signed-in person's, at most one card per skill name per conversation, none for a day after a Discard there,
-  a few a day at most, and the model writing the draft may decline.
+  a few a day at most, and the model writing the draft may decline (#840).
 - Every router turn is told what the user's skills are now, from the database: how many (or none), which were deleted or undone
   lately, and how many are turned off or used only when named. The router's prompt says to trust this over anything the
-  conversation said earlier, so a skill deleted earlier in the same conversation is no longer reported as existing.
+  conversation said earlier, so a skill deleted earlier in the same conversation is no longer reported as existing (#840).
 
 ## [0.4.5] - 2026-11-13
 
