@@ -95,10 +95,14 @@ deprecated names will be removed only in a release whose notes say so. Moving a 
 write its secrets (the feedback App key only where it is set):
 
 ```sh
+umask 077 && file="$(mktemp)"   # (the value goes through a file only you can read, never a command line)
 for name in encryption-keys exchange-client-secret feedback-github-app-key; do
-  value="$(az keyvault secret show --vault-name <your-vault-name> --name "clawy-$name" --query value -o tsv)" || continue
-  az keyvault secret set --vault-name <your-vault-name> --name "personal-agent-$name" --value "$value" --output none
+  if value="$(az keyvault secret show --vault-name <your-vault-name> --name "clawy-$name" --query value -o tsv)"; then
+    printf '%s' "$value" > "$file"
+    az keyvault secret set --vault-name <your-vault-name> --name "personal-agent-$name" --file "$file" --output none
+  fi
 done
+rm -f "$file"; unset value
 ```
 
 Restart the worker: the start-up warning no longer names a deprecated entry. Delete the `clawy-` entries once no running
