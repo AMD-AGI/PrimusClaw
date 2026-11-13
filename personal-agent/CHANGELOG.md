@@ -33,8 +33,8 @@ answers that the skills could not be read, or lists none; nothing else changes.
   saved, changed, turned off or deleted, with **Undo** (the change taken back in Claw, once) and, for a saved one,
   **Edit** (its description and SKILL.md in a form; Save changes saves the next version, with its own Undo); a draft the
   assistant suggested is its held write's card with **Save** and **Discard**. `/skills` in a 1:1 chat lists the person's
-  skills and shows, turns off, turns on or deletes one, each answered with the skill's card and Undo; a group chat never
-  lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
+  skills and shows one (its description, SKILL.md and files), or turns one off, turns it on or deletes it, each of
+  these three answered with the skill's card and Undo; a group chat never lists them. Both languages. Core adds `ClawSkillsPort` (`ClawPort.skills`), `SkillsCommand`, `SkillCardClicks` and the
   `skillCard` and `skillEdit` views; the store is unchanged (a card's record is a held-write card of kind `skill_undo`).
   Needs claw-v0.4.4 or later with `CLAW_USER_SKILLS_ENABLED=true` (see above); a Claw without the skill routes is
   told by `/skills` that they are not available (#825).
