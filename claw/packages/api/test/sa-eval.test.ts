@@ -1207,7 +1207,14 @@ test("S35 a turn's channel_context goes with its message, beside its files; a ca
   assert.deepEqual(turnMessageBody({ user: "q", channel_context: { channel: "teams", via: "on_behalf" } }, [{ name: "f" }]),
     { content: "q", messageType: "text", channel_context: { channel: "teams", via: "on_behalf", files: [{ name: "f" }] } });
   assert.deepEqual(turnMessageBody({ user: "q", channel_context: { files: [{ name: "forged" }] } }, [{ name: "f" }]).channel_context, { files: [{ name: "f" }] });
+  // The run's assistant name (EVAL_ASSISTANT_NAME) goes with every message as a client sends it; a case's own name wins; none, none sent.
+  assert.deepEqual(turnMessageBody({ user: "who are you" }, [], "Clawy"), { content: "who are you", messageType: "text", channel_context: { assistant_name: "Clawy" } });
+  assert.deepEqual(turnMessageBody({ user: "q", channel_context: { channel: "teams", assistant_name: "Other" } }, [{ name: "f" }], "Clawy").channel_context,
+    { assistant_name: "Other", channel: "teams", files: [{ name: "f" }] });
+  assert.deepEqual(turnMessageBody({ user: "q" }, [], undefined), { content: "q", messageType: "text" });
+  assert.equal(tokenRequestRefusal("POST", "/v1/sessions/s1/messages", turnMessageBody({ user: "q" }, [], "Clawy")), null, "the name is part of what the token sends");
   assert.deepEqual(problemsOf(caseOf({ turns: [{ user: "q", channel_context: { channel: "teams", people: [] } }] })), []);
+  assert.deepEqual(problemsOf(caseOf({ turns: [{ user: "q", channel_context: { assistant_name: "Clawy" } }] })), []);
   for (const bad of [{ files: [] }, { attended_via: "person" }]) {
     assert.ok(problemsOf(caseOf({ turns: [{ user: "q", channel_context: bad }] })).some((p) => p.startsWith("channel_context.")), JSON.stringify(bad));
   }
