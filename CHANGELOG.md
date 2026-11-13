@@ -111,6 +111,15 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- A delivery link opened in a browser with no session can send it to sign in and back: with the new setting
+  `CLAW_BROWSER_SIGN_IN_URL` (for example `/login?redirect=`), `GET /v1/sessions/:id/deliveries/:deliveryId` that
+  carries no credential at all and whose `Accept` names `text/html` is answered 302 to that address with the link's
+  external path (the public path prefix from `CLAW_PUBLIC_URL`, else `X-Forwarded-Prefix`, included) URL-encoded at
+  the end, instead of the JSON 401. API clients, a credential that was presented and refused, and every other route
+  answer as before; unset, the default, nothing changes.
+
 ## [0.4.2] - 2026-11-13
 
 Image `docker.io/primussafe/claw:202611131057` (commit 61998b05). A patch release: personal skills reach the assistant's

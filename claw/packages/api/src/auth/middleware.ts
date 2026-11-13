@@ -21,6 +21,7 @@ import { verifyIdentityAccessToken } from "./identity-token.js";
 import { safeFailureOf } from "./delegated-keys.js";
 import { recordRequestCredential } from "./request-credential.js";
 import { platformAccessRefusal } from "./platform-access.js";
+import { browserSignInRedirect } from "./browser-sign-in.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -671,6 +672,13 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     parsedCookieNames: Object.keys(cookies),
     hasAuthorization: authHeaderRaw.length > 0,
   }, "auth.rejected.no_credentials");
+  // A browser that opened a delivery link with no session at all is sent to sign
+  // in and back, when the operator named a sign-in page (auth/browser-sign-in.ts).
+  const signIn = browserSignInRedirect(req, pathname);
+  if (signIn) {
+    logger.info({ path: pathname }, "auth.rejected.no_credentials.sign_in_redirect");
+    return reply.header("Cache-Control", "no-store").redirect(signIn, 302) as any;
+  }
   return sendAuthError(req, reply, 401, "authentication_required", "authentication_error",
     "provide Bearer API key (ak-...), x-api-key header, or Token cookie") as any;
 }
