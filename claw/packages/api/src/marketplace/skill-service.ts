@@ -1439,6 +1439,28 @@ export async function listUserSkills(userId: string): Promise<UserSkillListEntry
   }));
 }
 
+/**
+ * A skill the user had and has no longer: deleted (by them, or by an undo of its save), and when. Most recent first, at most 20. Only
+ * active skills removed with a delete event: an unproven auto-skill the platform demoted was never in the user's list.
+ */
+export interface RemovedSkill { name: string; removed_at: string; how: "deleted" | "undone" }
+
+export async function removedSkills(userId: string, q: Querier = db.query): Promise<RemovedSkill[]> {
+  const rows = (await q(
+    `SELECT s.skill_name, MAX(s.deleted_at) AS removed_at,
+            (SELECT e.detail ? 'undo' FROM claw_skill_events e
+              WHERE e.user_id = s.user_id AND e.skill_name = s.skill_name AND e.op = 'delete' ORDER BY e.id DESC LIMIT 1) AS undone
+       FROM claw_skills s
+      WHERE s.user_id = $1 AND s.deleted_at IS NOT NULL AND s.status = 'active'
+        AND NOT EXISTS (SELECT 1 FROM claw_skills c WHERE c.user_id = s.user_id AND c.skill_name = s.skill_name AND c.deleted_at IS NULL)
+        -- Removed by the user (a delete, or an undo of its save): never one the platform demoted on its own, which they never had.
+        AND EXISTS (SELECT 1 FROM claw_skill_events e WHERE e.user_id = s.user_id AND e.skill_name = s.skill_name AND e.op = 'delete')
+      GROUP BY s.user_id, s.skill_name ORDER BY MAX(s.deleted_at) DESC LIMIT 20`,
+    [userId],
+  )).rows as Array<{ skill_name: string; removed_at: Date; undone: boolean | null }>;
+  return rows.map((r) => ({ name: r.skill_name, removed_at: new Date(r.removed_at).toISOString(), how: r.undone ? "undone" : "deleted" }));
+}
+
 /** One of the user's skills now, whole, turned off or not (for showing it to them, never for a turn): null when there is none. */
 export async function showUserSkill(userId: string, name: string): Promise<(UserSkillListEntry & { content: string; file_list: Array<{ path: string; size_bytes: number; is_binary: boolean }> }) | null> {
   const row = await visibleRow(db.query, userId, name);

@@ -53,7 +53,7 @@ test("T1 the runtime stage turns the CLAW_BUILD build-arg into ENV CLAW_BUILD", 
 test("T2 CI passes the tag it pushes as CLAW_BUILD", () => {
   assert.match(WORKFLOW, /--build-arg CLAW_BUILD=\$\{DATE_TIME\}/);
   assert.match(WORKFLOW, /-t \$\{\{ matrix\.name \}\}:\$\{DATE_TIME\}/, "DATE_TIME is a built tag");
-  assert.match(WORKFLOW, /buildah push \$\{DOCKERIO_REPOSITORY\}\/\$\{\{ matrix\.name \}\}:\$\{DATE_TIME\}/, "DATE_TIME is a pushed tag");
+  assert.match(WORKFLOW, /buildah push (?:--\S+ \S+ )*\$\{DOCKERIO_REPOSITORY\}\/\$\{\{ matrix\.name \}\}:\$\{DATE_TIME\}/, "DATE_TIME is a pushed tag");
 });
 
 test("T3 CI asserts the built image's CLAW_BUILD equals its tag", () => {

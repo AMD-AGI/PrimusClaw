@@ -53,8 +53,19 @@ trap '' PIPE
 # ── Config ────────────────────────────────────────────────────────────────────
 NAMESPACE="${NAMESPACE:-agent-sandbox-system}"
 RELEASE="${RELEASE:-agent-sandbox}"
-IMAGE_REGISTRY="${IMAGE_REGISTRY:-primussafe/}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+# Unset IMAGE_REGISTRY: the release, docker.io/rocm/primusclaw:agent-sandbox-<component>-<IMAGE_TAG>. Set: images of your
+# own, one repository per image, <IMAGE_REGISTRY>agent-sandbox-<component>:<IMAGE_TAG>.
+if [[ -n "${IMAGE_REGISTRY}" ]]; then
+    CONTROLPLANE_REPOSITORY="${IMAGE_REGISTRY}agent-sandbox-controlplane"
+    CONTROLPLANE_TAG="${IMAGE_TAG}"
+    ENVD_INJECTOR_IMAGE="${IMAGE_REGISTRY}agent-sandbox-envd-injector:${IMAGE_TAG}"
+else
+    CONTROLPLANE_REPOSITORY="docker.io/rocm/primusclaw"
+    CONTROLPLANE_TAG="agent-sandbox-controlplane-${IMAGE_TAG}"
+    ENVD_INJECTOR_IMAGE="docker.io/rocm/primusclaw:agent-sandbox-envd-injector-${IMAGE_TAG}"
+fi
 IMAGE_PULL_SECRET="${IMAGE_PULL_SECRET:-}"
 ENVD_KEY_SOURCE="${ENVD_KEY_SOURCE:-regen}"
 ENVD_KEY_SRC_KUBECONFIG="${ENVD_KEY_SRC_KUBECONFIG:-}"
@@ -375,8 +386,8 @@ fi
 log "Cluster context: ${CTX}"
 log "Namespace:       ${NAMESPACE}"
 log "Release:         ${RELEASE}"
-log "Image:           ${IMAGE_REGISTRY}agent-sandbox-controlplane:${IMAGE_TAG}"
-log "Envd injector:   ${IMAGE_REGISTRY}agent-sandbox-envd-injector:${IMAGE_TAG}"
+log "Image:           ${CONTROLPLANE_REPOSITORY}:${CONTROLPLANE_TAG}"
+log "Envd injector:   ${ENVD_INJECTOR_IMAGE}"
 log "Envd keys:       ${ENVD_KEY_SOURCE}"
 log "Dry-run:         ${DRY_RUN}"
 
@@ -492,9 +503,9 @@ HELM_ARGS=(
     upgrade --install "${RELEASE}" "${CHART_DIR}"
     --namespace "${NAMESPACE}"
     --values "${VALUES_FILE}"
-    --set "controlplane.image.repository=${IMAGE_REGISTRY}agent-sandbox-controlplane"
-    --set "controlplane.image.tag=${IMAGE_TAG}"
-    --set "controlplane.config.envdInjectorImage=${IMAGE_REGISTRY}agent-sandbox-envd-injector:${IMAGE_TAG}"
+    --set "controlplane.image.repository=${CONTROLPLANE_REPOSITORY}"
+    --set "controlplane.image.tag=${CONTROLPLANE_TAG}"
+    --set "controlplane.config.envdInjectorImage=${ENVD_INJECTOR_IMAGE}"
 )
 [[ -n "${IMAGE_PULL_SECRET}"   ]] && HELM_ARGS+=( --set "imagePullSecrets[0].name=${IMAGE_PULL_SECRET}" )
 [[ -n "${SANDBOX_EXTRA_CA_CONFIGMAP}" ]] && HELM_ARGS+=(

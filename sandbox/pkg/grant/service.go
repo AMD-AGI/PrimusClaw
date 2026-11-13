@@ -68,6 +68,7 @@ type Service struct {
 	record     Recorder
 	now        func() time.Time
 	owner      atomic.Pointer[ownerConfig]
+	ownerFault atomic.Bool
 	writes     grantLocks
 }
 

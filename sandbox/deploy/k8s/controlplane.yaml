@@ -206,7 +206,7 @@ spec:
           # would leave each node on whichever build it happened to cache first
           # and never pick up a new one. Pin to a published timestamp tag for a
           # reproducible deployment.
-          image: primussafe/agent-sandbox-controlplane:latest
+          image: docker.io/rocm/primusclaw:agent-sandbox-controlplane-latest
           imagePullPolicy: Always
           args:
             - --router-port=8080
@@ -235,7 +235,7 @@ spec:
             - name: REGISTRY_SECRET
               value: "registry-credentials"
             - name: ENVD_INJECTOR_IMAGE
-              value: "primussafe/agent-sandbox-envd-injector:latest"
+              value: "docker.io/rocm/primusclaw:agent-sandbox-envd-injector-latest"
             - name: WORKLOAD_MANAGER_SERVICE_NAME
               value: "workloadmanager"
             - name: WORKLOAD_MANAGER_SERVICE_PORT

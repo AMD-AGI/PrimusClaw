@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 # Deployment script for Claw into primus-claw namespace (Helm-based).
-# Image building was removed: build & push docker.io/primussafe/claw:<tag>
+# Image building was removed: deploy a release (docker.io/rocm/primusclaw:claw-<version>) or build & push $REGISTRY/claw:<tag>
 # out-of-band (e.g. deploy/build.sh) first, then pass TAG=<tag>.
 # Usage:
 #   TAG=v1.0.0 bash deploy/deploy.sh
@@ -33,8 +33,9 @@ for arg in "$@"; do
     --skip-lifecycle)      SKIP_LIFECYCLE=true ;;
     --skip-shared-assets)  SKIP_SHARED_ASSETS=true ;;
     --help|-h)
-      echo "Usage: REGISTRY=<reg> [TAG=<tag>] DOMAIN=<host> [STORAGE_CLASS=<sc>] $0 [--dry-run] [--skip-pgo] [--skip-nats] [--skip-pg] [--skip-lifecycle] [--skip-shared-assets]"
-      echo "  TAG defaults to 'latest' (image building was removed; build & push out-of-band first)."
+      echo "Usage: [REGISTRY=<reg> [REPOSITORY=<repo>]] [TAG=<tag>] DOMAIN=<host> [STORAGE_CLASS=<sc>] $0 [--dry-run] [--skip-pgo] [--skip-nats] [--skip-pg] [--skip-lifecycle] [--skip-shared-assets]"
+      echo "  Without REGISTRY the image is the release docker.io/rocm/primusclaw:<TAG>, TAG defaulting to claw-latest;"
+      echo "  with one it is \$REGISTRY/claw:<TAG> (REPOSITORY overrides claw), TAG defaulting to latest."
       echo "  DOMAIN is required (cluster ingress host); pass DOMAIN=<host> or set in values.<ns>.env."
       echo "  --skip-shared-assets: do not cp hands-binary into CLAW_DEPLOY_ROOT (use when host has no weka mount)."
       echo "  PG_SSL_NO_VERIFY=true: keep api's PG connection encrypted but skip server-cert validation (needed for PGO's own CA)."
@@ -69,13 +70,15 @@ PGO_CHART="${PGO_CHART:-oci://registry-1.docker.io/primussafe/primus-pgo}"
 PGO_VERSION="${PGO_VERSION:-5.8.2}"
 PGO_WAIT_TIMEOUT="${PGO_WAIT_TIMEOUT:-180}"
 
-# ── Resolve image TAG (default "latest") ────────────────────────
-# Image building was removed from the deploy path: build & push
-# $REGISTRY/claw:<tag> out-of-band (e.g. deploy/build.sh), then pass TAG=<tag>.
-# Defaults to "latest" when unset. IMG is used by health checks and the
-# hands-binary extraction helpers (deploy_shared_assets / deploy_hands_from_image).
-TAG="${TAG:-latest}"
-IMG="${IMG:-$REGISTRY/claw:$TAG}"
+# ── Resolve image TAG ───────────────────────────────────────────
+# Image building was removed from the deploy path. A release is pulled as
+# docker.io/rocm/primusclaw:<TAG> (common.sh), TAG defaulting to claw-latest; an
+# image of your own is built and pushed out-of-band (e.g. deploy/build.sh) as
+# $REGISTRY/$REPOSITORY:<tag>, TAG defaulting to latest. IMG is used by health
+# checks and the hands-binary extraction helpers (deploy_shared_assets /
+# deploy_hands_from_image).
+if [ "$REGISTRY/$REPOSITORY" = docker.io/rocm/primusclaw ]; then TAG="${TAG:-claw-latest}"; else TAG="${TAG:-latest}"; fi
+IMG="${IMG:-$REGISTRY/$REPOSITORY:$TAG}"
 export TAG IMG
 
 # ── Tools this installer cannot run without ───────────────────────────────
@@ -93,7 +96,7 @@ done
 # Resolve the StorageClass (explicit env, else interactive pick from `kubectl get sc`).
 select_storage_class
 
-log "Deploying Claw → namespace=$NAMESPACE  image=$REGISTRY/claw:$TAG  storageClass=$STORAGE_CLASS"
+log "Deploying Claw → namespace=$NAMESPACE  image=$REGISTRY/$REPOSITORY:$TAG  storageClass=$STORAGE_CLASS"
 
 # ── DOMAIN (cluster ingress host for the Claw ingress + the LLM gateway URLs
 # ANTHROPIC/OPENAI/BYOK = https://<DOMAIN>/llm-gateway). Provide DOMAIN=... or
@@ -471,7 +474,7 @@ log "Step 4/7: Applying Claw Helm chart ..."
 # CLAW_CHART_DIR is provided by common.sh ($SCRIPT_DIR/charts/claw).
 CLAW_VALUES_FILE="$WORK_DIR/claw-values.json"
 NATS_PASSWORD_EFFECTIVE="${NATS_PASSWORD_PROD:-${NATS_PASSWORD:-__TBD__}}"
-export REGISTRY TAG BRAIN_REPLICAS STORAGE_CLASS DOMAIN INGRESS_PATH AUTH_INTERNAL_TOKEN
+export REGISTRY REPOSITORY TAG BRAIN_REPLICAS STORAGE_CLASS DOMAIN INGRESS_PATH AUTH_INTERNAL_TOKEN
 export USER_ENV_ENCRYPTION_KEY BRAIN_CHECKPOINT_KEY NATS_PASSWORD_EFFECTIVE CLAW_DEPLOY_ROOT
 export NATS_PASSWORD_API NATS_PASSWORD_BRAIN NATS_PASSWORD_REAPER NATS_PASSWORD_OPS
 export CHECKPOINT_WRITE_VERSION
@@ -535,7 +538,7 @@ sandbox_workload_namespace = env("SANDBOX_WORKLOAD_NAMESPACE")
 values = {
     "image": {
         "registry": env("REGISTRY"),
-        "repository": "claw",
+        "repository": env("REPOSITORY"),
         "tag": env("TAG"),
         "pullPolicy": "IfNotPresent",
     },

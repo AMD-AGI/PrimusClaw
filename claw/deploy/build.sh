@@ -44,7 +44,9 @@ source "$SCRIPT_DIR/common.sh"
 TAG="${TAG:-$(date +%Y%m%d%H%M)}"
 export TAG
 
-IMG="$REGISTRY/claw:$TAG"
+# Builds push to a registry of your own; docker.io/rocm/primusclaw is published by AMD's release pipeline only.
+[ "$REGISTRY" != docker.io/rocm ] || fail "set REGISTRY to a registry you can push to (docker.io/rocm is release-only)"
+IMG="$REGISTRY/$REPOSITORY:$TAG"
 export IMG
 
 # Auto-select the kaniko backend when a push password is supplied; an

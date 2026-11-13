@@ -11,7 +11,7 @@ Teams bot that people talk to, and finally with a developer machine connected th
 | Artifact                                      | Version | Where                                                                                                                                                                                                                                                                       |
 | --------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The Teams worker, as npm packages             | 0.9.0   | [`@primusclaw/personal-agent-teams`](https://www.npmjs.com/package/@primusclaw/personal-agent-teams) (with [`-runtime`](https://www.npmjs.com/package/@primusclaw/personal-agent-runtime) and [`personal-agent`](https://www.npmjs.com/package/@primusclaw/personal-agent)) |
-| The Teams worker, as an image                 | 0.9.0   | [`docker.io/primussafe/personal-agent-teams:0.9.0`](https://hub.docker.com/r/primussafe/personal-agent-teams) (linux/amd64, runs as uid 65534)                                                                                                                              |
+| The Teams worker, as an image                 | 0.9.0   | [`docker.io/rocm/primusclaw:personal-agent-teams-0.9.0`](https://hub.docker.com/r/rocm/primusclaw/tags) (linux/amd64, runs as uid 65534)                                                                                                                                    |
 | The Teams ingress, as an Azure Function       | 0.9.0   | `personal-agent-teams-ingress-0.9.0.zip` on the GitHub Release `personal-agent-v0.9.0` ([step 4](#4-the-ingress))                                                                                                                                                           |
 | claw-connector, for a developer's own machine | 0.1.23  | [`@primusclaw/connector`](https://www.npmjs.com/package/@primusclaw/connector)                                                                                                                                                                                              |
 
@@ -110,7 +110,7 @@ otherwise. The answer to a message arrives in the stand-in connector's terminal 
 the host's network; the stand-in connector runs on the host as above):
 
 ```bash
-docker run --rm --network host --env-file try.env docker.io/primussafe/personal-agent-teams:0.9.0
+docker run --rm --network host --env-file try.env docker.io/rocm/primusclaw:personal-agent-teams-0.9.0
 ```
 
 **Claw's tool layer, without a cluster.** To see the part of Claw that edits files and runs commands for an agent, clone
@@ -362,7 +362,7 @@ With plain Docker:
 ```bash
 docker run -d --name personal-agent --env-file .env -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
   -v personal-agent-data:/data -v "$PWD/assertion-key.pem:/run/secrets/assertion-key.pem:ro" \
-  docker.io/primussafe/personal-agent-teams:0.9.0
+  docker.io/rocm/primusclaw:personal-agent-teams-0.9.0
 ```
 
 From npm (Node 26), with the store in a directory the user running it can write (SQLite creates the file, not the

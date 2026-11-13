@@ -13,8 +13,8 @@ controlplane:
   enabled: true
   replicas: 1
   image:
-    repository: primussafe/agent-sandbox-controlplane
-    tag: latest                       # override per-release: --set controlplane.image.tag=<yyyymmddhhmm>
+    repository: docker.io/rocm/primusclaw
+    tag: agent-sandbox-controlplane-latest  # a release pins agent-sandbox-controlplane-<version>
     pullPolicy: IfNotPresent
   ports:
     router: 8080
@@ -35,7 +35,7 @@ controlplane:
   config:
     leaderElect: true
     extensions: true
-    envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
+    envdInjectorImage: "docker.io/rocm/primusclaw:agent-sandbox-envd-injector-latest"
     auditEnabled: true
     auditRetentionDays: 30
     sandboxImageRegistry: ""
@@ -57,13 +57,16 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
-    # Identity provider introspection client. introspectUrl alone checks the
-    # /v1 caller credential when router.config.enableAuth is true.
-    # Identity provider keys on the E2B API are enabled when
-    # introspectUrl and ownerPolicyConfigMap are both set. The client Secret
-    # holds client_id and client_secret; the identity provider creates that
-    # Secret once in this namespace and does not rotate it. The ConfigMap key
-    # policy.json holds the owner quota policy.
+    # Identity provider introspection client. introspectUrl checks the /v1
+    # caller credential when router.config.enableAuth is true, and checks
+    # identity keys on the E2B API. The client Secret holds client_id and
+    # client_secret; the identity provider creates that Secret once in this
+    # namespace and does not rotate it.
+    # ownerPolicyConfigMap names a ConfigMap whose key policy.json holds the
+    # owner quota and template policy: the templates identity keys may use,
+    # and the quotas. It is used only when introspectUrl is set. Without it,
+    # identity keys get 503 owner_policy_not_applied on the E2B API; a rejected
+    # policy gives 500 owner_policy_invalid.
     # The policy is read at startup: a ConfigMap change needs a rollout restart.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners
