@@ -775,7 +775,7 @@ export function ephemeralWhere(configDir: string, mounts: Mount[] = readMounts()
     + `in your shell profile and the container's startup command, then `
     + (paired
       // A paired machine never ran init or login: what connects it again is a new pairing command from the chat.
-      ? `ask Clawy for a new pairing command ("连接我的开发环境") and run it in that shell (the state directory, with its pid and lock files, stays where it is).`
+      ? `ask the assistant in your chat for a new pairing command ("连接我的开发环境") and run it in that shell (the state directory, with its pid and lock files, stays where it is).`
       : `run init and login again (the state directory, with its pid and lock files, stays where it is).`);
 }
 

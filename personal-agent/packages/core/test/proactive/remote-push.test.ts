@@ -321,7 +321,7 @@ it("held messages released while the person's message is handled answer in their
     asked.map((r) => r.lang),
     ["zh"],
   );
-  assert.ok(suggested(w).includes("回到 Clawy"), suggested(w).join(" | "));
+  assert.ok(suggested(w).includes("回到 PrimusClaw Assistant"), suggested(w).join(" | "));
 });
 
 it("a push or a sweep outside any message answers in the language of the text", async () => {
@@ -332,7 +332,7 @@ it("a push or a sweep outside any message answers in the language of the text", 
     asked.map((r) => r.lang),
     ["en"],
   );
-  assert.ok(suggested(w).includes("Back to Clawy"), suggested(w).join(" | "));
+  assert.ok(suggested(w).includes("Back to PrimusClaw Assistant"), suggested(w).join(" | "));
 });
 
 /** A question a terminal asks (a connector's approval hooks), as Claw relays it (`remote.ask` with `origin: "terminal"`). */

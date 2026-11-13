@@ -32,6 +32,8 @@ const completion = z.object({
 export interface IntentReaderOptions {
   readonly baseUrl: string;
   readonly model: string;
+  /** The bot's name in this deployment (`Settings.botName`): the prompts say who the message was sent to. */
+  readonly botName: string;
   readonly logger: Logger;
   readonly fetch?: FetchLike;
   readonly timeoutMs?: number;
@@ -68,11 +70,11 @@ export class GatewayIntentReader implements IntentReader {
     mentions: readonly ListedMention[],
     channel: string,
   ): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, intentPrompt(channel), { message: text, mentions });
+    return this.complete(key, intentPrompt(channel, this.options.botName), { message: text, mentions });
   }
 
   readMode(key: string, text: string, channel: string): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, modePrompt(channel), { message: text });
+    return this.complete(key, modePrompt(channel, this.options.botName), { message: text });
   }
 
   readAnswer(
@@ -81,7 +83,10 @@ export class GatewayIntentReader implements IntentReader {
     pending: readonly Readonly<Record<string, string>>[],
     channel: string,
   ): Promise<Record<string, unknown> | undefined> {
-    return this.complete(key, answerPrompt(channel), { message: text, waiting_for_this_person: pending });
+    return this.complete(key, answerPrompt(channel, this.options.botName), {
+      message: text,
+      waiting_for_this_person: pending,
+    });
   }
 
   private async complete(key: string, system: string, payload: unknown): Promise<Record<string, unknown> | undefined> {

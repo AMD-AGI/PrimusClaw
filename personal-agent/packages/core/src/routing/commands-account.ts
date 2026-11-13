@@ -62,6 +62,7 @@ export class AccountCommands {
       label: attachment.label,
       host: attachment.host,
       cwd: attachment.cwd ? ` \`${attachment.cwd}\`` : "",
+      bot: this.ctx.deps.config.botName,
     };
     const text = helpLeadText.in(lang);
     if (remote.direct(userId)) return text.direct(where);

@@ -41,7 +41,7 @@ export const AGENT_USAGE =
   "to one, e.g. `/agent attach robin-dev-pod/claude`, or just say 切到 robin-dev-pod 的 claude\n" +
   "- `/agent detach` (or 回到助理) sends your messages to the assistant again; the session stays where it is\n" +
   "- `/agent mode` shows the permission modes; `/agent mode ID` changes it\n" +
-  "- `/agent mode card` keeps the chat box for Clawy and talks to the session on its card (the default); `/agent mode chat` sends " +
+  "- `/agent mode card` keeps the chat box for me and talks to the session on its card (the default); `/agent mode chat` sends " +
   "the chat box to the session\n" +
   "- `/agent close` ends the session you are attached to\n" +
   "- `/agent off` disconnects a machine\n" +

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Clawy's card kit: the one look every Adaptive Card it sends in Teams has, as the few builders every card is made of.
+ * The bot's card kit: the one look every Adaptive Card it sends in Teams has, as the few builders every card is made of.
  *
  * A card reads top down, the same way everywhere (header, body copy, 1-3 primary actions; built for a phone's width first):
  * - `header`: one bold sentence and at most one subtle line under it, beside a short bar in one of Teams' semantic container

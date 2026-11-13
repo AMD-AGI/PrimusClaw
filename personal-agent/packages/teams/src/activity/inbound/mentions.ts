@@ -8,13 +8,13 @@
  * `marked_text`).
  */
 import type { InboundMention } from "@primusclaw/personal-agent";
-import { cpLength, pyLstrip, pyStr, pyStrip } from "@primusclaw/personal-agent";
+import { BOT_NAME, cpLength, pyLstrip, pyStr, pyStrip } from "@primusclaw/personal-agent";
 import { AT_TAG, written } from "./markup.js";
 import { caseless, NOT_WORD_NEXT, SPACE } from "./patterns.js";
 import { botIdOf, entitiesOf, isFields, partOf, truthy, type Activity, type Fields } from "./schema.js";
 
-/** The bot's display name where the caller gives none (the Python worker's `branding.BOT_NAME`). */
-export const DEFAULT_BOT_NAME = "Clawy";
+/** The bot's display name where the caller gives none: core's default (a deployment's own is `Settings.botName`). */
+export const DEFAULT_BOT_NAME = BOT_NAME;
 
 function isMention(entity: Fields): boolean {
   return entity["type"] === "mention";
@@ -60,7 +60,7 @@ function toBotPattern(botName: string): RegExp {
 }
 
 /**
- * True when the message starts by naming the bot ("@Clawy ..."): in a 1:1 chat attached to a remote session, the way
+ * True when the message starts by naming the bot ("@<name> ...", the deployment's name): in a 1:1 chat attached to a remote session, the way
  * the person says these words are for the bot and not for the session.
  */
 export function addressedToBot(activity: Activity, botName: string = DEFAULT_BOT_NAME): boolean {

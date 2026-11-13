@@ -6,7 +6,7 @@
  * a conversation or anything a person chose.
  */
 
-/** The category fields of a security event that become labels of `clawy_security_events_total`, in this order. */
+/** The category fields of a security event that become labels of `personal_agent_security_events_total`, in this order. */
 export const SECURITY_EVENT_LABELS = ["scope", "outcome", "reason"] as const;
 
 /** Why a message or task was refused by a per-person limit. */

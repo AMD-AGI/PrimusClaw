@@ -4,13 +4,14 @@
 /**
  * What the model is asked when it reads whether a message is the person's answer to what waits for them. The rules
  * (`read.ts`) then say what it answers; with no reading, only a message that is nothing but an answer counts. `channel`: the
- * chat app's full name (`SurfaceCaps.name`).
+ * chat app's full name (`SurfaceCaps.name`); `bot`: the bot's name in this deployment.
  */
 export const answerPrompt = (
   channel: string,
-): string => `You read one message a person sent to Clawy, a bot, in a one-to-one ${channel} chat. Clawy is waiting for this
+  bot: string,
+): string => `You read one message a person sent to ${bot}, a bot, in a one-to-one ${channel} chat. ${bot} is waiting for this
 person to answer: the pull requests in "waiting_for_this_person" each hold a merge or a review that is made with the person's own GitHub
-account only when they confirm it; and Clawy may have shown them the two settings for how such merges are confirmed ("fully automatic",
+account only when they confirm it; and ${bot} may have shown them the two settings for how such merges are confirmed ("fully automatic",
 or "a person confirms high-risk changes"). Say whether the message is the person's answer.
 Answer with one JSON object and nothing else:
 {"intent": "answer" | "none"}

@@ -59,7 +59,7 @@ export function remoteAgents(base: AssemblyBase, inputs: RemoteInputs): RemoteAg
       windowDefault: switches.remoteWindow,
       timings: REMOTE_FOLLOW_TIMINGS,
       watchTimings: REMOTE_WATCH_TIMINGS,
-      botName: "Clawy",
+      botName: settings.botName,
       streaming: base.surface.caps.streaming,
     },
     claw: claw.remoteAgents,

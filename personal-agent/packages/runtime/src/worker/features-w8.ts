@@ -96,7 +96,7 @@ function feedbackService(base: AssemblyBase, mask: (text: string) => string): Fe
         return pyStrip(state.answer);
       },
     },
-    wording: { botName: "Clawy", channelName: base.shape.channelName },
+    wording: { botName: settings.botName, channelName: base.shape.channelName },
     publicBaseUrl: settings.publicBaseUrl,
     worker: workerInfoFromEnv(env, {
       pluginId: settings.claw.pluginId === null ? "" : String(settings.claw.pluginId),
@@ -145,6 +145,7 @@ export function w8Parts(
     conversationOf: conversationFor(base),
     pluginId: settings.claw.pluginId ?? undefined,
     log: logger,
+    botName: settings.botName,
   });
   const groupContext = new GroupContext({
     settings: settings.groupContext,
@@ -165,7 +166,7 @@ export function w8Parts(
   });
   return {
     service,
-    flow: new FeedbackFlow({ reports: store.feedback, reporting, service, log: logger }),
+    flow: new FeedbackFlow({ reports: store.feedback, reporting, service, log: logger, botName: settings.botName }),
     thumbs,
     observer,
     groupContext,

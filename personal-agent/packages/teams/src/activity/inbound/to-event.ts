@@ -38,7 +38,7 @@ export interface NoSender {
 }
 
 export interface ToEventOptions {
-  /** The bot's display name, for "@<name> ..." (default "Clawy"). */
+  /** The bot's display name, for "@<name> ..." (the deployment's `Settings.botName`; default `BOT_NAME`). */
   readonly botName?: string;
   readonly logger?: Logger;
 }

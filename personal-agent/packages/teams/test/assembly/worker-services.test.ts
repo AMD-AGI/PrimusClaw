@@ -49,7 +49,7 @@ function services() {
     securityLog: new SecurityLog(security, noMetrics, alsRequestScope()),
     logger: silentLogger,
     restoreRef: restoreConversationRef,
-    typedEvent: teamsTypedEvent(silentLogger),
+    typedEvent: teamsTypedEvent("PrimusClaw Assistant", silentLogger),
   });
   return { bound, store, surface, security };
 }

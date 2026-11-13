@@ -111,6 +111,22 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- `channel_context.assistant_name` on an inbound assistant message: the name a client's people call the assistant by
+  (letters, digits, spaces and `_ ' -`, at most 32 characters and 4 words; anything else, sentence punctuation
+  included, is dropped, never refused). The router is told it is that assistant, by that name quoted as a name only,
+  in its self section (`router-self-v2`), the GitHub binding line (`router-read-v17`) and the attached-chat line (#834).
+
+### Changed
+
+- **Breaking:** Claw no longer names any chat client: the assistant's prompts, the `claw_self_status` tool description,
+  comments and docs no longer carry a client's name, which collided with third-party products. A client that sends no
+  `assistant_name` gets a router told only that it is PrimusClaw's assistant, so a question that names the assistant by
+  a client's name (for example "how is <name> doing") is no longer recognised as being about the assistant itself.
+  Migration: the client sends its display name in `channel_context.assistant_name` on every message; the personal agent
+  does so from its configured bot name (#837). Until a client does, its name is not known to the router (#834).
+
 ### Fixed
 
 - Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill suggestion no longer depends on the model calling `skill_draft`.

@@ -4,6 +4,7 @@
 import { InvariantError } from "../errors.js";
 import { SECURITY_FIELDS } from "./security-fields.js";
 import { own } from "../own.js";
+import { PERSISTED_SECURITY_LOGGER } from "../legacy-names.js";
 
 /** The security events, their log levels (a closed list: SIEM rules match on these names). */
 export const SECURITY_EVENTS = {
@@ -24,8 +25,8 @@ export type SecurityEventRecord = Readonly<
   { event: SecurityEventName; dropped?: readonly string[] } & Record<string, unknown>
 >;
 
-/** What the log of security events is called (the Python worker's logger name, which SIEM rules select on). */
-export const SECURITY_LOGGER = "clawy.security";
+/** What the log of security events is called (the Python worker's logger name, which SIEM rules select on: kept as it was). */
+export const SECURITY_LOGGER = PERSISTED_SECURITY_LOGGER;
 
 /**
  * The record of one security event. `event` must be one of SECURITY_EVENTS (anything else is a bug: InvariantError). A

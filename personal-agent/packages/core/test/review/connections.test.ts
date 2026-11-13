@@ -61,7 +61,7 @@ test("whoami lists each connection and what connects the missing ones", () => {
 
 test("whoami when everything is connected", () => {
   const text = whoami({ githubState: BOUND, connection: conn({ readsWith: "binding", login: "alice-gh" }) });
-  assert.ok(text.includes("- GitHub: connected `alice-gh`; Clawy reads your GitHub with it, as you"), text);
+  assert.ok(text.includes("- GitHub: connected `alice-gh`; I read your GitHub with it, as you"), text);
   assert.ok(text.includes("- FleetPilot: default") && text.includes("- Memory: on"));
 });
 
@@ -93,13 +93,13 @@ test("each github line, in both languages", () => {
   const cases: [Partial<ConnectionsInput>, string, string][] = [
     [
       { connection: conn({ readsWith: "env" }) },
-      "connected; Clawy reads your GitHub with the GH_TOKEN in your PrimusClaw settings",
-      "已连接，Clawy 用你在 PrimusClaw 设置里保存的 GH_TOKEN 读 GitHub",
+      "connected; I read your GitHub with the GH_TOKEN in your PrimusClaw settings",
+      "已连接，我用你在 PrimusClaw 设置里保存的 GH_TOKEN 读 GitHub",
     ],
     [
       { connection: conn({ readsWith: "binding" }), githubState: BOUND },
-      "connected `alice-gh`; Clawy reads your GitHub with it, as you (pull requests, CI, issues)",
-      "已连接 `alice-gh`，Clawy 用它以你的身份读 GitHub（PR、CI、issue）",
+      "connected `alice-gh`; I read your GitHub with it, as you (pull requests, CI, issues)",
+      "已连接 `alice-gh`，我用它以你的身份读 GitHub（PR、CI、issue）",
     ],
     [
       { githubState: expired },
@@ -113,8 +113,8 @@ test("each github line, in both languages", () => {
     ],
     [
       { githubState: BOUND, connection: conn({ bindingReads: false }) },
-      "connected `alice-gh` (for reviews only; for Clawy to read your GitHub, keep a GH_TOKEN in your PrimusClaw settings)",
-      "已连接 `alice-gh`（只用于代审；要让 Clawy 读你的 GitHub，在 PrimusClaw 设置里保存一个 GH_TOKEN）",
+      "connected `alice-gh` (for reviews only; for me to read your GitHub, keep a GH_TOKEN in your PrimusClaw settings)",
+      "已连接 `alice-gh`（只用于代审；要让我读你的 GitHub，在 PrimusClaw 设置里保存一个 GH_TOKEN）",
     ],
     [
       { connection: conn({ bindingReads: false }) },

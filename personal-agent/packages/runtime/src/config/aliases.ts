@@ -9,8 +9,11 @@
  * uses `WORKER_IDENTITY_*` for its own Azure identity, and a surface's own settings keep the surface's prefix
  * (`TEAMS_STREAMING`, `TEAMS_AI_LABEL`), so the prefix says whose a setting is.
  *
- * The rule, for every pair: the `PA_` name when it is set and not blank; else the `TEAMS_` name when it is set; else the
- * `PA_` name (unset or blank). A message about a value names the variable it was read from.
+ * The model settings were first named after the bot's earlier default name; they now carry `PERSONAL_AGENT_`, and the
+ * earlier names are read as aliases the same way.
+ *
+ * The rule, for every pair: the new name when it is set and not blank; else the old name when it is set; else the new
+ * name (unset or blank). A message about a value names the variable it was read from. An old name is only ever read.
  */
 import { own, pyStrip, type Logger } from "@primusclaw/personal-agent";
 
@@ -60,10 +63,18 @@ export const ALIASED_SETTINGS = [
   "LIMIT_REMOTE_AGENT",
 ] as const;
 
-/** The pairs: `PA_` name -> the `TEAMS_` name still read when it is not set. */
-export const SETTING_ALIASES: ReadonlyMap<string, string> = new Map(
-  ALIASED_SETTINGS.map((stem) => [SETTING_PREFIX + stem, LEGACY_SETTING_PREFIX + stem]),
-);
+/** The prefix of the model settings. */
+export const MODEL_SETTING_PREFIX = "PERSONAL_AGENT_";
+/** The prefix the model settings were first written with, still read as an alias. */
+export const LEGACY_MODEL_SETTING_PREFIX = "CLAWY_";
+/** The model settings, by their name after the prefix. */
+export const MODEL_SETTINGS = ["MODEL", "FALLBACK_MODEL", "REVIEW_MODEL"] as const;
+
+/** The pairs: new name -> the old name still read when it is not set. */
+export const SETTING_ALIASES: ReadonlyMap<string, string> = new Map([
+  ...ALIASED_SETTINGS.map((stem) => [SETTING_PREFIX + stem, LEGACY_SETTING_PREFIX + stem] as const),
+  ...MODEL_SETTINGS.map((stem) => [MODEL_SETTING_PREFIX + stem, LEGACY_MODEL_SETTING_PREFIX + stem] as const),
+]);
 
 const NEUTRAL_OF: ReadonlyMap<string, string> = new Map([...SETTING_ALIASES].map(([neutral, old]) => [old, neutral]));
 
@@ -73,7 +84,7 @@ const isSet = (env: Env, name: string): boolean => pyStrip(own(env, name) ?? "")
 
 /**
  * The variable a setting is read from: `name` may be either name of a pair (or any other setting, read as it is). The
- * `PA_` name when it is set and not blank, else the `TEAMS_` name when it is present, else the `PA_` name.
+ * new name when it is set and not blank, else the old name when it is present, else the new name.
  */
 export function settingSource(env: Env, name: string): string {
   const neutral = NEUTRAL_OF.get(name) ?? name;
@@ -88,15 +99,15 @@ export function settingValue(env: Env, name: string): string | undefined {
   return own(env, settingSource(env, name));
 }
 
-/** A legacy name in use: the one read, or one set beside its `PA_` name and ignored. */
+/** A legacy name in use: the one read, or one set beside its new name and ignored. */
 export interface LegacySetting {
   readonly legacy: string;
   readonly neutral: string;
-  /** The `PA_` name is set too, so the `TEAMS_` value is not read. */
+  /** The new name is set too, so the old value is not read. */
   readonly ignored: boolean;
 }
 
-/** The `TEAMS_` names this environment sets (not blank) of the settings that now carry `PA_`. */
+/** The old names this environment sets (not blank) of the settings that now carry a new name. */
 export function legacySettings(env: Env): LegacySetting[] {
   const out: LegacySetting[] = [];
   for (const [neutral, legacy] of SETTING_ALIASES) {
@@ -106,8 +117,8 @@ export function legacySettings(env: Env): LegacySetting[] {
 }
 
 /**
- * One warning at start for the `TEAMS_` names in use, naming the `PA_` name of each (never a value: some are secrets);
- * and one for each `TEAMS_` name that is set beside its `PA_` name and so not read. Nothing when none is in use.
+ * One warning at start for the old names in use, naming the new name of each (never a value: some are secrets); and one
+ * for each old name that is set beside its new name and so not read. Nothing when none is in use.
  */
 export function warnLegacySettings(env: Env, logger: Logger): void {
   const used = legacySettings(env);
@@ -115,7 +126,7 @@ export function warnLegacySettings(env: Env, logger: Logger): void {
   if (read.length > 0) {
     logger.warn(
       `deprecated setting names: ${read.map((s) => `${s.legacy} (now ${s.neutral})`).join(", ")}; ` +
-        `they still work, the ${SETTING_PREFIX} names take precedence`,
+        "they still work, the new names take precedence",
       { settings: read.map((s) => s.legacy).join(",") },
     );
   }

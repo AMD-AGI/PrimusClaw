@@ -223,7 +223,7 @@ export class AgentCommands {
     if (this.p.state.direct(call.chatKey)) {
       // (one line, and the way back to the agent under it)
       const replies = this.p.board.backReplies(call.chatKey);
-      return call.to.send({ ...textMessage(leftLine(lang) + tail), suggestions: replies });
+      return call.to.send({ ...textMessage(leftLine(lang, this.p.ctx.settings.botName) + tail), suggestions: replies });
     }
     await this.say(call, backLine(lang) + tail);
   }

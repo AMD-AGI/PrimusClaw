@@ -26,6 +26,7 @@ import { raceAbort, startTimer } from "../connector/timer.js";
 import {
   KEYVAULT_API_VERSION,
   KEYVAULT_SCOPE,
+  LEGACY_VAULT_NAMES,
   shadowedSettings,
   VAULT_NAMES,
   vaultHost,
@@ -61,7 +62,14 @@ export interface KeyVaultOptions {
   readonly deadlineMs?: number;
 }
 
-type Attempt = { readonly value: string } | { readonly reason: string; readonly transient: boolean };
+type Attempt =
+  { readonly value: string } | { readonly reason: string; readonly transient: boolean; readonly missing: boolean };
+
+/** What one secret was read as: its value, and the vault entry it came from. */
+interface Read {
+  readonly value: string;
+  readonly from: string;
+}
 
 const Dict = z.record(z.string(), z.unknown());
 const SecretAnswer = z.object({ value: z.string() });
@@ -131,7 +139,7 @@ export class KeyVaultSecretSource implements SecretSource {
     }
     const deadlineMs = this.options.deadlineMs ?? LOAD_DEADLINE_MS;
     const deadline = startTimer(this.options.clock, deadlineMs, "the secrets were not read in time");
-    let values: Map<SecretName, string>;
+    let values: Map<SecretName, Read>;
     try {
       values = await raceAbort(deadline.signal, this.readAll(names, deadline.signal));
     } catch (error) {
@@ -144,18 +152,38 @@ export class KeyVaultSecretSource implements SecretSource {
     } finally {
       deadline.dispose();
     }
+    const legacy = names.filter((name) => values.get(name)?.from === LEGACY_VAULT_NAMES[name]);
+    if (legacy.length) {
+      this.logger.warn(
+        `secrets: deprecated Key Vault secret names: ${legacy.map((n) => `${LEGACY_VAULT_NAMES[n]} (now ${VAULT_NAMES[n]})`).join(", ")}; ` +
+          "they are still read when the new name is missing; store the secrets under the new names",
+      );
+    }
     this.logger.info(
       `secrets: ${String(values.size)} read from Key Vault ${vaultHost(this.url)} as client ` +
-        `${this.credential.clientId} (${names.map((name) => VAULT_NAMES[name]).join(", ")})`,
+        `${this.credential.clientId} (${[...values.values()].map((r) => r.from).join(", ")})`,
     );
+    return new Map([...values].map(([name, r]) => [name, r.value]));
+  }
+
+  private async readAll(names: readonly SecretName[], signal: AbortSignal): Promise<Map<SecretName, Read>> {
+    const token = await this.token(signal);
+    const values = new Map<SecretName, Read>();
+    for (const name of names) values.set(name, await this.readSecret(name, token, signal));
     return values;
   }
 
-  private async readAll(names: readonly SecretName[], signal: AbortSignal): Promise<Map<SecretName, string>> {
-    const token = await this.token(signal);
-    const values = new Map<SecretName, string>();
-    for (const name of names) values.set(name, await this.read(VAULT_NAMES[name], token, signal));
-    return values;
+  /** A secret under its name, else (the vault has no such entry) under its deprecated name; never written under either. */
+  private async readSecret(name: SecretName, token: string, signal: AbortSignal): Promise<Read> {
+    const current = VAULT_NAMES[name];
+    const legacy = LEGACY_VAULT_NAMES[name];
+    const found = await this.read(current, token, signal);
+    if (typeof found === "string") return { value: found, from: current };
+    const old = await this.read(legacy, token, signal);
+    if (typeof old === "string") return { value: old, from: legacy };
+    throw new SecretsUnavailable(
+      `Key Vault secret ${current}: ${found.missing} (nor under its deprecated name ${legacy})`,
+    );
   }
 
   private async token(signal: AbortSignal): Promise<string> {
@@ -178,11 +206,13 @@ export class KeyVaultSecretSource implements SecretSource {
     }
   }
 
-  private async read(name: string, token: string, signal: AbortSignal): Promise<string> {
+  /** `name`'s value, or why not when the vault has no such secret (it answered 404). */
+  private async read(name: string, token: string, signal: AbortSignal): Promise<string | { readonly missing: string }> {
     const target = `${this.url}/secrets/${pyQuote(name, "")}?api-version=${KEYVAULT_API_VERSION}`;
     for (let attempt = 1; ; attempt++) {
       const answer = await this.readOnce(target, name, token, signal);
       if ("value" in answer) return answer.value;
+      if (answer.missing) return { missing: answer.reason };
       if (!answer.transient || attempt === ATTEMPTS) {
         throw new SecretsUnavailable(`Key Vault secret ${name}: ${answer.reason}`);
       }
@@ -207,7 +237,7 @@ export class KeyVaultSecretSource implements SecretSource {
       status = response.status;
       text = await response.text();
     } catch (error) {
-      return { reason: `Key Vault unreachable (${errorName(error)})`, transient: true };
+      return { reason: `Key Vault unreachable (${errorName(error)})`, transient: true, missing: false };
     } finally {
       timer.dispose();
     }
@@ -215,6 +245,7 @@ export class KeyVaultSecretSource implements SecretSource {
     return {
       reason: `Key Vault answered ${String(status)}${vaultErrorCode(text)}`,
       transient: status === 429 || status >= 500,
+      missing: status === 404,
     };
   }
 }

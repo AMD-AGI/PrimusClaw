@@ -74,6 +74,8 @@ export interface FeedbackSinkOptions {
   /** Seconds since the epoch. */
   readonly clock?: () => number;
   readonly log: Logger;
+  /** The bot's name in this deployment (`Settings.botName`). */
+  readonly botName: string;
 }
 
 /** The sink feedback delivers to, or undefined when nothing is configured (reports are then only recorded). */
@@ -97,5 +99,5 @@ export function feedbackSink(config: FeedbackConfig, options: FeedbackSinkOption
     options.log.warn("feedback: GitHub App token failed; falling back to the token file", { code });
   });
   const api = new GithubApi({ apiUrl: config.apiUrl, tokens, ...(options.fetch ? { fetch: options.fetch } : {}) });
-  return new GithubIssueSink(api, config.repo, options.log);
+  return new GithubIssueSink(api, config.repo, options.log, options.botName);
 }

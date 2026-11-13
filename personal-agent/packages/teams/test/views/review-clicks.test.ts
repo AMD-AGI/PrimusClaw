@@ -49,6 +49,7 @@ test("a press on the confirmation setting card reaches the review service and ch
     lead: "",
     hint: "",
     installUrl: "",
+    bot: "PrimusClaw Assistant",
   });
   const button = buttons(card).find((b) => b.data.mode === "fully_auto");
   assert.ok(button !== undefined);
@@ -98,6 +99,7 @@ test("a press on a held write card and on the connect card reach the review serv
     model: "",
     hint: false,
     installUrl: "",
+    bot: "PrimusClaw Assistant",
     base: "main",
     login: "",
     lang: "zh",

@@ -42,7 +42,9 @@ export class GroupRemote {
     const switching = switchCommand(text);
     if (switching !== null) return splitOnce(switching)[1] ?? ""; // ("attach MACHINE/AGENT")
     // (the 1:1 reading: "回到助理" is a command only for a bound group)
-    return attached && naturalCommand(text) === "/agent detach" ? "detach" : null;
+    return attached && naturalCommand(text, false, new Set(), this.ctx.deps.config.botName) === "/agent detach"
+      ? "detach"
+      : null;
   }
 
   async route(message: InboundMessage, chat: Chat, key: string, words: GroupWords): Promise<boolean> {

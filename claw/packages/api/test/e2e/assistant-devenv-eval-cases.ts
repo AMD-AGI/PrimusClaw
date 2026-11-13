@@ -75,7 +75,7 @@ export const MANIFEST: ManifestItem[] = [
     remote: { machine: "yihan-dev-pod", agent: "codex", session: SES.chatCodex, online: true } },
 ];
 
-/** The channel's actions with this message, as Clawy declares them in a 1:1 chat (`capabilities.channel_actions`). */
+/** The channel's actions with this message, as a chat client declares them in a 1:1 chat (`capabilities.channel_actions`). */
 export const CHANNEL_ACTIONS = [
   { name: "agents", usage: "/agents", summary: "看看我电脑上的 agent" },
   { name: "agent", usage: "/agent attach MACHINE/AGENT (switch the chat to that agent's session, e.g. /agent attach yihan-dev-pod/claude; "
@@ -148,7 +148,7 @@ export const CASES: readonly DevenvCase[] = [
   { id: "switch-named-en", lang: "en", text: "connect me to the claude session in PrimusClaw", want: [{ tool: "devenv_list" }, attachTo(SES.chatClaude)], forbid: except("channel_action"),
     why: "the other PrimusClaw claude is open in a terminal and cannot be attached" },
   // 3. Back to the assistant: a message that reaches the router comes from a chat that is with the assistant already (an attached
-  //    chat's words go to its agent, and Clawy itself detaches on these words), so nothing is to be run: a button would only say
+  //    chat's words go to its agent, and the chat client itself detaches on these words), so nothing is to be run: a button would only say
   //    "you are not attached".
   { id: "back-zh", lang: "zh", text: "回到助理", want: [], forbid: except() },
   { id: "back-en", lang: "en", text: "back to the assistant", want: [], forbid: except() },

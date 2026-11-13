@@ -130,6 +130,7 @@ function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost):
       ? new GatewayIntentReader({
           baseUrl: `${settings.safeApiUrl}/llm-proxy/v1`,
           model: review.intentModel,
+          botName: settings.botName,
           logger,
           fetch,
         })
@@ -150,6 +151,7 @@ function reviewDeps(base: AssemblyBase, inputs: ReviewInputs, host: ReviewHost):
     owners: review.owners,
     installUrl: shape.installHintUrl,
     defaultModel: settings.models.review,
+    botName: settings.botName,
   };
 }
 

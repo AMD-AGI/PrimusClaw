@@ -60,7 +60,7 @@ export class PersonalText {
       !/agent/iu.test(message.text)
     )
       return "/sessions";
-    return naturalCommand(menuCommand(message.text, group), group, off);
+    return naturalCommand(menuCommand(message.text, group), group, off, config.botName);
   }
 
   async onText(message: InboundMessage, chat: Chat, key: string): Promise<void> {
@@ -279,7 +279,7 @@ export class PersonalText {
           kind: token.error.kind,
         });
     }
-    const channelMessageId = message.id || `clawy-${this.ctx.deps.random.hexId()}`;
+    const channelMessageId = message.id || `personal-agent-${this.ctx.deps.random.hexId()}`;
     const { channel } = chat.conversation.caps;
     const context = this.ctx.deps.channelContext({
       channel,

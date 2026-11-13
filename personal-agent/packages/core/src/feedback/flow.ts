@@ -1,7 +1,6 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { BOT_NAME } from "../branding.js";
 import { commandArgs } from "../commands/parse.js";
 import { isKnownCommand } from "../commands/names.js";
 import { FEEDBACK_TEXT as T } from "../locales/feedback.js";
@@ -23,6 +22,8 @@ export interface FeedbackFlowDeps {
   readonly reporting: FeedbackReporting;
   readonly service: FeedbackService;
   readonly log: Logger;
+  /** The bot's name in this deployment (`Settings.botName`). */
+  readonly botName: string;
 }
 
 export class FeedbackFlow {
@@ -98,7 +99,9 @@ export class FeedbackFlow {
       outcome = "asked";
       closing = T.reportAsked;
       this.deps.reports.openFeedbackAsk(sender.id, scope);
-      await conversation.send(textMessage(scope ? T.whatWentWrongInGroup({ bot: BOT_NAME }) : T.whatWentWrong));
+      await conversation.send(
+        textMessage(scope ? T.whatWentWrongInGroup({ bot: this.deps.botName }) : T.whatWentWrong),
+      );
     }
     const replaced = await click.settle(closing, { announce: false });
     this.deps.log.info("feedback report button", {

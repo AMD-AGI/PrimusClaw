@@ -110,6 +110,7 @@ function assistantChat(
     users: settings.assistant.users,
     understanding: settings.assistant.understandingUsers,
     pluginId: settings.claw.pluginId ?? undefined,
+    assistantName: settings.botName,
     legacyTurn: (aadId) => hooks.legacyTurn(aadId),
     files: messageFiles(base.surface),
     onFilesDropped: (path, count) => {
@@ -150,7 +151,11 @@ export function assistantParts(base: AssemblyBase, inputs: AssistantInputs): Ass
   const { store, claw, logger, exchange } = base;
   const subs = keeper(base, notifyUrl);
   const receipts = new Receipts(base.clock, logger, () => style.assistantReceipt);
-  const directChat = new DirectChat(base.settings.directChat.enabled, base.settings.directChat.users);
+  const directChat = new DirectChat(
+    base.settings.directChat.enabled,
+    base.settings.directChat.users,
+    base.settings.botName,
+  );
   const late: { chat?: AssistantChatService } = {};
   const board = new Board({
     store,

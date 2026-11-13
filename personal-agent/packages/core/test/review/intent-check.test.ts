@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { checkIntent, pullsWritten } from "../../src/review/intent-check.js";
 import { pullKey, pullRef, pullsIn, shortName } from "../../src/review-text/pull-ref.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 const H1 = "AMD-AGI/Hyperloom#1";
 const TEXT = `请 Bob 帮我 review 合入 ${H1}`;
@@ -18,7 +19,7 @@ const reading = (changes: Record<string, unknown> = {}) => ({
 });
 
 function verdictOf(answer: Record<string, unknown>, text = TEXT) {
-  return checkIntent(answer, text, [], pullsIn(text));
+  return checkIntent(answer, text, [], pullsIn(text), false, BOT_NAME);
 }
 
 test("the model's reading is held to what the message says", () => {
@@ -69,21 +70,34 @@ test("the same person named several ways is one reviewer", () => {
     text,
     mentions,
     pullsIn(H1),
+    false,
+    BOT_NAME,
   );
   assert.ok(verdict.kind === "ask" && verdict.ask.who === "⟦0⟧");
 });
 
 test("a model reading that names a mentioned person by name is that mention", () => {
   const mentions = [{ channelUserId: "29:w", userId: "", name: "Lin, Mei" }];
-  const verdict = checkIntent(reading({ reviewer: "Lin, Mei" }), `请 ⟦0⟧ review 合入 ${H1}`, mentions, pullsIn(H1));
+  const verdict = checkIntent(
+    reading({ reviewer: "Lin, Mei" }),
+    `请 ⟦0⟧ review 合入 ${H1}`,
+    mentions,
+    pullsIn(H1),
+    false,
+    BOT_NAME,
+  );
   assert.ok(verdict.kind === "ask" && verdict.ask.who === "⟦0⟧");
 });
 
 test("in a 1:1 chat naming nobody is the asker, unless someone was named", () => {
-  const own = checkIntent(reading({ reviewer: "", reviewers: [] }), TEXT, [], pullsIn(TEXT), true);
+  const own = checkIntent(reading({ reviewer: "", reviewers: [] }), TEXT, [], pullsIn(TEXT), true, BOT_NAME);
   assert.ok(own.kind === "ask" && own.ask.who === "");
-  const unsure = checkIntent(reading({ reviewer: "", reviewers: ["Bob"] }), TEXT, [], pullsIn(TEXT), true);
-  assert.ok(unsure.kind === "question" && unsure.text.startsWith("我不确定你请的是谁"));
+  const unsure = checkIntent(reading({ reviewer: "", reviewers: ["Bob"] }), TEXT, [], pullsIn(TEXT), true, "Robin");
+  assert.ok(
+    unsure.kind === "question" &&
+      unsure.text.startsWith("我不确定你请的是谁") &&
+      unsure.text.endsWith("例如 @Robin 请 XX 帮我 review 合入 <PR>"),
+  );
 });
 
 test("a model the message writes is taken", () => {

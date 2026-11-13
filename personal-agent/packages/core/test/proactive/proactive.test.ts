@@ -282,7 +282,7 @@ it("with direct chat on and the chat attached to a session an amending say is a 
   const out = shown(w.surface.outbox);
   assert.equal(out.length, 2);
   assert.ok(
-    out.every((line) => line.startsWith("post 💬 **Clawy**")),
+    out.every((line) => line.startsWith("post 💬 **PrimusClaw Assistant**")),
     out.join("\n"),
   );
 });

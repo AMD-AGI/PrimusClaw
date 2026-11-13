@@ -22,6 +22,7 @@ import {
 
 import { FakeSurface, openTestStore } from "../../../../test-support/index.js";
 import { RecordingLogger } from "../feedback/world.js";
+import { BOT_NAME } from "../../src/branding.js";
 
 export const CONV = "19:observed@thread.v2";
 export const SCOPE = `group:teams:${CONV}`;
@@ -97,6 +98,7 @@ export function observeWorld(options: ObserveWorldOptions = {}) {
     },
     pluginId: 2,
     log,
+    botName: BOT_NAME,
   });
   const settled: { card: OutMessage | string; options: SettleOptions }[] = [];
   return { store, assistant, surface, log, observer, settled, failingGroups };

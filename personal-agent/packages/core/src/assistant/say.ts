@@ -49,7 +49,7 @@ export interface SayOptions {
   readonly linkFor?: DeliveryLink | undefined;
   /** What the receipt already shows of the words. */
   readonly shown?: string;
-  /** The first line of what is said (direct chat: Clawy's head). */
+  /** The first line of what is said (direct chat: the bot's head). */
   readonly head?: string;
   /** Suggested replies of the worker's own, before Claw's. */
   readonly replies?: readonly SuggestedReply[];

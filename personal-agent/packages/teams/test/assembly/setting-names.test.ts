@@ -122,7 +122,7 @@ it("an environment with the older TEAMS_ names starts unchanged and says once wh
   assert.deepEqual(deprecations(logger), [
     "deprecated setting names: TEAMS_DB_PATH (now PA_DB_PATH), TEAMS_ENCRYPTION_KEYS (now PA_ENCRYPTION_KEYS), " +
       "TEAMS_USER_MESSAGE_LIMIT (now PA_USER_MESSAGE_LIMIT), TEAMS_LIMIT_PR_MERGE (now PA_LIMIT_PR_MERGE); " +
-      "they still work, the PA_ names take precedence",
+      "they still work, the new names take precedence",
   ]);
   assert.ok(!logger.dump().includes(KEY), "no value is logged");
   assert.ok(!logger.dump().includes("TEAMS_AI_LABEL"), "a Teams setting is no deprecated name");

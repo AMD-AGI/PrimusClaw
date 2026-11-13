@@ -36,7 +36,7 @@ describe("assistant observe", { skip }, () => {
   let alice: { userId: string; routerSid: string };
 
   before(async () => {
-    w = await startWorld({ CLAW_ASSISTANT_OBSERVE: "true", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy" });
+    w = await startWorld({ CLAW_ASSISTANT_OBSERVE: "true", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client" });
     observe = await import("../src/assistant/observe.js");
     app = Fastify();
     app.addHook("preHandler", async (req) => {
@@ -236,10 +236,10 @@ describe("assistant observe", { skip }, () => {
     const back = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "observe" }, { "x-test-method": "api_key" });
     assert.equal(back.status, 200, "observe only takes power away, so any request of hers may set it");
     assert.equal(await mode(), "observe");
-    const service = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "auto" }, { "x-test-client": "clawy" });
+    const service = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "auto" }, { "x-test-client": "chat-client" });
     assert.equal(service.status, 200);
     const via = (await w.q("SELECT mode_set_via FROM claw_assistant_scopes WHERE user_id = 'alice' AND scope = $1", [GROUP]))[0].mode_set_via;
-    assert.deepEqual(via, { method: "identity_token", service: { clientId: "clawy", actorSub: "svc" } });
+    assert.deepEqual(via, { method: "identity_token", service: { clientId: "chat-client", actorSub: "svc" } });
 
     // A switch is per person and per place.
     await w.user("bob");

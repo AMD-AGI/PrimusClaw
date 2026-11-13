@@ -9,6 +9,7 @@
 import {
   err,
   ok,
+  PERSISTED_FEEDBACK_LABEL,
   type FeedbackSink,
   type IssueRef,
   type Logger,
@@ -19,9 +20,13 @@ import {
 import { GithubApi, GithubApiError, segment } from "./api.js";
 import { GithubAuthError } from "./app-token.js";
 
-export const FEEDBACK_LABEL = "clawy-feedback";
+export const FEEDBACK_LABEL = PERSISTED_FEEDBACK_LABEL;
 const LABEL_COLOR = "d93f0b";
-const LABEL_DESCRIPTION = "Reported by a user from Teams through Clawy";
+
+/** The feedback label's description, naming the bot by the deployment's name. */
+export function labelDescription(botName: string): string {
+  return `Reported by a user from Teams through ${botName}`;
+}
 
 /** `%Y-%m-%dT%H:%M:%SZ`, as GitHub's `since` takes it. */
 function isoSeconds(epochMs: number): string {
@@ -69,6 +74,8 @@ export class GithubIssueSink implements FeedbackSink {
     /** `owner/name`. */
     repo: string,
     private readonly log: Logger,
+    /** The bot's name in this deployment (`Settings.botName`), for the label's description. */
+    private readonly botName: string,
   ) {
     const [owner = "", name = ""] = repo.split("/");
     this.repoPath = `/repos/${segment(owner)}/${segment(name)}`;
@@ -148,7 +155,7 @@ export class GithubIssueSink implements FeedbackSink {
       const made = await this.api.request({
         method: "POST",
         path: `${this.repoPath}/labels`,
-        body: { name: FEEDBACK_LABEL, color: LABEL_COLOR, description: LABEL_DESCRIPTION },
+        body: { name: FEEDBACK_LABEL, color: LABEL_COLOR, description: labelDescription(this.botName) },
       });
       if (made.status === 201 || made.status === 422)
         this.labelReady = true; // 422: somebody else made it first

@@ -42,6 +42,7 @@ export * as turn from "./turn/index.js";
 export { fetchChanges } from "./turn/changes.js";
 export * from "./note/note.js";
 export * from "./branding.js";
+export * from "./legacy-names.js";
 export * from "./claw/message-text.js";
 export * from "./claw/requester-view.js";
 export * from "./claw/service-refusal.js";

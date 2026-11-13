@@ -154,6 +154,7 @@ export class HeldWrites {
           model: review.ranModel,
           hint: !this.deps.store.members.clickedPersonally(review.actorId),
           installUrl: this.deps.installUrl,
+          bot: this.deps.botName,
           base,
           login: review.actorLogin,
           lang: review.lang,

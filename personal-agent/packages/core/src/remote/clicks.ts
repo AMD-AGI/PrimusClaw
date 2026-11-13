@@ -296,7 +296,7 @@ export class SessionClicks {
     await this.p.board.dropKept(click.chatKey, click.to);
     const direct = this.p.state.direct(click.chatKey);
     // (and what became of a turn that was running: it goes on there)
-    const line = (direct ? leftLine(lang) : backLine(lang)) + (left ? ` ${left}` : "");
+    const line = (direct ? leftLine(lang, this.p.ctx.settings.botName) : backLine(lang)) + (left ? ` ${left}` : "");
     if (click.data["view"] === "agents") return this.home(click, line); // Detach on the list: the list again
     if (direct) {
       await this.end(click, line, undefined, false); // (a status card from before it was on: closed down to the line)

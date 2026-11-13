@@ -25,6 +25,11 @@ export interface Settings {
   readonly listenPort: number;
   /** METRICS_PORT (default 9090), never PORT. */
   readonly metricsPort: number;
+  /**
+   * PERSONAL_AGENT_BOT_NAME (default `BOT_NAME`, "PrimusClaw Assistant"): the name the bot goes by in this deployment, in every
+   * text that names it and in what an @mention of it is read as.
+   */
+  readonly botName: string;
   readonly claw: ClawSettings;
   readonly exchange: ExchangeSettings;
   readonly models: ModelSettings;
@@ -58,7 +63,7 @@ export interface ClawSettings {
   readonly pluginId: number | null;
   /** CLAW_RULE_TOOL_ID: the rule tool whose text rides on every message; null none. */
   readonly ruleToolId: number | null;
-  /** CLAW_CLIENT_LABEL (default "clawy"): what Claw's audit trail calls this client (`X-Claw-Client`). */
+  /** CLAW_CLIENT_LABEL (default "personal-agent"): what Claw's audit trail calls this client (`X-Claw-Client`). */
   readonly clientLabel: string;
 }
 
@@ -86,11 +91,11 @@ export interface ExchangeSettings {
 
 /** The models sessions ask for ("" sends none: Claw's default applies). */
 export interface ModelSettings {
-  /** CLAWY_MODEL. */
+  /** PERSONAL_AGENT_MODEL. */
   readonly chat: string;
-  /** CLAWY_FALLBACK_MODEL: a turn refused for want of a model key is run again on it, once ("" no second run). */
+  /** PERSONAL_AGENT_FALLBACK_MODEL: a turn refused for want of a model key is run again on it, once ("" no second run). */
   readonly fallback: string;
-  /** CLAWY_REVIEW_MODEL: a review whose request names none ("" CLAWY_MODEL). */
+  /** PERSONAL_AGENT_REVIEW_MODEL: a review whose request names none ("" PERSONAL_AGENT_MODEL). */
   readonly review: string;
 }
 
@@ -100,7 +105,7 @@ export interface GithubReviewSettings {
   readonly enabled: boolean;
   /** PA_GITHUB_REVIEW_OWNERS: the GitHub owners whose pull requests are taken; required when on. */
   readonly owners: readonly string[];
-  /** PA_REVIEW_INTENT_MODEL (else CLAWY_MODEL) when on; "" requests are read by the rules alone. */
+  /** PA_REVIEW_INTENT_MODEL (else PERSONAL_AGENT_MODEL) when on; "" requests are read by the rules alone. */
   readonly intentModel: string;
   /** PA_GITHUB_CREDENTIAL_URL (default PUBLIC_BASE_URL/oauth/external-credentials) when on. */
   readonly credentialUrl: string;

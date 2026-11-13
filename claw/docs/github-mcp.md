@@ -13,7 +13,7 @@ With `CLAW_GITHUB_MCP_BINDING_ENABLED=true` as well, an owner who keeps no `GH_T
 account they bound at the identity provider (`/github bind` in Teams, the binding [GitHub review](github-review.md)
 uses), so binding once is enough for the tools too. The vault comes first: an owner who keeps a `GH_TOKEN` is served
 with it. Off by default: switching it on changes what a binding is used for, so the people who bound one have to be
-told (Clawy's `/github status` and its binding card say it).
+told (a chat client's `/github status` and its binding card can say it).
 
 | Reads (run without asking) | Writes (each waits for the user's decision) |
 |---|---|

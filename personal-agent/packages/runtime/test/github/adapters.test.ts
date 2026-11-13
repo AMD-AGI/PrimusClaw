@@ -159,6 +159,7 @@ test("the reader calls the gateway with the askers key and gives up on anything 
     new GatewayIntentReader({
       baseUrl: "https://llm.test/v1/",
       model: "small",
+      botName: "Robin",
       logger: silentLogger,
       fetch: (_url, init) => {
         bodies.push(typeof init?.body === "string" ? init.body : "");
@@ -171,6 +172,7 @@ test("the reader calls the gateway with the askers key and gives up on anything 
   assert.deepEqual(ok, { intent: "none" });
   assert.ok(bodies[0]?.includes('"model":"small"') && bodies[0].includes("请 Bob review 合入 x/y#1"));
   assert.ok(bodies[0]?.includes("in a Microsoft Teams group chat")); // (the model is told the chat app the message came through)
+  assert.ok(bodies[0]?.includes("sent to Robin, a bot")); // (and the bot by the deployment's name)
   assert.equal(
     await reader(() => Promise.resolve(new Response("", { status: 429 }))).readMode("k", "t", "Microsoft Teams"),
     undefined,

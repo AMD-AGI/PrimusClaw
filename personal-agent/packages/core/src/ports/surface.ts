@@ -228,7 +228,7 @@ export interface Citation {
 
 /**
  * A reply to tap: the button's `title` and the text it sends as the person's message, `value` (they differ: "Back to
- * Clawy" sends "back to Clawy"; Teams: an imBack action).
+ * <bot>" sends "back to <bot>"; Teams: an imBack action).
  */
 export interface SuggestedReply {
   readonly title: string;

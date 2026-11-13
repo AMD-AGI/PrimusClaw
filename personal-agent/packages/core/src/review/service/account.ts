@@ -113,7 +113,11 @@ export class GithubAccount {
       return undefined;
     }
     const [connection, known] = await connectionOf(this.deps, sender.id);
-    await say(this.deps, conversation, consentText(started.value, !known || connection?.bindingReads === true));
+    await say(
+      this.deps,
+      conversation,
+      consentText(started.value, !known || connection?.bindingReads === true, this.deps.botName),
+    );
     this.modeChosen.delete(sender.id);
     try {
       // (the choice goes with the binding; pressing nothing is the default)
@@ -290,6 +294,7 @@ export class GithubAccount {
       lead,
       hint: hint ? TYPED_MODE_HINT : "",
       installUrl: this.deps.installUrl,
+      bot: this.deps.botName,
     });
   }
 

@@ -69,6 +69,7 @@ export class FollowControl {
       showPermission: (key, sid, request, to) => this.hooks.showPermission(key, sid, request, to),
       lang: () => this.state.lang(chatKey),
       direct: () => this.state.direct(chatKey),
+      botName: this.ctx.settings.botName,
       describeEnd: (reason) => this.hooks.describeEnd(chatKey, attached.connectorId, reason),
       window: (text, final) => Promise.resolve(this.board.windowSaid(chatKey, text, final)),
       windowSettled: () => this.board.windowSettled(chatKey),

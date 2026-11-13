@@ -3,7 +3,7 @@
 
 /**
  * `/github bind` reaches private and internal repositories and says what it is used for as Claw uses it; `/github status` says
- * what a binding can read and what Clawy reads GitHub with; the confirmation setting chosen while binding goes with the binding
+ * what a binding can read and what the bot reads GitHub with; the confirmation setting chosen while binding goes with the binding
  * (`test_github_repo_scope`, `test_github_connect`'s bind and status tests, `test_github_review_mode`'s bind tests).
  */
 import assert from "node:assert/strict";
@@ -125,7 +125,7 @@ test("github status shows the line", async () => {
   world.identity.know("aad-a", "u-alice", "alice-gh");
   world.claw.connection = { readsWith: "binding", login: "alice-gh", missing: "", bindingReads: true };
   await command(world, "status");
-  assert.ok(last(world).includes("Clawy 用这个令牌读你的 GitHub"), last(world));
+  assert.ok(last(world).includes("我用这个令牌读你的 GitHub"), last(world));
 });
 
 for (const [name, connection, saysToken] of [

@@ -1208,7 +1208,7 @@ test("S35 a turn's channel_context goes with its message, beside its files; a ca
 // Replies of the live assistant to the evaluation identities (sa-eval-bot-4, 2026-11-09), which the language check failed although
 // each is in the person's language: Chinese answers that list English names, a command answered in the identity's language.
 const PLANS_ZH = "**Dispatron 里现在共 7 个 plan**\n\n- top-model-daily\n- hyperloom-main-daily-ci\n- hyperloom-release-qualification\n"
-  + "- hyperloom-release-legs-v1.1.5\n- mi355x-kernel-arena-daily-dag\n- ka-geak-canary-20261028\n- clawy-eval-main-daily-ci";
+  + "- hyperloom-release-legs-v1.1.5\n- mi355x-kernel-arena-daily-dag\n- ka-geak-canary-20261028\n- assistant-eval-main-daily-ci";
 const PULSE_ZH = "**✅ Pulse 排行榜（按相对基线的提升幅度 gain 排序）前 5 名如下：**\n\n"
   + "- 1. **DeepSeek-V4.1-Flash**：提升 **+2341.78%**，状态 **failed**。mxfp4、sglang、mi355x。吞吐从 221.77 提升到 686.48 tok/s/GPU。\n"
   + "- 2. **futurehouse-ether0**：提升 **+1203.96%**，状态 target_reached。fp8、sglang、mi300x。吞吐从 198.53 提升到 2588.79。\n"
@@ -1225,7 +1225,7 @@ const RUNS_ZH = "**最近 24 小时（2026-11-08 16:11 至 2026-11-09 16:11 UTC�
   + "  - 另一个是 `digest:oneoff-017c61f49553472e`。两个都用 glm-5-3-with-fallback。\n"
   + "- **被平台抢占（`failed(interrupted)`，cause 为 preempted）：1 个**\n"
   + "  - 例子：`hyperloom:11-13-g97-7c0c447bf0`。11-08 17:11 它所在的 allocation 被调度器的更高优先级 job 抢占（job 274710 被 274711 抢占）。";
-const BRIEF_OFF_ZH = "**❌ 这里没能关闭每日简报**\n\n这条消息不是通过能执行设置的渠道发来的，所以 `/brief off` 没有生效。\n\n📌 请在 Teams 里直接对 Clawy 发送 `/brief off`。";
+const BRIEF_OFF_ZH = "**❌ 这里没能关闭每日简报**\n\n这条消息不是通过能执行设置的渠道发来的，所以 `/brief off` 没有生效。\n\n📌 请在 Teams 里直接对 Helper 发送 `/brief off`。";
 
 test("S36 the reply's language is judged by its own words, not by the names, code, links and quotes in it", () => {
   const zh = caseOf({ lang: "zh", style: { reply_lang: "follow_user" } });

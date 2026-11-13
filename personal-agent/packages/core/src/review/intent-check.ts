@@ -115,29 +115,32 @@ function whoOf(
   mentions: readonly Mention[],
   people: readonly string[],
   direct: boolean,
+  bot: string,
 ): { readonly who: string } | { readonly question: string } {
   const reviewer = squashSpaces(reading.reviewer);
   const refs = mentionRefs(reviewer, mentions);
   if (refs.length) return { who: refs.map((i) => `${MARK_OPEN}${String(i)}${MARK_CLOSE}`).join("") };
   if (reviewer && flat(reviewer) && !reviewer.includes(MARK_OPEN) && writtenIn(reviewer, text))
     return { who: reviewer };
-  if (reviewer) return { question: reviewRequestText.nameNotInMessage({ name: displayName(reviewer) }) };
+  if (reviewer) return { question: reviewRequestText.nameNotInMessage({ name: displayName(reviewer), bot }) };
   // (a 1:1 chat that names nobody: the asker reviews with their own account; no reviewer, yet someone asked: a question)
-  if (direct) return people.length ? { question: reviewRequestText.unsureWho } : { who: "" };
-  return { question: reviewRequestText.askWho };
+  if (direct) return people.length ? { question: reviewRequestText.unsureWho(bot) } : { who: "" };
+  return { question: reviewRequestText.askWho(bot) };
 }
 
 /**
  * The model's reading of a request, held to the message. `text` is what the asker wrote (with the addresses behind its
  * links), never a message it quotes: a quote may name the pull requests (`found` is read from it too), never the reviewer
- * or the model. `direct`: a 1:1 chat, where naming nobody means the asker.
+ * or the model. `direct`: a 1:1 chat, where naming nobody means the asker. `bot`: the bot's name in this deployment, for the
+ * example a question shows.
  */
 export function checkIntent(
   raw: Readonly<Record<string, unknown>>,
   text: string,
   mentions: readonly Mention[],
   found: readonly PullRef[],
-  direct = false,
+  direct: boolean,
+  bot: string,
 ): IntentVerdict {
   const reading = readingOf(raw);
   if (typeof reading === "string") return { kind: "unreadable", why: reading };
@@ -158,9 +161,9 @@ export function checkIntent(
   const keys = new Set(found.map(pullKey));
   const chosen = new Set(named(reading.prs).flatMap((item) => [...pullsWritten(pyStrip(item), keys)]));
   const pulls = found.filter((p) => chosen.has(pullKey(p)));
-  const who = whoOf(reading, text, mentions, people, direct);
+  const who = whoOf(reading, text, mentions, people, direct, bot);
   if ("question" in who) return { kind: "question", text: who.question };
-  if (!pulls.length) return { kind: "question", text: reviewRequestText.noPullRecognised };
+  if (!pulls.length) return { kind: "question", text: reviewRequestText.noPullRecognised(bot) };
   const model = pyStrip(reading.model);
   if (model && (!new RegExp(`^(?:${MODEL_ID})$`, "u").test(model) || !casefold(text).includes(casefold(model)))) {
     return { kind: "question", text: reviewRequestText.unsureModel };

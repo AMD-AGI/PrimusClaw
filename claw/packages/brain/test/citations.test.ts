@@ -356,9 +356,9 @@ test("C8 the say's text streams whatever follows it: sources after text do not h
 
 test("C10 the agent board's issues are sources by their own html_url, under its prefix only", async () => {
   const BOARD = "https://board.example/board/";
-  const ISSUE = `${BOARD}boards/clawy-eval/issues/2`;
+  const ISSUE = `${BOARD}boards/assistant-eval/issues/2`;
   const issues = JSON.stringify([
-    { html_url: ISSUE, title: "你真正会问 Clawy 的 10 个问题", body: "see https://evil.example/x and https://board.example/board/boards/other/issues/9" },
+    { html_url: ISSUE, title: "你真正会问助理的 10 个问题", body: "see https://evil.example/x and https://board.example/board/boards/other/issues/9" },
     { html_url: "https://evil.example/board/boards/x/issues/1", title: "elsewhere" },
     { html_url: `${BOARD}../admin`, title: "climbs out" },
     { number: 3, title: "no address" },
@@ -382,12 +382,12 @@ test("C10 the agent board's issues are sources by their own html_url, under its 
   assert.equal(router.citations!.size, 2, "the issue (its comment is the same page) and the board, nothing else");
   // #16: the say names the board issue it read, and it reaches the API as a source.
   await router.route(SAY, {
-    text: "clawy-eval 只有 2 条 [1]；hyperloom-multibranch 见 [2]；[3][4]",
+    text: "assistant-eval 只有 2 条 [1]；hyperloom-multibranch 见 [2]；[3][4]",
     sources: [ISSUE, `${BOARD}boards/hyperloom-multibranch`, "https://evil.example/x", `${BOARD}boards/other/issues/9`],
   });
   assert.deepEqual(calls.at(-1)!.meta, {
     [CITE_SOURCES_META]: [
-      { n: 1, url: ISSUE, title: "你真正会问 Clawy 的 10 个问题", kind: "board" },
+      { n: 1, url: ISSUE, title: "你真正会问助理的 10 个问题", kind: "board" },
       { n: 2, url: `${BOARD}boards/hyperloom-multibranch`, title: "boards/hyperloom-multibranch", kind: "board" },
     ],
     [CITE_DROPPED_META]: { not_in_turn: 2, invalid: 0, over_cap: 0 },
