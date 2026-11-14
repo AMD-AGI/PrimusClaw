@@ -161,6 +161,41 @@ func (s *Server) admitTemplateWorkspace(c *gin.Context, namespace string) bool {
 	return false
 }
 
+// defaultTemplateNamespace picks the namespace of a template create that names
+// none: the only workspace of a verified non-admin caller, else "default".
+// It answers 400 when the caller has several workspaces, 403 when it has none,
+// and 503 when its User cannot be read.
+func (s *Server) defaultTemplateNamespace(c *gin.Context) (string, bool) {
+	if !s.cfg.EnableAuth || canWriteAll(c) {
+		return "default", true
+	}
+	reader, ok := s.templateMembership.(grant.UserReader)
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace membership is not configured", "code": "membership_unavailable"})
+		return "", false
+	}
+	user, err := reader.ReadUser(c.Request.Context(), currentUserID(c))
+	if err != nil {
+		var oe *grant.OpError
+		if errors.As(err, &oe) {
+			c.JSON(oe.Status, gin.H{"error": oe.Error(), "code": oe.Reason})
+			return "", false
+		}
+		log.Warn("template workspace read failed", "userId", currentUserID(c), "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace membership is temporarily unreadable", "code": "membership_unavailable"})
+		return "", false
+	}
+	switch {
+	case !user.Found || len(user.Workspaces) == 0:
+		c.JSON(http.StatusForbidden, gin.H{"error": "the caller has no workspace", "code": "user_not_in_workspace"})
+		return "", false
+	case len(user.Workspaces) > 1:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "set namespace to one of the caller's workspaces", "code": "workspace_required"})
+		return "", false
+	}
+	return user.Workspaces[0], true
+}
+
 // isTemplateWritable checks if the current user can update/delete this template.
 // Writable if: system-admin (canWriteAll) OR owner of a private template.
 func isTemplateWritable(c *gin.Context, ci *runtimev1alpha1.CodeInterpreter) bool {

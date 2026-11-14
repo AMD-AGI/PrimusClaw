@@ -1237,7 +1237,11 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		return
 	}
 	if req.Namespace == "" {
-		req.Namespace = "default"
+		ns, ok := s.defaultTemplateNamespace(c)
+		if !ok {
+			return
+		}
+		req.Namespace = ns
 	}
 	// Before the image build: a denied namespace must not cost a kaniko run.
 	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
@@ -1351,7 +1355,11 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 		return
 	}
 	if req.Namespace == "" {
-		req.Namespace = "default"
+		ns, ok := s.defaultTemplateNamespace(c)
+		if !ok {
+			return
+		}
+		req.Namespace = ns
 	}
 	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
 		return

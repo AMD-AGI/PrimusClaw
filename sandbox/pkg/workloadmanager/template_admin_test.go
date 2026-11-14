@@ -79,6 +79,39 @@ func (m workspaceMembership) Check(_ context.Context, userID string, workspaces 
 	return nil
 }
 
+// ReadUser reports the workspaces listed for userID; an unlisted user is not found.
+func (m workspaceMembership) ReadUser(_ context.Context, userID string) (grant.OwnerUser, error) {
+	ws, ok := m[userID]
+	return grant.OwnerUser{Found: ok, Workspaces: ws}, nil
+}
+
+// TestTemplateNamespaceDefaultsToOnlyWorkspace checks that with caller auth a
+// non-admin create without a namespace uses the caller's only workspace.
+func TestTemplateNamespaceDefaultsToOnlyWorkspace(t *testing.T) {
+	rig := newWMRig(t, wmAdmitter(t, true), true)
+	rig.s.cfg.EnableAuth = true
+	rig.s.WithTemplateMembership(workspaceMembership{
+		"single": {"admitted"},
+		"multi":  {"admitted", "denied"},
+		"none":   {},
+	})
+	create := func(user string) *httptest.ResponseRecorder {
+		body := `{"name":"t-` + user + `",` + templateSpec + `}`
+		return rig.serveAs(user, RoleDefault, http.MethodPost, "/v1/templates", body)
+	}
+	if w := create("single"); w.Code != http.StatusCreated || !rig.templateExists(t, "admitted", "t-single") {
+		t.Fatalf("create with one workspace = %d, want 201 in that workspace: %s", w.Code, w.Body.String())
+	}
+	if w := create("multi"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "workspace_required") {
+		t.Fatalf("create with several workspaces = %d, want 400 workspace_required: %s", w.Code, w.Body.String())
+	}
+	for _, user := range []string{"none", "unknown"} {
+		if w := create(user); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "user_not_in_workspace") {
+			t.Fatalf("create by %s = %d, want 403 user_not_in_workspace: %s", user, w.Code, w.Body.String())
+		}
+	}
+}
+
 // TestTemplateWritesNeedWorkspace checks that with caller auth a non-admin
 // creates and updates templates only in its own workspaces.
 func TestTemplateWritesNeedWorkspace(t *testing.T) {

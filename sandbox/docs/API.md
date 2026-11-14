@@ -56,7 +56,7 @@ Source: `pkg/router/server.go`
 | PATCH  | `/v1/sandbox/sessions/{id}/policy`        | Update egress policy                     |
 | GET    | `/v1/sandbox/sessions/{id}/logs`          | Get session logs                         |
 
-Any caller may create a private template in an admitted namespace and update or delete its own private templates. With caller authentication, a caller other than `system-admin` creates and updates templates only in namespaces listed as its workspaces on its User; other namespaces get 403 `user_not_in_workspace`. Creating a public template, changing the `public` flag, changing a public template, and changing another user's template require the `system-admin` role.
+Any caller may create a private template in an admitted namespace and update or delete its own private templates. With caller authentication, a caller other than `system-admin` creates and updates templates only in namespaces listed as its workspaces on its User; other namespaces get 403 `user_not_in_workspace`. When such a caller omits `namespace`, the template goes to its only workspace; a caller with several workspaces gets 400 `workspace_required`. Otherwise an omitted `namespace` is `default`. Creating a public template, changing the `public` flag, changing a public template, and changing another user's template require the `system-admin` role.
 
 ### Create a template (minimal)
 
