@@ -408,7 +408,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.deepEqual(authorProof, ["assistant/review-items.ts"], "only the review items ask for the author re-run's proof");
   // A review whose one turn called no review tool at all: its same words once more, once. Made only for one completed turn with those
   // words and nothing queued, with no review tool call and no confirmation in the session, whose item is open and was not run again so before.
-  assert.match(actingSession, /AND NOT \(w\.params \? 'empty_rerun'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id AND a\.tool <> 'gh_pr_follow'\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_confirmations c WHERE c\.session_id = s\.session_id\)\) AS waiting/,
+  assert.match(actingSession, /AND NOT \(w\.params \? 'empty_rerun'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id AND a\.tool <> 'gh_pr_follow'\s*AND a\.at > \(SELECT MIN\(t\.created_at\) FROM claw_tasks t WHERE t\.session_id = s\.session_id AND t\.origin = 'chat'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_confirmations c WHERE c\.session_id = s\.session_id\)\) AS waiting/,
     "the no-call re-run's proof only for an open review item not run again so before, whose session called no review tool and holds nothing");
   const noCallProof = [...found.keys()].filter((f) => /\bproofForReviewAfterNoCall\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(noCallProof, ["assistant/review-items.ts"], "only the review items ask for the no-call re-run's proof");

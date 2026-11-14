@@ -146,6 +146,13 @@ describe("assistant review items", { skip }, () => {
       },
       checkPullRequest: async (actor: Record<string, unknown>, pr: { owner: string; repo: string; number: number }) => {
         checks.push({ actor, pr });
+        // As the real service does (`run` -> `auditStart`): the check is audited in the new session, before its first turn.
+        await w.q(
+          `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, tool, arguments, result, detail)
+           VALUES ($1, $2, $3, $4, $5, 'gh_pr_check', $6::jsonb, 'ok', 'ok')`,
+          [actor.requesterUserId ?? "", actor.actorUserId ?? "", actor.sessionId ?? "", `${pr.owner}/${pr.repo}`, pr.number,
+            JSON.stringify({ pr: `${pr.owner}/${pr.repo}#${pr.number}` })],
+        );
         return { ...checkAnswer(pr), text: "" };
       },
       decide: async (_user: string, id: string, decision: string) => {
@@ -1208,7 +1215,7 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([control.boardState, control.summary], ["needs_you", "the merge of AMD-AGI/PrimusClaw#810 was refused: merge_state_not_clean"]);
   });
 
-  test("M4 a turn that called no review tool is run once more, and a second one ends told to whoever asked, not the reviewer (N31, PrimusClaw#846)", () => {
+  test("M4 a turn that called no review tool is run once more, and a second one ends told to whoever asked, not the reviewer (N31, PrimusClaw#846)", async () => {
     const base = {
       ownerUserId: "bob", actingAs: "bob", actingAsName: "Bob B", reviewOnly: false, pr: PR(846), confirmations: [], writes: [], turn: "finished" as const,
       ownReview: false, requestedBy: "alice", turns: 1, reviewCalls: 0, emptyRerun: null,
@@ -1220,6 +1227,12 @@ describe("assistant review items", { skip }, () => {
     assert.deepEqual([second.boardState, second.boardState === "done" && second.outcome, second.boardState === "done" && second.result],
       ["done", "stopped", "not_run"]);
     assert.equal(ri.reviewState({ ...base, emptyRerun: "not_queued" } as never).boardState, "done");
+    const { notRunText } = await import("../src/assistant/review-result.js");
+    const f = { pr: "AMD-AGI/PrimusClaw#846", url: "https://github.com/AMD-AGI/PrimusClaw/pull/846", seq: 3, forRequester: true };
+    assert.match(notRunText(f, false), /ran twice/);
+    assert.match(notRunText({ ...f, ranOnce: true }, false), /could not be run again by itself/);
+    assert.doesNotMatch(notRunText({ ...f, ranOnce: true }, false), /twice/);
+    assert.doesNotMatch(notRunText({ ...f, ranOnce: true }, true), /两次/);
     // A review that called a tool, failed, or was stopped by the server is judged as before.
     assert.equal(ri.reviewState({ ...base, reviewCalls: 1 } as never).boardState, "needs_you");
     assert.equal(ri.reviewState({ ...base, turn: "failed" } as never).boardState, "needs_you");
@@ -2329,7 +2342,9 @@ describe("assistant review items", { skip }, () => {
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const it = await w.item(r.body.data.items[0].item_id);
     const sid = it.worker_session_id as string;
-    // The first turn ended having called no review tool (the tools did not connect in time). Only the server's own follow-up is recorded.
+    // The first turn ended having called no review tool (the tools did not connect in time). Only the server's own rows are recorded:
+    // the pull request check made before the session's first turn (as every start audits it), and a follow-up.
+    assert.equal(await count("claw_github_audit", `session_id = '${sid}' AND tool = 'gh_pr_check'`), 1, "the start's check is audited in the session");
     const words = await firstTurnWords(sid);
     await w.q(
       `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, result, detail)
@@ -2388,6 +2403,9 @@ describe("assistant review items", { skip }, () => {
       [sid, "c".repeat(40)],
     );
     assert.equal(await proofForReviewAfterNoCall(query, sid, words), null, "a read");
+    // A row of any tool written once the turn began counts, whatever its name: the pull request check too, if the turn made one.
+    await w.q("UPDATE claw_github_audit SET tool = 'gh_pr_check' WHERE session_id = $1 AND tool = 'gh_pr_get'", [sid]);
+    assert.equal(await proofForReviewAfterNoCall(query, sid, words), null, "a check made by the turn");
     await ri.sweepReviewItems();
     const item = await w.item(it.item_id);
     assert.deepEqual([item.board_state, item.params.empty_rerun], ["needs_you", undefined], "a review that read and posted nothing is the reviewer's, as before");

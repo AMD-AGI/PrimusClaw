@@ -208,7 +208,8 @@ export async function proofForReviewAfterAuthor(
  * 2026-11-13, N31: the review tools did not connect in time, the turn ended in seconds having read and posted nothing, and the reviewer was
  * woken for it). It is the same words in the same session, given once more, as the turn did nothing of what they asked. Made only when the
  * database shows exactly that: the session acts as a user, has had one turn and no other, that turn completed and its words are `content`,
- * nothing is queued, the session has no review tool call (the server's own follow-ups, `gh_pr_follow`, aside) and no confirmation, and it
+ * nothing is queued, the session has no review tool call since its turn began (the pull request check the server audits in it before then,
+ * and the server's own follow-ups, `gh_pr_follow`, aside) and no confirmation, and it
  * is the session of an open review item that was not run again this way before (`empty_rerun`). Null otherwise: never twice, since the
  * turn it lets through is the session's second. A review someone asked of the owner still passes every gate a queued turn does.
  */
@@ -223,7 +224,8 @@ export async function proofForReviewAfterNoCall(
             (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
             (EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state <> 'done'
                       AND NOT (w.params ? 'empty_rerun'))
-             AND NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool <> 'gh_pr_follow')
+             AND NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool <> 'gh_pr_follow'
+                              AND a.at > (SELECT MIN(t.created_at) FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat'))
              AND NOT EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = s.session_id)) AS waiting
        FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
     [sessionId],

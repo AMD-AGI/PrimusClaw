@@ -1149,7 +1149,10 @@ export interface ReviewFacts {
    * very head in another session: a re-review of a pull request with no new commits, which has nothing new to post. Else null.
    */
   unchanged?: { headSha: string; at: number } | null;
-  /** How many review tool calls the session made, in any state (the server's own follow-ups, `gh_pr_follow`, aside); unset when not read. */
+  /**
+   * How many review tool calls the session's turns made, in any state: rows written after its first turn began, the server's own follow-ups
+   * (`gh_pr_follow`) aside. The pull request check made before the session's first turn (`checkPullRequests`) is not one. Unset when not read.
+   */
   reviewCalls?: number;
   /** How a turn that called no review tool was handled (`ReviewParams.empty_rerun`), or null. */
   emptyRerun?: EmptyRerun | null;
@@ -1421,8 +1424,12 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     [sessionId],
   )).rows[0] as { head_sha: string; risk_reasons: unknown } | undefined;
   const unchanged = (await q.query(UNCHANGED_HEAD_SQL, [sessionId, row.params.acting_as])).rows[0] as { head_sha: string; at: unknown } | undefined;
+  // Only what the review's turns called: a row from before its first turn began is the server's (the pull request check every start and
+  // restart audits in the new session, `checkPullRequests`), and so is the sweep's follow-up whenever it runs.
   const calls = (await q.query(
-    `SELECT COUNT(*)::int AS n FROM claw_github_audit WHERE session_id = $1 AND tool <> '${FOLLOW_TOOL}'`, [sessionId],
+    `SELECT COUNT(*)::int AS n FROM claw_github_audit a
+      WHERE a.session_id = $1 AND a.tool <> '${FOLLOW_TOOL}'
+        AND a.at > (SELECT MIN(t.created_at) FROM claw_tasks t WHERE t.session_id = $1 AND t.origin = 'chat')`, [sessionId],
   )).rows[0] as { n: number } | undefined;
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,

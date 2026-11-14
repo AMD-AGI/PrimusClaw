@@ -200,20 +200,24 @@ export function unchangedText(kind: "unchanged_wait" | "unchanged", f: Unchanged
 }
 
 /** What whoever asked for a review whose turns called no review tool is told (`not_run`), by language. */
-export function notRunText(f: { pr: string; url: string; seq: number; forRequester: boolean }, zh: boolean): string {
+export function notRunText(f: { pr: string; url: string; seq: number; forRequester: boolean; ranOnce?: boolean }, zh: boolean): string {
   const again = f.forRequester
     ? (zh ? "再请一次评审" : "ask for the review again")
     : (zh ? `回复 \`再审 #${f.seq}\`` : `reply \`review again #${f.seq}\``);
   return zh
     ? [
       `**${f.forRequester ? "你请人评审的 " : ""}${f.pr} 这次没审成：评审工具没有响应**`, "",
-      "- 评审跑了两次，都没能用上 GitHub 评审工具，什么也没读、没发，PR 上没有任何改动。",
+      f.ranOnce
+        ? "- 评审没能用上 GitHub 评审工具，什么也没读、没发，PR 上没有任何改动；也没能自动再跑一次。"
+        : "- 评审跑了两次，都没能用上 GitHub 评审工具，什么也没读、没发，PR 上没有任何改动。",
       `- 接下来：稍后${again}。`,
       `- PR：${f.url}`,
     ].join("\n")
     : [
       `**${f.pr}${f.forRequester ? ", which you asked to be reviewed," : ""} was not reviewed: the review tools did not respond**`, "",
-      "- The review ran twice and could not use the GitHub review tools either time: it read and posted nothing, and nothing changed on the pull request.",
+      f.ranOnce
+        ? "- The review could not use the GitHub review tools: it read and posted nothing, nothing changed on the pull request, and it could not be run again by itself."
+        : "- The review ran twice and could not use the GitHub review tools either time: it read and posted nothing, and nothing changed on the pull request.",
       `- Next: ${again} in a while.`,
       `- The pull request: ${f.url}`,
     ].join("\n");
@@ -264,7 +268,9 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
       // Told to whoever asked: the person who asked someone else for it, or the owner of their own review.
       const forRequester = requester !== null && requester !== item.user_id;
       const to = forRequester ? requester! : item.user_id;
-      const facts = { pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq), forRequester };
+      // (a re-run that could not be queued: the review ran once, not twice)
+      const ranOnce = (item.params.empty_rerun as { reason?: unknown } | undefined)?.reason === "not_queued";
+      const facts = { pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq), forRequester, ranOnce };
       const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [to])).rows[0]?.session_id as string | undefined;
       if (!sessionId) return skipped(forRequester ? "requester_has_no_assistant" : "owner_has_no_assistant");
       const told = await reviewResultPorts.recordSystemNotice({
