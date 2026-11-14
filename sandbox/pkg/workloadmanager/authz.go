@@ -241,6 +241,16 @@ func (s *Server) templateTarget(c *gin.Context, req *CreateTemplateRequest) (str
 	return s.cfg.Namespace, workspace, true
 }
 
+// admitSandboxNamespace answers 403 when a verified non-admin caller creates a
+// sandbox in the control-plane namespace.
+func (s *Server) admitSandboxNamespace(c *gin.Context, namespace string) bool {
+	if !s.verifiedNonAdmin(c) || s.cfg.Namespace == "" || namespace != s.cfg.Namespace {
+		return true
+	}
+	c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin can create a sandbox in the control-plane namespace " + strconv.Quote(namespace), "code": "control_plane_namespace"})
+	return false
+}
+
 // deniedTemplateField returns the first spec field a non-admin caller may not
 // set: volumes other than emptyDir, env vars from a source, sidecars, image
 // pull secrets, runtime class, pod labels and annotations, a non-default auth

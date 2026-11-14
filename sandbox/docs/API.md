@@ -107,6 +107,8 @@ Returns:
   "entryPoints": { "default": "http://...svc.cluster.local:8080" } }
 ```
 
+With caller authentication, only `system-admin` creates a sandbox in the control-plane namespace, which is also the namespace used when `namespace` is omitted; other callers get 403 `control_plane_namespace`.
+
 `sessionId` is returned only once — save it. CPU/memory/GPU come from the
 template; no runtime override.
 

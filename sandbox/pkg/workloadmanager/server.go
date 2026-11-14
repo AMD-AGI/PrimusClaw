@@ -451,7 +451,7 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 		req.Namespace = s.cfg.Namespace
 	}
 	// Before the SSE headers: once they are flushed a 403 can no longer be sent.
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitSandboxNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -586,7 +586,7 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace is required"})
 		return
 	}
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitSandboxNamespace(c, req.Namespace) {
 		return
 	}
 

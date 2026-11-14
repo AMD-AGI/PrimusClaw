@@ -259,6 +259,32 @@ func TestNonAdminTemplateFields(t *testing.T) {
 	}
 }
 
+// TestControlPlaneSandboxNeedsSystemAdmin checks that with caller auth only
+// system-admin creates a code interpreter in the control-plane namespace.
+func TestControlPlaneSandboxNeedsSystemAdmin(t *testing.T) {
+	rig := workspaceRig(t)
+	if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodPost, "/v1/templates", `{"name":"pub","namespace":"admitted","public":true,`+templateSpec+`}`); w.Code != http.StatusCreated {
+		t.Fatalf("admin public template = %d: %s", w.Code, w.Body.String())
+	}
+	denied := func(w *httptest.ResponseRecorder) bool {
+		return w.Code == http.StatusForbidden && strings.Contains(w.Body.String(), "control_plane_namespace")
+	}
+	for _, path := range []string{"/v1/code-interpreter", "/v1/code-interpreter/stream"} {
+		for _, body := range []string{`{"name":"pub","namespace":"admitted"}`, `{"name":"pub"}`} {
+			if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, path, body); !denied(w) {
+				t.Fatalf("non-admin POST %s %s = %d: %s", path, body, w.Code, w.Body.String())
+			}
+			if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodPost, path, body); denied(w) {
+				t.Fatalf("admin POST %s %s denied: %s", path, body, w.Body.String())
+			}
+		}
+	}
+	rig.s.cfg.EnableAuth = false
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/code-interpreter", `{"name":"pub","namespace":"admitted"}`); denied(w) {
+		t.Fatalf("POST without auth denied: %s", w.Body.String())
+	}
+}
+
 // TestPublicTemplateWritesNeedSystemAdmin checks that once a template is public
 // its owner can no longer update or delete it, and system-admin still can.
 func TestPublicTemplateWritesNeedSystemAdmin(t *testing.T) {
