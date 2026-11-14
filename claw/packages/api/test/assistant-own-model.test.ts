@@ -34,9 +34,9 @@ test("M2 the line names the router's own model as the answer, and says the item 
   assert.match(renderOwnModelState({ runsOn: "auto", lastServed: "model-b" }),
     /^Your model: you, the assistant, run on auto; your latest answer here was served by model-b\. /);
   assert.match(renderOwnModelState({ runsOn: null, lastServed: "model-b" }),
-    /^Your model: you, the assistant, run on the gateway's default model; your latest answer here was served by model-b\. .*name that one/);
+    /^Your model: you, the assistant, run on the deployment's built-in default model; your latest answer here was served by model-b\. .*name that one/);
   assert.match(renderOwnModelState({ runsOn: null, lastServed: null }),
-    /^Your model: you, the assistant, run on the gateway's default model, whose name Claw is not told\. .*name it as that/);
+    /^Your model: you, the assistant, run on the deployment's built-in default model, whose name is not known until an answer here has been served\. .*name it as that/);
 });
 
 test("M3 the model that served the latest answer: the session's newest events only, and a model name only", async () => {

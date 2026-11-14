@@ -7,9 +7,11 @@
  * nothing in its prompt named its own model, and the item defaults were the only model names it had.
  *
  * The router's model is the one its turn asks for (the session's model, or the fallback a refused turn is run again on), else the
- * deployment's default (`DEFAULT_MODEL`, the one Brain uses for a turn that names none). When the gateway picks the backend itself,
- * the name it answered the last turn with (`routed_model` of the session's latest answer) is the one that actually served it, and is
- * named beside it. The models work items and reviews run on are chosen per item (the user's defaults, the allow-list, the payer's
+ * deployment's default (`DEFAULT_MODEL`, the one Brain uses for a turn that names none). The model that served the session's latest
+ * answer (`routed_model`, which Brain records from the gateway's header or the response's own `model`) is named beside it when it
+ * differs: when the gateway picks the backend itself, and when `DEFAULT_MODEL` is not set here and Brain falls back to its own
+ * built-in default, which the API does not repeat (a second copy of Brain's default would drift from it). In that last case the very
+ * first turn of a session cannot name the model, and every later one names the one that answered. The models work items and reviews run on are chosen per item (the user's defaults, the allow-list, the payer's
  * key, a fallback), so none is named here: the router is told they are the workers', not its own, and says an item's model from what
  * starting it returned.
  */
@@ -69,8 +71,8 @@ export function renderOwnModelState(c: OwnModelContext): string {
   const own = c.runsOn
     ? `Your model: you, the assistant, run on ${c.runsOn}${served}.`
     : c.lastServed
-      ? `Your model: you, the assistant, run on the gateway's default model; your latest answer here was served by ${c.lastServed}.`
-      : "Your model: you, the assistant, run on the gateway's default model, whose name Claw is not told.";
+      ? `Your model: you, the assistant, run on the deployment's built-in default model; your latest answer here was served by ${c.lastServed}.`
+      : "Your model: you, the assistant, run on the deployment's built-in default model, whose name is not known until an answer here has been served.";
   return `${own} Asked which model you run on (你用的什么模型, which model are you), name ${c.runsOn || c.lastServed ? "that one" : "it as that"}, `
     + "as the answer: never say you cannot see your model. "
     + "Work items and reviews run on models chosen for each of them: those are the workers' models, not yours; name one only as "
