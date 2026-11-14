@@ -275,12 +275,13 @@ describe("the router writes itself, and a worker's words reach the user", { skip
       sources: ["https://kubernetes.io/releases/", "https://github.com/kubernetes/kubernetes/releases/tag/v1.37.2"],
     }, w.sayDeps, meta([k8s], 1));
     assert.equal(await code(lost), "citation_not_found");
-    try {
-      await w.mod.tools.say(turn as never, { text: "见 [2]", sources: ["https://x.example/"] }, w.sayDeps, meta([], 1));
-    } catch (err) {
-      assert.match((err as Error).message, /cites \[2\]/);
-      assert.match((err as Error).message, /web_search for it first/);
-    }
+    await assert.rejects(w.mod.tools.say(turn as never, { text: "见 [2]", sources: ["https://x.example/"] }, w.sayDeps, meta([], 1)), (err: Error) => {
+      assert.match(err.message, /cites \[2\]/);
+      // The next step is a search for the source, never an answer without it.
+      assert.match(err.message, /Next step: call web_search for the page/);
+      assert.match(err.message, /Do not answer without the sources instead/);
+      return true;
+    });
     assert.equal((await says()).length, 0, "nothing with a bare number reached the user");
     await w.mod.tools.say(turn as never, { text: "最新稳定版是 v1.37 [1]。", sources: ["https://kubernetes.io/releases/"] }, w.sayDeps, meta([k8s]));
     await w.mod.tools.say(turn as never, { text: "数组下标 a[1] 是第二个元素。" }, w.sayDeps, meta([]));

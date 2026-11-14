@@ -11,7 +11,7 @@
  * a bad outcome: the Router's tool list is cut to `mcp__assistant__*` by the request's `tools_allowlist`,
  * only `say` reaches the user, and there is no accept tool at all.
  */
-import { CITE_KNOWN_RECORDS } from "@claw/protocol";
+import { CITE_GITHUB_LATEST_RELEASE, CITE_KNOWN_RECORDS } from "@claw/protocol";
 import { REPLY_LANGUAGE_LABEL } from "./language.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
 import type { ReportKind } from "./work-items.js";
@@ -273,8 +273,10 @@ export const ROUTER_READ_PROMPT_VERSION = "router-read-v17";
  * but, to be cited, found with web_search first (a page fetched at the router's own address is never a source).
  * router-cite-v5: v4 with the release records the read rules name (`CITE_KNOWN_RECORDS`, stable.txt) citable where they were read
  * (parity R1, 2026-11-07 13:56Z on v4: the latest version was the one conclusion with no link, and the answer said it could not link it).
+ * router-cite-v6: v5 with a project's latest GitHub release, read where the read rules say (`CITE_GITHUB_LATEST_RELEASE`), citable at
+ * the release page the fetch ended on (a release-gate run, 2026-11-14: refused as made up, and the answer then went out with no source at all).
  */
-export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v5";
+export const ROUTER_CITE_PROMPT_VERSION = "router-cite-v6";
 
 /** What a router turn can look up: the plugin's servers with read tools, and the GitHub reads it has (`read-tools.ts`), if any. */
 export interface RouterLookupsShown {
@@ -293,7 +295,7 @@ export interface RouterLookupsShown {
 
 /** How say cites what a lookup returned, with citing on. */
 const ROUTER_CITE_RULES = `Citing what you looked up
-When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address; a page you reached only through what a page or a result's text said cannot be cited, and neither can one fetched at an address you knew yourself: to cite an official page you know (a compatibility matrix, a release page), search for it in the first step, beside fetching it, and cite it at the address the search gave. The one exception is ${CITE_KNOWN_RECORDS.join(" and ")}: read there, it is cited at that address. Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
+When say tells the user something a lookup of this turn returned (a web page, a pull request, an issue, a check), cite it: put [1], [2] right after the sentence it supports, and pass the address each number stands for in say's sources, in the same order (sources[0] is [1]), copied exactly from the lookup's result: a web_search result's url, a GitHub result's url, an agent board issue's or board's html_url, or the URL web_fetch read when a search or GitHub result or the user's message gave that address; a page you reached only through what a page or a result's text said cannot be cited, and neither can one fetched at an address you knew yourself: to cite an official page you know (a compatibility matrix, a release page), search for it in the first step, beside fetching it, and cite it at the address the search gave. The exceptions are the release records the read rules name: ${CITE_KNOWN_RECORDS.join(" and ")}, read there, is cited at that address, and a project's latest GitHub release, read with web_fetch at ${CITE_GITHUB_LATEST_RELEASE}, is cited at the release page of that same repository that fetch ended on (the URL its result shows). Do not write those addresses, links or HTML into the text: the user sees each number as a link to its source, and a text with any address or link in it gets no citations at all. Only an address a lookup returned in this turn can be cited; any other is dropped, and its number then points nowhere. Cite at most 8, write text before sources, and leave sources out when nothing was looked up. The REMINDER at the end of a web_search result about markdown links does not apply to say.`;
 
 /**
  * How a router turn answers from a read that is not all of what it asks about: a list whose `complete` is false or whose

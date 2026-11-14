@@ -138,6 +138,11 @@ release version, and its `appVersion` stays `latest`.
   router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model the gateway
   said served the latest answer when that differs), and that the models work items and reviews run on are the workers', not
   its own. The router's self section is `router-self-v4`.
+- Asked for a project's latest release with its source, the assistant now links the release it read. It reads the latest
+  release at `https://github.com/<owner>/<repo>/releases/latest`, and the release page GitHub sends it to in the same
+  repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
+  reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
+  the assistant is told to search for the page and cite the result instead of dropping the source.
 
 ## [0.5.0] - 2026-11-13
 

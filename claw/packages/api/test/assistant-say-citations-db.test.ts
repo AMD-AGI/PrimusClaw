@@ -84,6 +84,13 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       });
       assert.equal(lost.isError, true, "[2] lost its address: the user would see a number that links nowhere");
       assert.match(JSON.stringify(lost.content), /citation_not_found/);
+      // Told the exact next step (search, then say again with the result's url), and not to answer without the source instead.
+      const told = (lost.content as Array<{ text?: string }>).map((c) => c.text ?? "").join("");
+      const { CITATION_NEXT_STEP } = await import("../src/assistant/tools.js");
+      assert.ok(told.includes(CITATION_NEXT_STEP), told);
+      assert.match(told, /call web_search for the page each of those numbers stands for, then call say again with the same text/);
+      assert.match(told, /Do not answer without the sources instead/);
+      assert.match(told, /latest GitHub release at the release page of the same repository that its https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest fetch ended on/);
       const text = "#309 已合入 [1]，CI 全绿。";
       const res = await router.callTool({
         name: "say",

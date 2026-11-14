@@ -60,6 +60,8 @@
  *       write it since say took choices) or a choice put to the person; request words inside a sign-off or a "no need" clause do
  *       not count, so an answer ending in "如果有任何问题，请告诉我" does not ask (any question mark still does, as before); an item
  *       or a card is no clarification however it asks
+ *   S-cited cited: the final answer must carry a source (its say's `sources`); one that names its source only in words fails, a
+ *       baseline session is skipped, sources not read leave the check unverified, never passed; only a boolean
  *   S35 the signed-in token is sent only with the person's text message (its words, type and channel context, nothing else), a card's
  *       `deny` and the check of whose it is: an allow, an answer, a decision or a message with more in it, or any other route is refused; a turn's channel_context is sent beside its files, and a
  *       case may name only what a channel sends
@@ -1574,3 +1576,32 @@ test("S-clock a date or weekday case is graded against the date and weekday in i
   assert.ok(staticFindings([bad], { router: [], worker: [], baseline: [] }).problems.some((p) => p.kind === "bad-clock"));
 });
 
+
+test("S-cited cited: the final answer carries a source; one that names its source only in words fails", () => {
+  const m = "claw-1794627813857";
+  const TAG = "https://github.com/vllm-project/vllm/releases/tag/v0.33.0rc3";
+  const c: EvalCase = {
+    id: "c", pipeline: "catalog", area: "general", lang: "zh", route: "answer", cited: true,
+    turns: [{ user: "查一下 vLLM 在 GitHub 上最新发布的 release 版本号是多少，一句话回答并注明出处。" }],
+  };
+  const cited = say(2000, m, "vLLM 最新 release 是 v0.33.0rc3 [1]。", { sources: [{ n: 1, url: TAG, title: "v0.33.0rc3", kind: "web" }] });
+  // The release gate, 2026-11-14: the citation refused, the answer named its source in words and carried none.
+  const inWords = say(2000, m, "vLLM 最新 release 是 v0.33.0rc3，出处是 vLLM 的 GitHub releases 页面。");
+  const check = (o: Partial<Observed>) => grade(c, observed(o)).find((x) => x.name === "cited");
+  const of = (e: LiveEvent) => finalSay(saysOf([e]), [m], [])!;
+  assert.deepEqual(of(cited).sources, [TAG]);
+  assert.deepEqual(of(inWords).sources, []);
+  assert.deepEqual(saysOf([say(1, m, "x", { sources: [{ url: "" }, null, { title: "no url" }] })])[0].sources, [], "only entries with an address");
+  assert.equal(check({ finalSources: of(cited).sources })?.pass, true);
+  const missing = check({ finalSources: of(inWords).sources });
+  assert.equal(missing?.pass, false);
+  assert.equal(missing?.detail, "no source");
+  const unread = check({});
+  assert.equal(unread?.pass, false, "sources not read are never a pass");
+  assert.equal(unread?.unverified, true);
+  assert.equal(check({ mode: "baseline" })?.skipped, true);
+  assert.equal(grade({ ...c, cited: undefined }, observed({ finalSources: [] })).some((x) => x.name === "cited"), false);
+  assert.equal(parseCases(JSON.stringify({ ...c, cited: "yes" })).bad.length, 1, "only a boolean");
+  const shipped = loadCases(SEED_DIR).cases.find((x) => x.id === "cat-general-cite-001");
+  assert.equal(shipped?.cited, true, "the catalog case asks for a cited answer");
+});
