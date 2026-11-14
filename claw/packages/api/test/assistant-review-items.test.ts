@@ -58,6 +58,12 @@
  *   AW2 the wait ends when the pull request gets new commits: the review is run once more on them in its session (the same words, no
  *       wake for the reviewer); a second wait whose head moves again cannot be run a third time and goes to the reviewer
  *   AW3 a wait nobody ends within a day goes to the reviewer; a restart carries neither the wait's mark nor its end over
+ *   BU1 the whole way, with the review service: the sweep's own follow-ups of a review open for hours make more GitHub requests than the
+ *       session's budget, and the review's re-run in the same session still reads the pull request (2026-11-15, PrimusClaw#846)
+ *   BU2 a review whose session used up its GitHub requests before it posted anything did not review: the item ends, whoever asked is told
+ *       to ask again, the reviewer is not woken
+ *   BU3 an item left needing the reviewer by a budget refusal before the fix (its follow-up rows written without the budget mark) ends at
+ *       the next sweep, told to whoever asked, and its session's own budget is whole again
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1166,8 +1172,9 @@ describe("assistant review items", { skip }, () => {
           const f = { ...base, reviewOnly, unchanged: { headSha: "a".repeat(40), at: 1 }, turns: 1, writes: [wr(tool, "refused", code)] };
           assert.equal(ri.unchangedReview(f as never), false, `${tool} ${code}`);
           const st = ri.reviewState(f as never);
-          // (GitHub saying the pull request is merged ends the item, whichever write it answered: N32)
-          assert.equal(st.boardState, code === "already_merged" ? "done" : "needs_you", `${tool} refused ${code} (review only: ${reviewOnly})`);
+          // (GitHub saying the pull request is merged ends the item, whichever write it answered: N32; a session out of GitHub requests
+          // did not review, and is told to whoever asked: BU2)
+          assert.equal(st.boardState, code === "already_merged" || code === ri.BUDGET_REFUSAL ? "done" : "needs_you", `${tool} refused ${code} (review only: ${reviewOnly})`);
           assert.ok(!/no new commits/.test(st.summary), st.summary);
         }
       }
@@ -1233,6 +1240,10 @@ describe("assistant review items", { skip }, () => {
     assert.match(notRunText({ ...f, ranOnce: true }, false), /could not be run again by itself/);
     assert.doesNotMatch(notRunText({ ...f, ranOnce: true }, false), /twice/);
     assert.doesNotMatch(notRunText({ ...f, ranOnce: true }, true), /两次/);
+    // A session out of GitHub requests (BU2) says so, not that the tools did not respond.
+    assert.match(notRunText({ ...f, budget: true }, false), /used up its GitHub requests/);
+    assert.doesNotMatch(notRunText({ ...f, budget: true }, false), /did not respond/);
+    assert.match(notRunText({ ...f, budget: true }, true), /请求次数用完了/);
     // A review that called a tool, failed, or was stopped by the server is judged as before.
     assert.equal(ri.reviewState({ ...base, reviewCalls: 1 } as never).boardState, "needs_you");
     assert.equal(ri.reviewState({ ...base, turn: "failed" } as never).boardState, "needs_you");
@@ -2096,8 +2107,9 @@ describe("assistant review items", { skip }, () => {
     const { UNCHANGED_HEAD_SQL } = ri;
     // Every code, a submit or a merge, and a call still unfinished: no unchanged fact, no re-run proof, still the reviewer's.
     for (const [tool, result, detail] of [
-      // (already_merged ends the item, which is done after it: asked last, below)
-      ...writeRefusalCodes().filter((code) => code !== "already_merged").flatMap((code) => [["gh_review_submit", "refused", code], ["gh_pr_merge", "refused", code]]),
+      // (already_merged ends the item, which is done after it: asked last, below; so does a session out of GitHub requests, which did
+      // not review and is told to whoever asked: BU2)
+      ...writeRefusalCodes().filter((code) => code !== "already_merged" && code !== ri.BUDGET_REFUSAL).flatMap((code) => [["gh_review_submit", "refused", code], ["gh_pr_merge", "refused", code]]),
       ["gh_review_submit", "started", ""], ["gh_pr_merge", "started", ""],
     ] as Array<[string, string, string]>) {
       await w.q("UPDATE claw_github_audit SET tool = $2, result = $3, detail = $4 WHERE id = $1", [write, tool, result, detail]);
@@ -2418,5 +2430,135 @@ describe("assistant review items", { skip }, () => {
     await turnRan(sid2, "failed");
     await w.q("UPDATE claw_tasks SET prompt = $2 WHERE session_id = $1 AND origin = 'chat'", [sid2, row.content]);
     assert.equal(await proofForReviewAfterNoCall(query, sid2, row.content as string), null, "a failed turn");
+  });
+
+  /** The review service as production builds it, on this world's database, with a fake GitHub and a request budget of `budget`. */
+  async function reviewService(budget: number) {
+    const { GithubReview } = await import("../src/github-review/service.js");
+    const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+    const { FakeGithub } = await import("./support/fake-github.js");
+    const { credential, REQUESTER_TOKEN, SECRET } = await import("./support/review-env.js");
+    const pg = w.h.app.db.db;
+    const db = { query: async (text: string, params?: unknown[]) => { const r = await pg.query(text, params as never); return { rows: r.rows, rowCount: r.rowCount }; } };
+    const gh = new FakeGithub();
+    const service = new GithubReview({
+      settings: () => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true", CLAW_GITHUB_REQUESTS_PER_SESSION: String(budget) }, true),
+      db, fetchImpl: gh.fetch, sleep: async () => {}, recordPosted: true, sessionStopped: ri.reviewSessionStopped,
+      resolveCredential: async (req) => (req.userId === "bob" ? credential() : credential({ token: REQUESTER_TOKEN, providerLogin: "alice" })),
+    });
+    return { service, gh, db };
+  }
+  const DEMO = "AMD-AGI/demo#7";
+  /** alice asked bob to review and merge AMD-AGI/demo#7, and its first turn ended having called nothing: the item and bob's review actor. */
+  async function askedForDemo(): Promise<{ itemId: string; sid: string; words: string; actor: { sessionId: string; requesterUserId: string; actorUserId: string } }> {
+    const r = await start("alice", { prs: [PR(7, "AMD-AGI", "demo")], acting_as: "bob", acting_as_name: "Bob B", review_only: false });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const it = await w.item(r.body.data.items[0].item_id);
+    const sid = it.worker_session_id as string;
+    return { itemId: it.item_id as string, sid, words: await firstTurnWords(sid), actor: { sessionId: sid, requesterUserId: "alice", actorUserId: "bob" } };
+  }
+  const followRequests = async (sid: string) =>
+    (await w.q("SELECT COALESCE(SUM(github_requests), 0)::int AS n, COUNT(*)::int AS rows FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_follow'", [sid]))[0] as { n: number; rows: number };
+
+  test("BU1 the sweep's own follow-ups of a review open for hours never use up its session's GitHub requests: its re-run still reads the pull request (PrimusClaw#846)", async () => {
+    await w.user("alice");
+    await w.user("bob");
+    const { service } = await reviewService(40);
+    const { itemId, sid, words, actor } = await askedForDemo();
+    // The item waits (as #666 did for eight hours), and the sweep follows its pull request every interval, through the review service.
+    ri.reviewItemPorts.followPullRequest = (f) => service.followPullRequest(f);
+    const t0 = Date.now();
+    try {
+      for (let i = 1; (await followRequests(sid)).n <= 40; i += 1) {
+        assert.ok(i < 60, "the follow-ups make requests");
+        await ri.followReviewItems(t0 + i * (ri.REVIEW_FOLLOW_MS + 1));
+      }
+    } finally {
+      ri.reviewItemPorts.followPullRequest = null;
+    }
+    const follows = await followRequests(sid);
+    assert.ok(follows.n > 40 && follows.rows > 1, JSON.stringify(follows));
+    // The turn called no review tool, so it is run once more, in the same session (N31)...
+    await ri.sweepReviewItems();
+    assert.equal((await w.item(itemId)).params.empty_rerun?.reason, "rerun");
+    const queued = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [sid]);
+    assert.deepEqual(queued.map((q: { content: string }) => q.content), [words]);
+    // ...and the re-run's first read is not refused for the requests the server made.
+    const read = await service.getPr(actor, { pr: DEMO });
+    assert.equal(read.isError, false, read.text);
+    assert.equal(await count("claw_github_audit", `session_id = '${sid}' AND detail = 'request_budget_exhausted'`), 0);
+    await turnRan(sid);
+    await ri.sweepReviewItems();
+    const item = await w.item(itemId);
+    assert.notEqual(item.outcome, "stopped", "a review that read the pull request is judged as before");
+    assert.ok((await toldTo("alice")).every((t) => !/GitHub requests|请求次数/.test(t)), "nobody is told the budget ran out");
+  });
+
+  test("BU2 a review whose session used up its GitHub requests before it posted anything ends told to whoever asked, never to the reviewer", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const { service } = await reviewService(5);
+    const { itemId, sid, actor } = await askedForDemo();
+    // The session's own reads use the budget up: the first read is let through, the next is refused, as the review service refuses it.
+    assert.equal((await service.getPr(actor, { pr: DEMO })).isError, false);
+    const refused = await service.getPr(actor, { pr: DEMO });
+    assert.equal(refused.body.reason, "request_budget_exhausted", refused.text);
+    await turnRan(sid);
+    w.drains.length = 0;
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    const item = await w.item(itemId);
+    assert.deepEqual([item.board_state, item.outcome, item.summary],
+      ["done", "stopped", "the review of AMD-AGI/demo#7 could not run: its GitHub requests were used up"]);
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken");
+    const told = (await toldTo("alice")).filter((t) => /AMD-AGI\/demo#7/.test(t));
+    assert.equal(told.length, 1, (await toldTo("alice")).join("\n---\n"));
+    assert.match(told[0]!, /was not reviewed: the review session used up its GitHub requests|这个评审会话的 GitHub 请求次数用完了/);
+    assert.match(told[0]!, /ask for the review again|再请一次评审/);
+    assert.equal((await toldTo("bob")).filter((t) => /GitHub requests|请求次数/.test(t)).length, 0, "bob is told nothing of it");
+    // Told once: another sweep says nothing more.
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    assert.equal((await toldTo("alice")).filter((t) => /AMD-AGI\/demo#7/.test(t)).length, 1);
+  });
+
+  test("BU3 an item a budget refusal left needing the reviewer before the fix ends at the next sweep, told to whoever asked, its session's budget whole again", async () => {
+    await w.user("alice");
+    const bob = await w.user("bob");
+    const { service } = await reviewService(400);
+    const { itemId, sid, actor } = await askedForDemo();
+    // What the release before this one wrote: hundreds of follow-ups, far past the budget, none of them marked (the column did not exist),
+    // the re-run of a turn that called nothing (N31) and its first read refused for the budget; the item needing bob.
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, head_sha, tool, arguments, github_requests, result, detail, budgeted)
+       SELECT 'alice', 'alice', $1, 'AMD-AGI/demo', 7, $2, 'gh_pr_follow', '{"pr":"AMD-AGI/demo#7","as":"requester"}', 2, 'ok', 'waiting', NULL
+         FROM generate_series(1, 946)`,
+      [sid, "1".repeat(40)],
+    );
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, repo, pr, tool, arguments, result, detail, budgeted)
+       VALUES ('alice', 'bob', $1, 'AMD-AGI/demo', 7, 'gh_pr_get', '{"pr":"AMD-AGI/demo#7"}', 'refused', 'request_budget_exhausted', NULL)`,
+      [sid],
+    );
+    await w.q("UPDATE claw_work_items SET params = params || '{\"empty_rerun\": {\"reason\": \"rerun\", \"at\": \"2026-11-15T00:53:11Z\"}}'::jsonb WHERE item_id = $1", [itemId]);
+    await turnRan(sid);
+    await w.q(
+      "UPDATE claw_work_items SET board_state = 'needs_you', last_report_kind = 'blocked', summary = 'the review of AMD-AGI/demo#7 ended without posting anything' WHERE item_id = $1",
+      [itemId],
+    );
+    const { sessionRequestCount } = await import("../src/github-review/store.js");
+    const pg = w.h.app.db.db;
+    assert.equal(await sessionRequestCount({ query: (t: string, p?: unknown[]) => pg.query(t, p as never) }, sid), 0, "the follow-ups do not count");
+    // The release with the fix: the next sweep ends it, alice is told to ask again, bob is not woken again.
+    w.drains.length = 0;
+    await ri.sweepReviewItems();
+    await reviewResultsSettled();
+    const item = await w.item(itemId);
+    assert.deepEqual([item.board_state, item.outcome], ["done", "stopped"]);
+    assert.equal((await w.pending(bob.routerSid)).length, 0, "bob is not woken");
+    assert.equal((await toldTo("alice")).filter((t) => /AMD-AGI\/demo#7/.test(t) && /GitHub requests|请求次数/.test(t)).length, 1);
+    // And the session's own budget is whole: a read in it is let through.
+    const read = await service.getPr(actor, { pr: DEMO });
+    assert.equal(read.isError, false, read.text);
   });
 });

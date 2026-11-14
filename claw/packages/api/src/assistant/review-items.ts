@@ -1156,6 +1156,8 @@ export interface ReviewFacts {
   reviewCalls?: number;
   /** How a turn that called no review tool was handled (`ReviewParams.empty_rerun`), or null. */
   emptyRerun?: EmptyRerun | null;
+  /** Whether a review tool call of the session was refused because the session's GitHub request budget was used up. Unset when not read. */
+  budgetRefused?: boolean;
 }
 
 /** How long a merge waits for its author (`AuthorWait`) before it goes to the reviewer. */
@@ -1205,7 +1207,24 @@ const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_m
  * A re-review of a head already reviewed that posted nothing (`unchangedReview`) is told to whoever asked for it, the owner or the requester:
  * it waits for CI on that head before it is run again (`unchanged_wait`), or it ends with nothing new to post (`unchanged`).
  */
-export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run";
+export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run" | "budget_exhausted";
+
+/** The refusal of a review tool call made when the session's GitHub request budget is used up (`GithubReview.run`). */
+export const BUDGET_REFUSAL = "request_budget_exhausted";
+
+/**
+ * A review whose session ran out of GitHub requests before it posted anything (`BUDGET_REFUSAL`): its turn ended with nothing posted, no
+ * write made or tried except one refused for that same reason, and nothing held. It did not review, and the reviewer has nothing to look at
+ * in it: a request asked again starts a new session with a budget of its own. So whoever asked for it is told that it was not reviewed and to ask again (`budget_exhausted`), the way a review that
+ * called no review tool is (`not_run`), and the reviewer is not woken (2026-11-15: the server's own follow-ups used up a review's budget,
+ * its re-run was refused at its first read, and the reviewer was told it was stuck).
+ */
+export function budgetSpent(f: ReviewFacts): boolean {
+  const refused = f.budgetRefused === true || f.writes.some((w) => WRITE_TOOLS.has(w.tool) && w.result === "refused" && w.detail === BUDGET_REFUSAL);
+  // (a write tried and refused for anything else, or made, is judged as before: only a budget refusal is this)
+  return refused && f.turn === "finished" && !f.halted && f.confirmations.length === 0
+    && f.writes.every((w) => !WRITE_TOOLS.has(w.tool) || (w.result === "refused" && w.detail === BUDGET_REFUSAL));
+}
 
 /**
  * A review whose turn ended having called no review tool at all (`ReviewFacts.reviewCalls`): nothing read, posted or held. It did not
@@ -1308,6 +1327,9 @@ export function reviewState(f: ReviewFacts): ReviewState {
     return { boardState: "needs_you", reportKind: "failed", summary: `${pr} not run: ${f.halted.message}`, question: RQ.lookAtReview.en(pr) };
   }
   if (f.turn === "none") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
+  if (!submitted && budgetSpent(f)) {
+    return { boardState: "done", outcome: "stopped", summary: `the review of ${pr} could not run: its GitHub requests were used up`, result: "budget_exhausted" };
+  }
   const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status) && current(c)));
   if (closed && (!submitted || closed.at >= submitted.at)) {
     switch (closed.status) {
@@ -1431,6 +1453,9 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
       WHERE a.session_id = $1 AND a.tool <> '${FOLLOW_TOOL}'
         AND a.at > (SELECT MIN(t.created_at) FROM claw_tasks t WHERE t.session_id = $1 AND t.origin = 'chat')`, [sessionId],
   )).rows[0] as { n: number } | undefined;
+  const budget = (await q.query(
+    `SELECT EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND result = 'refused' AND detail = $2) AS refused`, [sessionId, BUDGET_REFUSAL],
+  )).rows[0] as { refused: boolean } | undefined;
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
@@ -1450,6 +1475,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     unchanged: unchanged ? { headSha: String(unchanged.head_sha).toLowerCase(), at: ms(unchanged.at) } : null,
     reviewCalls: Number(calls?.n ?? 0),
     emptyRerun: row.params.empty_rerun?.reason ?? null,
+    budgetRefused: budget?.refused === true,
   };
 }
 

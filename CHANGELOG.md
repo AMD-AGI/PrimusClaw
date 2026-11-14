@@ -151,6 +151,14 @@ release version, and its `appVersion` stays `latest`.
   "@bot back to the assistant". Another member's @-messages still go to the assistant, and their press on the card leaves it
   as it was. The group's card has no Switch button and never shows the binder's lists of sessions and machines; those stay in
   a 1:1 chat. 1:1 chats are unchanged.
+- GitHub review: the server's own calls no longer use up a review session's GitHub request budget
+  (`CLAW_GITHUB_REQUESTS_PER_SESSION`). The look at a review item's pull request every 90 seconds, the pull request check
+  made before the session's first turn and a person's answer to a held write are recorded as not held to the budget (a new
+  `budgeted` column on `claw_github_audit`; follow-ups and checks recorded before it are left out by name). A review item
+  open for hours had its budget spent by those follow-ups, so its re-run in the same session was refused at its first read.
+  A review whose session does run out of GitHub requests before it posts anything now ends as not reviewed: whoever asked
+  for it is told so and to ask again, which starts a new session, and the reviewer is no longer asked to look at it as
+  stuck. An item left waiting for the reviewer that way ends at the first sweep after the upgrade.
 
 ## [0.5.0] - 2026-11-13
 

@@ -1185,7 +1185,9 @@ export class GithubReview {
     const ref = opts.ref ?? parsePrRef(args.pr ?? (typeof args.repo === "string" && typeof args.number === "number" ? `${args.repo}#${args.number}` : undefined));
     let auditId: number;
     try {
-      auditId = await auditStart(this.deps.db, { requesterUserId: actor.requesterUserId, actorUserId: actor.actorUserId, sessionId: actor.sessionId, tool, args: summarise(args) });
+      auditId = await auditStart(this.deps.db, {
+        requesterUserId: actor.requesterUserId, actorUserId: actor.actorUserId, sessionId: actor.sessionId, tool, args: summarise(args), budgeted: !opts.skipBudget,
+      });
     } catch {
       // Nothing is done that cannot be written down.
       return failure("audit_unavailable", "the audit log cannot be written, so nothing was done", {}, plain);
