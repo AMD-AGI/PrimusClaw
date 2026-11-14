@@ -118,6 +118,19 @@ release version, and its `appVersion` stays `latest`.
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
+## [0.5.5] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141305` (commit 29a12de5), released as `docker.io/rocm/primusclaw:claw-0.5.5`. A patch
+release: asked which model it runs on, the assistant names its own model. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Asked which model it runs on (你用的什么模型), the assistant names its own model instead of saying it cannot see it: every
+  router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model reported for
+  the latest answer when that differs), and that the models work items and reviews run on are chosen for each of them and are
+  the workers', not its own. The router's self section is `router-self-v4` (#853).
+
 ## [0.5.4] - 2026-11-14
 
 Image `docker.io/primussafe/claw:202611141122` (commit dd8d4685), released as `docker.io/rocm/primusclaw:claw-0.5.4`. A patch

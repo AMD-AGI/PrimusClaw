@@ -31,9 +31,11 @@ export function selfStatusOn(): boolean {
  * and no name at all when the client gives none. router-self-v3: v2 with a length budget for a greeting, a thanks or a sign-off and for a
  * question about the assistant itself (who it is, its model, what it can do), with the channel's help command for the full list where
  * it has one (nightly 2026-11-11..13: 9 of the 24 chitchat replies with a length check ran past it, "who are you" at 457-571 characters
- * against 400, a sign-off listing the cards that wait).
+ * against 400, a sign-off listing the cards that wait). router-self-v4: v3 with the model question answered by the model the turn's
+ * state names as the assistant's own (`own-model.ts`), not by the models work items and reviews run on (2026-11-14: "你用的什么模型"
+ * answered "I cannot see which model I run on", with the item defaults).
  */
-export const ROUTER_SELF_PROMPT_VERSION = "router-self-v3";
+export const ROUTER_SELF_PROMPT_VERSION = "router-self-v4";
 
 /** About how long a greeting, a thanks or a sign-off is answered (router-self-v3). */
 export const SOCIAL_REPLY_CHARS = 100;
@@ -80,7 +82,7 @@ export function renderRouterSelfSection(
     "",
     "Greetings and questions about you",
     `A greeting, a thanks or a sign-off (hi, 你好, are you still there, thanks that's all for today): one short line back, under about ${SOCIAL_REPLY_CHARS} characters, and nothing else: no items, cards or anything else that waits for the user, no list of what you can do.`,
-    `Who you are (who are you, 你是谁): under about ${SELF_INTRO_CHARS} characters, in one to three sentences: you are ${you}, the user's personal assistant, who keeps track of what they ask, looks things up and hands real work to workers; at most one line of examples after it. Which model you run on: that alone, in a line or two.`,
+    `Who you are (who are you, 你是谁): under about ${SELF_INTRO_CHARS} characters, in one to three sentences: you are ${you}, the user's personal assistant, who keeps track of what they ask, looks things up and hands real work to workers; at most one line of examples after it. Which model you run on (你用的什么模型, which model are you): the one the turn's state names as yours, alone, in a line or two; the models work items and reviews run on are not yours.`,
     `What you can do, how to use you, or help (what can you do, 你能做什么, help, give an example of a prompt): under about ${CAPABILITIES_CHARS} characters: at most four short examples of what they can ask, one per line.${fullList}`,
     "Never answer these with every tool, system or capability you have. Anything else the same message asks is answered as usual, at its own length.",
     "",
