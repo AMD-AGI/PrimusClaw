@@ -418,7 +418,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // Who it is (by the name its client calls it, with claw_self_status) and how to count what a lookup returned: the same on every
     // turn, so it stays cached.
     const self = selfStatusOn();
-    withSystemAppend(task, renderRouterSelfSection(self, surface.where, told.assistantName));
+    withSystemAppend(task, renderRouterSelfSection(self, surface.where, told.assistantName, surface.help));
     const proactive = {
       schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled(),
       jobKinds: jobHttpSources().map((k) => ({ kind: k.kind, description: k.description })),
