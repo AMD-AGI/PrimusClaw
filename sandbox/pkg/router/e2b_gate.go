@@ -18,6 +18,7 @@ import (
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -87,16 +88,17 @@ func (s *Server) e2bAccessGate(c *gin.Context) {
 	c.Abort()
 }
 
-// proxyE2B forwards an E2B control-plane call after requiring X-API-KEY.
-// The Workload Manager resolves the key. An upstream-only Router refuses it:
-// the E2B control plane is served by the managing Router.
+// proxyE2B forwards an E2B control-plane call after requiring an API key.
+// The key is X-API-KEY or an Authorization bearer token. The Workload Manager
+// resolves it. An upstream-only Router refuses the call: the E2B control plane
+// is served by the managing Router.
 func (s *Server) proxyE2B(c *gin.Context) {
 	if s.dp.upstreamOnly {
 		s.rejectDirectCaller(c)
 		return
 	}
-	if c.GetHeader("X-API-KEY") == "" {
-		writeGate(c, http.StatusUnauthorized, "invalid_key", "X-API-KEY is required")
+	if identity.E2BKey(c.Request.Header) == "" {
+		writeGate(c, http.StatusUnauthorized, "invalid_key", identity.MissingCredential.Message)
 		return
 	}
 	s.proxyToWM(c)
@@ -135,6 +137,7 @@ func (s *Server) proxyEnvD(c *gin.Context, info *store.SandboxInfo, ref runtimev
 			if sandboxID != "" {
 				req.Header.Set("x-session-id", sandboxID)
 			}
+			req.Header.Del(identity.APIKeyHeader)
 			// Sealed policy travels in the signed token. Drop any client headers.
 			req.Header.Del(e2b.HeaderSealed)
 			req.Header.Del(e2b.HeaderInputs)

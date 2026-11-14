@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -136,6 +137,7 @@ func (s *Server) handlePortProxy(c *gin.Context, info *store.SandboxInfo, port i
 			req.Header.Del("x-session-id")
 			req.Header.Del("Authorization")
 			req.Header.Del("X-Sandbox-Api-Key")
+			req.Header.Del(identity.APIKeyHeader)
 		},
 		Transport:     portProxyTransport,
 		FlushInterval: -1,

@@ -638,15 +638,18 @@ func (s *Server) resolveInvokeSandbox(c *gin.Context, sessionID, namespace, name
 	//   2. WM recovery endpoint → Sandbox CR (fallback)
 	//   3. Error with actionable message
 	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
-	// A forwarded invocation's Authorization is the hop token, which is not a
-	// caller credential the Workload Manager can verify, so it is not passed on.
+	// A forwarded invocation carries a hop token and may still carry the
+	// caller's API key. Neither is a caller credential for the Workload Manager.
 	authorization := c.GetHeader("Authorization")
+	apiKey := c.GetHeader(identity.APIKeyHeader)
 	if forwarded {
 		authorization = ""
+		apiKey = ""
 	}
 	requestContext := withCallerCredentials(
 		c.Request.Context(),
 		authorization,
+		apiKey,
 		c.GetHeader("Cookie"),
 	)
 	info, err := local, error(nil)

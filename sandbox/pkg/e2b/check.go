@@ -113,6 +113,8 @@ type resolvedTemplate struct {
 	Pending      time.Duration
 	// Workspace is the SaFE workspace the template names, empty when it names none.
 	Workspace string
+	// User marks a user template from the template API rather than the grant list.
+	User bool
 }
 
 // resolveTemplate matches an expanded name, or a short name with one expansion.
@@ -157,7 +159,7 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 	if len(matches) > 1 {
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested+" matches more than one gpu size")
 	}
-	return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested)
+	return resolvedTemplate{}, grant.TemplateNotFound(requested)
 }
 
 // pendingWait is the time a create waits for the sandbox to run: the caller's

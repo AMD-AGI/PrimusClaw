@@ -26,10 +26,12 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 type fakeRunner struct {
@@ -126,6 +128,13 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 
 func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	svc, runner, keys, _ := testPlaneWithClient(t, maxSec, perGPU, maxSandboxes, spec, workspaces)
+	return svc, runner, keys
+}
+
+// testPlaneWithClient builds a grant-key plane and also returns its fake cluster client.
+func testPlaneWithClient(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string, client.Client) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -167,7 +176,7 @@ func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandbo
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{}
-	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys
+	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys, cl
 }
 
 func bytes32() []byte {
@@ -809,6 +818,69 @@ func TestQuotaMessageBody(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("missing key=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreateAcceptsBearerAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keys["measurement"])
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("bearer create=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreatePrefersAPIKeyOverBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer not-a-platform-key")
+	req.Header.Set("X-API-KEY", keys["measurement"])
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("api key with bearer=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreateAcceptsIdentityKeyAsBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1", Email: "alice@example.com"}}}
+	plane, _, _ := ownerPlane(t, ids, samplePolicy())
+	r := gin.New()
+	NewHandler(plane).Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"runner","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer ak-alice")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated || ids.calls != 1 {
+		t.Fatalf("identity bearer=%d calls=%d %s", w.Code, ids.calls, w.Body.String())
+	}
+}
+
+func TestMissingSandboxCredentialNamesBothHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, _ := testPlane(t, 600, []int32{1}, 1)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "X-API-KEY") || !strings.Contains(w.Body.String(), "Authorization") {
+		t.Fatalf("missing=%d %s", w.Code, w.Body.String())
 	}
 }
 

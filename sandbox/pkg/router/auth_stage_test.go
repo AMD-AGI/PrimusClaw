@@ -31,6 +31,21 @@ func proxyToUpstream(t *testing.T, upstreamURL string) *gin.Engine {
 	return engine
 }
 
+func TestProxyRequestDropsAPIKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("X-API-KEY"))
+		assert.NotEmpty(t, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	req.Header.Set("X-API-KEY", "ak-caller")
+	rec := httptest.NewRecorder()
+	proxyToUpstream(t, upstream.URL).ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
 // The incident this labelling exists for: EnvD rejects the Router's own JWT,
 // the status is passed through untouched, and the operator reads a 401 as "the
 // user's credential expired" -- when the caller's credential never reached the

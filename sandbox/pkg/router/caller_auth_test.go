@@ -95,6 +95,62 @@ func TestCallerAuth_NotBearer(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "authentication required")
 }
 
+func TestCallerAuth_APIKeyHeader(t *testing.T) {
+	var calls atomic.Int32
+	s, _ := newTestRouterWithAuth(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		require.NoError(t, r.ParseForm())
+		assert.Equal(t, "ak-header-key", r.PostForm.Get("token"))
+		introspectAnswer("uid-key", "key-user@example.com", "default")(w, r)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("X-API-KEY", "ak-header-key")
+	s.engine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]string
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "uid-key", resp["userId"])
+	assert.Equal(t, "key-user@example.com", resp["userName"])
+	assert.EqualValues(t, 1, calls.Load())
+}
+
+func TestCallerAuth_BearerWinsOverAPIKeyHeader(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		assert.Equal(t, "ak-bearer", r.PostForm.Get("token"))
+		introspectAnswer("uid-bearer", "", "default")(w, r)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer ak-bearer")
+	req.Header.Set("X-API-KEY", "ak-header")
+	s.engine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"userId":"uid-bearer"`)
+}
+
+func TestCallerAuth_GrantKeyStaysInCluster(t *testing.T) {
+	s, _ := newTestRouterWithAuth(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("a grant key must not reach the identity provider")
+	})
+	for _, header := range []string{"X-API-KEY", "Authorization"} {
+		value := "e2b_secret"
+		if header == "Authorization" {
+			value = "Bearer " + value
+		}
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+		req.Header.Set(header, value)
+		s.engine.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code, header)
+	}
+}
+
 func TestCallerAuth_ValidKey(t *testing.T) {
 	var calls atomic.Int32
 	s, _ := newTestRouterWithAuth(t, func(w http.ResponseWriter, r *http.Request) {

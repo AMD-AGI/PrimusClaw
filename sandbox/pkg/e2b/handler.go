@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 // Handler serves the E2B sandbox routes.
@@ -176,9 +177,9 @@ func (h *Handler) ready(c *gin.Context) (string, bool) {
 }
 
 func apiKey(c *gin.Context) (string, bool) {
-	key := c.GetHeader("X-API-KEY")
+	key := identity.E2BKey(c.Request.Header)
 	if key == "" {
-		writeErr(c, grant.Op(http.StatusUnauthorized, "invalid_key", "X-API-KEY is required"))
+		writeErr(c, grant.Op(http.StatusUnauthorized, "invalid_key", identity.MissingCredential.Message))
 		return "", false
 	}
 	return key, true
