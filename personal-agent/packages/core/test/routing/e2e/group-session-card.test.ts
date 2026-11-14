@@ -80,6 +80,26 @@ test("test_send_on_a_groups_session_card_reaches_the_session", () =>
     assert.deepEqual(w.r.turns.calls, []);
   }, CARD));
 
+test("test_a_tap_on_a_groups_session_card_carries_the_key_the_binders_mentions_carry", () =>
+  routed(async (w) => {
+    const sid = await boundGroup(w);
+    // (what the follower reads with is another credential: the tap must act as the account the group was bound with)
+    w.rw.credential = () => Promise.resolve("ak-bob");
+    await press(w, { op: "send", session_id: sid, [INPUT_ID]: "fix the README" }, cardOf(w));
+    assert.deepEqual(prompts(w), ["fix the README"]);
+    const sent = w.rw.server.calls.filter(([method, path]) => method === "POST" && path.includes(sid));
+    assert.ok(sent.length > 0 && sent.every((c) => c[2] === CLAW_ALICE), JSON.stringify(sent));
+  }, CARD));
+
+test("test_a_tap_on_a_groups_session_card_after_unlinking_sends_nothing", () =>
+  routed(async (w) => {
+    const sid = await boundGroup(w);
+    w.r.store.links.unlink("aad-a");
+    await press(w, { op: "send", session_id: sid, [INPUT_ID]: "again" }, cardOf(w));
+    assert.deepEqual(prompts(w), []);
+    assert.ok(!w.rw.said().includes("That button is not active any more."), w.rw.said().join("\n"));
+  }, CARD));
+
 test("test_another_member_pressing_a_groups_session_card_changes_nothing", () =>
   routed(async (w) => {
     const sid = await boundGroup(w);

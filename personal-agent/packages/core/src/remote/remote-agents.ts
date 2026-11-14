@@ -18,6 +18,7 @@ import type { Conversation, InboundMessage, UserRef } from "../ports/surface.js"
 import { neutral } from "./inert.js";
 import { remoteText } from "../locales/remote.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
+import { routingText } from "../locales/routing.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import type { Attachment, RemoteAgentCommand, RemoteChat, RemotePrompt } from "../routing/features.js";
 import { StatusBoard } from "./board.js";
@@ -333,9 +334,31 @@ export class RemoteAgents implements RemoteChat {
     const chatKey = groupChatKey(route.sender.id, route.scope);
     const data = route.action.data;
     const op = typeof data["op"] === "string" ? data["op"] : "";
+    if (await this.groupRefused(route, chatKey, op)) return true;
+    // (the binder's key as their @-messages in this group read it: the account the binding was made with)
+    const credential = route.groupCredential === undefined ? undefined : await route.groupCredential();
+    if (!credential) {
+      await route.settle(routingText.in(this.state.lang(chatKey)).notConnected);
+      return true;
+    }
+    await this.tap({
+      chatKey,
+      key: credential,
+      provider: undefined,
+      to: route.conversation,
+      tapped: route.action.cardMessageId,
+      data,
+      id: route.action.id,
+      settle: (card, options) => route.settle(card, options),
+    });
+    return true;
+  }
+
+  /** A group tap that is not the binder's own, or not one a group's card may make: answered here (true), before any key is read. */
+  private async groupRefused(route: ClickRoute, chatKey: string, op: string): Promise<boolean> {
+    const data = route.action.data;
     const tapped = route.action.cardMessageId;
-    const lang = this.state.lang(chatKey);
-    const words = remoteAgentText.in(lang);
+    const words = remoteAgentText.in(this.state.lang(chatKey));
     const state = this.state.attached(chatKey);
     const own =
       op === "attach"
@@ -349,28 +372,10 @@ export class RemoteAgents implements RemoteChat {
       } else await route.settle(state === null ? words.notAttachedCard : words.otherSessionCard);
       return true;
     }
-    if (!GROUP_OPS.has(op)) {
-      const line = words.groupCardOnly({ bot: this.ctx.settings.botName });
-      if (state === null) await route.settle(line);
-      else
-        await route.settle(this.board.statusOf(chatKey, state, this.state.phase(chatKey)).message, { fallback: line });
-      return true;
-    }
-    const credential = await this.ctx.credentialFor(route.sender.id); // (the binder's, as the binding's follower reads with)
-    if (!credential) {
-      await route.settle(saidIn(lang, "tapInactive"));
-      return true;
-    }
-    await this.tap({
-      chatKey,
-      key: credential,
-      provider: undefined,
-      to: route.conversation,
-      tapped,
-      data,
-      id: route.action.id,
-      settle: (card, options) => route.settle(card, options),
-    });
+    if (GROUP_OPS.has(op)) return false;
+    const line = words.groupCardOnly({ bot: this.ctx.settings.botName });
+    if (state === null) await route.settle(line);
+    else await route.settle(this.board.statusOf(chatKey, state, this.state.phase(chatKey)).message, { fallback: line });
     return true;
   }
 
