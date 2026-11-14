@@ -428,8 +428,6 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (proactiveSection) withSystemAppend(task, proactiveSection);
     if (proactive.schedules) state.push(await renderScheduleState(role.userId, commands));
     const choice = modelChoiceOn();
-    let ownItems: string | null = null;
-    let ownReviews: string | null = null;
     if (choice) {
       // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take. In the
       // system prompt: it changes only when the user changes a default, not from turn to turn.
@@ -441,15 +439,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       // A turn the gateway refused for want of a key binding, run again on the fallback (`model-fallback.ts`): this turn only.
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
-      ownItems = prefs.default_model;
-      ownReviews = prefs.review_model ?? prefs.default_model;
     }
-    // Which model the router itself runs on, and which ones its items and reviews do (`own-model.ts`): asked "你用的什么模型", it named
-    // only the item defaults. After the re-run above, which changes this turn's model.
+    // Which model the router itself runs on (`own-model.ts`): asked "你用的什么模型", it named only the item defaults. After the re-run
+    // above, which changes this turn's model.
     state.push(renderOwnModelState({
       runsOn: routerTurnModel(task.model, ASSISTANT_DEPLOYMENT_MODEL),
       lastServed: await lastServedModel((t, p) => db.query(t, p), sessionId),
-      items: ownItems ?? platformModel("task"), reviews: ownReviews ?? platformModel("review"),
     }));
     // Little thinking, and the say streamed while it is written (`router-speed.ts`); for the users who have it, the turn's own text
     // too, when it answers them (a worker's report is not theirs: what the turn writes then is not for them).

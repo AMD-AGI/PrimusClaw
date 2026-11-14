@@ -530,7 +530,7 @@ describe("assistant role profile", { skip }, () => {
     }
   });
 
-  test("A13 the turn's state names the model the router runs on, and the item and review models as the workers'", async () => {
+  test("A13 the turn's state names the model the router runs on, and says the item and review models are the workers'", async () => {
     const stateOf = async (messageId: string) => {
       const prompt = JSON.parse((await send(alice.routerSid, "alice", { doorbell: false, content: "你用的什么模型？", messageId })).published[0]).prompt as string;
       return prompt.split(`\n\n${TURN_STATE_HEADER}\n\n`)[1] ?? "";
@@ -538,7 +538,7 @@ describe("assistant role profile", { skip }, () => {
     // No model named anywhere in this world: the gateway's default, which nobody has said yet.
     const before = await stateOf("claw-own-model-1");
     assert.match(before, /Your model: you, the assistant, run on the gateway's default model, whose name Claw is not told\./);
-    assert.match(before, /Work items run on the deployment default and reviews on the deployment default: those are the workers' models, not yours/);
+    assert.match(before, /Work items and reviews run on models chosen for each of them: those are the workers' models, not yours/);
     // The gateway said which model served the latest answer: that one is named, and a later answer that says none does not hide it.
     await w.q("INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ('own-model-1', $1, 'AssistantMessage', $2)",
       [alice.routerSid, JSON.stringify({ type: "AssistantMessage", routed_model: "model-a-1.0", data: { content: [] } })]);
