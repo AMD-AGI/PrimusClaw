@@ -120,29 +120,83 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
-- The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
-  turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
-  `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
-  else the default its quiet hours use), and Asia/Shanghai otherwise. Asked after midnight in Beijing, it said the UTC
-  weekday, with the right one only in a note.
-- Personal skills: a statement of how the user always works ("以后我的会议纪要都是这个格式") that the router took for a request to
-  save (`skill_save`, refused as not asked, nothing saved) no longer stops the server's draft after the turn; a save refused for what
-  the skill holds still does. A skill draft's card waiting for the user is listed to the router as answered on its card, without
-  the typed approval command, so the router no longer tells the user to type `批准 #ref` for it; the router's skills prompt
-  (`router-skills-v5`) says such a statement is never a request to save.
-- The assistant answers a greeting, a thanks or a sign-off in one short line, without listing what waits for the user, and a
-  question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
-  examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
-  self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command.
-- Asked which model it runs on (你用的什么模型), the assistant names its own model instead of saying it cannot see it: every
-  router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model the gateway
-  said served the latest answer when that differs), and that the models work items and reviews run on are the workers', not
-  its own. The router's self section is `router-self-v4`.
 - Asked for a project's latest release with its source, the assistant now links the release it read. It reads the latest
   release at `https://github.com/<owner>/<repo>/releases/latest`, and the release page GitHub sends it to in the same
   repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
   reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
-  the assistant is told to search for the page and cite the result instead of dropping the source.
+  the assistant is told to search for the page and cite the result instead of dropping the source (#854).
+
+## [0.5.5] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141305` (commit 29a12de5). It was not published as `docker.io/rocm/primusclaw:claw-0.5.5`:
+its change ships with the next release. A patch release: asked which model it runs on, the assistant names its own model. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Asked which model it runs on (你用的什么模型), the assistant names its own model instead of saying it cannot see it: every
+  router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model reported for
+  the latest answer when that differs), and that the models work items and reviews run on are chosen for each of them and are
+  the workers', not its own. The router's self section is `router-self-v4` (#853).
+
+## [0.5.4] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141122` (commit dd8d4685), released as `docker.io/rocm/primusclaw:claw-0.5.4`. A patch
+release: the assistant answers greetings and questions about itself briefly. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers a greeting, a thanks or a sign-off in one short line, without listing what waits for the user, and a
+  question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
+  examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
+  self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command (#852).
+
+## [0.5.3] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140835` (commit 04efef14), released as `docker.io/rocm/primusclaw:claw-0.5.3`. A patch
+release: a review asked of someone else no longer wakes the reviewer when it never reached its tools or found its pull
+request already merged. No schema change. One new optional setting, `MCP_REQUIRED_CONNECT_BUDGET_MS` (Brain, default
+30000), which needs no change to take effect. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Reviews asked of someone else: a review turn now waits for its `github_review` tools for up to
+  `MCP_REQUIRED_CONNECT_BUDGET_MS` (default 30 s, never shorter than `MCP_CONNECT_BUDGET_MS`; 0 waits however long it takes)
+  instead of the 2 s every other MCP server gets, so a cold connection no longer ends the review having done nothing. A review
+  whose turn still called no review tool is run once more by itself; if that also does nothing, the item closes and whoever
+  asked for the review is told to ask again. The reviewer is not asked to look at it (#850).
+- A review that ran again on new commits and found the pull request already merged (its approval or merge refused
+  `already_merged`) ends as accepted, and writes made on a head the review has since moved past no longer decide its state.
+  Before, a merged pull request could still be handed to the reviewer (#850).
+
+## [0.5.2] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140544` (commit 26e87d49), released as `docker.io/rocm/primusclaw:claw-0.5.2`. A patch
+release: the assistant answers the date and weekday in the user's time zone. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
+  turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
+  `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
+  else the default its quiet hours use), and Asia/Shanghai otherwise. Asked after midnight in Beijing, it said the UTC
+  weekday, with the right one only in a note (#847).
+
+## [0.5.1] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611132353` (commit 7b9b4318), released as `docker.io/rocm/primusclaw:claw-0.5.1`. A patch
+release: a stated recurring format still gets its skill draft card, and the card asks for no typed approval. No schema
+change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Personal skills: a statement of how the user always works ("以后我的会议纪要都是这个格式") that the router took for a request to
+  save (`skill_save`, refused as not asked, nothing saved) no longer stops the server's draft after the turn; a save refused for what
+  the skill holds still does. A skill draft's card waiting for the user is listed to the router as answered on its card, without
+  the typed approval command, so the router no longer tells the user to type `批准 #ref` for it; the router's skills prompt
+  (`router-skills-v5`) says such a statement is never a request to save (#844).
 
 ## [0.5.0] - 2026-11-13
 
