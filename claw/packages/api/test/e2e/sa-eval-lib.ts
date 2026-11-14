@@ -16,8 +16,9 @@
  *   turns            [{user, after_ms, files?}]                         one or more user messages; after_ms from the first; files
  *                    [{fixture, name?, media_type?}] are sent with the message as a channel sends them (uploaded to the assistant's
  *                    session, named in channel_context.files); fixture is a path relative to the cases directory.
- *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?}) is sent
- *                    with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through `files`)
+ *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?,
+ *                    assistant_name?}) is sent with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through
+ *                    `files`; assistant_name, when the case names none, is the run's EVAL_ASSISTANT_NAME)
  *   route            answer | item | review | confirm | clarify         expected handling of the last turn; clarify: answered in the
  *                    chat with a final reply that asks the person (`asksUser`: a question mark, a request for what is missing, or a
  *                    choice put to them)
@@ -99,11 +100,15 @@ export interface TurnFile { fixture: string; name?: string; media_type?: string 
 export interface Turn { user: string; after_ms?: number; files?: TurnFile[]; channel_context?: Record<string, unknown> }
 
 /** What a case may put in a turn's `channel_context`: what a channel sends beside a message (`parseChannelContext`), files aside. */
-export const TURN_CONTEXT_KEYS: readonly string[] = ["channel", "via", "channel_message_id", "people", "actions", "repos", "handoffs", "attached"];
+export const TURN_CONTEXT_KEYS: readonly string[] = ["channel", "via", "channel_message_id", "people", "actions", "repos", "handoffs", "attached", "assistant_name"];
 
-/** The body of a turn's message: its words, and the channel's context with the files uploaded for it. */
-export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files: readonly unknown[]): Record<string, unknown> {
-  const context = { ...(t.channel_context ?? {}), ...(files.length ? { files } : {}) };
+/**
+ * The body of a turn's message: its words, and the channel's context with the files uploaded for it. `assistantName` is the name the run's
+ * chat client calls the assistant by (EVAL_ASSISTANT_NAME), sent as a client sends it with every message (`channel_context.assistant_name`)
+ * unless the case names one itself; without it the message names none, as the API alone does.
+ */
+export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files: readonly unknown[], assistantName?: string): Record<string, unknown> {
+  const context = { ...(assistantName ? { assistant_name: assistantName } : {}), ...(t.channel_context ?? {}), ...(files.length ? { files } : {}) };
   return { content: t.user, messageType: "text", ...(Object.keys(context).length ? { channel_context: context } : {}) };
 }
 
