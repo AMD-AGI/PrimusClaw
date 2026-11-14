@@ -5,6 +5,7 @@ package workloadmanager
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -85,82 +86,120 @@ func (m workspaceMembership) ReadUser(_ context.Context, userID string) (grant.O
 	return grant.OwnerUser{Found: ok, Workspaces: ws}, nil
 }
 
-// TestTemplateNamespaceDefaultsToOnlyWorkspace checks that with caller auth a
-// non-admin create without a namespace uses the caller's only workspace.
-func TestTemplateNamespaceDefaultsToOnlyWorkspace(t *testing.T) {
+// workspaceRig serves templates with caller auth from control-plane namespace
+// "admitted"; user-1 belongs to lab, multi to lab and prod, none to nothing.
+func workspaceRig(t *testing.T) *wmRig {
+	t.Helper()
 	rig := newWMRig(t, wmAdmitter(t, true), true)
 	rig.s.cfg.EnableAuth = true
+	rig.s.cfg.Namespace = "admitted"
 	rig.s.WithTemplateMembership(workspaceMembership{
-		"single": {"admitted"},
-		"multi":  {"admitted", "denied"},
+		"user-1": {"lab"},
+		"multi":  {"lab", "prod"},
 		"none":   {},
 	})
-	create := func(user string) *httptest.ResponseRecorder {
-		body := `{"name":"t-` + user + `",` + templateSpec + `}`
-		return rig.serveAs(user, RoleDefault, http.MethodPost, "/v1/templates", body)
+	return rig
+}
+
+// templateWorkspace returns the workspace label of a template in "admitted", or "" when absent.
+func (r *wmRig) templateWorkspace(t *testing.T, name string) string {
+	t.Helper()
+	var ci runtimev1alpha1.CodeInterpreter
+	if err := r.k8s.Get(context.Background(), ctrlclient.ObjectKey{Namespace: "admitted", Name: name}, &ci); err != nil {
+		t.Fatalf("template %s: %v", name, err)
 	}
-	if w := create("single"); w.Code != http.StatusCreated || !rig.templateExists(t, "admitted", "t-single") {
-		t.Fatalf("create with one workspace = %d, want 201 in that workspace: %s", w.Code, w.Body.String())
+	return ci.Labels[grant.TemplateWorkspaceLabel]
+}
+
+// TestWorkspaceTemplateCreate checks that with caller auth a non-admin template
+// is stored in the control-plane namespace for one of the caller's workspaces.
+func TestWorkspaceTemplateCreate(t *testing.T) {
+	rig := workspaceRig(t)
+	create := func(user, role, path, body string) *httptest.ResponseRecorder {
+		return rig.serveAs(user, role, http.MethodPost, path, body)
 	}
-	if w := create("multi"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "workspace_required") {
-		t.Fatalf("create with several workspaces = %d, want 400 workspace_required: %s", w.Code, w.Body.String())
+	tpl := func(name, extra string) string { return `{"name":"` + name + `",` + extra + templateSpec + `}` }
+
+	if w := create("user-1", RoleDefault, "/v1/templates", tpl("t1", `"workspace":"lab",`)); w.Code != http.StatusCreated {
+		t.Fatalf("create in own workspace = %d: %s", w.Code, w.Body.String())
+	}
+	if got := rig.templateWorkspace(t, "t1"); got != "lab" {
+		t.Fatalf("workspace label = %q, want lab", got)
+	}
+	if w := create("user-1", RoleDefault, "/v1/templates", tpl("t2", "")); w.Code != http.StatusCreated || rig.templateWorkspace(t, "t2") != "lab" {
+		t.Fatalf("create without workspace = %d, want 201 in the only workspace: %s", w.Code, w.Body.String())
+	}
+	for _, path := range []string{"/v1/templates", "/v1/templates/stream"} {
+		if w := create("user-1", RoleDefault, path, tpl("t3", `"workspace":"prod",`)); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "user_not_in_workspace") {
+			t.Fatalf("POST %s outside own workspaces = %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+	if w := create("multi", RoleDefault, "/v1/templates", tpl("t4", "")); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "workspace_required") {
+		t.Fatalf("several workspaces without workspace = %d: %s", w.Code, w.Body.String())
 	}
 	for _, user := range []string{"none", "unknown"} {
-		if w := create(user); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "user_not_in_workspace") {
-			t.Fatalf("create by %s = %d, want 403 user_not_in_workspace: %s", user, w.Code, w.Body.String())
+		if w := create(user, RoleDefault, "/v1/templates", tpl("t5", "")); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "user_not_in_workspace") {
+			t.Fatalf("create by %s = %d: %s", user, w.Code, w.Body.String())
 		}
+	}
+	if w := create("user-1", RoleDefault, "/v1/templates", tpl("t6", `"namespace":"other",`)); w.Code != http.StatusBadRequest {
+		t.Fatalf("non-admin namespace = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if w := create("user-1", RoleDefault, "/v1/templates", tpl("e2b-mine", `"workspace":"lab",`)); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "template_name_reserved") {
+		t.Fatalf("reserved prefix = %d: %s", w.Code, w.Body.String())
+	}
+	if w := create("admin", RoleSystemAdmin, "/v1/templates", tpl("a1", `"workspace":"any-ws",`)); w.Code != http.StatusCreated || rig.templateWorkspace(t, "a1") != "any-ws" {
+		t.Fatalf("admin workspace template = %d: %s", w.Code, w.Body.String())
+	}
+	if w := create("admin", RoleSystemAdmin, "/v1/templates", tpl("a2", `"namespace":"admitted",`)); w.Code != http.StatusCreated || rig.templateWorkspace(t, "a2") != "" {
+		t.Fatalf("admin namespace template = %d: %s", w.Code, w.Body.String())
+	}
+
+	w := rig.serveAs("user-1", RoleDefault, http.MethodGet, "/v1/templates?workspace=lab", "")
+	var list TemplateListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.TotalCount != 2 {
+		t.Fatalf("workspace filter listed %d templates, want t1 and t2", list.TotalCount)
 	}
 }
 
-// TestTemplateWritesNeedWorkspace checks that with caller auth a non-admin
-// creates and updates templates only in its own workspaces.
-func TestTemplateWritesNeedWorkspace(t *testing.T) {
-	rig := newWMRig(t, wmAdmitter(t, true), true)
-	rig.s.cfg.EnableAuth = true
-	rig.s.WithTemplateMembership(workspaceMembership{"user-1": {"admitted"}})
-
-	create := func(user, role, path string) int {
-		body := `{"name":"t-` + user + `","namespace":"admitted",` + templateSpec + `}`
-		return rig.serveAs(user, role, http.MethodPost, path, body).Code
+// TestWorkspaceTemplateUpdate checks that a caller who left the template
+// workspace can no longer update the template but can still delete it.
+func TestWorkspaceTemplateUpdate(t *testing.T) {
+	rig := workspaceRig(t)
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"t1",`+templateSpec+`}`); w.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", w.Code, w.Body.String())
 	}
-	for _, path := range []string{"/v1/templates", "/v1/templates/stream"} {
-		if code := create("user-2", RoleDefault, path); code != http.StatusForbidden {
-			t.Fatalf("POST %s outside the caller's workspaces = %d, want 403", path, code)
-		}
+	path := "/v1/templates/admitted/t1"
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPut, path, `{`+templateSpec+`}`); w.Code != http.StatusOK {
+		t.Fatalf("member update = %d: %s", w.Code, w.Body.String())
 	}
-	if rig.templateExists(t, "admitted", "t-user-2") {
-		t.Fatal("template created outside the caller's workspaces")
-	}
-	if code := create("user-1", RoleDefault, "/v1/templates"); code != http.StatusCreated {
-		t.Fatalf("create in the caller's workspace = %d, want 201", code)
-	}
-	if code := create("admin", RoleSystemAdmin, "/v1/templates"); code != http.StatusCreated {
-		t.Fatalf("system-admin create = %d, want 201", code)
-	}
-
-	path := "/v1/templates/admitted/t-user-1"
-	rig.s.WithTemplateMembership(workspaceMembership{})
+	rig.s.WithTemplateMembership(workspaceMembership{"user-1": {}})
 	if w := rig.serveAs("user-1", RoleDefault, http.MethodPut, path, `{`+templateSpec+`}`); w.Code != http.StatusForbidden {
 		t.Fatalf("update after leaving the workspace = %d, want 403: %s", w.Code, w.Body.String())
 	}
 	if w := rig.serveAs("user-1", RoleDefault, http.MethodDelete, path, ""); w.Code >= 300 {
-		t.Fatalf("delete after leaving the workspace = %d, want success: %s", w.Code, w.Body.String())
+		t.Fatalf("delete after leaving the workspace = %d: %s", w.Code, w.Body.String())
 	}
-
 	rig.s.WithTemplateMembership(nil)
-	if code := create("user-1", RoleDefault, "/v1/templates"); code != http.StatusServiceUnavailable {
-		t.Fatalf("create without a membership checker = %d, want 503", code)
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"t2","workspace":"lab",`+templateSpec+`}`); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("create without a membership checker = %d, want 503: %s", w.Code, w.Body.String())
 	}
 }
 
-// TestTemplateWorkspaceUncheckedWithoutAuth checks that without caller auth
-// template creation does not consult workspace membership.
-func TestTemplateWorkspaceUncheckedWithoutAuth(t *testing.T) {
-	rig := newWMRig(t, wmAdmitter(t, true), true)
+// TestWorkspaceTemplateWithoutAuth checks that without caller auth a workspace
+// template is stored unchecked and a template without one keeps its namespace.
+func TestWorkspaceTemplateWithoutAuth(t *testing.T) {
+	rig := workspaceRig(t)
+	rig.s.cfg.EnableAuth = false
 	rig.s.WithTemplateMembership(workspaceMembership{})
-	body := `{"name":"brain","namespace":"admitted",` + templateSpec + `}`
-	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", body); w.Code != http.StatusCreated {
-		t.Fatalf("create without caller auth = %d, want 201: %s", w.Code, w.Body.String())
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"ws","workspace":"lab",`+templateSpec+`}`); w.Code != http.StatusCreated || rig.templateWorkspace(t, "ws") != "lab" {
+		t.Fatalf("workspace template without auth = %d: %s", w.Code, w.Body.String())
+	}
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"brain","namespace":"admitted",`+templateSpec+`}`); w.Code != http.StatusCreated || rig.templateWorkspace(t, "brain") != "" {
+		t.Fatalf("namespace template without auth = %d: %s", w.Code, w.Body.String())
 	}
 }
 

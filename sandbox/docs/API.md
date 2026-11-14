@@ -56,7 +56,16 @@ Source: `pkg/router/server.go`
 | PATCH  | `/v1/sandbox/sessions/{id}/policy`        | Update egress policy                     |
 | GET    | `/v1/sandbox/sessions/{id}/logs`          | Get session logs                         |
 
-Any caller may create a private template in an admitted namespace and update or delete its own private templates. With caller authentication, a caller other than `system-admin` creates and updates templates only in namespaces listed as its workspaces on its User; other namespaces get 403 `user_not_in_workspace`. When such a caller omits `namespace`, the template goes to its only workspace; a caller with several workspaces gets 400 `workspace_required`. Otherwise an omitted `namespace` is `default`. Creating a public template, changing the `public` flag, changing a public template, and changing another user's template require the `system-admin` role.
+Any caller may create a private template and update or delete its own private templates. Creating a public template, changing the `public` flag, changing a public template, and changing another user's template require the `system-admin` role.
+
+A template created with `workspace` is stored in the control-plane namespace with that workspace and can be used by E2B creates in it (see [E2B.md](E2B.md#user-templates)); its name cannot start with `e2b-`. Without `workspace`, the template is stored in `namespace`, `default` when empty. With caller authentication, a caller other than `system-admin`:
+
+- always creates workspace templates and cannot set another `namespace` (400);
+- names one of the workspaces listed on its User, or gets 403 `user_not_in_workspace`;
+- may omit `workspace` when it has one workspace; with several it gets 400 `workspace_required`;
+- updates a workspace template only while it belongs to that workspace. Deleting is not limited.
+
+`GET /v1/templates?workspace=<name>` lists the templates of one workspace.
 
 ### Create a template (minimal)
 

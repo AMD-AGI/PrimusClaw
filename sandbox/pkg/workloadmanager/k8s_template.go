@@ -12,6 +12,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 )
 
@@ -25,8 +26,11 @@ type TemplateListResult struct {
 type CreateTemplateRequest struct {
 	// Name of the CodeInterpreter resource.
 	Name string `json:"name" binding:"required"`
-	// Namespace defaults to "default".
+	// Namespace defaults to "default". It is not used when Workspace is set.
 	Namespace string `json:"namespace"`
+	// Workspace stores the template in the control-plane namespace for this
+	// SaFE workspace, where E2B creates may use it.
+	Workspace string `json:"workspace,omitempty"`
 	// Spec is the full CodeInterpreterSpec.
 	Spec runtimev1alpha1.CodeInterpreterSpec `json:"spec" binding:"required"`
 	// Public marks the template as visible/usable by all users.
@@ -58,7 +62,8 @@ func validateTemplateLayers(spec runtimev1alpha1.CodeInterpreterSpec) error {
 // CreateTemplate creates a new CodeInterpreter CRD object in Kubernetes.
 // If user is non-nil, stamps user identity annotations for auditing.
 // If public is true, marks the template as publicly visible/usable.
-func (c *K8sSandboxCreator) CreateTemplate(ctx context.Context, name, namespace string, spec runtimev1alpha1.CodeInterpreterSpec, user *UserIdentity, public bool) (*runtimev1alpha1.CodeInterpreter, error) {
+// A non-empty workspace is recorded as the template workspace label.
+func (c *K8sSandboxCreator) CreateTemplate(ctx context.Context, name, namespace, workspace string, spec runtimev1alpha1.CodeInterpreterSpec, user *UserIdentity, public bool) (*runtimev1alpha1.CodeInterpreter, error) {
 	if namespace == "" {
 		namespace = "default"
 	}
@@ -79,6 +84,9 @@ func (c *K8sSandboxCreator) CreateTemplate(ctx context.Context, name, namespace 
 	// Public visibility label
 	if public {
 		ciLabels[templatePublicLabelKey] = "true"
+	}
+	if workspace != "" {
+		ciLabels[grant.TemplateWorkspaceLabel] = workspace
 	}
 
 	ci := &runtimev1alpha1.CodeInterpreter{

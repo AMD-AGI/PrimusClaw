@@ -63,6 +63,15 @@ Sealed rules:
 
 A template that is not sealed allows commands and file access in the sandbox.
 
+### User templates
+
+A user creates a template for a workspace with `POST /v1/templates` and the `workspace` field (see [API.md](API.md)). Its template id is the template name. A name cannot start with `e2b-`.
+
+- The template id is matched exactly: first against the caller's policy or grant, then against user templates. An id that matches neither returns `404 template_not_found`.
+- A caller may use its own templates and public templates. Another user's private template returns `404 template_not_found`; a `system-admin` SaFE API key may use any.
+- The sandbox runs in the template workspace. A SaFE API key must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`). A grant key must list it (`403 workspace_not_allowed`).
+- The quota of the caller applies. A user template accepts no environment variables from the caller.
+
 ## Quotas
 
 Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user. A field the policy leaves out keeps the built-in value; a field left out of one user's quota comes from the user or `system-admin` quota of that user.
@@ -148,11 +157,13 @@ from e2b import Sandbox
 | ------ | ----------------------- | ------------------------------------------------- |
 | 401    | `invalid_key`           | Key is unknown, inactive, or expired              |
 | 403    | `timeout_not_allowed`   | Timeout exceeds the max lifetime                  |
-| 403    | `template_not_allowed`  | Template is not in the caller's policy            |
+| 400    | `workspace_mismatch`    | Workspace metadata differs from the template's    |
+| 403    | `template_not_allowed`  | Template is not allowed for the caller            |
 | 403    | `env_not_allowed`       | Environment variable is not accepted              |
 | 403    | `metadata_reserved`     | Metadata key is reserved by the platform          |
 | 403    | `user_not_in_workspace` | Caller is not a member of the workspace           |
 | 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
+| 404    | `template_not_found`    | No template the caller may use has this id        |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
 | 410    | `idempotency_key_spent` | Key already ended; the detail carries the reason  |
 | 503    | `pending_timeout`       | Sandbox was not running within the pending timeout |

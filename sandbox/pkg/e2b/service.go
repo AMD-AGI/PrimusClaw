@@ -195,6 +195,31 @@ func grantWorkspace(names []string, templateWorkspace string) (string, error) {
 	return names[0], nil
 }
 
+// resolveUserTemplate returns the user template id when the caller may use it:
+// its creator, any caller of a public template, or a system-admin identity key.
+// A template the caller may not use is reported as not found.
+func (s *Service) resolveUserTemplate(ctx context.Context, who caller, snap grant.Snapshot, id string) (resolvedTemplate, error) {
+	ut, err := s.grants.UserTemplate(ctx, id)
+	if err != nil {
+		return resolvedTemplate{}, err
+	}
+	userID := snap.UserID
+	if who.owner {
+		userID = who.userID
+	}
+	if !ut.Public && !(who.owner && who.admin) && (userID == "" || ut.UserID != userID) {
+		return resolvedTemplate{}, grant.TemplateNotFound(id)
+	}
+	return resolvedTemplate{
+		ID:        ut.Name,
+		Alias:     ut.Name,
+		GPUs:      ut.GPUs,
+		Pending:   defaultPendingWait,
+		Workspace: ut.Workspace,
+		User:      true,
+	}, nil
+}
+
 // Create starts a sandbox, or replays an idempotency key.
 // The access token is returned on this call and on connect, then only as a hash.
 func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (SandboxResponse, int, error) {
@@ -212,6 +237,9 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, err
 	}
 	tpl, err := resolveTemplate(snap, role, body.TemplateID)
+	if grant.IsReason(err, "template_not_found") {
+		tpl, err = s.resolveUserTemplate(ctx, who, snap, body.TemplateID)
+	}
 	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
@@ -227,7 +255,16 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	}
 	var workspace string
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
+		requested := body.Metadata[workspaceMetadata]
+		if tpl.User {
+			if requested != "" && requested != tpl.Workspace {
+				err = grant.Op(http.StatusBadRequest, "workspace_mismatch", "template "+tpl.ID+" runs in workspace "+tpl.Workspace)
+			}
+			requested = tpl.Workspace
+		}
+		if err == nil {
+			workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, requested, who.admin, who.user)
+		}
 	} else {
 		workspace, err = grantWorkspace(snap.Workspaces, tpl.Workspace)
 	}
@@ -293,6 +330,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Sealed:            tpl.Sealed,
 		Inputs:            tpl.Inputs,
 		Outputs:           tpl.Outputs,
+		UserTemplate:      tpl.User,
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {

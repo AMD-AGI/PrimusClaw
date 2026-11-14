@@ -1236,15 +1236,13 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
-	if req.Namespace == "" {
-		ns, ok := s.defaultTemplateNamespace(c)
-		if !ok {
-			return
-		}
-		req.Namespace = ns
+	ns, workspace, ok := s.templateTarget(c, &req)
+	if !ok {
+		return
 	}
+	req.Namespace = ns
 	// Before the image build: a denied namespace must not cost a kaniko run.
-	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1280,7 +1278,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		req.Spec.Template.FromImage = buildResult.Image
 	}
 
-	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, req.Spec, user, public)
+	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, workspace, req.Spec, user, public)
 	if err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "already exists") {
@@ -1354,14 +1352,12 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
-	if req.Namespace == "" {
-		ns, ok := s.defaultTemplateNamespace(c)
-		if !ok {
-			return
-		}
-		req.Namespace = ns
+	ns, workspace, ok := s.templateTarget(c, &req)
+	if !ok {
+		return
 	}
-	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
+	req.Namespace = ns
+	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1403,7 +1399,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 
 	// Create the template CRD
 	writeSSE("phase", BuildPhase{Phase: "crd_creation", Status: "started"})
-	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, req.Spec, user, public)
+	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, workspace, req.Spec, user, public)
 	if err != nil {
 		errMsg := err.Error()
 		writeSSE("phase", BuildPhase{Phase: "crd_creation", Status: "failed", Message: errMsg})
@@ -1445,6 +1441,8 @@ type ListTemplatesRequest struct {
 	UserName string `form:"userName" binding:"omitempty"`
 	// Filter by template name (fuzzy match)
 	Name string `form:"name" binding:"omitempty"`
+	// Filter by template workspace (exact match on label)
+	Workspace string `form:"workspace" binding:"omitempty"`
 	// Filter by public status: "true" = only public, "false" = only private, empty = all (subject to role)
 	Public string `form:"public" binding:"omitempty,oneof=true false"`
 	// Pagination offset, default 0
@@ -1538,6 +1536,9 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 		}
 		// Name filter (fuzzy match)
 		if req.Name != "" && !strings.Contains(ci.Name, req.Name) {
+			continue
+		}
+		if req.Workspace != "" && ci.Labels[grant.TemplateWorkspaceLabel] != req.Workspace {
 			continue
 		}
 		filtered = append(filtered, ci)
@@ -1639,7 +1640,7 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can update this template"})
 		return
 	}
-	if !s.admitTemplateWorkspace(c, namespace) {
+	if ws := existing.Labels[grant.TemplateWorkspaceLabel]; ws != "" && !s.admitTemplateWorkspace(c, ws) {
 		return
 	}
 

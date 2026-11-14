@@ -26,6 +26,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
@@ -127,6 +128,13 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 
 func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	svc, runner, keys, _ := testPlaneWithClient(t, maxSec, perGPU, maxSandboxes, spec, workspaces)
+	return svc, runner, keys
+}
+
+// testPlaneWithClient builds a grant-key plane and also returns its fake cluster client.
+func testPlaneWithClient(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string, client.Client) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -168,7 +176,7 @@ func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandbo
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{}
-	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys
+	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys, cl
 }
 
 func bytes32() []byte {
