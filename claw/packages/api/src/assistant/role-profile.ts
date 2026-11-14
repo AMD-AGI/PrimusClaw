@@ -18,7 +18,7 @@
 import pino from "pino";
 import { REMOTE_AGENT_TIMING } from "@claw/protocol";
 import {
-  CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
+  ASSISTANT_DEPLOYMENT_MODEL, CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
   CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, CLAW_REMOTE_AGENTS_ENABLED, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
@@ -61,6 +61,7 @@ import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
 import { routerCite } from "./citations.js";
 import { routerSkillParts } from "./skill-tools.js";
 import { renderNowState, routerClock } from "./now.js";
+import { lastServedModel, renderOwnModelState, routerTurnModel } from "./own-model.js";
 import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
 const logger = pino({ name: "assistant-role" });
@@ -439,6 +440,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
     }
+    // Which model the router itself runs on (`own-model.ts`): asked "你用的什么模型", it named only the item defaults. After the re-run
+    // above, which changes this turn's model.
+    state.push(renderOwnModelState({
+      runsOn: routerTurnModel(task.model, ASSISTANT_DEPLOYMENT_MODEL),
+      lastServed: await lastServedModel((t, p) => db.query(t, p), sessionId),
+    }));
     // Little thinking, and the say streamed while it is written (`router-speed.ts`); for the users who have it, the turn's own text
     // too, when it answers them (a worker's report is not theirs: what the turn writes then is not for them).
     applyRouterTurnSpeed(task, undefined, streamTextOn(role.userId) && !stringField(task, "prompt").startsWith(WORK_EVENT_PREFIX));

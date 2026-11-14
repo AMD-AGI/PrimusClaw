@@ -134,6 +134,10 @@ release version, and its `appVersion` stays `latest`.
   question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
   examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
   self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command.
+- Asked which model it runs on (你用的什么模型), the assistant names its own model instead of saying it cannot see it: every
+  router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model the gateway
+  said served the latest answer when that differs), and that the models work items and reviews run on are the workers', not
+  its own. The router's self section is `router-self-v4`.
 
 ## [0.5.0] - 2026-11-13
 
