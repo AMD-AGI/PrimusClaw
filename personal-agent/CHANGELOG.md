@@ -15,6 +15,21 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.10.1
+
+A patch release: the assistant answers questions about the date and time in the person's time zone (#847). No plugin port (core's
+`src/plugins/`) or store change; works with any Claw (claw-v0.5.2 and later read the zone, an older Claw ignores it and
+answers in UTC as before).
+
+### Fixed
+
+- `@primusclaw/personal-agent`: a message the person writes to the assistant carries their time zone as
+  `channel_context.timezone`: the one they set with `/timezone`, else the default their quiet hours use. Claw tells the
+  router what now is in that zone (the local date, weekday and time, with UTC beside it), so questions about the date,
+  the weekday, the time or tomorrow ("今天星期几", "今天几号") are answered in the person's zone: asked after midnight in
+  Beijing, the answer is the local day, not the UTC one. An observer suggestion the person accepts is sent without it,
+  and Claw takes Asia/Shanghai for it (#847).
+
 ## 0.10.0
 
 A minor release, because behaviour changes for a deployment that sets nothing (the default display name, the client

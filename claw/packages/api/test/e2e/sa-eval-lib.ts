@@ -16,8 +16,9 @@
  *   turns            [{user, after_ms, files?}]                         one or more user messages; after_ms from the first; files
  *                    [{fixture, name?, media_type?}] are sent with the message as a channel sends them (uploaded to the assistant's
  *                    session, named in channel_context.files); fixture is a path relative to the cases directory.
- *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?}) is sent
- *                    with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through `files`)
+ *                    channel_context ({channel?, via?, channel_message_id?, people?, actions?, repos?, handoffs?, attached?,
+ *                    assistant_name?}) is sent with the message as the channel would send it (`TURN_CONTEXT_KEYS`; files only through
+ *                    `files`; assistant_name, when the case names none, is the run's EVAL_ASSISTANT_NAME)
  *   route            answer | item | review | confirm | clarify         expected handling of the last turn; clarify: answered in the
  *                    chat with a final reply that asks the person (`asksUser`: a question mark, a request for what is missing, or a
  *                    choice put to them)
@@ -39,6 +40,10 @@
  *                    takes a regex's first group (or the match), `map:<from>=<to>;...` says a value in words (`true=merged`), and
  *                    `empty:<text>` stands for an empty list (`empty:none||没有`). A value with `||` is named when any one of its
  *                    alternatives is.
+ *                    A `clock` oracle is the date or the weekday when the case is asked, in a time zone: `weekday@Asia/Shanghai`,
+ *                    `date@America/Los_Angeles` (`clockQuery`). The runner works it out when it sends the case (and again at the end
+ *                    of its time to answer, either counting, so a case asked across midnight is not failed for it): the answer must
+ *                    name it, and the judge is told it as the truth.
  *                    A static or fixture value is a value to find in the answer (a number, a name); a description of what
  *                    the answer should say belongs in the rubric. A fact without a value or a runnable query is graded by the
  *                    judge, with the oracle's text as what it is checked against.
@@ -95,11 +100,15 @@ export interface TurnFile { fixture: string; name?: string; media_type?: string 
 export interface Turn { user: string; after_ms?: number; files?: TurnFile[]; channel_context?: Record<string, unknown> }
 
 /** What a case may put in a turn's `channel_context`: what a channel sends beside a message (`parseChannelContext`), files aside. */
-export const TURN_CONTEXT_KEYS: readonly string[] = ["channel", "via", "channel_message_id", "people", "actions", "repos", "handoffs", "attached"];
+export const TURN_CONTEXT_KEYS: readonly string[] = ["channel", "via", "channel_message_id", "people", "actions", "repos", "handoffs", "attached", "assistant_name"];
 
-/** The body of a turn's message: its words, and the channel's context with the files uploaded for it. */
-export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files: readonly unknown[]): Record<string, unknown> {
-  const context = { ...(t.channel_context ?? {}), ...(files.length ? { files } : {}) };
+/**
+ * The body of a turn's message: its words, and the channel's context with the files uploaded for it. `assistantName` is the name the run's
+ * chat client calls the assistant by (EVAL_ASSISTANT_NAME), sent as a client sends it with every message (`channel_context.assistant_name`)
+ * unless the case names one itself; without it the message names none, as the API alone does.
+ */
+export function turnMessageBody(t: Pick<Turn, "user" | "channel_context">, files: readonly unknown[], assistantName?: string): Record<string, unknown> {
+  const context = { ...(assistantName ? { assistant_name: assistantName } : {}), ...(t.channel_context ?? {}), ...(files.length ? { files } : {}) };
   return { content: t.user, messageType: "text", ...(Object.keys(context).length ? { channel_context: context } : {}) };
 }
 
@@ -125,7 +134,7 @@ export function tokenRequestRefusal(method: string, path: string, body?: unknown
   return `${method} ${path.split("?")[0]} is not sent with the token`;
 }
 export interface Delivers { name?: string; type?: string }
-export interface Oracle { kind: "static" | "api" | "fixture"; value?: string; query?: string }
+export interface Oracle { kind: "static" | "api" | "fixture" | "clock"; value?: string; query?: string }
 export interface Fact { claim: string; oracle?: Oracle }
 
 export interface EvalCase {
@@ -633,6 +642,89 @@ export function oracleQuery(o: Oracle | undefined): OracleQuery | null {
     args[k] = /^(-?\d+(\.\d+)?|true|false|null)$/.test(v) ? JSON.parse(v) : v;
   }
   return { via: "mcp", server: mcp[1]!, tool: mcp[2]!, args, ...mcpTail };
+}
+
+/** A `clock` oracle's query: what (`weekday` or `date`) in which IANA zone, or null when it is not one this runtime can work out. */
+export function clockQuery(o: Oracle | undefined): { what: "weekday" | "date"; zone: string } | null {
+  if (o?.kind !== "clock") return null;
+  const m = /^(weekday|date)@([A-Za-z][A-Za-z0-9_+\-/]*)$/.exec((o.query ?? "").trim());
+  if (!m) return null;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: m[2]! }); } catch { return null; }
+  return { what: m[1] as "weekday" | "date", zone: m[2]! };
+}
+
+const ZH_DAYS = ["日", "一", "二", "三", "四", "五", "六"];
+const EN_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const EN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/** The ways an answer names the weekday or the date of `at` in `zone`, as one value of `||` alternatives (`names`). */
+export function clockValue(what: "weekday" | "date", zone: string, at: Date): string {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", weekday: "long" }).formatToParts(at);
+  const v = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  if (what === "weekday") {
+    const k = EN_DAYS.indexOf(v("weekday"));
+    const zh = ZH_DAYS[k]!;
+    const forms = [`星期${zh}`, `周${zh}`, `礼拜${zh}`, ...(k === 0 ? ["星期天", "周天", "礼拜天"] : []), EN_DAYS[k]!];
+    return forms.join("||");
+  }
+  const y = v("year"), m = Number(v("month")), d = Number(v("day"));
+  const mm = String(m).padStart(2, "0"), dd = String(d).padStart(2, "0");
+  const month = EN_MONTHS[m - 1]!;
+  return [`${y}-${mm}-${dd}`, `${m}月${d}日`, `${m}月${d}号`, `${month} ${d}`, `${d} ${month}`, `${month.slice(0, 3)} ${d}`].join("||");
+}
+
+const ZH_DAY_FORMS = ZH_DAYS.map((z, k) => [`星期${z}`, `周${z}`, `礼拜${z}`, ...(k === 0 ? ["星期天", "周天", "礼拜天"] : [])]);
+const NEGATED_BEFORE = /(不是|并非|而非|\bnot\s+|n't\s+)$/i;
+
+/**
+ * The weekday (0 Sunday .. 6 Saturday) or the date (`MM-DD`) a reply gives as its answer: the first one it names that is not said not
+ * to be it ("不是周六", "not Friday"), or null when it names none. A date is read as a whole (`November 1` is not in `November 14`).
+ */
+export function clockAnswer(what: "weekday" | "date", text: string): string | null {
+  const t = (text || "").normalize("NFKC");
+  const found: Array<{ at: number; value: string; end: number }> = [];
+  if (what === "weekday") {
+    ZH_DAY_FORMS.forEach((forms, k) => {
+      for (const f of forms) for (const m of t.matchAll(new RegExp(f, "g"))) found.push({ at: m.index!, end: m.index! + f.length, value: String(k) });
+    });
+    EN_DAYS.forEach((d, k) => {
+      for (const m of t.matchAll(new RegExp(`\\b${d}\\b`, "gi"))) found.push({ at: m.index!, end: m.index! + d.length, value: String(k) });
+    });
+  } else {
+    const md = (m: number, d: number) => (m >= 1 && m <= 12 && d >= 1 && d <= 31 ? `${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}` : null);
+    const month = (name: string) => EN_MONTHS.findIndex((x) => x.slice(0, 3).toLowerCase() === name.slice(0, 3).toLowerCase()) + 1;
+    const MONTH = `(${EN_MONTHS.map((x) => `${x.slice(0, 3)}(?:${x.slice(3)})?\\.?`).join("|")})`;
+    const add = (m: RegExpMatchArray, v: string | null) => { if (v) found.push({ at: m.index!, end: m.index! + m[0].length, value: v }); };
+    for (const m of t.matchAll(/(?<!\d)\d{4}[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/g)) add(m, md(Number(m[1]), Number(m[2])));
+    for (const m of t.matchAll(/(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号](?!\d)/g)) add(m, md(Number(m[1]), Number(m[2])));
+    for (const m of t.matchAll(new RegExp(`\\b${MONTH}\\s+(\\d{1,2})(?:st|nd|rd|th)?(?!\\d)`, "gi"))) add(m, md(month(m[1]!), Number(m[2])));
+    for (const m of t.matchAll(new RegExp(`(?<!\\d)(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH}\\b`, "gi"))) add(m, md(month(m[2]!), Number(m[1])));
+  }
+  found.sort((a, b) => a.at - b.at || b.end - a.end);
+  for (const f of found) {
+    if (NEGATED_BEFORE.test(t.slice(Math.max(0, f.at - 12), f.at))) continue;
+    return f.value;
+  }
+  return null;
+}
+
+/** The answers a clock fact's value allows, in `clockAnswer`'s form, read back from its alternatives. */
+export function clockAllowed(what: "weekday" | "date", value: string): Set<string> {
+  const alts = value.split("||");
+  return new Set(what === "weekday"
+    ? alts.map((a) => EN_DAYS.indexOf(a)).filter((k) => k >= 0).map(String)
+    : alts.map((a) => /^\d{4}-(\d{2}-\d{2})$/.exec(a)?.[1]).filter((x): x is string => !!x));
+}
+
+/**
+ * A `clock` oracle's value for an attempt asked between `from` and `to`: what it is at either end (one value whose alternatives are
+ * both, when midnight fell between), or null when the query is not one (`clockQuery`).
+ */
+export function clockValues(o: Oracle | undefined, from: Date, to: Date): string[] | null {
+  const q = clockQuery(o);
+  if (!q) return null;
+  const alts = new Set([...clockValue(q.what, q.zone, from).split("||"), ...clockValue(q.what, q.zone, to).split("||")]);
+  return [[...alts].join("||")];
 }
 
 /** A GraphQL document that is one query: no mutation or subscription, whatever it is named. */
@@ -1611,6 +1703,13 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     const want = values.slice(0, 10);
     // An oracle's value is the identity's own data: the result says only how many were expected, never what.
     const detail = f.oracle?.kind === "api" ? `expected ${want.length} oracle value(s)` : `expected ${want.join(", ").slice(0, 80)}`;
+    // A clock fact: the weekday or date the reply gives as its answer (the first it names, not negated) is the one of the run.
+    const clock = clockQuery(f.oracle);
+    if (clock) {
+      const given = clockAnswer(clock.what, o.final);
+      out.push({ name, pass: want.length > 0 && given !== null && clockAllowed(clock.what, want[0]!).has(given), detail: `${detail}; answered ${given ?? "none"}` });
+      return;
+    }
     out.push({ name, pass: want.length > 0 && want.every((v) => names(o.final, v)), detail });
   });
   if (c.cards) {
@@ -1748,7 +1847,8 @@ export interface Attempt {
 export const needsJudge = (c: EvalCase): boolean => !!c.rubric || judgeFacts(c).length > 0;
 
 /** A fact graded without a judge: a runnable oracle, or a static or fixture value. */
-const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.value !== undefined);
+const deterministic = (f: Fact): boolean => !!oracleQuery(f.oracle) || !!clockQuery(f.oracle)
+  || (!!f.oracle && f.oracle.kind !== "api" && f.oracle.kind !== "clock" && f.oracle.value !== undefined);
 
 /**
  * What only a judge can grade, one line per fact: its claim and, where the oracle describes a read this runner cannot make,
@@ -1935,7 +2035,8 @@ export function planOf(cases: readonly EvalCase[], mode: Mode, env: Record<strin
     const filled = filledCase(c, env) ?? c;
     const facts = (filled.facts ?? []).map((f) => {
       const q = oracleQuery(f.oracle);
-      return q ? (q.via === "claw" ? "api" : q.via) : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
+      return q ? (q.via === "claw" ? "api" : q.via) : clockQuery(f.oracle) ? "clock"
+        : f.oracle?.value !== undefined && f.oracle.kind !== "api" ? "value" : "judge";
     });
     return [c.id, skip || `${c.turns.length} turn(s)`, `route=${c.route ?? "-"}`, `tools=${(c.tools_must ?? []).join(",") || "-"}`,
       `facts=${facts.join(",") || "-"}`, `budget=${JSON.stringify(c.latency_budget_s ?? {})}`].join("  ");
@@ -2008,7 +2109,7 @@ export function descriptiveValue(v: string): boolean {
     || /^(asks?|no|not|does|doesn't|states?|mentions?|lists?|names?|covers?|refuses?|declines?|offers?|says?|explains?|either|any|at least|reply|answer|regex)\b/i.test(t);
 }
 
-export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "blocked" | "judge-only" | "needs-vars"; detail: string }
+export interface CaseFinding { id: string; kind: "unreachable" | "assistant-only" | "descriptive-value" | "bad-clock" | "blocked" | "judge-only" | "needs-vars"; detail: string }
 
 /**
  * What can be told about cases without running them. Problems (the check fails on them):
@@ -2036,6 +2137,8 @@ export function staticFindings(cases: readonly EvalCase[], arms: Arms, vars: Var
       // Runnable once its placeholders are filled, whatever they are filled with.
       else if (o?.kind === "api" && !oracleQuery({ ...o, query: (o.query ?? "").replace(PLACEHOLDER, "x") })) {
         notes.push({ id: c.id, kind: "judge-only", detail: `${f.claim}`.slice(0, 80) });
+      } else if (o?.kind === "clock" && !clockQuery(o)) {
+        problems.push({ id: c.id, kind: "bad-clock", detail: `${f.claim}: ${o.query ?? ""} (weekday@<zone> or date@<zone>)`.slice(0, 120) });
       }
     }
     if (c.blocked && armsOf(c, arms).every(({ allow }) => (c.tools_must ?? []).every((p) => reachable(p, allow)))) {

@@ -118,6 +118,11 @@
  *                     service's delegated token (an evaluation runner's client acting for the identity): the key goes beside it in
  *                     `x-api-key`, so a turn runs on the identity's own keys. It is sent with nothing but the person's text message,
  *                     a card's `deny` and that check (`tokenRequestRefusal`): the run never allows or answers anything with it
+ *   EVAL_ASSISTANT_NAME
+ *                     the name the deployment's chat client calls the assistant by, sent with every message as that client sends it
+ *                     (`channel_context.assistant_name`) unless a case names one: a run of a deployment whose people reach the
+ *                     assistant through a client that names it is graded on the name they see. Unset: no name, the API's own
+ *                     neutral one. One the API would not take as a name (`assistantNameOf`) refuses the run
  *   EVAL_QUIET_S      the assistant mode refuses to start when the identity's assistant session has a turn running, or had any
  *                     event less than this many seconds ago (default 300; 0 checks only for a running turn): another run, or a
  *                     person, is using the identity. Each run going at the same time needs an identity of its own
@@ -169,7 +174,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import {
   BUILTIN_TOOLS, assistantInUse, capRefusedSays, pacedPerHour, caseHash, caseSays, cardsOf, cleanupOf, countedSays, countedSaysOf, deleteSessionConfirmed,
   mergeSays, parseSayLog, endedTurns, storedTurnEnds, streamMissed, filledCase, filesFrom, finalSay, grade, forRecording, identityRefusal, itemsStartedBy,
-  judgePrompt, loadCases, messagesOf, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
+  judgePrompt, loadCases, messagesOf, clockValues, oracleMcpTarget, missingVars, oracleMayRun, oracleQuery, parseRecordings, planOf, renderTable, routeOf,
   ownSays, sayWaitMs, saysOf, staticFindings, turnsAnswered, verdictOf, scrub as scrubWith, select, sseFrames, totals, turnCalls, turnEnded, heldCallRan, heldRequest,
   holdAnswers, toolPattern, judgeVerdict, JUDGE_RETRY_NOTE, oracleValues, withToolFailures, flatVars, storedTurnCalls,
   freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
@@ -178,6 +183,7 @@ import {
   type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
+import { assistantNameOf } from "../../src/assistant/assistant-name.js";
 
 /**
  * `dir` as a private directory, made (0700) when missing: its real path (symlinks are followed here, once) must be a directory of this
@@ -248,6 +254,9 @@ if (SAY_PER_HOUR && SAY_RESERVE >= SAY_PER_HOUR) { console.error("EVAL_SAY_RESER
 /** The pace kept: SAY_PER_HOUR, lowered under the cap the server answers POST /v1/assistant with (`pacedPerHour`). */
 let sayPerHour = SAY_PER_HOUR;
 const QUIET_MS = int("EVAL_QUIET_S", 300, 0, 86_400) * 1000;
+const ASSISTANT_NAME_RAW = (process.env.EVAL_ASSISTANT_NAME || "").trim();
+const ASSISTANT_NAME = ASSISTANT_NAME_RAW ? assistantNameOf(ASSISTANT_NAME_RAW) : undefined;
+if (ASSISTANT_NAME_RAW && !ASSISTANT_NAME) { console.error("EVAL_ASSISTANT_NAME is not a name the API takes (assistantNameOf)"); process.exit(2); }
 const TURN_WAIT_S = process.env.EVAL_TURN_WAIT_S ? int("EVAL_TURN_WAIT_S", 180, 1, 3600) : null;
 /** How long a turn may take to end: EVAL_TURN_WAIT_S, else 180 s for a router turn and 600 s for a plain session's. */
 const turnWaitMs = (router: boolean): number => (TURN_WAIT_S ?? (router ? 180 : 600)) * 1000;
@@ -553,8 +562,15 @@ async function idle(sessionId: string, waitMs: number): Promise<boolean> {
 /** The values each fact expects, read now with the eval identity: the Claw API, GitHub, or a read tool of the plugin. */
 async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   const out: Array<string[] | null> = [];
+  // A clock fact is what the date or weekday is while the case is asked and answered: from now to the end of its last turn's time to
+  // answer (`clockValues`, either end counting).
+  const from = new Date();
+  const lastAt = Math.max(0, ...c.turns.map((t) => t.after_ms ?? 0));
+  // Ten minutes more for what may delay the sending itself (an upload, another oracle's read): near midnight, either day counts.
+  const to = new Date(from.getTime() + lastAt + (c.latency_budget_s?.final ?? turnWaitMs(true) / 1000) * 1000 + 600_000);
   for (const [k, f] of (c.facts ?? []).entries()) {
     const o = f.oracle;
+    if (o?.kind === "clock") { out.push(clockValues(o, from, to)); continue; }
     const q = oracleQuery(o);
     if (!q) { out.push(o && o.kind !== "api" && o.value !== undefined ? [o.value] : null); continue; }
     // An oracle that could not be read (an error status, an outage, a server it may not call) says nothing about the answer:
@@ -765,7 +781,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
       // A message whose answer was lost (or a 5xx) may still have been taken: its turn is waited for at the end, unnamed.
       // Sent signed in when EVAL_SEND_TOKEN_CMD gives a token (the person's own message, `attendedTurn`), else with the key.
       const path = `/v1/sessions/${sessionId}/messages`;
-      const body = turnMessageBody(t, files);
+      const body = turnMessageBody(t, files, ASSISTANT_NAME);
       const r = await (SEND_TOKEN_CMD ? tokenApi("POST", path, body) : api("POST", path, body, KEY))
         .catch((err) => { session.unknownSends++; throw err; });
       if (r.status >= 500) session.unknownSends++;
@@ -1558,7 +1574,7 @@ async function main(): Promise<void> {
   const cases = select(loaded.cases, list("EVAL_CASES"), list("EVAL_PIPELINES"), process.env.EVAL_VARIANTS === "1");
   if (!cases.length) { console.error("no case selected"); process.exit(2); }
   if (DRY_RUN) {
-    console.log(`dry run: mode=${MODE} k=${K} cases=${cases.length} from ${CASES_DIR}; nothing is sent`);
+    console.log(`dry run: mode=${MODE} k=${K} cases=${cases.length} from ${CASES_DIR}; assistant name ${ASSISTANT_NAME ?? "-"}; nothing is sent`);
     for (const line of planOf(cases, MODE, VARS)) console.log(line);
     process.exit(loaded.bad.length ? 1 : 0);
   }
@@ -1574,7 +1590,7 @@ async function main(): Promise<void> {
   if (refusal) { console.error(`refusing to run: ${refusal}`); process.exit(2); }
   process.on("SIGINT", stopOn);
   process.on("SIGTERM", stopOn);
-  log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K}`);
+  log(`mode=${MODE} plugin=${PLUGIN_ID ?? "-"} cases=${cases.length} k=${K} assistant_name=${ASSISTANT_NAME ?? "-"}`);
   // Messages go with a signed-in token when EVAL_SEND_TOKEN_CMD gives one: it must be the same identity's.
   if (SEND_TOKEN_CMD && LIVE && MODE === "assistant") {
     const tme = await tokenApi("GET", "/v1/me");
