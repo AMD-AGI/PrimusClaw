@@ -130,6 +130,10 @@ release version, and its `appVersion` stays `latest`.
   the skill holds still does. A skill draft's card waiting for the user is listed to the router as answered on its card, without
   the typed approval command, so the router no longer tells the user to type `批准 #ref` for it; the router's skills prompt
   (`router-skills-v5`) says such a statement is never a request to save.
+- The assistant answers a greeting, a thanks or a sign-off in one short line, without listing what waits for the user, and a
+  question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
+  examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
+  self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command.
 
 ## [0.5.0] - 2026-11-13
 

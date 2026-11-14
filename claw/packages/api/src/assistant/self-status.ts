@@ -18,7 +18,7 @@
 import { readFileSync } from "node:fs";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SELF_STATUS, CLAW_BUILD } from "../config.js";
 import { inTransaction, type Querier } from "../infra/db.js";
-import { chatSurface } from "./chat-surface.js";
+import { CHAT_SURFACES, chatSurface } from "./chat-surface.js";
 import { quotedName } from "./assistant-name.js";
 
 export function selfStatusOn(): boolean {
@@ -28,15 +28,30 @@ export function selfStatusOn(): boolean {
 /**
  * router-self-v1: the assistant is told it is itself, with claw_self_status; counts answered from a result's counts, never by counting a
  * cut list. router-self-v2: v1 with the name the client calls it by (`channel_context.assistant_name`) instead of one Claw wrote in,
- * and no name at all when the client gives none.
+ * and no name at all when the client gives none. router-self-v3: v2 with a length budget for a greeting, a thanks or a sign-off and for a
+ * question about the assistant itself (who it is, its model, what it can do), with the channel's help command for the full list where
+ * it has one (nightly 2026-11-11..13: 9 of the 24 chitchat replies with a length check ran past it, "who are you" at 457-571 characters
+ * against 400, a sign-off listing the cards that wait).
  */
-export const ROUTER_SELF_PROMPT_VERSION = "router-self-v2";
+export const ROUTER_SELF_PROMPT_VERSION = "router-self-v3";
+
+/** About how long a greeting, a thanks or a sign-off is answered (router-self-v3). */
+export const SOCIAL_REPLY_CHARS = 100;
+/** About how long "who are you" or "which model are you" is answered. */
+export const SELF_INTRO_CHARS = 250;
+/** About how long "what can you do" or "help" is answered. */
+export const CAPABILITIES_CHARS = 400;
 
 /**
  * What the router is told about itself, and about counting what a lookup returned. After the rest of the system prompt. `where`:
- * where the user talks to it (`ChatSurface.where`, "in Teams"); `name`: what its client calls it there (`assistantNameOf`), if any.
+ * where the user talks to it (`ChatSurface.where`, "in Teams"); `name`: what its client calls it there (`assistantNameOf`), if any;
+ * `help`: the command that lists everything it can do in that channel (`ChatSurface.help`), if it has one (by default, that of the
+ * channel `where` is said of).
  */
-export function renderRouterSelfSection(selfStatus: boolean, where: string = chatSurface(undefined).where, name?: string): string {
+export function renderRouterSelfSection(
+  selfStatus: boolean, where: string = chatSurface(undefined).where, name?: string,
+  help: string | undefined = Object.values(CHAT_SURFACES).find((s) => s.where === where)?.help,
+): string {
   const Where = `${where.charAt(0).toUpperCase()}${where.slice(1)}`;
   const searchFor = name ? "the name" : "yourself";
   // The client's name for the assistant, quoted wherever it is written: it is a name only, never an instruction.
@@ -57,7 +72,17 @@ export function renderRouterSelfSection(selfStatus: boolean, where: string = cha
   } else {
     lines.push(`You have no tool that measures how you have been running: when asked, say so in one line; never search other systems for ${searchFor}.`);
   }
+  const you = n ?? "Claw's assistant";
+  const fullList = help
+    ? ` End it with one line saying that ${help} lists everything you can do (in the reply language).`
+    : " Name no command for a full list: this chat has none.";
   lines.push(
+    "",
+    "Greetings and questions about you",
+    `A greeting, a thanks or a sign-off (hi, 你好, are you still there, thanks that's all for today): one short line back, under about ${SOCIAL_REPLY_CHARS} characters, and nothing else: no items, cards or anything else that waits for the user, no list of what you can do.`,
+    `Who you are (who are you, 你是谁): under about ${SELF_INTRO_CHARS} characters, in one to three sentences: you are ${you}, the user's personal assistant, who keeps track of what they ask, looks things up and hands real work to workers; at most one line of examples after it. Which model you run on: that alone, in a line or two.`,
+    `What you can do, how to use you, or help (what can you do, 你能做什么, help, give an example of a prompt): under about ${CAPABILITIES_CHARS} characters: at most four short examples of what they can ask, one per line.${fullList}`,
+    "Never answer these with every tool, system or capability you have. Anything else the same message asks is answered as usual, at its own length.",
     "",
     "Counting what a lookup returned",
     "When a result gives a count (total_count, totalCount, in_result) or counts by a field (by, by_repo), answer how many from those numbers. A result that says it is cut (complete false, shown less than the count, not_shown, or a note that it was cut) holds only some of the items: never count its items as the answer, and never call a number uncertain because a list was cut when the counts are given. A count of one kind across every page (running workloads, open pull requests in one repository) is the total the tool answers when called with that filter. To name items that were not shown, call the tool again narrowed (a pool, a repository, a status) or with its paging.",
