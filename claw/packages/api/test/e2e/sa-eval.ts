@@ -864,7 +864,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   const firstOwn = lastSays.length ? Math.min(...lastSays.map((s) => s.at)) : null;
   const observed: Observed = {
     mode: MODE, route: routeOf(lastItems, lastRouter, lastSays), cards: cardsOf(lastSays), calls: lastCalls, shown: shown.map((s) => s.text),
-    final: final?.text ?? "", finalChoices: final?.choices.length ?? 0,
+    final: final?.text ?? "", finalChoices: final?.choices.length ?? 0, finalSources: final?.sources ?? [],
     firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
     items, factValues: values, delivered: filesFrom(says, lastIds), ownSays: ownSays(says, lastId, ME_USER_ID), ...(hold ? { hold } : {}), ...(seqMax ? { itemSeqMax: seqMax } : {}),

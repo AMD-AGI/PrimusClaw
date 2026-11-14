@@ -620,7 +620,7 @@ export class ToolRouter {
       const text = await this.routeAllowed(name, input, signal, answered, ctx, meta);
       failed = answered.isError;
       if (!failed) {
-        cite?.keep(name, answered.sources);
+        cite?.keep(name, answered.sources, input.url);
         cite?.keepLinks(name, text);
       }
       return text;

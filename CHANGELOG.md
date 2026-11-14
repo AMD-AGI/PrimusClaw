@@ -118,10 +118,18 @@ release version, and its `appVersion` stays `latest`.
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
+### Fixed
+
+- Asked for a project's latest release with its source, the assistant now links the release it read. It reads the latest
+  release at `https://github.com/<owner>/<repo>/releases/latest`, and the release page GitHub sends it to in the same
+  repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
+  reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
+  the assistant is told to search for the page and cite the result instead of dropping the source (#854).
+
 ## [0.5.5] - 2026-11-14
 
-Image `docker.io/primussafe/claw:202611141305` (commit 29a12de5), released as `docker.io/rocm/primusclaw:claw-0.5.5`. A patch
-release: asked which model it runs on, the assistant names its own model. No schema change, no new setting. Connector
+Image `docker.io/primussafe/claw:202611141305` (commit 29a12de5). It was not published as `docker.io/rocm/primusclaw:claw-0.5.5`:
+its change ships with the next release. A patch release: asked which model it runs on, the assistant names its own model. No schema change, no new setting. Connector
 requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
 
 ### Fixed

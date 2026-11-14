@@ -13,7 +13,7 @@
  * refused: a late call from the past must not speak to the user or change what a newer turn has decided.
  */
 import { randomUUID } from "node:crypto";
-import { CITE_DROPPED_META, CITE_SOURCES_META, parseSessionRepo } from "@claw/protocol";
+import { CITE_DROPPED_META, CITE_GITHUB_LATEST_RELEASE, CITE_SOURCES_META, parseSessionRepo } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_WORKER_MODEL, CLAW_DEPLOY_MODE, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import pino from "pino";
@@ -294,7 +294,7 @@ async function sayOnce(
   if (unlinked.length) {
     throw new ToolRefused(
       "citation_not_found",
-      `the text cites ${unlinked.map((n) => `[${n}]`).join(" ")} but no lookup of this turn returned the address given for ${unlinked.length > 1 ? "them" : "it"}, so the user would see a number that links nowhere. An address can be cited only as a web_search result's url, a GitHub result's url, or an address the user wrote; a page you fetched at an address you made up is not one (web_search for it first, then cite the result's url). Fix the sources or take those numbers out of the text, and call say again`,
+      `the text cites ${unlinked.map((n) => `[${n}]`).join(" ")} but no lookup of this turn returned the address given for ${unlinked.length > 1 ? "them" : "it"}, so the user would see a number that links nowhere. An address can be cited only as a web_search result's url, a GitHub result's url, an address the user wrote, or a release record the read rules name where it was read (a project's latest GitHub release at the release page of the same repository that its ${CITE_GITHUB_LATEST_RELEASE} fetch ended on); a page you fetched at an address you made up is not one. ${CITATION_NEXT_STEP}`,
     );
   }
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
@@ -335,6 +335,14 @@ async function identityRefusedHere(claims: AssistantTokenClaims): Promise<boolea
     return false;
   }
 }
+
+/**
+ * What a say refused as `citation_not_found` is told to do next. Told only to "fix the sources or take the numbers out", the router
+ * took the numbers and the sources out and answered with no source at all (a release-gate run, 2026-11-14, on a question that asked for one): the
+ * source is found, not dropped.
+ */
+export const CITATION_NEXT_STEP =
+  "Next step: call web_search for the page each of those numbers stands for, then call say again with the same text and, as its sources, the url each search result gave. Do not answer without the sources instead: take a number and its source out only when no lookup of this turn supports its sentence";
 
 /**
  * The numbers a say's text cites as [n] (`citedNumbers`) that carry no source once the turn's lookups were checked: [] unless the model

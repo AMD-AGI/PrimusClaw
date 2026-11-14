@@ -27,6 +27,9 @@
  *   said             true: the last turn must have answered with a message of its own: a say of the router's, or the plain text it
  *                    ended with, which the server says for it (`deliverUnsaidAnswer`). The system's own lines never count: the "on it"
  *                    line (`turnAckSayId`) and its notice for a turn that failed, was declined or said nothing (`SYSTEM_TURN_NOTICES`).
+ *   cited            true: the last turn's final answer must carry at least one source (the say's `sources`, each a link the channel
+ *                    shows), as one that asks where the answer came from does; an answer that names no source, or only names one in
+ *                    words, fails.
  *   facts            [{claim, oracle: {kind: static|api|fixture, value?, query?}}]; the final answer must name the value.
  *                    An `api` oracle is read at run time with the eval identity, in one of three forms (`oracleQuery`):
  *                      `/v1/...#<pick>`                a Claw API GET, e.g. `/v1/work-items?state=in_progress#data.length`
@@ -147,6 +150,7 @@ export interface EvalCase {
   tools_must?: string[];
   tools_must_not?: string[];
   said?: boolean;
+  cited?: boolean;
   facts?: Fact[];
   cards?: Cards;
   style?: { reply_lang?: "follow_user"; max_chars?: number; min_chars?: number; no_ids?: boolean };
@@ -267,6 +271,7 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
     out.push("delivers needs a name or a type for each file");
   }
   if (c.said !== undefined && typeof c.said !== "boolean") out.push(`said ${String(c.said)}`);
+  if (c.cited !== undefined && typeof c.cited !== "boolean") out.push(`cited ${String(c.cited)}`);
   if (c.route !== undefined && !ROUTES.includes(c.route)) out.push(`route ${c.route}`);
   if (c.cards !== undefined && !CARDS.includes(c.cards)) out.push(`cards ${c.cards}`);
   if (c.hold !== undefined) {
@@ -1086,6 +1091,8 @@ export interface Say {
   files: SaidFile[];
   /** The options of the choice the message puts to the user (its `choices`), in order; empty when it puts none. */
   choices: string[];
+  /** The addresses of the sources the message cites (its `sources`), in order; empty when it cites none. */
+  sources: string[];
 }
 
 export const saysOf = (events: readonly LiveEvent[]): Say[] => events
@@ -1104,6 +1111,8 @@ export const saysOf = (events: readonly LiveEvent[]): Say[] => events
       name: String(f.name), content_type: String(f.content_type ?? ""), item_id: typeof f.item_id === "string" ? f.item_id : null,
     })),
     choices: (Array.isArray(e.data.choices?.options) ? e.data.choices.options : []).filter((o: unknown) => typeof o === "string"),
+    sources: (Array.isArray(e.data.sources) ? e.data.sources : [])
+      .filter((x: any) => x && typeof x.url === "string" && x.url).map((x: any) => String(x.url)),
   }));
 
 /** The files the user was handed by these items' messages, in order. */
@@ -1463,6 +1472,8 @@ export interface Observed {
   final: string;
   /** The options of the choice the final answer put to the user (assistant mode; absent in baseline and in older recordings). */
   finalChoices?: number;
+  /** The addresses of the sources the final answer cites (assistant mode; absent in baseline and in older recordings). */
+  finalSources?: string[];
   firstReplyMs: number | null;
   finalMs: number | null;
   /** Per turn: when its own first reply arrived, from when it was sent. */
@@ -1691,6 +1702,12 @@ export function grade(c: EvalCase, o: Observed): Check[] {
     if (o.mode === "baseline") skip("said");
     else if (o.ownSays === null || o.ownSays === undefined) out.push({ name: "said", pass: false, unverified: true, detail: "the system's own lines could not be told apart" });
     else out.push({ name: "said", pass: o.ownSays > 0, detail: o.ownSays ? `${o.ownSays} message(s)` : "only the system's own lines" });
+  }
+  if (c.cited) {
+    // A baseline session's answer is plain text, with no sources to carry; a recording from before sources were kept has none read.
+    if (o.mode === "baseline") skip("cited");
+    else if (o.finalSources === undefined) out.push({ name: "cited", pass: false, unverified: true, detail: "the final answer's sources were not read" });
+    else out.push({ name: "cited", pass: o.finalSources.length > 0, detail: o.finalSources.length ? o.finalSources.join(" ") : "no source" });
   }
   (c.facts ?? []).forEach((f, k) => {
     const values = o.factValues[k] ?? null;
