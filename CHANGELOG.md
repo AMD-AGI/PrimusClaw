@@ -118,6 +118,19 @@ release version, and its `appVersion` stays `latest`.
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
+## [0.5.4] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141122` (commit dd8d4685), released as `docker.io/rocm/primusclaw:claw-0.5.4`. A patch
+release: the assistant answers greetings and questions about itself briefly. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers a greeting, a thanks or a sign-off in one short line, without listing what waits for the user, and a
+  question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
+  examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
+  self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command (#852).
+
 ## [0.5.3] - 2026-11-14
 
 Image `docker.io/primussafe/claw:202611140835` (commit 04efef14), released as `docker.io/rocm/primusclaw:claw-0.5.3`. A patch

@@ -20,6 +20,8 @@ export interface ChatSurface {
   readonly where: string;
   /** The plugin's rules that say how a reply is written for this channel, by name (`readToolsOfPlugin`). */
   readonly replyRules: readonly string[];
+  /** The command the person types in this channel for the full list of what the assistant can do, when it has one (`/help`). */
+  readonly help?: string;
 }
 
 /** What a client from before `channel_context.channel` was sent is: the Teams worker. */
@@ -30,7 +32,7 @@ export const CHAT_REPLY_RULE = "chat-reply-style";
 
 /** The channels with words and a rule of their own. */
 export const CHAT_SURFACES: Readonly<Record<string, ChatSurface>> = {
-  teams: { channel: "teams", where: "in Teams", replyRules: ["teams-reply-style"] },
+  teams: { channel: "teams", where: "in Teams", replyRules: ["teams-reply-style"], help: "/help" },
 };
 
 /** The longest channel id kept; a longer or odd one is no channel. */
