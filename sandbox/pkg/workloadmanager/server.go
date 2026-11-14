@@ -1590,7 +1590,7 @@ func (s *Server) handleTemplateGet(c *gin.Context) {
 }
 
 // handleTemplateUpdate handles PUT /v1/templates/:namespace/:name.
-// Permission: only owner or system-admin can update; only system-admin can change public status.
+// Permission: system-admin, or the owner of a private template; only system-admin can change public status.
 func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	if s.k8s == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
@@ -1618,9 +1618,9 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 		return
 	}
 
-	// Permission check: must be writable (system-admin or owner)
+	// Permission check: must be writable (system-admin, or owner of a private template)
 	if !isTemplateWritable(c, existing) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the template owner or system-admin can update this template"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can update this template"})
 		return
 	}
 
@@ -1639,7 +1639,7 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 }
 
 // handleTemplateDelete handles DELETE /v1/templates/:namespace/:name.
-// Permission: only owner or system-admin can delete.
+// Permission: system-admin, or the owner of a private template.
 func (s *Server) handleTemplateDelete(c *gin.Context) {
 	if s.k8s == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
@@ -1658,9 +1658,9 @@ func (s *Server) handleTemplateDelete(c *gin.Context) {
 		return
 	}
 
-	// Permission check: must be writable (system-admin or owner)
+	// Permission check: must be writable (system-admin, or owner of a private template)
 	if !isTemplateWritable(c, existing) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the template owner or system-admin can delete this template"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can delete this template"})
 		return
 	}
 

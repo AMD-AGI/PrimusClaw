@@ -56,7 +56,7 @@ Source: `pkg/router/server.go`
 | PATCH  | `/v1/sandbox/sessions/{id}/policy`        | Update egress policy                     |
 | GET    | `/v1/sandbox/sessions/{id}/logs`          | Get session logs                         |
 
-Any caller may create a private template in an admitted namespace and update or delete its own templates. Creating a public template, changing the `public` flag, and changing another user's template require the `system-admin` role.
+Any caller may create a private template in an admitted namespace and update or delete its own private templates. Creating a public template, changing the `public` flag, changing a public template, and changing another user's template require the `system-admin` role.
 
 ### Create a template (minimal)
 

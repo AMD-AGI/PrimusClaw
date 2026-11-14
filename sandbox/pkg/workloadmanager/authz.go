@@ -132,10 +132,10 @@ func isTemplateReadable(c *gin.Context, ci *runtimev1alpha1.CodeInterpreter) boo
 }
 
 // isTemplateWritable checks if the current user can update/delete this template.
-// Writable if: system-admin (canWriteAll) OR owner.
+// Writable if: system-admin (canWriteAll) OR owner of a private template.
 func isTemplateWritable(c *gin.Context, ci *runtimev1alpha1.CodeInterpreter) bool {
 	if canWriteAll(c) {
 		return true
 	}
-	return isOwnerOfTemplate(c, ci)
+	return !isTemplatePublic(ci) && isOwnerOfTemplate(c, ci)
 }

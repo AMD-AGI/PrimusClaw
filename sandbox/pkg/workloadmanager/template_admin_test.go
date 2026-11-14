@@ -63,3 +63,30 @@ func TestTemplateWritesByOwner(t *testing.T) {
 		t.Fatal("template still exists after owner delete")
 	}
 }
+
+// TestPublicTemplateWritesNeedSystemAdmin checks that once a template is public
+// its owner can no longer update or delete it, and system-admin still can.
+func TestPublicTemplateWritesNeedSystemAdmin(t *testing.T) {
+	rig := newWMRig(t, wmAdmitter(t, true), true)
+	body := `{"name":"shared","namespace":"admitted",` + templateSpec + `}`
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", body); w.Code != http.StatusCreated {
+		t.Fatalf("owner create = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	path := "/v1/templates/admitted/shared"
+	if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodPut, path, `{"public":true,`+templateSpec+`}`); w.Code != http.StatusOK {
+		t.Fatalf("admin publish = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPut, path, `{`+templateSpec+`}`); w.Code != http.StatusForbidden {
+		t.Fatalf("owner update of a public template = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodDelete, path, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("owner delete of a public template = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodPut, path, `{`+templateSpec+`}`); w.Code != http.StatusOK {
+		t.Fatalf("admin update of a public template = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodDelete, path, ""); w.Code >= 300 {
+		t.Fatalf("admin delete of a public template = %d, want success: %s", w.Code, w.Body.String())
+	}
+}
