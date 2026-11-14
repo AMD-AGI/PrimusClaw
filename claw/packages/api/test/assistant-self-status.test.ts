@@ -60,7 +60,7 @@ test("S1 the router is told who it is, by the name its client gives or by none, 
 test("S6 a greeting or a question about the assistant is answered short, with the channel's help command for the full list", () => {
   // router-self-v3 (nightly 2026-11-13: "who are you" 480 characters against 400, "hello" 265 against 200, a sign-off that listed
   // the cards waiting): each kind of social turn has its budget, every one under the shortest the eval allows for that kind.
-  assert.equal(ROUTER_SELF_PROMPT_VERSION, "router-self-v3");
+  assert.equal(ROUTER_SELF_PROMPT_VERSION, "router-self-v4");
   assert.ok(SOCIAL_REPLY_CHARS <= 100 && SELF_INTRO_CHARS <= 300 && CAPABILITIES_CHARS <= 450);
   for (const self of [true, false]) {
     const teams = renderRouterSelfSection(self, undefined, "Helper");
@@ -69,6 +69,8 @@ test("S6 a greeting or a question about the assistant is answered short, with th
     assert.match(teams, new RegExp(`What you can do, .*: under about ${CAPABILITIES_CHARS} characters: at most four short examples`));
     assert.match(teams, /End it with one line saying that \/help lists everything you can do/);
     assert.match(teams, /Never answer these with every tool, system or capability you have\./);
+    // router-self-v4: the model question is answered with the model the turn's state names as the assistant's own.
+    assert.match(teams, /Which model you run on \(你用的什么模型, which model are you\): the one the turn's state names as yours, alone, in a line or two; the models work items and reviews run on are not yours\./);
     // The section stays ahead of the counting rules, which other tests read from the end.
     assert.ok(teams.indexOf("Greetings and questions about you") < teams.indexOf("Counting what a lookup returned"));
   }
