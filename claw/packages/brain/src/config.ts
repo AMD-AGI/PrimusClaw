@@ -1707,6 +1707,10 @@ export const MCP_POOL_IDLE_MS = envInt("MCP_POOL_IDLE_MS", 600_000, { min: 1_000
 // then is left out of that turn, said to the model, logged as mcp_client.connect_deferred, and keeps connecting for the
 // next turn. 0: wait for every server however long it takes.
 export const MCP_CONNECT_BUDGET_MS = envInt("MCP_CONNECT_BUDGET_MS", 2_000, { min: 0 });
+// How long a turn waits for a server it cannot work without (`connectPlatformMcp`'s `required`): the review tools of a review
+// session, whose turn has nothing else to do. A cold connection can take longer than MCP_CONNECT_BUDGET_MS, and a review run
+// without its tools ends having done nothing. Never shorter than MCP_CONNECT_BUDGET_MS. 0: wait for it however long it takes.
+export const MCP_REQUIRED_CONNECT_BUDGET_MS = envInt("MCP_REQUIRED_CONNECT_BUDGET_MS", 30_000, { min: 0 });
 
 // --- LLM streaming timeouts (SSE-style response body) ---
 // Aligned to LiteLLM gateway's read=600s to avoid client-side aborts that

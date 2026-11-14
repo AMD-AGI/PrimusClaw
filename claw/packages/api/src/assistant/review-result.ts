@@ -21,6 +21,9 @@
  * their own review or the person who asked someone else for it, within what that person may know of it (`requester-view.ts`): the pull
  * request, its head, and that it has no new commits since that head was reviewed; then that it waits for CI on that head before it is run
  * once more, or why it does not.
+ *
+ * And a review whose turns called no review tool at all, twice (`not_run`; 2026-11-13, N31): it read and posted nothing, the reviewer has
+ * nothing to look at, and the one who asked is told that it did not run and to ask again, the same way.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
@@ -196,6 +199,30 @@ export function unchangedText(kind: "unchanged_wait" | "unchanged", f: Unchanged
   return [title, "", same, ...(why ? [zh ? `- ${why}。` : `- ${why.charAt(0).toUpperCase()}${why.slice(1)}.`] : []), next, link].join("\n");
 }
 
+/** What whoever asked for a review whose turns called no review tool is told (`not_run`), by language. */
+export function notRunText(f: { pr: string; url: string; seq: number; forRequester: boolean; ranOnce?: boolean }, zh: boolean): string {
+  const again = f.forRequester
+    ? (zh ? "再请一次评审" : "ask for the review again")
+    : (zh ? `回复 \`再审 #${f.seq}\`` : `reply \`review again #${f.seq}\``);
+  return zh
+    ? [
+      `**${f.forRequester ? "你请人评审的 " : ""}${f.pr} 这次没审成：评审工具没有响应**`, "",
+      f.ranOnce
+        ? "- 评审没能用上 GitHub 评审工具，什么也没读、没发，PR 上没有任何改动；也没能自动再跑一次。"
+        : "- 评审跑了两次，都没能用上 GitHub 评审工具，什么也没读、没发，PR 上没有任何改动。",
+      `- 接下来：稍后${again}。`,
+      `- PR：${f.url}`,
+    ].join("\n")
+    : [
+      `**${f.pr}${f.forRequester ? ", which you asked to be reviewed," : ""} was not reviewed: the review tools did not respond**`, "",
+      f.ranOnce
+        ? "- The review could not use the GitHub review tools: it read and posted nothing, nothing changed on the pull request, and it could not be run again by itself."
+        : "- The review ran twice and could not use the GitHub review tools either time: it read and posted nothing, and nothing changed on the pull request.",
+      `- Next: ${again} in a while.`,
+      `- The pull request: ${f.url}`,
+    ].join("\n");
+}
+
 /** The checks a `ci_not_green` refusal named on its audit row (`ciEvidence` in the review service): failed and not finished. */
 export function ciNamesOf(riskReasons: unknown): { failed: string[]; pending: string[] } {
   const lines = Array.isArray(riskReasons) ? riskReasons.filter((x): x is string => typeof x === "string") : [];
@@ -234,9 +261,25 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
     )).rows[0] as { item_id: string; user_id: string; seq: number; params: Record<string, unknown> | null; worker_session_id: string; kind: string } | undefined;
     if (!item || item.kind !== "review" || !item.params) return skipped("no_review_item");
     const requester = typeof item.params.requested_by === "string" && item.params.requested_by ? item.params.requested_by : null;
-    if (requester && kind !== "unchanged_wait" && kind !== "unchanged") return skipped("asked_by_someone_else");
+    if (requester && kind !== "unchanged_wait" && kind !== "unchanged" && kind !== "not_run") return skipped("asked_by_someone_else");
     const pr = item.params.pr as { owner?: unknown; repo?: unknown; number?: unknown } | undefined;
     if (!pr || typeof pr.owner !== "string" || typeof pr.repo !== "string" || typeof pr.number !== "number") return skipped("no_pr");
+    if (kind === "not_run") {
+      // Told to whoever asked: the person who asked someone else for it, or the owner of their own review.
+      const forRequester = requester !== null && requester !== item.user_id;
+      const to = forRequester ? requester! : item.user_id;
+      // (a re-run that could not be queued: the review ran once, not twice)
+      const ranOnce = (item.params.empty_rerun as { reason?: unknown } | undefined)?.reason === "not_queued";
+      const facts = { pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq), forRequester, ranOnce };
+      const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [to])).rows[0]?.session_id as string | undefined;
+      if (!sessionId) return skipped(forRequester ? "requester_has_no_assistant" : "owner_has_no_assistant");
+      const told = await reviewResultPorts.recordSystemNotice({
+        userId: to, sessionId, text: notRunText(facts, await personWritesChinese(q, to)), key: `review_result:${item.item_id}:not_run`,
+      });
+      if (told === null) return skipped("already_told");
+      logger.info({ itemId, kind, pr: facts.pr, toRequester: forRequester }, "assistant.review_result_told");
+      return true;
+    }
     if (kind === "unchanged_wait" || kind === "unchanged") {
       if (requester === item.user_id) return skipped("requested_by_is_owner");
       const to = requester ?? item.user_id;
