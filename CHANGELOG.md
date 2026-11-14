@@ -118,6 +118,24 @@ release version, and its `appVersion` stays `latest`.
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
 
+## [0.5.3] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140835` (commit 04efef14), released as `docker.io/rocm/primusclaw:claw-0.5.3`. A patch
+release: a review asked of someone else no longer wakes the reviewer when it never reached its tools or found its pull
+request already merged. No schema change. One new optional setting, `MCP_REQUIRED_CONNECT_BUDGET_MS` (Brain, default
+30000), which needs no change to take effect. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Reviews asked of someone else: a review turn now waits for its `github_review` tools for up to
+  `MCP_REQUIRED_CONNECT_BUDGET_MS` (default 30 s, never shorter than `MCP_CONNECT_BUDGET_MS`; 0 waits however long it takes)
+  instead of the 2 s every other MCP server gets, so a cold connection no longer ends the review having done nothing. A review
+  whose turn still called no review tool is run once more by itself; if that also does nothing, the item closes and whoever
+  asked for the review is told to ask again. The reviewer is not asked to look at it (#850).
+- A review that ran again on new commits and found the pull request already merged (its approval or merge refused
+  `already_merged`) ends as accepted, and writes made on a head the review has since moved past no longer decide its state.
+  Before, a merged pull request could still be handed to the reviewer (#850).
+
 ## [0.5.2] - 2026-11-14
 
 Image `docker.io/primussafe/claw:202611140544` (commit 26e87d49), released as `docker.io/rocm/primusclaw:claw-0.5.2`. A patch
