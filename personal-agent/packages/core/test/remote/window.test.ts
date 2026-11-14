@@ -4,6 +4,7 @@
 // The session card as the window: when it is posted again, and the output it holds (`remote/window/`).
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { windowView } from "../../src/remote-view/window-view.js";
 import { modeFlagOf } from "../../src/remote/state.js";
 
 import {
@@ -114,6 +115,41 @@ test("where typed text goes is said in the chat's language", () => {
   assert.equal(
     modeSetLine("card", "zh", false, "PrimusClaw Assistant"),
     "好的：接入会话后，聊天框留给 PrimusClaw Assistant，发给会话用会话卡片上的输入框。",
+  );
+});
+
+test("a group's session card says its @-messages go to the session and how to get back", () => {
+  assert.equal(
+    chatBoxLine("group", "zh", "PrimusClaw Assistant"),
+    "在这个群里你 @PrimusClaw Assistant 说的话都发给这个会话（其他人 @PrimusClaw Assistant 仍是跟 PrimusClaw Assistant 说），卡片上的输入框也发给它。" +
+      "想回到 PrimusClaw Assistant：点「回到助理」，或说「@PrimusClaw Assistant 回到助理」。",
+  );
+  assert.ok(
+    chatBoxLine("group", "en", "PrimusClaw Assistant").startsWith(
+      "In this group, what you say to @PrimusClaw Assistant goes to this session",
+    ),
+  );
+  const input = {
+    label: "🟠 Claude Code",
+    host: "dev-pod",
+    cwd: "/repo",
+    mode: "default",
+    sessionId: "s-1",
+    phase: "idle" as const,
+    at: 0,
+    lang: "en" as const,
+    view: new WindowView(),
+    approvals: [],
+    bot: "PrimusClaw Assistant",
+  };
+  const ops = (group: boolean) => windowView({ ...input, group }).actions.map((a) => a.op);
+  assert.deepEqual(ops(false), ["send", "stop", "detach", "switch"]);
+  assert.deepEqual(ops(true), ["send", "stop", "detach"]); // (the lists are the binder's own: a 1:1 chat's)
+  assert.ok(windowView({ ...input, group: true }).chatBox.startsWith("In this group,"));
+  assert.ok(
+    windowView({ ...input, group: false }).chatBox.startsWith(
+      "What you type in the chat box goes to PrimusClaw Assistant;",
+    ),
   );
 });
 

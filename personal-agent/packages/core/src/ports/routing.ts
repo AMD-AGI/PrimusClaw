@@ -54,6 +54,11 @@ export interface ClickRoute extends RouteBase {
    * edit once the outcome was said.
    */
   settle(card: OutMessage | string, options?: SettleOptions): Promise<boolean>;
+  /**
+   * In a group chat: the presser's credential, read as their @-messages in that group read it (undefined: none, or not just
+   * now). Read only when needed; never asks the person to connect. Absent in a 1:1 chat (`withCredential` is given it).
+   */
+  readonly groupCredential?: () => Promise<string | undefined>;
 }
 
 /** A message read before the router's own reading of it. */
