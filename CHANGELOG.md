@@ -143,6 +143,14 @@ release version, and its `appVersion` stays `latest`.
   repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
   reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
   the assistant is told to search for the page and cite the result instead of dropping the source.
+- Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
+  window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
+  quoting the card reached the session), and every button on the group's session card answered "That button is not active
+  any more". Now each @-message of the binder goes to the session, and the card's Send, Stop, Mode, Full output and Back to
+  assistant work for the binder, as they do in a 1:1 chat. The card says how to get back: press Back to assistant, or say
+  "@bot back to the assistant". Another member's @-messages still go to the assistant, and their press on the card leaves it
+  as it was. The group's card has no Switch button and never shows the binder's lists of sessions and machines; those stay in
+  a 1:1 chat. 1:1 chats are unchanged.
 
 ## [0.5.0] - 2026-11-13
 

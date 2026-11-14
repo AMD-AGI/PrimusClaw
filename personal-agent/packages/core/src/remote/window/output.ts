@@ -70,6 +70,7 @@ export function sentLabel(source: SentFrom, lang: Lang): string {
  */
 export function chatBoxLine(window: string, lang: Lang, bot: string): string {
   const words = remoteWindowText.in(lang);
+  if (window === "group") return words.chatBoxGroup({ bot }); // (a group's @-messages go to the session it is bound to)
   return window === "card" ? words.chatBoxCard({ bot }) : words.chatBoxChat({ bot });
 }
 

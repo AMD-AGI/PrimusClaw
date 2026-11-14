@@ -22,7 +22,8 @@ export interface GroupWords {
 /**
  * A group chat bound to one of the sender's agent sessions (one group, one session at a time; the Python
  * `Agent._group_remote`). "切到 X 上的 claude" (`/agent attach REF`) binds the group for the sender, "回到助理"
- * (`/agent detach`) unbinds it; while bound, the sender's @-messages go to that session and "停掉它" stops its turn. The
+ * (`/agent detach`) unbinds it; while bound, the sender's @-messages go to that session (whether the session card is the
+ * window or not) and "停掉它" stops its turn. The
  * binding is the sender's own: another member's message is never read by it. False: not a message about the binding.
  */
 export class GroupRemote {
@@ -79,11 +80,10 @@ export class GroupRemote {
       return true;
     }
     if (!choice && parseCommand(words.text) !== null) return false; // (the group's own commands stay the bot's)
-    let quote = words.quote;
-    if (remote.windowMode(bound.id) === "card") {
-      if (!remote.quotesWindow(bound.id, message)) return false; // (the card is the window: the @-message is the bot's)
-      quote = "";
-    }
+    // Every @-message of the binder goes to the session, whatever the chat box mode: in a group the bot is only ever reached by
+    // an @-mention, so the 1:1 "chat box stays the bot's" reading would leave nothing that reaches the session. "回到助理" (or the
+    // card's button) is the way back. A reply quoting the session card names the session, not what to read: only the words go.
+    const quote = remote.quotesWindow(bound.id, message) ? "" : words.quote;
     const prompt = this.ctx.deps.messageText.withQuote(words.sent, quote);
     const files = await this.text.attachments(message, chat, true);
     if (!prompt) return files.length > 0; // (files alone: told they do not go; nothing is sent to the agent)

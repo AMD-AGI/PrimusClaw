@@ -158,6 +158,10 @@ export const remoteAgentText = defineCatalog({
     whichMachineNone: "Which machine? Use `/agent off NAME`. You have no machine connected.",
     notAttachedCard: "You are not attached to a remote session.",
     otherSessionCard: "That card is for another session. This chat is attached to a different one: use its buttons.",
+    groupNotYours: "Only the person who switched this group to the session can use its card.",
+    groupCardOnly: (p: { bot: string }) =>
+      `In a group, the session card acts only on its session. To switch to another one, say ` +
+      `"@${p.bot} switch to the claude session on MACHINE"; the lists of sessions and machines are in a 1:1 chat with me.`,
     pairHead: "To connect a new machine:",
     pairAbove: " the command is in the message above; run it on that machine.",
     emptySend: "Write in the box first, then press Send.",
@@ -303,6 +307,9 @@ export const remoteAgentText = defineCatalog({
     whichMachineNone: "Which machine? Use `/agent off NAME`. You have no machine connected.",
     notAttachedCard: "你还没有接入远程会话。",
     otherSessionCard: "这张卡片属于另一个会话。这个聊天接入的是别的会话：用那个会话的按钮。",
+    groupNotYours: "只有把这个群切到这个会话的人能用这张卡。",
+    groupCardOnly: (p) =>
+      `群里的会话卡只管这一个会话。要换会话，在群里说「@${p.bot} 切到 机器名 上的 claude 会话」；会话和机器的列表在和我的 1:1 聊天里。`,
     pairHead: "连接新机器：",
     pairAbove: "命令在上面的消息里，在那台机器上运行它。",
     emptySend: "先在输入框里写好，再按发送。",

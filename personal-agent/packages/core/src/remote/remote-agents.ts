@@ -17,6 +17,8 @@ import type { ClickHandler, ClickRoute } from "../ports/routing.js";
 import type { Conversation, InboundMessage, UserRef } from "../ports/surface.js";
 import { neutral } from "./inert.js";
 import { remoteText } from "../locales/remote.js";
+import { remoteAgentText } from "../locales/remote-agents.js";
+import type { RemoteState } from "../ports/store/remote.js";
 import type { Attachment, RemoteAgentCommand, RemoteChat, RemotePrompt } from "../routing/features.js";
 import { StatusBoard } from "./board.js";
 import { groupChatKey, personOf } from "./chat-key.js";
@@ -46,6 +48,9 @@ import { windowCloser } from "./window/closer.js";
 import { quotesWindow } from "./window/index.js";
 import { chatBoxLine } from "./window/output.js";
 import { own } from "../own.js";
+
+/** What a tap on a group's session card may do: act on the bound session, or bind it again from its own card. */
+const GROUP_OPS: ReadonlySet<string> = new Set(["send", "stop", "detach", "mode", "set_mode", "row", "full", "attach"]);
 
 /** How long the assistant's context waits for a session's watch marker to be read back. */
 export const CHAT_CONTEXT_WATCH_SECONDS = 2.0;
@@ -314,7 +319,72 @@ export class RemoteAgents implements RemoteChat {
     return {
       verbs: ["remote", "remote_decision", "remote_off"],
       withCredential: (click, credential) => this.onClick(click, credential),
+      inGroup: (click) => this.onGroupClick(click),
     };
+  }
+
+  /**
+   * A tap on a group's session card (the binding of the presser in that group, keyed as its messages are). Only the binder's own
+   * card answers, and only for what acts on the bound session; the lists of sessions and machines stay in a 1:1 chat. A press
+   * on someone else's card leaves it as it was and says whose it is. False: not a button a group answers (the router's note).
+   */
+  private async onGroupClick(route: ClickRoute): Promise<boolean> {
+    if (!this.enabled || route.action.data["primusclaw"] !== "remote") return false; // (approvals stay in the binder's 1:1)
+    const chatKey = groupChatKey(route.sender.id, route.scope);
+    const data = route.action.data;
+    const op = typeof data["op"] === "string" ? data["op"] : "";
+    const tapped = route.action.cardMessageId;
+    const lang = this.state.lang(chatKey);
+    const words = remoteAgentText.in(lang);
+    const state = this.state.attached(chatKey);
+    const own =
+      op === "attach"
+        ? tapped !== "" && this.ctx.remoteState.getRemote(chatKey)?.statusCard === tapped // ("Back to this session")
+        : state !== null && state.sessionId === data["session_id"] && data["view"] !== "agents";
+    if (!own) {
+      const owner = this.ownerOf(route.scope, tapped, chatKey);
+      if (owner !== null) {
+        const card = this.board.statusOf(owner.chatKey, owner.state, this.state.phase(owner.chatKey));
+        await route.settle(card.message, { fallback: words.groupNotYours }); // (the binder's card stays as it was)
+      } else await route.settle(state === null ? words.notAttachedCard : words.otherSessionCard);
+      return true;
+    }
+    if (!GROUP_OPS.has(op)) {
+      const line = words.groupCardOnly({ bot: this.ctx.settings.botName });
+      if (state === null) await route.settle(line);
+      else
+        await route.settle(this.board.statusOf(chatKey, state, this.state.phase(chatKey)).message, { fallback: line });
+      return true;
+    }
+    const credential = await this.ctx.credentialFor(route.sender.id); // (the binder's, as the binding's follower reads with)
+    if (!credential) {
+      await route.settle(saidIn(lang, "tapInactive"));
+      return true;
+    }
+    await this.tap({
+      chatKey,
+      key: credential,
+      provider: undefined,
+      to: route.conversation,
+      tapped,
+      data,
+      id: route.action.id,
+      settle: (card, options) => route.settle(card, options),
+    });
+    return true;
+  }
+
+  /** The binding in group `scope` whose card `tapped` is, when it is not `presser`'s (null: nobody's now). */
+  private ownerOf(scope: string, tapped: string, presser: string): { chatKey: string; state: RemoteState } | null {
+    if (!tapped) return null;
+    for (const chatKey of this.ctx.remoteState.remoteAttachedUsers()) {
+      if (chatKey === presser || chatKey !== groupChatKey(personOf(chatKey), scope)) continue;
+      const stored = this.ctx.remoteState.getRemote(chatKey);
+      const state = this.state.attached(chatKey);
+      if (stored === null || state === null) continue;
+      if (stored.statusCard === tapped || stored.windowCards.includes(tapped)) return { chatKey, state };
+    }
+    return null;
   }
 
   private async onClick(route: ClickRoute, credential: string): Promise<void> {
