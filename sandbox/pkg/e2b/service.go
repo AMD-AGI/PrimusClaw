@@ -244,9 +244,11 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
-		s.grants.AuditDenied(ctx, grantID, "", err)
-		return SandboxResponse{}, 0, err
+	if !(tpl.User && who.owner && who.admin) {
+		if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
+			s.grants.AuditDenied(ctx, grantID, "", err)
+			return SandboxResponse{}, 0, err
+		}
 	}
 	pending, err := pendingWait(tpl.Pending, body.Metadata[pendingTimeoutMetadata])
 	if err != nil {

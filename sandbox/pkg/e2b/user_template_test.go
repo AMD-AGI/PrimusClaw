@@ -44,6 +44,7 @@ func wantNotFound(t *testing.T, err error, id string) {
 
 // TestIdentityKeyUserTemplates checks that an identity key runs its own and
 // public user templates in the template workspace, and that any other id is 404.
+// A system-admin identity key may use any user template and pass env vars.
 func TestIdentityKeyUserTemplates(t *testing.T) {
 	ids := &fakeIntrospector{tokens: map[string]identity.Token{
 		"ak-alice": {Subject: "u-1"},
@@ -87,8 +88,11 @@ func TestIdentityKeyUserTemplates(t *testing.T) {
 	if got := runner.created[len(runner.created)-1].Workspace; got != "prod" {
 		t.Fatalf("public template workspace = %q, want prod", got)
 	}
-	if _, _, err := plane.Create(ctx, "ak-admin", CreateBody{TemplateID: "bob-tpl"}); err != nil {
-		t.Fatalf("admin on a private template: %v", err)
+	if _, _, err := plane.Create(ctx, "ak-admin", CreateBody{TemplateID: "bob-tpl", EnvVars: map[string]string{"FOO": "1"}}); err != nil {
+		t.Fatalf("admin on a private template with env: %v", err)
+	}
+	if got := runner.created[len(runner.created)-1].Env["FOO"]; got != "1" {
+		t.Fatalf("admin env FOO = %q, want 1", got)
 	}
 }
 

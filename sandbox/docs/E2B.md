@@ -70,7 +70,7 @@ A user creates a template for a workspace with `POST /v1/templates` and the `wor
 - The template id is matched exactly: first against the caller's policy or grant, then against user templates. An id that matches neither returns `404 template_not_found`.
 - A caller may use its own templates and public templates. Another user's private template returns `404 template_not_found`; a `system-admin` SaFE API key may use any.
 - The sandbox runs in the template workspace. A SaFE API key must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`). A grant key must list it (`403 workspace_not_allowed`).
-- The quota of the caller applies. A user template accepts no environment variables from the caller.
+- The quota of the caller applies. A user template accepts no environment variables from the caller, except from a `system-admin` SaFE API key.
 
 ## Quotas
 
