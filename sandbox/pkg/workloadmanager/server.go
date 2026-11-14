@@ -122,6 +122,8 @@ type Server struct {
 	wg         sync.WaitGroup
 	auditStore audit.AuditStore // nil when audit disabled
 	builder    *builder.Builder // nil when image building not configured
+	// ownerPolicy is nil until the owner policy store is attached.
+	ownerPolicy *grant.OwnerPolicyStore
 }
 
 // New creates a new Workload Manager server.
@@ -289,6 +291,9 @@ func (s *Server) setupRoutes() {
 	templates.GET("/:namespace/:name", s.handleTemplateGet)
 	templates.PUT("/:namespace/:name", s.handleTemplateUpdate)
 	templates.DELETE("/:namespace/:name", s.handleTemplateDelete)
+
+	// Owner policy templates: the templates identity keys may use.
+	s.mountOwnerPolicyRoutes(v1.Group("/admin/owner-policy/templates"))
 
 	// Sandbox policy management (§4.1 egress control) — stored on the SandboxPolicy CR.
 	// Dual-read, same wildcard rule as sessions: the SDK percent-encodes the

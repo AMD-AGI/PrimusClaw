@@ -61,6 +61,27 @@ Sealed rules:
 
 A template that is not sealed allows commands and file access in the sandbox.
 
+### Managing policy templates
+
+When the policy comes from a ConfigMap (`controlplane.config.identity.ownerPolicyConfigMap`), a `system-admin` manages its templates through the management API. The control plane must run with caller auth; every other caller gets 403.
+
+| Method | Path                                         | Description                         |
+| ------ | -------------------------------------------- | ----------------------------------- |
+| GET    | `/v1/admin/owner-policy/templates`           | List the policy templates           |
+| GET    | `/v1/admin/owner-policy/templates/{name}`    | Get one policy template             |
+| PUT    | `/v1/admin/owner-policy/templates/{name}`    | Add or replace one policy template  |
+| DELETE | `/v1/admin/owner-policy/templates/{name}`    | Remove one policy template          |
+
+The PUT body is one template entry of the policy, without the name:
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  https://<safe-host>/v1/admin/owner-policy/templates/measurement \
+  -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
+```
+
+A write validates the new policy, stores it in the ConfigMap, and then applies it. A rejected policy is not stored and returns the error. The last template cannot be removed. Every replica reloads the ConfigMap every 15 seconds and applies it; only the leader replica creates, updates and deletes the template objects, so a new template can take up to one sync to appear on a follower. A caller's template list follows on the next create. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy; a rejected policy is tried again every 5 minutes.
+
 ## Quotas
 
 Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user. A field the policy leaves out keeps the built-in value; a field left out of one user's quota comes from the user or `system-admin` quota of that user.

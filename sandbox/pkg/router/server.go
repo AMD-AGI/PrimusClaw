@@ -231,6 +231,12 @@ func (s *Server) setupRoutes() {
 	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
 	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.proxyToWM)
 
+	// Owner policy templates (system-admin only, checked by WM).
+	v1.GET("/admin/owner-policy/templates", s.proxyToWM)
+	v1.GET("/admin/owner-policy/templates/:name", s.proxyToWM)
+	v1.PUT("/admin/owner-policy/templates/:name", s.proxyToWM)
+	v1.DELETE("/admin/owner-policy/templates/:name", s.proxyToWM)
+
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
 
