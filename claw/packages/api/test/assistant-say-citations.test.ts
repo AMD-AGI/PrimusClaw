@@ -143,7 +143,7 @@ test("SC4 a router turn cites with say, from the API's GitHub server when it has
   // router-cite-v5 (parity R1): the release records the read rules name are citable where they were read, and Brain keeps them.
   assert.match(on, /https:\/\/dl\.k8s\.io\/release\/stable\.txt, read there, is cited at that address/);
   // router-cite-v6: the read rules' other release record, a project's latest GitHub release, is cited at the page the fetch ended on.
-  assert.match(on, /a project's latest GitHub release, read with web_fetch at https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest, is cited at the release page that fetch ended on/);
+  assert.match(on, /a project's latest GitHub release, read with web_fetch at https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest, is cited at the release page of that same repository that fetch ended on/);
   assert.equal(ROUTER_CITE_PROMPT_VERSION, "router-cite-v6");
   assert.doesNotMatch(on, /with the links for what came from the web/);
   assert.match(off, /with the links for what came from the web/);

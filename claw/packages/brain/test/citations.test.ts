@@ -17,7 +17,8 @@
  *   C9 a page web_fetch read is a source only at an address a search or GitHub result or the user's message gave first: a link a
  *      result's text names, fetched and cited, is dropped, from the cache too
  *   C11 a project's latest GitHub release, read at its latest-release address, is kept at the release page the fetch ended on and at
- *       the address asked for; a redirect anywhere else, another page of a repository or a look-alike host is not
+ *       the address asked for, also when a search kept the page first; a redirect anywhere else, another page of a repository or a
+ *       look-alike host is not
  *   C12 `route()`: the read rules' GitHub latest-release fetch, redirected to its tag page, is cited by the say that names either
  *       address, from the cache too; a fetch that ends elsewhere is dropped
  *   C10 a link server's (the agent board's) result objects are sources by their own `html_url` under the server's prefix: the say of
@@ -439,6 +440,18 @@ test("C11 a project's latest GitHub release read at its latest-release address i
   const page = { url: TAG, title: "github.com/vllm-project/vllm/releases/tag/v0.33.0rc3", kind: "web" };
   assert.deepEqual(meta[CITE_SOURCES_META], [{ n: 1, ...page }, { n: 2, ...page }], "either address links to the page that was read");
   assert.deepEqual(meta[CITE_DROPPED_META], { not_in_turn: 0, invalid: 0, over_cap: 0 });
+  // A search found the release page first: the fetch at the latest-release address still names it.
+  const searched = parseCite({ tools: [SAY] }, {})!;
+  searched.keep("web_search", [webSource(TAG, "Release v0.33.0rc3")]);
+  searched.keep("web_fetch", [webSource(TAG)], LATEST);
+  assert.equal(searched.size, 2);
+  const both = { url: TAG, title: "Release v0.33.0rc3", kind: "web" };
+  assert.deepEqual(searched.metaFor(SAY, { text: "[1] [2]", sources: [LATEST, TAG] })![CITE_SOURCES_META], [{ n: 1, ...both }, { n: 2, ...both }],
+    "the address asked for links to the page as the search kept it");
+  const otherRepo = parseCite({ tools: [SAY] }, {})!;
+  otherRepo.keep("web_search", [webSource("https://github.com/acme/other/releases/tag/v1", "v1")]);
+  otherRepo.keep("web_fetch", [webSource("https://github.com/acme/other/releases/tag/v1")], "https://github.com/acme/tool/releases/latest");
+  assert.equal(otherRepo.size, 1, "a kept page of another repository gives the address asked for nothing");
   const other = new RunCitations(new Set([SAY]), new Set(["github"]));
   other.keep("mcp__github__pr_get", [{ url: TAG, title: "t", kind: "web" }], LATEST);
   assert.equal(other.size, 1, "another producer keeps what it gave, and nothing beside it for the address it was not asked for");

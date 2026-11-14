@@ -131,8 +131,14 @@ export class RunCitations {
     for (const raw of sources) {
       const source = citeSource(raw);
       const key = source && citeKey(source.url);
-      if (!source || !key || this.kept.has(key)) continue;
+      if (!source || !key) continue;
       const release = name === CONFIRMING_TOOL && githubLatestRelease(asked, key);
+      // The latest-release address the call asked for names the release page it led to, so a say citing either links there; the
+      // page may be kept already (a search found it), and the address asked for is still added.
+      const alias = (): void => {
+        if (release && asked && !this.kept.has(asked) && this.kept.size < RUN_SOURCES_MAX) this.kept.set(asked, this.kept.get(key) ?? source);
+      };
+      if (this.kept.has(key)) { alias(); continue; }
       if (name === CONFIRMING_TOOL && !this.userKeys.has(key) && !release) {
         // Host only: the address came from what the model read, and its path or query may carry anything.
         logger.info({ tool: name, host: new URL(key).host }, "cite.fetch_not_confirmed");
@@ -143,8 +149,7 @@ export class RunCitations {
         return;
       }
       this.kept.set(key, source);
-      // The latest-release address the call asked for names the release page it led to, so a say citing either links there.
-      if (release && asked && !this.kept.has(asked) && this.kept.size < RUN_SOURCES_MAX) this.kept.set(asked, source);
+      alias();
     }
   }
 

@@ -90,7 +90,7 @@ describe("say with citations, on a real Postgres", { skip }, () => {
       assert.ok(told.includes(CITATION_NEXT_STEP), told);
       assert.match(told, /call web_search for the page each of those numbers stands for, then call say again with the same text/);
       assert.match(told, /Do not answer without the sources instead/);
-      assert.match(told, /latest GitHub release at the release page its https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest fetch ended on/);
+      assert.match(told, /latest GitHub release at the release page of the same repository that its https:\/\/github\.com\/<owner>\/<repo>\/releases\/latest fetch ended on/);
       const text = "#309 已合入 [1]，CI 全绿。";
       const res = await router.callTool({
         name: "say",

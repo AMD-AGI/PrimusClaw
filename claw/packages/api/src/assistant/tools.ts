@@ -294,7 +294,7 @@ async function sayOnce(
   if (unlinked.length) {
     throw new ToolRefused(
       "citation_not_found",
-      `the text cites ${unlinked.map((n) => `[${n}]`).join(" ")} but no lookup of this turn returned the address given for ${unlinked.length > 1 ? "them" : "it"}, so the user would see a number that links nowhere. An address can be cited only as a web_search result's url, a GitHub result's url, an address the user wrote, or a release record the read rules name where it was read (a project's latest GitHub release at the release page its ${CITE_GITHUB_LATEST_RELEASE} fetch ended on); a page you fetched at an address you made up is not one. ${CITATION_NEXT_STEP}`,
+      `the text cites ${unlinked.map((n) => `[${n}]`).join(" ")} but no lookup of this turn returned the address given for ${unlinked.length > 1 ? "them" : "it"}, so the user would see a number that links nowhere. An address can be cited only as a web_search result's url, a GitHub result's url, an address the user wrote, or a release record the read rules name where it was read (a project's latest GitHub release at the release page of the same repository that its ${CITE_GITHUB_LATEST_RELEASE} fetch ended on); a page you fetched at an address you made up is not one. ${CITATION_NEXT_STEP}`,
     );
   }
   if (cited) for (const outcome of SAY_SOURCE_OUTCOMES) metrics.onAssistantSaySources(outcome, cited.counts[outcome]);
