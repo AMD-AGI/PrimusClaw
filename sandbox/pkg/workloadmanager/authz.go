@@ -241,6 +241,64 @@ func (s *Server) templateTarget(c *gin.Context, req *CreateTemplateRequest) (str
 	return s.cfg.Namespace, workspace, true
 }
 
+// deniedTemplateField returns the first spec field a non-admin caller may not
+// set: volumes other than emptyDir, env vars from a source, sidecars, image
+// pull secrets, runtime class, pod labels and annotations, a non-default auth
+// mode or runtime policy, internal hosts, and a warm pool on a workspace
+// template. It returns "" when the spec has none.
+func deniedTemplateField(spec runtimev1alpha1.CodeInterpreterSpec, workspace bool) string {
+	switch {
+	case spec.AuthMode != "" && spec.AuthMode != runtimev1alpha1.AuthModeEnvD:
+		return "spec.authMode"
+	case spec.RuntimePolicy != "" && spec.RuntimePolicy != "agent-default":
+		return "spec.runtimePolicy"
+	case len(spec.AllowedInternalHosts) > 0:
+		return "spec.allowedInternalHosts"
+	case workspace && spec.WarmPoolSize != nil && *spec.WarmPoolSize > 0:
+		return "spec.warmPoolSize"
+	}
+	tmpl := spec.Template
+	if tmpl == nil {
+		return ""
+	}
+	for _, vol := range tmpl.Volumes {
+		if vol.EmptyDir == nil {
+			return "spec.template.volumes[" + vol.Name + "]"
+		}
+	}
+	for _, env := range tmpl.Environment {
+		if env.ValueFrom != nil {
+			return "spec.template.environment[" + env.Name + "].valueFrom"
+		}
+	}
+	switch {
+	case len(tmpl.Sidecars) > 0:
+		return "spec.template.sidecars"
+	case len(tmpl.ImagePullSecrets) > 0:
+		return "spec.template.imagePullSecrets"
+	case tmpl.RuntimeClassName != nil:
+		return "spec.template.runtimeClassName"
+	case len(tmpl.Labels) > 0:
+		return "spec.template.labels"
+	case len(tmpl.Annotations) > 0:
+		return "spec.template.annotations"
+	}
+	return ""
+}
+
+// admitTemplateFields answers 400 when a verified non-admin caller sets a
+// field deniedTemplateField reports.
+func (s *Server) admitTemplateFields(c *gin.Context, spec runtimev1alpha1.CodeInterpreterSpec, workspace bool) bool {
+	if !s.verifiedNonAdmin(c) {
+		return true
+	}
+	if field := deniedTemplateField(spec, workspace); field != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": field + " needs system-admin", "code": "template_field_not_allowed"})
+		return false
+	}
+	return true
+}
+
 // isTemplateWritable checks if the current user can update/delete this template.
 // Writable if: system-admin (canWriteAll) OR owner of a private template.
 func isTemplateWritable(c *gin.Context, ci *runtimev1alpha1.CodeInterpreter) bool {

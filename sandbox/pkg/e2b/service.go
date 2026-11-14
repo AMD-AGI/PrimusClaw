@@ -195,19 +195,15 @@ func grantWorkspace(names []string, templateWorkspace string) (string, error) {
 	return names[0], nil
 }
 
-// resolveUserTemplate returns the user template id when the caller may use it:
-// its creator, any caller of a public template, or a system-admin identity key.
+// resolveUserTemplate returns the user template id when an identity key may
+// use it: its creator, any caller of a public template, or a system-admin.
 // A template the caller may not use is reported as not found.
-func (s *Service) resolveUserTemplate(ctx context.Context, who caller, snap grant.Snapshot, id string) (resolvedTemplate, error) {
+func (s *Service) resolveUserTemplate(ctx context.Context, who caller, id string) (resolvedTemplate, error) {
 	ut, err := s.grants.UserTemplate(ctx, id)
 	if err != nil {
 		return resolvedTemplate{}, err
 	}
-	userID := snap.UserID
-	if who.owner {
-		userID = who.userID
-	}
-	if !ut.Public && !(who.owner && who.admin) && (userID == "" || ut.UserID != userID) {
+	if !ut.Public && !who.admin && (who.userID == "" || ut.UserID != who.userID) {
 		return resolvedTemplate{}, grant.TemplateNotFound(id)
 	}
 	return resolvedTemplate{
@@ -237,8 +233,8 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		return SandboxResponse{}, 0, err
 	}
 	tpl, err := resolveTemplate(snap, role, body.TemplateID)
-	if grant.IsReason(err, "template_not_found") {
-		tpl, err = s.resolveUserTemplate(ctx, who, snap, body.TemplateID)
+	if who.owner && grant.IsReason(err, "template_not_found") {
+		tpl, err = s.resolveUserTemplate(ctx, who, body.TemplateID)
 	}
 	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)

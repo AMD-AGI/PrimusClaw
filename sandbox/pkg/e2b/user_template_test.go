@@ -96,27 +96,20 @@ func TestIdentityKeyUserTemplates(t *testing.T) {
 	}
 }
 
-// TestGrantKeyUserTemplates checks that a grant key runs user templates of its
-// user in a workspace the grant lists, and that any other id is 404.
+// TestGrantKeyUserTemplates checks that a grant key runs only the templates of
+// its role: a user template of the grant user or a public one is 404.
 func TestGrantKeyUserTemplates(t *testing.T) {
 	svc, runner, keys, cl := testPlaneWithClient(t, 600, []int32{1}, 4, `{}`, []string{"top-models"})
 	key := keys["measurement"]
 	ctx := context.Background()
 	putUserTemplate(t, cl, "g-own", "top-models", "u-123", false, 1)
-	putUserTemplate(t, cl, "g-lab", "lab", "u-123", false, 0)
-	putUserTemplate(t, cl, "g-foreign", "top-models", "u-999", false, 0)
+	putUserTemplate(t, cl, "g-public", "top-models", "u-999", true, 0)
 
-	_, _, err := svc.Create(ctx, key, CreateBody{TemplateID: "g-foreign"})
-	wantNotFound(t, err, "g-foreign")
-	_, _, err = svc.Create(ctx, key, CreateBody{TemplateID: "missing"})
-	wantNotFound(t, err, "missing")
-	if _, _, err := svc.Create(ctx, key, CreateBody{TemplateID: "g-lab"}); opReason(err) != "workspace_not_allowed" {
-		t.Fatalf("workspace the grant does not list err = %v", err)
+	for _, id := range []string{"g-own", "g-public", "missing"} {
+		_, _, err := svc.Create(ctx, key, CreateBody{TemplateID: id})
+		wantNotFound(t, err, id)
 	}
-	if _, _, err := svc.Create(ctx, key, CreateBody{TemplateID: "g-own"}); err != nil {
-		t.Fatalf("own template: %v", err)
-	}
-	if req := runner.created[len(runner.created)-1]; req.TemplateID != "g-own" || req.Workspace != "top-models" {
-		t.Fatalf("own template request = %+v", req)
+	if len(runner.created) != 0 {
+		t.Fatalf("grant key started %d sandboxes from user templates", len(runner.created))
 	}
 }

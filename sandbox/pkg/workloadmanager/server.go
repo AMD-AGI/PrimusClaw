@@ -1237,7 +1237,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		return
 	}
 	ns, workspace, ok := s.templateTarget(c, &req)
-	if !ok {
+	if !ok || !s.admitTemplateFields(c, req.Spec, workspace != "") {
 		return
 	}
 	req.Namespace = ns
@@ -1353,7 +1353,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 		return
 	}
 	ns, workspace, ok := s.templateTarget(c, &req)
-	if !ok {
+	if !ok || !s.admitTemplateFields(c, req.Spec, workspace != "") {
 		return
 	}
 	req.Namespace = ns
@@ -1640,7 +1640,11 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can update this template"})
 		return
 	}
-	if ws := existing.Labels[grant.TemplateWorkspaceLabel]; ws != "" && !s.admitTemplateWorkspace(c, ws) {
+	ws := existing.Labels[grant.TemplateWorkspaceLabel]
+	if ws != "" && !s.admitTemplateWorkspace(c, ws) {
+		return
+	}
+	if !s.admitTemplateFields(c, req.Spec, ws != "") {
 		return
 	}
 

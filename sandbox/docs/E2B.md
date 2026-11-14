@@ -65,12 +65,12 @@ A template that is not sealed allows commands and file access in the sandbox.
 
 ### User templates
 
-A user creates a template for a workspace with `POST /v1/templates` and the `workspace` field (see [API.md](API.md)). Its template id is the template name. A name cannot start with `e2b-`.
+A user creates a template for a workspace with `POST /v1/templates` and the `workspace` field (see [API.md](API.md)). Its template id is the template name. A name cannot start with `e2b-`. User templates are used with SaFE API keys; a grant key runs only the templates of its role.
 
-- The template id is matched exactly: first against the caller's policy or grant, then against user templates. An id that matches neither returns `404 template_not_found`.
-- A caller may use its own templates and public templates. Another user's private template returns `404 template_not_found`; a `system-admin` SaFE API key may use any.
-- The sandbox runs in the template workspace. A SaFE API key must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`). A grant key must list it (`403 workspace_not_allowed`).
-- The quota of the caller applies. A user template accepts no environment variables from the caller, except from a `system-admin` SaFE API key.
+- The template id is matched exactly: first against the owner policy, then against user templates. An id that matches neither returns `404 template_not_found`.
+- A caller may use its own templates and public templates. Another user's private template returns `404 template_not_found`; a `system-admin` may use any.
+- The sandbox runs in the template workspace. The caller must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`).
+- The quota of the caller applies. A user template accepts no environment variables from the caller, except from a `system-admin`.
 
 ## Quotas
 

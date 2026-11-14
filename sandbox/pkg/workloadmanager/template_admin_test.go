@@ -203,6 +203,62 @@ func TestWorkspaceTemplateWithoutAuth(t *testing.T) {
 	}
 }
 
+// fieldSpec returns a template spec body with extra spec and template fields.
+func fieldSpec(specExtra, tmplExtra string) string {
+	return `"spec":{` + specExtra + `"template":{"fromImage":"example.invalid/sandbox:1"` + tmplExtra + `}}`
+}
+
+// TestNonAdminTemplateFields checks that with caller auth a non-admin cannot
+// create or update a template with host-level fields, while system-admin and
+// unauthenticated callers can.
+func TestNonAdminTemplateFields(t *testing.T) {
+	denied := map[string]string{
+		"hostPath volume":      fieldSpec("", `,"volumes":[{"name":"h","hostPath":{"path":"/"}}]`),
+		"secret volume":        fieldSpec("", `,"volumes":[{"name":"s","secret":{"secretName":"x"}}]`),
+		"env valueFrom":        fieldSpec("", `,"environment":[{"name":"K","valueFrom":{"secretKeyRef":{"name":"x","key":"k"}}}]`),
+		"sidecars":             fieldSpec("", `,"sidecars":[{"name":"p","image":"x"}]`),
+		"imagePullSecrets":     fieldSpec("", `,"imagePullSecrets":[{"name":"x"}]`),
+		"runtimeClassName":     fieldSpec("", `,"runtimeClassName":"runc"`),
+		"labels":               fieldSpec("", `,"labels":{"a":"b"}`),
+		"annotations":          fieldSpec("", `,"annotations":{"a":"b"}`),
+		"authMode":             fieldSpec(`"authMode":"none",`, ""),
+		"runtimePolicy":        fieldSpec(`"runtimePolicy":"open",`, ""),
+		"allowedInternalHosts": fieldSpec(`"allowedInternalHosts":["10.0.0.0/8"],`, ""),
+		"warmPoolSize":         fieldSpec(`"warmPoolSize":1,`, ""),
+	}
+	allowed := fieldSpec(`"authMode":"envd","runtimePolicy":"agent-default",`,
+		`,"volumes":[{"name":"w","emptyDir":{}}],"environment":[{"name":"K","value":"v"}]`)
+
+	rig := workspaceRig(t)
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"ok",`+allowed+`}`); w.Code != http.StatusCreated {
+		t.Fatalf("allowed fields = %d: %s", w.Code, w.Body.String())
+	}
+	for name, spec := range denied {
+		for _, path := range []string{"/v1/templates", "/v1/templates/stream"} {
+			w := rig.serveAs("user-1", RoleDefault, http.MethodPost, path, `{"name":"bad",`+spec+`}`)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "template_field_not_allowed") {
+				t.Fatalf("POST %s with %s = %d: %s", path, name, w.Code, w.Body.String())
+			}
+		}
+		w := rig.serveAs("user-1", RoleDefault, http.MethodPut, "/v1/templates/admitted/ok", `{`+spec+`}`)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "template_field_not_allowed") {
+			t.Fatalf("PUT with %s = %d: %s", name, w.Code, w.Body.String())
+		}
+	}
+	if rig.templateExists(t, "admitted", "bad") {
+		t.Fatal("a denied template was stored")
+	}
+
+	host := denied["hostPath volume"]
+	if w := rig.serveAs("admin", RoleSystemAdmin, http.MethodPost, "/v1/templates", `{"name":"adm","workspace":"lab",`+host+`}`); w.Code != http.StatusCreated {
+		t.Fatalf("admin hostPath = %d: %s", w.Code, w.Body.String())
+	}
+	rig.s.cfg.EnableAuth = false
+	if w := rig.serveAs("user-1", RoleDefault, http.MethodPost, "/v1/templates", `{"name":"brain","namespace":"admitted",`+host+`}`); w.Code != http.StatusCreated {
+		t.Fatalf("hostPath without auth = %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestPublicTemplateWritesNeedSystemAdmin checks that once a template is public
 // its owner can no longer update or delete it, and system-admin still can.
 func TestPublicTemplateWritesNeedSystemAdmin(t *testing.T) {

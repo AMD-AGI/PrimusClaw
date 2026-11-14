@@ -63,7 +63,8 @@ A template created with `workspace` is stored in the control-plane namespace wit
 - always creates workspace templates and cannot set another `namespace` (400);
 - names one of the workspaces listed on its User, or gets 403 `user_not_in_workspace`;
 - may omit `workspace` when it has one workspace; with several it gets 400 `workspace_required`;
-- updates a workspace template only while it belongs to that workspace. Deleting is not limited.
+- updates a workspace template only while it belongs to that workspace. Deleting is not limited;
+- cannot set these spec fields on create or update (400 `template_field_not_allowed`): volumes other than `emptyDir`, `environment[].valueFrom`, `template.sidecars`, `template.imagePullSecrets`, `template.runtimeClassName`, `template.labels`, `template.annotations`, an `authMode` other than `envd`, a `runtimePolicy` other than `agent-default`, `allowedInternalHosts`, and `warmPoolSize` above 0 on a workspace template.
 
 `GET /v1/templates?workspace=<name>` lists the templates of one workspace.
 
