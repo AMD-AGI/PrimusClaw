@@ -9,9 +9,14 @@
 package workloadmanager
 
 import (
+	"errors"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
 
 // ─── SaFE Role Constants ─────────────────────────────────────────────────────
@@ -129,6 +134,31 @@ func isTemplateReadable(c *gin.Context, ci *runtimev1alpha1.CodeInterpreter) boo
 		return true
 	}
 	return isTemplatePublic(ci)
+}
+
+// admitTemplateWorkspace answers 403 unless a verified non-admin caller belongs
+// to the workspace named namespace, and 503 when membership cannot be read.
+// Without caller auth the identity is unverified and no check is made.
+func (s *Server) admitTemplateWorkspace(c *gin.Context, namespace string) bool {
+	if !s.cfg.EnableAuth || canWriteAll(c) {
+		return true
+	}
+	if s.templateMembership == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace membership is not configured", "code": "membership_unavailable"})
+		return false
+	}
+	err := s.templateMembership.Check(c.Request.Context(), currentUserID(c), []string{namespace})
+	if err == nil {
+		return true
+	}
+	var oe *grant.OpError
+	if errors.As(err, &oe) {
+		c.JSON(oe.Status, gin.H{"error": oe.Error(), "code": oe.Reason})
+		return false
+	}
+	log.Warn("template workspace check failed", "userId", currentUserID(c), "namespace", namespace, "error", err)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace membership is temporarily unreadable", "code": "membership_unavailable"})
+	return false
 }
 
 // isTemplateWritable checks if the current user can update/delete this template.

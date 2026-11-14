@@ -122,6 +122,8 @@ type Server struct {
 	wg         sync.WaitGroup
 	auditStore audit.AuditStore // nil when audit disabled
 	builder    *builder.Builder // nil when image building not configured
+	// templateMembership lists the workspaces a caller may write templates in.
+	templateMembership grant.MembershipChecker
 }
 
 // New creates a new Workload Manager server.
@@ -134,6 +136,12 @@ func New(cfg Config, st store.Store) *Server {
 // WithK8s attaches a K8s sandbox creator (for production use).
 func (s *Server) WithK8s(k8s *K8sSandboxCreator) *Server {
 	s.k8s = k8s
+	return s
+}
+
+// WithTemplateMembership attaches the workspace check for template creates and updates.
+func (s *Server) WithTemplateMembership(m grant.MembershipChecker) *Server {
+	s.templateMembership = m
 	return s
 }
 
@@ -1232,7 +1240,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		req.Namespace = "default"
 	}
 	// Before the image build: a denied namespace must not cost a kaniko run.
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
 		return
 	}
 
@@ -1345,7 +1353,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitTemplateWorkspace(c, req.Namespace) {
 		return
 	}
 
@@ -1621,6 +1629,9 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	// Permission check: must be writable (system-admin, or owner of a private template)
 	if !isTemplateWritable(c, existing) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can update this template"})
+		return
+	}
+	if !s.admitTemplateWorkspace(c, namespace) {
 		return
 	}
 

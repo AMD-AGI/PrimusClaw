@@ -417,6 +417,7 @@ func main() {
 	}
 
 	apiServer := workloadmanager.New(wmCfg, st)
+	apiServer.WithTemplateMembership(grant.NewUserCRMembership(dynamicClient))
 	if registry := os.Getenv("SANDBOX_IMAGE_REGISTRY"); registry != "" {
 		builderCfg := builder.DefaultConfig()
 		builderCfg.Registry = registry
