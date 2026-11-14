@@ -74,6 +74,13 @@ export function citeSourcesAsked(raw: unknown): unknown[] {
  */
 export const CITE_KNOWN_RECORDS: readonly string[] = ["https://dl.k8s.io/release/stable.txt"];
 
+/**
+ * The other release record the read rules name: a project's latest GitHub release, read at this address with the project's owner
+ * and repository in it. GitHub answers it with a redirect to that release's own page (`/releases/tag/<tag>`) on the same repository,
+ * and a page read so is a source at that page (and at this address), as a record of `CITE_KNOWN_RECORDS` is.
+ */
+export const CITE_GITHUB_LATEST_RELEASE = "https://github.com/<owner>/<repo>/releases/latest";
+
 export function isCiteSourceKind(v: unknown): v is CiteSourceKind {
   return typeof v === "string" && (CITE_SOURCE_KINDS as readonly string[]).includes(v);
 }

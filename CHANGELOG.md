@@ -138,6 +138,14 @@ release version, and its `appVersion` stays `latest`.
   router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model the gateway
   said served the latest answer when that differs), and that the models work items and reviews run on are the workers', not
   its own. The router's self section is `router-self-v4`.
+- Asked for a project's latest release with its source, the assistant cites the release it read: a page `web_fetch` read at
+  `https://github.com/<owner>/<repo>/releases/latest`, where the router's read rules send it, is a source at the release page
+  GitHub redirected it to (`/releases/tag/<tag>` of the same repository) and at the address it asked for. Before, its citation
+  was refused as an address the router made up, and the answer went out without any source. A redirect out of that repository,
+  or any other fetched page the turn's lookups or the user did not give, is still not a source. A say refused for a citation
+  with no source (`citation_not_found`) now tells the router to search for the page and say it again with the result's address,
+  and not to answer without the source instead. The router's citing rules are `router-cite-v6`. The evaluation catalog has a
+  case for it, and a `cited` check: the final answer must carry a source.
 
 ## [0.5.0] - 2026-11-13
 

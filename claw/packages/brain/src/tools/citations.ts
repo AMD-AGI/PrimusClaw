@@ -8,7 +8,8 @@
  * `_meta["claw/sources"]` of a result from a server the request names in `source_servers` that is one the API adds itself
  * (`isPlatformMcpServer`). A page `web_fetch` read whole only confirms a source: it is kept when its address is one of those or one
  * the user wrote in the message the turn answers (`user_urls`), so what a page or a search result's text says cannot lead the model
- * to an address of its choosing and make it a source. A plugin's server, a page's body and the model's own words are never read
+ * to an address of its choosing and make it a source. The release records the read rules name are the exception: a page read at
+ * one of `CITE_KNOWN_RECORDS`, or a project's latest GitHub release read at `CITE_GITHUB_LATEST_RELEASE` (`githubLatestRelease`), is kept. A plugin's server, a page's body and the model's own words are never read
  * for addresses, with one exception: a server the request names in `link_servers` (the agent board's Gitea) answers with JSON objects that
  * carry their own page as `html_url`, and that field of a top-level object (or of each element of a top-level array) is kept when it
  * starts with the prefix the request gives for that server (`keepLinks`). An address in a body, a comment or a title is never read.
@@ -46,6 +47,25 @@ export function citeKey(raw: unknown): string | null {
   const url = citeableUrl(raw);
   if (!url) return null;
   return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}${url.search}`;
+}
+
+/** A GitHub owner and a repository name as an address names them (`https://github.com/<owner>/<repo>/...`). */
+const GITHUB_REPO = String.raw`([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})`;
+const GITHUB_LATEST = new RegExp(String.raw`^https://github\.com/${GITHUB_REPO}/releases/latest$`);
+const GITHUB_RELEASE = new RegExp(String.raw`^https://github\.com/${GITHUB_REPO}/releases/(?:latest|tag/[^/?#]+)$`);
+
+/**
+ * Whether a page `web_fetch` read is a project's latest GitHub release, read as the read rules say (`CITE_GITHUB_LATEST_RELEASE`):
+ * `requested` (the address the call asked for) is `https://github.com/<owner>/<repo>/releases/latest`, and `read` (the page it
+ * read, after the redirects it followed) is that address or a release's own page, `/releases/tag/<tag>`, of the same repository.
+ * Both are `citeKey` forms. A redirect anywhere else (the release list of a repository with no release, another repository) is not
+ * one. GitHub names owners and repositories without regard to case.
+ */
+export function githubLatestRelease(requested: string | null | undefined, read: string): boolean {
+  const asked = requested ? GITHUB_LATEST.exec(requested) : null;
+  const got = GITHUB_RELEASE.exec(read);
+  if (!asked || !got) return false;
+  return asked[1].toLowerCase() === got[1].toLowerCase() && asked[2].toLowerCase() === got[2].toLowerCase();
 }
 
 /** The longest result `keepLinks` parses: a larger one (or one cut short) keeps nothing. */
@@ -101,15 +121,19 @@ export class RunCitations {
 
   /**
    * Keep the sources a call of `name` returned, when `name` is one whose sources are believed. Malformed entries are skipped, and so
-   * is a page `web_fetch` read at an address neither kept already nor written by the user (`CONFIRMING_TOOL`).
+   * is a page `web_fetch` read at an address neither kept already nor written by the user (`CONFIRMING_TOOL`), unless it is a
+   * project's latest GitHub release read at its latest-release address (`requested`, the address the call asked for).
    */
-  keep(name: string, sources: unknown): void {
+  keep(name: string, sources: unknown, requested?: unknown): void {
     if (!Array.isArray(sources) || !sources.length || !this.producedBy(name)) return;
+    // The address a `web_fetch` call asked for, which the page it read was reached from (`githubLatestRelease`).
+    const asked = name === CONFIRMING_TOOL ? citeKey(requested) : null;
     for (const raw of sources) {
       const source = citeSource(raw);
       const key = source && citeKey(source.url);
       if (!source || !key || this.kept.has(key)) continue;
-      if (name === CONFIRMING_TOOL && !this.userKeys.has(key)) {
+      const release = name === CONFIRMING_TOOL && githubLatestRelease(asked, key);
+      if (name === CONFIRMING_TOOL && !this.userKeys.has(key) && !release) {
         // Host only: the address came from what the model read, and its path or query may carry anything.
         logger.info({ tool: name, host: new URL(key).host }, "cite.fetch_not_confirmed");
         continue;
@@ -119,6 +143,8 @@ export class RunCitations {
         return;
       }
       this.kept.set(key, source);
+      // The latest-release address the call asked for names the release page it led to, so a say citing either links there.
+      if (release && asked && !this.kept.has(asked) && this.kept.size < RUN_SOURCES_MAX) this.kept.set(asked, source);
     }
   }
 
