@@ -24,7 +24,7 @@
 # /shared/bin/ld-musl-x86_64.so.1, bundled with musl libc to ensure it works in glibc containers
 
 # ── Stage 0: Build EnvD ──────────────────────────────────────────────────────
-FROM golang:1.27@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e AS envd-builder
+FROM golang:1.27@sha256:ec47ea3725fea0cc88f6de94919aef19f40f12fc1ec0e2d1b3426dbf15ecca04 AS envd-builder
 
 WORKDIR /workspace
 COPY go.mod go.sum ./
@@ -33,7 +33,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o /envd ./cmd/envd/main.go
 
 # ── Stage 1: Statically compile tmux ────────────────────────────────────────────────────
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS tmux-builder
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS tmux-builder
 
 RUN apk add --no-cache \
     build-base \
@@ -67,7 +67,7 @@ RUN wget -q -O /tmp/tmux.tar.gz \
 # xtables-legacy-multi is a multi-call binary (like busybox), distinguished by argv[0]
 # for iptables / ip6tables. Static linking ensures it runs in any user base image.
 # Kata guest kernel requires iptables-legacy; nftables backend is not compatible.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS iptables-builder
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS iptables-builder
 
 RUN apk add --no-cache \
     build-base \
@@ -128,7 +128,7 @@ RUN wget -q -O /tmp/iptables.tar.xz \
 # the same content under the names self-maintained sandbox templates used
 # before the generic names existed. They are kept so those templates keep
 # working unchanged; new templates should use the generic names.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS ca-fetcher
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS ca-fetcher
 
 ARG EXTRA_CA_CERT_URLS=""
 
