@@ -541,7 +541,7 @@ func TestNoOwnerPolicySkipsIntrospection(t *testing.T) {
 		t.Fatal(err)
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
-	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Authz: defaultAuthz()})
 	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
 	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
 
@@ -565,7 +565,7 @@ func TestRejectedOwnerPolicyIsServerError(t *testing.T) {
 		t.Fatal(err)
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
-	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Membership: listMembership{"u-1": {"lab"}}})
+	gs := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system", Authz: defaultAuthz()})
 	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1"}}}
 	plane := New(Options{Grants: gs, Runner: &fakeRunner{}, Namespace: "agent-sandbox-system", Identity: ids})
 

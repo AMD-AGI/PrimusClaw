@@ -458,7 +458,7 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		idClient, policySupplied := ownerKeys(ctx, grants)
+		idClient := ownerKeys(ctx, grants)
 		opts := e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
@@ -466,9 +466,6 @@ func main() {
 		}
 		if idClient != nil {
 			opts.Identity = idClient
-			if attester == nil && policySupplied {
-				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
-			}
 		}
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
@@ -509,44 +506,42 @@ func main() {
 var ownerPolicyRetry = time.Second
 
 // ownerKeys returns the identity client when the introspection client is configured,
-// so identity keys are checked by introspection. The second result is true when an
-// owner policy was supplied. A missing policy answers identity keys with 503
+// so identity keys are checked by introspection. A missing policy answers identity keys with 503
 // owner_policy_not_applied; a rejected policy answers 500 owner_policy_invalid.
 // Grant keys keep working. A policy that fails for a transient reason is retried
 // in the background.
-func ownerKeys(ctx context.Context, grants *grant.Service) (*identity.Client, bool) {
+func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
 	client, err := identity.FromEnv()
 	if err != nil {
 		log.Error("identity keys disabled: identity client config is invalid", "error", err)
-		return nil, false
+		return nil
 	}
 	if client == nil {
-		return nil, false
+		return nil
 	}
 	policy, err := grant.OwnerPolicyFromEnv()
-	supplied := policy != nil || err != nil
 	if err != nil {
 		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
 		grants.SetOwnerPolicyFault(err)
-		return client, supplied
+		return client
 	}
 	if policy == nil {
 		log.Warn("identity keys await owner policy: owner policy is not configured")
-		return client, false
+		return client
 	}
 	err = grants.SetOwnerPolicy(ctx, *policy)
 	if err == nil {
 		log.Info("identity keys enabled", "role", grants.OwnerRole())
-		return client, true
+		return client
 	}
 	if !transientPolicyError(err) {
 		log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
 		grants.SetOwnerPolicyFault(err)
-		return client, true
+		return client
 	}
 	log.Warn("owner policy was not applied, retrying", "error", err)
 	go retryOwnerPolicy(ctx, grants, *policy)
-	return client, true
+	return client
 }
 
 // transientPolicyError reports whether an owner policy error may clear on retry.
