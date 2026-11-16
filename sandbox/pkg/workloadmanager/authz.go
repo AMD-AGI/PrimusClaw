@@ -3,7 +3,7 @@
 
 // Authorization helpers for Workload Manager.
 // Implements role-based access control (RBAC) on control-plane endpoints
-// based on SaFE user roles (system-admin / system-admin-readonly / default).
+// based on the platform role (system-admin / system-admin-readonly / default).
 //
 // Router data-plane invocation enforces the same owner/full-admin boundary.
 package workloadmanager

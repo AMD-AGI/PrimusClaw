@@ -147,6 +147,7 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	})
 	creator := NewSafeWorkloadCreator(dc, cl)
 	var call attestCall
+	creator.SetAttestWorkloads(true)
 	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
 	result, err := creator.Create(context.Background(), e2b.CreateRequest{
 		SandboxID:   sandboxID,
@@ -159,6 +160,7 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		UserName:    "alice",
 		GrantID:     "gr-01jb7m9k2x",
 		Attestation: "eyJ.test",
+		SubjectKey:  "ak-platform-key",
 		Timeout:     time.Minute,
 	})
 	if err != nil {
@@ -177,11 +179,11 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	if timeout != 60 {
 		t.Fatalf("timeout=%d", timeout)
 	}
-	if _, ok := obj.GetAnnotations()[identityAttestationAnnotation]; ok || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
+	if obj.GetAnnotations()[identityAttestationAnnotation] != "eyJ.identity" || obj.GetAnnotations()[grantAttestationAnnotation] != "eyJ.test" {
 		t.Fatalf("annotations=%v", obj.GetAnnotations())
 	}
-	if call.called {
-		t.Fatal("a grant-key create asked the identity provider for an attestation")
+	if call.key != "ak-platform-key" || call.ws != "top-models" {
+		t.Fatalf("attest call=%+v", call)
 	}
 	if err := creator.Delete(context.Background(), result.SandboxName); err != nil {
 		t.Fatal(err)
@@ -228,6 +230,7 @@ func TestCreateDeletesFailedWorkload(t *testing.T) {
 		UserID:      "u-123",
 		GrantID:     "gr-01jb7m9k2x",
 		Attestation: "eyJ.test",
+		SubjectKey:  "ak-platform-key",
 		Timeout:     time.Minute,
 	})
 	if err == nil || !strings.Contains(err.Error(), "phase Failed") || !strings.Contains(err.Error(), "node node-a") || !strings.Contains(err.Error(), "exit 1") {
@@ -351,7 +354,7 @@ func signingCreateRequest(sandboxID string) e2b.CreateRequest {
 		SandboxID: sandboxID, TemplateID: "ar-run-dev-g2", Namespace: "agent-sandbox-system",
 		Role: "dev", SessionID: "s-8f2a", Workspace: "top-models",
 		UserID: "u-123", GrantID: "gr-01jb7m9k2x", Attestation: "eyJ.test",
-		SigningKeyPEM: "test-private-key", Timeout: time.Minute,
+		SubjectKey: "ak-platform-key", SigningKeyPEM: "test-private-key", Timeout: time.Minute,
 	}
 }
 
@@ -433,6 +436,26 @@ func TestCreateRefusesWithoutIdentityAttester(t *testing.T) {
 	}
 	if _, err := dc.Tracker().Get(workloadGVR, "", sandboxID); err == nil {
 		t.Fatal("workload was created without an attestation")
+	}
+}
+
+func TestGrantWorkloadIsNotAttestedUntilEnabled(t *testing.T) {
+	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
+	creator, dc := signingWorkloadCreator(t, sandboxID, "Running")
+	var call attestCall
+	creator.SetIdentityAttester(staticAttester{token: "eyJ.identity", call: &call})
+	if _, err := creator.Create(context.Background(), signingCreateRequest(sandboxID)); err != nil {
+		t.Fatal(err)
+	}
+	if call.called {
+		t.Fatal("attested a grant workload while workload assertion is off")
+	}
+	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.(*unstructured.Unstructured).GetAnnotations()[identityAttestationAnnotation]; got != "" {
+		t.Fatalf("identity annotation=%q", got)
 	}
 }
 
