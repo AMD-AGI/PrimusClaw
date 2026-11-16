@@ -14,7 +14,7 @@
  *   S  one review, once, on lines the diff shows
  *   M  the merge gates: CI, threads, GitHub's own state, approval
  *   C  high risk: a merge waits for the acting user, once, on that commit
- *   W  the dry-run switch, rate limits and the request budget
+ *   W  the dry-run switch, rate limits and the request budget (which the server's own calls never count against)
  *   I  the identity provider failing, and the audit trail
  *   T  the token: nowhere it should not be
  */
@@ -1438,6 +1438,49 @@ describe("W dry run, limits and the budget", () => {
     const calls = e.gh.calls.length;
     await get();
     assert.equal(e.gh.calls.length, calls);
+  });
+
+  test("W3b the server's own follow-ups and the check before the first turn never count against the session's budget", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "5" });
+    const { sessionRequestCount } = await import("../src/github-review/store.js");
+    const ref = { owner: "AMD-AGI", repo: "demo", number: 7 };
+    // The review item's sweep follows the pull request, as production does, far past the session's budget (a review item open for hours
+    // is followed hundreds of times), and the check made before the session's first turn is audited in it too.
+    for (let i = 0; i < 4; i += 1) {
+      const f = await e.service.followPullRequest({ sessionId: e.actor.sessionId, ref, actingUserId: "u-bob", requesterUserId: "u-alice", mergeByRequester: false });
+      assert.equal(f.body.status, "open", JSON.stringify(f.body));
+    }
+    assert.equal((await e.service.checkPullRequest(e.actor, ref)).isError, false);
+    const [server] = await e.sql(
+      "SELECT SUM(github_requests)::int AS n, BOOL_OR(budgeted) AS any_budgeted FROM claw_github_audit WHERE session_id = $1 AND tool IN ('gh_pr_follow', 'gh_pr_check')", [e.actor.sessionId]);
+    assert.ok(server.n > 5, `the server's own calls made ${server.n} requests`);
+    assert.equal(server.any_budgeted, false, "each is written as not held to the budget");
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), 0);
+    // So the session's own first read still has its whole budget, and the budget still holds for what the session itself asks.
+    const first = await get();
+    assert.equal(first.isError, false, first.text);
+    const own = await sessionRequestCount(e.db, e.actor.sessionId);
+    assert.ok(own >= 5, `the session's own read: ${own} requests`);
+    assert.equal(reason(await get()), "request_budget_exhausted");
+    // Rows written before the budget was marked on them (null): the server's follow-ups and checks are still left out, by name, and
+    // every other call still counts.
+    await e.sql("UPDATE claw_github_audit SET budgeted = NULL WHERE session_id = $1", [e.actor.sessionId]);
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), own);
+    await e.sql("UPDATE claw_github_audit SET budgeted = TRUE WHERE session_id = $1 AND tool = 'gh_pr_follow'", [e.actor.sessionId]);
+    assert.ok(await sessionRequestCount(e.db, e.actor.sessionId) > own + 5, "the control: counted, the follow-ups alone are past the budget");
+  });
+
+  test("W3c a person's answer to a held write is not held to the session's budget, and its requests do not count against it", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "400" });
+    allowed();
+    const { sessionRequestCount } = await import("../src/github-review/store.js");
+    const before = await sessionRequestCount(e.db, e.actor.sessionId);
+    const r = await heldThenAllowed();
+    assert.equal(r.body.status, "merged", r.text);
+    const rows = await e.sql("SELECT tool, budgeted, github_requests FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' ORDER BY id", [e.actor.sessionId]);
+    assert.deepEqual(rows.map((x) => x.budgeted), [true, false], "the held call is the session's; the answer is the person's");
+    assert.ok(rows[1].github_requests > 0);
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), before + rows[0].github_requests);
   });
 
   test("W4 so many reviews of one repository at once; the rest wait", async () => {

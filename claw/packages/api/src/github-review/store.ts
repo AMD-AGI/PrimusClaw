@@ -111,6 +111,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   // What a review that was posted said, for the review item it belongs to (assistant/review-items.ts reviewRecord): its event and each inline
   // finding with the thread GitHub made for it. Written only for a review item's session; null for every other call.
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS posted JSONB`,
+  // Whether the call was held to its session's request budget (see {@link sessionRequestCount}): false for the calls the server makes on
+  // its own or on a person's answer (`skipBudget`), null on rows written before the column existed.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS budgeted BOOLEAN`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -194,6 +197,8 @@ export interface AuditStart {
   tool: string;
   /** A short summary of the arguments, never their full text and never a credential. */
   args: Record<string, unknown>;
+  /** Whether the call is held to the session's request budget; false for one that is not (`skipBudget`). Unset: held. */
+  budgeted?: boolean;
 }
 
 export interface AuditFinish {
@@ -226,9 +231,9 @@ export interface PostedReview { event: string; review_id: number | null; finding
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
   const r = await db.query(
-    `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, arguments)
-     VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id`,
-    [a.requesterUserId, a.actorUserId, a.sessionId, a.tool, JSON.stringify(a.args)],
+    `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, arguments, budgeted)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING id`,
+    [a.requesterUserId, a.actorUserId, a.sessionId, a.tool, JSON.stringify(a.args), a.budgeted ?? true],
   );
   return Number((r.rows[0] as { id: string | number }).id);
 }
@@ -259,10 +264,23 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
 export const GITHUB_MCP_AUDIT_TOOL_PREFIX = "github_mcp.";
 export const REVIEW_ROWS_ONLY = `tool NOT LIKE '${GITHUB_MCP_AUDIT_TOOL_PREFIX}%'`;
 
-/** What this session has already asked of GitHub with the review tools. */
+/**
+ * The review tools that are never held to a session's request budget, whoever calls them: the server's own look at a review's pull request
+ * (`gh_pr_follow`, every 90 s for as long as the review item is open) and the pull request check made before a session's first turn
+ * (`gh_pr_check`). What tells an audit row apart is its `budgeted` column; this list reads the rows written before that column existed.
+ */
+export const UNBUDGETED_TOOLS: readonly string[] = ["gh_pr_follow", "gh_pr_check"];
+
+/**
+ * What this session has already asked of GitHub with the review tools: the requests of the calls held to its budget only. The calls the
+ * server makes without that budget (`skipBudget`: its follow-ups of the pull request, the check before the first turn, a person's answer to
+ * a held write) are not the session's spending, and never count against it (2026-11-15: a review item open for eight hours had its 400
+ * requests used up by its own follow-ups, and its re-run was refused at its first read).
+ */
 export async function sessionRequestCount(db: Queryable, sessionId: string): Promise<number> {
   const r = await db.query(
-    `SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit WHERE session_id = $1 AND ${REVIEW_ROWS_ONLY}`, [sessionId],
+    `SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit
+      WHERE session_id = $1 AND ${REVIEW_ROWS_ONLY} AND COALESCE(budgeted, tool <> ALL($2::text[]))`, [sessionId, UNBUDGETED_TOOLS],
   );
   return Number((r.rows[0] as { n: number }).n);
 }

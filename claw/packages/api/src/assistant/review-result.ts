@@ -23,13 +23,16 @@
  * once more, or why it does not.
  *
  * And a review whose turns called no review tool at all, twice (`not_run`; 2026-11-13, N31): it read and posted nothing, the reviewer has
- * nothing to look at, and the one who asked is told that it did not run and to ask again, the same way.
+ * nothing to look at, and the one who asked is told that it did not run and to ask again, the same way. So is a review whose session used up
+ * its GitHub requests before it posted anything (`budget_exhausted`, `budgetSpent` in `review-items.ts`; 2026-11-15). One that ran out after
+ * it had changed the pull request (resolved review threads, or sent a write) is partly done (`budget_partial`): the reviewer is asked to look
+ * at it, and whoever asked someone else for it is told what was done, never that nothing changed.
  */
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED, CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
 import { db, type Querier } from "../infra/db.js";
 import { personWritesChinese, recordSystemNotice } from "./outbound.js";
-import type { CiWaitEnd, ReviewResult } from "./review-items.js";
+import { GITHUB_EFFECTS_SQL, type CiWaitEnd, type ReviewResult } from "./review-items.js";
 
 const logger = pino({ name: "assistant-review-result" });
 
@@ -199,11 +202,29 @@ export function unchangedText(kind: "unchanged_wait" | "unchanged", f: Unchanged
   return [title, "", same, ...(why ? [zh ? `- ${why}。` : `- ${why.charAt(0).toUpperCase()}${why.slice(1)}.`] : []), next, link].join("\n");
 }
 
-/** What whoever asked for a review whose turns called no review tool is told (`not_run`), by language. */
-export function notRunText(f: { pr: string; url: string; seq: number; forRequester: boolean; ranOnce?: boolean }, zh: boolean): string {
+/**
+ * What whoever asked for a review that did not run is told, by language: its turns called no review tool (`not_run`), or its session used up
+ * its GitHub requests before it posted anything (`budget: true`, `budget_exhausted`).
+ */
+export function notRunText(f: { pr: string; url: string; seq: number; forRequester: boolean; ranOnce?: boolean; budget?: boolean }, zh: boolean): string {
   const again = f.forRequester
     ? (zh ? "再请一次评审" : "ask for the review again")
     : (zh ? `回复 \`再审 #${f.seq}\`` : `reply \`review again #${f.seq}\``);
+  if (f.budget) {
+    return zh
+      ? [
+        `**${f.forRequester ? "你请人评审的 " : ""}${f.pr} 这次没审成：这个评审会话的 GitHub 请求次数用完了**`, "",
+        "- 评审没有发出任何内容，PR 上没有任何改动。",
+        `- 接下来：${again}，会开一个新的评审会话。`,
+        `- PR：${f.url}`,
+      ].join("\n")
+      : [
+        `**${f.pr}${f.forRequester ? ", which you asked to be reviewed," : ""} was not reviewed: the review session used up its GitHub requests**`, "",
+        "- The review posted nothing, and nothing changed on the pull request.",
+        `- Next: ${again}; that starts a new review session.`,
+        `- The pull request: ${f.url}`,
+      ].join("\n");
+  }
   return zh
     ? [
       `**${f.forRequester ? "你请人评审的 " : ""}${f.pr} 这次没审成：评审工具没有响应**`, "",
@@ -219,6 +240,28 @@ export function notRunText(f: { pr: string; url: string; seq: number; forRequest
         ? "- The review could not use the GitHub review tools: it read and posted nothing, nothing changed on the pull request, and it could not be run again by itself."
         : "- The review ran twice and could not use the GitHub review tools either time: it read and posted nothing, and nothing changed on the pull request.",
       `- Next: ${again} in a while.`,
+      `- The pull request: ${f.url}`,
+    ].join("\n");
+}
+
+/** What whoever asked someone else for a review that ran out of GitHub requests after it changed the pull request is told (`budget_partial`). */
+export function partialText(f: { pr: string; url: string; resolvedThreads: number; wrote: boolean }, zh: boolean): string {
+  const done: string[] = [];
+  if (f.resolvedThreads > 0) {
+    done.push(zh ? `在 GitHub 上用评审人的账号 resolve 了上一轮评审的 ${f.resolvedThreads} 个讨论` : `resolved ${f.resolvedThreads} review thread${f.resolvedThreads === 1 ? "" : "s"} of the last review on GitHub with the reviewer's account`);
+  }
+  if (f.wrote) done.push(zh ? "向 PR 发出过写操作" : "sent a write to the pull request");
+  return zh
+    ? [
+      `**你请人评审的 ${f.pr} 只审了一部分：这个评审会话的 GitHub 请求次数用完了**`, "",
+      `- 用完之前，它${done.join("，并")}；没有发出新的评审。`,
+      "- 已请评审人看一下这个评审。",
+      `- PR：${f.url}`,
+    ].join("\n")
+    : [
+      `**${f.pr}, which you asked to be reviewed, was only partly reviewed: the review session used up its GitHub requests**`, "",
+      `- Before that, it ${done.join(", and ")}. It posted no new review.`,
+      "- The reviewer has been asked to look at the review.",
       `- The pull request: ${f.url}`,
     ].join("\n");
 }
@@ -261,20 +304,41 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
     )).rows[0] as { item_id: string; user_id: string; seq: number; params: Record<string, unknown> | null; worker_session_id: string; kind: string } | undefined;
     if (!item || item.kind !== "review" || !item.params) return skipped("no_review_item");
     const requester = typeof item.params.requested_by === "string" && item.params.requested_by ? item.params.requested_by : null;
-    if (requester && kind !== "unchanged_wait" && kind !== "unchanged" && kind !== "not_run") return skipped("asked_by_someone_else");
+    if (requester && kind !== "unchanged_wait" && kind !== "unchanged" && kind !== "not_run" && kind !== "budget_exhausted" && kind !== "budget_partial") return skipped("asked_by_someone_else");
     const pr = item.params.pr as { owner?: unknown; repo?: unknown; number?: unknown } | undefined;
     if (!pr || typeof pr.owner !== "string" || typeof pr.repo !== "string" || typeof pr.number !== "number") return skipped("no_pr");
-    if (kind === "not_run") {
+    if (kind === "budget_partial") {
+      // The reviewer is asked by the item's wake; told here is only the person who asked them for it.
+      if (!requester || requester === item.user_id) return skipped("no_requester");
+      const effects = (await q(GITHUB_EFFECTS_SQL, [item.worker_session_id])).rows[0] as { resolved: number; wrote: boolean } | undefined;
+      const facts = {
+        pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`,
+        resolvedThreads: Number(effects?.resolved ?? 0), wrote: effects?.wrote === true,
+      };
+      if (facts.resolvedThreads === 0 && !facts.wrote) return skipped("nothing_changed");
+      const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [requester])).rows[0]?.session_id as string | undefined;
+      if (!sessionId) return skipped("requester_has_no_assistant");
+      const told = await reviewResultPorts.recordSystemNotice({
+        userId: requester, sessionId, text: partialText(facts, await personWritesChinese(q, requester)), key: `review_result:${item.item_id}:${kind}`,
+      });
+      if (told === null) return skipped("already_told");
+      logger.info({ itemId, kind, pr: facts.pr, toRequester: true }, "assistant.review_result_told");
+      return true;
+    }
+    if (kind === "not_run" || kind === "budget_exhausted") {
       // Told to whoever asked: the person who asked someone else for it, or the owner of their own review.
       const forRequester = requester !== null && requester !== item.user_id;
       const to = forRequester ? requester! : item.user_id;
       // (a re-run that could not be queued: the review ran once, not twice)
       const ranOnce = (item.params.empty_rerun as { reason?: unknown } | undefined)?.reason === "not_queued";
-      const facts = { pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq), forRequester, ranOnce };
+      const facts = {
+        pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq), forRequester, ranOnce,
+        budget: kind === "budget_exhausted",
+      };
       const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [to])).rows[0]?.session_id as string | undefined;
       if (!sessionId) return skipped(forRequester ? "requester_has_no_assistant" : "owner_has_no_assistant");
       const told = await reviewResultPorts.recordSystemNotice({
-        userId: to, sessionId, text: notRunText(facts, await personWritesChinese(q, to)), key: `review_result:${item.item_id}:not_run`,
+        userId: to, sessionId, text: notRunText(facts, await personWritesChinese(q, to)), key: `review_result:${item.item_id}:${kind}`,
       });
       if (told === null) return skipped("already_told");
       logger.info({ itemId, kind, pr: facts.pr, toRequester: forRequester }, "assistant.review_result_told");
