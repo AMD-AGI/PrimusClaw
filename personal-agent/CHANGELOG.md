@@ -15,6 +15,21 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.10.2
+
+A patch release: a group chat switched to one of a member's machine sessions can talk to that session (#855). No plugin
+port (core's `src/plugins/`) or store change; works with any Claw.
+
+### Fixed
+
+- `@primusclaw/personal-agent`: in a group chat switched to a member's machine session, that member's @-messages now go
+  to the session, whatever the chat box mode; before, with the session card as the window (the default), they were
+  answered by the assistant and nothing typed reached the session. "back to the assistant" (回到助理) or the card's Back
+  to assistant ends it. Other members' @-messages still go to the assistant, and commands stay the bot's (#855).
+- The session card's buttons work in a group: Send, Stop, Mode, Full output, Back to assistant and Back to this session
+  answer the member who switched, with their own credential, as in a one-to-one chat. Before, every button in a group
+  answered "That button is not active any more." (#855).
+
 ## 0.10.1
 
 A patch release: the assistant answers questions about the date and time in the person's time zone (#847). No plugin port (core's
