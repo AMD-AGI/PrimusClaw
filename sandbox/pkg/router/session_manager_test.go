@@ -16,6 +16,7 @@ func TestForwardCallerCredentials(t *testing.T) {
 	ctx := withCallerCredentials(
 		context.Background(),
 		"Bearer safe-user-token",
+		"ak-caller",
 		"Token=safe-cookie-token; userType=platform",
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://wm/recover", nil)
@@ -24,9 +25,37 @@ func TestForwardCallerCredentials(t *testing.T) {
 	forwardCallerCredentials(ctx, req)
 
 	require.Equal(t, "Bearer safe-user-token", req.Header.Get("Authorization"))
+	require.Equal(t, "ak-caller", req.Header.Get("X-API-KEY"))
 	require.Equal(t, "Token=safe-cookie-token; userType=platform", req.Header.Get("Cookie"))
 	require.Empty(t, req.Header.Get("userId"))
 	require.Empty(t, req.Header.Get("userRole"))
+}
+
+func TestCreateForwardsAPIKeyWithoutBearer(t *testing.T) {
+	var gotKey, gotAuth string
+	wm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-API-KEY")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"sessionId":"sid-1",
+			"userId":"owner-1",
+			"sandboxName":"sandbox-1",
+			"namespace":"tenant-1",
+			"podIp":"10.0.0.2",
+			"podPort":8080,
+			"status":"running"
+		}`))
+	}))
+	defer wm.Close()
+
+	manager := &defaultSessionManager{wmURL: wm.URL, httpClient: wm.Client()}
+	ctx := withCallerCredentials(context.Background(), "", "ak-caller", "")
+	if _, err := manager.createSandbox(ctx, "tenant-1", "sandbox-1", "code-interpreter"); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, "ak-caller", gotKey)
+	require.Empty(t, gotAuth)
 }
 
 func TestRecoverSessionFromWMPreservesOwner(t *testing.T) {
@@ -47,7 +76,7 @@ func TestRecoverSessionFromWMPreservesOwner(t *testing.T) {
 	defer wm.Close()
 
 	manager := &defaultSessionManager{wmURL: wm.URL, httpClient: wm.Client()}
-	ctx := withCallerCredentials(context.Background(), "Bearer safe-user-token", "")
+	ctx := withCallerCredentials(context.Background(), "Bearer safe-user-token", "", "")
 	info, err := manager.recoverSessionFromWM(ctx, "sid-1")
 	require.NoError(t, err)
 	require.Equal(t, "owner-1", info.UserID)

@@ -35,6 +35,9 @@ type BeginRequest struct {
 	Sealed            bool
 	Inputs            []string
 	Outputs           []string
+	// UserTemplate marks a template the caller verified as a usable user
+	// template; the grant template list is not consulted for it.
+	UserTemplate bool
 }
 
 // Replay is returned when the idempotency key already names a sandbox.
@@ -522,7 +525,7 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	if !ok {
 		return opErr(http.StatusForbidden, "role_not_allowed", req.Role)
 	}
-	if !containsStr(limit.Templates, req.TemplateID) {
+	if !req.UserTemplate && !containsStr(limit.Templates, req.TemplateID) {
 		return opErr(http.StatusForbidden, "template_not_allowed", req.TemplateID)
 	}
 	if g.Spec.MaxSandboxSeconds > 0 && req.TimeoutSec > g.Spec.MaxSandboxSeconds {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -199,6 +200,7 @@ func (s *Server) proxyToCluster(c *gin.Context, base, cluster, token string) {
 			req.Header.Del(UserIDHeader)
 			req.Header.Del(UserNameHeader)
 			req.Header.Del(UserRoleHeader)
+			req.Header.Del(identity.APIKeyHeader)
 			req.Header.Set("Authorization", "Bearer "+token)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
