@@ -8,7 +8,7 @@ import type { DispatchInput } from "../src/sessions/dispatch.js";
 import type { Harness } from "./scenario-harness.js";
 
 process.env.CLAW_DEPLOY_MODE = "safe";
-process.env.LLM_KEY_SOURCE = "virtualKey";
+process.env.CLAW_AUTH_PROVIDER = "safe";
 
 const { db } = await import("../src/infra/db.js");
 const { dispatchTaskToBrain, sessionDispatchPorts } = await import("../src/sessions/dispatch.js");
@@ -128,11 +128,11 @@ for (const doorbell of [false, true]) {
     // The caller's own `platform_key` is removed with the plain fields: only the sealed keys remain.
     assert.deepEqual(await stamped(), {
       rest: { model: "test-model", resources: { cpu: 2 }, _server_managed_credentials: true },
-      keys: { platformKey: user.platformKey, llmApiKey: user.virtualKey },
+      keys: { platformKey: user.platformKey, llmApiKey: user.platformKey },
     });
   });
 
-  test(`${path} chat refreshes the same session credentials and clears a removed LLM key`, async () => {
+  test(`${path} chat refreshes the same session credentials and the LLM key follows the platform key`, async () => {
     dispatchPorts(doorbell, user.platformKey);
     assert.equal((await dispatchTaskToBrain(input(user), async () => {})).kind, "dispatched");
     const rotated = { ...user, platformKey: "platform-rotated", virtualKey: "" };
@@ -143,7 +143,7 @@ for (const doorbell of [false, true]) {
     assert.equal(result.kind, "dispatched");
     assert.deepEqual(await stamped(), {
       rest: { _server_managed_credentials: true },
-      keys: { platformKey: rotated.platformKey, llmApiKey: "" },
+      keys: { platformKey: rotated.platformKey, llmApiKey: rotated.platformKey },
     });
   });
 

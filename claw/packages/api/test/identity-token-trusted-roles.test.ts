@@ -35,7 +35,7 @@ import { canAccessSessionAsOperator, getUserRole, isAdmin, isSystemAdmin } from 
 // SaFE is asked what keys the token's subject has (auth/identity-token.ts); this one is a SaFE that does not know the
 // issuer, which is the deployment the roles below are for, so every caller here is a plain user without keys.
 const safe = await startFakeUpstream((_req, res) => sendJson(res, 401, { code: 401, message: "invalid token" }));
-Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t" });
+Object.assign(process.env, { SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t" });
 delete process.env.CLAW_DEPLOY_MODE;
 const { ADOPTABLE_ROLES, identityTokenSettings, verifyIdentityAccessToken } = await import("../src/auth/identity-token.js");
 const { startIdentityClient } = await import("../src/auth/identity.js");

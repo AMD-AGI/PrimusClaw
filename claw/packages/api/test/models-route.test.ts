@@ -32,7 +32,7 @@ let gatewayAnswer: (key: string, res: import("node:http").ServerResponse) => voi
 let app: FastifyInstance;
 
 const MODELS_BY_KEY: Record<string, unknown> = {
-  "vk-alice": {
+  "pk-alice": {
     object: "list",
     data: [
       { id: "model-a1", object: "model", created: 1700000000, owned_by: "team-a", internal_cost: 12.5 },
@@ -42,7 +42,7 @@ const MODELS_BY_KEY: Record<string, unknown> = {
       "not-an-object",
     ],
   },
-  "vk-bob": { object: "list", data: [{ id: "model-b1", owned_by: "team-b" }, { id: "model-shared" }] },
+  "pk-bob": { object: "list", data: [{ id: "model-b1", owned_by: "team-b" }, { id: "model-shared" }] },
 };
 
 before(async () => {
@@ -65,6 +65,7 @@ before(async () => {
   process.env.APP_ENV = "production";
   delete process.env.CLAW_INSECURE_DEV_AUTH;
   process.env.CLAW_DEPLOY_MODE = "safe";
+  process.env.CLAW_AUTH_PROVIDER = "safe";
   delete process.env.LLM_KEY_SOURCE;
   process.env.SAFE_API_URL = platform.url;
   process.env.AUTH_INTERNAL_TOKEN = AUTH_INTERNAL_TOKEN;
@@ -148,7 +149,7 @@ test("M2: each caller is answered with their own key's models and the gateway se
   const bob = await get(asBob);
   assert.deepEqual(ids(alice.body), ["model-a1", "model-shared"]);
   assert.deepEqual(ids(bob.body), ["model-b1", "model-shared"]);
-  assert.deepEqual(gateway.seen.map((r) => r.headers.authorization), ["Bearer vk-alice", "Bearer vk-bob"]);
+  assert.deepEqual(gateway.seen.map((r) => r.headers.authorization), ["Bearer pk-alice", "Bearer pk-bob"]);
   // The caller's own credential to this API is not what the gateway is shown.
   for (const r of gateway.seen) {
     assert.equal(r.headers.cookie, undefined);
@@ -166,7 +167,7 @@ test("M2: concurrent callers never receive each other's models", async () => {
     assert.deepEqual(ids(res.body), i % 2 === 0 ? ["model-a1", "model-shared"] : ["model-b1", "model-shared"]);
   });
   const shown = new Set(gateway.seen.map((r) => r.headers.authorization));
-  assert.deepEqual([...shown].sort(), ["Bearer vk-alice", "Bearer vk-bob"]);
+  assert.deepEqual([...shown].sort(), ["Bearer pk-alice", "Bearer pk-bob"]);
 });
 
 test("M2: a request carrying alice's cookie and bob's key is answered as alice", async () => {
@@ -174,7 +175,7 @@ test("M2: a request carrying alice's cookie and bob's key is answered as alice",
   gateway.seen.length = 0;
   const res = await get({ ...asAlice, ...asBob });
   assert.deepEqual(ids(res.body), ["model-a1", "model-shared"]);
-  assert.deepEqual(gateway.seen.map((r) => r.headers.authorization), ["Bearer vk-alice"]);
+  assert.deepEqual(gateway.seen.map((r) => r.headers.authorization), ["Bearer pk-alice"]);
 });
 
 test("M4: an account with no gateway key is a 503, not an empty list, and the gateway is not asked", async () => {
@@ -193,7 +194,7 @@ test("M6: the answer is not cacheable, for a success and for a refusal alike", a
 
 test("M5: the failure table", async (t) => {
   const cases: { name: string; answer: typeof gatewayAnswer; status: number; error: string }[] = [
-    { name: "gateway 500", answer: (_k, res) => sendJson(res, 500, { error: "boom vk-alice" }), status: 502, error: "llm_gateway_error" },
+    { name: "gateway 500", answer: (_k, res) => sendJson(res, 500, { error: "boom pk-alice" }), status: 502, error: "llm_gateway_error" },
     { name: "gateway 503", answer: (_k, res) => sendJson(res, 503, "down"), status: 502, error: "llm_gateway_error" },
     { name: "gateway 401", answer: (_k, res) => sendJson(res, 401, { error: "bad key" }), status: 502, error: "llm_key_rejected" },
     { name: "gateway 403", answer: (_k, res) => sendJson(res, 403, { error: "no" }), status: 502, error: "llm_key_rejected" },
@@ -214,7 +215,7 @@ test("M5: the failure table", async (t) => {
         assert.equal(typeof body.reason, "string");
         assert.deepEqual(Object.keys(body).sort(), ["error", "reason"]);
         // What the gateway said, and the key it was sent, stay out of the answer.
-        assert.equal(res.body.includes("vk-alice"), false);
+        assert.equal(res.body.includes("pk-alice"), false);
         assert.equal(res.body.includes("boom"), false);
       } finally {
         gatewayAnswer = (key, res) => (MODELS_BY_KEY[key] ? sendJson(res, 200, MODELS_BY_KEY[key]) : sendJson(res, 401, {}));

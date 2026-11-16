@@ -124,6 +124,17 @@ same client, so they cannot be configured to disagree.
 {{- end -}}
 
 {{- /*
+CLAW_AUTH_PROVIDER for the API: identity.authProvider, default "identity".
+The identity provider verifies callers with the identity client (identity.enabled).
+*/ -}}
+{{- define "primus-claw.authProviderEnv" -}}
+{{- $i := .Values.identity | default dict -}}
+{{- $p := $i.authProvider | default "identity" -}}
+- name: CLAW_AUTH_PROVIDER
+  value: {{ $p | quote }}
+{{- end -}}
+
+{{- /*
 Accepting an identity provider's access token as an API credential, for the API
 Deployment only (Brain authenticates nobody with it). Renders nothing while
 identity.tokenAuth.enabled is false, so the default chart is byte-for-byte what it

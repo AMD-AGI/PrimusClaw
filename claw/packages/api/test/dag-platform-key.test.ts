@@ -28,6 +28,7 @@ import assert from "node:assert/strict";
 process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.SAFE_PLATFORM_KEY = "pk-CLUSTER-SHARED";
 process.env.CLAW_DEPLOY_MODE = "safe";
+process.env.CLAW_AUTH_PROVIDER = "safe";
 process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
 (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
 
@@ -179,7 +180,7 @@ test("C5 the patch every entry point writes carries the marker, and the keys onl
   assert.equal(patch._server_managed_credentials, true);
   assert.equal(JSON.stringify(patch).includes("pk-user-1"), false);
   assert.equal(JSON.stringify(patch).includes("vk-1"), false);
-  assert.deepEqual(readTrustedSessionCredentials(patch), { platformKey: "pk-user-1", llmApiKey: "vk-1" });
+  assert.deepEqual(readTrustedSessionCredentials(patch), { platformKey: "pk-user-1", llmApiKey: "pk-user-1" });
 });
 
 test("C5a an absent credential replaces a stale session value", () => {

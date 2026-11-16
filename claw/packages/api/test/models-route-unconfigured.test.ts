@@ -19,13 +19,14 @@ for (const k of ["BYOK_VERIFY_MODELS_URL", "BYOK_VERIFY_API_STYLE", "OPENAI_BASE
 process.env.APP_ENV = "production";
 delete process.env.CLAW_INSECURE_DEV_AUTH;
 process.env.CLAW_DEPLOY_MODE = "safe";
+process.env.CLAW_AUTH_PROVIDER = "safe";
 delete process.env.LLM_KEY_SOURCE;
 
 test("no gateway configured is a 503 llm_gateway_not_configured", async () => {
   const { registerModelsRoutes } = await import("../src/routes/models.js");
   const app = Fastify();
   app.addHook("preHandler", async (req) => {
-    (req as any).user = { userId: "u-dan", userName: "Dan", roles: ["default"], platformKey: "", virtualKey: "vk-dan" };
+    (req as any).user = { userId: "u-dan", userName: "Dan", roles: ["default"], platformKey: "pk-dan", virtualKey: "vk-dan" };
   });
   await registerModelsRoutes(app);
   try {
@@ -34,7 +35,7 @@ test("no gateway configured is a 503 llm_gateway_not_configured", async () => {
     const body = JSON.parse(res.body) as { error: string; reason: string };
     assert.equal(body.error, "llm_gateway_not_configured");
     assert.equal(typeof body.reason, "string");
-    assert.equal(res.body.includes("vk-dan"), false);
+    assert.equal(res.body.includes("pk-dan"), false);
   } finally {
     await app.close();
   }

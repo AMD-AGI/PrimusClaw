@@ -191,8 +191,9 @@ export class SafeClient {
     return h;
   }
 
+  // LLM calls use the platform key through SaFE's LLM proxy, so the virtual key is not asked for.
   private body(): Record<string, unknown> {
-    return { includePlatformKey: true, includeVirtualKey: true };
+    return { includePlatformKey: true };
   }
 
   // Cache-lookup + singleflight wrapper shared by the API-key, cookie and access-token paths.

@@ -526,6 +526,9 @@ secret:
   # Named rather than "capture the response headers", because these are logged
   # and response headers carry credentials. Empty is off, and off is default.
   llmDebugResponseHeaders: ""
+  # In the SaFE deploy mode LLM calls carry the user's platform key, so both base
+  # URLs name SaFE's LLM proxy (https://<safe>/api/v1/llm-proxy/v1), which puts the
+  # user's LiteLLM virtual key on the request.
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
@@ -579,6 +582,12 @@ grantSigningKey:
 # and the default used.
 identity:
   enabled: false
+  # Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER), for the API.
+  # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
+  # (POST /api/v1/apikeys/platform on the origin of endpoints.introspection).
+  # Needs identity.enabled and endpoints.introspection.
+  # "safe": SaFE's /api/v1/auth/verify returns the user and the platform key.
+  authProvider: identity
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
   issuerUrl: ""
   clientId: ""

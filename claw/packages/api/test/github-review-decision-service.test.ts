@@ -70,7 +70,7 @@ describe("a service an operator allowed answers a held merge for the user its to
     fake = await FakeIdentity.start();
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     Object.assign(process.env, {
-      SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t",
+      SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t",
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw", IDENTITY_CLIENT_SECRET: "s3cret",
       CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true",
     });

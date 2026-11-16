@@ -10,7 +10,9 @@ import {
   SafeUpstreamHttpError,
 } from "./safe-client.js";
 import type { UserInfo } from "./models.js";
-import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode, isIdentityAuthProvider } from "../config.js";
+import { identityClient } from "./identity.js";
+import { IdentityVerifier, identityServiceOrigin } from "./identity-verifier.js";
 import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
@@ -27,14 +29,22 @@ import pino from "pino";
 const logger = pino({ name: "auth" });
 
 let _client: SafeClient | null = null;
+let _identityVerifier: IdentityVerifier | null = null;
 
-function getClient(): SafeClient | null {
+/** The verifier of the configured auth provider, or null when that provider is not configured. */
+function getClient(): CredentialVerifier | null {
+  if (isIdentityAuthProvider()) {
+    const identity = identityClient();
+    const apiUrl = identityServiceOrigin(process.env.IDENTITY_INTROSPECTION_URL);
+    if (!_identityVerifier && identity && apiUrl) _identityVerifier = new IdentityVerifier(identity, apiUrl);
+    return _identityVerifier;
+  }
   if (!_client && SAFE_API_URL) _client = new SafeClient(SAFE_API_URL);
   return _client;
 }
 
-/** The SaFE client the credential paths verify with, for a route that verifies a second person's key (`verifyActingAsCredentials`). */
-export function credentialVerifier(): SafeClient | null {
+/** The client the credential paths verify with, for a route that verifies a second person's key (`verifyActingAsCredentials`). */
+export function credentialVerifier(): CredentialVerifier | null {
   return getClient();
 }
 
@@ -650,7 +660,9 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   const client = getClient();
   if (!client) {
     return sendAuthError(req, reply, 500, "authentication_misconfigured", "api_error",
-      "SAFE_API_URL is not configured; cannot authenticate") as any;
+      isIdentityAuthProvider()
+        ? "CLAW_AUTH_PROVIDER=identity needs the identity client (IDENTITY_CLIENT_ENABLED) and IDENTITY_INTROSPECTION_URL; cannot authenticate"
+        : "SAFE_API_URL is not configured; cannot authenticate") as any;
   }
 
   for (const verifyCredential of CREDENTIAL_PATHS) {

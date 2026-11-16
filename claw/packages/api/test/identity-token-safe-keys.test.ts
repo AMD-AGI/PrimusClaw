@@ -3,8 +3,8 @@
 
 /**
  * What a caller authenticated by an identity provider's access token has once SaFE
- * has been asked about it: the platform key and the virtual key of the person the
- * token names, and nobody else's.
+ * has been asked about it: the platform key of the person the token names, and
+ * nobody else's. SaFE is not asked for the virtual key.
  *
  * SaFE is never shown the person's token. The API exchanges it at the provider (RFC 8693
  * service delegation) for a token for SaFE's audience that names the API as the party acting
@@ -172,12 +172,12 @@ beforeEach(() => {
 });
 
 describe("K1 the keys of the subject", () => {
-  test("a person SaFE accepts the delegated token of gives SaFE's platform key and virtual key, and SaFE was asked with that token, not theirs", async () => {
+  test("a person SaFE accepts the delegated token of gives SaFE's platform key and no virtual key, and SaFE was asked with that token, not theirs", async () => {
     const token = mint();
     const u = user(await run(token));
     assert.equal(u.userId, "u-alice");
     assert.equal(u.platformKey, "ak-alice-platform");
-    assert.equal(u.virtualKey, "sk-alice-virtual");
+    assert.equal(u.virtualKey, "");
 
     // The provider was asked to exchange the person's token, as the API's own client, for SaFE's audience.
     assert.deepEqual(delegations, [{ subjectToken: token, audience: "primus-safe", scope: "safe.api" }]);
@@ -190,8 +190,8 @@ describe("K1 the keys of the subject", () => {
     const [call, ...rest] = verifyCalls();
     assert.equal(rest.length, 0, "one question");
     assert.equal(call!.headers["x-internal-token"], INTERNAL);
-    const asked = JSON.parse(call!.body) as { includePlatformKey: boolean; includeVirtualKey: boolean; authorization: string };
-    assert.deepEqual([asked.includePlatformKey, asked.includeVirtualKey], [true, true]);
+    const asked = JSON.parse(call!.body) as { includePlatformKey: boolean; includeVirtualKey?: boolean; authorization: string };
+    assert.deepEqual([asked.includePlatformKey, asked.includeVirtualKey], [true, undefined]);
     assert.notEqual(asked.authorization, `Bearer ${token}`);
     assert.ok(!call!.body.includes(token), "the person's token is not in what SaFE was sent");
     const delegated = payloadOf(asked.authorization.replace("Bearer ", ""));
@@ -349,8 +349,8 @@ describe("K3 nothing is exchanged or shown to SaFE for a token this API did not 
 describe("K4 nobody else's keys, and no roles from anywhere", () => {
   test("two users each get their own keys, in either order and in parallel", async () => {
     const [a, b] = await Promise.all([run(mint({ sub: "u-alice" })), run(mint({ sub: "u-bob" }))]);
-    assert.deepEqual([user(a).platformKey, user(a).virtualKey], ["ak-alice-platform", "sk-alice-virtual"]);
-    assert.deepEqual([user(b).platformKey, user(b).virtualKey], ["ak-bob-platform", "sk-bob-virtual"]);
+    assert.deepEqual([user(a).platformKey, user(a).virtualKey], ["ak-alice-platform", ""]);
+    assert.deepEqual([user(b).platformKey, user(b).virtualKey], ["ak-bob-platform", ""]);
     const again = user(await run(mint({ sub: "u-bob" })));
     assert.equal(again.platformKey, "ak-bob-platform");
     assert.equal(delegations.length, 2, "one exchange per person");
@@ -448,7 +448,7 @@ describe("K5 how long an answer is kept", () => {
     fake.token = (r) => (r.form.get("subject_token") === signedOut ? { status: 400, body: { error: "invalid_grant" } } : real(r));
     assert.equal(user(await run(signedOut)).platformKey, "", "the refused token runs keyless");
     assert.equal(user(await run(phone)).platformKey, "ak-alice-platform", "the other device is not made keyless by it");
-    assert.equal(user(await run(phone)).virtualKey, "sk-alice-virtual");
+    assert.equal(user(await run(phone)).virtualKey, "");
     assert.equal(delegations.length, 1, "only the good token was exchanged for SaFE's audience");
   });
 
@@ -557,13 +557,13 @@ describe("K7 a delegated token has no keys, except an allow-listed service's, wh
     const u = user(await run(asService(), client, { "x-api-key": "ak-alice-platform" }));
     assert.equal(u.userId, "u-alice");
     assert.equal(u.platformKey, "ak-alice-platform");
-    assert.equal(u.virtualKey, "sk-alice-virtual");
+    assert.equal(u.virtualKey, "");
     assert.deepEqual(u.roles, ["default"], "SaFE's roles for the user are nobody's but the operator's, here too");
     assert.deepEqual(u.delegation, { actorSub: SERVICE, clientId: SERVICE }, "still the caller it was: a service acting for the person");
     const [call, ...rest] = verifyCalls();
     assert.equal(rest.length, 0, "one question");
     assert.equal(call!.headers["x-internal-token"], INTERNAL);
-    assert.deepEqual(asked(), [{ includePlatformKey: true, includeVirtualKey: true, apiKey: "ak-alice-platform" }]);
+    assert.deepEqual(asked(), [{ includePlatformKey: true, apiKey: "ak-alice-platform" }]);
     assert.equal(exchangeCalls().length, 0, "a delegated token is not exchanged again");
   });
 
@@ -648,7 +648,7 @@ describe("K7 a delegated token has no keys, except an allow-listed service's, wh
   test("a token that is not delegated has the keys SaFE holds for its subject by delegation, whatever key rides along and whoever sent it", async () => {
     // The named service's own plain token (no act): the header is not read, so a key that is somebody else's gets nobody anything.
     const u = user(await run(mint({ client_id: SERVICE }), client, { "x-api-key": "ak-bob-platform" }));
-    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", "sk-alice-virtual"]);
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", ""]);
     assert.deepEqual(asked().map((q) => Object.keys(q).includes("apiKey")), [false], "SaFE was asked about the delegated token, never about the key");
     assert.equal(delegations.length, 1);
   });
@@ -687,7 +687,7 @@ describe("K9 a named chat service's delegated token has the keys SaFE holds for 
   test("the service's token is exchanged once more, SaFE is shown the result (this API acting, the service kept in the chain), and the keys are the subject's", async () => {
     const token = byChat();
     const u = user(await run(token));
-    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", "sk-alice-virtual"]);
+    assert.deepEqual([u.userId, u.platformKey, u.virtualKey], ["u-alice", "ak-alice-platform", ""]);
     assert.deepEqual(u.roles, ["default"], "SaFE's roles are still nobody's but the operator's");
     assert.deepEqual(u.delegation, { actorSub: CHAT, clientId: CHAT }, "still a service acting for the person");
     assert.deepEqual(delegations.map((d) => [d.subjectToken, d.audience, d.scope]), [[token, "primus-safe", "safe.api"]]);
@@ -702,7 +702,7 @@ describe("K9 a named chat service's delegated token has the keys SaFE holds for 
   test("two people through the same service never share keys", async () => {
     const a = user(await run(byChat()));
     const b = user(await run(byChat({ sub: "u-bob", name: "Bob" })));
-    assert.deepEqual([a.virtualKey, b.virtualKey], ["sk-alice-virtual", "sk-bob-virtual"]);
+    assert.deepEqual([a.platformKey, b.platformKey], ["ak-alice-platform", "ak-bob-platform"]);
   });
 
   test("an answer for another subject than the token's is not taken", async () => {
@@ -714,7 +714,7 @@ describe("K9 a named chat service's delegated token has the keys SaFE holds for 
   test("a key the service brings for the person is still the one used, and nothing is exchanged", async () => {
     process.env.CLAW_IDENTITY_TOKEN_OWN_KEY_CLIENT_IDS = CHAT;
     const u = user(await run(byChat(), client, { "x-api-key": "ak-alice-platform" }));
-    assert.deepEqual([u.platformKey, u.virtualKey], ["ak-alice-platform", "sk-alice-virtual"]);
+    assert.deepEqual([u.platformKey, u.virtualKey], ["ak-alice-platform", ""]);
     assert.equal(exchangeCalls().length, 0);
     assert.deepEqual(asked().map((q) => q.apiKey), ["ak-alice-platform"]);
   });
@@ -748,7 +748,7 @@ describe("K9 a named chat service's delegated token has the keys SaFE holds for 
 
   test("the setting is a list of client ids as signed, separated by commas or white space", async () => {
     process.env.CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS = ` first ,${CHAT}\n third`;
-    assert.equal(user(await run(byChat())).virtualKey, "sk-alice-virtual");
+    assert.equal(user(await run(byChat())).platformKey, "ak-alice-platform");
   });
 });
 
@@ -765,7 +765,7 @@ describe("K8 the credentials a service brings for the person a review is asked o
     assert.equal(r.ok, true, JSON.stringify(r));
     if (!r.ok) return;
     assert.deepEqual([r.user.userId, r.user.userName, r.user.platformKey, r.user.virtualKey, r.user.delegation],
-      ["u-bob", "Bob", "ak-bob-platform", "sk-bob-virtual", { actorSub: "svc-chat", clientId: "svc-reviews" }]);
+      ["u-bob", "Bob", "ak-bob-platform", "", { actorSub: "svc-chat", clientId: "svc-reviews" }]);
     assert.deepEqual(verifyCalls().map((c) => JSON.parse(c.body).apiKey), ["ak-bob-platform"], "SaFE judged the key");
     assert.equal(exchangeCalls().length, 0, "nothing is exchanged for it");
   });

@@ -62,6 +62,7 @@ Object.assign(process.env, {
   CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: `${SERVICE} svc-answers-only`,
   CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true",
   RUN_FAT_PREPARING_RECONCILE: "true",
+  CLAW_AUTH_PROVIDER: "safe",
   SAFE_API_URL: `http://127.0.0.1:${(safe.address() as AddressInfo).port}`,
   AUTH_INTERNAL_TOKEN: "internal-token-for-tests",
 });
@@ -180,7 +181,7 @@ test("O2 a named service's token with the requester's own key creates the sessio
   assert.equal(row.user_id, "u-alice", "the requester owns it");
   assert.equal((row.config as { acting_as: string }).acting_as, "u-alice");
   assert.equal(published.length, 1);
-  assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["ak-alice", "vk-alice"], "the turn runs on the requester's own keys");
+  assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["ak-alice", "ak-alice"], "the turn runs on the requester's own keys");
   assert.equal(published[0]?.withhold_sandbox_keys, true, "and its sandbox holds none of them");
   assert.ok((published[0]?.mcp_servers as Record<string, unknown>)?.github_review, "with the review tools");
 
@@ -218,7 +219,7 @@ test("O4 without a key, or from a service that is not named for it, the token is
 test("O5 a key beside a plain person's token is not read, and a service that only answers confirmations is not given the requester's keys", async () => {
   const own = await post({ ...bearer(token("u-alice")), "x-api-key": "ak-bob" }, "/v1/sessions", { name: "plain", config: {}, message: { content: "hello" } });
   assert.equal(own.status, 200, JSON.stringify(own.body));
-  assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["ak-alice", "vk-alice"], "Alice's keys by delegation, never the key that rode along");
+  assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["ak-alice", "ak-alice"], "Alice's keys by delegation, never the key that rode along");
   assert.ok(!("withhold_sandbox_keys" in published[0]!), "an ordinary session");
   const answersOnly = await post({ ...bearer(token("u-alice", "svc-answers-only")), "x-api-key": "ak-alice" }, "/v1/sessions", { name: "plain", config: {}, message: { content: "hello" } });
   assert.equal(answersOnly.status, 200, JSON.stringify(answersOnly.body));

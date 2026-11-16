@@ -25,7 +25,7 @@ let app: FastifyInstance;
 
 before(async () => {
   gateway = await startFakeUpstream((req, res) => {
-    if (req.headers["x-api-key"] !== "vk-carol") return sendJson(res, 401, { error: "wrong header" });
+    if (req.headers["x-api-key"] !== "pk-carol") return sendJson(res, 401, { error: "wrong header" });
     sendJson(res, 200, { data: [{ id: "claude-x", type: "model", display_name: "Claude X" }] });
   });
   // The base URLs point here, and a call that lands here has ignored the explicit URL.
@@ -34,6 +34,7 @@ before(async () => {
   process.env.APP_ENV = "production";
   delete process.env.CLAW_INSECURE_DEV_AUTH;
   process.env.CLAW_DEPLOY_MODE = "safe";
+  process.env.CLAW_AUTH_PROVIDER = "safe";
   delete process.env.LLM_KEY_SOURCE;
   process.env.BYOK_VERIFY_MODELS_URL = `${gateway.url}/v1/models`;
   process.env.BYOK_VERIFY_API_STYLE = "anthropic";
@@ -45,7 +46,7 @@ before(async () => {
   app = Fastify();
   // Stand-in for the auth middleware: this file is about the gateway, not the caller.
   app.addHook("preHandler", async (req) => {
-    (req as any).user = { userId: "u-carol", userName: "Carol", roles: ["default"], platformKey: "", virtualKey: "vk-carol" };
+    (req as any).user = { userId: "u-carol", userName: "Carol", roles: ["default"], platformKey: "pk-carol", virtualKey: "vk-carol" };
   });
   await registerModelsRoutes(app);
   await app.ready();
@@ -62,7 +63,7 @@ test("an explicit models URL wins over the base URLs, and the Anthropic protocol
   assert.deepEqual(JSON.parse(res.body), { object: "list", data: [{ id: "claude-x" }] });
   assert.equal(decoy.seen.length, 0);
   assert.equal(gateway.seen.length, 1);
-  assert.equal(gateway.seen[0].headers["x-api-key"], "vk-carol");
+  assert.equal(gateway.seen[0].headers["x-api-key"], "pk-carol");
   assert.equal(gateway.seen[0].headers["anthropic-version"], "2023-06-01");
   assert.equal(gateway.seen[0].headers.authorization, undefined);
 });

@@ -17,6 +17,7 @@ import test, { after, before, beforeEach } from "node:test";
 import type { FastifyInstance } from "fastify";
 
 // Before anything reads the configuration, which is read when its module loads.
+process.env.CLAW_AUTH_PROVIDER = "safe";
 process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.CLAW_GITHUB_REVIEW_MCP_URL = "http://api.internal.example:8200/v1/internal/github-review/mcp";
@@ -281,7 +282,7 @@ test("T6 the first turn of a session that acts as a user is marked so that its s
   assert.equal(acting.status, 200, JSON.stringify(acting.body));
   assert.equal(published[0]?.withhold_sandbox_keys, true);
   assert.equal(published[0]?.platform_key, "pk", "Brain is still given the keys: it asks the model and SaFE with them");
-  assert.equal(published[0]?.llm_api_key, "vk");
+  assert.equal(published[0]?.llm_api_key, "pk");
   const plain = await create(ALICE, { notify_on_finish: true }, { message: { content: "hello" } });
   assert.equal(plain.status, 200);
   assert.equal("withhold_sandbox_keys" in (published[1] ?? {}), false, "an ordinary session's turn is exactly what it was");

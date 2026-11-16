@@ -54,7 +54,7 @@ describe("a user's access token and a connector's, both switched on", () => {
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     Object.assign(process.env, {
       // A SaFE that does not know the issuer: the only question put to it is what keys a user token's subject has.
-      SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t",
+      SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t",
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw", IDENTITY_CLIENT_SECRET: "s3cret",
       CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true",
     });
