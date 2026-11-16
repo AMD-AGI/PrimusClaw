@@ -470,6 +470,7 @@ func main() {
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
 		apiServer.WithE2B(plane)
+		apiServer.WithTemplateMembership(membership)
 	}
 
 	// Sandbox health watcher — exposes pod health as Prometheus metrics

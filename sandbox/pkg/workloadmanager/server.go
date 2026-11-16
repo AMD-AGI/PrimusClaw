@@ -125,6 +125,15 @@ type Server struct {
 	wg         sync.WaitGroup
 	auditStore audit.AuditStore // nil when audit disabled
 	builder    *builder.Builder // nil when image building not configured
+	// templateMembership lists the workspaces a caller may write templates in.
+	templateMembership TemplateMembership
+}
+
+// TemplateMembership chooses the SaFE workspace of a template writer.
+type TemplateMembership interface {
+	// ChooseWorkspace returns requested when tok may use it. With requested
+	// empty it returns the workspace it picks, or authz.ErrWorkspaceRequired.
+	ChooseWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error)
 }
 
 // New creates a new Workload Manager server.
@@ -137,6 +146,13 @@ func New(cfg Config, st store.Store) *Server {
 // WithK8s attaches a K8s sandbox creator (for production use).
 func (s *Server) WithK8s(k8s *K8sSandboxCreator) *Server {
 	s.k8s = k8s
+	return s
+}
+
+// WithTemplateMembership attaches the workspace check for template creates and
+// updates. Without it a verified non-admin caller cannot write templates.
+func (s *Server) WithTemplateMembership(m TemplateMembership) *Server {
+	s.templateMembership = m
 	return s
 }
 
@@ -446,7 +462,7 @@ func (s *Server) handleCodeInterpreterCreateStream(c *gin.Context) {
 		req.Namespace = s.cfg.Namespace
 	}
 	// Before the SSE headers: once they are flushed a 403 can no longer be sent.
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitSandboxNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -581,7 +597,7 @@ func (s *Server) handleCreate(c *gin.Context, kind string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace is required"})
 		return
 	}
-	if !s.admitNamespace(c, req.Namespace) {
+	if !s.admitNamespace(c, req.Namespace) || !s.admitSandboxNamespace(c, req.Namespace) {
 		return
 	}
 
@@ -1231,9 +1247,11 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
-	if req.Namespace == "" {
-		req.Namespace = "default"
+	ns, workspace, ok := s.templateTarget(c, &req)
+	if !ok || !s.admitTemplateFields(c, req.Spec, req.Dockerfile, workspace != "" || ns == s.cfg.Namespace) {
+		return
 	}
+	req.Namespace = ns
 	// Before the image build: a denied namespace must not cost a kaniko run.
 	if !s.admitNamespace(c, req.Namespace) {
 		return
@@ -1271,7 +1289,7 @@ func (s *Server) handleTemplateCreate(c *gin.Context) {
 		req.Spec.Template.FromImage = buildResult.Image
 	}
 
-	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, req.Spec, user, public)
+	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, workspace, req.Spec, user, public)
 	if err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "already exists") {
@@ -1345,9 +1363,11 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
 		return
 	}
-	if req.Namespace == "" {
-		req.Namespace = "default"
+	ns, workspace, ok := s.templateTarget(c, &req)
+	if !ok || !s.admitTemplateFields(c, req.Spec, req.Dockerfile, workspace != "" || ns == s.cfg.Namespace) {
+		return
 	}
+	req.Namespace = ns
 	if !s.admitNamespace(c, req.Namespace) {
 		return
 	}
@@ -1390,7 +1410,7 @@ func (s *Server) handleTemplateCreateStream(c *gin.Context) {
 
 	// Create the template CRD
 	writeSSE("phase", BuildPhase{Phase: "crd_creation", Status: "started"})
-	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, req.Spec, user, public)
+	ci, err := s.k8s.CreateTemplate(c.Request.Context(), req.Name, req.Namespace, workspace, req.Spec, user, public)
 	if err != nil {
 		errMsg := err.Error()
 		writeSSE("phase", BuildPhase{Phase: "crd_creation", Status: "failed", Message: errMsg})
@@ -1432,6 +1452,8 @@ type ListTemplatesRequest struct {
 	UserName string `form:"userName" binding:"omitempty"`
 	// Filter by template name (fuzzy match)
 	Name string `form:"name" binding:"omitempty"`
+	// Filter by template workspace (exact match on label)
+	Workspace string `form:"workspace" binding:"omitempty"`
 	// Filter by public status: "true" = only public, "false" = only private, empty = all (subject to role)
 	Public string `form:"public" binding:"omitempty,oneof=true false"`
 	// Pagination offset, default 0
@@ -1527,6 +1549,9 @@ func (s *Server) handleTemplateList(c *gin.Context) {
 		if req.Name != "" && !strings.Contains(ci.Name, req.Name) {
 			continue
 		}
+		if req.Workspace != "" && ci.Labels[grant.TemplateWorkspaceLabel] != req.Workspace {
+			continue
+		}
 		filtered = append(filtered, ci)
 	}
 
@@ -1593,7 +1618,7 @@ func (s *Server) handleTemplateGet(c *gin.Context) {
 }
 
 // handleTemplateUpdate handles PUT /v1/templates/:namespace/:name.
-// Permission: only owner or system-admin can update; only system-admin can change public status.
+// Permission: system-admin, or the owner of a private template; only system-admin can change public status.
 func (s *Server) handleTemplateUpdate(c *gin.Context) {
 	if s.k8s == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
@@ -1621,9 +1646,16 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 		return
 	}
 
-	// Permission check: must be writable (system-admin or owner)
+	// Permission check: must be writable (system-admin, or owner of a private template)
 	if !isTemplateWritable(c, existing) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the template owner or system-admin can update this template"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can update this template"})
+		return
+	}
+	ws := existing.Labels[grant.TemplateWorkspaceLabel]
+	if ws != "" && !s.admitTemplateWorkspace(c, ws) {
+		return
+	}
+	if !s.admitTemplateFields(c, req.Spec, "", ws != "" || namespace == s.cfg.Namespace) {
 		return
 	}
 
@@ -1642,7 +1674,7 @@ func (s *Server) handleTemplateUpdate(c *gin.Context) {
 }
 
 // handleTemplateDelete handles DELETE /v1/templates/:namespace/:name.
-// Permission: only owner or system-admin can delete.
+// Permission: system-admin, or the owner of a private template.
 func (s *Server) handleTemplateDelete(c *gin.Context) {
 	if s.k8s == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "K8s not available in dev mode"})
@@ -1661,9 +1693,9 @@ func (s *Server) handleTemplateDelete(c *gin.Context) {
 		return
 	}
 
-	// Permission check: must be writable (system-admin or owner)
+	// Permission check: must be writable (system-admin, or owner of a private template)
 	if !isTemplateWritable(c, existing) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the template owner or system-admin can delete this template"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only system-admin or the owner of a private template can delete this template"})
 		return
 	}
 

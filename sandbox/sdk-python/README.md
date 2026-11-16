@@ -59,6 +59,11 @@ session.exec("ls")        # still in /tmp
 | Templates | `list_templates`, `get_template`, `create_template` |
 | Operations | `gpu_status`, `get_logs`, `get_policy`, `update_policy` |
 
+A template created with `workspace` is stored in the control-plane namespace;
+`get_template`, `update_template` and `delete_template` take that namespace for it.
+With caller authentication, a caller other than `system-admin` creates only
+workspace templates.
+
 Full parameter documentation is generated from the docstrings — see the
 [Python API reference](../../docs/api/) or build it locally with
 `make verify-docs` from the repository root.

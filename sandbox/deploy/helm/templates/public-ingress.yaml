@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.controlplane.enabled }}
+{{- with .Values.router.publicIngress }}
+{{- if .enabled }}
+{{- if not .hosts }}
+{{- fail "router.publicIngress.enabled requires at least one host" }}
+{{- end }}
+{{- $allowed := list "/sandboxes" "/v2/sandboxes" "/files" "/api/files" "/process.Process" "/filesystem.Filesystem" "/v1/templates" }}
+{{- range .paths }}
+{{- $raw := . | toString }}
+{{- $path := trimSuffix "/" $raw }}
+{{- $ok := false }}
+{{- range $allowed }}
+{{- if or (eq $path .) (hasPrefix (printf "%s/" .) $path) }}
+{{- $ok = true }}
+{{- end }}
+{{- end }}
+{{- if not $ok }}
+{{- fail (printf "router.publicIngress path %q must name a specific route: one of %s, or a path below one" $raw (join ", " $allowed)) }}
+{{- end }}
+{{- if and (hasPrefix "/v1/" $path) (not $.Values.router.config.enableAuth) }}
+{{- fail (printf "router.publicIngress path %q requires router.config.enableAuth: without caller auth the Workload Manager treats every /v1 request as system-admin" $raw) }}
+{{- end }}
+{{- if and (hasPrefix "/v1/" $path) (not $.Values.router.config.namespaceSelector) }}
+{{- fail (printf "router.publicIngress path %q requires router.config.namespaceSelector: without one the path would reach every namespace" $raw) }}
+{{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ required "router.publicIngress.name is required" .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: agent-sandbox
+    app.kubernetes.io/component: router
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    higress.io/resource-definer: higress
+  {{- with .annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    {{- range .hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          {{- range $.Values.router.publicIngress.paths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-sandbox-router
+                port:
+                  number: {{ $.Values.controlplane.service.router.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
