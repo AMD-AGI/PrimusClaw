@@ -1158,6 +1158,11 @@ export interface ReviewFacts {
   emptyRerun?: EmptyRerun | null;
   /** Whether a review tool call of the session was refused because the session's GitHub request budget was used up. Unset when not read. */
   budgetRefused?: boolean;
+  /**
+   * What the session's own calls changed on GitHub (`GITHUB_EFFECTS_SQL`): how many review threads it resolved, and whether any other call
+   * sent a write (a review or a merge, made or refused after it was sent). Unset when not read.
+   */
+  changed?: { resolvedThreads: number; wrote: boolean };
 }
 
 /** How long a merge waits for its author (`AuthorWait`) before it goes to the reviewer. */
@@ -1207,7 +1212,7 @@ const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_m
  * A re-review of a head already reviewed that posted nothing (`unchangedReview`) is told to whoever asked for it, the owner or the requester:
  * it waits for CI on that head before it is run again (`unchanged_wait`), or it ends with nothing new to post (`unchanged`).
  */
-export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run" | "budget_exhausted";
+export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run" | "budget_exhausted" | "budget_partial";
 
 /** The refusal of a review tool call made when the session's GitHub request budget is used up (`GithubReview.run`). */
 export const BUDGET_REFUSAL = "request_budget_exhausted";
@@ -1220,11 +1225,53 @@ export const BUDGET_REFUSAL = "request_budget_exhausted";
  * its re-run was refused at its first read, and the reviewer was told it was stuck).
  */
 export function budgetSpent(f: ReviewFacts): boolean {
+  return budgetRefusedOnly(f) && !changedGithub(f);
+}
+
+/** A session that ran out of GitHub requests, with nothing posted, held or tried as a write but refused for that (see {@link budgetSpent}). */
+function budgetRefusedOnly(f: ReviewFacts): boolean {
   const refused = f.budgetRefused === true || f.writes.some((w) => WRITE_TOOLS.has(w.tool) && w.result === "refused" && w.detail === BUDGET_REFUSAL);
   // (a write tried and refused for anything else, or made, is judged as before: only a budget refusal is this)
   return refused && f.turn === "finished" && !f.halted && f.confirmations.length === 0
     && f.writes.every((w) => !WRITE_TOOLS.has(w.tool) || (w.result === "refused" && w.detail === BUDGET_REFUSAL));
 }
+
+/** Whether the session's own calls changed anything on GitHub (`ReviewFacts.changed`). */
+export function changedGithub(f: ReviewFacts): boolean {
+  return (f.changed?.resolvedThreads ?? 0) > 0 || f.changed?.wrote === true;
+}
+
+/**
+ * A session that ran out of GitHub requests after it had changed the pull request (it resolved review threads of the last review, or sent a
+ * write), with no review posted: partly done. It is never told as "not reviewed, nothing changed" (`budget_exhausted`): the reviewer is
+ * asked to look at it, as before, and whoever asked for it is told what was done before the requests ran out (`budget_partial`).
+ */
+export function budgetPartial(f: ReviewFacts): boolean {
+  return budgetRefusedOnly(f) && changedGithub(f);
+}
+
+/**
+ * What each review tool (`GithubReview.run`) can change on GitHub, read when a review ends, every tool in exactly one class
+ * (`test/assistant-review-items.test.ts` reads the tool names off the service and checks each is here):
+ *   - `read`: changes nothing (`gh_pr_get`, `gh_pr_risk`, `gh_pr_check`);
+ *   - `write_flag`: a review or a merge, whose audit row is marked `write` once it is sent (`reserveWrite`), whatever became of it;
+ *   - `resolve`: a review thread resolved with the acting account, which is no review and no merge (so not marked `write`, and not in their
+ *     hourly limits): its row says `resolved` when it did;
+ *   - `server`: the server's own follow-up (`gh_pr_follow`), never a call of the session's turns: what it does ends the item on its own.
+ */
+export const REVIEW_TOOL_EFFECTS = {
+  gh_pr_get: "read", gh_pr_risk: "read", gh_pr_check: "read",
+  gh_review_submit: "write_flag", gh_pr_merge: "write_flag",
+  gh_thread_resolve: "resolve",
+  gh_pr_follow: "server",
+} as const satisfies Record<string, "read" | "write_flag" | "resolve" | "server">;
+const toolsOf = (effect: string): string[] => Object.entries(REVIEW_TOOL_EFFECTS).filter(([, e]) => e === effect).map(([t]) => t);
+
+/** What session $1's own calls changed on GitHub (`ReviewFacts.changed`): threads resolved, and any write sent (a dry run sends nothing). */
+export const GITHUB_EFFECTS_SQL = `
+  SELECT COUNT(*) FILTER (WHERE tool = ANY('{${toolsOf("resolve").join(",")}}'::text[]) AND result = 'ok' AND detail = 'resolved')::int AS resolved,
+         COALESCE(BOOL_OR(write AND NOT dry_run AND tool <> ALL('{${toolsOf("server").join(",")}}'::text[])), FALSE) AS wrote
+    FROM claw_github_audit WHERE session_id = $1 AND ${REVIEW_ROWS_ONLY}`;
 
 /**
  * A review whose turn ended having called no review tool at all (`ReviewFacts.reviewCalls`): nothing read, posted or held. It did not
@@ -1234,7 +1281,7 @@ export function budgetSpent(f: ReviewFacts): boolean {
  */
 export function calledNoReviewTool(f: ReviewFacts): boolean {
   return f.reviewCalls === 0 && f.turn === "finished" && !f.halted && !f.unchanged && f.confirmations.length === 0
-    && f.writes.every((w) => w.tool === FOLLOW_TOOL);
+    && f.writes.every((w) => w.tool === FOLLOW_TOOL) && !changedGithub(f);
 }
 
 /**
@@ -1266,7 +1313,7 @@ const AUTHOR_WAIT_QUESTION: Record<AuthorWait, (pr: string) => string> = {
 
 export type ReviewState =
   | { boardState: "in_progress"; summary: string; question: string | null; result?: ReviewResult; authorWait?: AuthorWait; rerun?: "no_review_call" }
-  | { boardState: "needs_you"; reportKind: "blocked" | "failed"; summary: string; question: string }
+  | { boardState: "needs_you"; reportKind: "blocked" | "failed"; summary: string; question: string; result?: Extract<ReviewResult, "budget_partial"> }
   | { boardState: "done"; outcome: Extract<Outcome, "accepted" | "stopped">; summary: string; result?: ReviewResult };
 
 /**
@@ -1329,6 +1376,12 @@ export function reviewState(f: ReviewFacts): ReviewState {
   if (f.turn === "none") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   if (!submitted && budgetSpent(f)) {
     return { boardState: "done", outcome: "stopped", summary: `the review of ${pr} could not run: its GitHub requests were used up`, result: "budget_exhausted" };
+  }
+  if (!submitted && budgetPartial(f)) {
+    return {
+      boardState: "needs_you", reportKind: "blocked", summary: `the review of ${pr} ran out of GitHub requests after changing it`,
+      question: RQ.lookAtSession.en(pr), result: "budget_partial",
+    };
   }
   const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status) && current(c)));
   if (closed && (!submitted || closed.at >= submitted.at)) {
@@ -1456,6 +1509,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
   const budget = (await q.query(
     `SELECT EXISTS (SELECT 1 FROM claw_github_audit WHERE session_id = $1 AND result = 'refused' AND detail = $2) AS refused`, [sessionId, BUDGET_REFUSAL],
   )).rows[0] as { refused: boolean } | undefined;
+  const effects = (await q.query(GITHUB_EFFECTS_SQL, [sessionId])).rows[0] as { resolved: number; wrote: boolean } | undefined;
   return {
     ownerUserId: row.user_id, actingAs: row.params.acting_as, actingAsName: row.params.acting_as_name, reviewOnly: row.params.review_only,
     pr: row.params.pr,
@@ -1476,6 +1530,7 @@ async function readFacts(q: StatementRunner, row: { user_id: string; worker_sess
     reviewCalls: Number(calls?.n ?? 0),
     emptyRerun: row.params.empty_rerun?.reason ?? null,
     budgetRefused: budget?.refused === true,
+    changed: { resolvedThreads: Number(effects?.resolved ?? 0), wrote: effects?.wrote === true },
   };
 }
 
@@ -1565,7 +1620,8 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
       && (row.pending_question ?? null) === question && row.summary === summary) return null;
     const attention = state.boardState === "needs_you" ? 1 : 0;
     const outcome = state.boardState === "done" ? state.outcome : null;
-    told = state.boardState === "needs_you" ? null : state.result ?? null;
+    // (a review that needs its reviewer is told to them by the wake; only a partly done one is also told to whoever asked: `budget_partial`)
+    told = state.result ?? null;
     await query(
       `UPDATE claw_work_items
           SET board_state = $2, last_report_kind = COALESCE($3, last_report_kind), summary = $4, pending_question = $5, outcome = $6,

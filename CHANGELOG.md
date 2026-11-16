@@ -158,7 +158,9 @@ release version, and its `appVersion` stays `latest`.
   open for hours had its budget spent by those follow-ups, so its re-run in the same session was refused at its first read.
   A review whose session does run out of GitHub requests before it posts anything now ends as not reviewed: whoever asked
   for it is told so and to ask again, which starts a new session, and the reviewer is no longer asked to look at it as
-  stuck. An item left waiting for the reviewer that way ends at the first sweep after the upgrade.
+  stuck. An item left waiting for the reviewer that way ends at the first sweep after the upgrade. A review that had already
+  changed the pull request before its requests ran out (it resolved review threads of the last review, or sent a review or a
+  merge) is partly done instead: the reviewer is asked to look at it, and whoever asked is told what was done.
 
 ## [0.5.0] - 2026-11-13
 
