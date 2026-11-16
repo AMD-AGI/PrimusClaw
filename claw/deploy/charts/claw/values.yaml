@@ -583,11 +583,11 @@ grantSigningKey:
 identity:
   enabled: false
   # Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER), for the API.
-  # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
-  # (POST /api/v1/apikeys/platform on the origin of endpoints.introspection).
-  # Needs identity.enabled and endpoints.introspection.
   # "safe": SaFE's /api/v1/auth/verify returns the user and the platform key.
-  authProvider: identity
+  # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
+  # (GET /api/v1/apikeys/platform on the origin of endpoints.introspection).
+  # Needs identity.enabled and endpoints.introspection.
+  authProvider: safe
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
   issuerUrl: ""
   clientId: ""

@@ -11,8 +11,9 @@
  *     token of the `Token` cookie (with its `userType`). The caller is the answer's `sub`; the roles are the
  *     answer's `roles` (the user's groups plus `default`).
  *   - The platform key of an `ak-` caller is the key it presented. The platform key of a session caller is the
- *     one the identity service keeps for the user, read with that session from `POST /api/v1/apikeys/platform`
- *     on the origin of IDENTITY_INTROSPECTION_URL (created on the first call) and kept here per user.
+ *     one the identity service keeps for the user, read with that session from `GET /api/v1/apikeys/platform`
+ *     on the origin of IDENTITY_INTROSPECTION_URL and kept here per user. A user without one is refused with
+ *     {@link PlatformKeyMissingError}.
  *   - There is no virtual key: LLM calls use the platform key through SaFE's LLM proxy.
  *
  * Failures are reported with the error classes of {@link SafeClient}, so the middleware maps them the same way:
@@ -29,11 +30,20 @@ import {
 } from "./safe-client.js";
 
 const PLATFORM_KEY_PATH = "/api/v1/apikeys/platform";
-const PLATFORM_KEY_TTL_MS = 600_000;
+const PLATFORM_KEY_TTL_MS = 60_000;
 const MAX_PLATFORM_KEYS = 1000;
 const MAX_NAME_CHARS = 128;
 
 type Introspect = Pick<IdentityClient, "introspect">;
+
+/** The identity service holds no platform key for the session user. */
+export class PlatformKeyMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlatformKeyMissingError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
 type ActiveAnswer = Extract<IntrospectionResult, { active: true }>;
 
 /**
@@ -65,6 +75,7 @@ export class IdentityVerifier {
   async verifyApiKey(apiKey: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
     const answer = await this.introspect(apiKey, {}, "invalid or expired API key");
+    if (answer.tokenType !== "api_key") throw new Error("invalid or expired API key");
     return userOf(answer, apiKey);
   }
 
@@ -96,14 +107,15 @@ export class IdentityVerifier {
     return answer;
   }
 
-  /** The platform key of `userId`, from the cache or read with the user's session. */
+  /** The platform key of `userId`, from the cache or read with the user's session; concurrent reads share one per session. */
   private async platformKeyOf(userId: string, token: string, userType: string): Promise<string> {
     const cached = this.platformKeys.get(userId);
     if (cached && Date.now() < cached.expiresAt) return cached.key;
-    const existing = this.inflight.get(userId);
+    const flightKey = `${userType}\n${token}`;
+    const existing = this.inflight.get(flightKey);
     if (existing) return existing;
-    const flight = this.fetchPlatformKey(userId, token, userType).finally(() => this.inflight.delete(userId));
-    this.inflight.set(userId, flight);
+    const flight = this.fetchPlatformKey(userId, token, userType).finally(() => this.inflight.delete(flightKey));
+    this.inflight.set(flightKey, flight);
     return flight;
   }
 
@@ -114,7 +126,7 @@ export class IdentityVerifier {
     let resp: Response;
     try {
       resp = await this.fetchFn(`${this.apiUrl.replace(/\/+$/, "")}${PLATFORM_KEY_PATH}`, {
-        method: "POST", headers, signal: AbortSignal.timeout(this.timeoutMs),
+        method: "GET", headers, signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (err) {
       throw new AuthUpstreamUnreachableError("cannot reach the identity service to read the platform key", err);
@@ -130,9 +142,10 @@ export class IdentityVerifier {
       throw new SafeUpstreamProtocolError("the identity service answered the platform key with a body that is not JSON", err);
     }
     const key = typeof body?.apiKey === "string" ? body.apiKey : "";
-    if (!isApiKey(key) || body.userId !== userId) {
+    if (body?.userId !== userId || (key !== "" && !isApiKey(key))) {
       throw new SafeUpstreamProtocolError("the identity service answered the platform key without the session user's key");
     }
+    if (key === "") throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
     if (this.platformKeys.size >= MAX_PLATFORM_KEYS) {
       const oldest = this.platformKeys.keys().next().value;
       if (oldest !== undefined) this.platformKeys.delete(oldest);

@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
-  AUTH_INTERNAL_TOKEN, NATS_URL,
+  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
@@ -22,6 +22,7 @@ import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
+import { identityServiceOrigin } from "./auth/identity-verifier.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
@@ -114,6 +115,12 @@ function validateStartupConfig(): void {
   if (!isDev) {
     if (!SAFE_API_URL) missing.push("SAFE_API_URL");
     if (!AUTH_INTERNAL_TOKEN) missing.push("AUTH_INTERNAL_TOKEN");
+    if (isIdentityAuthProvider()) {
+      if (!["true", "1", "yes"].includes((process.env.IDENTITY_CLIENT_ENABLED ?? "").trim().toLowerCase())) {
+        missing.push("IDENTITY_CLIENT_ENABLED");
+      }
+      if (!identityServiceOrigin(process.env.IDENTITY_INTROSPECTION_URL)) missing.push("IDENTITY_INTROSPECTION_URL");
+    }
   }
   if (missing.length) {
     logger.warn({ missing, APP_ENV }, "startup.config_missing");

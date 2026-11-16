@@ -75,7 +75,7 @@ import type { FastifyRequest } from "fastify";
 import pino from "pino";
 import { IdentityUnavailableError, JwtVerificationError } from "@claw/utils";
 import type { UserInfo } from "./models.js";
-import { envBool } from "../config.js";
+import { envBool, isIdentityAuthProvider } from "../config.js";
 import { DelegatedKeys, safeFailureOf, type SaFeKeys } from "./delegated-keys.js";
 import { identityClient } from "./identity.js";
 import type { CredentialOutcome } from "./middleware.js";
@@ -270,7 +270,7 @@ async function safeKeysOf(
 ): Promise<SaFeKeys> {
   if (ownKey !== undefined) return ownKeysOf(verifier, ownKey, sub);
   const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
-  if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
+  if (!verifier || !verifyAccessToken) return { status: "none", reason: isIdentityAuthProvider() ? "identity_provider" : "no_safe" };
   if (claims.act !== undefined && !(clientId && settings.delegatedKeyClientIds.includes(clientId))) {
     return { status: "none", reason: "delegated_token" };
   }

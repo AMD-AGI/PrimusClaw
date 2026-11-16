@@ -185,8 +185,8 @@
           "type": "boolean"
         },
         "authProvider": {
-          "description": "Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER): identity (needs identity.enabled and identity.endpoints.introspection) or safe.",
-          "default": "identity",
+          "description": "Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER): safe or identity (needs identity.enabled and identity.endpoints.introspection).",
+          "default": "safe",
           "enum": ["identity", "safe"]
         },
         "cache": {

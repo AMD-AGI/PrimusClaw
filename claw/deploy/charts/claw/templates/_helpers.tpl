@@ -124,12 +124,16 @@ same client, so they cannot be configured to disagree.
 {{- end -}}
 
 {{- /*
-CLAW_AUTH_PROVIDER for the API: identity.authProvider, default "identity".
-The identity provider verifies callers with the identity client (identity.enabled).
+CLAW_AUTH_PROVIDER for the API: identity.authProvider, default "safe".
+The identity provider verifies callers with the identity client, so it needs identity.enabled
+and identity.endpoints.introspection.
 */ -}}
 {{- define "primus-claw.authProviderEnv" -}}
 {{- $i := .Values.identity | default dict -}}
-{{- $p := $i.authProvider | default "identity" -}}
+{{- $p := $i.authProvider | default "safe" -}}
+{{- if and (eq $p "identity") (or (not $i.enabled) (not (dig "endpoints" "introspection" "" $i))) -}}
+{{- fail "identity.authProvider=identity needs identity.enabled and identity.endpoints.introspection" -}}
+{{- end -}}
 - name: CLAW_AUTH_PROVIDER
   value: {{ $p | quote }}
 {{- end -}}

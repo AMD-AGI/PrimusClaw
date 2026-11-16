@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { IdentityUnavailableError, type IntrospectionResult } from "@claw/utils";
 
 delete process.env.CLAW_DEPLOY_MODE;
-delete process.env.CLAW_AUTH_PROVIDER;
+process.env.CLAW_AUTH_PROVIDER = "identity";
 delete process.env.LLM_KEY_SOURCE;
 delete process.env.IDENTITY_CLIENT_ENABLED;
 delete process.env.CLAW_INSECURE_DEV_AUTH;
@@ -28,7 +28,7 @@ function active(over: Partial<Extract<IntrospectionResult, { active: true }>>): 
 
 /** A fake identity service: introspection answers by token, the platform key endpoint by bearer session. */
 function fakeIdentity(answers: Record<string, IntrospectionResult | Error>, keys: Record<string, { status: number; body?: unknown }>) {
-  const seen = { introspect: [] as { token: string; params?: Record<string, string> }[], fetch: [] as { url: string; headers: Record<string, string> }[] };
+  const seen = { introspect: [] as { token: string; params?: Record<string, string> }[], fetch: [] as { url: string; method?: string; headers: Record<string, string> }[] };
   const identity = {
     introspect: async (token: string, opts: { params?: Record<string, string> } = {}) => {
       seen.introspect.push({ token, params: opts.params });
@@ -39,14 +39,14 @@ function fakeIdentity(answers: Record<string, IntrospectionResult | Error>, keys
   };
   const fetchFn = (async (url: string, init: RequestInit) => {
     const headers = init.headers as Record<string, string>;
-    seen.fetch.push({ url, headers });
+    seen.fetch.push({ url, method: init.method, headers });
     const answer = keys[headers.Authorization!.replace(/^Bearer /, "")] ?? { status: 401 };
     return new Response(answer.body === undefined ? "" : JSON.stringify(answer.body), { status: answer.status });
   }) as typeof fetch;
   return { verifier: new IdentityVerifier(identity as never, API, fetchFn), seen };
 }
 
-test("the provider is identity by default, and LLM calls use the platform key", () => {
+test("CLAW_AUTH_PROVIDER=identity selects the identity provider, and LLM calls use the platform key", () => {
   assert.equal(config.CLAW_AUTH_PROVIDER, "identity");
   assert.equal(config.isIdentityAuthProvider(), true);
   assert.equal(config.LLM_KEY_SOURCE, "platformKey");
@@ -72,6 +72,7 @@ test("a session cookie is the introspected user, with the platform key read with
   });
   assert.deepEqual(seen.introspect[0], { token: "sess-alice", params: { user_type: "sso" } });
   assert.equal(seen.fetch[0]!.url, `${API}/api/v1/apikeys/platform`);
+  assert.equal(seen.fetch[0]!.method, "GET");
   assert.equal(seen.fetch[0]!.headers.UserType, "sso");
 
   await verifier.verifyCookie("sess-alice", "sso");
@@ -102,6 +103,65 @@ test("refusals: an inactive credential, a cookie that is not a session, and a pl
   await assert.rejects(verifier.verifyCookie("sess-dave"), /without the session user's key/);
 });
 
+test("a session user the identity service holds no platform key for is refused with 403 platform_key_missing", async () => {
+  const { default: Fastify } = await import("fastify");
+  const { default: cookie } = await import("@fastify/cookie");
+  const { verifySessionCookie } = await import("../src/auth/middleware.js");
+  const { verifier, seen } = fakeIdentity(
+    { "sess-jack": active({ sub: "u-jack", tokenType: "session" }) },
+    { "sess-jack": { status: 200, body: { userId: "u-jack", apiKey: "" } } },
+  );
+  const app = Fastify();
+  await app.register(cookie);
+  app.get("/v1/ping", async (req) => verifySessionCookie(req, verifier, "/v1/ping"));
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "GET", url: "/v1/ping", headers: { cookie: "Token=sess-jack" } });
+    const outcome = JSON.parse(res.body);
+    assert.equal(outcome.error.status, 403);
+    assert.equal(outcome.error.legacyError, "platform_key_missing");
+    await app.inject({ method: "GET", url: "/v1/ping", headers: { cookie: "Token=sess-jack" } });
+    assert.equal(seen.fetch.length, 2, "a missing key is not kept");
+  } finally {
+    await app.close();
+  }
+});
+
+test("an ak- string that introspects as another token type is not an API key", async () => {
+  const { verifier } = fakeIdentity({ "ak-session": active({ sub: "u-gina", tokenType: "session" }) }, {});
+  await assert.rejects(verifier.verifyApiKey("ak-session"), /invalid or expired API key/);
+});
+
+test("concurrent sessions of one user each read the platform key with their own session", async () => {
+  const { verifier, seen } = fakeIdentity(
+    {
+      "sess-stale": active({ sub: "u-hana", tokenType: "session" }),
+      "sess-valid": active({ sub: "u-hana", tokenType: "session" }),
+    },
+    { "sess-valid": { status: 200, body: { userId: "u-hana", apiKey: "ak-hana" } } },
+  );
+  const [stale, valid] = await Promise.allSettled([verifier.verifyCookie("sess-stale"), verifier.verifyCookie("sess-valid")]);
+  assert.equal(stale.status, "rejected");
+  assert.equal(valid.status === "fulfilled" && valid.value.platformKey, "ak-hana");
+  assert.equal(seen.fetch.length, 2);
+});
+
+test("a kept platform key is read again after one minute", async (t) => {
+  const { verifier, seen } = fakeIdentity(
+    { "sess-ivy": active({ sub: "u-ivy", tokenType: "session" }) },
+    { "sess-ivy": { status: 200, body: { userId: "u-ivy", apiKey: "ak-ivy" } } },
+  );
+  const start = Date.now();
+  const now = t.mock.method(Date, "now", () => start);
+  await verifier.verifyCookie("sess-ivy");
+  now.mock.mockImplementation(() => start + 59_000);
+  await verifier.verifyCookie("sess-ivy");
+  assert.equal(seen.fetch.length, 1);
+  now.mock.mockImplementation(() => start + 61_000);
+  await verifier.verifyCookie("sess-ivy");
+  assert.equal(seen.fetch.length, 2);
+});
+
 test("an identity service that cannot answer is unavailable; one that refuses this client or serves no platform keys is misconfigured", async () => {
   const { verifier } = fakeIdentity(
     {
@@ -129,6 +189,25 @@ test("without the identity client the middleware answers 500 authentication_misc
     const res = await app.inject({ method: "GET", url: "/v1/ping", headers: { authorization: "Bearer ak-x" } });
     assert.equal(res.statusCode, 500);
     assert.equal(JSON.parse(res.body).error, "authentication_misconfigured");
+  } finally {
+    await app.close();
+  }
+});
+
+test("an identity service that cannot be reached is a 503 that names the identity settings", async () => {
+  const { default: Fastify } = await import("fastify");
+  const { default: cookie } = await import("@fastify/cookie");
+  const { verifyBearerApiKey } = await import("../src/auth/middleware.js");
+  const { verifier } = fakeIdentity({ "ak-down": new IdentityUnavailableError("introspection", "network") }, {});
+  const app = Fastify();
+  await app.register(cookie);
+  app.get("/v1/ping", async (req) => verifyBearerApiKey(req, verifier, "/v1/ping"));
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "GET", url: "/v1/ping", headers: { authorization: "Bearer ak-down" } });
+    const outcome = JSON.parse(res.body);
+    assert.equal(outcome.error.status, 503);
+    assert.match(outcome.error.message, /identity service.*IDENTITY_INTROSPECTION_URL/);
   } finally {
     await app.close();
   }

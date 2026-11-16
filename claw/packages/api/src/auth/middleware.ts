@@ -12,7 +12,7 @@ import {
 import type { UserInfo } from "./models.js";
 import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode, isIdentityAuthProvider } from "../config.js";
 import { identityClient } from "./identity.js";
-import { IdentityVerifier, identityServiceOrigin } from "./identity-verifier.js";
+import { IdentityVerifier, PlatformKeyMissingError, identityServiceOrigin } from "./identity-verifier.js";
 import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
@@ -263,6 +263,9 @@ function verificationFailureSpec(
   // One reading for every credential SaFE is asked about (delegated-keys.ts): SaFE that cannot be reached, that
   // answers 5xx, or that answers 2xx with something that is not an answer has not judged the credential. A 401 for
   // that tells a person (and a connector, which stops for good after a run of them) that a good key is invalid.
+  if (e instanceof PlatformKeyMissingError) {
+    return { status: 403, legacyError: "platform_key_missing", anthropicType: "permission_error", message: e.message };
+  }
   const failure = safeFailureOf(e);
   if (failure.status === "unavailable") {
     return {
@@ -271,7 +274,7 @@ function verificationFailureSpec(
       anthropicType: "api_error",
       // SaFE's own error text stays in the log (verificationFailureLogFields), not in the answer.
       message: e instanceof AuthUpstreamUnreachableError ? unreachableMessage
-        : "SaFE could not verify the credential now (it answered with an error); this is not an invalid-credential response.",
+        : `${isIdentityAuthProvider() ? "The identity service" : "SaFE"} could not verify the credential now (it answered with an error); this is not an invalid-credential response.`,
     };
   }
   if (failure.status === "misconfigured") {
@@ -296,16 +299,22 @@ function verificationFailureLogFields(e: unknown): Record<string, unknown> {
   return {
     errMessage: e instanceof Error ? e.message : String(e),
     errStack: e instanceof Error ? e.stack?.split("\n").slice(0, 4).join(" | ") : "",
-    safeApiUrl: SAFE_API_URL,
+    ...(isIdentityAuthProvider() ? { identityUrl: process.env.IDENTITY_INTROSPECTION_URL ?? "" } : { safeApiUrl: SAFE_API_URL }),
     upstreamStatus: up?.status ?? null,
     upstreamRequestId: up?.requestId ?? null,
     upstreamBody: up?.bodySnippet ?? null,
   };
 }
 
-const UNREACHABLE_FOR_API_KEY =
-  "cannot reach SaFE to verify the API key (check SAFE_API_URL, AUTH_INTERNAL_TOKEN, and network). " +
-  "This is not an invalid-key response from SaFE.";
+/** The 503 message for a credential the configured auth provider cannot be reached to verify. */
+function unreachableText(credential: string): string {
+  return isIdentityAuthProvider()
+    ? `cannot reach the identity service to verify the ${credential} (check IDENTITY_INTROSPECTION_URL, IDENTITY_CLIENT_ID, and network).`
+    : `cannot reach SaFE to verify the ${credential} (check SAFE_API_URL, AUTH_INTERNAL_TOKEN, and network).`;
+}
+
+const UNREACHABLE_FOR_API_KEY = (): string =>
+  `${unreachableText("API key")} This is not an invalid-key response from ${isIdentityAuthProvider() ? "the identity service" : "SaFE"}.`;
 
 /**
  * Path 1: SaFE session cookie.
@@ -339,7 +348,7 @@ export async function verifySessionCookie(
       status: "rejected",
       error: verificationFailureSpec(
         e,
-        "cannot reach SaFE to verify the session cookie (check SAFE_API_URL, AUTH_INTERNAL_TOKEN, and network).",
+        unreachableText("session cookie"),
         "invalid_cookie",
       ),
     };
@@ -412,7 +421,7 @@ export async function verifyBearerApiKey(
     }, "auth.apikey.rejected");
     return {
       status: "rejected",
-      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY, "invalid_api_key"),
+      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY(), "invalid_api_key"),
     };
   }
 }
@@ -446,7 +455,7 @@ export async function verifyXApiKeyHeader(
     }, "auth.x_api_key.rejected");
     return {
       status: "rejected",
-      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY, "invalid_api_key"),
+      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY(), "invalid_api_key"),
     };
   }
 }

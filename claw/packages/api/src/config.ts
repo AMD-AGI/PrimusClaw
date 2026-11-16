@@ -167,24 +167,24 @@ export function isKubernetesMode(): boolean {
 }
 
 // --- Auth provider (SaFE deploy mode) ---
+// "safe" (default): callers are verified by SaFE's /api/v1/auth/verify, which returns the platform key.
 // "identity": callers are verified by the identity service, which also holds each user's platform key.
-// "safe": callers are verified by SaFE's /api/v1/auth/verify, which returns the platform key.
 export type AuthProvider = "identity" | "safe";
 export const CLAW_AUTH_PROVIDER: AuthProvider =
-  env("CLAW_AUTH_PROVIDER", "identity") === "safe" ? "safe" : "identity";
+  env("CLAW_AUTH_PROVIDER", "safe") === "identity" ? "identity" : "safe";
 /** True when the identity service verifies callers (SaFE deploy mode only). */
 export function isIdentityAuthProvider(): boolean {
   return !isKubernetesMode() && CLAW_AUTH_PROVIDER === "identity";
 }
 
 // --- LLM key source ---
-// SaFE deploy mode always uses "platformKey": LLM calls go through SaFE's
-// /api/v1/llm-proxy with the user's platform key, and SaFE puts the user's
-// LiteLLM virtual key on the request. Kubernetes mode reads LLM_KEY_SOURCE:
-// "virtualKey" (default) is the caller's own gateway key, "platformKey" proxy mode.
+// LLM_KEY_SOURCE: "platformKey" sends the user's platform key (SaFE's
+// /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request),
+// "virtualKey" sends the caller's own gateway key. The default is "platformKey"
+// in SaFE deploy mode and "virtualKey" in Kubernetes mode.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
-  !isKubernetesMode() || env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
+  env("LLM_KEY_SOURCE", isKubernetesMode() ? "virtualKey" : "platformKey") === "platformKey" ? "platformKey" : "virtualKey";
 export function usePlatformKeyForLlm(): boolean {
   return LLM_KEY_SOURCE === "platformKey";
 }

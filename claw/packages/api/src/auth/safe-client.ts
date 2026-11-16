@@ -3,6 +3,7 @@
 
 import { createHash } from "node:crypto";
 import type { UserInfo } from "./models.js";
+import { LLM_KEY_SOURCE } from "../config.js";
 import { safePreview } from "@claw/utils";
 import pino from "pino";
 
@@ -191,9 +192,9 @@ export class SafeClient {
     return h;
   }
 
-  // LLM calls use the platform key through SaFE's LLM proxy, so the virtual key is not asked for.
+  // The virtual key is asked for only when LLM calls use it (LLM_KEY_SOURCE=virtualKey).
   private body(): Record<string, unknown> {
-    return { includePlatformKey: true };
+    return LLM_KEY_SOURCE === "virtualKey" ? { includePlatformKey: true, includeVirtualKey: true } : { includePlatformKey: true };
   }
 
   // Cache-lookup + singleflight wrapper shared by the API-key, cookie and access-token paths.
