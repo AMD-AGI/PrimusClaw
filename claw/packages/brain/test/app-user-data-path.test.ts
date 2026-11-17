@@ -16,7 +16,12 @@
  *   U5 a real run in such a sandbox: the application gets the derived path, its files land in it
  *   U6 the same run with nothing to derive from fails at once, saying so
  *   U7 the roots are the workspace's hostpath mount paths, from SaFE, in order
- *   U8 a workspace that cannot be read throws (retried); one that is not there has no roots
+ *   U8 a workspace that cannot be read throws (retried); one refused or not there has no roots, and says why
+ *   U9 an application that never names USER_DATA_PATH runs exactly as before: no prelude, no SaFE read,
+ *      even when the derived directory could not be created
+ *   U10 the owner's key refused the workspace (403): the run fails at once, saying that, not "no volume"
+ *   U11 an application that names USER_DATA_PATH only in its command or bootstrap still gets it, and
+ *       fails at once, saying so, when it cannot be created
  *
  * The shell runs in a real `sh` whose environment has no USER_DATA_PATH unless a
  * test puts one there.
@@ -30,8 +35,10 @@ import { join } from "node:path";
 import { type AppManifestV1 } from "@claw/protocol";
 
 process.env.SAFE_API_URL = "http://safe.test";
-const { AppRunner, NO_USER_DATA_DIR_REASON } = await import("../src/apps/app-runner.js");
-const { STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED, expandStateDirCommand, userDataPathPrelude } = await import("../src/apps/app-env.js");
+const { AppRunner, NO_USER_DATA_DIR_REASON, USER_DATA_DIR_NOT_CREATED_REASON, workspaceUnreadableReason } = await import("../src/apps/app-runner.js");
+const {
+  STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED, expandStateDirCommand, needsUserDataPath, userDataPathPrelude,
+} = await import("../src/apps/app-env.js");
 const { hostpathMountPaths, workspaceUserDataRoots } = await import("../src/apps/app-sandbox.js");
 const { World, MANIFEST, RUN_ID } = await import("./support/app-runner-world.js");
 
@@ -104,26 +111,33 @@ test("U4 a derived directory that cannot be created exits with its own status", 
 });
 
 /** A runner whose every command runs in a real shell with `env` as the sandbox's own environment. */
-function shellRunner(env: Record<string, string>, roots: string[] | ((ws: string | undefined) => Promise<string[]>), script: string) {
+function shellRunner(
+  env: Record<string, string>,
+  roots: string[] | ((ws: string | undefined) => Promise<{ roots: string[]; unreadable?: string }>),
+  script: string,
+  extra: Partial<AppManifestV1> = {},
+) {
   const manifest: AppManifestV1 = {
     ...MANIFEST, command: ["sh", "-c", script], events: undefined, mcp: undefined, restart: { max_restarts: 3, backoff_sec: [30, 120, 900] },
+    ...extra,
   };
+  let asked = 0;
   const world = new World(manifest);
   const commands: string[] = [];
   world.sandbox = {
     ...world.sandbox,
     exec: async (_inst, command, _t, opts) => { commands.push(command); return { ...(await sh(command, { ...env, ...(opts?.env ?? {}) })), stderr: "" }; },
     stop: async () => undefined,
-    userDataRoots: async (run) => (typeof roots === "function" ? roots(run.workspaceId) : roots),
+    userDataRoots: async (run) => { asked += 1; return typeof roots === "function" ? roots(run.workspaceId) : { roots }; },
   };
   const runner = new AppRunner(RUN_ID, "pk", { store: world.store, sandbox: world.sandbox, tickMs: 100 });
-  return { world, runner, commands };
+  return { world, runner, commands, asked: () => asked };
 }
 
 test("U5 a real run in a sandbox SaFE gave no USER_DATA_PATH: the application gets the derived one, its files land in it", async () => {
   const root = fresh();
   const asked: Array<string | undefined> = [];
-  const { world, runner } = shellRunner({ USER_ID: UID }, async (ws) => { asked.push(ws); return [root]; },
+  const { world, runner } = shellRunner({ USER_ID: UID }, async (ws) => { asked.push(ws); return { roots: [root] }; },
     'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"');
   const result = await runner.run(AbortSignal.timeout(30_000));
   const userDir = `${root}/users/${UID}`;
@@ -169,9 +183,70 @@ test("U8 the workspace is read with the owner's key; unreadable throws, absent o
     return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   const vols = { volumes: [{ type: "hostpath", mountPath: "/shared_nfs" }] };
-  assert.deepEqual(await workspaceUserDataRoots("team-a", "key-1", answer(200, vols)), ["/shared_nfs"]);
+  assert.deepEqual(await workspaceUserDataRoots("team-a", "key-1", answer(200, vols)), { roots: ["/shared_nfs"] });
   assert.deepEqual(seen[0], { url: "http://safe.test/api/v1/workspaces/team-a", auth: "Bearer key-1" });
-  for (const status of [401, 403, 404]) assert.deepEqual(await workspaceUserDataRoots("w", "k", answer(status, {})), []);
+  for (const status of [401, 403, 404]) {
+    assert.deepEqual(await workspaceUserDataRoots("w", "k", answer(status, {})), { roots: [], unreadable: `HTTP ${status}` });
+  }
   for (const status of [500, 502, 503]) await assert.rejects(workspaceUserDataRoots("w", "k", answer(status, {})), /HTTP/);
   await assert.rejects(workspaceUserDataRoots("w", "k", (async () => { throw new TypeError("fetch failed"); }) as typeof fetch));
+});
+
+test("U9 an application that never names USER_DATA_PATH runs exactly as before, even when the derived directory could not be created", async () => {
+  // A mounted root whose users directory cannot be made: a file stands where it would be.
+  const root = fresh();
+  writeFileSync(join(root, "users"), "x");
+  const stateBase = fresh();
+  const { world, runner, commands, asked } = shellRunner({ USER_ID: UID }, [root],
+    'env > "$APP_STATE_DIR/env.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
+    { state_dir: `${stateBase}/apps/\${run_id}`, bootstrap: undefined });
+  const result = await runner.run(AbortSignal.timeout(30_000));
+  const stateDir = `${stateBase}/apps/${RUN_ID}`;
+  assert.deepEqual(result, { kind: "ended", outcome: { success: true, reason: "app finished", captures: { session_dir: stateDir } } });
+  assert.equal(asked(), 0, "SaFE is not asked for the workspace");
+  assert.equal(commands.some((c) => c.includes("USER_ID")), false, "no command carries the derivation");
+  assert.doesNotMatch(readFileSync(`${stateDir}/env.txt`, "utf8"), /^USER_DATA_PATH=/m, "the application's environment is as it was");
+  assert.equal(statSync(`${stateDir}/input.json`).mode & 0o777, 0o600);
+  assert.equal(world.rec.restarts, 0);
+});
+
+test("U10 the owner's key refused the workspace (403): the run fails at once, saying the volumes could not be read", async () => {
+  const refused = (async () => new Response("{}", { status: 403 })) as typeof fetch;
+  const { world, runner, commands } = shellRunner({ USER_ID: UID }, async (ws) => workspaceUserDataRoots(ws ?? "", "pk", refused), "echo never");
+  const result = await runner.run(AbortSignal.timeout(30_000));
+  assert.equal(result.kind, "ended");
+  assert.ok(result.kind === "ended" && !result.outcome.success);
+  assert.equal(result.kind === "ended" && result.outcome.reason, `app run ended: start failed (${workspaceUnreadableReason("HTTP 403")})`);
+  assert.match(workspaceUnreadableReason("HTTP 403"), /the workspace's volumes could not be read \(HTTP 403\)/);
+  assert.ok(!(result.kind === "ended" && result.outcome.reason.includes("no hostpath volume")));
+  assert.equal(world.rec.last_exit?.stop_reason, workspaceUnreadableReason("HTTP 403"));
+  assert.equal(commands.some((c) => c.includes("setsid")), false);
+});
+
+test("U11 an application that names USER_DATA_PATH only in its command gets it, and fails at once when it cannot be created", async () => {
+  const stateBase = fresh();
+  const extra = { state_dir: `${stateBase}/apps/\${run_id}`, bootstrap: undefined };
+  const script = 'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"';
+  const root = fresh();
+  const ok = shellRunner({ USER_ID: UID }, [root], script, extra);
+  const done = await ok.runner.run(AbortSignal.timeout(30_000));
+  assert.equal(done.kind === "ended" && done.outcome.success, true, JSON.stringify(done));
+  assert.equal(readFileSync(`${stateBase}/apps/${RUN_ID}/udp.txt`, "utf8"), `${root}/users/${UID}`);
+
+  const bad = fresh();
+  writeFileSync(join(bad, "users"), "x");
+  const failing = shellRunner({ USER_ID: UID }, [bad], script, { ...extra, state_dir: `${fresh()}/apps/\${run_id}` });
+  const result = await failing.runner.run(AbortSignal.timeout(30_000));
+  assert.equal(result.kind === "ended" && result.outcome.reason, `app run ended: start failed (${USER_DATA_DIR_NOT_CREATED_REASON})`);
+  assert.equal(failing.world.rec.restarts, 0, "no restart road");
+  assert.equal(failing.commands.some((c) => c.includes("setsid")), false);
+});
+
+test("U12 needsUserDataPath: the state_dir, the command or the bootstrap file names it", () => {
+  const base = { state_dir: "/tmp/a/${run_id}", command: ["app"], bootstrap: undefined };
+  assert.equal(needsUserDataPath(base), false);
+  assert.equal(needsUserDataPath({ ...base, state_dir: "${USER_DATA_PATH}/x" }), true);
+  assert.equal(needsUserDataPath({ ...base, command: ["sh", "-c", "cd $USER_DATA_PATH"] }), true);
+  assert.equal(needsUserDataPath({ ...base, bootstrap: { file: "b.sh", content_b64: Buffer.from("cd \"${USER_DATA_PATH}\"").toString("base64") } }), true);
+  assert.equal(needsUserDataPath({ ...base, bootstrap: { file: "b.sh", content_b64: Buffer.from("echo hi").toString("base64") } }), false);
 });

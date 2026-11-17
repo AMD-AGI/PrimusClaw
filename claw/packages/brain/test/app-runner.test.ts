@@ -1006,7 +1006,7 @@ test("P4a no USER_DATA_PATH in the sandbox and none to derive (exit 4) ends the 
 test("P4c a workspace that cannot be read for the user data roots is asked again, never taken as having none", async () => {
   let reads = 0;
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 3, backoff_sec: [1] } } });
-  h.world.sandbox.userDataRoots = async () => { reads += 1; if (reads <= 2) throw new Error("workspace lookup failed: HTTP 502"); return ["/shared_nfs"]; };
+  h.world.sandbox.userDataRoots = async () => { reads += 1; if (reads <= 2) throw new Error("workspace lookup failed: HTTP 502"); return { roots: ["/shared_nfs"] }; };
   await until(h, "starting");
   for (let i = 0; i < 2; i++) await assert.rejects(h.runner.reconcile(), /HTTP 502/);
   assert.equal(h.world.rec.state, "starting");
@@ -1018,7 +1018,7 @@ test("P4c a workspace that cannot be read for the user data roots is asked again
 
 test("P4d the roots ride in every command that reads USER_DATA_PATH: the expansion, the file writes and the start", async () => {
   const h = harness();
-  h.world.sandbox.userDataRoots = async (run) => { assert.equal(run.workspaceId, "ws-1"); return ["/shared_nfs"]; };
+  h.world.sandbox.userDataRoots = async (run) => { assert.equal(run.workspaceId, "ws-1"); return { roots: ["/shared_nfs"] }; };
   await toRunning(h);
   const derive = (c: string) => c.includes("'/shared_nfs'") && c.includes('"$r/users/$USER_ID"');
   const expansion = h.world.execs.filter((e) => e.command.includes("exit 4; printf %s"));

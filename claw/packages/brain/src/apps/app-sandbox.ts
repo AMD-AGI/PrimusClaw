@@ -200,14 +200,14 @@ export function hostpathMountPaths(body: unknown): string[] {
 /**
  * Where an app sandbox's `USER_DATA_PATH` is derived from when SaFE set none:
  * the mount paths of its workspace's hostpath volumes. A workspace that is not
- * there or not readable with the run owner's key has nothing to derive from;
- * any other failure throws, and the caller asks again.
+ * there or not readable with the run owner's key has nothing to derive from, and
+ * says why (`unreadable`); any other failure throws, and the caller asks again.
  */
 export async function workspaceUserDataRoots(
   workspaceId: string,
   apiKey: string,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
-): Promise<string[]> {
+): Promise<{ roots: string[]; unreadable?: string }> {
   if (!SAFE_API_URL) throw new Error("workspace lookup failed: SAFE_API_URL is not configured");
   const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -216,13 +216,13 @@ export async function workspaceUserDataRoots(
   if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
     await resp.body?.cancel().catch(() => {});
     logger.warn({ workspaceId, status: resp.status }, "app_sandbox.workspace_unreadable_for_user_data_path");
-    return [];
+    return { roots: [], unreadable: `HTTP ${resp.status}` };
   }
   if (resp.status !== 200) {
     await resp.body?.cancel().catch(() => {});
     throw new Error(`workspace lookup failed: HTTP ${resp.status}`);
   }
-  return hostpathMountPaths(await resp.json().catch(() => null));
+  return { roots: hostpathMountPaths(await resp.json().catch(() => null)) };
 }
 
 /** The spec's env without the session correlation variable, which a manifest must not set either. */

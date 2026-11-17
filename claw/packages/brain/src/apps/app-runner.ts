@@ -61,6 +61,7 @@ import {
 } from "./app-run-store.js";
 import {
   BOOTSTRAP_FILE_MODES, EXIT_ABSENT, INPUT_FILE, INPUT_FILE_MODES, STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED, buildAppEnv,
+  needsUserDataPath,
   expandStateDirCommand, generationTag, isUsableStateDir, killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand,
   stopCommand, writeFileCommand,
   type FileModes, type ProbeVerdict,
@@ -260,10 +261,18 @@ export interface AppSandboxOps {
   /**
    * The mount paths of the run's workspace's hostpath volumes, in the workspace's
    * order: where a `USER_DATA_PATH` SaFE did not set is derived from (see
-   * `userDataPathPrelude`). Throws when the workspace could not be read, which is
-   * retried; empty when it has none. Absent means nothing is ever derived.
+   * `userDataPathPrelude`). Throws when the workspace could not be read for a
+   * reason that may pass, which is retried; no roots, with `unreadable` saying why,
+   * when the run owner's key is refused it. Absent means nothing is ever derived.
    */
-  userDataRoots?(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">, platformKey: string): Promise<string[]>;
+  userDataRoots?(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">, platformKey: string): Promise<UserDataRoots>;
+}
+
+/** What {@link AppSandboxOps.userDataRoots} answers. */
+export interface UserDataRoots {
+  roots: string[];
+  /** Why the workspace's volumes are not known, e.g. "HTTP 403"; absent when they were read. */
+  unreadable?: string;
 }
 
 export interface AppRunnerDeps {
@@ -311,6 +320,11 @@ class StateDirError extends Error {}
 export const NO_USER_DATA_DIR_REASON =
   "the sandbox has no user data directory: USER_DATA_PATH is unset, and no hostpath volume of the workspace "
   + "is mounted in it to derive {mountPath}/users/{USER_ID} from";
+/** The run's failure reason when the workspace's volumes could not be read to derive one from. */
+export function workspaceUnreadableReason(why: string): string {
+  return `the sandbox has no user data directory: USER_DATA_PATH is unset, and the workspace's volumes could not be read (${why}) `
+    + "to derive {mountPath}/users/{USER_ID} from";
+}
 /** The run's failure reason when the derived user data directory could not be created. */
 export const USER_DATA_DIR_NOT_CREATED_REASON =
   "the sandbox has no user data directory: USER_DATA_PATH is unset, and {mountPath}/users/{USER_ID} could not be created";
@@ -388,7 +402,7 @@ export class AppRunner {
   private unparseableExits = 0;
   private failedLossLooks = 0;
   /** See {@link AppRunner.userDataRoots}; null until read. */
-  private roots: string[] | null = null;
+  private roots: UserDataRoots | null = null;
   private readonly finishAttempts = new Map<string, number>();
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
@@ -838,11 +852,13 @@ export class AppRunner {
   /** Expand `state_dir` inside the sandbox once and keep the result on the row. */
   private async ensureStateDir(inst: SandboxInstance): Promise<string> {
     if (this.rec.state_dir) return this.rec.state_dir;
-    const roots = await this.userDataRoots();
+    const { roots, unreadable } = await this.userDataRoots();
     const r = await this.deps.sandbox.exec(
       inst, expandStateDirCommand(this.rec.manifest.state_dir, this.runId, roots), EXEC_TIMEOUT, { untracked: true },
     );
-    if (r.exitCode === STATE_DIR_NO_USER_DATA) throw new NoUserDataDirError(NO_USER_DATA_DIR_REASON);
+    if (r.exitCode === STATE_DIR_NO_USER_DATA) {
+      throw new NoUserDataDirError(unreadable ? workspaceUnreadableReason(unreadable) : NO_USER_DATA_DIR_REASON);
+    }
     if (r.exitCode === USER_DATA_DIR_NOT_CREATED) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
     const dir = r.stdout.trim();
     if (r.exitCode !== 0 || !isUsableStateDir(dir)) {
@@ -887,7 +903,7 @@ export class AppRunner {
     // is thrown, so the tick fails and the next one tries again, and it never
     // counts toward the restart budget.
     const env = await this.applicationEnv(stateDir);
-    const roots = await this.userDataRoots();
+    const { roots } = await this.userDataRoots();
     try {
       this.assertActive();
       await this.writeFiles(inst, stateDir, roots);
@@ -899,6 +915,7 @@ export class AppRunner {
         logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.grant_restart_failed");
         return { done: false };
       }
+      if (err instanceof NoUserDataDirError) return this.endWithoutUserDataDir(err.message);
       return this.onStartFailure(err);
     }
     this.startFailures = 0;
@@ -915,6 +932,8 @@ export class AppRunner {
         inst, writeFileCommand(`${stateDir}/${rel}`, modes, roots), EXEC_TIMEOUT,
         { untracked: true, env: { CLAW_FILE_B64: content.toString("base64") } },
       );
+      // Exit 5 comes only from the derivation, which is there only when roots are.
+      if (r.exitCode === USER_DATA_DIR_NOT_CREATED && roots.length > 0) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
       if (r.exitCode !== 0) throw new Error(`writing ${rel} failed (exit ${r.exitCode})`);
     };
     await put(INPUT_FILE, Buffer.from(JSON.stringify(this.rec.input), "utf8"), INPUT_FILE_MODES);
@@ -933,6 +952,7 @@ export class AppRunner {
       inst, startCommand(this.rec.manifest, stateDir, this.tag(), roots), EXEC_TIMEOUT,
       { env: appStartEnv(this.rec.sandbox_spec, env, this.platformKey) },
     );
+    if (r.exitCode === USER_DATA_DIR_NOT_CREATED && roots.length > 0) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
     if (r.exitCode !== 0) throw new Error(`start command failed (exit ${r.exitCode}): ${clip(this.scrubbed(r.stderr))}`);
   }
 
@@ -980,13 +1000,15 @@ export class AppRunner {
 
   /**
    * Where a `USER_DATA_PATH` SaFE did not set is derived from, read once per
-   * worker. A read that fails throws, so the tick fails and the next one asks
-   * again: "could not read the workspace" is not "it has no volume".
+   * worker, and only for an application that uses the variable: any other gets no
+   * roots, so its commands are exactly what they were, and SaFE is not asked. A
+   * read that fails throws, so the tick fails and the next one asks again:
+   * "could not read the workspace" is not "it has no volume".
    */
-  private async userDataRoots(): Promise<string[]> {
+  private async userDataRoots(): Promise<UserDataRoots> {
     if (this.roots) return this.roots;
     const read = this.deps.sandbox.userDataRoots;
-    this.roots = read ? await read(this.sandboxRun(), this.platformKey) : [];
+    this.roots = read && needsUserDataPath(this.rec.manifest) ? await read(this.sandboxRun(), this.platformKey) : { roots: [] };
     return this.roots;
   }
 

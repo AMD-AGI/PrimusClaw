@@ -127,7 +127,9 @@ release version, and its `appVersion` stays `latest`.
   derived (no such volume, no `USER_ID`) or the directory cannot be created, the run now fails at once with that reason
   instead of spending its restarts and their backoff on the same refusal, which held the task in executing, with no
   error, until it was cancelled. A workspace that cannot be read (SaFE unavailable) is asked again; only a refusal from
-  the sandbox ends the run.
+  the sandbox ends the run; a workspace the run owner's key may not read is reported as such (for example "the
+  workspace's volumes could not be read (HTTP 403)"). An app whose `state_dir`, command and bootstrap file never name
+  `USER_DATA_PATH` is not affected: nothing is derived or checked for it, and it runs as before.
 - The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
   turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
   `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,

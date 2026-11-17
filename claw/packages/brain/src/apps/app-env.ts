@@ -78,6 +78,20 @@ export function userDataPathPrelude(roots: readonly string[]): string {
 }
 
 /**
+ * Whether the application uses `USER_DATA_PATH` at all: its `state_dir`, its
+ * command or its bootstrap file names the variable. Only such an application has
+ * one derived for it (and fails without one); any other runs exactly as it did
+ * before Claw derived the variable, with no prelude in front of its commands.
+ */
+export function needsUserDataPath(manifest: Pick<AppManifestV1, "state_dir" | "command" | "bootstrap">): boolean {
+  const names = (text: string): boolean => text.includes("USER_DATA_PATH");
+  if (names(manifest.state_dir)) return true;
+  if (manifest.command.some(names)) return true;
+  const boot = manifest.bootstrap?.content_b64;
+  return boot !== undefined && names(Buffer.from(boot, "base64").toString("utf8"));
+}
+
+/**
  * A command that prints the state directory: the manifest's template with
  * `${run_id}` filled in here and `${USER_DATA_PATH}` left to the sandbox, which
  * is the only place that knows it (derived from `roots` when SaFE set none, see
