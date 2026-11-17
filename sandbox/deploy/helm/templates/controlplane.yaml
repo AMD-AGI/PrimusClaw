@@ -28,11 +28,11 @@ rules:
     verbs: ["get", "create", "update", "patch"]
   {{- with .Values.controlplane.config.identity }}
   {{- if and .introspectUrl .ownerPolicyConfigMap }}
-  # The owner policy admin API reads and rewrites the policy ConfigMap.
+  # The owner policy admin API reads, watches and rewrites the policy ConfigMap.
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: [{{ .ownerPolicyConfigMap | quote }}]
-    verbs: ["get", "update"]
+    verbs: ["get", "list", "watch", "update"]
   {{- end }}
   {{- end }}
 ---

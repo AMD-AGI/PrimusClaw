@@ -237,7 +237,7 @@ func TestOwnerPolicyStoreConflictHasNoSideEffects(t *testing.T) {
 	}
 }
 
-func TestOwnerPolicyStoreOnlyLeaderRegistersTemplates(t *testing.T) {
+func TestOwnerPolicyStoreFollowerSyncDoesNotRegister(t *testing.T) {
 	ctx := context.Background()
 	r := newStoreRig(t, storePolicy, nil)
 	r.leader.Store(false)
@@ -251,22 +251,12 @@ func TestOwnerPolicyStoreOnlyLeaderRegistersTemplates(t *testing.T) {
 	if err != nil || !out.InSync {
 		t.Fatalf("follower should be in sync without registering: %+v %v", out, err)
 	}
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); opStatus(err) != http.StatusServiceUnavailable {
-		t.Fatalf("follower put: %v", err)
-	}
-	if strings.Contains(r.stored(t), "extra") || r.ciExists(t, "e2b-extra-g1") {
-		t.Fatal("follower write changed the cluster")
-	}
-	r.leader.Store(true)
+	// Any replica may write and register.
 	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
-	if !r.ciExists(t, "e2b-runner-g1") || !r.ciExists(t, "e2b-extra-g1") {
-		t.Fatal("leader put did not register the templates")
-	}
-	out, err = r.store.Templates(ctx)
-	if err != nil || !out.InSync {
-		t.Fatalf("leader after put: %+v %v", out, err)
+	if !r.ciExists(t, "e2b-extra-g1") || !strings.Contains(r.stored(t), "extra") {
+		t.Fatal("follower put did not register and store")
 	}
 }
 
@@ -325,6 +315,31 @@ func TestOwnerPolicyStoreRefusesTemplatesKeyInOtherCase(t *testing.T) {
 	}
 }
 
+// PUT on a document with "Templates" keeps role and quotas via case-insensitive decode.
+func TestOwnerPolicyStorePutKeepsQuotasWhenTemplatesKeyCased(t *testing.T) {
+	ctx := context.Background()
+	raw := `{"role":"e2b","Templates":[{"name":"runner","perGpuCount":[1],"spec":` + storeSpec + `}],"default":{"maxSandboxes":2},"admin":{"maxSandboxes":3},"owners":{"u1":{"maxSandboxes":1}}}`
+	r := newStoreRig(t, raw, nil)
+	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(r.stored(t)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["Templates"]; ok {
+		t.Fatal("stored document kept the Templates field")
+	}
+	for _, key := range []string{"role", "default", "admin", "owners", "templates"} {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("missing %s after repair: %s", key, r.stored(t))
+		}
+	}
+	if !bytes.Contains(doc["default"], []byte(`"maxSandboxes": 2`)) || !bytes.Contains(doc["owners"], []byte(`"u1"`)) {
+		t.Fatalf("quotas dropped: %s", r.stored(t))
+	}
+}
+
 // A broken stored document can be repaired by PUT, which rebuilds the policy.
 func TestOwnerPolicyStorePutRepairsInvalidJSON(t *testing.T) {
 	ctx := context.Background()
@@ -341,6 +356,67 @@ func TestOwnerPolicyStorePutRepairsInvalidJSON(t *testing.T) {
 	}
 	if !r.ciExists(t, "e2b-runner-g1") {
 		t.Fatal("repair did not register the template")
+	}
+}
+
+// A partial upsert rolls CodeInterpreters back to the stored policy.
+func TestOwnerPolicyStoreRollbackPartialUpsert(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: storeName, Namespace: storeNS},
+		Data:       map[string]string{OwnerPolicyKey: storePolicy},
+	}
+	creates := 0
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).
+		WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c ctrlclient.WithWatch, obj ctrlclient.Object, opts ...ctrlclient.CreateOption) error {
+				if _, ok := obj.(*runtimev1alpha1.CodeInterpreter); ok {
+					creates++
+					if creates >= 2 {
+						return apierrors.NewInternalError(errors.New("apiserver"))
+					}
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).Build()
+	svc := New(Options{Client: cl, Namespace: storeNS})
+	store := NewOwnerPolicyStore(cl, cl, storeNS, storeName, svc, func() bool { return true })
+	if err := store.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := storePolicy
+	newSpec := `{"fromImage":"harbor.example/other@sha256:0123456789abcdef"}`
+	if err := store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1, 8}, Spec: json.RawMessage(newSpec)}); err == nil {
+		t.Fatal("put succeeded with a partial upsert")
+	}
+	cm2 := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: storeNS, Name: storeName}, cm2); err != nil {
+		t.Fatal(err)
+	}
+	if cm2.Data[OwnerPolicyKey] != before {
+		t.Fatalf("failed put changed the ConfigMap: %s", cm2.Data[OwnerPolicyKey])
+	}
+	ci := &runtimev1alpha1.CodeInterpreter{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: storeNS, Name: "e2b-runner-g1"}, ci); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ci.Spec.Template.FromImage, "harbor.example/runner@") {
+		t.Fatalf("rollback left the new image: %s", ci.Spec.Template.FromImage)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: storeNS, Name: "e2b-runner-g8"}, &runtimev1alpha1.CodeInterpreter{}); err == nil {
+		t.Fatal("partial create of g8 was not rolled back")
+	}
+	out, err := store.Templates(ctx)
+	if err != nil || !out.InSync {
+		t.Fatalf("after rollback: %+v %v", out, err)
 	}
 }
 

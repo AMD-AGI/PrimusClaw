@@ -16,6 +16,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/retry"
@@ -39,21 +40,24 @@ func OwnerPolicyConfigMapFromEnv() string {
 	return strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_CONFIGMAP"))
 }
 
-// OwnerPolicyStore keeps the owner policy in a ConfigMap. A write validates and
-// applies the new policy on the leader, then stores it. Followers only sync the
-// stored policy into memory. Only the leader registers the owner CodeInterpreters.
+// OwnerPolicyStore keeps the owner policy in a ConfigMap. A write validates,
+// applies and registers the new policy, then stores it. Every replica can write.
+// Followers sync the stored policy into memory; the leader also registers
+// templates that an external edit stored without registration.
 type OwnerPolicyStore struct {
 	client    ctrlclient.Client
 	reader    ctrlclient.Reader
+	watcher   ctrlclient.WithWatch
 	namespace string
 	name      string
 	grants    *Service
 	leader    func() bool
 	now       func() time.Time
 
-	mu sync.Mutex
+	writeMu sync.Mutex // serializes mutate and Sync
+	mu      sync.Mutex // guards applied, registered, rejected, lastErr
 	// applied is the policy in memory; registered is the policy whose
-	// templates this replica registered as leader.
+	// templates this replica registered.
 	applied    [sha256.Size]byte
 	registered [sha256.Size]byte
 	rejected   [sha256.Size]byte
@@ -70,7 +74,17 @@ func NewOwnerPolicyStore(client ctrlclient.Client, reader ctrlclient.Reader, nam
 	if leader == nil {
 		leader = func() bool { return true }
 	}
-	return &OwnerPolicyStore{client: client, reader: reader, namespace: namespace, name: name, grants: grants, leader: leader, now: time.Now}
+	p := &OwnerPolicyStore{client: client, reader: reader, namespace: namespace, name: name, grants: grants, leader: leader, now: time.Now}
+	if w, ok := client.(ctrlclient.WithWatch); ok {
+		p.watcher = w
+	}
+	return p
+}
+
+// WithWatcher attaches a client used to watch the policy ConfigMap.
+func (p *OwnerPolicyStore) WithWatcher(w ctrlclient.WithWatch) *OwnerPolicyStore {
+	p.watcher = w
+	return p
 }
 
 // OwnerPolicyTemplates is the stored template list. InSync reports whether the
@@ -116,6 +130,33 @@ func parseOwnerPolicyDoc(raw string) (*ownerPolicyDoc, error) {
 		doc.parsed = append(doc.parsed, tpl)
 	}
 	return doc, nil
+}
+
+// docFromPolicy builds a document from a decoded policy, normalizing field names.
+func docFromPolicy(policy OwnerPolicy) (*ownerPolicyDoc, error) {
+	b, err := json.Marshal(policy)
+	if err != nil {
+		return nil, opWrap(http.StatusInternalServerError, "owner_policy_invalid", "", err)
+	}
+	return parseOwnerPolicyDoc(string(b))
+}
+
+// loadDoc returns the stored document. A wrong-case templates field is rebuilt
+// from a case-insensitive decode so role and quotas are kept. Only a document
+// that cannot be decoded at all is replaced with an empty policy for repair.
+func loadDoc(raw string) (*ownerPolicyDoc, error) {
+	doc, err := parseOwnerPolicyDoc(raw)
+	if err == nil {
+		return doc, nil
+	}
+	if policy, decErr := decodeOwnerPolicy(raw); decErr == nil {
+		return docFromPolicy(policy)
+	}
+	var op *OpError
+	if errors.As(err, &op) && op.Reason == "owner_policy_invalid" {
+		return &ownerPolicyDoc{fields: map[string]json.RawMessage{}}, nil
+	}
+	return nil, err
 }
 
 // index returns the position of template name, or -1.
@@ -208,29 +249,20 @@ func (p *OwnerPolicyStore) DeleteTemplate(ctx context.Context, name string) erro
 	})
 }
 
-// mutate edits the stored policy on the leader: validate, apply (and register),
-// then store. A rejected apply leaves the ConfigMap unchanged. A failed store
-// rolls the in-memory policy and CodeInterpreters back to the stored document.
+// mutate edits the stored policy: validate, apply (and register), then store.
+// A rejected apply leaves the ConfigMap unchanged. A failed apply or store
+// rolls CodeInterpreters and memory back to the stored document.
 func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc) error) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.leader() {
-		return opErr(http.StatusServiceUnavailable, "owner_policy_not_leader", "only the leader can change the owner policy")
-	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := p.get(ctx)
 		if err != nil {
 			return err
 		}
-		doc, err := parseOwnerPolicyDoc(cm.Data[OwnerPolicyKey])
+		doc, err := loadDoc(cm.Data[OwnerPolicyKey])
 		if err != nil {
-			var op *OpError
-			// A broken stored document can be repaired by a PUT that rebuilds it.
-			if errors.As(err, &op) && op.Reason == "owner_policy_invalid" {
-				doc = &ownerPolicyDoc{fields: map[string]json.RawMessage{}}
-			} else {
-				return err
-			}
+			return err
 		}
 		if err := edit(doc); err != nil {
 			return err
@@ -243,17 +275,19 @@ func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc
 		if err != nil {
 			return err
 		}
-		cfg, err := p.grants.ValidateOwnerPolicy(ctx, policy)
+		cfg, err := p.grants.prepareOwnerPolicy(ctx, policy)
 		if err != nil {
 			return err
 		}
 		if err := p.grants.applyOwnerConfig(ctx, cfg, true); err != nil {
-			p.recordApplyErr(raw, err)
+			p.recordApplyErr(raw, err, false)
 			return err
 		}
 		sum := sha256.Sum256([]byte(raw))
+		p.mu.Lock()
 		p.applied, p.registered = sum, sum
 		p.rejected, p.lastErr = [sha256.Size]byte{}, ""
+		p.mu.Unlock()
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
@@ -261,35 +295,57 @@ func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc
 		return p.client.Update(ctx, cm)
 	})
 	if err != nil {
-		if cm, getErr := p.get(ctx); getErr == nil {
-			_ = p.applyLocked(ctx, cm.Data[OwnerPolicyKey])
-		}
+		p.rollback(ctx)
 		return err
 	}
 	return nil
 }
 
-// recordApplyErr records a failed apply of raw. p.mu must be held.
-func (p *OwnerPolicyStore) recordApplyErr(raw string, err error) {
+// rollback forces a re-apply and re-register of the stored policy so partial
+// CodeInterpreter writes from a failed mutate are undone. writeMu must be held.
+func (p *OwnerPolicyStore) rollback(ctx context.Context) {
+	cm, err := p.get(ctx)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	p.applied = [sha256.Size]byte{}
+	p.registered = [sha256.Size]byte{}
+	p.mu.Unlock()
+	_ = p.applyLocked(ctx, cm.Data[OwnerPolicyKey], true)
+}
+
+// recordApplyErr records a failed apply of raw.
+func (p *OwnerPolicyStore) recordApplyErr(raw string, err error, faultIfUnapplied bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.lastErr = err.Error()
 	var op *OpError
 	if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
 		p.rejected, p.rejectedAt = sha256.Sum256([]byte(raw)), p.now()
-		p.grants.SetOwnerPolicyFault(err)
+		if faultIfUnapplied && p.grants.owner.Load() == nil {
+			p.grants.SetOwnerPolicyFault(err)
+		}
 	}
 }
 
-// applyLocked applies raw in memory, and registers its templates when this
-// replica is the leader and has not registered raw yet. p.mu must be held.
-func (p *OwnerPolicyStore) applyLocked(ctx context.Context, raw string) error {
+// applyLocked applies raw in memory, and registers its templates when force is
+// set, or when this replica is the leader and has not registered raw yet.
+// writeMu must be held.
+func (p *OwnerPolicyStore) applyLocked(ctx context.Context, raw string, force bool) error {
 	sum := sha256.Sum256([]byte(raw))
-	register := p.leader() && p.registered != sum
-	if !register && p.applied == sum {
+	p.mu.Lock()
+	register := force || (p.leader() && p.registered != sum)
+	skip := !register && p.applied == sum
+	p.mu.Unlock()
+	if skip {
 		return nil
 	}
 	policy, err := decodeOwnerPolicy(raw)
 	if err != nil {
+		p.mu.Lock()
 		p.lastErr = err.Error()
+		p.mu.Unlock()
 		return err
 	}
 	cfg, err := p.grants.prepareOwnerPolicy(ctx, policy)
@@ -297,14 +353,16 @@ func (p *OwnerPolicyStore) applyLocked(ctx context.Context, raw string) error {
 		err = p.grants.applyOwnerConfig(ctx, cfg, register)
 	}
 	if err != nil {
-		p.recordApplyErr(raw, err)
+		p.recordApplyErr(raw, err, true)
 		return err
 	}
+	p.mu.Lock()
 	p.applied = sum
 	if register {
 		p.registered = sum
 	}
 	p.rejected, p.lastErr = [sha256.Size]byte{}, ""
+	p.mu.Unlock()
 	return nil
 }
 
@@ -333,12 +391,19 @@ func (p *OwnerPolicyStore) MarkApplied(raw string) {
 	p.applied = sha256.Sum256([]byte(raw))
 }
 
+// MarkRegistered records raw as the policy whose templates this replica registered.
+func (p *OwnerPolicyStore) MarkRegistered(raw string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.registered = sha256.Sum256([]byte(raw))
+}
+
 // Sync applies the stored policy when it differs from the applied one, or when
 // this replica became leader and has not registered it. A rejected policy is
 // tried again after rejectedPolicyRetry.
 func (p *OwnerPolicyStore) Sync(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	cm, err := p.get(ctx)
 	if err != nil {
 		return err
@@ -347,10 +412,13 @@ func (p *OwnerPolicyStore) Sync(ctx context.Context) error {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	if sha256.Sum256([]byte(raw)) == p.rejected && p.now().Sub(p.rejectedAt) < rejectedPolicyRetry {
+	p.mu.Lock()
+	skipRejected := sha256.Sum256([]byte(raw)) == p.rejected && p.now().Sub(p.rejectedAt) < rejectedPolicyRetry
+	p.mu.Unlock()
+	if skipRejected {
 		return nil
 	}
-	return p.applyLocked(ctx, raw)
+	return p.applyLocked(ctx, raw, false)
 }
 
 // Run syncs now, watches the ConfigMap for changes, and resyncs every interval
@@ -361,12 +429,7 @@ func (p *OwnerPolicyStore) Run(ctx context.Context, interval time.Duration) {
 	}
 	for {
 		if err := p.Sync(ctx); err != nil {
-			var op *OpError
-			if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
-				log.Error("owner policy was rejected; the previous policy stays applied", "configmap", p.name, "error", err)
-			} else {
-				log.Warn("owner policy sync failed", "configmap", p.name, "error", err)
-			}
+			p.logSyncErr(err)
 		}
 		if err := p.watchOnce(ctx, interval); err != nil && ctx.Err() == nil {
 			log.Warn("owner policy watch ended", "configmap", p.name, "error", err)
@@ -379,14 +442,26 @@ func (p *OwnerPolicyStore) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// watchOnce watches the policy ConfigMap until ctx ends, the watch closes, or
-// interval elapses. Without a watchable client it polls once per interval.
+// logSyncErr logs a Sync failure.
+func (p *OwnerPolicyStore) logSyncErr(err error) {
+	var op *OpError
+	if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
+		log.Error("owner policy was rejected; the previous policy stays applied", "configmap", p.name, "error", err)
+		return
+	}
+	log.Warn("owner policy sync failed", "configmap", p.name, "error", err)
+}
+
+// watchOnce watches the named policy ConfigMap until ctx ends, the watch
+// closes, or interval elapses. Without a watcher it polls once per interval.
 func (p *OwnerPolicyStore) watchOnce(ctx context.Context, interval time.Duration) error {
-	w, ok := p.client.(ctrlclient.WithWatch)
-	if !ok {
+	if p.watcher == nil {
 		return p.pollOnce(ctx, interval)
 	}
-	watcher, err := w.Watch(ctx, &corev1.ConfigMapList{}, ctrlclient.InNamespace(p.namespace))
+	watcher, err := p.watcher.Watch(ctx, &corev1.ConfigMapList{},
+		ctrlclient.InNamespace(p.namespace),
+		ctrlclient.MatchingFieldsSelector{Selector: fields.OneTermEqualSelector("metadata.name", p.name)},
+	)
 	if err != nil {
 		return p.pollOnce(ctx, interval)
 	}
@@ -411,12 +486,7 @@ func (p *OwnerPolicyStore) watchOnce(ctx context.Context, interval time.Duration
 				continue
 			}
 			if err := p.Sync(ctx); err != nil {
-				var op *OpError
-				if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
-					log.Error("owner policy was rejected; the previous policy stays applied", "configmap", p.name, "error", err)
-				} else {
-					log.Warn("owner policy sync failed", "configmap", p.name, "error", err)
-				}
+				p.logSyncErr(err)
 			}
 		}
 	}

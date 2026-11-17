@@ -91,7 +91,7 @@ curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: applicati
   -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
 ```
 
-A write runs on the leader only: it validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. A follower write returns `503 owner_policy_not_leader`. The last template cannot be removed. Every replica watches the ConfigMap (with a 15s backup resync) and applies it in memory; only the leader creates, updates and deletes the template objects. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
+A write on any replica validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. The last template cannot be removed. Every replica watches the named ConfigMap (with a 15s backup resync) and applies it in memory; the leader also registers templates stored by an external edit. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
 
 ## Quotas
 

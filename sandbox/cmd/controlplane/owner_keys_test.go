@@ -101,9 +101,9 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 	}
 }
 
-// TestOwnerKeysWithStoreAppliesInMemory checks that a replica with a policy store
-// applies the startup policy without registering templates or starting a retry.
-func TestOwnerKeysWithStoreAppliesInMemory(t *testing.T) {
+// TestOwnerKeysWithStoreRegistersAtStartup checks that a replica with a policy
+// store registers templates before identity keys are accepted.
+func TestOwnerKeysWithStoreRegistersAtStartup(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -126,8 +126,8 @@ func TestOwnerKeysWithStoreAppliesInMemory(t *testing.T) {
 	if err := cl.List(context.Background(), &cis); err != nil {
 		t.Fatal(err)
 	}
-	if len(cis.Items) != 0 {
-		t.Fatalf("startup registered %d templates; the store leader does that", len(cis.Items))
+	if len(cis.Items) != 1 || cis.Items[0].Name != "e2b-t-g1" {
+		t.Fatalf("startup registered %v, want e2b-t-g1", cis.Items)
 	}
 }
 

@@ -111,7 +111,7 @@ func TestOwnerPolicyAPIWithoutStoreIs404(t *testing.T) {
 	}
 }
 
-func TestOwnerPolicyAPIFollowerWriteIs503(t *testing.T) {
+func TestOwnerPolicyAPIFollowerCanWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	roles := map[string]string{"admin": RoleSystemAdmin}
 	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,8 +138,8 @@ func TestOwnerPolicyAPIFollowerWriteIs503(t *testing.T) {
 	s.WithOwnerPolicyStore(grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false }))
 	put := `{"perGpuCount":[1],"spec":` + ownerPolicySpec + `}`
 	w := serveOwnerPolicy(s, http.MethodPut, ownerPolicyTemplatesPath+"/extra", "admin", put, nil)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("follower put = %d, want 503: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("follower put = %d, want 200: %s", w.Code, w.Body.String())
 	}
 }
 

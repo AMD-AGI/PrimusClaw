@@ -461,6 +461,15 @@ func main() {
 		var policyStore *grant.OwnerPolicyStore
 		if name := grant.OwnerPolicyConfigMapFromEnv(); name != "" {
 			policyStore = grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), wmCfg.Namespace, name, grants, leaderCheck(mgr.Elected()))
+			if watchClient, err := ctrlclient.NewWithWatch(k8sCfg, ctrlclient.Options{
+				HTTPClient: mgr.GetHTTPClient(),
+				Scheme:     mgr.GetScheme(),
+				Mapper:     mgr.GetRESTMapper(),
+			}); err != nil {
+				log.Warn("owner policy ConfigMap watch disabled", "error", err)
+			} else {
+				policyStore.WithWatcher(watchClient)
+			}
 		}
 		idClient, policySupplied := ownerKeys(ctx, grants, policyStore)
 		opts := e2b.Options{
@@ -563,11 +572,14 @@ func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPol
 		return client, false
 	}
 	if store != nil {
-		if err := grants.ApplyOwnerPolicy(ctx, *policy, false); err != nil {
+		// Register templates at startup so identity keys are not accepted before
+		// their CodeInterpreters exist. Upsert is idempotent across replicas.
+		if err := grants.ApplyOwnerPolicy(ctx, *policy, true); err != nil {
 			log.Warn("owner policy was not applied; the policy store retries", "error", err)
 			return client, true
 		}
 		store.MarkApplied(raw)
+		store.MarkRegistered(raw)
 		log.Info("identity keys enabled", "role", grants.OwnerRole())
 		return client, true
 	}

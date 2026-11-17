@@ -164,12 +164,6 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	return s.ApplyOwnerPolicy(ctx, p, true)
 }
 
-// ValidateOwnerPolicy checks the policy and returns the prepared config. It
-// changes neither the cluster nor the applied policy.
-func (s *Service) ValidateOwnerPolicy(ctx context.Context, p OwnerPolicy) (*ownerConfig, error) {
-	return s.prepareOwnerPolicy(ctx, p)
-}
-
 // ApplyOwnerPolicy validates the policy and makes it the applied policy.
 // With registerTemplates it also creates, updates and deletes the owner
 // CodeInterpreters, which every replica shares; one replica at a time may do that.
@@ -235,34 +229,11 @@ func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*owner
 	if err := s.resolveTemplateGPUCounts(ctx, ownerAppRunID, stored); err != nil {
 		return nil, err
 	}
-	if err := s.checkOwnerTemplateNames(ctx, stored); err != nil {
-		return nil, err
-	}
 	owners := make(map[string]OwnerQuota, len(p.Owners))
 	for id, q := range p.Owners {
 		owners[id] = q
 	}
 	return &ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners}, nil
-}
-
-// checkOwnerTemplateNames rejects a template spec that is not JSON and a
-// template name held by a CodeInterpreter the owner policy does not own.
-func (s *Service) checkOwnerTemplateNames(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
-	for _, tpl := range templates {
-		_, ok, err := templateFromSpec(tpl.Spec)
-		if err != nil {
-			return opWrap(http.StatusBadRequest, "invalid_owner_policy", "template spec is not JSON", err)
-		}
-		if !ok {
-			continue
-		}
-		for _, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
-			if _, err := s.ownerTemplateCI(ctx, name); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // ownerTemplateCI returns the CodeInterpreter name when it exists and is owned
