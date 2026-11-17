@@ -109,11 +109,12 @@ never became usable records one of the provisioning codes --
 `sandbox_image_missing`, `sandbox_auth_missing`, `sandbox_template_missing`,
 `sandbox_health_failed`, `sandbox_bootstrap_failed` -- and nothing in it executed.
 
-A run whose turn asked for a sandbox that the platform could not provide
-(`sandbox_unschedulable`, `sandbox_pending_timeout`, `sandbox_start_timeout`,
-`sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`) is `failed` with that code
-even when its agent went on to answer without one: the answer is in the session, but none of
-the work that needed the sandbox ran.
+A run whose turn asked for a sandbox that the platform had no capacity for
+(`sandbox_unschedulable`, `sandbox_pending_timeout`, `sandbox_start_timeout`) is `failed` with
+that code even when its agent went on to answer without one: the answer is in the session, but
+none of the work that needed the sandbox ran. An account the platform refuses a sandbox to
+(`sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`) is not such a failure: its
+turns carry on without one by design.
 
 `failure_message` is what happened, for a person, when the run recorded more than its code:
 for a sandbox the platform could not provide, the platform's reason (for example

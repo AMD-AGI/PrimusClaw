@@ -132,11 +132,10 @@ release version, and its `appVersion` stays `latest`.
   the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
   sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
   up to 3 hours and keeps at least 4 hours to run.
-- Runs: a run whose sandbox the platform could not provide is recorded as failed. Its turn still ends with the agent's
+- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
   answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
   could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
-  `sandbox_pending_timeout`, `sandbox_start_timeout`, `sandbox_workspace_forbidden` or `sandbox_workspace_not_allowed`), and
-  the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
+  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
   its code). Task and DAG runs report the same through their callback.
 - Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
   window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply

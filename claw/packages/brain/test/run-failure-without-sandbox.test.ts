@@ -166,6 +166,14 @@ test("a run that never asked for a sandbox ends as it always did", async () => {
   assert.equal(delivered[0]!.failureReason, undefined);
 });
 
+test("an account the platform refuses a sandbox to carries on, and the run is not failed for it", async () => {
+  for (const reason of ["sandbox_workspace_forbidden", "sandbox_workspace_not_allowed"]) {
+    const { completion, delivered } = await runTurn({ open: refused(reason), callback: true });
+    assert.equal(completion[RUN_FAILURE_REASON_FIELD], undefined, reason);
+    assert.equal(delivered[0]!.abortReason, undefined, reason);
+  }
+});
+
 test("an open that failed for a reason the run may retry past does not fail the run", async () => {
   // Not one of the endings that say the platform has no sandbox for this run: the
   // next tool gets a fresh open, so the run is not over for want of one.
