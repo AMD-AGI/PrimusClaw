@@ -549,8 +549,9 @@ func leaderCheck(elected <-chan struct{}) func() bool {
 // owner policy was supplied. A missing policy answers identity keys with 503
 // owner_policy_not_applied; a rejected policy answers 500 owner_policy_invalid.
 // Grant keys keep working. A policy that fails for a transient reason is retried
-// in the background. With a policy store the policy is applied in memory only:
-// the store registers the templates from the leader and retries failures.
+// in the background. With a policy store the policy is registered at startup so
+// identity keys are not accepted before their CodeInterpreters exist; the store
+// retries later failures.
 func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPolicyStore) (*identity.Client, bool) {
 	client, err := identity.FromEnv()
 	if err != nil {
