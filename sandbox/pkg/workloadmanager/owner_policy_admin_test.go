@@ -88,6 +88,8 @@ func TestOwnerPolicyAPIOnlySystemAdmin(t *testing.T) {
 		{"admin", http.MethodPut, ownerPolicyTemplatesPath + "/extra", put, http.StatusOK},
 		{"admin", http.MethodGet, ownerPolicyTemplatesPath + "/extra", "", http.StatusOK},
 		{"admin", http.MethodPut, ownerPolicyTemplatesPath + "/extra", `{"name":"other","spec":` + ownerPolicySpec + `}`, http.StatusBadRequest},
+		{"admin", http.MethodPut, ownerPolicyTemplatesPath + "/Bad_Name", `{"perGpuCount":[1],"spec":` + ownerPolicySpec + `}`, http.StatusBadRequest},
+		{"admin", http.MethodPut, ownerPolicyTemplatesPath + "/extra", `{"perGpuCount":[1],"gpuCounts":[8],"spec":` + ownerPolicySpec + `}`, http.StatusBadRequest},
 		{"admin", http.MethodDelete, ownerPolicyTemplatesPath + "/extra", "", http.StatusNoContent},
 		{"admin", http.MethodGet, ownerPolicyTemplatesPath + "/extra", "", http.StatusNotFound},
 	} {

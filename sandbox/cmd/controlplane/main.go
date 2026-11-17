@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -458,19 +459,7 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		var policyStore *grant.OwnerPolicyStore
-		if name := grant.OwnerPolicyConfigMapFromEnv(); name != "" {
-			policyStore = grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), wmCfg.Namespace, name, grants, leaderCheck(mgr.Elected()))
-			if watchClient, err := ctrlclient.NewWithWatch(k8sCfg, ctrlclient.Options{
-				HTTPClient: mgr.GetHTTPClient(),
-				Scheme:     mgr.GetScheme(),
-				Mapper:     mgr.GetRESTMapper(),
-			}); err != nil {
-				log.Warn("owner policy ConfigMap watch disabled", "error", err)
-			} else {
-				policyStore.WithWatcher(watchClient)
-			}
-		}
+		policyStore := newOwnerPolicyStore(k8sCfg, mgr, wmCfg.Namespace, grants)
 		idClient, policySupplied := ownerKeys(ctx, grants, policyStore)
 		opts := e2b.Options{
 			Grants:    grants,
@@ -544,14 +533,32 @@ func leaderCheck(elected <-chan struct{}) func() bool {
 	}
 }
 
+// newOwnerPolicyStore builds the ConfigMap-backed store and its watch client.
+func newOwnerPolicyStore(k8sCfg *rest.Config, mgr ctrl.Manager, namespace string, grants *grant.Service) *grant.OwnerPolicyStore {
+	name := grant.OwnerPolicyConfigMapFromEnv()
+	if name == "" {
+		return nil
+	}
+	store := grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), namespace, name, grants, leaderCheck(mgr.Elected()))
+	watchClient, err := ctrlclient.NewWithWatch(k8sCfg, ctrlclient.Options{
+		HTTPClient: mgr.GetHTTPClient(),
+		Scheme:     mgr.GetScheme(),
+		Mapper:     mgr.GetRESTMapper(),
+	})
+	if err != nil {
+		log.Warn("owner policy ConfigMap watch disabled", "error", err)
+		return store
+	}
+	return store.WithWatcher(watchClient)
+}
+
 // ownerKeys returns the identity client when the introspection client is configured,
 // so identity keys are checked by introspection. The second result is true when an
 // owner policy was supplied. A missing policy answers identity keys with 503
 // owner_policy_not_applied; a rejected policy answers 500 owner_policy_invalid.
 // Grant keys keep working. A policy that fails for a transient reason is retried
-// in the background. With a policy store the policy is registered at startup so
-// identity keys are not accepted before their CodeInterpreters exist; the store
-// retries later failures.
+// in the background. With a policy store the ConfigMap is the only source and is
+// registered at startup so identity keys are not accepted before their templates exist.
 func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPolicyStore) (*identity.Client, bool) {
 	client, err := identity.FromEnv()
 	if err != nil {
@@ -561,7 +568,19 @@ func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPol
 	if client == nil {
 		return nil, false
 	}
-	policy, raw, err := grant.OwnerPolicyRawFromEnv()
+	if store != nil {
+		if err := store.ApplyStored(ctx); err != nil {
+			if !transientPolicyError(err) {
+				log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
+			} else {
+				log.Warn("owner policy was not applied; the policy store retries", "error", err)
+			}
+			return client, true
+		}
+		log.Info("identity keys enabled", "role", grants.OwnerRole())
+		return client, true
+	}
+	policy, _, err := grant.OwnerPolicyRawFromEnv()
 	supplied := policy != nil || err != nil
 	if err != nil {
 		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
@@ -571,18 +590,6 @@ func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPol
 	if policy == nil {
 		log.Warn("identity keys await owner policy: owner policy is not configured")
 		return client, false
-	}
-	if store != nil {
-		// Register templates at startup so identity keys are not accepted before
-		// their CodeInterpreters exist. Upsert is idempotent across replicas.
-		if err := grants.ApplyOwnerPolicy(ctx, *policy, true); err != nil {
-			log.Warn("owner policy was not applied; the policy store retries", "error", err)
-			return client, true
-		}
-		store.MarkApplied(raw)
-		store.MarkRegistered(raw)
-		log.Info("identity keys enabled", "role", grants.OwnerRole())
-		return client, true
 	}
 	err = grants.SetOwnerPolicy(ctx, *policy)
 	if err == nil {

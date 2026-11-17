@@ -83,15 +83,16 @@ When the policy comes from a ConfigMap (`controlplane.config.identity.ownerPolic
 | PUT    | `/v1/admin/owner-policy/templates/{name}`    | Add or replace one policy template  |
 | DELETE | `/v1/admin/owner-policy/templates/{name}`    | Remove one policy template          |
 
-The PUT body is one template entry of the policy, without the name:
+The API is served by the control-plane Router Service only; the public Ingress does not allow `/v1/admin`. Reach it through the Service (for example with `kubectl port-forward`):
 
 ```bash
+kubectl -n agent-sandbox-system port-forward svc/agent-sandbox-controlplane 8080:80
 curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
-  https://<safe-host>/v1/admin/owner-policy/templates/measurement \
+  http://127.0.0.1:8080/v1/admin/owner-policy/templates/measurement \
   -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
 ```
 
-A write on any replica validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. The last template cannot be removed. Every replica watches the named ConfigMap (with a 15s backup resync) and applies it in memory; the leader also registers templates stored by an external edit. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
+A write on any replica validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. An invalid stored document is not rewritten by the API; fix the ConfigMap first. The last template cannot be removed. Every replica watches the named ConfigMap (with a 15s backup resync) and applies it in memory; the leader re-registers the stored templates on every Sync so drifted CodeInterpreters converge. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
 
 ## Quotas
 

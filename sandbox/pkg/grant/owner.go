@@ -159,14 +159,25 @@ func OwnerPolicyRawFromEnv() (*OwnerPolicy, string, error) {
 	return &p, string(raw), nil
 }
 
+// ValidTemplateName reports whether name is a DNS label suitable for a policy
+// template (at most 40 characters, as for a SaFE Workload display name).
+func ValidTemplateName(name string) bool {
+	return roleLabel(name)
+}
+
 // SetOwnerPolicy validates the policy, registers its templates, and applies it.
 func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
-	return s.ApplyOwnerPolicy(ctx, p, true)
+	cfg, err := s.prepareOwnerPolicy(ctx, p)
+	if err != nil {
+		return err
+	}
+	return s.applyOwnerConfig(ctx, cfg, true)
 }
 
 // ApplyOwnerPolicy validates the policy and makes it the applied policy.
 // With registerTemplates it also creates, updates and deletes the owner
-// CodeInterpreters, which every replica shares; one replica at a time may do that.
+// CodeInterpreters. Prefer SetOwnerPolicy; this form remains for callers that
+// apply without registering.
 func (s *Service) ApplyOwnerPolicy(ctx context.Context, p OwnerPolicy, registerTemplates bool) error {
 	cfg, err := s.prepareOwnerPolicy(ctx, p)
 	if err != nil {
@@ -236,9 +247,9 @@ func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*owner
 	return &ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners}, nil
 }
 
-// ownerTemplateCI returns the CodeInterpreter name when it exists and is owned
-// by the owner policy. A missing object returns nil. A name held by another
-// grant returns 409 template_exists.
+// ownerTemplateCI returns the CodeInterpreter when it exists and is owned by
+// the owner policy. A missing object returns nil. A name held by another grant
+// returns 409 template_exists.
 func (s *Service) ownerTemplateCI(ctx context.Context, name string) (*runtimev1alpha1.CodeInterpreter, error) {
 	existing := &runtimev1alpha1.CodeInterpreter{}
 	err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
@@ -458,7 +469,7 @@ func ownerSpecMatches(got, want runtimev1alpha1.SandboxGrantSpec) bool {
 
 // upsertOwnerTemplates creates or updates the CodeInterpreters of the owner policy
 // and deletes the owner CodeInterpreters the policy no longer lists. Ownership
-// conflicts use the same check as prepareOwnerPolicy (ownerTemplateCI).
+// conflicts use ownerTemplateCI.
 func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
 	wanted := map[string]bool{}
 	for _, tpl := range templates {

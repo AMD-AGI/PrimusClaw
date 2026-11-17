@@ -132,7 +132,7 @@ func TestOwnerPolicyStorePutAndDelete(t *testing.T) {
 		t.Fatal("sync did not register the policy template")
 	}
 
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
 	if !r.ciExists(t, "e2b-extra-g1") || !strings.Contains(r.appliedTemplates(), "e2b-extra-g1") {
@@ -151,16 +151,16 @@ func TestOwnerPolicyStorePutAndDelete(t *testing.T) {
 		t.Fatalf("templates=%+v err=%v", out, err)
 	}
 
-	if err := r.store.DeleteTemplate(ctx, "extra"); err != nil {
+	if _, err := r.store.DeleteTemplate(ctx, "extra"); err != nil {
 		t.Fatal(err)
 	}
 	if r.ciExists(t, "e2b-extra-g1") {
 		t.Fatal("delete kept the dropped template")
 	}
-	if err := r.store.DeleteTemplate(ctx, "extra"); opStatus(err) != http.StatusNotFound {
+	if _, err := r.store.DeleteTemplate(ctx, "extra"); opStatus(err) != http.StatusNotFound {
 		t.Fatalf("delete missing: %v", err)
 	}
-	if err := r.store.DeleteTemplate(ctx, "runner"); opStatus(err) != http.StatusBadRequest {
+	if _, err := r.store.DeleteTemplate(ctx, "runner"); opStatus(err) != http.StatusBadRequest {
 		t.Fatalf("delete last: %v", err)
 	}
 }
@@ -168,7 +168,7 @@ func TestOwnerPolicyStorePutAndDelete(t *testing.T) {
 func TestOwnerPolicyStoreReplacesTemplate(t *testing.T) {
 	ctx := context.Background()
 	r := newStoreRig(t, storePolicy, nil)
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1, 8}, Spec: json.RawMessage(storeSpec)}); err != nil {
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1, 8}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
 	out, err := r.store.Templates(ctx)
@@ -189,7 +189,7 @@ func TestOwnerPolicyStoreRejectsWithoutWriting(t *testing.T) {
 		{Name: "nospec"},
 		{Name: "bad", Spec: json.RawMessage(`{"fromImage":`)},
 	} {
-		if err := r.store.PutTemplate(ctx, tpl); err == nil {
+		if _, err := r.store.PutTemplate(ctx, tpl); err == nil {
 			t.Fatalf("put %q accepted", tpl.Name)
 		}
 	}
@@ -208,7 +208,7 @@ func TestOwnerPolicyStoreFailedSaveChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := r.appliedTemplates()
-	if err := r.store.DeleteTemplate(ctx, "extra"); err == nil {
+	if _, err := r.store.DeleteTemplate(ctx, "extra"); err == nil {
 		t.Fatal("delete succeeded without saving")
 	}
 	if !r.ciExists(t, "e2b-extra-g1") || r.appliedTemplates() != before {
@@ -229,7 +229,7 @@ func TestOwnerPolicyStoreConflictHasNoSideEffects(t *testing.T) {
 		}
 		return cl.Update(context.Background(), obj)
 	})
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
 	if conflicts != 1 || !r.ciExists(t, "e2b-extra-g1") || !strings.Contains(r.stored(t), "extra") {
@@ -252,7 +252,7 @@ func TestOwnerPolicyStoreFollowerSyncDoesNotRegister(t *testing.T) {
 		t.Fatalf("follower should be in sync without registering: %+v %v", out, err)
 	}
 	// Any replica may write and register.
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
 	if !r.ciExists(t, "e2b-extra-g1") || !strings.Contains(r.stored(t), "extra") {
@@ -313,49 +313,59 @@ func TestOwnerPolicyStoreRefusesTemplatesKeyInOtherCase(t *testing.T) {
 	if _, err := r.store.Templates(context.Background()); err == nil {
 		t.Fatal("list accepted a Templates field")
 	}
-}
-
-// PUT on a document with "Templates" keeps role and quotas via case-insensitive decode.
-func TestOwnerPolicyStorePutKeepsQuotasWhenTemplatesKeyCased(t *testing.T) {
 	ctx := context.Background()
-	raw := `{"role":"e2b","Templates":[{"name":"runner","perGpuCount":[1],"spec":` + storeSpec + `}],"default":{"maxSandboxes":2},"admin":{"maxSandboxes":3},"owners":{"u1":{"maxSandboxes":1}}}`
-	r := newStoreRig(t, raw, nil)
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
-		t.Fatal(err)
+	before := r.stored(t)
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err == nil {
+		t.Fatal("put accepted a Templates field")
 	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(r.stored(t)), &doc); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := doc["Templates"]; ok {
-		t.Fatal("stored document kept the Templates field")
-	}
-	for _, key := range []string{"role", "default", "admin", "owners", "templates"} {
-		if _, ok := doc[key]; !ok {
-			t.Fatalf("missing %s after repair: %s", key, r.stored(t))
-		}
-	}
-	if !bytes.Contains(doc["default"], []byte(`"maxSandboxes": 2`)) || !bytes.Contains(doc["owners"], []byte(`"u1"`)) {
-		t.Fatalf("quotas dropped: %s", r.stored(t))
+	if r.stored(t) != before {
+		t.Fatal("put rewrote an invalid stored document")
 	}
 }
 
-// A broken stored document can be repaired by PUT, which rebuilds the policy.
-func TestOwnerPolicyStorePutRepairsInvalidJSON(t *testing.T) {
+// A broken stored document is not rewritten by PUT; an admin fixes the ConfigMap first.
+func TestOwnerPolicyStorePutDoesNotRewriteInvalidJSON(t *testing.T) {
 	ctx := context.Background()
 	r := newStoreRig(t, `{"templates":`, nil)
-	if _, err := r.store.Templates(ctx); err == nil {
-		t.Fatal("list accepted invalid JSON")
+	before := r.stored(t)
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err == nil {
+		t.Fatal("put accepted invalid JSON")
 	}
-	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+	if r.stored(t) != before {
+		t.Fatal("put rewrote invalid JSON")
+	}
+}
+
+// The leader re-registers on Sync so a CodeInterpreter deleted by another replica returns.
+func TestOwnerPolicyStoreLeaderResyncRepairsDrift(t *testing.T) {
+	ctx := context.Background()
+	leader := newStoreRig(t, storePolicy, nil)
+	if err := leader.store.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	out, err := r.store.Templates(ctx)
-	if err != nil || len(out.Templates) != 1 || out.Templates[0].Name != "runner" || !out.InSync {
-		t.Fatalf("repaired templates=%+v err=%v", out, err)
+	if _, err := leader.store.PutTemplate(ctx, TemplateRequest{Name: "added", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+		t.Fatal(err)
 	}
-	if !r.ciExists(t, "e2b-runner-g1") {
-		t.Fatal("repair did not register the template")
+	if !leader.ciExists(t, "e2b-added-g1") {
+		t.Fatal("leader did not register added")
+	}
+	// A second replica applies an older snapshot and deletes the new CI.
+	old := OwnerPolicy{Templates: []TemplateRequest{{Name: "runner", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}}}
+	if err := leader.svc.SetOwnerPolicy(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if leader.ciExists(t, "e2b-added-g1") {
+		t.Fatal("stale apply kept the added template")
+	}
+	if err := leader.store.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !leader.ciExists(t, "e2b-added-g1") {
+		t.Fatal("leader sync did not restore the drifted CodeInterpreter")
+	}
+	out, err := leader.store.Templates(ctx)
+	if err != nil || !out.InSync {
+		t.Fatalf("leader after repair: %+v %v", out, err)
 	}
 }
 
@@ -394,7 +404,7 @@ func TestOwnerPolicyStoreRollbackPartialUpsert(t *testing.T) {
 	}
 	before := storePolicy
 	newSpec := `{"fromImage":"harbor.example/other@sha256:0123456789abcdef"}`
-	if err := store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1, 8}, Spec: json.RawMessage(newSpec)}); err == nil {
+	if _, err := store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1, 8}, Spec: json.RawMessage(newSpec)}); err == nil {
 		t.Fatal("put succeeded with a partial upsert")
 	}
 	cm2 := &corev1.ConfigMap{}

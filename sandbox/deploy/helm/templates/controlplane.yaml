@@ -32,7 +32,7 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: [{{ .ownerPolicyConfigMap | quote }}]
-    verbs: ["get", "list", "watch", "update"]
+    verbs: ["get", "watch", "update"]
   {{- end }}
   {{- end }}
 ---
