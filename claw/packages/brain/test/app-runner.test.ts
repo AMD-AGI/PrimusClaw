@@ -27,9 +27,10 @@ process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
   return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
 }) as typeof process.stdout.write;
 
-const { AppRunner, outcomeOf, backoffMs, parseExit, noopAppGrant } = await import("../src/apps/app-runner.js");
+const { AppRunner, outcomeOf, backoffMs, parseExit, noopAppGrant, NO_USER_DATA_DIR_REASON, USER_DATA_DIR_NOT_CREATED_REASON } =
+  await import("../src/apps/app-runner.js");
 const { AppRunWriteRefused } = await import("../src/apps/app-run-store.js");
-const { buildAppEnv } = await import("../src/apps/app-env.js");
+const { buildAppEnv, STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED } = await import("../src/apps/app-env.js");
 const W = await import("./support/app-runner-world.js");
 const { World, MANIFEST, RUN_ID, STATE_DIR, TOKEN, KEY_M, KEY_S, T0 } = W;
 
@@ -968,14 +969,85 @@ test("P3 a real start failure still counts", async () => {
   assert.equal(h.world.rec.state, "finishing");
 });
 
-test("P4 a state_dir that cannot be expanded is counted, and the run ends instead of sitting in starting", async () => {
+test("P4 a state_dir that cannot be expanded for another reason is counted, and the run ends instead of sitting in starting", async () => {
   const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 1, backoff_sec: [1] } } });
   await until(h, "starting");
-  h.world.stateDirExit = 4; // USER_DATA_PATH is empty in the sandbox
+  h.world.stateDirExit = 1; // the expansion failed, but not because USER_DATA_PATH is missing
   for (let i = 0; i < 40 && h.world.rec.state !== "ended"; i++) { h.world.clock += 5_000; await h.runner.reconcile().catch(() => undefined); }
   assert.equal(h.world.rec.state, "ended");
   assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(h.world.rec.restarts, 1, "it took the restart road");
   assert.equal(h.world.starts.length, 0);
+});
+
+const stateDirAsks = (h: H) => h.world.execs.filter((e) => e.command.includes(".claw-apps") && e.command.includes("printf %s") && !e.command.includes("base64") && !e.command.includes("setsid")).length;
+
+test("P4a no USER_DATA_PATH in the sandbox and none to derive (exit 4) ends the run at once, failed, saying what is missing", async () => {
+  // Restarts allowed, with a long backoff: what held the task in executing with no error.
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 3, backoff_sec: [30, 120, 900] } } });
+  await until(h, "starting");
+  h.world.stateDirExit = STATE_DIR_NO_USER_DATA;
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing", "the first refusal decides: no second ask, no restart");
+  assert.equal(h.world.rec.restarts, 0);
+  assert.equal(h.world.rec.last_exit?.cause, "start_failed");
+  assert.equal(h.world.rec.last_exit?.stop_reason, NO_USER_DATA_DIR_REASON);
+  for (let i = 0; i < 10 && h.world.rec.state !== "ended"; i++) await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "ended");
+  assert.equal(stateDirAsks(h), 1);
+  assert.equal(h.world.starts.length, 0);
+  assert.deepEqual(h.world.stopped, [h.world.rec.sandbox_workload_id], "the sandbox is stopped");
+  const outcome = outcomeOf(h.world.rec.last_exit, h.world.rec.state_dir);
+  assert.equal(outcome.success, false);
+  assert.match(outcome.reason, /no user data directory/);
+  assert.match(outcome.reason, /USER_DATA_PATH is unset/);
+});
+
+test("P4c a workspace that cannot be read for the user data roots is asked again, never taken as having none", async () => {
+  let reads = 0;
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 3, backoff_sec: [1] } } });
+  h.world.sandbox.userDataRoots = async () => { reads += 1; if (reads <= 2) throw new Error("workspace lookup failed: HTTP 502"); return ["/shared_nfs"]; };
+  await until(h, "starting");
+  for (let i = 0; i < 2; i++) await assert.rejects(h.runner.reconcile(), /HTTP 502/);
+  assert.equal(h.world.rec.state, "starting");
+  assert.equal(h.world.rec.last_exit, null);
+  assert.equal(stateDirAsks(h), 0, "nothing is asked of the sandbox without the roots");
+  await toRunning(h);
+  assert.equal(reads, 3, "read once it answered, and not again for the launch");
+});
+
+test("P4d the roots ride in every command that reads USER_DATA_PATH: the expansion, the file writes and the start", async () => {
+  const h = harness();
+  h.world.sandbox.userDataRoots = async (run) => { assert.equal(run.workspaceId, "ws-1"); return ["/shared_nfs"]; };
+  await toRunning(h);
+  const derive = (c: string) => c.includes("'/shared_nfs'") && c.includes('"$r/users/$USER_ID"');
+  const expansion = h.world.execs.filter((e) => e.command.includes("exit 4; printf %s"));
+  assert.ok(expansion.length === 1 && derive(expansion[0]!.command));
+  const writes = h.world.execs.filter((e) => e.command.includes("base64 -d"));
+  assert.equal(writes.length, 2);
+  assert.ok(writes.every((e) => derive(e.command)));
+  assert.ok(derive(h.world.starts[0]!.command));
+});
+
+test("P4e a derived user data directory that cannot be created ends the run at once, saying so", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 3, backoff_sec: [30] } } });
+  await until(h, "starting");
+  h.world.stateDirExit = USER_DATA_DIR_NOT_CREATED;
+  await h.runner.reconcile();
+  assert.equal(h.world.rec.state, "finishing");
+  assert.equal(h.world.rec.restarts, 0);
+  assert.equal(h.world.rec.last_exit?.stop_reason, USER_DATA_DIR_NOT_CREATED_REASON);
+});
+
+test("P4b a transport failure of the state_dir ask is retried, not taken as a missing USER_DATA_PATH", async () => {
+  const h = harness({ manifest: { ...MANIFEST, restart: { max_restarts: 3, backoff_sec: [1] } } });
+  await until(h, "starting");
+  h.world.failExec = { left: 2, when: (c) => c.includes("USER_DATA_PATH") && c.includes("printf %s") && !c.includes("base64") };
+  for (let i = 0; i < 2; i++) await assert.rejects(h.runner.reconcile());
+  assert.equal(h.world.rec.state, "starting");
+  assert.equal(h.world.rec.restarts, 0);
+  assert.equal(h.world.rec.last_exit, null);
+  await toRunning(h);
 });
 
 test("P5 finishNow stops at once when another worker holds the run", async () => {

@@ -251,7 +251,8 @@ export class World {
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
       return ok();
     }
-    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) {
+    // The start command carries the USER_DATA_PATH derivation too (it exports it to the application).
+    if (command.includes("USER_DATA_PATH") && command.includes("printf %s") && !command.includes("setsid")) {
       return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
     }
     if (command.includes("kill -KILL")) {

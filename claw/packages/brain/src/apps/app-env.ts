@@ -33,17 +33,65 @@ export const EXIT_FILE = "exit.json";
 export const generationTag = (workloadId: string, restarts: number): string => `${workloadId}:${restarts}`;
 
 /**
+ * Exit status of {@link expandStateDirCommand} when the template needs
+ * `$USER_DATA_PATH` and the sandbox has none, nor any it can be derived from.
+ * Deterministic: both come from the workload's volumes and identity, so asking
+ * the same sandbox again answers the same.
+ */
+export const STATE_DIR_NO_USER_DATA = 4;
+/** Exit status of a command whose derived user data directory could not be created. */
+export const USER_DATA_DIR_NOT_CREATED = 5;
+
+/** The users directory below a volume's mount path, as SaFE names it (`UserDirsPath`). */
+export const USER_DIRS = "users";
+
+/** A mount path usable as a user data root: absolute, plain characters, no `..`. */
+export function usableUserDataRoot(path: string): boolean {
+  return /^\/[A-Za-z0-9._/-]*$/.test(path) && !path.split("/").includes("..");
+}
+
+/**
+ * Shell that gives the command a `USER_DATA_PATH` when SaFE set none.
+ *
+ * SaFE sets `USER_DATA_PATH` only from a workspace volume with `enableUserDir`,
+ * as `{mountPath}/users/{userId}` (job-manager `generateUserDir`), where the user
+ * id is the workload's, which SaFE also sets as `USER_ID`. A workspace whose
+ * hostpath volume has no `enableUserDir` gets neither the variable nor the
+ * directory. Then the same path is derived here, from the first of `roots` (the
+ * mount paths of the workspace's hostpath volumes, in the workspace's order) that
+ * is mounted in this sandbox, and the directory is created when missing.
+ *
+ * A value SaFE set is never replaced. Nothing is derived without a `USER_ID`
+ * that names a directory (SaFE refuses the same ones), or without a mounted
+ * root; the variable then stays unset and whoever needs it refuses. A directory
+ * that cannot be created exits {@link USER_DATA_DIR_NOT_CREATED}. Empty when there
+ * is no usable root: the command is then exactly what it was.
+ */
+export function userDataPathPrelude(roots: readonly string[]): string {
+  const usable = roots.filter(usableUserDataRoot);
+  if (usable.length === 0) return "";
+  return 'if [ -z "$USER_DATA_PATH" ]; then '
+    + 'case "$USER_ID" in ""|.|..|*/*) ;; '
+    + `*) for r in ${usable.map(shq).join(" ")}; do if [ -d "$r" ]; then USER_DATA_PATH="$r/${USER_DIRS}/$USER_ID"; break; fi; done ;; esac; `
+    + `if [ -n "$USER_DATA_PATH" ]; then mkdir -p "$USER_DATA_PATH" || exit ${USER_DATA_DIR_NOT_CREATED}; export USER_DATA_PATH; fi; `
+    + "fi; ";
+}
+
+/**
  * A command that prints the state directory: the manifest's template with
  * `${run_id}` filled in here and `${USER_DATA_PATH}` left to the sandbox, which
- * is the only place that knows it. Refuses (exit 4) when the variable is needed
- * and empty, because the result would otherwise be a path at the filesystem root.
+ * is the only place that knows it (derived from `roots` when SaFE set none, see
+ * {@link userDataPathPrelude}). Refuses ({@link STATE_DIR_NO_USER_DATA}) when the
+ * variable is needed and still empty, because the result would otherwise be a
+ * path at the filesystem root.
  */
-export function expandStateDirCommand(template: string, runId: string): string {
+export function expandStateDirCommand(template: string, runId: string, roots: readonly string[] = []): string {
   const withRun = template.split("${run_id}").join(runId);
   const parts = withRun.split("${USER_DATA_PATH}");
   const word = parts.map(shq).join('"$USER_DATA_PATH"');
-  const guard = parts.length > 1 ? '[ -n "$USER_DATA_PATH" ] || exit 4; ' : "";
-  return `${guard}printf %s ${word}`;
+  const needed = parts.length > 1;
+  const guard = needed ? `[ -n "$USER_DATA_PATH" ] || exit ${STATE_DIR_NO_USER_DATA}; ` : "";
+  return `${needed ? userDataPathPrelude(roots) : ""}${guard}printf %s ${word}`;
 }
 
 /** A state directory is an absolute path on one line, or the expansion went wrong. */
@@ -74,11 +122,11 @@ export const BOOTSTRAP_FILE_MODES: FileModes = { inUserDir: "750", elsewhere: "7
  * The mode is chosen in the sandbox, which is the only place that knows
  * `$USER_DATA_PATH`; an unset or root `$USER_DATA_PATH` means `elsewhere`. A
  * temporary file left by an interrupted write is removed first: written by
- * another account, it could not be truncated.
+ * another account, it could not be truncated. `roots`: see {@link userDataPathPrelude}.
  */
-export function writeFileCommand(path: string, modes: FileModes): string {
+export function writeFileCommand(path: string, modes: FileModes, roots: readonly string[] = []): string {
   const p = shq(path);
-  return `mkdir -p "$(dirname ${p})" && rm -f ${p}.tmp && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && `
+  return `${userDataPathPrelude(roots)}mkdir -p "$(dirname ${p})" && rm -f ${p}.tmp && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && `
     + `u="\${USER_DATA_PATH%/}" && m=${modes.elsewhere} && `
     + `if [ -n "$u" ]; then case ${p} in "$u"/*) m=${modes.inUserDir} ;; esac; fi && `
     + `chmod "$m" ${p}.tmp && mv -f ${p}.tmp ${p}`;
@@ -159,12 +207,15 @@ const BREAK_LOCK = ".start.lock.break";
  * The marker is written before the launch so a launch that is never recorded
  * still names its generation.
  */
-export function startCommand(manifest: AppManifestV1, stateDir: string, tag: string): string {
+export function startCommand(manifest: AppManifestV1, stateDir: string, tag: string, roots: readonly string[] = []): string {
   const d = shq(stateDir);
   const workload = tag.slice(0, tag.lastIndexOf(":"));
   const argv = manifest.command.map(shq).join(" ");
   const events = manifest.events ? `mkdir -p ${shq(`${stateDir}/${manifest.events.dir}`)} && ` : "";
+  // The application gets the same USER_DATA_PATH the state directory was expanded with.
+  const prelude = userDataPathPrelude(roots);
   return [
+    ...(prelude ? [prelude.replace(/; $/, "")] : []),
     `mkdir -p ${d} && ${events}cd ${d} || exit 1`,
     // The lock is a symlink whose target is "<pid>|<sandbox>": creating it is one
     // atomic step that also writes the holder, so a contender never sees a lock with

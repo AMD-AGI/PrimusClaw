@@ -120,6 +120,14 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
+- App runs: a sandbox that SaFE gave no `USER_DATA_PATH` (a workspace whose hostpath volume does not set
+  `enableUserDir`) gets one from Claw, the way SaFE derives it: `{mountPath}/users/{USER_ID}`, from the first of the
+  workspace's hostpath volumes that is mounted in the sandbox, created when missing. The state directory, the files
+  written for the app and the app's own environment all use it. A value SaFE set is never replaced. When none can be
+  derived (no such volume, no `USER_ID`) or the directory cannot be created, the run now fails at once with that reason
+  instead of spending its restarts and their backoff on the same refusal, which held the task in executing, with no
+  error, until it was cancelled. A workspace that cannot be read (SaFE unavailable) is asked again; only a refusal from
+  the sandbox ends the run.
 - The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
   turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
   `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
