@@ -799,6 +799,12 @@ export interface ExecuteResult {
   abortReason?: AbortReason;
   /** Free-form error explanation when `abortReason` is `error` / `wait_external` / ... */
   failureReason?: string;
+  /**
+   * What happened, for a person, when `failureReason` is a code: for a run whose
+   * sandbox the platform could not provide, the reason it gave. Stored as the run's
+   * `error_message`.
+   */
+  failureMessage?: string;
   /** Carried through for wait_external resume: which step name caused the wait. */
   waitExternalId?: string;
 }

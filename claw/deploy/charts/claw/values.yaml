@@ -468,21 +468,28 @@ secret:
   safeDefaultWorkspace: default
   sandboxWorkloadPriority: "0"
   sandboxDefaultTimeoutSeconds: "86400"
-  # Max time a sandbox may stay Pending/Creating before the message fails with
-  # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
+  # Max time a sandbox may wait for capacity -- Pending/Creating in the queue, a node being
+  # added for it, or an autoscaler that says capacity can come (an account at its per-user
+  # limit, a node being given back) -- before the message fails with reason
+  # sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # How much of a request's own timeout is kept for the run: a request that names a timeout
+  # waits for capacity at most that timeout less this (and half of a timeout shorter than
+  # twice this), never past the ceiling above. Default 1h.
+  sandboxMinRunSeconds: "3600"
   # Max time a scheduled sandbox may stay not-ready (image pull, container start)
   # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
   sandboxStartTimeoutSeconds: "900"
-  # Max time a sandbox the platform has admitted may sit with no node having taken its pod and
-  # no node being added for it (every node cordoned, down or tainted) before the message fails
+  # Max time a sandbox the platform has admitted may sit with no node having taken its pod,
+  # no node being added for it and no capacity coming for it (every node cordoned, down or
+  # tainted, no pool that serves it, a request no node fits) before the message fails
   # with reason sandbox_unschedulable, the workload is stopped, and the model is told to report it
   # rather than open another. The platform's "0/N nodes are available" or "didn't trigger
   # scale-up" text is why it is stuck, not progress; a scale-up it reports as triggered (and
   # stays in force until the autoscaler says it will not add a node), or a
   # message that keeps changing, restarts the clock. Not applied to a sandbox still in the
-  # platform's queue or one with a scale-up under way (the Pending ceiling above, or the start
-  # ceiling once NotReady), or to one that is starting (the start ceiling). Raise it, or 0 = off,
+  # platform's queue, one with a scale-up under way, or one the autoscaler says capacity can
+  # come for (the capacity ceiling above), or to one that is starting (the start ceiling). Raise it, or 0 = off,
   # if nodes scale up without the platform saying so. Default 5m.
   sandboxUnschedulableTimeoutSeconds: "300"
   # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).

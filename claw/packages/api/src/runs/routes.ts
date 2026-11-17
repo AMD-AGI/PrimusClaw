@@ -111,6 +111,7 @@ interface RunRow {
   session_id: string;
   status: string;
   failure_reason: string | null;
+  error_message?: string | null;
   sandbox_workload_id: string | null;
   platform_exit_code: number | null;
   platform_node: string | null;
@@ -125,7 +126,7 @@ interface RunRow {
 }
 
 const SELECT_COLUMNS = `
-  task_id, session_id, status, failure_reason, sandbox_workload_id,
+  task_id, session_id, status, failure_reason, error_message, sandbox_workload_id,
   platform_exit_code, platform_node, platform_message, platform_container_reason,
   created_at, started_at, completed_at, deadline_at
 `;
@@ -133,6 +134,16 @@ const SELECT_COLUMNS = `
 function iso(value: string | Date | null): string {
   if (!value) return "";
   return value instanceof Date ? value.toISOString() : String(value);
+}
+
+/**
+ * The run's account of its failure for a person, `""` when it recorded none beyond
+ * the code. Rows store the code itself as their message when they had nothing
+ * more to say, and repeating it is not an account.
+ */
+function failureMessageOf(row: RunRow): string {
+  const message = (row.error_message ?? "").trim();
+  return message && message !== (row.failure_reason ?? "").trim() ? message : "";
 }
 
 /** One row as the contract renders it. */
@@ -148,7 +159,11 @@ export function toRunView(row: RunRow): RunView {
     run_id: row.task_id,
     session_id: row.session_id,
     phase: phaseOf(row.status),
-    terminal: terminal && { ...terminal, failure_reason: row.failure_reason ?? "" },
+    terminal: terminal && {
+      ...terminal,
+      failure_reason: row.failure_reason ?? "",
+      failure_message: failureMessageOf(row),
+    },
     timestamps: {
       created_at: iso(row.created_at),
       started_at: iso(row.started_at),

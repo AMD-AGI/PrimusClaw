@@ -120,6 +120,24 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
+- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
+  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
+  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
+  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
+  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
+  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
+  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
+  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
+  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
+  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
+  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
+  up to 3 hours and keeps at least 4 hours to run.
+- Runs: a run whose sandbox the platform could not provide is recorded as failed. Its turn still ends with the agent's
+  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
+  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
+  `sandbox_pending_timeout`, `sandbox_start_timeout`, `sandbox_workspace_forbidden` or `sandbox_workspace_not_allowed`), and
+  the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
+  its code). Task and DAG runs report the same through their callback.
 - Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
   window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
   quoting the card reached the session), and every button on the group's session card answered "That button is not active

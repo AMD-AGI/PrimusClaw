@@ -756,6 +756,12 @@ export interface CloseChatRunTarget {
   taskId?: string;
   /** The generation that reporter was issued. Absent when its acceptance returned none. */
   runClaim?: number;
+  /**
+   * What happened, for a person, when `failureReason` is a code (a run whose
+   * sandbox the platform could not provide). Stored as `error_message`, which is
+   * otherwise the reason itself.
+   */
+  failureMessage?: string;
 }
 
 interface ClosedRow {
@@ -911,7 +917,7 @@ export async function closeChatRun(
   target: CloseChatRunTarget = {},
 ): Promise<string[]> {
   const reason = outcome === "completed" ? null : (failureReason ?? outcome);
-  const message = outcome === "completed" ? null : (failureReason ?? "").slice(0, 2000) || null;
+  const message = outcome === "completed" ? null : (target.failureMessage || failureReason || "").slice(0, 2000) || null;
   try {
     const closed = target.taskId
       ? await closeNamedChatRun(sessionId, target, outcome, reason, message)

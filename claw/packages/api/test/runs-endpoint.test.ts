@@ -13,6 +13,7 @@
  *   R2 more ids than a call may carry is refused, not silently trimmed
  *   R3 the terminal listing reads one extra row to report whether a page follows
  *   R4 a run is rendered with the platform's account of its ending
+ *   R4c a run whose sandbox could not be provided carries the platform's reason as its message
  *   R5 equal timestamps paginate by task id without overlap
  *   R6 malformed cursors and limits fail before querying
  *   R7 the database index follows the cursor's complete ordering
@@ -162,9 +163,24 @@ test("R4 a run is rendered with the platform's account of its ending", async () 
   assert.equal(body.phase, "terminal");
   assert.deepEqual(body.terminal, {
     class: "killed", kill_reason: "preempted", exit_code: 137, signal: "SIGKILL",
-    failure_reason: "brain_timeout",
+    failure_reason: "brain_timeout", failure_message: "",
   });
   assert.equal(body.placement.node, "gpu-node-7");
+});
+
+test("R4c a run whose sandbox could not be provided says why, beside its code", async () => {
+  const why = "workload wl-1 could not be scheduled: no node can take the sandbox right now";
+  serve([row("ktsk_s", { status: "failed", failure_reason: "sandbox_unschedulable", error_message: why })]);
+  const resp = await app.inject({ method: "GET", url: "/v1/runs/ktsk_s" });
+  const body = resp.json() as { terminal: { class: string; failure_reason: string; failure_message: string } };
+  assert.equal(body.terminal.class, "failed");
+  assert.equal(body.terminal.failure_reason, "sandbox_unschedulable");
+  assert.equal(body.terminal.failure_message, why);
+  assert.match(lastSql, /\berror_message\b/, "the message is read with the row");
+  // A row whose message is its code says nothing more, and is not repeated.
+  serve([row("ktsk_t", { status: "failed", failure_reason: "agent_error", error_message: "agent_error" })]);
+  const same = (await app.inject({ method: "GET", url: "/v1/runs/ktsk_t" })).json() as { terminal: { failure_message: string } };
+  assert.equal(same.terminal.failure_message, "");
 });
 
 test("R4b a run with no reported exit code serialises null, not zero", async () => {

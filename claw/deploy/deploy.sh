@@ -627,6 +627,7 @@ values = {
         "sandboxPendingTimeoutSeconds": env("SANDBOX_PENDING_TIMEOUT_SECONDS", "10800"),
         "sandboxStartTimeoutSeconds": env("SANDBOX_START_TIMEOUT_SECONDS", "900"),
         "sandboxUnschedulableTimeoutSeconds": env("SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS", "300"),
+        "sandboxMinRunSeconds": env("SANDBOX_MIN_RUN_SECONDS", "3600"),
         "multiNodeStartTimeoutSeconds": env("MULTI_NODE_START_TIMEOUT_SECONDS", "0"),
         "sandboxIdleReuseSeconds": env("SANDBOX_IDLE_REUSE_SECONDS", "900"),
         "multiNodeDefaultTimeoutSeconds": env(
