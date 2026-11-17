@@ -21,6 +21,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 const (
@@ -132,41 +133,87 @@ type ownerConfig struct {
 // A nil policy means none is configured: identity keys are checked by introspection
 // and answered 503 until a policy is applied.
 func OwnerPolicyFromEnv() (*OwnerPolicy, error) {
+	p, _, err := OwnerPolicyRawFromEnv()
+	return p, err
+}
+
+// OwnerPolicyRawFromEnv is OwnerPolicyFromEnv and the exact bytes it decoded.
+func OwnerPolicyRawFromEnv() (*OwnerPolicy, string, error) {
 	var raw []byte
 	if path := strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_FILE")); path != "" {
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		raw = b
 	} else if v := strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY")); v != "" {
 		raw = []byte(v)
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
 	var p OwnerPolicy
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, fmt.Errorf("owner policy is not JSON: %w", err)
+		return nil, "", fmt.Errorf("owner policy is not JSON: %w", err)
 	}
-	return &p, nil
+	return &p, string(raw), nil
 }
 
-// SetOwnerPolicy validates the policy and registers its templates.
+// ValidTemplateName reports whether name is a DNS label suitable for a policy
+// template (at most 40 characters, as for a SaFE Workload display name).
+func ValidTemplateName(name string) bool {
+	return roleLabel(name)
+}
+
+// SetOwnerPolicy validates the policy, registers its templates, and applies it.
 func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
+	cfg, err := s.prepareOwnerPolicy(ctx, p)
+	if err != nil {
+		return err
+	}
+	return s.applyOwnerConfig(ctx, cfg, true)
+}
+
+// ApplyOwnerPolicy validates the policy and makes it the applied policy.
+// With registerTemplates it also creates, updates and deletes the owner
+// CodeInterpreters. Prefer SetOwnerPolicy; this form remains for callers that
+// apply without registering.
+func (s *Service) ApplyOwnerPolicy(ctx context.Context, p OwnerPolicy, registerTemplates bool) error {
+	cfg, err := s.prepareOwnerPolicy(ctx, p)
+	if err != nil {
+		return err
+	}
+	return s.applyOwnerConfig(ctx, cfg, registerTemplates)
+}
+
+// applyOwnerConfig stores cfg as the applied policy. With registerTemplates it
+// also creates, updates and deletes the owner CodeInterpreters.
+func (s *Service) applyOwnerConfig(ctx context.Context, cfg *ownerConfig, registerTemplates bool) error {
+	if registerTemplates {
+		if err := s.upsertOwnerTemplates(ctx, cfg.templates); err != nil {
+			return err
+		}
+	}
+	s.owner.Store(cfg)
+	s.ownerFault.Store(false)
+	return nil
+}
+
+// prepareOwnerPolicy validates the policy and resolves it. It only reads the cluster.
+func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*ownerConfig, error) {
 	role := p.Role
 	if role == "" {
 		role = defaultOwnerRole
 	}
 	if !roleLabel(role) {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "role "+role+" is not a workload display name")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "role "+role+" is not a workload display name")
 	}
 	if len(p.Templates) == 0 {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "at least one template is required")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "at least one template is required")
 	}
 	for id, q := range p.Owners {
 		if id == "" || !validQuota(q) {
-			return opErr(http.StatusBadRequest, "invalid_owner_policy", "owner "+id+" quota is invalid")
+			return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "owner "+id+" quota is invalid")
 		}
 	}
 	quota, admin := defaultUserQuota, defaultAdminQuota
@@ -177,10 +224,10 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 		admin = p.Admin.over(defaultAdminQuota)
 	}
 	if !validQuota(quota) || !validQuota(admin) {
-		return opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
+		return nil, opErr(http.StatusBadRequest, "invalid_owner_policy", "default or admin quota is invalid")
 	}
 	if err := s.checkOwnerRole(ctx, role); err != nil {
-		return err
+		return nil, err
 	}
 	names := make([]string, 0, len(p.Templates))
 	for _, tpl := range p.Templates {
@@ -188,21 +235,34 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	}
 	roles, _, stored, err := expandTemplates(ownerAppRunID, map[string]RoleRequest{role: {Templates: names}}, p.Templates)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.resolveTemplateGPUCounts(ctx, ownerAppRunID, stored); err != nil {
-		return err
-	}
-	if err := s.upsertOwnerTemplates(ctx, stored); err != nil {
-		return err
+		return nil, err
 	}
 	owners := make(map[string]OwnerQuota, len(p.Owners))
 	for id, q := range p.Owners {
 		owners[id] = q
 	}
-	s.owner.Store(&ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners})
-	s.ownerFault.Store(false)
-	return nil
+	return &ownerConfig{role: role, roleSpec: roles[role].Templates, templates: stored, quota: quota, admin: admin, owners: owners}, nil
+}
+
+// ownerTemplateCI returns the CodeInterpreter when it exists and is owned by
+// the owner policy. A missing object returns nil. A name held by another grant
+// returns 409 template_exists.
+func (s *Service) ownerTemplateCI(ctx context.Context, name string) (*runtimev1alpha1.CodeInterpreter, error) {
+	existing := &runtimev1alpha1.CodeInterpreter{}
+	err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
+	}
+	if !ownedByGrant(existing, ownerTemplatesID) {
+		return nil, opErr(http.StatusConflict, "template_exists", name)
+	}
+	return existing, nil
 }
 
 // ownerPolicyRejectedDetail is the only text a rejected owner policy returns.
@@ -408,7 +468,8 @@ func ownerSpecMatches(got, want runtimev1alpha1.SandboxGrantSpec) bool {
 }
 
 // upsertOwnerTemplates creates or updates the CodeInterpreters of the owner policy
-// and deletes the owner CodeInterpreters the policy no longer lists.
+// and deletes the owner CodeInterpreters the policy no longer lists. Ownership
+// conflicts use ownerTemplateCI.
 func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
 	wanted := map[string]bool{}
 	for _, tpl := range templates {
@@ -422,19 +483,15 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 		for i, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
 			wanted[name] = true
 			want := codeInterpreter(ownerTemplatesID, name, base, templateGPUCount(tpl, i), s.namespace)
-			existing := &runtimev1alpha1.CodeInterpreter{}
-			err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
-			if apierrors.IsNotFound(err) {
+			existing, err := s.ownerTemplateCI(ctx, name)
+			if err != nil {
+				return err
+			}
+			if existing == nil {
 				if err := s.client.Create(ctx, want); err != nil {
 					return opWrap(http.StatusInternalServerError, "template_register_failed", name, err)
 				}
 				continue
-			}
-			if err != nil {
-				return opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
-			}
-			if !ownedByGrant(existing, ownerTemplatesID) {
-				return opErr(http.StatusConflict, "template_exists", name)
 			}
 			existing.Labels = want.Labels
 			existing.Annotations = want.Annotations
@@ -465,64 +522,16 @@ func (s *Service) deleteDroppedOwnerTemplates(ctx context.Context, wanted map[st
 	return nil
 }
 
-// ReadOwnerUser reads the SaFE User of userID once. It returns nil when the
-// membership checker cannot read users. A read error is returned unchanged.
-func (s *Service) ReadOwnerUser(ctx context.Context, userID string) (*OwnerUser, error) {
-	reader, ok := s.membership.(UserReader)
-	if !ok || userID == "" {
-		return nil, nil
+// OwnerWorkspace picks the workspace for an identity-key sandbox.
+// The authorizer decides: workspace SAR requires a named workspace, and the User authorizer
+// may return the only workspace listed on the User.
+func (s *Service) OwnerWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	if s.authz == nil {
+		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "authorization client is not configured")
 	}
-	u, err := reader.ReadUser(ctx, userID)
+	ws, err := s.authz.ChooseWorkspace(ctx, tok, requested)
 	if err != nil {
-		return nil, err
+		return "", membershipErr(err, requested)
 	}
-	return &u, nil
-}
-
-// OwnerWorkspace picks the workspace for an identity-key sandbox. An admin must
-// request a workspace and may use any. A requested workspace of other users must
-// be listed on the User. Without a request, the user's only listed workspace is
-// used. user is the User read earlier in the request, or nil to read it here.
-func (s *Service) OwnerWorkspace(ctx context.Context, userID, requested string, admin bool, user *OwnerUser) (string, error) {
-	if admin {
-		if requested == "" {
-			return "", opErr(http.StatusBadRequest, "workspace_required", "system-admin must set metadata agent-sandbox.io/workspace")
-		}
-		return requested, nil
-	}
-	if user == nil {
-		u, err := s.ReadOwnerUser(ctx, userID)
-		if _, ok := err.(*OpError); ok {
-			return "", err
-		}
-		if err != nil {
-			return "", opWrap(http.StatusServiceUnavailable, "membership_unavailable", "user is temporarily unreadable", err)
-		}
-		user = u
-	}
-	if requested != "" {
-		if user != nil {
-			if err := user.allows([]string{requested}); err != nil {
-				return "", err
-			}
-			return requested, nil
-		}
-		if s.membership == nil {
-			return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-		}
-		if err := s.membership.Check(ctx, userID, []string{requested}); err != nil {
-			return "", err
-		}
-		return requested, nil
-	}
-	if user == nil {
-		return "", opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	if !user.Found {
-		return "", opErr(http.StatusForbidden, "user_not_in_workspace", "user was not found")
-	}
-	if len(user.Workspaces) != 1 {
-		return "", opErr(http.StatusBadRequest, "workspace_required", "set metadata agent-sandbox.io/workspace")
-	}
-	return user.Workspaces[0], nil
+	return ws, nil
 }

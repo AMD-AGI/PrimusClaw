@@ -188,13 +188,23 @@ else
     fi
 fi
 
-# ── 10. SaFE integration hint (informational) ─────────────────────────────────
-section "10. SaFE integration (informational)"
-if [[ -n "${SAFE_API_URL:-}" ]]; then
-    pass "SaFE API configured" "${SAFE_API_URL}"
+# ── 10. Permission review (SubjectAccessReview) ───────────────────────────────
+section "10. Permission review"
+CP_SA="system:serviceaccount:${NAMESPACE}:agent-sandbox-controlplane"
+SAR="$(kget get deploy agent-sandbox-controlplane \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_WORKSPACE_SAR")].value}' 2>/dev/null || true)"
+if [[ "${SAR}" == "true" ]]; then
+    if [[ "$(kubectl auth can-i create subjectaccessreviews.authorization.k8s.io --as="${CP_SA}" 2>/dev/null)" == "yes" ]]; then
+        pass "controlplane may create SubjectAccessReviews"
+    else
+        fail "controlplane SubjectAccessReview" "${CP_SA} lacks system:auth-delegator"
+    fi
 else
-    warn_ "SaFE API" "SAFE_API_URL is unset — sandbox will run standalone"
+    pass "controlplane SubjectAccessReview" "skipped (ENABLE_WORKSPACE_SAR is not true)"
 fi
+RBAC_PREFIX="$(kget get deploy agent-sandbox-controlplane \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RBAC_SUBJECT_PREFIX")].value}')"
+pass "RBAC subject prefix" "${RBAC_PREFIX:-primus: (default)}"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

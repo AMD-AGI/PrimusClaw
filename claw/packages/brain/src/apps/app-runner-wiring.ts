@@ -16,7 +16,9 @@ import { createEventTailer } from "./event-tailer.js";
 import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import {
   appSandboxInstance, appSandboxNamespace, createAppReaderSandbox, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
+  workspaceUserDataRoots,
 } from "./app-sandbox.js";
+import { isKubernetesMode } from "../config.js";
 
 export function realAppSandbox(store: AppRunStore): AppSandboxOps {
   return {
@@ -30,6 +32,8 @@ export function realAppSandbox(store: AppRunStore): AppSandboxOps {
     stop: (inst) => getSafeWorkloadProvider().stop(inst),
     liveIds: async (run, platformKey) => (await findLiveAppSandboxes(run.runId, platformKey, appSandboxNamespace(run))).map((w) => w.id),
     nodeName: (workloadId, platformKey) => readSandboxNodeName(workloadId, platformKey),
+    // Kubernetes mode has no SaFE workspace to read, and nothing is derived there.
+    userDataRoots: async (run, platformKey) => (isKubernetesMode() ? { roots: [] } : workspaceUserDataRoots(appSandboxNamespace(run), platformKey)),
   };
 }
 

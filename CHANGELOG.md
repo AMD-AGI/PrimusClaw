@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.2 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.1 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.2 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -120,11 +120,61 @@ release version, and its `appVersion` stays `latest`.
 
 ### Fixed
 
+- Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
+  window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
+  quoting the card reached the session), and every button on the group's session card answered "That button is not active
+  any more". Now each @-message of the binder goes to the session, and the card's Send, Stop, Mode, Full output and Back to
+  assistant work for the binder, as they do in a 1:1 chat. The card says how to get back: press Back to assistant, or say
+  "@bot back to the assistant". Another member's @-messages still go to the assistant, and their press on the card leaves it
+  as it was. The group's card has no Switch button and never shows the binder's lists of sessions and machines; those stay in
+  a 1:1 chat. 1:1 chats are unchanged (#855).
+
+## [0.5.7] - 2026-11-17
+
+Image `docker.io/primussafe/claw:202611171700` (commit 5dcee066), released as `docker.io/rocm/primusclaw:claw-0.5.7`. A patch
+release: app runs get a `USER_DATA_PATH` where SaFE sets none and fail at once when none can be had, and the server's own
+GitHub calls no longer use up a review session's request budget. One schema change, applied by the API at start: a nullable
+`budgeted` column on `claw_github_audit`. No new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4).
+
+### Fixed
+
+- App runs: a sandbox that SaFE gave no `USER_DATA_PATH` (a workspace whose hostpath volume does not set
+  `enableUserDir`) gets one from Claw, the way SaFE derives it: `{mountPath}/users/{USER_ID}`, from the first of the
+  workspace's hostpath volumes that is mounted in the sandbox, created when missing. The state directory, the files
+  written for the app and the app's own environment all use it. A value SaFE set is never replaced. When none can be
+  derived (no such volume, no `USER_ID`) or the directory cannot be created, the run now fails at once with that reason
+  instead of spending its restarts and their backoff on the same refusal, which held the task in executing, with no
+  error, until it was cancelled. A workspace that cannot be read (SaFE unavailable) is asked again; only a refusal from
+  the sandbox ends the run; a workspace the run owner's key may not read is reported as such (for example "the
+  workspace's volumes could not be read (HTTP 403)"). An app whose `state_dir`, command and bootstrap file never name
+  `USER_DATA_PATH` is not affected: nothing is derived or checked for it, and it runs as before (#861).
+- GitHub review: the server's own calls no longer use up a review session's GitHub request budget
+  (`CLAW_GITHUB_REQUESTS_PER_SESSION`). The look at a review item's pull request every 90 seconds, the pull request check
+  made before the session's first turn and a person's answer to a held write are recorded as not held to the budget (a new
+  `budgeted` column on `claw_github_audit`; follow-ups and checks recorded before it are left out by name). A review item
+  open for hours had its budget spent by those follow-ups, so its re-run in the same session was refused at its first read.
+  A review whose session does run out of GitHub requests before it posts anything now ends as not reviewed: whoever asked
+  for it is told so and to ask again, which starts a new session, and the reviewer is no longer asked to look at it as
+  stuck. An item left waiting for the reviewer that way ends at the first sweep after the upgrade. A review that had already
+  changed the pull request before its requests ran out (it resolved review threads of the last review, or sent a review or a
+  merge) is partly done instead: the reviewer is asked to look at it, and whoever asked is told what was done (#856).
+
+## [0.5.6] - 2026-11-16
+
+Image `docker.io/primussafe/claw:202611141536` (commit f724d50b), released as `docker.io/rocm/primusclaw:claw-0.5.6`. A patch
+release: the assistant cites a project's latest GitHub release page it read; it also carries 0.5.5, which was not published
+to rocm/primusclaw. No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4).
+
+### Fixed
+
 - Asked for a project's latest release with its source, the assistant now links the release it read. It reads the latest
   release at `https://github.com/<owner>/<repo>/releases/latest`, and the release page GitHub sends it to in the same
   repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
   reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
   the assistant is told to search for the page and cite the result instead of dropping the source (#854).
+- From 0.5.5: asked which model it runs on, the assistant names its own model (#853).
 
 ## [0.5.5] - 2026-11-14
 

@@ -203,13 +203,14 @@ function actionsOf(input: WindowInput): RemoteButton[] {
   const words = remoteWindowCardText.in(input.lang);
   const session = { session_id: input.sessionId };
   const back = remoteButton(words.back, "detach", null, session);
-  const switchTo = remoteButton(words.switch, "switch", null, session);
+  // (a group's card acts on its session only: the lists of sessions and machines are the binder's own, shown in a 1:1 chat)
+  const switchTo = input.group ? [] : [remoteButton(words.switch, "switch", null, session)];
   if (input.phase === "watching") {
     // (takeover names a connector, not the session)
     return [
       back,
-      switchTo,
-      ...(input.takeover ? [remoteButton(words.takeOver, "takeover", null, input.takeover)] : []),
+      ...switchTo,
+      ...(input.takeover && !input.group ? [remoteButton(words.takeOver, "takeover", null, input.takeover)] : []),
     ];
   }
   const send = takesInput(input.phase) ? [remoteButton(words.send, "send", "positive", session)] : [];
@@ -217,7 +218,7 @@ function actionsOf(input: WindowInput): RemoteButton[] {
     ...send,
     remoteButton(input.terminal ? words.stopTerminal : words.stop, "stop", null, session),
     back,
-    switchTo,
+    ...switchTo,
   ];
 }
 
@@ -242,7 +243,7 @@ export function windowView(input: WindowInput): WindowCardView {
     note: input.view.note ? lit(input.view.note, 300) : null,
     ...approvalsOf(input),
     ...boxOf(input),
-    chatBox: chatBoxLine("card", input.lang, input.bot),
+    chatBox: chatBoxLine(input.group ? "group" : "card", input.lang, input.bot),
     updated: words.updated({ stamp: utcClock(input.at) }),
     actions: actionsOf(input),
     takesInput: takesInput(input.phase),

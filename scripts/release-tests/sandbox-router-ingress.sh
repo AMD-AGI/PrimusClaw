@@ -131,6 +131,17 @@ elif case == "ingress":
     if len(namespace_rules()) != 1:
         fail("an enabled Ingress must come with namespace RBAC")
 
+elif case == "public":
+    ings = [d for d in kind("Ingress") if d["metadata"]["name"] == "agent-sandbox-public"]
+    if len(ings) != 1:
+        fail(f"expected the public Ingress, got {[d['metadata']['name'] for d in kind('Ingress')]}")
+    paths = [p["path"] for p in ings[0]["spec"]["rules"][0]["http"]["paths"]]
+    want = ["/sandboxes", "/v2/sandboxes", "/files", "/api/files", "/process.Process", "/filesystem.Filesystem", "/v1/templates"]
+    if paths != want:
+        fail(f"public paths {paths}")
+    if ings[0]["spec"]["rules"][0]["host"] != "sandbox.example.com":
+        fail("public host was not taken from values")
+
 else:
     fail("unknown case")
 print(f"  ok: {case}")
@@ -168,6 +179,41 @@ refused() {
   }
   echo "  ok: $name refused"
 }
+
+auth=(--set router.config.enableAuth=true
+  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect
+  --set-string router.config.namespaceSelector=example.com/sandbox=enabled)
+
+render "$tmp/public.yaml" "${auth[@]}" \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+check "$tmp/public.yaml" public
+
+for path in / /v1 /v2 /api /internal /internal/v1/grants /metrics /v1/namespaces /v1/code-interpreter /v1/sandbox /v1/templatesx; do
+  refused "public-path=$path" "must name a specific route" "${auth[@]}" \
+    --set router.publicIngress.enabled=true \
+    --set-string 'router.publicIngress.hosts[0]=sandbox.example.com' \
+    --set-string "router.publicIngress.paths[0]=$path"
+done
+
+# Without caller auth the Workload Manager treats /v1 callers as system-admin.
+refused public-v1-no-auth "requires router.config.enableAuth" \
+  --set security.allowInsecureNoAuth=true \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+
+# A public /v1 path without a selector would reach every namespace.
+refused public-v1-no-selector "requires router.config.namespaceSelector" \
+  --set router.config.enableAuth=true \
+  --set-string controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com'
+
+# The E2B paths alone need neither.
+render "$tmp/public-e2b.yaml" --set security.allowInsecureNoAuth=true \
+  --set router.publicIngress.enabled=true \
+  --set-string 'router.publicIngress.hosts[0]=sandbox.example.com' \
+  --set 'router.publicIngress.paths={/sandboxes,/files}'
 
 # An Ingress without a selector would expose every namespace.
 refused no-selector "router.ingress.enabled requires router.config.namespaceSelector" \

@@ -15,6 +15,9 @@ export const remoteWindowText = defineCatalog({
     chatBoxChat: (p: { bot: string }) =>
       `What you type goes to this session; messages that start with @${p.bot}, ${p.bot}'s / commands and requests sent on ` +
       `your behalf stay with ${p.bot}. To keep the chat box for ${p.bot}: /agent mode card`,
+    chatBoxGroup: (p: { bot: string }) =>
+      `In this group, what you say to @${p.bot} goes to this session (other members still talk to ${p.bot}); the box on ` +
+      `this card goes there too. To talk to ${p.bot} again, press Back to assistant or say "@${p.bot} back to the assistant".`,
     thisChatToo: " (this chat too, from now on)",
     modeSetCard: (p: { bot: string; now: string }) =>
       `Done: while a chat is attached, the chat box stays with ${p.bot} and the session card's box goes to the session${p.now}.`,
@@ -30,6 +33,9 @@ export const remoteWindowText = defineCatalog({
     chatBoxChat: (p) =>
       `聊天框里打的字都发给这个会话；以 @${p.bot} 开头的消息、${p.bot} 的 / 命令和协调者代发的请求仍由 ${p.bot} 处理。` +
       `想让聊天框留给 ${p.bot}：/agent mode card`,
+    chatBoxGroup: (p) =>
+      `在这个群里你 @${p.bot} 说的话都发给这个会话（其他人 @${p.bot} 仍是跟 ${p.bot} 说），卡片上的输入框也发给它。` +
+      `想回到 ${p.bot}：点「回到助理」，或说「@${p.bot} 回到助理」。`,
     thisChatToo: "（这个聊天现在就按这个来）",
     modeSetCard: (p) => `好的：接入会话后，聊天框留给 ${p.bot}，发给会话用会话卡片上的输入框${p.now}。`,
     modeSetChat: (p) => `好的：接入会话后，聊天框里打的字都发给会话${p.now}。以 @${p.bot} 开头的仍然给我。`,

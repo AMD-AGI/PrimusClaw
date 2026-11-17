@@ -14,6 +14,7 @@ import type { Lang } from "../locales/lang.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type OutMessage, richMessage } from "../ports/surface.js";
+import { isGroupKey } from "./chat-key.js";
 import { backLine } from "./lines.js";
 import { breakLinks } from "./inert.js";
 import { DROPPED_BY_RICH_TEXT } from "./links/answer.js";
@@ -82,8 +83,16 @@ export class SessionClicks {
     return click.settle(card, { ...(fallback ? { fallback } : {}), announce });
   }
 
-  /** End a tap with the card it came from again (the sessions card, or the agents card), `lead` on top. */
+  /**
+   * End a tap with the card it came from again (the sessions card, or the agents card), `lead` on top. In a group the lists are
+   * never shown (they are the presser's own sessions and machines): the tap ends with its line alone.
+   */
   async home(click: Click, lead: string): Promise<void> {
+    if (isGroupKey(click.chatKey)) {
+      const bot = this.p.ctx.settings.botName;
+      await this.end(click, lead || remoteAgentText.in(this.lang(click)).groupCardOnly({ bot }));
+      return;
+    }
     let view: OutMessage | string;
     try {
       if (click.data["view"] === "sessions")
@@ -150,7 +159,7 @@ export class SessionClicks {
     const op = textOf(click.data["op"]);
     if (
       state !== null &&
-      ["detach", "mode", "set_mode", "row", "stop"].includes(op) &&
+      (["detach", "mode", "set_mode", "row", "stop"].includes(op) || isGroupKey(click.chatKey)) && // (a group: never the list)
       state.sessionId === click.data["session_id"]
     ) {
       await this.end(click, (await this.p.ops.rowCard(click.chatKey, click.key, state, lead)).message, lead);

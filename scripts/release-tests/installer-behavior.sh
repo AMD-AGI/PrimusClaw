@@ -30,6 +30,18 @@ case "$*" in
       *) ;; # bare existence check
     esac
     ;;
+  *"get ingress agent-sandbox-public"*)
+    [[ -n "${MOCK_INGRESS_HOST:-}" ]] || exit 1
+    case "$*" in
+      *managed-by*release-name*) printf 'Helm|agent-sandbox|%s' "${NAMESPACE}" ;;
+      *release-namespace*) printf '%s' "${NAMESPACE}" ;;
+      *release-name*) printf 'agent-sandbox' ;;
+      *managed-by*) printf 'Helm' ;;
+      *ingressClassName*) printf 'higress' ;;
+      *rules*) printf '%s' "${MOCK_INGRESS_HOST}" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   *"get secret envd-router-identity"*) exit 1 ;;
   *"get ns "*) exit 1 ;;
   *"get configmap"*)
@@ -114,7 +126,7 @@ if ! env PATH="$tmp/bin:$PATH" \
   HELM_CAPTURE="$capture" \
   HELM_VALUES_CAPTURE="$values_capture" \
   MOCK_HELM_APPLIED="$tmp/helm.applied" \
-  SAFE_API_URL="https://safe.example" \
+  RBAC_SUBJECT_PREFIX="primus:" \
   IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
   FORCE_SANDBOX=true \
   AUTO_INSTALL_HELM=false \
@@ -124,9 +136,34 @@ if ! env PATH="$tmp/bin:$PATH" \
   exit 1
 fi
 
-grep -q -- '--set router.config.safeApiUrl=https://safe.example' "$capture"
+grep -q -- '--set-string controlplane.config.rbac.subjectPrefix=primus:' "$capture"
+grep -q -- 'safeApiUrl' "$capture" && {
+  echo "installer still passes safeApiUrl Helm sets" >&2
+  exit 1
+}
 grep -q -- '--set router.config.enableAuth=true' "$capture"
 grep -q -- '--set controlplane.config.identity.introspectUrl=https://identity.example/oauth/introspect' "$capture"
+grep -q -- 'workspaceSAR\|attestWorkloads' "$capture" && {
+  echo "installer turned on a switch that was not set" >&2
+  exit 1
+}
+
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
+  ENABLE_WORKSPACE_SAR=true \
+  ENABLE_WORKLOAD_ASSERTION=true \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q -- '--set controlplane.config.rbac.workspaceSAR=true' "$capture"
+grep -q -- '--set controlplane.config.identity.attestWorkloads=true' "$capture"
 grep -q -- '--set redis\.' "$capture" && {
   echo "installer still passes redis.* Helm sets" >&2
   exit 1
@@ -184,5 +221,72 @@ if env "${ca_env[@]}" MOCK_CA_DATA='{"ca.crt":"hello"}' \
 fi
 grep -q 'ConfigMap sandboxes/org-ca holds no PEM certificate' "$output"
 [[ ! -e "$capture" ]] || { echo "certificate-less CA ConfigMap still reached Helm" >&2; exit 1; }
+
+rm -f "$capture"
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  IDENTITY_INTROSPECT_URL="https://identity.example/oauth/introspect" \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q 'keeping Helm-managed public Ingress https://sandbox.example.com' "$output"
+grep -qF -- '--set router.publicIngress.enabled=true' "$capture"
+grep -qF -- '--set-string router.publicIngress.hosts[0]=sandbox.example.com' "$capture"
+grep -q 'public Ingress is rendered by Helm at https://sandbox.example.com' "$output"
+grep -qF -- '--set router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}' "$capture"
+
+# Without caller auth the public Ingress also serves the E2B routes only.
+rm -f "$capture"
+if ! env PATH="$tmp/bin:$PATH" \
+  HELM_CAPTURE="$capture" \
+  HELM_VALUES_CAPTURE="$values_capture" \
+  MOCK_HELM_APPLIED="$tmp/helm.applied" \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=sandbox.example.com \
+  ALLOW_INSECURE_NO_AUTH=true \
+  FORCE_SANDBOX=true \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -qF -- '--set router.publicIngress.paths={/sandboxes,/v2/sandboxes,/files,/api/files,/process.Process,/filesystem.Filesystem}' "$capture"
+
+# The fast path does not run Helm, so a host the release does not serve fails.
+if env PATH="$tmp/bin:$PATH" \
+  MOCK_READY=true \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=other.example.com \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  echo "fast path reported a host the release does not serve" >&2
+  exit 1
+fi
+grep -q 'Rerun with FORCE_SANDBOX=1' "$output"
+grep -q 'public Ingress is rendered by Helm' "$output" && {
+  echo "fast path printed success for an unrendered host" >&2
+  exit 1
+}
+
+if ! env PATH="$tmp/bin:$PATH" \
+  MOCK_READY=true \
+  MOCK_INGRESS_HOST=sandbox.example.com \
+  INGRESS_HOST=sandbox.example.com \
+  AUTO_INSTALL_HELM=false \
+  NAMESPACE=release-test \
+  bash "$repo_root/sandbox/deploy/scripts/install.sh" >"$output" 2>&1; then
+  command cat "$output" >&2
+  exit 1
+fi
+grep -q 'public Ingress is rendered by Helm at https://sandbox.example.com' "$output"
 
 echo "installer behavior: ok"

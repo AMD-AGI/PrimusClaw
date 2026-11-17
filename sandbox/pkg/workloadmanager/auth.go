@@ -15,6 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -26,19 +28,24 @@ const (
 	UserNameHeader = "userName"
 )
 
-// callerAuthMiddleware verifies the caller's bearer credential on every /v1/ request.
-// Caller-supplied identity and role headers are erased first and set only from a
-// verified credential. A missing or inactive credential is 401; an identity
-// provider that cannot answer is 503.
+// callerAuthMiddleware verifies the caller's credential on every /v1/ request.
+// The credential is an Authorization bearer token or an X-API-KEY. Caller-supplied
+// identity and role headers are erased first and set only from a verified credential.
+// A missing or inactive credential is 401; an identity provider that cannot answer is 503.
 func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Request.Header.Del(UserIDHeader)
 		c.Request.Header.Del(UserNameHeader)
 		c.Request.Header.Del(UserRoleHeader)
 
-		credential := identity.BearerCredential(c.GetHeader("Authorization"))
+		credential := identity.CallerCredential(c.Request.Header)
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
+			return
+		}
+		// A grant key is valid only on the E2B routes and must not leave the cluster.
+		if e2b.IsGrantKey(credential) {
+			abortCaller(c, identity.RejectionFor(identity.ErrInactive))
 			return
 		}
 
@@ -51,9 +58,15 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		setVerifiedUser(c, tok)
+		role, err := authz.ResolveRole(s.cfg.Authz, c.Request.Context(), tok)
+		if err != nil {
+			log.Warn("WM: caller platform role unreadable", "userId", tok.Subject, "error", err)
+			abortCaller(c, authz.Unavailable)
+			return
+		}
+		setVerifiedUser(c, tok, role)
 		log.Debug("WM: auth OK", "userId", tok.Subject,
-			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
+			"role", role, "path", c.Request.URL.Path)
 		c.Next()
 	}
 }
@@ -64,12 +77,26 @@ func abortCaller(c *gin.Context, r identity.Rejection) {
 }
 
 // setVerifiedUser writes the verified identity to request headers and the Gin context.
-func setVerifiedUser(c *gin.Context, tok identity.Token) {
-	role := identity.PlatformRole(tok.Roles)
+func setVerifiedUser(c *gin.Context, tok identity.Token, role string) {
 	c.Request.Header.Set(UserIDHeader, tok.Subject)
 	c.Request.Header.Set(UserNameHeader, tok.Email)
 	c.Request.Header.Set(UserRoleHeader, role)
 	c.Set("userId", tok.Subject)
 	c.Set("userName", tok.Email)
 	c.Set("userRole", role)
+	c.Set(callerTokenKey, tok)
+}
+
+// callerTokenKey is the Gin context key of the verified identity token.
+const callerTokenKey = "callerToken"
+
+// callerToken returns the verified identity token, or a token holding only the
+// user id when the request carries none.
+func callerToken(c *gin.Context) identity.Token {
+	if v, ok := c.Get(callerTokenKey); ok {
+		if tok, ok := v.(identity.Token); ok {
+			return tok
+		}
+	}
+	return identity.Token{Subject: currentUserID(c)}
 }

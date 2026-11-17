@@ -18,6 +18,7 @@ import {
   KEY_OF,
   type RemoteWorld,
   Script,
+  type WorldOptions,
   remoteWorld,
 } from "../../../../../test-support/remote-world.js";
 import { link, message, world, type World } from "../world.js";
@@ -34,7 +35,7 @@ export interface Routed {
 /** A routed world for one test: Alice and Bob linked with the keys the fake server knows them by. */
 export function routed<T>(
   test: (w: Routed) => Promise<T>,
-  options: { assistant?: Partial<AssistantChat>; limits?: Partial<RouterLimits> } = {},
+  options: { assistant?: Partial<AssistantChat>; limits?: Partial<RouterLimits>; remote?: WorldOptions } = {},
 ): Promise<T> {
   return remoteWorld(async (rw) => {
     const r = world({
@@ -56,7 +57,7 @@ export function routed<T>(
     const attachedSession = (user?: UserRef) =>
       rw.test.store.remoteState.attachedRemote(user?.id ?? "aad-a")?.sessionId ?? null;
     return test({ rw, r, say, attachedSession });
-  });
+  }, options.remote);
 }
 
 export const TWO_AGENTS: readonly (readonly [string, string, string])[] = [

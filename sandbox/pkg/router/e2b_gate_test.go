@@ -101,6 +101,9 @@ func TestE2BGateChecksTokenAndSealedPath(t *testing.T) {
 	if got.Get("X-Sandbox-Sealed") != "" || got.Get("X-Sandbox-Inputs") != "" || got.Get("X-Sandbox-Outputs") != "" {
 		t.Fatalf("sealed headers forwarded: %#v", got)
 	}
+	if got.Get("X-API-KEY") != "" {
+		t.Fatal("api key reached the sandbox")
+	}
 	parsed, err := jwt.Parse(strings.TrimPrefix(got.Get("Authorization"), "Bearer "), func(token *jwt.Token) (any, error) {
 		return mgr.publicKey, nil
 	})
@@ -142,6 +145,7 @@ func gateRequest(t *testing.T, rawURL, token string) gateResult {
 	if token != "" {
 		req.Header.Set("E2b-Sandbox-Id", "sbx-1")
 		req.Header.Set("X-Access-Token", token)
+		req.Header.Set("X-API-KEY", "ak-caller")
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

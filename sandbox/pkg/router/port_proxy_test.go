@@ -107,6 +107,7 @@ func TestHandlePortProxy_HTTP(t *testing.T) {
 		assert.Equal(t, "/hello", r.URL.Path)
 		assert.Empty(t, r.Header.Get("x-session-id"), "session-id must not leak")
 		assert.Empty(t, r.Header.Get("Authorization"), "auth must not leak")
+		assert.Empty(t, r.Header.Get("X-API-KEY"), "api key must not leak")
 		w.Header().Set("X-Custom", "from-upstream")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "hello from sandbox")
@@ -124,6 +125,7 @@ func TestHandlePortProxy_HTTP(t *testing.T) {
 	engine.GET("/proxy", func(c *gin.Context) {
 		c.Request.Header.Set("x-session-id", "test-session")
 		c.Request.Header.Set("Authorization", "Bearer secret-jwt")
+		c.Request.Header.Set("X-API-KEY", "ak-caller")
 		s.handlePortProxy(c, info, port, "/hello")
 	})
 	ts := httptest.NewServer(engine)

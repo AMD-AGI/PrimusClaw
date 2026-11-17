@@ -86,22 +86,29 @@ func New(opt Options) *Service {
 // grantKeyPrefix marks a key issued by the grant API.
 const grantKeyPrefix = "e2b_"
 
-// caller is the grant and role an API key resolves to. user is the SaFE User
-// read during lookup, or nil when it was not read.
+// IsGrantKey reports whether key was issued by the grant API. Such keys are
+// resolved in the cluster and are never sent to the identity provider.
+func IsGrantKey(key string) bool {
+	return strings.HasPrefix(key, grantKeyPrefix)
+}
+
+// caller is the grant and role an API key resolves to. groups are the
+// identity groups of an identity-key owner.
 type caller struct {
 	grantID string
 	role    string
 	owner   bool
 	userID  string
+	groups  []string
 	admin   bool
-	user    *grant.OwnerUser
+	token   identity.Token
 }
 
 // lookup resolves a grant key, or introspects any other key and returns the owner quota record.
 // The owner record is created or updated only when write is set; otherwise a missing
 // record leaves grantID empty.
 func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller, error) {
-	if s.identity == nil || strings.HasPrefix(apiKey, grantKeyPrefix) {
+	if s.identity == nil || IsGrantKey(apiKey) {
 		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 		return caller{grantID: grantID, role: role}, err
 	}
@@ -115,15 +122,11 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 	if err != nil {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
-	admin := token.HasRole(grant.SystemAdminRole)
-	var user *grant.OwnerUser
-	if !admin {
-		user, err = s.grants.ReadOwnerUser(ctx, token.Subject)
-		if err != nil {
-			return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "user is temporarily unreadable")
-		}
-		admin = user != nil && user.Admin
+	platformRole, err := s.grants.PlatformRole(ctx, token)
+	if err != nil {
+		return caller{}, err
 	}
+	admin := platformRole == identity.RoleSystemAdmin
 	var grantID string
 	if write {
 		grantID, err = s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
@@ -138,8 +141,9 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		role:    s.grants.OwnerRole(),
 		owner:   true,
 		userID:  token.Subject,
+		groups:  token.Groups,
 		admin:   admin,
-		user:    user,
+		token:   token,
 	}, nil
 }
 
@@ -192,6 +196,58 @@ func grantWorkspace(names []string, templateWorkspace string) (string, error) {
 	return names[0], nil
 }
 
+// resolveUserTemplate returns the user template id when an identity key may
+// use it: its creator, any caller of a public template, or a system-admin.
+// A template the caller may not use is reported as not found.
+func (s *Service) resolveUserTemplate(ctx context.Context, who caller, id string) (resolvedTemplate, error) {
+	ut, err := s.grants.UserTemplate(ctx, id)
+	if err != nil {
+		return resolvedTemplate{}, err
+	}
+	if !ut.Public && !who.admin && (who.userID == "" || ut.UserID != who.userID) {
+		return resolvedTemplate{}, grant.TemplateNotFound(id)
+	}
+	return resolvedTemplate{
+		ID:        ut.Name,
+		Alias:     ut.Name,
+		GPUs:      ut.GPUs,
+		Pending:   defaultPendingWait,
+		Workspace: ut.Workspace,
+		User:      true,
+	}, nil
+}
+
+// createTarget resolves the template of a create and the workspace it runs in.
+// An identity key falls back to a user template, which runs in its own
+// workspace and accepts env vars only from a system-admin.
+func (s *Service) createTarget(ctx context.Context, who caller, snap grant.Snapshot, body CreateBody) (resolvedTemplate, string, error) {
+	tpl, err := resolveTemplate(snap, who.role, body.TemplateID)
+	if who.owner && grant.IsReason(err, "template_not_found") {
+		tpl, err = s.resolveUserTemplate(ctx, who, body.TemplateID)
+	}
+	if err != nil {
+		return resolvedTemplate{}, "", err
+	}
+	if !(tpl.User && who.admin) {
+		if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
+			return resolvedTemplate{}, "", err
+		}
+	}
+	if !who.owner {
+		workspace, err := grantWorkspace(snap.Workspaces, tpl.Workspace)
+		return tpl, workspace, err
+	}
+	requested := body.Metadata[workspaceMetadata]
+	if tpl.User {
+		if requested != "" && requested != tpl.Workspace {
+			return resolvedTemplate{}, "", grant.Op(http.StatusBadRequest, "workspace_mismatch", "template "+tpl.ID+" runs in workspace "+tpl.Workspace)
+		}
+		requested = tpl.Workspace
+	}
+	workspace, err := s.grants.OwnerWorkspace(ctx, who.token, requested)
+	return tpl, workspace, err
+}
+
 // Create starts a sandbox, or replays an idempotency key.
 // The access token is returned on this call and on connect, then only as a hash.
 func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (SandboxResponse, int, error) {
@@ -208,12 +264,8 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	tpl, err := resolveTemplate(snap, role, body.TemplateID)
+	tpl, workspace, err := s.createTarget(ctx, who, snap, body)
 	if err != nil {
-		s.grants.AuditDenied(ctx, grantID, "", err)
-		return SandboxResponse{}, 0, err
-	}
-	if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
@@ -222,15 +274,16 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	var workspace string
+	// A grant key is not an identity subject. It is replaced only when the owner is rechecked.
+	subjectKey := ""
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
-	} else {
-		workspace, err = grantWorkspace(snap.Workspaces, tpl.Workspace)
-	}
-	if err != nil {
-		s.grants.AuditDenied(ctx, grantID, "", err)
-		return SandboxResponse{}, 0, err
+		subjectKey = apiKey
+	} else if s.grants.ChecksGrantOwner() {
+		subjectKey, err = s.grants.CheckGrantOwner(ctx, grantID, workspace)
+		if err != nil {
+			s.grants.AuditDenied(ctx, grantID, "", err)
+			return SandboxResponse{}, 0, err
+		}
 	}
 	if snap.SessionID == "" {
 		err := grant.Op(http.StatusBadRequest, "invalid_grant", "session is required")
@@ -290,6 +343,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Sealed:            tpl.Sealed,
 		Inputs:            tpl.Inputs,
 		Outputs:           tpl.Outputs,
+		UserTemplate:      tpl.User,
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {
@@ -317,7 +371,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		GrantID:       snap.GrantID,
 		Attestation:   snap.Attestation,
 		OwnerKey:      who.owner,
-		SubjectKey:    subjectKey(who, apiKey),
+		SubjectKey:    subjectKey,
 		Env:           body.EnvVars,
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
@@ -731,14 +785,6 @@ func tighterCap(a, b int64) int64 {
 		return a
 	}
 	return b
-}
-
-// subjectKey returns the caller's identity key for an owner-record create, and empty for a grant key.
-func subjectKey(who caller, apiKey string) string {
-	if !who.owner {
-		return ""
-	}
-	return apiKey
 }
 
 // withOwner returns a copy of md with the owner user id.

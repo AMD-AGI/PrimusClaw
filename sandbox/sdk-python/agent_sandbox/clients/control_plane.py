@@ -11,6 +11,16 @@ from urllib.parse import quote
 from ._base import BaseClient, iter_sse
 
 
+def _template_payload(name: str, spec: dict, namespace: Optional[str], workspace: Optional[str], public: bool) -> dict:
+    """Build a template create body; namespace and workspace are sent only when set."""
+    payload = {"name": name, "spec": spec, "public": public}
+    if namespace is not None:
+        payload["namespace"] = namespace
+    if workspace is not None:
+        payload["workspace"] = workspace
+    return payload
+
+
 class ControlPlaneClient(BaseClient):
     """HTTP client for the unified control-plane API exposed by the Router."""
 
@@ -119,11 +129,12 @@ class ControlPlaneClient(BaseClient):
         name: str,
         spec: dict,
         *,
-        namespace: str = "default",
+        namespace: Optional[str] = None,
+        workspace: Optional[str] = None,
         public: bool = False,
         dockerfile: Optional[str] = None,
     ) -> dict:
-        payload = {"name": name, "namespace": namespace, "spec": spec, "public": public}
+        payload = _template_payload(name, spec, namespace, workspace, public)
         if dockerfile is not None:
             payload["dockerfile"] = dockerfile
         return self._request_json("POST", "/v1/templates", json=payload)
@@ -133,11 +144,12 @@ class ControlPlaneClient(BaseClient):
         name: str,
         spec: dict,
         *,
-        namespace: str = "default",
+        namespace: Optional[str] = None,
+        workspace: Optional[str] = None,
         public: bool = False,
         dockerfile: Optional[str] = None,
     ) -> Generator[dict, None, None]:
-        payload = {"name": name, "namespace": namespace, "spec": spec, "public": public}
+        payload = _template_payload(name, spec, namespace, workspace, public)
         if dockerfile is not None:
             payload["dockerfile"] = dockerfile
         resp = self._request("POST", "/v1/templates/stream", json=payload, stream=True)

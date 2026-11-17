@@ -244,6 +244,30 @@ test("the state_dir expansion refuses (exit 4) when USER_DATA_PATH is unset, rat
   assert.equal(quoted.stdout, `${w.dir}/it's/${RUN_ID}`);
 });
 
+test("a sandbox with no USER_DATA_PATH ends the run at once, failed, saying so, after one ask and no start", async () => {
+  const w = realWorld('echo ran > "$APP_STATE_DIR/ran.txt"', { restart: { max_restarts: 3, backoff_sec: [30, 120, 900] } });
+  const commands: string[] = [];
+  // The workload has no user directory: SaFE set no USER_DATA_PATH at all.
+  w.world.sandbox = {
+    ...w.world.sandbox,
+    exec: async (_inst, command, _t, opts) => {
+      commands.push(command);
+      return runShell(command, w.dir, { ...(opts?.env ?? {}), USER_DATA_PATH: "" });
+    },
+  };
+  const runner = new AppRunner(RUN_ID, "pk", { store: w.world.store, sandbox: w.world.sandbox, tickMs: 100 });
+  const started = Date.now();
+  const result = await runner.run(SECS(30));
+  assert.equal(result.kind, "ended");
+  assert.ok(result.kind === "ended" && !result.outcome.success);
+  assert.ok(result.kind === "ended" && /no user data directory: USER_DATA_PATH is unset/.test(result.outcome.reason), JSON.stringify(result));
+  assert.ok(Date.now() - started < 10_000, "no restart backoff was waited out");
+  assert.equal(w.world.rec.restarts, 0);
+  assert.equal(commands.filter((c) => c.includes("printf %s") && !c.includes("base64")).length, 1, "asked once");
+  assert.equal(commands.some((c) => c.includes("setsid")), false, "nothing was started");
+  assert.equal(existsSync(`${w.dir}/.claw-apps`), false, "nothing was written at the filesystem root's stand-in either");
+});
+
 test("a manifest argument with a quote and a space reaches the process intact", async () => {
   const w = realWorld('sleep 0', {});
   w.world.rec.manifest = { ...w.world.rec.manifest, command: ["sh", "-c", 'printf %s "$1" > "$APP_STATE_DIR/arg.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"', "x", "it's a \"test\" $HOME"] };

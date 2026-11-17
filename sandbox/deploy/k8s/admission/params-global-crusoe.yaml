@@ -1,8 +1,11 @@
 # Parameters of sandbox-pod-guardrails on global-crusoe (SaFE cluster "crusoe").
-# GPU sandboxes in the SaFE workspaces crusoe-spur-vk and top-models use the
-# workspace's hostpath volume /shared_nfs (it is the workspace volume, not a PVC).
+# GPU sandboxes in the SaFE workspaces crusoe-spur-vk, top-models,
+# crusoe-amd-burst, crusoe-hyperloom-cicd and crusoe-hyperloom-dev use the
+# workspace's hostpath volume /shared_nfs (it is the workspace volume, not a
+# PVC). crusoe-amd-burst and crusoe-hyperloom-cicd replace crusoe-spur-vk and
+# top-models; the old entries stay until no sandbox runs there.
 # One key per namespace; the value is a comma-separated list of allowed roots.
-# Both workspaces are external: every Pod in them runs on an Autopilot
+# All five workspaces are external: every Pod in them runs on an Autopilot
 # virtual-kubelet node, whose backend refuses a seccomp profile and any
 # capability added or dropped, so virtual-kubelet.namespaces lists them and the
 # policy does not require either there (see sandbox-pod-guardrails.yaml).
@@ -16,7 +19,10 @@ metadata:
 data:
   crusoe-spur-vk: /shared_nfs
   top-models: /shared_nfs
-  virtual-kubelet.namespaces: crusoe-spur-vk,top-models
+  crusoe-amd-burst: /shared_nfs
+  crusoe-hyperloom-cicd: /shared_nfs
+  crusoe-hyperloom-dev: /shared_nfs
+  virtual-kubelet.namespaces: crusoe-spur-vk,top-models,crusoe-amd-burst,crusoe-hyperloom-cicd,crusoe-hyperloom-dev
 ---
 # The binding of sandbox-pod-guardrails on this cluster (see sandbox-pod-guardrails.yaml).
 # Warn only: violations are warnings, nothing is refused.

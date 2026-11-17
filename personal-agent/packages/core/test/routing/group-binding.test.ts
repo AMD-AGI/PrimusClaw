@@ -12,7 +12,7 @@ import type { RemoteAgentCommand, RemotePrompt } from "../../src/routing/feature
 import { ALICE, BOB } from "./fixtures.js";
 import { groupAsked, link, message, said, world } from "./world.js";
 
-function bound() {
+function bound(window: "card" | "chat" = "chat") {
   const keys = new Set<string>();
   const prompts: RemotePrompt[] = [];
   const agents: RemoteAgentCommand[] = [];
@@ -29,6 +29,7 @@ function bound() {
         return Promise.resolve();
       },
       stop: (chat) => (stops.push(chat.id), Promise.resolve(true)),
+      windowMode: () => window,
     },
   });
   link(w, ALICE.id, "ak-alice");
@@ -89,4 +90,22 @@ test("test_the_other_agent_commands_stay_a_1on1_chats_in_a_group", async () => {
   assert.deepEqual(b.agents, []);
   assert.equal(said(b.w).length, 3);
   assert.ok(said(b.w).every((t) => t.includes("1:1")));
+});
+
+test("test_a_bound_groups_mention_goes_to_the_session_when_the_card_is_the_window", async () => {
+  // (the 1:1 card window keeps the chat box for the bot; a group reaches the bot only by @-mention, so it would never reach the session)
+  const b = bound("card");
+  await b.say("切到 robin-dev-pod 的 claude");
+  await b.say("帮我看看这个报错");
+  await b.w.router.settled();
+  assert.deepEqual(
+    b.prompts.map((p) => [p.chat.id, p.prompt]),
+    [["aad-a|g-1", "帮我看看这个报错"]],
+  );
+  assert.deepEqual(b.w.turns.calls, []);
+  await b.say("回到助理");
+  await b.say("现在谁来回答");
+  await b.w.router.settled();
+  assert.equal(b.prompts.length, 1);
+  assert.deepEqual(b.w.turns.calls, [["create", "ak-alice", "现在谁来回答"]]);
 });

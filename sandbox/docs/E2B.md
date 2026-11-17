@@ -26,14 +26,16 @@ The data plane uses the `envdAccessToken` returned at create or connect. The SDK
 | SaFE API key (`ak-...`) | SaFE console       | Owner quota of the caller; templates from the owner policy |
 | Grant key (`e2b_...`)   | Claw sandbox grant | Role quota and templates of the grant                      |
 
+A key is sent as `X-API-Key` or as `Authorization: Bearer <key>`. On the E2B routes `X-API-Key` wins when both are present. On the `/v1` management routes the order is reversed: the bearer token wins and `X-API-Key` is the fallback. A grant key is refused on `/v1` and is never sent to the identity provider.
+
 A SaFE API key is checked with RFC 7662 token introspection at the identity provider. The first create or timeout call creates an owner record for the caller. Before that, list returns no sandboxes and get, connect, and kill return 404.
 
 ## Workspace
 
 A sandbox runs in a SaFE workspace the caller belongs to.
 
-- A caller in one workspace uses that workspace.
-- A caller in several workspaces sets metadata `agent-sandbox.io/workspace`.
+- With workspace SAR off, a caller listed on one SaFE User workspace uses that workspace. Several workspaces, or a system-admin, set metadata `agent-sandbox.io/workspace`.
+- With workspace SAR on, every caller sets metadata `agent-sandbox.io/workspace`. An omitted workspace returns `400 workspace_required`. The control plane does not list Workspaces.
 - A `system-admin` always sets metadata `agent-sandbox.io/workspace` and may choose any workspace.
 - A workspace the caller does not belong to returns `403 user_not_in_workspace`.
 
@@ -60,6 +62,37 @@ Sealed rules:
 | commands                  | no   | no    |
 
 A template that is not sealed allows commands and file access in the sandbox.
+
+### User templates
+
+A user creates a template for a workspace with `POST /v1/templates` and the `workspace` field (see [API.md](API.md)). Its template id is the template name. A name cannot start with `e2b-`. All user templates share the control-plane namespace, so a name is unique across users and workspaces: a name already taken returns 409. User templates are used with SaFE API keys; a grant key runs only the templates of its role.
+
+- The template id is matched exactly: first against the owner policy, then against user templates. An id that matches neither returns `404 template_not_found`.
+- A caller may use its own templates and public templates. Another user's private template returns `404 template_not_found`; a `system-admin` may use any.
+- The sandbox runs in the template workspace. The caller must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`).
+- The quota of the caller applies. A user template accepts no environment variables from the caller, except from a `system-admin`.
+
+### Managing policy templates
+
+When the policy comes from a ConfigMap (`controlplane.config.identity.ownerPolicyConfigMap`), a `system-admin` manages its templates through the management API. The control plane must run with caller auth; every other caller gets 403.
+
+| Method | Path                                         | Description                         |
+| ------ | -------------------------------------------- | ----------------------------------- |
+| GET    | `/v1/admin/owner-policy/templates`           | List the policy templates           |
+| GET    | `/v1/admin/owner-policy/templates/{name}`    | Get one policy template             |
+| PUT    | `/v1/admin/owner-policy/templates/{name}`    | Add or replace one policy template  |
+| DELETE | `/v1/admin/owner-policy/templates/{name}`    | Remove one policy template          |
+
+The API is served by the control-plane Router Service only; the public Ingress does not allow `/v1/admin`. Reach it through the Service (for example with `kubectl port-forward`):
+
+```bash
+kubectl -n agent-sandbox-system port-forward svc/agent-sandbox-controlplane 8080:80
+curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  http://127.0.0.1:8080/v1/admin/owner-policy/templates/measurement \
+  -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
+```
+
+A write on any replica validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. An invalid stored document is not rewritten by the API; fix the ConfigMap first. The last template cannot be removed. Every replica watches the named ConfigMap (with a 15s backup resync) and applies it in memory; the leader re-registers the stored templates on every Sync so drifted CodeInterpreters converge. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
 
 ## Quotas
 
@@ -146,11 +179,13 @@ from e2b import Sandbox
 | ------ | ----------------------- | ------------------------------------------------- |
 | 401    | `invalid_key`           | Key is unknown, inactive, or expired              |
 | 403    | `timeout_not_allowed`   | Timeout exceeds the max lifetime                  |
-| 403    | `template_not_allowed`  | Template is not in the caller's policy            |
+| 400    | `workspace_mismatch`    | Workspace metadata differs from the template's    |
+| 403    | `template_not_allowed`  | Template is not allowed for the caller            |
 | 403    | `env_not_allowed`       | Environment variable is not accepted              |
 | 403    | `metadata_reserved`     | Metadata key is reserved by the platform          |
 | 403    | `user_not_in_workspace` | Caller is not a member of the workspace           |
 | 403    | `sealed_denied`         | Path or call is outside the sealed allow-list     |
+| 404    | `template_not_found`    | No template the caller may use has this id        |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
 | 410    | `idempotency_key_spent` | Key already ended; the detail carries the reason  |
 | 500    | `owner_policy_invalid`  | Owner policy was rejected; the cause is in the control plane log |

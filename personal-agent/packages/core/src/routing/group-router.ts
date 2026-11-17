@@ -65,7 +65,10 @@ export class GroupRouter {
       return;
     }
     const handler = this.ctx.deps.handlers.clicks.find((h) => h.verbs.includes(action.verb));
-    if (handler?.inGroup !== undefined) await handler.inGroup(this.ctx.clickRoute(action, chat));
+    if (handler?.inGroup === undefined) return;
+    // (a handler that acts as the presser reads their key as their @-messages here do: the same account, whatever the exchange)
+    const groupCredential = () => this.ctx.credentials.credential(chat, false);
+    await handler.inGroup({ ...this.ctx.clickRoute(action, chat), groupCredential });
   }
 
   private words(message: InboundMessage): GroupWords {
