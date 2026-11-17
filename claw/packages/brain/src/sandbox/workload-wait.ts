@@ -254,7 +254,10 @@ export interface WorkloadWaitOptions {
    * queued workload (a queue moves, and the Pending ceiling bounds it) and an
    * admitted one with a scale-up under way (a node can take minutes to arrive);
    * those keep the ceilings of their phase, the Pending one while Pending and the
-   * start one once the platform reports it NotReady. 0 or absent disables.
+   * start one once the platform reports it NotReady. Nor an admitted one the
+   * autoscaler says capacity can come for (`capacityWait`: an account at its
+   * per-user limit, a node being given back): that is a wait for capacity too, on
+   * the same ceilings as a node being added. 0 or absent disables.
    */
   unschedulableTimeoutMs?: number;
   /**
@@ -266,8 +269,19 @@ export interface WorkloadWaitOptions {
    * and what a multi-node cluster passes) keeps the ceilings of the phase: the
    * start ceiling applies as it always did. Opt-in, so that a caller whose start
    * ceiling is "wait indefinitely" is never given a limit it did not ask for.
+   *
+   * The same ceiling, on the same clock, covers a dispatched workload the
+   * autoscaler says capacity can come for (`capacityWait`), which is a wait for
+   * capacity of the same kind; the clock runs on through a change between the two.
    */
   scaleUpTimeoutMs?: number;
+  /**
+   * The ceiling on one continuous Pending wait, in place of
+   * SANDBOX_PENDING_TIMEOUT_SECONDS, for a caller that derives its own (the sandbox
+   * a run opens bounds it by what the run's own timeout leaves; see
+   * `capacityWaitTimeoutMs`). 0 means no ceiling; absent keeps the setting.
+   */
+  pendingTimeoutMs?: number;
   deps?: WorkloadWaitDeps;
 }
 
@@ -309,10 +323,12 @@ async function sleepUnlessAborted(
  *     2xx whose body carries no phase;
  *   - Pending past the ceiling         -> sandbox_pending_timeout, counted only
  *     while queued and reset on dispatch;
- *   - dispatched with a node being added past `scaleUpTimeoutMs`, for a caller
- *     that set it -> sandbox_pending_timeout, counted from the first read of the
- *     scale-up and reset once it is not one;
- *   - admitted, no node has taken the pod and none is being added, past
+ *   - dispatched with a node being added, or with the autoscaler saying capacity
+ *     can come (an account at its limit, a node being given back), past
+ *     `scaleUpTimeoutMs`, for a caller that set it -> sandbox_pending_timeout,
+ *     counted from the first read of either and reset once it is neither;
+ *   - admitted, no node has taken the pod, none is being added and none can come
+ *     by waiting, past
  *     `unschedulableTimeoutMs` -> sandbox_unschedulable, counted from the first
  *     such read, restarted by a message the stall has not had before, and
  *     cleared the moment a pod is taken, a scale-up is triggered (and it stays
@@ -339,7 +355,7 @@ export async function waitForWorkloadReady(
   const FIXED_POLL_MS = deps?.pollMs;
   const REQUEST_TIMEOUT_MS = deps?.requestTimeoutMs ?? 15_000;
   const UNREADABLE_TIMEOUT_MS = deps?.unreadableTimeoutMs ?? SANDBOX_POLL_TIMEOUT_MS;
-  const PENDING_TIMEOUT_MS = deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
+  const PENDING_TIMEOUT_MS = opts.pendingTimeoutMs ?? deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
   const START_TIMEOUT_MS = deps?.startTimeoutMs ?? SANDBOX_START_TIMEOUT_MS;
   const NOT_FOUND_LIMIT = deps?.notFoundLimit ?? 12;
   const NOT_FOUND_WINDOW_MS = deps?.notFoundWindowMs
@@ -384,6 +400,9 @@ export async function waitForWorkloadReady(
   // workload only while it is the newest scheduling event, so the next read is
   // asked to keep it in force (see readWaitingState).
   let scaleUpSeen = false;
+  // The same for a wait for capacity: the reason the last read was given, or
+  // false when it was not one.
+  let capacitySeen: string | false = false;
   // When the workload was first seen waiting with nothing said about why, in an
   // unbroken run of such reads. Such a wait is announced only once it has lasted
   // WAIT_NOTICE_GAP_MS: a workload the platform has not synced yet looks the same.
@@ -549,10 +568,13 @@ export async function waitForWorkloadReady(
     // before the ceilings below so that an admitted workload nothing will run is
     // ended on its own, shorter limit rather than on the long one meant for a
     // sandbox that is genuinely starting.
-    const waiting = readWaitingState(detail, scaleUpSeen);
+    const waiting = readWaitingState(detail, scaleUpSeen, capacitySeen);
     // A body with no phase says nothing about the workload, so what was seen
     // before it stands; any other read decides it.
-    if (phase) scaleUpSeen = waiting?.scalingUp === true;
+    if (phase) {
+      scaleUpSeen = waiting?.scalingUp === true;
+      capacitySeen = waiting?.capacityWait === true ? waiting.reason : false;
+    }
     if (waiting?.kind === "unscheduled") {
       const t = now();
       if (unscheduledSince === null) {
@@ -592,7 +614,9 @@ export async function waitForWorkloadReady(
     // capacity, which for a GPU node can take hours, not for a start: for a caller
     // that asked (scaleUpTimeoutMs), it runs on that ceiling, from the first read
     // of the scale-up, and the start ceiling does not run.
-    const scalingUp = waiting?.scalingUp === true;
+    // A node being added and a node the autoscaler will add once capacity frees
+    // up are both waits for capacity, on one clock.
+    const scalingUp = waiting?.scalingUp === true || waiting?.capacityWait === true;
     if (phase === "pending") {
       dispatchedSince = null;
       scaleUpSince = null;
@@ -602,7 +626,8 @@ export async function waitForWorkloadReady(
         return await giveUp(
           "sandbox_pending_timeout",
           phase,
-          `workload ${workloadId} still queued (Pending) after ${pendingFor}s`,
+          `workload ${workloadId} still queued (Pending) after ${pendingFor}s`
+          + (waiting?.capacityWait ? `: ${waiting.reason}` : ""),
         );
       }
     } else if (phase && scalingUp && SCALE_UP_TIMEOUT_MS !== undefined) {
@@ -614,7 +639,9 @@ export async function waitForWorkloadReady(
         return await giveUp(
           "sandbox_pending_timeout",
           phase,
-          `workload ${workloadId} still waiting for the platform to add a node after ${scalingFor}s (phase=${phase})`,
+          waiting?.capacityWait
+            ? `workload ${workloadId} still waiting for capacity after ${scalingFor}s (phase=${phase}): ${waiting.reason}`
+            : `workload ${workloadId} still waiting for the platform to add a node after ${scalingFor}s (phase=${phase})`,
         );
       }
     } else if (phase) {

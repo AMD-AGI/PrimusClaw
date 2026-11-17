@@ -102,6 +102,22 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The endings among SANDBOX_UNAVAILABLE_REASONS that say the platform had no
+ * capacity for the sandbox within the wait the run was given: no node took its
+ * pod, the wait for capacity ran out, or it never became ready once scheduled.
+ * A run that asked for a sandbox and ended on one of these did not do the work
+ * it needed the sandbox for, and is recorded as failed for it even when its
+ * agent went on to answer (see TaskRunner.provisionFailure). A refused account or
+ * workspace is not among them: that is the account's standing, and a turn that
+ * carries on without a sandbox there is the designed behaviour, not a failure.
+ */
+export const SANDBOX_CAPACITY_FAILURE_REASONS: ReadonlySet<string> = new Set([
+  "sandbox_unschedulable",
+  "sandbox_start_timeout",
+  "sandbox_pending_timeout",
+]);
+
+/**
  * The platform refused to create the sandbox workload because the caller's
  * account may not create workloads in that workspace (SaFE answers 403, in
  * practice "not allowed to create workload, workspace: [<ws>]" for a user who

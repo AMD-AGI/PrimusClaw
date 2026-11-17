@@ -15,6 +15,7 @@ import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
 import { releaseWorkspaceSaveHold, workspaceSaveHoldSet } from "../sessions/save-hold.js";
 import {
+  RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD,
   WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD,
 } from "@claw/protocol";
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
@@ -1010,6 +1011,17 @@ export const completionPorts = {
   rerunOnFallback,
 };
 
+/**
+ * The run failure a turn that ended normally reports (`run_failure_reason`, and
+ * `run_failure_message` for a person), or null when it reports none.
+ */
+export function runFailureOf(event: Record<string, unknown>): { reason: string; message: string } | null {
+  const reason = event[RUN_FAILURE_REASON_FIELD];
+  if (typeof reason !== "string" || !reason.trim()) return null;
+  const message = event[RUN_FAILURE_MESSAGE_FIELD];
+  return { reason: reason.trim().slice(0, 200), message: typeof message === "string" ? message.slice(0, 2000) : "" };
+}
+
 async function handleComplete(
   sessionId: string,
   event: Record<string, unknown>,
@@ -1022,6 +1034,12 @@ async function handleComplete(
 ): Promise<RunFinished | undefined> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
+  // A turn that answered while its run failed (its sandbox could not be
+  // provided): the conversation keeps its normal ending, the run row and its
+  // notification record the failure (protocol run-failure.ts).
+  const runFailure = !failed && !interrupted ? runFailureOf(event) : null;
+  const runFailed = Boolean(failed) || runFailure !== null;
+  const runFailureReason = failed ? String(failure_reason ?? "agent_error") : runFailure?.reason;
   // Null rather than "" when absent: the unique index over the turns is partial
   // on this column, so an empty string would put every turn of every caller that
   // sends no message id into one index entry and let the first one written
@@ -1049,9 +1067,12 @@ async function handleComplete(
     const closed = await closeChatRun(
       sessionId,
       messageId ?? undefined,
-      interrupted ? "cancelled" : failed ? "failed" : "completed",
-      failed ? String(failure_reason ?? "agent_error") : undefined,
-      { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
+      interrupted ? "cancelled" : runFailed ? "failed" : "completed",
+      runFailed ? runFailureReason : undefined,
+      {
+        taskId: provenance ?? undefined, runClaim: runClaimOf(event),
+        ...(runFailure ? { failureMessage: runFailure.message } : {}),
+      },
     );
     endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
     // A zero match classifies the event; it is not a yes/no gate. This
@@ -1338,8 +1359,8 @@ async function handleComplete(
     const notice: RunFinished = {
       sessionId,
       taskIds: endedRunIds,
-      outcome: failed ? "failed" : "completed",
-      ...(failed ? { failureReason: String(failure_reason ?? "agent_error") } : {}),
+      outcome: runFailed ? "failed" : "completed",
+      ...(runFailed ? { failureReason: runFailureReason } : {}),
     };
     try {
       await completionPorts.recordRunFinished(notice);

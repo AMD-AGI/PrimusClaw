@@ -71,7 +71,10 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxUnavailableOf } from "../sandbox/errors.js";
+import {
+  SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
+  sandboxUnavailableOf,
+} from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -84,7 +87,7 @@ import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import { taskSubject, type RunTimeReport, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
+import { taskSubject, type RunTimeReport, RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
@@ -2943,6 +2946,27 @@ class TaskRunner {
   }
 
   /**
+   * Why this run ended without the sandbox it asked for, when it did: a tool asked
+   * for one, the platform had no capacity for it (SANDBOX_CAPACITY_FAILURE_REASONS:
+   * no node took the pod, the wait for capacity ran out, it never became ready)
+   * and none was opened after. The model was told and wrote its answer
+   * without one, so the turn ends as usual; but none of the work that needed the
+   * sandbox ran, and the run is recorded as failed for that reason, with the
+   * platform's account of it, so a caller reading the run sees why rather than a
+   * clean ending with no exit code.
+   *
+   * A prestarted open that failed with nothing asking for it is not this: the run
+   * never needed the sandbox. Nor is an account the platform refuses a sandbox to:
+   * such a run carries on without one by design.
+   */
+  private provisionFailure(): { reason: string; message: string } | null {
+    if (!this.sandboxClaimed || this.hands || !this.sandboxUnavailable) return null;
+    const terminal = sandboxUnavailableOf(this.sandboxUnavailable);
+    if (!terminal || !SANDBOX_CAPACITY_FAILURE_REASONS.has(terminal.reason)) return null;
+    return { reason: terminal.reason, message: String(terminal.message ?? "").slice(0, 2000) };
+  }
+
+  /**
    * Start opening the sandbox now, beside the first model call, rather than on the
    * first tool call that asks for it.
    *
@@ -3742,6 +3766,14 @@ class TaskRunner {
     // Named per save, not per turn: a redelivered turn keeps its message id, and
     // the finish of an earlier attempt's save must not end this one's.
     const saveId = !!hands && this.request.workspace_throwaway !== true ? randomUUID() : undefined;
+    const provisionFailure = this.provisionFailure();
+    if (provisionFailure) {
+      logger.warn(
+        { sessionId: this.sessionId, messageId: this.messageId, reason: provisionFailure.reason },
+        "task.ended_without_sandbox",
+      );
+      result = { ...result, abortReason: "error", failureReason: provisionFailure.reason, failureMessage: provisionFailure.message };
+    }
     const completion: Record<string, unknown> = {
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3760,6 +3792,12 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
+      // The turn answered, so it is not `failed` (which is the conversation's
+      // account: the answer stands); the run is, and these say why.
+      ...(provisionFailure ? {
+        [RUN_FAILURE_REASON_FIELD]: provisionFailure.reason,
+        [RUN_FAILURE_MESSAGE_FIELD]: provisionFailure.message,
+      } : {}),
       ...(saveId ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING, [WORKSPACE_SAVE_ID_FIELD]: saveId } : {}),
       ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     };

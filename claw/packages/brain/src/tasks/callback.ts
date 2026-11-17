@@ -47,6 +47,8 @@ interface AgentDoneBody {
   error_count?: number;
   abort_reason?: string;
   failure_reason?: string;
+  /** What happened, for a person, when `failure_reason` is a code. */
+  failure_message?: string;
   metadata?: Record<string, unknown>;
   /**
    * What the platform did, when it was the platform that ended the run. Only
@@ -583,6 +585,7 @@ export async function postAgentDone(
     error_count: result.errorCount,
     abort_reason: result.abortReason ?? "completed",
     failure_reason: result.failureReason,
+    ...(result.failureMessage ? { failure_message: truncateField(result.failureMessage, "failure message") } : {}),
     metadata: result.waitExternalId ? { external_id: result.waitExternalId } : undefined,
     // Merged in the same transaction as the terminal transition; what no
     // report covered stays unbanked rather than attributed to a state.

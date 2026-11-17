@@ -42,6 +42,8 @@ export interface AgentDonePayload {
   error_count?: number;
   abort_reason?: string;
   failure_reason?: string;
+  /** What happened, for a person, when `failure_reason` is a code. Stored as `error_message`. */
+  failure_message?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
   /** The attempt's final per-state totals, merged with the transition. */
@@ -147,7 +149,9 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     token_usage: payload.token_usage ? JSON.stringify(payload.token_usage) : null,
     turns: payload.turns ?? null,
     failure_reason: payload.failure_reason ?? null,
-    error_message: payload.failure_reason ?? null,
+    error_message: (typeof payload.failure_message === "string" && payload.failure_message
+      ? payload.failure_message.slice(0, 2000)
+      : null) ?? payload.failure_reason ?? null,
   };
 
   // Only written when the callback carried them. A run that ended for its own

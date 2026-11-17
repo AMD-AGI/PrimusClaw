@@ -1113,13 +1113,32 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // The sandbox a run opens (SafeWorkloadProvider, not hosted applications or
 // multi-node clusters) also uses it, on a clock of its own, for a dispatched
 // workload while the platform reports a node being added for it
-// (`TriggeredScaleUp`); see WorkloadWaitOptions.scaleUpTimeoutMs.
+// (`TriggeredScaleUp`), or says capacity can come (an account at the scheduler's
+// per-user limit, a node being given back); see WorkloadWaitOptions.scaleUpTimeoutMs.
+// For that sandbox the ceiling is also bounded by the run: a request that names its
+// own timeout waits at most that timeout less SANDBOX_MIN_RUN_SECONDS (see
+// `capacityWaitTimeoutMs` in sandbox/safe-workload-provider.ts).
 //
 // Task and DAG runs carry a renewable API-side lease, so this Pending ceiling
 // does not have to fit under BRAIN_TASK_TIMEOUT_SEC. That timeout now covers
 // only a row that never receives its first lease renewal; once Brain is alive,
 // the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
+
+// How much of a request's own timeout is kept for the run when its sandbox has to
+// wait for capacity. A request that names a timeout (`timeout`, in seconds) waits
+// for capacity -- queued, a node being added, or an autoscaler that says capacity
+// can come -- for at most that timeout less this much, and never past
+// SANDBOX_PENDING_TIMEOUT_SECONDS above; a timeout shorter than twice this keeps
+// half of it for the run. A request with no timeout waits on the ceiling above alone.
+//
+// Why the request bounds it: the queue is not free time for the run. SaFE starts a
+// sandbox's lifetime (the request's timeout plus an hour to stop in) when it
+// admits the workload, so a wait after admission comes out of the run's own time,
+// and a caller that gave the run a timeout gives up on it once that timeout has
+// passed, whether or not the sandbox ever started. Waiting longer than that buys a
+// sandbox nobody will use. Stored in seconds.
+export const SANDBOX_MIN_RUN_SECONDS = envInt("SANDBOX_MIN_RUN_SECONDS", 60 * 60, { min: 0 });
 
 // Maximum duration of a SINGLE continuous "dispatched but not ready" wait: the
 // workload has left Pending (it was scheduled) and is still short of ready --
@@ -1141,8 +1160,8 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
 // Maximum duration a sandbox the platform has ADMITTED may sit with nothing having
-// taken its pod -- no node has acknowledged it -- and no node being added for it,
-// before the message fails terminally with reason `sandbox_unschedulable`, the
+// taken its pod -- no node has acknowledged it -- no node being added for it, and
+// no capacity coming for it, before the message fails terminally with reason `sandbox_unschedulable`, the
 // workload is stopped, and the model is told to report it rather than open
 // another. That is what a sandbox that no node will run looks like (every node
 // cordoned, down or tainted for other workloads): waiting longer does not change
@@ -1166,12 +1185,19 @@ export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 
 // healthy start (image pull, container boot) takes; that keeps its own, longer
 // ceiling above. It does NOT cover a workload still in the platform's queue (a
 // queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
-// node being added (which can take longer than this): both are waits for capacity
+// node being added (which can take longer than this), nor an admitted one the
+// autoscaler will not add a node for yet for a reason that ends on its own (every
+// account it buys nodes as is at the scheduler's per-user limit, a node is still
+// being given back, the pool is at its limit and releases an idle node, a purchase
+// in backoff; the list is CAPACITY_WAIT_PHRASES in sandbox/workload-stall.ts), the
+// normal state of a burst GPU pool: all three are waits for capacity
 // and run on SANDBOX_PENDING_TIMEOUT_SECONDS, whichever phase the platform reports
 // (a sandbox being given a node is often NotReady already; that wait is clocked
 // from the first read of the scale-up), never on SANDBOX_START_TIMEOUT_SECONDS;
 // the user is told why they are waiting. When the
-// autoscaler refuses (`NotTriggerScaleUp`), the reason it gives is passed on, with
+// autoscaler refuses (`NotTriggerScaleUp`) for a reason no wait settles (no pool
+// serves the workspace, the pod fits no node of a pool, more nodes at once than a
+// pool may hold), this limit applies, and the reason it gives is passed on, with
 // its identifiers taken out. A cluster whose nodes scale up without the
 // platform saying so should raise this or set 0. Applies to the sandbox a run
 // opens, not to hosted applications or multi-node clusters.

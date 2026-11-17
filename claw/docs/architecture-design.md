@@ -574,8 +574,14 @@ Two different clocks bound a sandbox, and they must not be confused:
   writes when the workload **leaves the Pending queue and starts running** (not at dispatch —
   a workload is still Pending when marked dispatched). So it does **not** include time the
   workload spends **Pending** waiting for resources.
+  That holds for the queue only. A workload the platform has admitted (NotReady) already
+  has its `StartTime`, and a sandbox's `shutdownTime` is set when it is dispatched, so a wait
+  for capacity after admission (a node being added, an account at the scheduler's per-user
+  limit) is spent out of the sandbox's lifetime. Brain bounds that wait by the request:
+  `timeout` less `SANDBOX_MIN_RUN_SECONDS` (default 1h), so a run that had to queue keeps at
+  least that much of its own time.
 - **`SANDBOX_PENDING_TIMEOUT_SECONDS` (Brain config, default 3h)** — the ceiling on the
-  **Pending/queue wait**. A readable Pending status (SaFE answering HTTP 2xx with a phase)
+  **Pending/queue wait**, and on a wait for capacity after admission. A readable Pending status (SaFE answering HTTP 2xx with a phase)
   is polled and waited on; if the workload has not reached Running within this window the
   whole message fails terminally with reason `sandbox_pending_timeout` (never retried).
   Set to `0` to wait forever.
