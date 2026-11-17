@@ -948,9 +948,13 @@ export class AppRunner {
     this.assertActive();
     // Credentials ride with the start command, never in the workload (see
     // appSandboxEnv): the spec's own, and the model credential laid last.
+    const startEnv = appStartEnv(this.rec.sandbox_spec, env, this.platformKey);
+    // The derivation reads USER_ID, which must be the sandbox's own (SaFE's, as the state
+    // directory was expanded with), never one the manifest's env lays over it: that would
+    // point the application at another user's directory.
+    if (roots.length > 0) delete startEnv.USER_ID;
     const r = await this.deps.sandbox.exec(
-      inst, startCommand(this.rec.manifest, stateDir, this.tag(), roots), EXEC_TIMEOUT,
-      { env: appStartEnv(this.rec.sandbox_spec, env, this.platformKey) },
+      inst, startCommand(this.rec.manifest, stateDir, this.tag(), roots), EXEC_TIMEOUT, { env: startEnv },
     );
     if (r.exitCode === USER_DATA_DIR_NOT_CREATED && roots.length > 0) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
     if (r.exitCode !== 0) throw new Error(`start command failed (exit ${r.exitCode}): ${clip(this.scrubbed(r.stderr))}`);

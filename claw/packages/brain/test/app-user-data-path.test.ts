@@ -23,6 +23,8 @@
  *   U11 an application that names USER_DATA_PATH only in its command or bootstrap still gets it, and
  *       fails at once, saying so, when it cannot be created
  *
+ *   U13 a manifest env USER_ID does not steer the derivation to another user's directory
+ *
  * The shell runs in a real `sh` whose environment has no USER_DATA_PATH unless a
  * test puts one there.
  */
@@ -249,4 +251,17 @@ test("U12 needsUserDataPath: the state_dir, the command or the bootstrap file na
   assert.equal(needsUserDataPath({ ...base, command: ["sh", "-c", "cd $USER_DATA_PATH"] }), true);
   assert.equal(needsUserDataPath({ ...base, bootstrap: { file: "b.sh", content_b64: Buffer.from("cd \"${USER_DATA_PATH}\"").toString("base64") } }), true);
   assert.equal(needsUserDataPath({ ...base, bootstrap: { file: "b.sh", content_b64: Buffer.from("echo hi").toString("base64") } }), false);
+});
+
+test("U13 a manifest env USER_ID does not steer the derivation: the application gets the sandbox's own user directory", async () => {
+  const root = fresh();
+  const { world, runner } = shellRunner({ USER_ID: UID }, [root],
+    'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
+    { env: { USER_ID: "someone-else" } });
+  const result = await runner.run(AbortSignal.timeout(30_000));
+  assert.equal(result.kind === "ended" && result.outcome.success, true, JSON.stringify(result));
+  const stateDir = `${root}/users/${UID}/.claw-apps/${RUN_ID}`;
+  assert.equal(world.rec.state_dir, stateDir);
+  assert.equal(readFileSync(`${stateDir}/udp.txt`, "utf8"), `${root}/users/${UID}`);
+  assert.equal(existsSync(join(root, "users", "someone-else")), false);
 });
