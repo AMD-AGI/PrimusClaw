@@ -133,24 +133,30 @@ type ownerConfig struct {
 // A nil policy means none is configured: identity keys are checked by introspection
 // and answered 503 until a policy is applied.
 func OwnerPolicyFromEnv() (*OwnerPolicy, error) {
+	p, _, err := OwnerPolicyRawFromEnv()
+	return p, err
+}
+
+// OwnerPolicyRawFromEnv is OwnerPolicyFromEnv and the exact bytes it decoded.
+func OwnerPolicyRawFromEnv() (*OwnerPolicy, string, error) {
 	var raw []byte
 	if path := strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_FILE")); path != "" {
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		raw = b
 	} else if v := strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY")); v != "" {
 		raw = []byte(v)
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
 	var p OwnerPolicy
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, fmt.Errorf("owner policy is not JSON: %w", err)
+		return nil, "", fmt.Errorf("owner policy is not JSON: %w", err)
 	}
-	return &p, nil
+	return &p, string(raw), nil
 }
 
 // SetOwnerPolicy validates the policy, registers its templates, and applies it.
@@ -158,11 +164,10 @@ func (s *Service) SetOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
 	return s.ApplyOwnerPolicy(ctx, p, true)
 }
 
-// ValidateOwnerPolicy checks the policy. It changes neither the cluster nor
-// the applied policy.
-func (s *Service) ValidateOwnerPolicy(ctx context.Context, p OwnerPolicy) error {
-	_, err := s.prepareOwnerPolicy(ctx, p)
-	return err
+// ValidateOwnerPolicy checks the policy and returns the prepared config. It
+// changes neither the cluster nor the applied policy.
+func (s *Service) ValidateOwnerPolicy(ctx context.Context, p OwnerPolicy) (*ownerConfig, error) {
+	return s.prepareOwnerPolicy(ctx, p)
 }
 
 // ApplyOwnerPolicy validates the policy and makes it the applied policy.
@@ -173,6 +178,12 @@ func (s *Service) ApplyOwnerPolicy(ctx context.Context, p OwnerPolicy, registerT
 	if err != nil {
 		return err
 	}
+	return s.applyOwnerConfig(ctx, cfg, registerTemplates)
+}
+
+// applyOwnerConfig stores cfg as the applied policy. With registerTemplates it
+// also creates, updates and deletes the owner CodeInterpreters.
+func (s *Service) applyOwnerConfig(ctx context.Context, cfg *ownerConfig, registerTemplates bool) error {
 	if registerTemplates {
 		if err := s.upsertOwnerTemplates(ctx, cfg.templates); err != nil {
 			return err
@@ -246,20 +257,30 @@ func (s *Service) checkOwnerTemplateNames(ctx context.Context, templates []runti
 			continue
 		}
 		for _, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
-			existing := &runtimev1alpha1.CodeInterpreter{}
-			err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			if err != nil {
-				return opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
-			}
-			if !ownedByGrant(existing, ownerTemplatesID) {
-				return opErr(http.StatusConflict, "template_exists", name)
+			if _, err := s.ownerTemplateCI(ctx, name); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// ownerTemplateCI returns the CodeInterpreter name when it exists and is owned
+// by the owner policy. A missing object returns nil. A name held by another
+// grant returns 409 template_exists.
+func (s *Service) ownerTemplateCI(ctx context.Context, name string) (*runtimev1alpha1.CodeInterpreter, error) {
+	existing := &runtimev1alpha1.CodeInterpreter{}
+	err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
+	}
+	if !ownedByGrant(existing, ownerTemplatesID) {
+		return nil, opErr(http.StatusConflict, "template_exists", name)
+	}
+	return existing, nil
 }
 
 // ownerPolicyRejectedDetail is the only text a rejected owner policy returns.
@@ -465,7 +486,8 @@ func ownerSpecMatches(got, want runtimev1alpha1.SandboxGrantSpec) bool {
 }
 
 // upsertOwnerTemplates creates or updates the CodeInterpreters of the owner policy
-// and deletes the owner CodeInterpreters the policy no longer lists.
+// and deletes the owner CodeInterpreters the policy no longer lists. Ownership
+// conflicts use the same check as prepareOwnerPolicy (ownerTemplateCI).
 func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev1alpha1.GrantTemplate) error {
 	wanted := map[string]bool{}
 	for _, tpl := range templates {
@@ -479,19 +501,15 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 		for i, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
 			wanted[name] = true
 			want := codeInterpreter(ownerTemplatesID, name, base, templateGPUCount(tpl, i), s.namespace)
-			existing := &runtimev1alpha1.CodeInterpreter{}
-			err := s.reader.Get(ctx, types.NamespacedName{Name: name, Namespace: s.namespace}, existing)
-			if apierrors.IsNotFound(err) {
+			existing, err := s.ownerTemplateCI(ctx, name)
+			if err != nil {
+				return err
+			}
+			if existing == nil {
 				if err := s.client.Create(ctx, want); err != nil {
 					return opWrap(http.StatusInternalServerError, "template_register_failed", name, err)
 				}
 				continue
-			}
-			if err != nil {
-				return opWrap(http.StatusInternalServerError, "template_get_failed", name, err)
-			}
-			if !ownedByGrant(existing, ownerTemplatesID) {
-				return opErr(http.StatusConflict, "template_exists", name)
 			}
 			existing.Labels = want.Labels
 			existing.Annotations = want.Annotations

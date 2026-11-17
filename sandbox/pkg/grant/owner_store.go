@@ -17,6 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -38,10 +39,9 @@ func OwnerPolicyConfigMapFromEnv() string {
 	return strings.TrimSpace(os.Getenv("E2B_OWNER_POLICY_CONFIGMAP"))
 }
 
-// OwnerPolicyStore keeps the owner policy in a ConfigMap. A write validates the
-// new policy without side effects, stores it, and then applies it. Every replica
-// polls the ConfigMap and applies the stored policy in memory; only the leader
-// registers the owner CodeInterpreters, which every replica shares.
+// OwnerPolicyStore keeps the owner policy in a ConfigMap. A write validates and
+// applies the new policy on the leader, then stores it. Followers only sync the
+// stored policy into memory. Only the leader registers the owner CodeInterpreters.
 type OwnerPolicyStore struct {
 	client    ctrlclient.Client
 	reader    ctrlclient.Reader
@@ -157,9 +157,11 @@ func (p *OwnerPolicyStore) Templates(ctx context.Context) (OwnerPolicyTemplates,
 	if out.Templates == nil {
 		out.Templates = []TemplateRequest{}
 	}
+	sum := sha256.Sum256([]byte(raw))
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out.InSync = p.applied == sha256.Sum256([]byte(raw))
+	// A leader is in sync only after it has registered the stored templates.
+	out.InSync = p.applied == sum && p.lastErr == "" && (!p.leader() || p.registered == sum)
 	if !out.InSync {
 		out.Error = p.lastErr
 	}
@@ -206,13 +208,15 @@ func (p *OwnerPolicyStore) DeleteTemplate(ctx context.Context, name string) erro
 	})
 }
 
-// mutate edits the stored policy, validates it without side effects, stores
-// it, and then applies it. A conflicting write restarts from the new content.
-// A failed apply leaves the stored policy for the next Sync to apply.
+// mutate edits the stored policy on the leader: validate, apply (and register),
+// then store. A rejected apply leaves the ConfigMap unchanged. A failed store
+// rolls the in-memory policy and CodeInterpreters back to the stored document.
 func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var raw string
+	if !p.leader() {
+		return opErr(http.StatusServiceUnavailable, "owner_policy_not_leader", "only the leader can change the owner policy")
+	}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := p.get(ctx)
 		if err != nil {
@@ -220,21 +224,36 @@ func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc
 		}
 		doc, err := parseOwnerPolicyDoc(cm.Data[OwnerPolicyKey])
 		if err != nil {
-			return err
+			var op *OpError
+			// A broken stored document can be repaired by a PUT that rebuilds it.
+			if errors.As(err, &op) && op.Reason == "owner_policy_invalid" {
+				doc = &ownerPolicyDoc{fields: map[string]json.RawMessage{}}
+			} else {
+				return err
+			}
 		}
 		if err := edit(doc); err != nil {
 			return err
 		}
-		if raw, err = doc.encode(); err != nil {
+		raw, err := doc.encode()
+		if err != nil {
 			return opWrap(http.StatusInternalServerError, "owner_policy_invalid", "", err)
 		}
 		policy, err := decodeOwnerPolicy(raw)
 		if err != nil {
 			return err
 		}
-		if err := p.grants.ValidateOwnerPolicy(ctx, policy); err != nil {
+		cfg, err := p.grants.ValidateOwnerPolicy(ctx, policy)
+		if err != nil {
 			return err
 		}
+		if err := p.grants.applyOwnerConfig(ctx, cfg, true); err != nil {
+			p.recordApplyErr(raw, err)
+			return err
+		}
+		sum := sha256.Sum256([]byte(raw))
+		p.applied, p.registered = sum, sum
+		p.rejected, p.lastErr = [sha256.Size]byte{}, ""
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
 		}
@@ -242,12 +261,22 @@ func (p *OwnerPolicyStore) mutate(ctx context.Context, edit func(*ownerPolicyDoc
 		return p.client.Update(ctx, cm)
 	})
 	if err != nil {
+		if cm, getErr := p.get(ctx); getErr == nil {
+			_ = p.applyLocked(ctx, cm.Data[OwnerPolicyKey])
+		}
 		return err
 	}
-	if err := p.applyLocked(ctx, raw); err != nil {
-		return opWrap(http.StatusInternalServerError, "owner_policy_apply_failed", "the policy is stored and the next sync applies it", err)
-	}
 	return nil
+}
+
+// recordApplyErr records a failed apply of raw. p.mu must be held.
+func (p *OwnerPolicyStore) recordApplyErr(raw string, err error) {
+	p.lastErr = err.Error()
+	var op *OpError
+	if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
+		p.rejected, p.rejectedAt = sha256.Sum256([]byte(raw)), p.now()
+		p.grants.SetOwnerPolicyFault(err)
+	}
 }
 
 // applyLocked applies raw in memory, and registers its templates when this
@@ -259,16 +288,16 @@ func (p *OwnerPolicyStore) applyLocked(ctx context.Context, raw string) error {
 		return nil
 	}
 	policy, err := decodeOwnerPolicy(raw)
-	if err == nil {
-		err = p.grants.ApplyOwnerPolicy(ctx, policy, register)
-	}
 	if err != nil {
 		p.lastErr = err.Error()
-		var op *OpError
-		if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
-			p.rejected, p.rejectedAt = sum, p.now()
-			p.grants.SetOwnerPolicyFault(err)
-		}
+		return err
+	}
+	cfg, err := p.grants.prepareOwnerPolicy(ctx, policy)
+	if err == nil {
+		err = p.grants.applyOwnerConfig(ctx, cfg, register)
+	}
+	if err != nil {
+		p.recordApplyErr(raw, err)
 		return err
 	}
 	p.applied = sum
@@ -324,10 +353,12 @@ func (p *OwnerPolicyStore) Sync(ctx context.Context) error {
 	return p.applyLocked(ctx, raw)
 }
 
-// Run calls Sync now and then every interval until ctx ends.
+// Run syncs now, watches the ConfigMap for changes, and resyncs every interval
+// as a backup. When the client cannot watch, it falls back to polling interval.
 func (p *OwnerPolicyStore) Run(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
 	for {
 		if err := p.Sync(ctx); err != nil {
 			var op *OpError
@@ -337,10 +368,66 @@ func (p *OwnerPolicyStore) Run(ctx context.Context, interval time.Duration) {
 				log.Warn("owner policy sync failed", "configmap", p.name, "error", err)
 			}
 		}
+		if err := p.watchOnce(ctx, interval); err != nil && ctx.Err() == nil {
+			log.Warn("owner policy watch ended", "configmap", p.name, "error", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(time.Second):
 		}
+	}
+}
+
+// watchOnce watches the policy ConfigMap until ctx ends, the watch closes, or
+// interval elapses. Without a watchable client it polls once per interval.
+func (p *OwnerPolicyStore) watchOnce(ctx context.Context, interval time.Duration) error {
+	w, ok := p.client.(ctrlclient.WithWatch)
+	if !ok {
+		return p.pollOnce(ctx, interval)
+	}
+	watcher, err := w.Watch(ctx, &corev1.ConfigMapList{}, ctrlclient.InNamespace(p.namespace))
+	if err != nil {
+		return p.pollOnce(ctx, interval)
+	}
+	defer watcher.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case ev, ok := <-watcher.ResultChan():
+			if !ok {
+				return errors.New("watch closed")
+			}
+			if ev.Type == watch.Error {
+				return errors.New("watch error")
+			}
+			cm, ok := ev.Object.(*corev1.ConfigMap)
+			if !ok || cm.Name != p.name {
+				continue
+			}
+			if err := p.Sync(ctx); err != nil {
+				var op *OpError
+				if errors.As(err, &op) && op.Status < http.StatusInternalServerError {
+					log.Error("owner policy was rejected; the previous policy stays applied", "configmap", p.name, "error", err)
+				} else {
+					log.Warn("owner policy sync failed", "configmap", p.name, "error", err)
+				}
+			}
+		}
+	}
+}
+
+// pollOnce waits for interval then returns so Run can Sync again.
+func (p *OwnerPolicyStore) pollOnce(ctx context.Context, interval time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(interval):
+		return nil
 	}
 }

@@ -99,11 +99,47 @@ func TestOwnerPolicyAPIOnlySystemAdmin(t *testing.T) {
 }
 
 func TestOwnerPolicyAPIWithoutStoreIs404(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	s := New(DefaultConfig(), store.NewMemoryStore())
-	w := serveOwnerPolicy(s, http.MethodGet, ownerPolicyTemplatesPath, "", "", nil)
+	s := newOwnerPolicyServer(t, true)
+	s.ownerPolicy = nil
+	w := serveOwnerPolicy(s, http.MethodGet, ownerPolicyTemplatesPath, "admin", "", nil)
 	if w.Code != http.StatusNotFound {
-		t.Fatalf("no store = %d, want 404", w.Code)
+		t.Fatalf("admin, no store = %d, want 404: %s", w.Code, w.Body.String())
+	}
+	w = serveOwnerPolicy(s, http.MethodGet, ownerPolicyTemplatesPath, "user", "", nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-admin, no store = %d, want 403: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestOwnerPolicyAPIFollowerWriteIs503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	roles := map[string]string{"admin": RoleSystemAdmin}
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		role, ok := roles[r.PostForm.Get("token")]
+		_ = json.NewEncoder(w).Encode(map[string]any{"active": ok, "sub": "u-" + r.PostForm.Get("token"), "roles": []string{role}})
+	}))
+	t.Cleanup(idp.Close)
+	sch := k8sruntime.NewScheme()
+	utilruntime.Must(runtimev1alpha1.AddToScheme(sch))
+	utilruntime.Must(corev1.AddToScheme(sch))
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-policy", Namespace: "agent-sandbox-system"},
+		Data: map[string]string{grant.OwnerPolicyKey: `{"templates":[{"name":"runner","perGpuCount":[1],"spec":` +
+			ownerPolicySpec + `}]}`},
+	}
+	cl := ctrlfake.NewClientBuilder().WithScheme(sch).WithObjects(cm).
+		WithStatusSubresource(&runtimev1alpha1.SandboxGrant{}).Build()
+	grants := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system"})
+	cfg := DefaultConfig()
+	cfg.EnableAuth = true
+	cfg.Identity = identity.NewClient(idp.URL, "agent-sandbox", "secret", "")
+	s := New(cfg, store.NewMemoryStore())
+	s.WithOwnerPolicyStore(grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false }))
+	put := `{"perGpuCount":[1],"spec":` + ownerPolicySpec + `}`
+	w := serveOwnerPolicy(s, http.MethodPut, ownerPolicyTemplatesPath+"/extra", "admin", put, nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("follower put = %d, want 503: %s", w.Code, w.Body.String())
 	}
 }
 

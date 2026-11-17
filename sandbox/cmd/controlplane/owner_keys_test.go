@@ -6,12 +6,15 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -125,6 +128,43 @@ func TestOwnerKeysWithStoreAppliesInMemory(t *testing.T) {
 	}
 	if len(cis.Items) != 0 {
 		t.Fatalf("startup registered %d templates; the store leader does that", len(cis.Items))
+	}
+}
+
+// TestOwnerKeysWithStoreMarksFilePolicyApplied checks that MarkApplied hashes the
+// file contents when E2B_OWNER_POLICY_FILE is set, so Sync does not re-apply.
+func TestOwnerKeysWithStoreMarksFilePolicyApplied(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"templates":[{"name":"t","perGpuCount":[1],"spec":{"fromImage":"harbor.example/runner@sha256:0123456789abcdef"}}]}`
+	path := t.TempDir() + "/policy.json"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-policy", Namespace: "agent-sandbox-system"},
+		Data:       map[string]string{grant.OwnerPolicyKey: raw},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).Build()
+	grants := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system"})
+	store := grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false })
+	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
+	t.Setenv("IDENTITY_CLIENT_ID", "id")
+	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
+	t.Setenv("E2B_OWNER_POLICY", "")
+	t.Setenv("E2B_OWNER_POLICY_FILE", path)
+
+	if client, supplied := ownerKeys(context.Background(), grants, store); client == nil || !supplied {
+		t.Fatal("identity keys disabled with a policy file")
+	}
+	out, err := store.Templates(context.Background())
+	if err != nil || !out.InSync {
+		t.Fatalf("file policy marked applied: %+v %v", out, err)
 	}
 }
 

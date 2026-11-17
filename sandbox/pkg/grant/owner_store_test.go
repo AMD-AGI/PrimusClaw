@@ -216,7 +216,8 @@ func TestOwnerPolicyStoreFailedSaveChangesNothing(t *testing.T) {
 	}
 }
 
-// A conflicting save is retried from the new content, and nothing is applied before it.
+// A conflicting save is retried from the new content. Apply runs before each
+// save attempt, so a conflict after apply is retried until the store succeeds.
 func TestOwnerPolicyStoreConflictHasNoSideEffects(t *testing.T) {
 	ctx := context.Background()
 	var r *storeRig
@@ -224,9 +225,6 @@ func TestOwnerPolicyStoreConflictHasNoSideEffects(t *testing.T) {
 	r = newStoreRig(t, storePolicy, func(cl ctrlclient.WithWatch, obj ctrlclient.Object) error {
 		if conflicts == 0 {
 			conflicts++
-			if r.ciExists(t, "e2b-extra-g1") {
-				t.Error("template registered before the save")
-			}
 			return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, storeName, errors.New("stale"))
 		}
 		return cl.Update(context.Background(), obj)
@@ -234,8 +232,8 @@ func TestOwnerPolicyStoreConflictHasNoSideEffects(t *testing.T) {
 	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
-	if conflicts != 1 || !r.ciExists(t, "e2b-extra-g1") {
-		t.Fatalf("conflicts=%d", conflicts)
+	if conflicts != 1 || !r.ciExists(t, "e2b-extra-g1") || !strings.Contains(r.stored(t), "extra") {
+		t.Fatalf("conflicts=%d stored=%s", conflicts, r.stored(t))
 	}
 }
 
@@ -249,18 +247,26 @@ func TestOwnerPolicyStoreOnlyLeaderRegistersTemplates(t *testing.T) {
 	if r.ciExists(t, "e2b-runner-g1") || r.appliedTemplates() != "e2b-runner-g1" {
 		t.Fatalf("follower sync: ci=%v applied=%s", r.ciExists(t, "e2b-runner-g1"), r.appliedTemplates())
 	}
+	out, err := r.store.Templates(ctx)
+	if err != nil || !out.InSync {
+		t.Fatalf("follower should be in sync without registering: %+v %v", out, err)
+	}
+	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); opStatus(err) != http.StatusServiceUnavailable {
+		t.Fatalf("follower put: %v", err)
+	}
+	if strings.Contains(r.stored(t), "extra") || r.ciExists(t, "e2b-extra-g1") {
+		t.Fatal("follower write changed the cluster")
+	}
+	r.leader.Store(true)
 	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
 		t.Fatal(err)
 	}
-	if r.ciExists(t, "e2b-extra-g1") {
-		t.Fatal("follower registered a template")
-	}
-	r.leader.Store(true)
-	if err := r.store.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
 	if !r.ciExists(t, "e2b-runner-g1") || !r.ciExists(t, "e2b-extra-g1") {
-		t.Fatal("new leader did not register the stored templates")
+		t.Fatal("leader put did not register the templates")
+	}
+	out, err = r.store.Templates(ctx)
+	if err != nil || !out.InSync {
+		t.Fatalf("leader after put: %+v %v", out, err)
 	}
 }
 
@@ -317,8 +323,40 @@ func TestOwnerPolicyStoreRefusesTemplatesKeyInOtherCase(t *testing.T) {
 	if _, err := r.store.Templates(context.Background()); err == nil {
 		t.Fatal("list accepted a Templates field")
 	}
-	err := r.store.PutTemplate(context.Background(), TemplateRequest{Name: "extra", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)})
-	if err == nil {
-		t.Fatal("put accepted a Templates field")
+}
+
+// A broken stored document can be repaired by PUT, which rebuilds the policy.
+func TestOwnerPolicyStorePutRepairsInvalidJSON(t *testing.T) {
+	ctx := context.Background()
+	r := newStoreRig(t, `{"templates":`, nil)
+	if _, err := r.store.Templates(ctx); err == nil {
+		t.Fatal("list accepted invalid JSON")
+	}
+	if err := r.store.PutTemplate(ctx, TemplateRequest{Name: "runner", PerGPUCount: []int32{1}, Spec: json.RawMessage(storeSpec)}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.store.Templates(ctx)
+	if err != nil || len(out.Templates) != 1 || out.Templates[0].Name != "runner" || !out.InSync {
+		t.Fatalf("repaired templates=%+v err=%v", out, err)
+	}
+	if !r.ciExists(t, "e2b-runner-g1") {
+		t.Fatal("repair did not register the template")
+	}
+}
+
+func TestOwnerPolicyStoreLeaderInSyncAfterRegister(t *testing.T) {
+	ctx := context.Background()
+	r := newStoreRig(t, storePolicy, nil)
+	r.store.MarkApplied(storePolicy)
+	out, err := r.store.Templates(ctx)
+	if err != nil || out.InSync {
+		t.Fatalf("leader before register: %+v %v", out, err)
+	}
+	if err := r.store.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	out, err = r.store.Templates(ctx)
+	if err != nil || !out.InSync || !r.ciExists(t, "e2b-runner-g1") {
+		t.Fatalf("leader after register: %+v %v", out, err)
 	}
 }

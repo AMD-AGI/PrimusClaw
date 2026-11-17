@@ -518,7 +518,8 @@ func main() {
 // ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
 var ownerPolicyRetry = time.Second
 
-// ownerPolicySyncInterval is how often each replica reloads the owner policy ConfigMap.
+// ownerPolicySyncInterval is the backup resync period for the owner policy
+// ConfigMap watch (and the poll interval when watch is unavailable).
 const ownerPolicySyncInterval = 15 * time.Second
 
 // leaderCheck reports whether this replica holds the manager's leader lease.
@@ -550,7 +551,7 @@ func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPol
 	if client == nil {
 		return nil, false
 	}
-	policy, err := grant.OwnerPolicyFromEnv()
+	policy, raw, err := grant.OwnerPolicyRawFromEnv()
 	supplied := policy != nil || err != nil
 	if err != nil {
 		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
@@ -566,7 +567,7 @@ func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPol
 			log.Warn("owner policy was not applied; the policy store retries", "error", err)
 			return client, true
 		}
-		store.MarkApplied(os.Getenv("E2B_OWNER_POLICY"))
+		store.MarkApplied(raw)
 		log.Info("identity keys enabled", "role", grants.OwnerRole())
 		return client, true
 	}

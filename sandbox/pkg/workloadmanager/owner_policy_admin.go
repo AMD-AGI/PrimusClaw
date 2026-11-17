@@ -28,7 +28,7 @@ func (s *Server) WithOwnerPolicyStore(store *grant.OwnerPolicyStore) *Server {
 // mountOwnerPolicyRoutes registers the owner policy template API on g, a
 // group under /v1. Every route requires caller auth and the system-admin role.
 func (s *Server) mountOwnerPolicyRoutes(g *gin.RouterGroup) {
-	g.Use(s.requireOwnerPolicyStore(), s.requireVerifiedSystemAdmin())
+	g.Use(s.requireVerifiedSystemAdmin(), s.requireOwnerPolicyStore())
 	g.GET("", s.handleOwnerPolicyList)
 	g.GET("/:name", s.handleOwnerPolicyGet)
 	g.PUT("/:name", s.handleOwnerPolicyPut)
