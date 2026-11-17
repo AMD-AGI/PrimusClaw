@@ -368,6 +368,17 @@ test("stale serving can be turned off", async () => {
   });
 });
 
+test("allowStale false refuses a stale active answer during an outage", async () => {
+  await seeded({}, async ({ fake, clock, metrics, client }) => {
+    fake.introspect = () => ({ status: 503, body: "" });
+    clock.advance(31_000);
+    await assert.rejects(introspect(client, TOKEN, { allowStale: false }), unavailable("http_5xx", 503));
+    assert.equal(metrics.staleCount("introspection"), 0);
+    assert.equal((await introspect(client)).active, true, "default callers still take the stale window");
+    assert.equal(metrics.staleCount("introspection"), 1);
+  });
+});
+
 test("a token never outlives its own expiry on the stale path", async () => {
   await withHarness({}, async ({ fake, clock, client }) => {
     fake.introspect = () => ({ body: activeAnswer({ exp: clock.seconds + 40 }) });

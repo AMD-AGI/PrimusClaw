@@ -147,11 +147,9 @@ function resolveLlmApiStyle(): LlmApiStyle {
 export const LLM_API_STYLE: LlmApiStyle = resolveLlmApiStyle();
 
 // --- LLM key source ---
-// "virtualKey" preserves the existing behavior. "platformKey" is proxy mode:
-// Engines and kubernetes sandbox env use platform_key as the LLM API key.
 // "virtualKey" (default) is the caller's own gateway key. "platformKey" is proxy
 // mode: SaFE's /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request.
-// The chart sets platformKey when the LLM base URLs name /api/v1/llm-proxy.
+// CLAW_AUTH_PROVIDER=identity requires platformKey (IdentityVerifier leaves virtualKey empty).
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
   env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";

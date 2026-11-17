@@ -29,7 +29,6 @@ import type { FastifyInstance } from "fastify";
 
 // Before anything reads the configuration, which is read when its module loads.
 process.env.CLAW_AUTH_PROVIDER = "safe";
-process.env.LLM_KEY_SOURCE = "platformKey";
 process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.CLAW_GITHUB_REVIEW_MCP_URL = "http://api.internal.example:8200/v1/internal/github-review/mcp";
@@ -163,7 +162,7 @@ test("A2 the person's own token sends to it, queued or immediate, and an allowed
     assert.equal(published.length, 1, "the turn was dispatched");
     assert.ok((published[0]?.mcp_servers as Record<string, unknown>)?.github_review, "with the review tools");
     assert.equal(published[0]?.withhold_sandbox_keys, true, "and with the instruction that its sandbox holds none of its owner's keys, which Brain is still given");
-    assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["pk", "pk"]);
+    assert.deepEqual([published[0]?.platform_key, published[0]?.llm_api_key], ["pk", "vk"]);
 
     await h.sql("UPDATE claw_sessions SET agent_status = 'running' WHERE session_id = $1", [id]);
     const queued = await send(ALICE, "identity_token", message);

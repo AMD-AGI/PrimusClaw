@@ -278,7 +278,7 @@ export class SafeClient {
     }
   }
 
-  async verifyApiKey(apiKey: string): Promise<UserInfo> {
+  async verifyApiKey(apiKey: string, _clientIp?: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
     return this.verify(apiKey, { ...this.body(), apiKey }, "invalid or expired API key");
   }

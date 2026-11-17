@@ -223,7 +223,11 @@ export function authLogPath(url: string): string {
 }
 
 /** The SaFE calls the credential paths need. Narrowed so tests can pass a stub. */
-export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey"> & Partial<Pick<SafeClient, "verifyAccessToken">>;
+export type CredentialVerifier = {
+  verifyCookie(token: string, userType?: string): Promise<UserInfo>;
+  /** Optional clientIp is forwarded for identity IP-bound keys; SaFE ignores it. */
+  verifyApiKey(apiKey: string, clientIp?: string): Promise<UserInfo>;
+} & Partial<Pick<SafeClient, "verifyAccessToken">>;
 
 /** An error response a credential path asks {@link authMiddleware} to send. */
 type AuthErrorSpec = {
@@ -380,7 +384,7 @@ export async function verifyDownloadQueryToken(
   if (!queryToken || !isApiKey(queryToken)) return ABSENT;
 
   try {
-    const user = await client.verifyApiKey(queryToken);
+    const user = await client.verifyApiKey(queryToken, req.ip);
     return { status: "verified", user, method: "query_token" };
   } catch (e: unknown) {
     logger.warn({
@@ -411,7 +415,7 @@ export async function verifyBearerApiKey(
   if (!isApiKey(token)) return ABSENT;
 
   try {
-    const user = await client.verifyApiKey(token);
+    const user = await client.verifyApiKey(token, req.ip);
     return { status: "verified", user, method: "api_key" };
   } catch (e: unknown) {
     logger.warn({
@@ -446,7 +450,7 @@ export async function verifyXApiKeyHeader(
   if (!apiKeyHeaderValue || !isApiKey(apiKeyHeaderValue)) return ABSENT;
 
   try {
-    const user = await client.verifyApiKey(apiKeyHeaderValue);
+    const user = await client.verifyApiKey(apiKeyHeaderValue, req.ip);
     return { status: "verified", user, method: "x_api_key" };
   } catch (e: unknown) {
     logger.warn({

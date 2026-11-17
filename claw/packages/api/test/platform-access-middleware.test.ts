@@ -94,16 +94,17 @@ describe("the platform-role requirement through the authentication hook", () => 
       const account = id === undefined ? undefined : { ...ACCOUNTS, ...ISOLATED }[id];
       if (!id || !account) return sendJson(res, 401, { message: "invalid credential" });
       sendJson(res, 200, {
-        data: { id: `u-${id}`, name: id, ...(account.roles !== undefined ? { roles: account.roles } : {}), platformKey: `pk-${id}`, virtualKey: `vk-${id}` },
+        data: { id: `u-${id}`, name: id, ...(account.roles !== undefined ? { roles: account.roles } : {}), platformKey: "", virtualKey: `vk-${id}` },
       });
     });
     fake = await FakeIdentity.start();
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     Object.assign(process.env, {
-      SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", LLM_KEY_SOURCE: "platformKey", AUTH_INTERNAL_TOKEN: "t", APP_ENV: "production", CLAW_REMOTE_AGENTS_ENABLED: "true",
+      SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t", APP_ENV: "production", CLAW_REMOTE_AGENTS_ENABLED: "true",
     });
     delete process.env.CLAW_INSECURE_DEV_AUTH;
     delete process.env.CLAW_DEPLOY_MODE;
+    process.env.CLAW_AUTH_PROVIDER = "safe";
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
     ({ getCachedUserLlmKey } = await import("../src/llm/client.js"));
     const { authMiddleware, getUser } = await import("../src/auth/middleware.js");

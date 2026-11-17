@@ -112,6 +112,7 @@ same client, so they cannot be configured to disagree.
       key: {{ dig "clientSecret" "key" "client-secret" $i | quote }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_DISCOVERY_URL" "value" $i.discoveryUrl) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_INTROSPECTION_URL" "value" (dig "endpoints" "introspection" "" $i)) }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_API_URL" "value" (dig "endpoints" "api" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_TOKEN_URL" "value" (dig "endpoints" "token" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_JWKS_URL" "value" (dig "endpoints" "jwks" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_INTROSPECTION_CACHE_SECONDS" "value" (dig "cache" "positiveSeconds" "" $i)) }}
@@ -124,15 +125,34 @@ same client, so they cannot be configured to disagree.
 {{- end -}}
 
 {{- /*
+Resolve secret.llmKeySource: virtualKey (default) or platformKey.
+Empty falls back to virtualKey; no URL sniffing.
+*/ -}}
+{{- define "primus-claw.llmKeySource" -}}
+{{- $raw := .Values.secret.llmKeySource | default "" | toString | trim -}}
+{{- if eq $raw "" -}}
+virtualKey
+{{- else if or (eq $raw "virtualKey") (eq $raw "platformKey") -}}
+{{- $raw -}}
+{{- else -}}
+{{- fail (printf "secret.llmKeySource must be virtualKey or platformKey, got %q" $raw) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 CLAW_AUTH_PROVIDER for the API: identity.authProvider, default "safe".
 The identity provider verifies callers with the identity client, so it needs identity.enabled
-and identity.endpoints.introspection.
+and identity.endpoints.introspection. It also needs LLM_KEY_SOURCE=platformKey because
+IdentityVerifier leaves virtualKey empty.
 */ -}}
 {{- define "primus-claw.authProviderEnv" -}}
 {{- $i := .Values.identity | default dict -}}
 {{- $p := $i.authProvider | default "safe" -}}
 {{- if and (eq $p "identity") (or (not $i.enabled) (not (dig "endpoints" "introspection" "" $i))) -}}
 {{- fail "identity.authProvider=identity needs identity.enabled and identity.endpoints.introspection" -}}
+{{- end -}}
+{{- if and (eq $p "identity") (ne (include "primus-claw.llmKeySource" .) "platformKey") -}}
+{{- fail "identity.authProvider=identity requires secret.llmKeySource=platformKey (IdentityVerifier leaves virtualKey empty)" -}}
 {{- end -}}
 - name: CLAW_AUTH_PROVIDER
   value: {{ $p | quote }}

@@ -526,14 +526,13 @@ secret:
   # Named rather than "capture the response headers", because these are logged
   # and response headers carry credentials. Empty is off, and off is default.
   llmDebugResponseHeaders: ""
-  # When either base URL contains /api/v1/llm-proxy, LLM_KEY_SOURCE defaults to
-  # platformKey (SaFE puts the user's LiteLLM virtual key on the request). Otherwise
-  # it stays virtualKey. Set llmKeySource to override.
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
-  # Empty: platformKey when either base URL contains /api/v1/llm-proxy, else virtualKey.
-  llmKeySource: ""
+  # virtualKey (default): the caller's own gateway key.
+  # platformKey: SaFE's /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request.
+  # Required when identity.authProvider=identity (IdentityVerifier leaves virtualKey empty).
+  llmKeySource: virtualKey
   byokVerifyModelsUrl: ""
   byokVerifyApiStyle: openai
   cursorApiKey: ""
@@ -587,8 +586,10 @@ identity:
   # Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER), for the API.
   # "safe": SaFE's /api/v1/auth/verify returns the user and the platform key.
   # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
-  # (GET /api/v1/apikeys/platform on the origin of endpoints.introspection).
-  # Needs identity.enabled and endpoints.introspection.
+  # (GET /api/v1/apikeys/platform on endpoints.api, or the origin of endpoints.introspection).
+  # Needs identity.enabled, endpoints.introspection, and secret.llmKeySource=platformKey.
+  # Provider roles (including system-admin) become Claw platform roles verbatim.
+  # Access-token callers under this provider get no SaFE-exchanged LLM/sandbox keys.
   authProvider: safe
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
   issuerUrl: ""
@@ -604,12 +605,16 @@ identity:
   # never discovered; with all three pinned discovery is not fetched at all.
   endpoints:
     introspection: ""
+    # Base URL for identity HTTP APIs (platform key). Empty: origin of introspection.
+    api: ""
     token: ""
     jwks: ""
   cache:
     positiveSeconds: ""      # active answers, default 30; 0 = not cached
     negativeSeconds: ""      # inactive answers, default 5; 0 = not cached
-    staleIfErrorSeconds: ""  # stale active answers while the provider is down, default 1800; 0 = never
+    # Stale active answers while the provider is down, default 1800; 0 = never.
+    # Primary cookie/ak- auth always uses allowStale=false regardless of this value.
+    staleIfErrorSeconds: ""
   requestTimeoutMs: ""       # default 5000
   keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
   exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30

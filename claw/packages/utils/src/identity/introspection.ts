@@ -63,6 +63,12 @@ export interface IntrospectOptions {
    * is still served stale as before, inside its stale window.
    */
   maxAgeMs?: number;
+  /**
+   * When false, a failed refresh never falls back to a cached active answer (the default stale-if-error window).
+   * Primary authentication uses this so a revoked credential is not accepted during an identity outage.
+   * Omitted or true keeps the existing stale-if-error behaviour.
+   */
+  allowStale?: boolean;
 }
 
 interface Entry {
@@ -154,11 +160,12 @@ export class Introspector {
     const now = this.deps.now();
     const entry = this.entries.get(key);
     const youngEnough = (e: Entry): boolean => opts.maxAgeMs === undefined || now < e.fetchedAt + Math.max(0, opts.maxAgeMs);
+    const allowStale = opts.allowStale !== false;
     if (entry && now < entry.freshUntil && youngEnough(entry)) {
       this.deps.metrics.onCache("introspection", entry.result.active ? "hit" : "hit_negative");
       return entry.result;
     }
-    if (entry && this.canServeStale(entry, now) && now < entry.retryAt) {
+    if (allowStale && entry && this.canServeStale(entry, now) && now < entry.retryAt) {
       this.deps.metrics.onStaleServed("introspection");
       return entry.result;
     }
@@ -178,6 +185,7 @@ export class Introspector {
       return await flight;
     } catch (err) {
       if (
+        allowStale &&
         entry && err instanceof IdentityUnavailableError && err.reason !== "client_rejected" &&
         this.canServeStale(entry, this.deps.now())
       ) {

@@ -366,8 +366,9 @@ export async function verifyIdentityAccessToken(
         error: { status: 500, legacyError: "authentication_misconfigured", anthropicType: "api_error", message: keys.message },
       };
     }
-    if (keys.status === "none" && keys.reason !== "no_safe") {
+    if (keys.status === "none" && keys.reason !== "no_safe" && keys.reason !== "identity_provider") {
       // Not an error of the request, but this user has no key for model calls or sandboxes: the log is where that is visible.
+      // identity_provider is expected in CLAW_AUTH_PROVIDER=identity (no SaFE key exchange); skip the per-request warn.
       logger.warn({ path: pathname, userId: sub, reason: keys.reason }, "auth.identity_token.no_safe_keys");
     }
     const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);

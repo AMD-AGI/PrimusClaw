@@ -7,14 +7,16 @@
  * The same calls as {@link SafeClient} (`verifyCookie`, `verifyApiKey`), so the credential paths of the
  * middleware are unchanged; only who answers differs.
  *
- *   - Every credential is judged by the identity service's RFC 7662 introspection: an `ak-` key, or the session
+ *   - Every credential is judged by the identity service's RFC 7662 introspection with allowStale: false
+ *     (a revoked credential is never accepted from cache during an outage): an `ak-` key, or the session
  *     token of the `Token` cookie (with its `userType`). The caller is the answer's `sub`; the roles are the
  *     answer's `roles` (the user's groups plus `default`).
  *   - The platform key of an `ak-` caller is the key it presented. The platform key of a session caller is the
  *     one the identity service keeps for the user, read with that session from `GET /api/v1/apikeys/platform`
- *     on the origin of IDENTITY_INTROSPECTION_URL and kept here per user. A user without one is refused with
- *     {@link PlatformKeyMissingError}.
- *   - There is no virtual key: LLM calls use the platform key through SaFE's LLM proxy.
+ *     on IDENTITY_API_URL (or the origin of IDENTITY_INTROSPECTION_URL) and kept here per user. A user without
+ *     one (404/405 or empty key) is refused with {@link PlatformKeyMissingError}.
+ *   - virtualKey is empty. This provider requires LLM_KEY_SOURCE=platformKey so Engines and the sandbox use
+ *     the platform key for the LLM gateway.
  *
  * Failures are reported with the error classes of {@link SafeClient}, so the middleware maps them the same way:
  * the identity service that cannot be reached is a 503, a client it refuses is a 500, a refused credential a 401.
@@ -47,10 +49,22 @@ export class PlatformKeyMissingError extends Error {
 type ActiveAnswer = Extract<IntrospectionResult, { active: true }>;
 
 /**
- * The identity service's own address: the origin of its introspection endpoint (IDENTITY_INTROSPECTION_URL), which
- * also serves the platform key endpoint. Empty when that is not a usable http(s) URL.
+ * Base URL for identity HTTP APIs (platform key). Prefer IDENTITY_API_URL when set;
+ * otherwise the origin of IDENTITY_INTROSPECTION_URL. Empty when neither is a usable http(s) URL.
  */
-export function identityServiceOrigin(introspectionUrl: string | undefined): string {
+export function identityServiceOrigin(
+  introspectionUrl: string | undefined,
+  apiUrl: string | undefined = process.env.IDENTITY_API_URL,
+): string {
+  const explicit = (apiUrl ?? "").trim();
+  if (explicit) {
+    try {
+      const u = new URL(explicit);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.origin;
+    } catch {
+      /* fall through */
+    }
+  }
   try {
     const u = new URL((introspectionUrl ?? "").trim());
     return u.protocol === "http:" || u.protocol === "https:" ? u.origin : "";
@@ -71,10 +85,15 @@ export class IdentityVerifier {
     private readonly timeoutMs = 10_000,
   ) {}
 
-  /** Verify an `ak-` key; the key itself is the caller's platform key. */
-  async verifyApiKey(apiKey: string): Promise<UserInfo> {
+  /**
+   * Verify an `ak-` key; the key itself is the caller's platform key.
+   * When clientIp is set it is sent as client_ip for IP-bound keys.
+   */
+  async verifyApiKey(apiKey: string, clientIp?: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
-    const answer = await this.introspect(apiKey, {}, "invalid or expired API key");
+    const params: Record<string, string> = {};
+    if (clientIp) params.client_ip = clientIp;
+    const answer = await this.introspect(apiKey, params, "invalid or expired API key");
     if (answer.tokenType !== "api_key") throw new Error("invalid or expired API key");
     return userOf(answer, apiKey);
   }
@@ -92,7 +111,8 @@ export class IdentityVerifier {
   private async introspect(token: string, params: Record<string, string>, invalidMsg: string): Promise<ActiveAnswer> {
     let answer: IntrospectionResult;
     try {
-      answer = await this.identity.introspect(token, { params });
+      // Primary auth must not accept a stale active answer during an identity outage.
+      answer = await this.identity.introspect(token, { params, allowStale: false });
     } catch (err) {
       if (err instanceof IdentityUnavailableError) {
         if (err.reason === "client_rejected") {
@@ -131,9 +151,14 @@ export class IdentityVerifier {
     } catch (err) {
       throw new AuthUpstreamUnreachableError("cannot reach the identity service to read the platform key", err);
     }
+    // 404: no platform key for this user. 405: route not mounted (API keys on, platform keys off).
     if (resp.status === 404) {
+      throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
+    }
+    if (resp.status === 405) {
       throw new AuthServiceMisconfiguredError("the identity service does not serve platform keys (needs API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)");
     }
+    if (resp.status === 401 || resp.status === 403) throw new Error("invalid or expired cookie");
     if (!resp.ok) throw new SafeUpstreamHttpError({ status: resp.status, bodySnippet: "" });
     let body: Record<string, unknown>;
     try {

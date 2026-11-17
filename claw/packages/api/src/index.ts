@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
-  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider,
+  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider, envBool, LLM_KEY_SOURCE,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
@@ -116,7 +116,7 @@ function validateStartupConfig(): void {
     if (!SAFE_API_URL) missing.push("SAFE_API_URL");
     if (!AUTH_INTERNAL_TOKEN) missing.push("AUTH_INTERNAL_TOKEN");
     if (isIdentityAuthProvider()) {
-      if (!["true", "1", "yes"].includes((process.env.IDENTITY_CLIENT_ENABLED ?? "").trim().toLowerCase())) {
+      if (!envBool("IDENTITY_CLIENT_ENABLED", false)) {
         missing.push("IDENTITY_CLIENT_ENABLED");
       }
       if (!identityServiceOrigin(process.env.IDENTITY_INTROSPECTION_URL)) missing.push("IDENTITY_INTROSPECTION_URL");
@@ -161,6 +161,20 @@ function assertNoSharedIdentityBypass(): void {
       "every caller a system-admin and the key lets them act as the cluster's shared " +
       "identity; together they let anyone who can reach this port create workloads " +
       "owned by nobody. Unset one.",
+  );
+}
+
+/**
+ * Refuse identity auth without LLM_KEY_SOURCE=platformKey: IdentityVerifier leaves
+ * virtualKey empty, so virtualKey mode would silently fall back to the deployment key.
+ */
+function assertIdentityUsesPlatformKey(): void {
+  if (!isIdentityAuthProvider()) return;
+  if (LLM_KEY_SOURCE === "platformKey") return;
+  logger.error({ LLM_KEY_SOURCE }, "startup.identity_requires_platform_key");
+  throw new Error(
+    "CLAW_AUTH_PROVIDER=identity requires LLM_KEY_SOURCE=platformKey: the identity " +
+      "verifier leaves virtualKey empty, so Engines and the sandbox must use the platform key.",
   );
 }
 
@@ -228,6 +242,7 @@ async function main() {
     logBackgroundOff(logger);
   }
   assertNoSharedIdentityBypass();
+  assertIdentityUsesPlatformKey();
   assertRunLeaseTiming();
   assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
   assertTriggerToolsConfig(CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY);

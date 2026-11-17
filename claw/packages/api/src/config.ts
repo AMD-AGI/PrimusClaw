@@ -180,8 +180,8 @@ export function isIdentityAuthProvider(): boolean {
 // --- LLM key source ---
 // LLM_KEY_SOURCE: "virtualKey" (default) sends the caller's own gateway key.
 // "platformKey" sends the user's platform key (SaFE's /api/v1/llm-proxy puts the
-// user's LiteLLM virtual key on the request). The chart sets platformKey when
-// the LLM base URLs name /api/v1/llm-proxy.
+// user's LiteLLM virtual key on the request). CLAW_AUTH_PROVIDER=identity requires
+// platformKey because IdentityVerifier leaves virtualKey empty.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
   env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";

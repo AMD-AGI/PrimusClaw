@@ -16,7 +16,7 @@ delete process.env.IDENTITY_CLIENT_ENABLED;
 delete process.env.CLAW_INSECURE_DEV_AUTH;
 process.env.APP_ENV = "production";
 
-const { IdentityVerifier, identityServiceOrigin } = await import("../src/auth/identity-verifier.js");
+const { IdentityVerifier, identityServiceOrigin, PlatformKeyMissingError } = await import("../src/auth/identity-verifier.js");
 const { AuthServiceMisconfiguredError, AuthUpstreamUnreachableError } = await import("../src/auth/safe-client.js");
 const config = await import("../src/config.js");
 
@@ -28,10 +28,13 @@ function active(over: Partial<Extract<IntrospectionResult, { active: true }>>): 
 
 /** A fake identity service: introspection answers by token, the platform key endpoint by bearer session. */
 function fakeIdentity(answers: Record<string, IntrospectionResult | Error>, keys: Record<string, { status: number; body?: unknown }>) {
-  const seen = { introspect: [] as { token: string; params?: Record<string, string> }[], fetch: [] as { url: string; method?: string; headers: Record<string, string> }[] };
+  const seen = {
+    introspect: [] as { token: string; params?: Record<string, string>; allowStale?: boolean }[],
+    fetch: [] as { url: string; method?: string; headers: Record<string, string> }[],
+  };
   const identity = {
-    introspect: async (token: string, opts: { params?: Record<string, string> } = {}) => {
-      seen.introspect.push({ token, params: opts.params });
+    introspect: async (token: string, opts: { params?: Record<string, string>; allowStale?: boolean } = {}) => {
+      seen.introspect.push({ token, params: opts.params, allowStale: opts.allowStale });
       const a = answers[token];
       if (a instanceof Error) throw a;
       return a ?? { active: false as const };
@@ -52,12 +55,16 @@ test("CLAW_AUTH_PROVIDER=identity selects the identity provider, and the default
   assert.equal(config.LLM_KEY_SOURCE, "virtualKey");
 });
 
-test("the identity service's address is the origin of its introspection endpoint", () => {
-  assert.equal(identityServiceOrigin("http://primus-identity.primus-identity.svc.cluster.local/oauth/introspect"),
-    "http://primus-identity.primus-identity.svc.cluster.local");
+test("the identity service's address prefers IDENTITY_API_URL, else the origin of introspection", () => {
+  assert.equal(identityServiceOrigin("http://identity.example.test/oauth/introspect"),
+    "http://identity.example.test");
   assert.equal(identityServiceOrigin("https://id.example.test:8443/oauth/introspect"), "https://id.example.test:8443");
   assert.equal(identityServiceOrigin(undefined), "");
   assert.equal(identityServiceOrigin("ftp://id.example.test/x"), "");
+  assert.equal(
+    identityServiceOrigin("http://identity.example.test/prefix/oauth/introspect", "https://api.example.test/id"),
+    "https://api.example.test",
+  );
 });
 
 test("a session cookie is the introspected user, with the platform key read with that session and kept", async () => {
@@ -70,7 +77,7 @@ test("a session cookie is the introspected user, with the platform key read with
     userId: "u-alice", userName: "Alice", email: "alice@example.test", roles: ["system-admin", "default"],
     platformKey: "ak-alice-platform", virtualKey: "",
   });
-  assert.deepEqual(seen.introspect[0], { token: "sess-alice", params: { user_type: "sso" } });
+  assert.deepEqual(seen.introspect[0], { token: "sess-alice", params: { user_type: "sso" }, allowStale: false });
   assert.equal(seen.fetch[0]!.url, `${API}/api/v1/apikeys/platform`);
   assert.equal(seen.fetch[0]!.method, "GET");
   assert.equal(seen.fetch[0]!.headers.UserType, "sso");
@@ -173,7 +180,7 @@ test("an identity service that cannot answer is unavailable; one that refuses th
   );
   await assert.rejects(verifier.verifyApiKey("ak-down"), AuthUpstreamUnreachableError);
   await assert.rejects(verifier.verifyApiKey("ak-refused"), AuthServiceMisconfiguredError);
-  await assert.rejects(verifier.verifyCookie("sess-nokeys"), AuthServiceMisconfiguredError);
+  await assert.rejects(verifier.verifyCookie("sess-nokeys"), PlatformKeyMissingError);
 });
 
 test("without the identity client the middleware answers 500 authentication_misconfigured", async () => {
@@ -211,4 +218,39 @@ test("an identity service that cannot be reached is a 503 that names the identit
   } finally {
     await app.close();
   }
+});
+
+test("primary auth introspects with allowStale false and forwards client_ip for ak- keys", async () => {
+  const { verifier, seen } = fakeIdentity(
+    { "ak-bound": active({ sub: "u-bound", tokenType: "api_key", roles: ["default"] }) },
+    {},
+  );
+  await verifier.verifyApiKey("ak-bound", "203.0.113.9");
+  assert.equal(seen.introspect[0]!.allowStale, false);
+  assert.equal(seen.introspect[0]!.params?.client_ip, "203.0.113.9");
+  await verifier.verifyCookie("sess-missing", "sso").catch(() => undefined);
+  const cookieCall = seen.introspect.find((c) => c.token === "sess-missing");
+  assert.equal(cookieCall?.allowStale, false);
+});
+
+test("platform-key 405 is misconfigured; 5xx and non-JSON are upstream failures", async () => {
+  const { SafeUpstreamHttpError, SafeUpstreamProtocolError } = await import("../src/auth/safe-client.js");
+  const noRoute = fakeIdentity(
+    { "sess-405": active({ sub: "u-405", tokenType: "session" }) },
+    { "sess-405": { status: 405 } },
+  );
+  await assert.rejects(noRoute.verifier.verifyCookie("sess-405"), AuthServiceMisconfiguredError);
+
+  const five = fakeIdentity(
+    { "sess-500": active({ sub: "u-500", tokenType: "session" }) },
+    { "sess-500": { status: 500, body: { error: "boom" } } },
+  );
+  await assert.rejects(five.verifier.verifyCookie("sess-500"), SafeUpstreamHttpError);
+
+  const identity = {
+    introspect: async () => active({ sub: "u-bad", tokenType: "session" }),
+  };
+  const fetchFn = (async () => new Response("not-json", { status: 200 })) as typeof fetch;
+  const verifier = new IdentityVerifier(identity as never, API, fetchFn);
+  await assert.rejects(verifier.verifyCookie("sess-bad"), SafeUpstreamProtocolError);
 });
