@@ -61,7 +61,7 @@ import {
 } from "./app-run-store.js";
 import {
   BOOTSTRAP_FILE_MODES, EXIT_ABSENT, INPUT_FILE, INPUT_FILE_MODES, STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED, buildAppEnv,
-  needsUserDataPath,
+  needsUserDataPath, USER_ID_CARRIER,
   expandStateDirCommand, generationTag, isUsableStateDir, killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand,
   stopCommand, writeFileCommand,
   type FileModes, type ProbeVerdict,
@@ -951,8 +951,12 @@ export class AppRunner {
     const startEnv = appStartEnv(this.rec.sandbox_spec, env, this.platformKey);
     // The derivation reads USER_ID, which must be the sandbox's own (SaFE's, as the state
     // directory was expanded with), never one the manifest's env lays over it: that would
-    // point the application at another user's directory.
-    if (roots.length > 0) delete startEnv.USER_ID;
+    // point the application at another user's directory. The application's own USER_ID
+    // rides under another name and is restored after the derivation (startCommand).
+    if (roots.length > 0 && startEnv.USER_ID !== undefined) {
+      startEnv[USER_ID_CARRIER] = startEnv.USER_ID;
+      delete startEnv.USER_ID;
+    }
     const r = await this.deps.sandbox.exec(
       inst, startCommand(this.rec.manifest, stateDir, this.tag(), roots), EXEC_TIMEOUT, { env: startEnv },
     );

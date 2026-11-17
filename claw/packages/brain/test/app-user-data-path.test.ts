@@ -23,7 +23,8 @@
  *   U11 an application that names USER_DATA_PATH only in its command or bootstrap still gets it, and
  *       fails at once, saying so, when it cannot be created
  *
- *   U13 a manifest env USER_ID does not steer the derivation to another user's directory
+ *   U13 a manifest env USER_ID does not steer the derivation to another user's directory, and the app still gets it
+ *   U14 with an injected USER_DATA_PATH the app gets its env's USER_ID and the injected path, as before
  *
  * The shell runs in a real `sh` whose environment has no USER_DATA_PATH unless a
  * test puts one there.
@@ -256,7 +257,8 @@ test("U12 needsUserDataPath: the state_dir, the command or the bootstrap file na
 test("U13 a manifest env USER_ID does not steer the derivation: the application gets the sandbox's own user directory", async () => {
   const root = fresh();
   const { world, runner } = shellRunner({ USER_ID: UID }, [root],
-    'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
+    'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf %s "$USER_ID" > "$APP_STATE_DIR/uid.txt"; env > "$APP_STATE_DIR/env.txt"; '
+      + 'printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
     { env: { USER_ID: "someone-else" } });
   const result = await runner.run(AbortSignal.timeout(30_000));
   assert.equal(result.kind === "ended" && result.outcome.success, true, JSON.stringify(result));
@@ -264,4 +266,22 @@ test("U13 a manifest env USER_ID does not steer the derivation: the application 
   assert.equal(world.rec.state_dir, stateDir);
   assert.equal(readFileSync(`${stateDir}/udp.txt`, "utf8"), `${root}/users/${UID}`);
   assert.equal(existsSync(join(root, "users", "someone-else")), false);
+  assert.equal(readFileSync(`${stateDir}/uid.txt`, "utf8"), "someone-else", "the application still gets the USER_ID its env sets");
+  assert.doesNotMatch(readFileSync(`${stateDir}/env.txt`, "utf8"), /^CLAW_APP_USER_ID=/m, "and not the carrier");
+});
+
+test("U14 with SaFE's USER_DATA_PATH injected, the application gets its env's USER_ID and the injected path, as before", async () => {
+  const root = fresh();
+  const injected = fresh();
+  const { world, runner } = shellRunner({ USER_ID: UID, USER_DATA_PATH: injected }, [root],
+    'printf %s "$USER_DATA_PATH" > "$APP_STATE_DIR/udp.txt"; printf %s "$USER_ID" > "$APP_STATE_DIR/uid.txt"; '
+      + 'printf \'{"final":true,"returncode":0}\' > "$APP_STATE_DIR/exit.json"',
+    { env: { USER_ID: "from-manifest" } });
+  const result = await runner.run(AbortSignal.timeout(30_000));
+  assert.equal(result.kind === "ended" && result.outcome.success, true, JSON.stringify(result));
+  const stateDir = `${injected}/.claw-apps/${RUN_ID}`;
+  assert.equal(world.rec.state_dir, stateDir);
+  assert.equal(readFileSync(`${stateDir}/udp.txt`, "utf8"), injected);
+  assert.equal(readFileSync(`${stateDir}/uid.txt`, "utf8"), "from-manifest");
+  assert.equal(existsSync(join(root, "users")), false);
 });

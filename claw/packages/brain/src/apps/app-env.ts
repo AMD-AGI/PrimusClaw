@@ -42,6 +42,13 @@ export const STATE_DIR_NO_USER_DATA = 4;
 /** Exit status of a command whose derived user data directory could not be created. */
 export const USER_DATA_DIR_NOT_CREATED = 5;
 
+/**
+ * Where the start command's env map carries a `USER_ID` of the application's env while
+ * the derivation runs: the derivation must read the sandbox's own (SaFE's), and the
+ * application must still get its own. See {@link startCommand}.
+ */
+export const USER_ID_CARRIER = "CLAW_APP_USER_ID";
+
 /** The users directory below a volume's mount path, as SaFE names it (`UserDirsPath`). */
 export const USER_DIRS = "users";
 
@@ -226,10 +233,15 @@ export function startCommand(manifest: AppManifestV1, stateDir: string, tag: str
   const workload = tag.slice(0, tag.lastIndexOf(":"));
   const argv = manifest.command.map(shq).join(" ");
   const events = manifest.events ? `mkdir -p ${shq(`${stateDir}/${manifest.events.dir}`)} && ` : "";
-  // The application gets the same USER_DATA_PATH the state directory was expanded with.
+  // The application gets the same USER_DATA_PATH the state directory was expanded with,
+  // derived from the sandbox's own USER_ID; a USER_ID of the application's env, carried
+  // under another name past the derivation (see USER_ID_CARRIER), is its own again after.
   const prelude = userDataPathPrelude(roots);
   return [
-    ...(prelude ? [prelude.replace(/; $/, "")] : []),
+    ...(prelude ? [
+      prelude.replace(/; $/, ""),
+      `if [ -n "\${${USER_ID_CARRIER}+x}" ]; then USER_ID="$${USER_ID_CARRIER}"; export USER_ID; unset ${USER_ID_CARRIER}; fi`,
+    ] : []),
     `mkdir -p ${d} && ${events}cd ${d} || exit 1`,
     // The lock is a symlink whose target is "<pid>|<sandbox>": creating it is one
     // atomic step that also writes the holder, so a contender never sees a lock with
