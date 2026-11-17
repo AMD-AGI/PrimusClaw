@@ -59,6 +59,12 @@ test("U1 a USER_DATA_PATH SaFE injected wins: nothing is derived or created", as
   assert.equal(r.exitCode, 0);
   assert.equal(r.stdout, `${injected}/.claw-apps/${RUN_ID}`);
   assert.equal(existsSync(join(root, "users")), false, "the derived directory is not made");
+  // Nothing is created or checked for an injected value either: one that could not be created still expands as before.
+  const file = join(fresh(), "a-file");
+  writeFileSync(file, "x");
+  const uncreatable = await sh(expandStateDirCommand(TEMPLATE, RUN_ID, [root]), { USER_DATA_PATH: `${file}/sub`, USER_ID: UID });
+  assert.equal(uncreatable.exitCode, 0);
+  assert.equal(uncreatable.stdout, `${file}/sub/.claw-apps/${RUN_ID}`);
 });
 
 test("U2 absent: {mountPath}/users/{USER_ID} of the first mounted root, created", async () => {
