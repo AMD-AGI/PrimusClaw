@@ -20,7 +20,7 @@ process.env.APP_ENV = "production";
 delete process.env.CLAW_INSECURE_DEV_AUTH;
 process.env.CLAW_DEPLOY_MODE = "safe";
 process.env.CLAW_AUTH_PROVIDER = "safe";
-delete process.env.LLM_KEY_SOURCE;
+process.env.LLM_KEY_SOURCE = "platformKey";
 
 test("no gateway configured is a 503 llm_gateway_not_configured", async () => {
   const { registerModelsRoutes } = await import("../src/routes/models.js");

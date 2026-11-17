@@ -46,10 +46,10 @@ function fakeIdentity(answers: Record<string, IntrospectionResult | Error>, keys
   return { verifier: new IdentityVerifier(identity as never, API, fetchFn), seen };
 }
 
-test("CLAW_AUTH_PROVIDER=identity selects the identity provider, and LLM calls use the platform key", () => {
+test("CLAW_AUTH_PROVIDER=identity selects the identity provider, and the default LLM key source is the virtual key", () => {
   assert.equal(config.CLAW_AUTH_PROVIDER, "identity");
   assert.equal(config.isIdentityAuthProvider(), true);
-  assert.equal(config.LLM_KEY_SOURCE, "platformKey");
+  assert.equal(config.LLM_KEY_SOURCE, "virtualKey");
 });
 
 test("the identity service's address is the origin of its introspection endpoint", () => {

@@ -62,7 +62,7 @@ Object.assign(process.env, {
   CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: `${SERVICE} svc-answers-only`,
   CLAW_IDENTITY_TOKEN_AUTH_ENABLED: "true",
   RUN_FAT_PREPARING_RECONCILE: "true",
-  CLAW_AUTH_PROVIDER: "safe",
+  CLAW_AUTH_PROVIDER: "safe", LLM_KEY_SOURCE: "platformKey",
   SAFE_API_URL: `http://127.0.0.1:${(safe.address() as AddressInfo).port}`,
   AUTH_INTERNAL_TOKEN: "internal-token-for-tests",
 });

@@ -3,7 +3,7 @@
 
 /**
  * SaFE deploy mode with no CLAW_AUTH_PROVIDER and no LLM_KEY_SOURCE: SaFE verifies callers, LLM calls use the
- * platform key, and SaFE's verify is asked for the platform key only.
+ * virtual key, and SaFE's verify is asked for both keys.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -23,7 +23,7 @@ async function verifyBodyOf(client: InstanceType<typeof SafeClient>): Promise<Re
   let body: Record<string, unknown> = {};
   globalThis.fetch = (async (_url: string, init: RequestInit) => {
     body = JSON.parse(String(init.body));
-    return new Response(JSON.stringify({ id: "u-1", name: "u", platformKey: "ak-u-1" }), { status: 200 });
+    return new Response(JSON.stringify({ id: "u-1", name: "u", platformKey: "ak-u-1", virtualKey: "vk-u-1" }), { status: 200 });
   }) as typeof fetch;
   try {
     await client.verifyApiKey("ak-u-1");
@@ -33,14 +33,14 @@ async function verifyBodyOf(client: InstanceType<typeof SafeClient>): Promise<Re
   return body;
 }
 
-test("the provider is safe by default, and LLM calls use the platform key", () => {
+test("the provider is safe by default, and LLM calls use the virtual key", () => {
   assert.equal(config.CLAW_AUTH_PROVIDER, "safe");
   assert.equal(config.isIdentityAuthProvider(), false);
-  assert.equal(config.LLM_KEY_SOURCE, "platformKey");
+  assert.equal(config.LLM_KEY_SOURCE, "virtualKey");
 });
 
-test("SaFE's verify is asked for the platform key only", async () => {
+test("SaFE's verify is asked for the platform key and the virtual key", async () => {
   const body = await verifyBodyOf(new SafeClient("http://safe.test"));
   assert.equal(body.includePlatformKey, true);
-  assert.equal(body.includeVirtualKey, undefined);
+  assert.equal(body.includeVirtualKey, true);
 });

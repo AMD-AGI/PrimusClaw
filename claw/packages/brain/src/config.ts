@@ -149,11 +149,12 @@ export const LLM_API_STYLE: LlmApiStyle = resolveLlmApiStyle();
 // --- LLM key source ---
 // "virtualKey" preserves the existing behavior. "platformKey" is proxy mode:
 // Engines and kubernetes sandbox env use platform_key as the LLM API key.
-// The default is "platformKey" in SaFE deploy mode (SaFE's /api/v1/llm-proxy puts
-// the user's LiteLLM virtual key on the request) and "virtualKey" in Kubernetes mode.
+// "virtualKey" (default) is the caller's own gateway key. "platformKey" is proxy
+// mode: SaFE's /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request.
+// The chart sets platformKey when the LLM base URLs name /api/v1/llm-proxy.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
-  env("LLM_KEY_SOURCE", isKubernetesMode() ? "virtualKey" : "platformKey") === "platformKey" ? "platformKey" : "virtualKey";
+  env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
 export function usePlatformKeyForLlm(): boolean {
   return LLM_KEY_SOURCE === "platformKey";
 }

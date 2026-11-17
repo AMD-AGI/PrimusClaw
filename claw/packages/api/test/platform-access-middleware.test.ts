@@ -100,7 +100,7 @@ describe("the platform-role requirement through the authentication hook", () => 
     fake = await FakeIdentity.start();
     fake.jwks = () => ({ body: { keys: [es.jwk] } });
     Object.assign(process.env, {
-      SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t", APP_ENV: "production", CLAW_REMOTE_AGENTS_ENABLED: "true",
+      SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", LLM_KEY_SOURCE: "platformKey", AUTH_INTERNAL_TOKEN: "t", APP_ENV: "production", CLAW_REMOTE_AGENTS_ENABLED: "true",
     });
     delete process.env.CLAW_INSECURE_DEV_AUTH;
     delete process.env.CLAW_DEPLOY_MODE;

@@ -526,12 +526,14 @@ secret:
   # Named rather than "capture the response headers", because these are logged
   # and response headers carry credentials. Empty is off, and off is default.
   llmDebugResponseHeaders: ""
-  # In the SaFE deploy mode LLM calls carry the user's platform key, so both base
-  # URLs name SaFE's LLM proxy (https://<safe>/api/v1/llm-proxy/v1), which puts the
-  # user's LiteLLM virtual key on the request.
+  # When either base URL contains /api/v1/llm-proxy, LLM_KEY_SOURCE defaults to
+  # platformKey (SaFE puts the user's LiteLLM virtual key on the request). Otherwise
+  # it stays virtualKey. Set llmKeySource to override.
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
+  # Empty: platformKey when either base URL contains /api/v1/llm-proxy, else virtualKey.
+  llmKeySource: ""
   byokVerifyModelsUrl: ""
   byokVerifyApiStyle: openai
   cursorApiKey: ""

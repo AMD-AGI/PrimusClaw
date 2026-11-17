@@ -1,13 +1,13 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/** SaFE deploy mode with LLM_KEY_SOURCE=virtualKey: LLM calls use the virtual key, and SaFE's verify is asked for it. */
+/** SaFE deploy mode with LLM_KEY_SOURCE=platformKey: LLM calls use the platform key, and SaFE's verify is not asked for the virtual key. */
 import test from "node:test";
 import assert from "node:assert/strict";
 
 delete process.env.CLAW_DEPLOY_MODE;
 delete process.env.CLAW_AUTH_PROVIDER;
-process.env.LLM_KEY_SOURCE = "virtualKey";
+process.env.LLM_KEY_SOURCE = "platformKey";
 process.env.APP_ENV = "production";
 process.env.AUTH_INTERNAL_TOKEN = "test-internal-token";
 
@@ -30,12 +30,12 @@ async function verifyBodyOf(client: InstanceType<typeof SafeClient>): Promise<Re
   return body;
 }
 
-test("an explicit LLM_KEY_SOURCE=virtualKey is kept in SaFE deploy mode", () => {
-  assert.equal(config.LLM_KEY_SOURCE, "virtualKey");
+test("an explicit LLM_KEY_SOURCE=platformKey is kept in SaFE deploy mode", () => {
+  assert.equal(config.LLM_KEY_SOURCE, "platformKey");
 });
 
-test("SaFE's verify is asked for the platform key and the virtual key", async () => {
+test("SaFE's verify is asked for the platform key only", async () => {
   const body = await verifyBodyOf(new SafeClient("http://safe.test"));
   assert.equal(body.includePlatformKey, true);
-  assert.equal(body.includeVirtualKey, true);
+  assert.equal(body.includeVirtualKey, undefined);
 });

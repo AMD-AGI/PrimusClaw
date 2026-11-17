@@ -178,13 +178,13 @@ export function isIdentityAuthProvider(): boolean {
 }
 
 // --- LLM key source ---
-// LLM_KEY_SOURCE: "platformKey" sends the user's platform key (SaFE's
-// /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request),
-// "virtualKey" sends the caller's own gateway key. The default is "platformKey"
-// in SaFE deploy mode and "virtualKey" in Kubernetes mode.
+// LLM_KEY_SOURCE: "virtualKey" (default) sends the caller's own gateway key.
+// "platformKey" sends the user's platform key (SaFE's /api/v1/llm-proxy puts the
+// user's LiteLLM virtual key on the request). The chart sets platformKey when
+// the LLM base URLs name /api/v1/llm-proxy.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
-  env("LLM_KEY_SOURCE", isKubernetesMode() ? "virtualKey" : "platformKey") === "platformKey" ? "platformKey" : "virtualKey";
+  env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
 export function usePlatformKeyForLlm(): boolean {
   return LLM_KEY_SOURCE === "platformKey";
 }

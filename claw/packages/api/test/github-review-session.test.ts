@@ -18,6 +18,7 @@ import type { FastifyInstance } from "fastify";
 
 // Before anything reads the configuration, which is read when its module loads.
 process.env.CLAW_AUTH_PROVIDER = "safe";
+process.env.LLM_KEY_SOURCE = "platformKey";
 process.env.CLAW_GITHUB_REVIEW_ENABLED = "true";
 process.env.CLAW_GITHUB_REVIEW_MCP_SECRET = "t".repeat(40);
 process.env.CLAW_GITHUB_REVIEW_MCP_URL = "http://api.internal.example:8200/v1/internal/github-review/mcp";

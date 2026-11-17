@@ -639,6 +639,7 @@ values = {
         "llmCacheStyle": llm_cache_style,
         "llmDebugResponseHeaders": env("LLM_DEBUG_RESPONSE_HEADERS"),
         "anthropicBaseUrl": anthropic_base,
+        "llmKeySource": env("LLM_KEY_SOURCE", ""),
         "openaiBaseUrl": openai_base,
         "byokVerifyModelsUrl": env("BYOK_VERIFY_MODELS_URL", models_url(provider_base)),
         "byokVerifyApiStyle": env("BYOK_VERIFY_API_STYLE", "openai"),

@@ -66,7 +66,7 @@ before(async () => {
   delete process.env.CLAW_INSECURE_DEV_AUTH;
   process.env.CLAW_DEPLOY_MODE = "safe";
   process.env.CLAW_AUTH_PROVIDER = "safe";
-  delete process.env.LLM_KEY_SOURCE;
+  process.env.LLM_KEY_SOURCE = "platformKey";
   process.env.SAFE_API_URL = platform.url;
   process.env.AUTH_INTERNAL_TOKEN = AUTH_INTERNAL_TOKEN;
   process.env.OPENAI_BASE_URL = gateway.url;

@@ -29,6 +29,7 @@ process.env.TASK_DISPATCH_STAGE_TIMEOUT_MS = "200";
 process.env.SAFE_PLATFORM_KEY = "pk-CLUSTER-SHARED";
 process.env.CLAW_DEPLOY_MODE = "safe";
 process.env.CLAW_AUTH_PROVIDER = "safe";
+process.env.LLM_KEY_SOURCE = "platformKey";
 process.env.USER_ENV_ENCRYPTION_KEY ??= Buffer.alloc(32, 7).toString("base64");
 (await import("../src/crypto/user-env.js")).initUserEnvCrypto();
 

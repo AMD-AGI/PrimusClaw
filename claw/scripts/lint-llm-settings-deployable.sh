@@ -23,7 +23,7 @@ VALUES=claw/deploy/charts/claw/values.yaml
 DEPLOY=claw/deploy/deploy.sh
 
 # Credentials are handed to a session at run time, not baked into the release.
-EXEMPT="ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY LLM_KEY_SOURCE"
+EXEMPT="ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY"
 
 fail=0
 for name in $(grep -oE 'env\("(LLM_|PROMPT_CACHE_)[A-Z0-9_]*"' "$CONFIG" | sed 's/env("//;s/"//' | sort -u); do
