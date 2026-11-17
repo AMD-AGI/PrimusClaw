@@ -35,6 +35,7 @@ import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import { parseWorkloadListPage } from "../sandbox/multi-node/workload-parse.js";
 import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
+import { usableUserDataRoot } from "./app-env.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
@@ -172,6 +173,56 @@ export async function findLiveAppSandboxes(
     if (parsed.items.length === 0 || seen >= parsed.totalCount) return found;
   }
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
+}
+
+/**
+ * The mount paths of a workspace's hostpath volumes, in the workspace's order,
+ * from SaFE's workspace detail (`volumes`, omitted when there are none). Only
+ * paths a shell can carry plainly are kept (see `usableUserDataRoot`).
+ */
+export function hostpathMountPaths(body: unknown): string[] {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error("workspace lookup failed: unrecognised workspace");
+  }
+  const volumes = (body as { volumes?: unknown }).volumes;
+  if (volumes === undefined || volumes === null) return [];
+  if (!Array.isArray(volumes)) throw new Error("workspace lookup failed: unrecognised volumes");
+  const out: string[] = [];
+  for (const v of volumes) {
+    if (typeof v !== "object" || v === null) continue;
+    const { type, mountPath } = v as { type?: unknown; mountPath?: unknown };
+    if (type !== "hostpath" || typeof mountPath !== "string" || !usableUserDataRoot(mountPath)) continue;
+    if (!out.includes(mountPath)) out.push(mountPath);
+  }
+  return out;
+}
+
+/**
+ * Where an app sandbox's `USER_DATA_PATH` is derived from when SaFE set none:
+ * the mount paths of its workspace's hostpath volumes. A workspace that is not
+ * there or not readable with the run owner's key has nothing to derive from, and
+ * says why (`unreadable`); any other failure throws, and the caller asks again.
+ */
+export async function workspaceUserDataRoots(
+  workspaceId: string,
+  apiKey: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<{ roots: string[]; unreadable?: string }> {
+  if (!SAFE_API_URL) throw new Error("workspace lookup failed: SAFE_API_URL is not configured");
+  const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+  });
+  if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
+    await resp.body?.cancel().catch(() => {});
+    logger.warn({ workspaceId, status: resp.status }, "app_sandbox.workspace_unreadable_for_user_data_path");
+    return { roots: [], unreadable: `HTTP ${resp.status}` };
+  }
+  if (resp.status !== 200) {
+    await resp.body?.cancel().catch(() => {});
+    throw new Error(`workspace lookup failed: HTTP ${resp.status}`);
+  }
+  return { roots: hostpathMountPaths(await resp.json().catch(() => null)) };
 }
 
 /** The spec's env without the session correlation variable, which a manifest must not set either. */
