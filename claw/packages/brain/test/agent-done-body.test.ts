@@ -86,3 +86,15 @@ test("the duration does not reach the DAG at all", async () => {
   assert.ok(!("elapsed_ms" in body) && !("elapsedMs" in body),
     "AgentDoneBody has no duration field; add one before claiming the sinks agree");
 });
+
+test("a run failed for want of a sandbox reaches the DAG with the platform's account beside its code", async () => {
+  const why = "workload wl-1 could not be scheduled: no node can take the sandbox right now";
+  const body = await postedBody(baseResult({
+    abortReason: "error", failureReason: "sandbox_unschedulable", failureMessage: why,
+  }));
+  assert.equal(body.abort_reason, "error");
+  assert.equal(body.failure_reason, "sandbox_unschedulable");
+  assert.equal(body.failure_message, why);
+  // Nothing to say, nothing sent: the API then keeps the code as the message.
+  assert.ok(!("failure_message" in await postedBody(baseResult())));
+});
