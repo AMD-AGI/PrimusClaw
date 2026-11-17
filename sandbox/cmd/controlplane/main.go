@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -458,7 +459,8 @@ func main() {
 
 	if grants != nil {
 		routerServer.WithGrants(grants)
-		idClient := ownerKeys(ctx, grants)
+		policyStore := newOwnerPolicyStore(k8sCfg, mgr, wmCfg.Namespace, grants)
+		idClient, policySupplied := ownerKeys(ctx, grants, policyStore)
 		opts := e2b.Options{
 			Grants:    grants,
 			Runner:    apiServer,
@@ -466,6 +468,14 @@ func main() {
 		}
 		if idClient != nil {
 			opts.Identity = idClient
+			if attester == nil && policySupplied {
+				log.Warn("identity-key sandbox creates are refused: IDENTITY_TOKEN_URL is not set")
+			}
+			if policyStore != nil {
+				apiServer.WithOwnerPolicyStore(policyStore)
+				go policyStore.Run(ctx, ownerPolicySyncInterval)
+				log.Info("owner policy admin API enabled", "configmap", grant.OwnerPolicyConfigMapFromEnv())
+			}
 		}
 		plane := e2b.New(opts)
 		grants.SetPromoter(plane)
@@ -506,43 +516,94 @@ func main() {
 // ownerPolicyRetry is the first delay between owner policy attempts. It doubles up to a minute.
 var ownerPolicyRetry = time.Second
 
+// ownerPolicySyncInterval is the backup resync period for the owner policy
+// ConfigMap watch (and the poll interval when watch is unavailable).
+const ownerPolicySyncInterval = 15 * time.Second
+
+// leaderCheck reports whether this replica holds the manager's leader lease.
+// The manager exits when it loses the lease, so the answer never goes back to false.
+func leaderCheck(elected <-chan struct{}) func() bool {
+	return func() bool {
+		select {
+		case <-elected:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// newOwnerPolicyStore builds the ConfigMap-backed store and its watch client.
+func newOwnerPolicyStore(k8sCfg *rest.Config, mgr ctrl.Manager, namespace string, grants *grant.Service) *grant.OwnerPolicyStore {
+	name := grant.OwnerPolicyConfigMapFromEnv()
+	if name == "" {
+		return nil
+	}
+	store := grant.NewOwnerPolicyStore(mgr.GetClient(), mgr.GetAPIReader(), namespace, name, grants, leaderCheck(mgr.Elected()))
+	watchClient, err := ctrlclient.NewWithWatch(k8sCfg, ctrlclient.Options{
+		HTTPClient: mgr.GetHTTPClient(),
+		Scheme:     mgr.GetScheme(),
+		Mapper:     mgr.GetRESTMapper(),
+	})
+	if err != nil {
+		log.Warn("owner policy ConfigMap watch disabled", "error", err)
+		return store
+	}
+	return store.WithWatcher(watchClient)
+}
+
 // ownerKeys returns the identity client when the introspection client is configured,
-// so identity keys are checked by introspection. A missing policy answers identity keys with 503
+// so identity keys are checked by introspection. The second result is true when an
+// owner policy was supplied. A missing policy answers identity keys with 503
 // owner_policy_not_applied; a rejected policy answers 500 owner_policy_invalid.
 // Grant keys keep working. A policy that fails for a transient reason is retried
-// in the background.
-func ownerKeys(ctx context.Context, grants *grant.Service) *identity.Client {
+// in the background. With a policy store the ConfigMap is the only source and is
+// registered at startup so identity keys are not accepted before their templates exist.
+func ownerKeys(ctx context.Context, grants *grant.Service, store *grant.OwnerPolicyStore) (*identity.Client, bool) {
 	client, err := identity.FromEnv()
 	if err != nil {
 		log.Error("identity keys disabled: identity client config is invalid", "error", err)
-		return nil
+		return nil, false
 	}
 	if client == nil {
-		return nil
+		return nil, false
 	}
-	policy, err := grant.OwnerPolicyFromEnv()
+	if store != nil {
+		if err := store.ApplyStored(ctx); err != nil {
+			if !transientPolicyError(err) {
+				log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
+			} else {
+				log.Warn("owner policy was not applied; the policy store retries", "error", err)
+			}
+			return client, true
+		}
+		log.Info("identity keys enabled", "role", grants.OwnerRole())
+		return client, true
+	}
+	policy, _, err := grant.OwnerPolicyRawFromEnv()
+	supplied := policy != nil || err != nil
 	if err != nil {
 		log.Error("identity keys await owner policy: owner policy is invalid", "error", err)
 		grants.SetOwnerPolicyFault(err)
-		return client
+		return client, supplied
 	}
 	if policy == nil {
 		log.Warn("identity keys await owner policy: owner policy is not configured")
-		return client
+		return client, false
 	}
 	err = grants.SetOwnerPolicy(ctx, *policy)
 	if err == nil {
 		log.Info("identity keys enabled", "role", grants.OwnerRole())
-		return client
+		return client, true
 	}
 	if !transientPolicyError(err) {
 		log.Error("identity keys await owner policy: owner policy was not applied", "error", err)
 		grants.SetOwnerPolicyFault(err)
-		return client
+		return client, true
 	}
 	log.Warn("owner policy was not applied, retrying", "error", err)
 	go retryOwnerPolicy(ctx, grants, *policy)
-	return client
+	return client, true
 }
 
 // transientPolicyError reports whether an owner policy error may clear on retry.

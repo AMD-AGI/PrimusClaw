@@ -72,6 +72,28 @@ A user creates a template for a workspace with `POST /v1/templates` and the `wor
 - The sandbox runs in the template workspace. The caller must belong to it, and metadata `agent-sandbox.io/workspace`, when set, must name it (`400 workspace_mismatch`).
 - The quota of the caller applies. A user template accepts no environment variables from the caller, except from a `system-admin`.
 
+### Managing policy templates
+
+When the policy comes from a ConfigMap (`controlplane.config.identity.ownerPolicyConfigMap`), a `system-admin` manages its templates through the management API. The control plane must run with caller auth; every other caller gets 403.
+
+| Method | Path                                         | Description                         |
+| ------ | -------------------------------------------- | ----------------------------------- |
+| GET    | `/v1/admin/owner-policy/templates`           | List the policy templates           |
+| GET    | `/v1/admin/owner-policy/templates/{name}`    | Get one policy template             |
+| PUT    | `/v1/admin/owner-policy/templates/{name}`    | Add or replace one policy template  |
+| DELETE | `/v1/admin/owner-policy/templates/{name}`    | Remove one policy template          |
+
+The API is served by the control-plane Router Service only; the public Ingress does not allow `/v1/admin`. Reach it through the Service (for example with `kubectl port-forward`):
+
+```bash
+kubectl -n agent-sandbox-system port-forward svc/agent-sandbox-controlplane 8080:80
+curl -s -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  http://127.0.0.1:8080/v1/admin/owner-policy/templates/measurement \
+  -d '{"perGpuCount":[1,8],"spec":{"fromImage":"<image>@sha256:<digest>","sealed":true,"inputs":["/in"],"outputs":["/out"]}}'
+```
+
+A write on any replica validates, applies and registers the new policy, then stores it in the ConfigMap, so a rejected policy is not stored and returns the error. An invalid stored document is not rewritten by the API; fix the ConfigMap first. The last template cannot be removed. Every replica watches the named ConfigMap (with a 15s backup resync) and applies it in memory; the leader re-registers the stored templates on every Sync so drifted CodeInterpreters converge. The list response reports `inSync: false` and the last `error` while the answering replica has not applied the stored policy, or while the leader has not registered its templates; a rejected policy is tried again every 5 minutes.
+
 ## Quotas
 
 Quotas apply per person, across all templates. The built-in defaults are below; the owner policy can override the user quota, the `system-admin` quota, or the quota of one user. A field the policy leaves out keeps the built-in value; a field left out of one user's quota comes from the user or `system-admin` quota of that user.

@@ -6,12 +6,15 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -38,9 +41,9 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 			t.Setenv("E2B_OWNER_POLICY", policy)
-			client := ownerKeys(context.Background(), grants)
-			if client == nil || grants.OwnerRole() != "" {
-				t.Fatalf("client=%v role=%q, want a client and no owner role", client, grants.OwnerRole())
+			client, supplied := ownerKeys(context.Background(), grants, nil)
+			if client == nil || !supplied || grants.OwnerRole() != "" {
+				t.Fatalf("client=%v supplied=%v role=%q, want a client, a supplied policy and no owner role", client, supplied, grants.OwnerRole())
 			}
 			oe, ok := grants.OwnerReady().(*grant.OpError)
 			if !ok || oe.Status != http.StatusInternalServerError || oe.Reason != "owner_policy_invalid" || oe.Detail != "owner policy was rejected; see the control plane log" {
@@ -55,7 +58,7 @@ func TestOwnerKeysFailureDoesNotStopStartup(t *testing.T) {
 	grants := grant.New(grant.Options{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Namespace: "agent-sandbox-system"})
 	t.Setenv("IDENTITY_CLIENT_SECRET", "")
 	t.Setenv("E2B_OWNER_POLICY", `{"templates":[{"name":"t"}]}`)
-	if client := ownerKeys(context.Background(), grants); client != nil {
+	if client, _ := ownerKeys(context.Background(), grants, nil); client != nil {
 		t.Fatalf("missing secret: client=%v", client)
 	}
 }
@@ -86,7 +89,7 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if client := ownerKeys(ctx, grants); client == nil {
+	if client, supplied := ownerKeys(ctx, grants, nil); client == nil || !supplied {
 		t.Fatal("identity keys disabled after a transient failure")
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -95,6 +98,82 @@ func TestOwnerKeysRetryTransientPolicyFailure(t *testing.T) {
 			t.Fatal("owner policy was not applied after retries")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestOwnerKeysWithStoreRegistersAtStartup checks that a replica with a policy
+// store registers the ConfigMap policy before identity keys are accepted.
+func TestOwnerKeysWithStoreRegistersAtStartup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"templates":[{"name":"t","perGpuCount":[1],"spec":{"fromImage":"harbor.example/runner@sha256:0123456789abcdef"}}]}`
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-policy", Namespace: "agent-sandbox-system"},
+		Data:       map[string]string{grant.OwnerPolicyKey: raw},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).Build()
+	grants := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system"})
+	store := grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false })
+	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
+	t.Setenv("IDENTITY_CLIENT_ID", "id")
+	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
+	// Env snapshot must not be the source when a store is configured.
+	t.Setenv("E2B_OWNER_POLICY", `{"templates":[{"name":"stale","perGpuCount":[1],"spec":{"fromImage":"harbor.example/runner@sha256:0123456789abcdef"}}]}`)
+
+	if client, supplied := ownerKeys(context.Background(), grants, store); client == nil || !supplied {
+		t.Fatal("identity keys disabled with a policy store")
+	}
+	if grants.OwnerRole() == "" {
+		t.Fatal("startup policy was not applied")
+	}
+	var cis runtimev1alpha1.CodeInterpreterList
+	if err := cl.List(context.Background(), &cis); err != nil {
+		t.Fatal(err)
+	}
+	if len(cis.Items) != 1 || cis.Items[0].Name != "e2b-t-g1" {
+		t.Fatalf("startup registered %v from ConfigMap, want e2b-t-g1", cis.Items)
+	}
+}
+
+// TestOwnerKeysWithStoreMarksFilePolicyApplied checks ApplyStored leaves the
+// replica in sync with the ConfigMap contents.
+func TestOwnerKeysWithStoreMarksFilePolicyApplied(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"templates":[{"name":"t","perGpuCount":[1],"spec":{"fromImage":"harbor.example/runner@sha256:0123456789abcdef"}}]}`
+	path := t.TempDir() + "/policy.json"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-policy", Namespace: "agent-sandbox-system"},
+		Data:       map[string]string{grant.OwnerPolicyKey: raw},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).Build()
+	grants := grant.New(grant.Options{Client: cl, Namespace: "agent-sandbox-system"})
+	store := grant.NewOwnerPolicyStore(cl, cl, "agent-sandbox-system", "owner-policy", grants, func() bool { return false })
+	t.Setenv("IDENTITY_INTROSPECT_URL", "http://identity.test/oauth/introspect")
+	t.Setenv("IDENTITY_CLIENT_ID", "id")
+	t.Setenv("IDENTITY_CLIENT_SECRET", "secret")
+	t.Setenv("E2B_OWNER_POLICY", "")
+	t.Setenv("E2B_OWNER_POLICY_FILE", path)
+
+	if client, supplied := ownerKeys(context.Background(), grants, store); client == nil || !supplied {
+		t.Fatal("identity keys disabled with a policy file")
+	}
+	out, err := store.Templates(context.Background())
+	if err != nil || !out.InSync {
+		t.Fatalf("ConfigMap policy marked applied: %+v %v", out, err)
 	}
 }
 
@@ -112,9 +191,12 @@ func TestOwnerKeysEnabledWithoutOwnerPolicy(t *testing.T) {
 	t.Setenv("E2B_OWNER_POLICY", "")
 	t.Setenv("E2B_OWNER_POLICY_FILE", "")
 
-	client := ownerKeys(context.Background(), grants)
+	client, supplied := ownerKeys(context.Background(), grants, nil)
 	if client == nil {
 		t.Fatal("identity client disabled without an owner policy: SaFE API keys are matched as grant keys")
+	}
+	if supplied {
+		t.Fatal("empty owner policy env reported as supplied")
 	}
 	if oe, ok := grants.OwnerReady().(*grant.OpError); !ok || oe.Reason != "owner_policy_not_applied" {
 		t.Fatalf("OwnerReady = %v, want owner_policy_not_applied", grants.OwnerReady())
