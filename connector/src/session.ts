@@ -36,7 +36,8 @@ import type { SessionStore } from "./session-store.js";
 import { errMessage, isObject, sleep, truncateBytes, verdictOf, type Logger, type MayRun } from "./util.js";
 
 /** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
-export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>) => void;
+/** `at`: when it happened, ms since the epoch (a transcript entry's own time); absent, when it is emitted. */
+export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number) => void;
 
 export interface SessionTiming {
   /** A session with no activity for this long loses its adapter process (the session itself stays and resumes on demand). */
@@ -80,8 +81,22 @@ export interface SessionTiming {
   terminalShowMs: number;
 }
 
+/**
+ * How often a conversation open in a terminal has its transcript read for new lines: what the agent does there reaches the phone
+ * within this (a read is one stat of the file when nothing was written, and only what is new otherwise).
+ */
+export const SPECTATE_MS = 250;
+
+/**
+ * When a transcript entry happened, for its event: the time Claude Code wrote on it, unless it has none or one that is later than
+ * now (a clock that moved back): then the event is dated when it is sent, as every other event is.
+ */
+export function entryTime(at: number | undefined, now = Date.now()): number | undefined {
+  return at !== undefined && Number.isFinite(at) && at > 0 && at <= now ? at : undefined;
+}
+
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
-  idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: 1_000, spectateCheckMs: 5_000,
+  idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: SPECTATE_MS, spectateCheckMs: 5_000,
   rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalScreenWaitMs: 30_000,
   terminalShowMs: ECHO_WAIT_MS,
 };
@@ -216,6 +231,8 @@ export class Session {
     keys?: boolean;
     /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
     started?: () => void;
+    /** The phone was told it waits for the terminal's running turn (`terminal_working`): once per message. */
+    toldWorking?: boolean;
   } | null = null;
   private terminalPumping = false;
   /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
@@ -244,8 +261,8 @@ export class Session {
 
   // --- helpers -----------------------------------------------------------------
 
-  private emit(type: string, data: Record<string, unknown>, after?: Promise<unknown>): void {
-    this.env.emit(this.id, type, data, after);
+  private emit(type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number): void {
+    this.env.emit(this.id, type, data, after, at);
   }
 
   private audit(kind: string, detail: Record<string, unknown> = {}): void {
@@ -444,7 +461,10 @@ export class Session {
     if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
       if (!turn || turn.seen || !turn.pasted) return;
       const said = String(u.update.text ?? "");
-      if (u.type === "queued" && sameText(said, turn.text)) turn.queued = true;
+      if (u.type === "queued" && sameText(said, turn.text)) {
+        turn.queued = true;
+        this.tellWorking(turn, true);
+      }
       else if (u.type === "queued_taken" && sameText(said, turn.text)) turn.seen = true;
       else if (u.type === "queue_withdrawn" && turn.queued) this.endTerminalTurn("error", "terminal_input_withdrawn");
       return;
@@ -461,7 +481,7 @@ export class Session {
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
     if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
     const data = limitStrings(redactDeep({ sessionId: this.acpId, update: u.update }) as Record<string, unknown>, MAX_TOOL_OUTPUT_BYTES);
-    this.emit(u.type, { ...data, ...(this.terminal ? {} : { read_only: true }), ...(replay ? { replay: true } : {}) });
+    this.emit(u.type, { ...data, ...(this.terminal ? {} : { read_only: true }), ...(replay ? { replay: true } : {}) }, undefined, entryTime(u.at));
   }
 
   // --- typing into the terminal ------------------------------------------------------------
@@ -621,7 +641,7 @@ export class Session {
             submitted: () => turn.seen || turn.queued === true,
             onPaste: () => { turn.pasted = true; },
             // (a busy terminal draws the paste late: the phone is told the message waits there)
-            onSlow: () => this.emit("terminal_input_queued", { reason: "terminal_working", cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1 }),
+            onSlow: () => this.tellWorking(turn, false),
           });
           turn.typing = false;
           turn.sentAt = Date.now();
@@ -688,6 +708,19 @@ export class Session {
     } else {
       turn.idleSince = null;
     }
+  }
+
+  /**
+   * The phone's message waits for the turn the terminal is running: said once per message (`terminal_input_queued`, `terminal_working`),
+   * whichever comes first: the paste drawn late, or Claude Code's queue taking it (`held: "terminal"`: it is in Claude Code's
+   * queue now, taken in at that turn's next step or once it ends; only the terminal can take it back from there).
+   */
+  private tellWorking(turn: NonNullable<Session["terminalTurn"]>, held: boolean): void {
+    if (turn.toldWorking || this.terminalTurn !== turn) return;
+    turn.toldWorking = true;
+    this.emit("terminal_input_queued", {
+      reason: "terminal_working", cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq, queued: this.terminalQueue.length + 1, ...(held ? { held: "terminal" } : {}),
+    });
   }
 
   private endTerminalTurn(stopReason: string, error?: string): void {

@@ -73,6 +73,8 @@ export interface StatusOptions<S> {
   readonly streamReplyTo?: string | undefined;
   /** Every member sees the floating status: it carries no words of the agent's. */
   readonly group?: boolean;
+  /** The progress message (no stream) is edited at most this often, in seconds (default LIVE_MIN_INTERVAL). */
+  readonly editSeconds?: number;
 }
 
 export class StatusMessage<S> {
@@ -83,6 +85,7 @@ export class StatusMessage<S> {
   private readonly policy: StatusPolicy<S>;
   private readonly lead: string;
   private readonly group: boolean;
+  private readonly editSeconds: number;
   /** undefined: the progress message (no stream here, or the chat refused it). */
   private stream: StreamHandle | undefined;
   /** The stream itself, kept after a refusal: it is still closed when it can be. */
@@ -123,6 +126,7 @@ export class StatusMessage<S> {
     this.stream = options.streamReplyTo ? new StreamHandle(surface, options.streamReplyTo, options.clock) : undefined;
     this.live = this.stream;
     this.group = options.group ?? false;
+    this.editSeconds = Math.max(options.editSeconds ?? LIVE_MIN_INTERVAL, LIVE_MIN_INTERVAL);
   }
 
   begin(): void {
@@ -320,7 +324,7 @@ export class StatusMessage<S> {
     }
     const messageId = await this.messageId(signal);
     while (messageId && !this.closed) {
-      const wait = Math.max(this.lastAt, this.begunAt) + LIVE_MIN_INTERVAL - nowSeconds(this.clock);
+      const wait = Math.max(this.lastAt, this.begunAt) + this.editSeconds - nowSeconds(this.clock);
       if (wait > 0) {
         await sleepSeconds(this.clock, wait, signal);
         continue; // the view may have changed while waiting, and the status may have been closed

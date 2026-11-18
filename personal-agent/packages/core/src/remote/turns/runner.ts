@@ -37,6 +37,10 @@ export const RECONNECT_BACKOFF_SECONDS = 1.0;
 export const CURSOR_EVERY = 25;
 /** A stream that keeps dropping is given up after this many tries in a row. */
 export const STREAM_ATTEMPTS = 4;
+/** Why a message waits that is the terminal's running turn (`terminal_input_queued`): the person is told so once per message. */
+export const BUSY_REASONS: ReadonlySet<string> = new Set(["terminal_working", "terminal_waiting"]);
+/** The messages a chat was told wait for a busy terminal, remembered per chat (the newest) so each is told once. */
+export const BUSY_TOLD_KEPT = 20;
 
 /** How the turn is shown: in the chat, or in the session card (`window-turn.ts`). */
 export type DisplayFor = (request: TurnRequest, signer: Signer | null) => TurnDisplay;
@@ -60,6 +64,11 @@ export interface TurnRequest {
 }
 
 export class TurnRunner {
+  /** Per chat: the messages it was told wait for a busy terminal (`tellBusy`), oldest first. */
+  private readonly toldBusy = new Map<string, Set<string>>();
+  /** The turns told so whose connector named no message. */
+  private readonly toldTurns = new WeakSet<RemoteTurn>();
+
   constructor(
     private readonly ctx: RemoteContext,
     private readonly state: ChatState,
@@ -266,6 +275,7 @@ export class TurnRunner {
     // (said in the chat's language, as a line of the turn's live view)
     const shown = step.queued !== null ? { ...step, note: queuedLine(step.queued, this.state.lang(chatKey)) } : step;
     display.progress(shown);
+    if (step.queued !== null && BUSY_REASONS.has(step.queued)) await this.tellBusy(request, step);
     if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sid, step);
     if (step.permission !== null) await this.show(chatKey, sid, step.permission, to);
     // answered somewhere else (or it ran out on the machine): the card is dead
@@ -274,6 +284,47 @@ export class TurnRunner {
       // (a turn the restart ended says so as its own end, which comes next)
       await this.sayRecovered(chatKey, to, step.recovered.interrupted, step.recovered.continuing);
     }
+  }
+
+  /**
+   * This turn's message waits for the turn the terminal is running: the person is told at once, in the chat, once per message, and
+   * how to take it back (in the terminal when its own queue holds it; else /stop). A message queued behind a turn of this chat was
+   * told so when it was sent (`queuedBehind`): not again here.
+   */
+  private async tellBusy(request: TurnRequest, step: RemoteStep): Promise<void> {
+    const { chatKey, to } = request;
+    const mine = request.cmdSeq?.();
+    if (step.queuedSeq !== null && mine !== undefined && step.queuedSeq !== mine) return;
+    const key = step.queuedFor ?? (mine !== undefined ? String(mine) : "");
+    if (!this.firstBusy(chatKey, key)) return;
+    const words = remoteAgentText.in(this.state.lang(chatKey));
+    try {
+      await to.send(
+        textMessage(words.terminalBusy + (step.queuedHeld ? words.terminalBusyHeld : words.terminalBusyWaiting)),
+      );
+    } catch (error) {
+      this.ctx.logger.warn("that the message waits for a busy terminal could not be told", { error: errorName(error) });
+    }
+  }
+
+  /** Whether the chat is told now that the message `key` waits for a busy terminal: once per message (per turn when none is named). */
+  private firstBusy(chatKey: string, key: string): boolean {
+    if (!key) {
+      const turn = this.state.chats.turns.get(chatKey);
+      if (turn === undefined) return true;
+      if (this.toldTurns.has(turn)) return false;
+      this.toldTurns.add(turn);
+      return true;
+    }
+    const told = this.toldBusy.get(chatKey) ?? new Set<string>();
+    if (told.has(key)) return false;
+    told.add(key);
+    for (const oldest of told) {
+      if (told.size <= BUSY_TOLD_KEPT) break;
+      told.delete(oldest);
+    }
+    this.toldBusy.set(chatKey, told);
+    return true;
   }
 
   /**

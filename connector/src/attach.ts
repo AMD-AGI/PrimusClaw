@@ -1473,9 +1473,15 @@ export interface TranscriptUpdate {
    */
   type: "user_message_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "turn_done" | "turn_interrupted" | "queued" | "queued_taken" | "queue_withdrawn";
   update: Record<string, unknown>;
+  /**
+   * When Claude Code wrote the entry (its `timestamp`, ms since the epoch), absent when the entry does not say. The event goes out
+   * with it, so a step is dated when it happened, not when the transcript was next read.
+   */
+  at?: number;
 }
 
 const MAX_TOOL_TITLE = 200;
+const MAX_TOOL_NAME = 64;
 
 /** `promptSource` of a prompt a person gave (measured on Claude Code 2.1.285-2.1.319): typed at the terminal, a queued one
  * that came out of the queue, an accepted suggestion, or sent through the SDK. Claude Code's own say `system`. */
@@ -1537,7 +1543,15 @@ export function unwrapPasted(text: string): string {
 export function transcriptUpdates(line: string): TranscriptUpdate[] {
   let doc: unknown;
   try { doc = JSON.parse(line); } catch { return []; }
-  if (!isObject(doc) || doc.isSidechain === true || doc.isMeta === true) return [];
+  if (!isObject(doc)) return [];
+  const out = updatesOf(doc);
+  const at = typeof doc.timestamp === "string" ? Date.parse(doc.timestamp) : NaN;
+  if (Number.isFinite(at) && at > 0) for (const u of out) u.at = at;
+  return out;
+}
+
+function updatesOf(doc: Record<string, unknown>): TranscriptUpdate[] {
+  if (doc.isSidechain === true || doc.isMeta === true) return [];
   if (doc.type === "system" && doc.subtype === "turn_duration") return [{ type: "turn_done", update: {} }];
   if (doc.type === "queue-operation") {
     if (doc.operation === "enqueue" && typeof doc.content === "string") return [{ type: "queued", update: { text: unwrapPasted(doc.content) } }];
@@ -1569,7 +1583,11 @@ export function transcriptUpdates(line: string): TranscriptUpdate[] {
     if (block.type === "text" && typeof block.text === "string") {
       out.push(...text(doc.type === "user" ? "user_message_chunk" : "agent_message_chunk", block.text));
     } else if (doc.type === "assistant" && block.type === "tool_use" && typeof block.id === "string") {
-      out.push({ type: "tool_call", update: { sessionUpdate: "tool_call", toolCallId: block.id, title: toolTitle(block.name, block.input), kind: "other", status: "in_progress", rawInput: isObject(block.input) ? block.input : {} } });
+      // (`_meta.claudeCode.toolName`: where the Claude Code ACP adapter names the tool, so a phone counts the steps by tool alike)
+      out.push({ type: "tool_call", update: {
+        sessionUpdate: "tool_call", toolCallId: block.id, title: toolTitle(block.name, block.input), kind: "other", status: "in_progress",
+        rawInput: isObject(block.input) ? block.input : {}, _meta: { claudeCode: { toolName: toolName(block.name) } },
+      } });
     } else if (doc.type === "user" && block.type === "tool_result" && typeof block.tool_use_id === "string") {
       const result = resultText(block.content);
       out.push({ type: "tool_call_update", update: {
@@ -1579,6 +1597,10 @@ export function transcriptUpdates(line: string): TranscriptUpdate[] {
     }
   }
   return out;
+}
+
+function toolName(name: unknown): string {
+  return cleanTitleTo(typeof name === "string" && name ? name : "Tool", MAX_TOOL_NAME);
 }
 
 function toolTitle(name: unknown, input: unknown): string {

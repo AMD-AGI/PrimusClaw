@@ -27,6 +27,12 @@ export const remoteAgentText = defineCatalog({
         ? " The message queued behind it was dropped too."
         : ` The ${String(p.n)} messages queued behind it were dropped too.`,
     queuedRefused: (p: { reason: string }) => `A message you queued was not run on the machine: ${p.reason}`,
+    /** The message waits for the turn the terminal is running (`terminal_input_queued`, `terminal_working`), said once per message. */
+    terminalBusy: "The session is busy: your message is queued and goes in when the current turn ends.",
+    /** ... and it is in Claude Code's own queue there (`held: "terminal"`): only the terminal can take it back. */
+    terminalBusyHeld: " To withdraw it, press ↑ in that terminal: the queued message goes back into its input box.",
+    /** ... and it still waits on the connector: /stop takes it back. */
+    terminalBusyWaiting: " To withdraw it, send /stop.",
     stopFirst: "A task is still running. Send /stop first.",
     notAttached:
       "You are not attached to a remote session. Start one with `/agent new AGENT PATH`, or `/agent attach N`.",
@@ -188,6 +194,9 @@ export const remoteAgentText = defineCatalog({
     queueDropped: (p) =>
       p.n === 1 ? "排在后面的那条消息也一起撤回了。" : `排在后面的 ${String(p.n)} 条消息也一起撤回了。`,
     queuedRefused: (p) => `你排队的一条消息没有在机器上运行：${p.reason}`,
+    terminalBusy: "会话正忙，已排队，当前回合结束后发送。",
+    terminalBusyHeld: "要撤回：在那台机器的终端里按 ↑，排队的消息会回到输入框。",
+    terminalBusyWaiting: "要撤回：发 /stop。",
     stopFirst: "还有任务在运行。先发 /stop。",
     notAttached: "你还没有接入远程会话。用 `/agent new AGENT PATH` 开一个，或者发 `/agent attach N`。",
     approvalInactive: "这个审批请求已经失效了。",
