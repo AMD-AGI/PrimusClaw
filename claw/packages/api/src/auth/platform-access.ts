@@ -20,9 +20,8 @@
  * operator's word, and a role SaFE has not defined simply matches nobody.
  *
  * Only a credential the provider verified brings roles the provider reported. Under
- * CLAW_AUTH_PROVIDER=identity those are the roles of the identity introspection answer that are
- * `default`, a trusted admin role (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES) or a role named here; nothing
- * is added that the answer does not list (`IdentityVerifier`). The identity-token,
+ * CLAW_AUTH_PROVIDER=identity those are the roles of the identity introspection answer, as listed
+ * (`IdentityVerifier`). The identity-token,
  * connector-token and BYOK paths build the caller themselves and give it the
  * single role `default`, which is Claw's own marker for "an ordinary user" and not
  * anything SaFE said, so counting it would let a caller SaFE never vouched for

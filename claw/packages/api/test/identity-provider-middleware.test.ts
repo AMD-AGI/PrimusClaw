@@ -41,8 +41,8 @@ describe("CLAW_AUTH_PROVIDER=identity through the authentication hook", () => {
       IDENTITY_CLIENT_ENABLED: "true", IDENTITY_ISSUER_URL: fake.issuer, IDENTITY_CLIENT_ID: "svc-claw", IDENTITY_CLIENT_SECRET: "s3cret",
       IDENTITY_INTROSPECTION_URL: `${fake.issuer}/oauth/introspect`,
       IDENTITY_INTROSPECTION_CACHE_SECONDS: "0", IDENTITY_INTROSPECTION_NEGATIVE_CACHE_SECONDS: "0", IDENTITY_STALE_IF_ERROR_SECONDS: "0",
-      CLAW_IDENTITY_TOKEN_TRUSTED_ROLES: "system-admin",
     });
+    delete process.env.CLAW_IDENTITY_TOKEN_TRUSTED_ROLES;
     (await import("../src/auth/identity.js")).startIdentityClient(log);
     const { authMiddleware, getUser } = await import("../src/auth/middleware.js");
     const { resolveUserLlmKey } = await import("../src/llm/key-source.js");
@@ -66,13 +66,24 @@ describe("CLAW_AUTH_PROVIDER=identity through the authentication hook", () => {
     return { status: r.status, body: await r.json().catch(() => null) };
   }
 
-  test("a trusted role from the answer grants system-admin; an untrusted caller is not an admin", async () => {
+  test("the answer's admin role is the caller's admin role, with no trusted roles named", async () => {
     const admin = await whoami({ authorization: "Bearer ak-admin" });
     assert.equal(admin.status, 200, JSON.stringify(admin.body));
-    assert.ok(admin.body.user.roles.includes("system-admin"));
+    assert.deepEqual(admin.body.user.roles, ["default", "system-admin"]);
     const plain = await whoami({ authorization: "Bearer ak-plain" });
     assert.equal(plain.status, 200);
-    assert.ok(!plain.body.user.roles.includes("system-admin"));
+    assert.deepEqual(plain.body.user.roles, ["default"]);
+  });
+
+  test("CLAW_REQUIRED_PLATFORM_ROLES admits callers and does not change their roles", async () => {
+    process.env.CLAW_REQUIRED_PLATFORM_ROLES = "system-admin,claw-user";
+    const admin = await whoami({ authorization: "Bearer ak-admin" });
+    assert.equal(admin.status, 200, JSON.stringify(admin.body));
+    assert.deepEqual(admin.body.user.roles, ["default", "system-admin"]);
+    const user = await whoami({ authorization: "Bearer ak-clawuser" });
+    assert.equal(user.status, 200, JSON.stringify(user.body));
+    assert.deepEqual(user.body.user.roles, ["default", "claw-user"]);
+    assert.equal((await whoami({ authorization: "Bearer ak-plain" })).status, 403);
   });
 
   test("CLAW_REQUIRED_PLATFORM_ROLES=default admits only callers the answer lists default for", async () => {

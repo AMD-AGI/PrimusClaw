@@ -185,7 +185,7 @@
           "type": "boolean"
         },
         "authProvider": {
-          "description": "Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER): safe or identity. identity needs identity.enabled, identity.endpoints.introspection, and secret.llmKeySource=platformKey. A caller's platform roles are the introspection answer's roles that are default, in identity.tokenAuth.trustedRoles, or in CLAW_REQUIRED_PLATFORM_ROLES; access-token callers get no SaFE-exchanged LLM/sandbox keys.",
+          "description": "Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER): safe or identity. identity needs identity.enabled, identity.endpoints.introspection, and secret.llmKeySource=platformKey. A caller's platform roles, admin roles included, are the introspection answer's roles; access-token callers get no SaFE-exchanged LLM/sandbox keys.",
           "default": "safe",
           "enum": [
             "identity",
@@ -243,7 +243,7 @@
               "type": "boolean"
             },
             "trustedRoles": {
-              "description": "Platform roles a token the identity provider confirms (RFC 7662) may confer on its caller; with authProvider=identity, also the admin roles a cookie or ak- key caller may take from the introspection answer. Empty by default: no admin role is conferred.",
+              "description": "Platform roles a token the identity provider confirms (RFC 7662) may confer on its caller. Empty by default: every token's caller is a plain user.",
               "default": [],
               "type": "array",
               "uniqueItems": true,

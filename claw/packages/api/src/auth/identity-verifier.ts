@@ -10,9 +10,7 @@
  *   - Every credential is judged by the identity service's RFC 7662 introspection with allowStale: false
  *     (a revoked credential is never accepted from cache during an outage): an `ak-` key, or the session
  *     token of the `Token` cookie (with its `userType`). The caller is the answer's `sub`. Its roles are the
- *     answer's roles that are `default`, an admin role the operator lets the provider confer
- *     (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES, a subset of {@link ADOPTABLE_ROLES}), or a role CLAW_REQUIRED_PLATFORM_ROLES
- *     names. Nothing is added that the answer does not list.
+ *     answer's roles as listed: the identity service is Claw's user and admin directory under this provider.
  *   - The platform key of an `ak-` caller is the key it presented. The platform key of a session caller is the
  *     one the identity service keeps for the user, read from `GET /api/v1/apikeys/platform` under
  *     IDENTITY_API_URL (or the base of IDENTITY_INTROSPECTION_URL) with that session and this API's identity
@@ -32,7 +30,6 @@ import {
 } from "@claw/utils";
 import type { UserInfo } from "./models.js";
 import { AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, isApiKey } from "./safe-client.js";
-import { requiredPlatformRoles } from "./platform-access.js";
 
 const PLATFORM_KEY_PATH = "/api/v1/apikeys/platform";
 const INTROSPECTION_PATH = "/oauth/introspect";
@@ -92,10 +89,6 @@ export interface IdentityVerifierOptions {
   /** Base URL of the identity HTTP APIs, without a trailing slash. */
   apiUrl: string;
   client: IdentityServiceClient;
-  /** Admin roles the provider may confer. */
-  trustedRoles: readonly string[];
-  /** Roles that only admit a caller (CLAW_REQUIRED_PLATFORM_ROLES), read on every answer. */
-  gateRoles?: () => readonly string[];
   fetchFn?: typeof fetch;
   /** Request timeout for the platform key, IDENTITY_REQUEST_TIMEOUT_MS by default 5000. */
   timeoutMs?: number;
@@ -143,16 +136,12 @@ export class IdentityVerifier {
   private inflight = new Map<string, Promise<string>>();
   private readonly apiUrl: string;
   private readonly clientToken: string;
-  private readonly trusted: ReadonlySet<string>;
-  private readonly gateRoles: () => readonly string[];
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
 
   constructor(private readonly identity: Introspect, opts: IdentityVerifierOptions) {
     this.apiUrl = opts.apiUrl.replace(/\/+$/, "");
     this.clientToken = `${opts.client.clientId}:${opts.client.clientSecret}`;
-    this.trusted = new Set(opts.trustedRoles);
-    this.gateRoles = opts.gateRoles ?? (() => requiredPlatformRoles());
     this.fetchFn = opts.fetchFn ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
@@ -271,15 +260,14 @@ export class IdentityVerifier {
     return key;
   }
 
-  /** The caller an active introspection answer names, with its platform key and the roles it may adopt from the answer. */
+  /** The caller an active introspection answer names, with its platform key and the answer's roles. */
   private userOf(answer: ActiveAnswer, platformKey: string): UserInfo {
     const userId = answer.sub ?? "";
-    const gate = new Set(this.gateRoles());
     return {
       userId,
       userName: (answer.name || answer.preferredUsername || answer.username || answer.email || userId).slice(0, MAX_NAME_CHARS),
       ...(answer.email ? { email: answer.email } : {}),
-      roles: answer.roles.filter((r) => r === "default" || this.trusted.has(r) || gate.has(r)),
+      roles: [...answer.roles],
       platformKey,
       virtualKey: "",
     };

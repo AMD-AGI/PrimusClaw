@@ -19,7 +19,7 @@ import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, 
 import { constantTimeEquals, readIdentityConfig } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
 import { verifyConnectorGrant } from "./connector-grant.js";
-import { identityTokenSettings, verifyIdentityAccessToken } from "./identity-token.js";
+import { verifyIdentityAccessToken } from "./identity-token.js";
 import { safeFailureOf } from "./delegated-keys.js";
 import { recordRequestCredential } from "./request-credential.js";
 import { platformAccessRefusal } from "./platform-access.js";
@@ -41,7 +41,6 @@ function getClient(): CredentialVerifier | null {
     _identityVerifier = new IdentityVerifier(identity, {
       apiUrl,
       client: { clientId: process.env.IDENTITY_CLIENT_ID ?? "", clientSecret: process.env.IDENTITY_CLIENT_SECRET ?? "" },
-      trustedRoles: identityTokenSettings().trustedRoles,
       timeoutMs: readIdentityConfig(process.env).settings?.requestTimeoutMs,
     });
     return _identityVerifier;

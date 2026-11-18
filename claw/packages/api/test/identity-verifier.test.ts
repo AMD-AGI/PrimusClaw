@@ -25,11 +25,9 @@ const config = await import("../src/config.js");
 
 const API = "http://identity.test";
 const CLIENT = { clientId: "claw-api", clientSecret: "s3cret" };
-const TRUSTED = ["system-admin", "system-admin-readonly"];
-
-/** A verifier against `identity` and `fetchFn` with this file's client and trusted roles. */
-function verifierOf(identity: unknown, fetchFn: typeof fetch, trustedRoles: string[] = TRUSTED) {
-  return new IdentityVerifier(identity as never, { apiUrl: API, client: CLIENT, trustedRoles, fetchFn });
+/** A verifier against `identity` and `fetchFn` with this file's client. */
+function verifierOf(identity: unknown, fetchFn: typeof fetch) {
+  return new IdentityVerifier(identity as never, { apiUrl: API, client: CLIENT, fetchFn });
 }
 
 function active(over: Partial<Extract<IntrospectionResult, { active: true }>>): IntrospectionResult {
@@ -40,7 +38,6 @@ function active(over: Partial<Extract<IntrospectionResult, { active: true }>>): 
 function fakeIdentity(
   answers: Record<string, IntrospectionResult | Error>,
   keys: Record<string, { status: number; body?: unknown }>,
-  trustedRoles: string[] = TRUSTED,
 ) {
   const seen = {
     introspect: [] as { token: string; params?: Record<string, string>; allowStale?: boolean }[],
@@ -60,7 +57,7 @@ function fakeIdentity(
     const answer = keys[headers.Authorization!.replace(/^Bearer /, "")] ?? { status: 401 };
     return new Response(answer.body === undefined ? "" : JSON.stringify(answer.body), { status: answer.status });
   }) as typeof fetch;
-  return { verifier: verifierOf(identity, fetchFn, trustedRoles), seen };
+  return { verifier: verifierOf(identity, fetchFn), seen };
 }
 
 test("CLAW_AUTH_PROVIDER=identity selects the identity provider, and the default LLM key source is the virtual key", () => {
@@ -109,14 +106,20 @@ test("an ak- key is the introspected user, and the key is its platform key; no r
   assert.equal(seen.fetch.length, 0);
 });
 
-test("only the roles the operator trusts are adopted from an answer", async () => {
-  const { verifier } = fakeIdentity(
-    { "ak-mallory": active({ sub: "u-mallory", roles: ["system-admin", "system-admin-readonly", "root"], tokenType: "api_key" }) },
-    {},
-    ["system-admin-readonly"],
-  );
-  const user = await verifier.verifyApiKey("ak-mallory");
-  assert.deepEqual(user.roles, ["system-admin-readonly"]);
+test("the caller's roles are the answer's roles, whatever CLAW_REQUIRED_PLATFORM_ROLES names", async () => {
+  const saved = process.env.CLAW_REQUIRED_PLATFORM_ROLES;
+  process.env.CLAW_REQUIRED_PLATFORM_ROLES = "claw-user";
+  try {
+    const { verifier } = fakeIdentity(
+      { "ak-dave": active({ sub: "u-dave", roles: ["system-admin", "system-admin-readonly", "team-a"], tokenType: "api_key" }) },
+      {},
+    );
+    const user = await verifier.verifyApiKey("ak-dave");
+    assert.deepEqual(user.roles, ["system-admin", "system-admin-readonly", "team-a"]);
+  } finally {
+    if (saved === undefined) delete process.env.CLAW_REQUIRED_PLATFORM_ROLES;
+    else process.env.CLAW_REQUIRED_PLATFORM_ROLES = saved;
+  }
 });
 
 test("refusals: an inactive credential, a cookie that is not a session, and a platform key of another user", async () => {

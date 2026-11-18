@@ -590,9 +590,7 @@ identity:
   # /oauth/introspect), read with the user's session and this API's client (clientId, clientSecret).
   # Needs identity.enabled, clientId, clientSecret, endpoints.introspection, and secret.llmKeySource=platformKey;
   # the API refuses to start without them.
-  # A caller's platform roles are the introspection answer's roles that are "default", an admin role in
-  # identity.tokenAuth.trustedRoles (rendered for this provider whether or not tokenAuth is enabled), or a
-  # role CLAW_REQUIRED_PLATFORM_ROLES names; no role is added that the answer does not list.
+  # A caller's platform roles, admin roles included, are the introspection answer's roles as listed.
   # Access-token callers under this provider get no SaFE-exchanged LLM/sandbox keys.
   authProvider: safe
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
@@ -642,8 +640,7 @@ identity:
     # caller is a plain user, whatever the token's roles claim says. A named role is adopted only for a token that claims
     # it AND whose provider answer (RFC 7662, asked per the identity cache rules) is active, names the same subject and
     # lists it; when the provider cannot be asked the caller is a plain user for that request. Name a role only if the
-    # provider's role of that name means the same thing here. With authProvider=identity these are also the admin
-    # roles a cookie or ak- key caller may take from the introspection answer.
+    # provider's role of that name means the same thing here.
     trustedRoles: []
 
 sandboxTemplate:
