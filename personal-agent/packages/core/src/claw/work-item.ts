@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { JsonObject } from "../json.js";
 import { parseRequesterView } from "./requester-view.js";
 import { anything, isObject, objectOf, someText, wholeNumber } from "./lenient.js";
-import type { AskerView, PullRef, WorkItem } from "./model.js";
+import type { AskerView, Delivered, PullRef, WorkItem } from "./model.js";
 
 /** A work item as the board lists it and as an event carries it; an event's item carries less, read as nothing. */
 const workItemSchema = z.looseObject({
@@ -23,7 +23,41 @@ const workItemSchema = z.looseObject({
   kind: someText,
   params: objectOf,
   updated_at: someText,
+  delivered_version: anything,
+  watching_pr: anything,
 });
+
+/** `{ delivered }` when there is one, else nothing: an item that is not delivered reads as it did before. */
+export function delivery(d: Delivered | null): { delivered?: Delivered } {
+  return d ? { delivered: d } : {};
+}
+
+/**
+ * A result Claw delivered without an Accept, while the item stands delivered: as an event's item says it (`delivered_version`,
+ * `watching_pr`), else as a board row's state and `params` show it (closed as accepted with `params.delivered`, or open with
+ * `params.watching_pr`). Null when it does not, and for anything malformed.
+ */
+export function deliveredOf(item: {
+  readonly board_state?: string | undefined;
+  readonly outcome?: string | undefined;
+  readonly params?: Readonly<Record<string, unknown>> | undefined;
+  readonly delivered_version?: unknown;
+  readonly watching_pr?: unknown;
+}): Delivered | null {
+  const names = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x !== "") : [];
+  const said = item.delivered_version;
+  if (said !== undefined) {
+    return typeof said === "number" && Number.isInteger(said) && said > 0
+      ? { version: said, watching: names(item.watching_pr) }
+      : null;
+  }
+  const version = item.params?.["delivered"];
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) return null;
+  const watching = names(item.params?.["watching_pr"]);
+  const stands = item.board_state === "done" ? item.outcome === "accepted" : watching.length > 0;
+  return stands ? { version, watching } : null;
+}
 
 /** The pull request of a review item (`params.pr`); null for anything else, or for one that is not a pull request. */
 export function pullOf(params: Readonly<Record<string, unknown>> | undefined): PullRef | null {
@@ -58,6 +92,7 @@ export function parseWorkItem(raw: unknown): WorkItem | null {
     params: (item.params ?? {}) as JsonObject,
     pull: pullOf(item.params),
     updatedAt: item.updated_at ?? "",
+    ...delivery(deliveredOf(item)),
   };
 }
 

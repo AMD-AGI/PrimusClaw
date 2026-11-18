@@ -37,6 +37,17 @@ export interface WorkItem {
   readonly pull: PullRef | null;
   /** When Claw last changed it (ISO 8601; "" not said). */
   readonly updatedAt: string;
+  /**
+   * A result Claw delivered without an Accept, while the item stands delivered (closed by it, or open only to watch a pull
+   * request); absent or null otherwise, and from a Claw that does not deliver.
+   */
+  readonly delivered?: Delivered | null;
+}
+
+/** A result Claw delivered without an Accept: its version, and the pull requests (owner/repo#123) the item still watches. */
+export interface Delivered {
+  readonly version: number;
+  readonly watching: readonly string[];
 }
 
 /**

@@ -26,6 +26,11 @@ export const assistantCardText = defineCatalog({
     resultReady: (p: { version: number }) => `Result v${String(p.version)} is ready for you`,
     waiting: "Waiting for you",
     replyForChanges: "Reply here to ask for changes.",
+    /** A result Claw delivered without an Accept: its version, and the pull request the item still watches. */
+    delivered: (p: { version: number }) => `v${String(p.version)} delivered`,
+    deliveredWatching: (p: { version: number; pulls: string }) =>
+      `v${String(p.version)} delivered; still watching PR ${p.pulls}`,
+    replyToChange: "Reply to me to have it changed.",
     accept: (p: { version: number }) => `Accept v${String(p.version)}`,
     stop: "Stop",
     watch: "Auto-reply to PR comments",
@@ -78,6 +83,9 @@ export const assistantCardText = defineCatalog({
     resultReady: (p) => `结果 v${String(p.version)} 等你确认`,
     waiting: "等你回复",
     replyForChanges: "在这里回复即可要求修改。",
+    delivered: (p) => `v${String(p.version)} 已交付`,
+    deliveredWatching: (p) => `v${String(p.version)} 已交付，继续盯 PR ${p.pulls}`,
+    replyToChange: "要改直接回复我。",
     accept: (p) => `接受 v${String(p.version)}`,
     stop: "停止",
     watch: "开启 PR 评论自动回复",

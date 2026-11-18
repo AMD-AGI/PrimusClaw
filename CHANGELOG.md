@@ -113,6 +113,14 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Personal agent: a result Claw delivered without an Accept (`delivered_version` on the message's item, from a Claw with
+  `CLAW_ASSISTANT_AUTO_DELIVER` on) is shown as a result card instead of the "Accept vN" card: "v2 delivered" ("v2 已交付"),
+  or "v1 delivered; still watching PR owner/repo#7" ("v1 已交付，继续盯 PR owner/repo#7") while the item follows its pull
+  request, with what the assistant said and "Reply to me to have it changed." ("要改直接回复我。"), and no buttons. The
+  system's own notice of such a result is its words alone. An Accept pressed on a card drawn before the result was
+  delivered says it was delivered and there is nothing to accept; an item that still waits for an Accept gets its card and
+  buttons as before. The retry refusal at the limit of running tasks no longer suggests accepting one.
+
 - Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
   it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
