@@ -365,22 +365,26 @@ function rowsFrom(head: string[], at: number): string[] {
   return rows;
 }
 
+/** The most rows of one wrapped text a summary reads (every way of joining them is tried: 2^(n-1)); more is far past what it says. */
+const WRAPPED_ROWS_MAX = 8;
+
 /**
  * Rows of one text the pane wrapped, as one line: a row as wide as the widest of them was broken inside a word (joined as it is),
- * any other at a space (joined with one). Every credential found in that line, or in the rows joined either way throughout, is
- * masked whole: a key the wrap cut in two never leaves the machine as its first part (a guess at where the wrap fell cannot unmask).
+ * any other at a space (joined with one). Where the wrap fell is only a guess, so every credential found with the rows joined in any
+ * way at all (each wrap inside a word or at a space) is masked whole: a key the wrap cut in parts never leaves the machine as one of
+ * them. Rows past WRAPPED_ROWS_MAX are left out, and with them the word they cut (it may be a credential's first part).
  */
-function joinRows(rows: string[]): string {
-  if (rows.length < 2) return rows[0] ?? "";
+function joinRows(all: string[]): string {
+  if (all.length < 2) return all[0] ?? "";
+  const rows = all.slice(0, WRAPPED_ROWS_MAX);
   const widest = Math.max(...rows.map(displayWidth));
-  const guessed = rows.slice(0, -1).map((r) => (displayWidth(r) >= widest ? "" : " "));
   const joined = (seps: string[]) => {
     let text = "";
     const starts: number[] = [];
     rows.forEach((r, k) => { starts.push(text.length); text += r + (seps[k] ?? ""); });
     return { text, starts };
   };
-  const line = joined(guessed);
+  const line = joined(rows.slice(0, -1).map((r) => (displayWidth(r) >= widest ? "" : " ")));
   const hidden = new Array<boolean>(line.text.length).fill(false);
   // (a position in a joining: its row and column, then where that is in `line`)
   const toLine = (starts: number[], at: number) => {
@@ -388,8 +392,8 @@ function joinRows(rows: string[]): string {
     while (k > 0 && starts[k]! > at) k--;
     return line.starts[k]! + Math.min(at - starts[k]!, rows[k]!.length - 1);
   };
-  for (const seps of [guessed, guessed.map(() => ""), guessed.map(() => " ")]) {
-    const other = joined(seps);
+  for (let mask = 0; mask < 1 << (rows.length - 1); mask++) {
+    const other = joined(rows.slice(0, -1).map((_, k) => (mask & (1 << k) ? " " : "")));
     for (const [s, e] of credentialSpans(other.text)) {
       for (let q = toLine(other.starts, s); q <= toLine(other.starts, e - 1); q++) hidden[q] = true;
     }
@@ -399,7 +403,7 @@ function joinRows(rows: string[]): string {
     if (!hidden[q]) out += line.text[q];
     else if (q === 0 || !hidden[q - 1]) out += MASK;
   }
-  return out;
+  return all.length > rows.length ? out.replace(/\S*$/, "…") : out;
 }
 
 /** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */

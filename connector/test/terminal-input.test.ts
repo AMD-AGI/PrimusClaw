@@ -87,6 +87,15 @@ describe("what a question on the screen asks", () => {
     const both = asks(`curl -H "Authorization: Bearer\n${long.slice(0, 80)}\n${long.slice(80)}" x`);
     assert.ok(!both.includes("Zz9Zz9"), both);
     assert.match(both, /^Bash command: curl -H "Authorization: \[hidden\]/);
+    // (wrapped at a space after `Bearer` on a row as wide as the token's own: no guess at the wrap unmasks it; codex round 5)
+    const wide = `${"Q".repeat(60)}1${"Q".repeat(59)}`;
+    const mixed = asks(`curl --silent --show-error -H "Authorization: Bearer\n${wide.slice(0, 36)}\n${wide.slice(36)}" x`);
+    assert.ok(!mixed.includes("QQQQQQ"), mixed);
+    // (a command on more rows than are read: the word the last read row cuts is left out with them)
+    const rows = [...Array.from({ length: 7 }, (_, k) => `echo row${k};`), `export API_KEY=a1${"Q".repeat(8)}`, "Q".repeat(40), "echo row9"];
+    const many = asks(rows.join("\n"));
+    assert.ok(!many.includes("QQQQQQ") && !many.includes("row9"), many);
+    assert.match(many, /echo row0; echo row1;/);
     // (rows of a command that are its own lines still read as one line, a path on the second one cut too)
     assert.equal(asks("cd /home/dev/project &&\nmake -C /srv/build/out all"), "Bash command: cd …/project && make -C …/out all");
   });
