@@ -144,7 +144,7 @@ export class TurnRunner {
       await this.read(request, display, fold, cursor, deadline);
     } catch (error) {
       if (signal.aborted) {
-        display.close(true); // cancelled (the machine was disconnected, or the stop could not reach it): nothing more is sent
+        display.close(true); // cancelled (the machine was disconnected, or the stop could not reach it): only its progress goes
         return;
       }
       await this.failed(request, display, error);

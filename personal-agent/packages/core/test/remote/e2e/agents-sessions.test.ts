@@ -282,6 +282,10 @@ test("detach new and attach wait for a running turn", () =>
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
     assert.deepEqual(w.server.commands.slice(before), []);
     assert.ok(w.last().includes("That turn goes on on the machine, uninterrupted"), w.last());
+    // (the chat stopped following that turn: its progress message is retired, not left as stale progress)
+    const progress = w.operations().find((o) => o.op === "post" && o.text.startsWith("Working on it"));
+    assert.ok(progress, "no progress message was posted");
+    await w.until(() => w.operations().some((o) => o.op === "delete" && o.id === progress.id));
   }));
 
 // --- /agent mode --------------------------------------------------------------------------------------------------------

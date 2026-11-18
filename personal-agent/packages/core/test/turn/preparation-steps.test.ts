@@ -272,7 +272,12 @@ it("test_a_turn_cancelled_during_setup_leaves_no_timer_and_sends_nothing_more", 
   assert.notEqual(await w.clock.pump(outcome), "resolved");
   await w.clock.drain();
   assert.ok(quiet(w));
-  assert.ok(w.bus.sent.length === sentBefore && w.told.at(-1) === "failed");
+  // (the only thing sent after the cancel retires the progress message, so it is not left as stale progress)
+  assert.deepEqual(
+    w.bus.sent.slice(sentBefore).map((s) => s.operation),
+    ["delete"],
+  );
+  assert.equal(w.told.at(-1), "failed");
 });
 
 // --- the pure parts ---------------------------------------------------------------------------------------------------

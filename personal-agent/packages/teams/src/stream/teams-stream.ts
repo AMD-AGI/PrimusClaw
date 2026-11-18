@@ -174,11 +174,35 @@ export class TeamsStream {
 
   private finalOnce(activity: JsonObject): Promise<void> {
     return this.lock.run(async () => {
-      await this.send(streamFinal(activity, this.parts.replyTo, this.streamId), true);
-      this.closed = true;
-      if (this.parts.conversation && this.openedAt !== undefined) {
-        this.parts.busy.closed(this.parts.conversation, this.openedAt);
+      try {
+        await this.send(streamFinal(activity, this.parts.replyTo, this.streamId), true);
+      } catch (error) {
+        if (refusedForGood(error)) {
+          this.logger.info("Teams refused the stream's final for good; the conversation can stream again");
+          this.close();
+        }
+        throw error;
       }
+      this.close();
     });
   }
+
+  /** The stream is done with: it takes nothing more, and the conversation is free for the next one. */
+  private close(): void {
+    this.closed = true;
+    if (this.parts.conversation && this.openedAt !== undefined) {
+      this.parts.busy.closed(this.parts.conversation, this.openedAt);
+    }
+  }
+}
+
+/**
+ * Teams refused a final with 403 ContentStreamNotAllowed: the stream is over on its side (the person stopped it, it had
+ * already completed, or it ran past Teams' limit), or the final itself was not acceptable (too large, or not containing
+ * what was streamed). The conversation is freed either way: in the first case nothing is open, and in the second a new
+ * stream is refused by Teams if it is, which falls back exactly as waiting would have. A final that failed any other way
+ * (no answer, a timeout, a 5xx) may not have reached Teams, so the stream may still be open there until Teams closes it.
+ */
+function refusedForGood(error: unknown): boolean {
+  return error instanceof StreamRefusedError && error.status === 403 && error.code === "ContentStreamNotAllowed";
 }

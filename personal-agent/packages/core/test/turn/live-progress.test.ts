@@ -303,7 +303,12 @@ it("test_no_live_edit_lands_after_the_turn_is_cancelled", async () => {
   cancel.abort(new Error("cancelled"));
   assert.notEqual(await w.clock.pump(outcome), "resolved");
   await w.clock.drain();
-  assert.equal(w.bus.sent.length, sentBefore);
+  // (no live edit: the only thing sent after the cancel retires the progress message, so it is not left as stale progress)
+  assert.deepEqual(
+    w.bus.sent.slice(sentBefore).map((s) => s.operation),
+    ["delete"],
+  );
+  assert.deepEqual(w.bus.chat, []);
   assert.equal(w.told.at(-1), "failed");
   assert.ok(quiet(w));
 });

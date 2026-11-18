@@ -162,6 +162,16 @@ release version, and its `appVersion` stays `latest`.
   `terminal_working`, `held: "terminal"`), also after a notice that the paste was drawn late; before, it said nothing unless
   the paste was drawn late. After a restart, the events still to be sent go in each session's own order whatever time they
   carry.
+- Personal agent: when Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (for example
+  because the person stopped the stream in the chat), the stream is over on Teams' side and the conversation streams
+  again from the next turn. Before, the worker treated the stream as possibly still open for up to 10 minutes after it
+  opened, and every turn in that time showed no floating status: it posted a progress message, sent the answer as a new
+  message and deleted the progress message, which Teams shows as a deleted message above each answer. A final that fails
+  any other way (no answer, a timeout, a server error) still keeps the conversation off streams until Teams' 10-minute
+  limit, since that stream may still be open.
+- Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
+  is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
+  deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
 
 ## [0.5.7] - 2026-11-17
 
