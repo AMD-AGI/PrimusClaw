@@ -21,7 +21,8 @@
 //   --mem-per-node         GiB, default 1024
 //   --model                model path/id (infera frontend, or atomesh/sglangrouter --model-path)
 //   --framework            sglang | vllm, default sglang. Atom router --backend and
-//                          Infera backendFramework take this value.
+//                          Infera backendFramework take this value; atomesh and
+//                          sglangrouter accept only sglang.
 //   --server-args          engine flags, appended as given
 //   --pd-prefill-extra-args / --pd-decode-extra-args   per-role engine flags
 //   --pd-ib-device         IB device list for the disaggregation plane
@@ -365,6 +366,8 @@ function pdClusterPromptMessage(backend: string, problem: PdClusterProblem): str
   switch (problem.kind) {
     case "pd_mode":
       return `${backend} requires --pd-mode disaggregated (got ${problem.got})`;
+    case "framework":
+      return `${backend} requires --framework sglang (got ${problem.got}); its prefill and decode engines are sglang`;
     case "partial_roles":
       return `${backend} requires both --pd-prefill-nodes and --pd-decode-nodes when either is set`;
     case "min_nodes":
@@ -471,6 +474,7 @@ function declaredFailureCode(raw: unknown): string | null {
   const problems = pdClusterProblems({
     backend: known,
     pdMode: typeof body.pd_mode === "string" ? body.pd_mode : undefined,
+    framework: typeof body.framework === "string" ? body.framework : undefined,
     nodes: typeof body.nodes === "number" ? body.nodes : 0,
     gpusPerNode: typeof body.gpus_per_node === "number" ? body.gpus_per_node : undefined,
     pdPrefillNodes: typeof body.pd_prefill_nodes === "number" ? body.pd_prefill_nodes : undefined,

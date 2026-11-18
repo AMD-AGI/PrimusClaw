@@ -3,8 +3,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { SandboxFailure } from "../src/sandbox/errors.js";
 import {
   buildAtomWorkloadBody,
+  detachedServer,
   buildInferaWorkloadBody,
   buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
@@ -368,11 +371,11 @@ test("buildAtomWorkloadBody splits --nodes across prefill and decode when pd cou
   assert.match(decodeEp(body.entryPoints[1]), /--tp-size 8/);
 });
 
-test("buildAtomWorkloadBody uses the prompt framework and engine args", () => {
+test("buildAtomWorkloadBody uses the prompt engine args", () => {
   const body = buildAtomWorkloadBody({
     ...COMMON,
     model: "/models/m",
-    framework: "vllm",
+    framework: "sglang",
     kvTransferBackend: "nixl",
     pdMode: "disaggregated",
     serverArgs: "--mem-fraction-static 0.8",
@@ -383,7 +386,7 @@ test("buildAtomWorkloadBody uses the prompt framework and engine args", () => {
   const router = decodeEp(body.entryPoints[0]);
   const prefill = decodeEp(body.entryPoints[1]);
   const decode = decodeEp(body.entryPoints[2]);
-  assert.match(router, /--backend 'vllm'/);
+  assert.match(router, /--backend 'sglang'/);
   assert.match(prefill, /--disaggregation-transfer-backend 'nixl'/);
   assert.ok(prefill.includes("'--mem-fraction-static'"));
   assert.ok(prefill.includes("'0.8'"));
@@ -421,6 +424,34 @@ test("buildAtomWorkloadBody rejects aggregated pd-mode and cross-pod TP", () => 
     }),
     /must equal prefill\+decode/,
   );
+});
+
+test("atomesh and sglangrouter reject a framework other than the sglang engines they run", () => {
+  for (const build of [buildAtomWorkloadBody, buildSGLangRouterWorkloadBody]) {
+    assert.throws(
+      () => build({ ...COMMON, model: "/models/m", framework: "vllm", kvTransferBackend: "mooncake", pdMode: "disaggregated" }),
+      (e: unknown) => e instanceof SandboxFailure && e.code === "mn_config_invalid" && /--framework sglang/.test(e.message),
+    );
+  }
+});
+
+test("engine args keep quoted values as one word without their quotes", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    serverArgs: `--json-model-override-args '{"a": 1}' --chat-template "a b"`,
+    pdPrefillExtraArgs: String.raw`--x c\ d "it's"`,
+  }) as Record<string, any>;
+  const prefill = decodeEp(body.entryPoints[1]);
+  const block = prefill.slice(prefill.indexOf("args=("), prefill.indexOf("\n)\n") + 2);
+  const run = spawnSync("bash", ["-c", `${block}\nprintf '%s\\n' "\${args[@]:17}"`], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trimEnd().split("\n"), [
+    "--json-model-override-args", '{"a": 1}', "--chat-template", "a b", "--x", "c d", "it's",
+  ]);
 });
 
 test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine roles", () => {
@@ -471,7 +502,9 @@ test("Infera frontend starts sshd on its own port, runs the server detached and 
     const base = inferaSshPortBase(INFERA_COMMON.displayName);
     assert.ok(frontend.includes(`export MN_SSH_PORT=${base + 20}\n`), frontend);
     assert.ok(frontend.includes("/usr/sbin/sshd -p \"${MN_SSH_PORT}\""), frontend);
-    assert.match(frontend, /\n\( setsid python3 -m infera\.server .* < \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+    assert.match(frontend, /\n\( setsid python3 -m infera\.server .* < \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
+    assert.ok(frontend.includes(`/dev/tcp/127.0.0.1/${inferaFrontendPort(INFERA_COMMON.displayName)}`), frontend);
+    assert.match(frontend, /\nexec tail -f \/dev\/null$/);
     assert.equal(sshPortForPod("frontend", null, base), base + 20);
   }
 });
@@ -493,9 +526,13 @@ test("PD entrypoints run the server detached and hold the waited pid", () => {
       }) as Record<string, any>;
       const [router, prefill, decode] = body.entryPoints.map(decodeEp);
       assert.ok(router.includes(routerCommand), router);
-      assert.match(router, /< \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+      assert.match(router, /< \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
       for (const ep of [prefill, decode]) {
-        assert.match(ep, /\n\( setsid "\$\{args\[@\]\}" < \/dev\/null & \)\nexec tail -f \/dev\/null$/);
+        assert.match(ep, /\n\( setsid "\$\{args\[@\]\}" < \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
+      }
+      for (const ep of [router, prefill, decode]) {
+        assert.ok(ep.includes("/dev/tcp/127.0.0.1/${ATOM_SERVER_PORT}"), ep);
+        assert.match(ep, /\nexec tail -f \/dev\/null$/);
       }
       for (const ep of [router, prefill, decode]) {
         const execs = ep.split("\n").filter((line) => line.startsWith("exec "));
@@ -505,7 +542,7 @@ test("PD entrypoints run the server detached and hold the waited pid", () => {
   }
 });
 
-test("PD entrypoints start sshd on the shared port before the server when a key is given", () => {
+test("PD entrypoints start sshd on a port of each role before the server when a key is given", () => {
   for (const [build, routerCommand] of [
     [buildAtomWorkloadBody, "setsid atomesh launch"],
     [buildSGLangRouterWorkloadBody, "setsid python3 -m sglang_router.launch_router"],
@@ -520,7 +557,11 @@ test("PD entrypoints start sshd on the shared port before the server when a key 
       sshPortBase: 25032,
     }) as Record<string, any>;
     assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, "ssh-ed25519 AAAATEST primus-claw-sess-1");
-    assert.equal(body.env.MN_SSH_PORT, "25032");
+    assert.equal(body.env.MN_SSH_PORT, undefined, "the port is per role, not shared");
+    const [routerEp, prefillEp, decodeEp_] = body.entryPoints.map(decodeEp);
+    assert.ok(routerEp.includes(`export MN_SSH_PORT=${sshPortForPod("frontend", null, 25032)}\n`), routerEp);
+    assert.ok(prefillEp.includes(`export MN_SSH_PORT=${sshPortForPod("prefill", null, 25032)}\n`), prefillEp);
+    assert.ok(decodeEp_.includes(`export MN_SSH_PORT=${sshPortForPod("decode", null, 25032)}\n`), decodeEp_);
     const router = decodeEp(body.entryPoints[0]);
     assert.ok(router.startsWith("set -euo pipefail\n"), router);
     const routerSshd = router.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
@@ -661,6 +702,41 @@ test("discoverRolePods orders an LWS group leader-first", () => {
   const groups = discoverRolePods(workload, "aggregated", 2222);
   assert.deepStrictEqual(groups.worker.map((p) => p.podIp), ["192.0.2.2", "192.0.2.3", "192.0.2.4"]);
   assert.deepStrictEqual(groups.worker.map((p) => p.sshPort), [2222, 2223, 2224]);
+});
+
+test("gpuPodsReady with the router required waits for a router pod IP", () => {
+  const noRouter = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-p", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+        { podId: "wl-d", podIP: "192.0.2.3", phase: "Running", resourceId: 2 },
+      ],
+    },
+    "disaggregated",
+    2222,
+  );
+  assert.equal(gpuPodsReady(noRouter, "disaggregated"), true);
+  assert.equal(gpuPodsReady(noRouter, "disaggregated", { requireRouter: true }), false);
+  noRouter.frontend.push({ podId: "wl-r", podIp: "192.0.2.1", sshPort: 2242, lwsIndex: null } as never);
+  assert.equal(gpuPodsReady(noRouter, "disaggregated", { requireRouter: true }), true);
+});
+
+/** Run `detachedServer(command, port)` then `echo HELD`; stdout, stderr and exit status. */
+function runDetached(command: string, port: number): { status: number | null; stdout: string; stderr: string } {
+  const script = ["set -euo pipefail", ...detachedServer(command, String(port)), "echo HELD"].join("\n");
+  return spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 20_000 });
+}
+
+test("a server that exits before it listens fails the entrypoint; one that listens is held", () => {
+  const dead = runDetached("sh -c 'exit 3'", 39411);
+  assert.equal(dead.status, 1, dead.stderr);
+  assert.equal(dead.stdout.includes("HELD"), false);
+  assert.match(dead.stderr, /exited before listening on 39411/);
+
+  const node = process.execPath;
+  const up = runDetached(`${node} -e "require('net').createServer().listen(39412); setTimeout(() => process.exit(0), 3000)"`, 39412);
+  assert.equal(up.status, 0, up.stderr);
+  assert.match(up.stdout, /HELD/);
 });
 
 test("gpuPodsReady waits for every role the topology needs", () => {

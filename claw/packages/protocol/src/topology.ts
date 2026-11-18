@@ -248,6 +248,8 @@ export interface PdClusterShape {
   backend: string;
   /** Omitted means the builder default, disaggregated. */
   pdMode?: string;
+  /** Omitted means the default engine, sglang. */
+  framework?: string;
   nodes: number;
   gpusPerNode?: number;
   pdPrefillNodes?: number;
@@ -256,8 +258,12 @@ export interface PdClusterShape {
   pdDecodeTp?: number;
 }
 
+/** The only engine an Atomesh or SGLangRouter cluster runs. */
+export const PD_CLUSTER_FRAMEWORK = "sglang";
+
 export type PdClusterProblem =
   | { kind: "pd_mode"; got: string }
+  | { kind: "framework"; got: string }
   | { kind: "partial_roles" }
   | { kind: "min_nodes"; nodes: number }
   | { kind: "role_sum"; nodes: number; total: number }
@@ -266,6 +272,7 @@ export type PdClusterProblem =
 /**
  * Shape rules for an Atomesh or SGLangRouter cluster.
  *
+ * The prefill and decode engines are sglang, so no other framework is accepted.
  * Explicit prefill and decode counts must both be set and sum to nodes.
  * Otherwise nodes is split evenly, which requires at least two nodes.
  */
@@ -273,6 +280,9 @@ export function pdClusterProblems(shape: PdClusterShape): PdClusterProblem[] {
   const problems: PdClusterProblem[] = [];
   if (shape.pdMode !== undefined && shape.pdMode !== "disaggregated") {
     problems.push({ kind: "pd_mode", got: shape.pdMode });
+  }
+  if (shape.framework !== undefined && shape.framework !== PD_CLUSTER_FRAMEWORK) {
+    problems.push({ kind: "framework", got: shape.framework });
   }
   const gpus = shape.gpusPerNode && shape.gpusPerNode > 0
     ? shape.gpusPerNode
@@ -334,6 +344,7 @@ function pdClusterShapeErrors(
   return pdClusterProblems({
     backend,
     pdMode: typeof raw.pd_mode === "string" ? raw.pd_mode : undefined,
+    framework: typeof raw.framework === "string" ? raw.framework : undefined,
     nodes,
     gpusPerNode: typeof raw.gpus_per_node === "number" ? raw.gpus_per_node : undefined,
     pdPrefillNodes: typeof raw.pd_prefill_nodes === "number" ? raw.pd_prefill_nodes : undefined,
@@ -347,6 +358,8 @@ function pdClusterAdmissionMessage(backend: string, problem: PdClusterProblem): 
   switch (problem.kind) {
     case "pd_mode":
       return `topology.pd_mode ${problem.got} is not supported when backend is ${backend}`;
+    case "framework":
+      return `topology.framework ${problem.got} is not supported when backend is ${backend}: its engines are ${PD_CLUSTER_FRAMEWORK}`;
     case "partial_roles":
       return `topology.pd_prefill_nodes and topology.pd_decode_nodes must both be set when backend is ${backend}`;
     case "min_nodes":

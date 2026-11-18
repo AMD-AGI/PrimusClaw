@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyMultiNodeExternalEnv, buildNodeList, MN_NODE_LIST_ENV, usesTopologyHandoff } from "../src/sandbox/params.js";
+import { SandboxFailure } from "../src/sandbox/errors.js";
 import type { MultiNodeContext, MultiNodeNodeList } from "../src/sandbox/multi-node/types.js";
 
 const RAYJOB_CTX: MultiNodeContext = {
@@ -76,6 +77,7 @@ const PD_CTX: MultiNodeContext = {
   sshPrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETKEYBODY\n-----END OPENSSH PRIVATE KEY-----\n",
   sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
   sshPortBase: 25032,
+  sshPorts: { router: [25052], prefill: [25032], decode: [25042, 25042] },
   routerIps: ["10.0.0.1"],
   prefillIps: ["10.0.0.2"],
   decodeIps: ["10.0.0.3", "10.0.0.4"],
@@ -109,9 +111,9 @@ test("sglangrouter and atomesh hand the cluster over as one node list", () => {
       service_url: PD_CTX.serviceUrl,
       prefill_url: PD_CTX.prefillUrl,
       decode_url: PD_CTX.decodeUrl,
-      router: { host: "10.0.0.1" },
-      prefill: [{ host: "10.0.0.2" }],
-      decode: [{ host: "10.0.0.3" }, { host: "10.0.0.4" }],
+      router: { host: "10.0.0.1", ssh_port: 25052 },
+      prefill: [{ host: "10.0.0.2", ssh_port: 25032 }],
+      decode: [{ host: "10.0.0.3", ssh_port: 25042 }, { host: "10.0.0.4", ssh_port: 25042 }],
       gpus_per_node: 8,
       launch_mode: "in_place",
       ssh: { port: 25032, user: "root", key_file: "/tmp/primus-claw-mn-ssh-key" },
@@ -169,11 +171,17 @@ test("the node list leaves out what the prompt did not set", () => {
   assert.equal(nodeList.transfer_backend, undefined);
 });
 
-test("no node list without router, prefill and decode hosts", () => {
-  for (const missing of [{ routerIps: [] }, { prefillIps: [] }, { decodeIps: undefined }, { pdLaunch: undefined }]) {
-    const env: Record<string, string> = {};
-    applyMultiNodeExternalEnv(env, { ...PD_CTX, ...missing });
-    assert.equal(env[MN_NODE_LIST_ENV], undefined, JSON.stringify(missing));
+test("atomesh and sglangrouter without router, prefill or decode hosts fail instead of handing nothing over", () => {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
+    for (const missing of [{ routerIps: [] }, { prefillIps: [] }, { decodeIps: undefined }, { pdLaunch: undefined }]) {
+      const env: Record<string, string> = {};
+      assert.throws(
+        () => applyMultiNodeExternalEnv(env, { ...PD_CTX, backend, ...missing }),
+        (e: unknown) => e instanceof SandboxFailure && e.code === "mn_handoff_incomplete",
+        JSON.stringify(missing),
+      );
+      assert.equal(env[MN_NODE_LIST_ENV], undefined, JSON.stringify(missing));
+    }
   }
   assert.equal(buildNodeList(INFERA_CTX), undefined, "an infera cluster without a launch request has no node list");
 });
@@ -213,7 +221,7 @@ const INFERA_PD_CTX: MultiNodeContext = {
   ...INFERA_CTX,
   sshPrivateKey: PD_CTX.sshPrivateKey,
   routerIps: ["10.0.0.1"],
-  sshPorts: { "10.0.0.1": 2242, "10.0.0.2": 2222, "10.0.0.3": 2232 },
+  sshPorts: { router: [2242], prefill: [2222], decode: [2232] },
   pdLaunch: { ...PD_CTX.pdLaunch!, framework: "sglang", mode: "disaggregated" },
 };
 
@@ -257,7 +265,7 @@ test("aggregated infera names worker hosts and the server args as the workers' a
     prefillIps: [],
     decodeIps: [],
     workerIps: ["10.0.0.4", "10.0.0.5"],
-    sshPorts: { "10.0.0.4": 2222, "10.0.0.5": 2223 },
+    sshPorts: { worker: [2222, 2223] },
     pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, mode: "aggregated" },
   });
   assert.ok(nodeList);
@@ -285,4 +293,15 @@ test("infera without an sglang engine or its role pods keeps the topology handof
     assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "infera");
     assert.equal(usesTopologyHandoff(ctx), true);
   }
+});
+
+test("co-located prefill and decode pods sharing a node IP keep their own ssh ports", () => {
+  const nodeList = buildNodeList({
+    ...INFERA_PD_CTX,
+    prefillIps: ["10.0.0.5"],
+    decodeIps: ["10.0.0.5"],
+    sshPorts: { router: [2242], prefill: [2222], decode: [2232] },
+  });
+  assert.deepEqual(nodeList?.prefill, [{ host: "10.0.0.5", ssh_port: 2222 }]);
+  assert.deepEqual(nodeList?.decode, [{ host: "10.0.0.5", ssh_port: 2232 }]);
 });

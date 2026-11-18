@@ -40,10 +40,10 @@ export interface MultiNodeContext {
   sshPrivateKey?: string;
   /** infera, atomesh, sglangrouter: path the private key is materialised at inside the sandbox. */
   sshKeyPath?: string;
-  /** infera: SSH base port, decode pods role-offset; atomesh/sglangrouter: the one port of every pod. */
+  /** infera, atomesh, sglangrouter: SSH base port; each role listens on its own offset. */
   sshPortBase?: number;
-  /** infera: the sshd port of each pod, by pod IP. */
-  sshPorts?: Record<string, number>;
+  /** The sshd port of each pod per role, in the order of that role's IP list. */
+  sshPorts?: { router?: number[]; prefill?: number[]; decode?: number[]; worker?: number[] };
   /** atomesh/sglangrouter: router pod IPs. */
   routerIps?: string[];
   /** PD: prefill pod IPs, rank order. */

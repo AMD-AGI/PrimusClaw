@@ -140,8 +140,12 @@ export function rayClusterName(workload: Record<string, unknown>): string | unde
   return undefined;
 }
 
-/** True once every GPU role the topology needs has at least one live pod IP. */
-export function gpuPodsReady(groups: RolePodGroups, pdMode: string): boolean {
+/**
+ * True once every GPU role the topology needs has at least one live pod IP,
+ * and with `requireRouter` the router (frontend) pod too.
+ */
+export function gpuPodsReady(groups: RolePodGroups, pdMode: string, opts: { requireRouter?: boolean } = {}): boolean {
+  if (opts.requireRouter && groups.frontend.length === 0) return false;
   return pdMode.toLowerCase() === "disaggregated"
     ? groups.prefill.length > 0 && groups.decode.length > 0
     : groups.worker.length > 0;

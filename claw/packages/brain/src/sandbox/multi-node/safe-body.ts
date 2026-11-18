@@ -484,8 +484,11 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
     "set -euo pipefail",
     `export MN_SSH_PORT=${sshPortForPod("frontend", null, sshPortBase)}`,
     ...PD_SSHD_BOOTSTRAP,
-    `( setsid python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-      `--router-tokenizer-path ${shellSingleQuote(p.model.trim())} < /dev/null & )`,
+    ...detachedServer(
+      `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
+        `--router-tokenizer-path ${shellSingleQuote(p.model.trim())}`,
+      String(frontendPort),
+    ),
     PD_HOLD,
   ].join("\n"));
 
@@ -577,6 +580,9 @@ export const ATOM_ROUTER_PORT = 8000;
 export const PD_ENGINE_PREFILL_PORT = 8010;
 export const PD_ENGINE_DECODE_PORT = 8020;
 
+/** The listen port SaFE injects into every Atom and SGLangRouter role, as a shell expression. */
+const ATOM_SERVER_PORT_EXPR = "${ATOM_SERVER_PORT}";
+
 /** Mooncake bootstrap ports published on the prefill and decode Services. */
 const ATOM_PREFILL_BOOTSTRAP_PORT = 8998;
 const ATOM_DECODE_BOOTSTRAP_PORT = 9098;
@@ -593,6 +599,31 @@ function shellSingleQuote(value: string): string {
  */
 const PD_HOLD = "exec tail -f /dev/null";
 
+/** File the detached server's pid is written to. */
+const PD_SERVER_PID_FILE = "/tmp/mn-server.pid";
+
+/**
+ * Start `command` detached in its own session, then wait until it accepts TCP
+ * connections on `port` (a number or a shell expression). A server that exits
+ * before it listens ends the entrypoint with status 1, so the pod fails instead
+ * of holding a dead service; once it has listened, stopping it never ends the
+ * container.
+ */
+export function detachedServer(command: string, port: string): string[] {
+  return [
+    `( setsid ${command} < /dev/null & echo $! > ${PD_SERVER_PID_FILE} )`,
+    `mn_server_pid=$(cat ${PD_SERVER_PID_FILE})`,
+    `until (: > /dev/tcp/127.0.0.1/${port}) 2>/dev/null; do`,
+    `  mn_server_state=$(sed -E 's/.*\\) ([A-Za-z]).*/\\1/' "/proc/\${mn_server_pid}/stat" 2>/dev/null || echo X)`,
+    `  if [ "\${mn_server_state}" = X ] || [ "\${mn_server_state}" = Z ]; then`,
+    `    echo "ERROR: server exited before listening on ${port}" >&2`,
+    "    exit 1",
+    "  fi",
+    "  sleep 2",
+    "done",
+  ];
+}
+
 /**
  * SGLang model-gateway command.
  *
@@ -603,12 +634,14 @@ const PD_HOLD = "exec tail -f /dev/null";
 function sglangRouterEntrypoint(): string {
   return [
     "set -euo pipefail",
-    "( setsid python3 -m sglang_router.launch_router \\",
-    "  --pd-disaggregation \\",
-    `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
-    "  --decode {decode} \\",
-    "  --host 0.0.0.0 \\",
-    "  --port \"${ATOM_SERVER_PORT}\" < /dev/null & )",
+    ...detachedServer([
+      "python3 -m sglang_router.launch_router \\",
+      "  --pd-disaggregation \\",
+      `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+      "  --decode {decode} \\",
+      "  --host 0.0.0.0 \\",
+      "  --port \"${ATOM_SERVER_PORT}\"",
+    ].join("\n"), ATOM_SERVER_PORT_EXPR),
     PD_HOLD,
   ].join("\n");
 }
@@ -620,13 +653,15 @@ function sglangRouterEntrypoint(): string {
 function atomRouterEntrypoint(framework: string): string {
   return [
     "set -euo pipefail",
-    "( setsid atomesh launch \\",
-    "  --host 0.0.0.0 \\",
-    "  --port \"${ATOM_SERVER_PORT}\" \\",
-    "  --pd-disaggregation \\",
-    `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
-    "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
-    `  --backend ${shellSingleQuote(framework)} < /dev/null & )`,
+    ...detachedServer([
+      "atomesh launch \\",
+      "  --host 0.0.0.0 \\",
+      "  --port \"${ATOM_SERVER_PORT}\" \\",
+      "  --pd-disaggregation \\",
+      `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+      "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
+      `  --backend ${shellSingleQuote(framework)}`,
+    ].join("\n"), ATOM_SERVER_PORT_EXPR),
     PD_HOLD,
   ].join("\n");
 }
@@ -637,6 +672,7 @@ function atomRouterEntrypoint(framework: string): string {
  * The images carry sshd but not the SaFE idle scripts, so the key and daemon
  * are set up here from MN_SSH_AUTHORIZED_KEY / MN_SSH_PORT. Key-only root
  * login. A failure only warns: the process still serves, without SSH control.
+ * MN_SSH_PORT is exported per role by the entrypoint (`sshdBootstrap`).
  */
 const PD_SSHD_BOOTSTRAP = [
   "if ! { mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh \\",
@@ -649,23 +685,66 @@ const PD_SSHD_BOOTSTRAP = [
   "fi",
 ];
 
-/** A router entrypoint with the sshd bootstrap after its `set` line when `withSshd`. */
-function routerEntrypointWithSshd(entrypoint: string, withSshd: boolean): string {
-  if (!withSshd) return entrypoint;
-  const [first, ...rest] = entrypoint.split("\n");
-  return [first, ...PD_SSHD_BOOTSTRAP, ...rest].join("\n");
+/** The sshd bootstrap on `sshPort`, or nothing when the role runs without sshd. */
+function sshdBootstrap(sshPort: number | null): string[] {
+  return sshPort === null ? [] : [`export MN_SSH_PORT=${sshPort}`, ...PD_SSHD_BOOTSTRAP];
 }
 
-/** Split a prompt arg string into shell words. Quotes are already removed. */
-function shellWords(raw: string): string[] {
-  return raw.trim().split(/\s+/).filter((word) => word.length > 0);
+/** A router entrypoint with the sshd bootstrap on `sshPort` after its `set` line. */
+function routerEntrypointWithSshd(entrypoint: string, sshPort: number | null): string {
+  if (sshPort === null) return entrypoint;
+  const [first, ...rest] = entrypoint.split("\n");
+  return [first, ...sshdBootstrap(sshPort), ...rest].join("\n");
+}
+
+/**
+ * Split a prompt arg string into words the way a POSIX shell does, without
+ * expansion: whitespace separates words, single quotes keep their content
+ * literally, double quotes keep it with `\` escaping `"`, `\`, `$` and a
+ * backtick, and an unquoted `\` keeps the next character.
+ */
+export function shellWords(raw: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let inWord = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === "'") {
+      const end = raw.indexOf("'", i + 1);
+      if (end < 0) throw new SandboxFailure("mn_config_invalid", `unterminated single quote in engine args: ${raw}`);
+      word += raw.slice(i + 1, end);
+      inWord = true;
+      i = end;
+    } else if (c === '"') {
+      inWord = true;
+      for (i++; ; i++) {
+        if (i >= raw.length) throw new SandboxFailure("mn_config_invalid", `unterminated double quote in engine args: ${raw}`);
+        const d = raw[i]!;
+        if (d === '"') break;
+        if (d === "\\" && i + 1 < raw.length && '"\\$`'.includes(raw[i + 1]!)) word += raw[++i];
+        else word += d;
+      }
+    } else if (c === "\\") {
+      if (i + 1 < raw.length) word += raw[++i];
+      inWord = true;
+    } else if (/\s/.test(c)) {
+      if (inWord) words.push(word);
+      word = "";
+      inWord = false;
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  if (inWord) words.push(word);
+  return words;
 }
 
 /**
  * Prefill or decode command. Model, TP, transfer backend, IB device, and the
  * extra server flags all come from the prompt. The listen port is the one SaFE
  * injects. Bootstrap ports are the pair this workload's router command uses.
- * `withSshd` prepends the sshd bootstrap.
+ * A non-null `sshPort` prepends the sshd bootstrap on that port.
  */
 function atomEngineEntrypoint(
   role: "prefill" | "decode",
@@ -675,12 +754,12 @@ function atomEngineEntrypoint(
   ibDevice: string,
   serverArgs: string,
   roleArgs: string,
-  withSshd: boolean,
+  sshPort: number | null,
 ): string {
   const bootstrap = role === "prefill" ? ATOM_PREFILL_BOOTSTRAP_PORT : ATOM_DECODE_BOOTSTRAP_PORT;
   const lines = [
     "set -euo pipefail",
-    ...(withSshd ? PD_SSHD_BOOTSTRAP : []),
+    ...sshdBootstrap(sshPort),
     "export SGLANG_HOST_IP=\"${POD_IP:-$(hostname -i | awk '{print $1}')}\"",
     "args=(",
     "  python3 -m sglang.launch_server",
@@ -698,7 +777,7 @@ function atomEngineEntrypoint(
   for (const word of [...shellWords(serverArgs), ...shellWords(roleArgs)]) {
     lines.push(`  ${shellSingleQuote(word)}`);
   }
-  lines.push(")", "( setsid \"${args[@]}\" < /dev/null & )", PD_HOLD);
+  lines.push(")", ...detachedServer("\"${args[@]}\"", ATOM_SERVER_PORT_EXPR), PD_HOLD);
   return lines.join("\n");
 }
 
@@ -726,7 +805,7 @@ export interface AtomWorkloadParams extends CommonWorkloadParams {
   rdmaResource?: string;
   /** Public key authorised for root SSH on prefill and decode; no sshd without it. */
   sshAuthorizedKey?: string;
-  /** sshd port shared by every prefill and decode pod. */
+  /** sshd base port; each role listens on its own offset (`sshPortForPod`). */
   sshPortBase?: number;
 }
 
@@ -804,12 +883,11 @@ function buildPdClusterWorkloadBody(
   });
 
   const sshKey = (p.sshAuthorizedKey ?? "").trim();
-  const withSshd = sshKey.length > 0;
+  const sshBase = p.sshPortBase ?? inferaSshPortBase(p.displayName);
+  // hostNetwork pods of different roles can share a node, so each role's sshd gets its own port.
+  const sshPort = (role: string): number | null => (sshKey ? sshPortForPod(role, null, sshBase) : null);
   const env = sanitizeEnv(p.extraEnv);
-  if (withSshd) {
-    env.MN_SSH_AUTHORIZED_KEY = sshKey;
-    env.MN_SSH_PORT = String(p.sshPortBase ?? inferaSshPortBase(p.displayName));
-  }
+  if (sshKey) env.MN_SSH_AUTHORIZED_KEY = sshKey;
   applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
 
   // useWorkspaceStorage stays absent: SaFE defaults an absent *bool to true
@@ -823,14 +901,14 @@ function buildPdClusterWorkloadBody(
     resources: [routerResource, gpuResource(prefillReplica), gpuResource(decodeReplica)],
     images: [p.image, p.image, p.image],
     entryPoints: [
-      b64(routerEntrypointWithSshd(opts.routerEntrypoint, withSshd)),
+      b64(routerEntrypointWithSshd(opts.routerEntrypoint, sshPort("frontend"))),
       b64(atomEngineEntrypoint(
         "prefill", model, prefillTp, p.kvTransferBackend,
-        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "", withSshd,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "", sshPort("prefill"),
       )),
       b64(atomEngineEntrypoint(
         "decode", model, decodeTp, p.kvTransferBackend,
-        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "", withSshd,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "", sshPort("decode"),
       )),
     ],
     env,

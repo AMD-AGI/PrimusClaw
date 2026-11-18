@@ -108,10 +108,8 @@ test("atomesh and sglangrouter use no topology handoff file", () => {
       gpusPerNode: 8,
       serviceUrl: `http://msg1-${backend}.ws.svc.cluster.local:8000`,
     };
-    const env: Record<string, string> = {};
-    applyMultiNodeExternalEnv(env, ctx, { legacyTopologyEnv: true });
     assert.equal(usesTopologyHandoff(ctx), false, backend);
-    assert.equal(env.TOPOLOGY_HANDOFF_FILE, undefined, backend);
+    assert.throws(() => buildTopologyHandoff(ctx), /node list/, backend);
   }
   assert.ok(usesTopologyHandoff(RAYJOB) && usesTopologyHandoff(INFERA));
 });

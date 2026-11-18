@@ -42,6 +42,7 @@ import {
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
+  sshPortForPod,
   PD_ENGINE_DECODE_PORT,
   PD_ENGINE_PREFILL_PORT,
   RAYJOB_SERVER_PORT,
@@ -715,12 +716,13 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       isReady: (detail) => {
         if (String(detail.phase ?? "").toLowerCase() !== "running") return false;
         // Atom and SGLangRouter report Running only after router, prefill and
-        // decode are all up; their pod IPs are still needed for the SSH handoff.
-        // Infera needs live pod IPs as well.
+        // decode are all up; their pod IPs, the router's included, are still
+        // needed for the node list. Infera needs live GPU pod IPs as well.
         if (spec.backend === "rayjob") return true;
         return gpuPodsReady(
           discoverRolePods(detail, spec.pdMode, inferaSshPortBase(displayName)),
           spec.pdMode,
+          { requireRouter: spec.backend === "atomesh" || spec.backend === "sglangrouter" },
         );
       },
       onGiveUp: async ({ reason }) => {
@@ -814,6 +816,11 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         sshPrivateKey: keypair?.privateKeyPem,
         sshKeyPath: SANDBOX_SSH_KEY_PATH,
         sshPortBase: sshPort,
+        sshPorts: {
+          router: groups.frontend.map(() => sshPortForPod("frontend", null, sshPort)),
+          prefill: groups.prefill.map(() => sshPortForPod("prefill", null, sshPort)),
+          decode: groups.decode.map(() => sshPortForPod("decode", null, sshPort)),
+        },
         routerIps: groups.frontend.map((p) => p.podIp),
         prefillIps: groups.prefill.map((p) => p.podIp),
         decodeIps: groups.decode.map((p) => p.podIp),
@@ -831,14 +838,18 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
 
     const sshPortBase = inferaSshPortBase(displayName);
     const groups: RolePodGroups = discoverRolePods(detail, spec.pdMode, sshPortBase);
-    const pods = [...groups.frontend, ...groups.prefill, ...groups.decode, ...groups.worker];
     return {
       ...base,
       serviceUrl: `http://${host}:${inferaFrontendPort(displayName)}`,
       sshPrivateKey: keypair?.privateKeyPem,
       sshKeyPath: SANDBOX_SSH_KEY_PATH,
       sshPortBase,
-      sshPorts: Object.fromEntries(pods.map((p) => [p.podIp, p.sshPort])),
+      sshPorts: {
+        router: groups.frontend.map((p) => p.sshPort),
+        prefill: groups.prefill.map((p) => p.sshPort),
+        decode: groups.decode.map((p) => p.sshPort),
+        worker: groups.worker.map((p) => p.sshPort),
+      },
       routerIps: groups.frontend.map((p) => p.podIp),
       prefillIps: groups.prefill.map((p) => p.podIp),
       decodeIps: groups.decode.map((p) => p.podIp),
