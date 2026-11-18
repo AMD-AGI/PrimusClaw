@@ -31,6 +31,7 @@ import {
   type Lang,
   type ReviewAskedOfOther,
   type WorkCardModel,
+  type WorkDeliveredModel,
   type WorkDoneModel,
   type WorkItem,
   type WorkNoteModel,
@@ -99,6 +100,25 @@ function workCard(model: WorkCardModel): TeamsMessage {
     actions.push(workButton("watch", model.cardId, t.watch));
   }
   return message(body, actions);
+}
+
+/**
+ * A result Claw delivered without an Accept, where the card that asked for one was: the version, the pull request the item still
+ * watches, what the assistant said, and that a reply changes it. No buttons.
+ */
+function workDelivered(model: WorkDeliveredModel): TeamsMessage {
+  const { item } = model;
+  const lang = cardLang(model.lang, model.text, item.title);
+  const t = assistantCardText.in(lang);
+  const version = item.delivered?.version ?? item.resultVersion;
+  const watching = item.delivered?.watching ?? [];
+  const sub = watching.length
+    ? t.deliveredWatching({ version, pulls: watching.join(lang === "zh" ? "、" : ", ") })
+    : t.delivered({ version });
+  const body = [header(markdownPlain(itemLabel(item)), { tone: "good", subtitle: sub, emoji: "good" })];
+  if (model.text) body.push(text(workCardText(model.text)));
+  body.push(note(t.replyToChange));
+  return message(body);
 }
 
 function workDone(model: WorkDoneModel): TeamsMessage {
@@ -285,6 +305,7 @@ export const assistantRenderers = {
   board,
   confirmWrite,
   workCard,
+  workDelivered,
   workDone,
   workNote,
 } satisfies Partial<Renderers>;

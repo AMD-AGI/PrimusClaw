@@ -25,6 +25,18 @@ export interface WorkCardModel {
   readonly lang: string | null;
 }
 
+/**
+ * A result Claw delivered without an Accept (`WorkItem.delivered`), in place of the card that asked for one: the version, the pull
+ * request the item still watches, and that a reply changes it. No buttons: nothing waits for the person.
+ */
+export interface WorkDeliveredModel {
+  readonly item: WorkItem;
+  /** What the assistant said about it ("" when said apart). */
+  readonly text: string;
+  /** "zh" or "en"; null to follow what was said, or the item's title. */
+  readonly lang: string | null;
+}
+
 /** What replaces a work card after Accept or Stop went through (render.work_done_card). */
 export interface WorkDoneModel {
   /** "Accepted" (the version is said), or how it ended otherwise. */
@@ -109,6 +121,7 @@ declare module "../ports/surface.js" {
     board: BoardModel;
     confirmWrite: ConfirmWriteModel;
     workCard: WorkCardModel;
+    workDelivered: WorkDeliveredModel;
     workDone: WorkDoneModel;
     workNote: WorkNoteModel;
   }

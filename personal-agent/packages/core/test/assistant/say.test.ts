@@ -200,3 +200,42 @@ it("a held write with a long text says it whole once then its card", () => {
   assert.ok(card?.type === "view" && card.view.name === "confirmWrite");
   assert.equal(card.view.model.text, "创建");
 });
+
+it("a result claw delivered is a card that says so, with no accept, holding short words", () => {
+  const { say, store } = planner();
+  const delivered = { ...ITEM, board_state: "done", outcome: "accepted", can_accept: false, delivered_version: 3 };
+  const out = say.messages(ALICE, { type: "assistant.say", text: "v3 已交付：已推到 fix 分支。", item: delivered });
+  assert.deepEqual(shape(out), ["view:workDelivered"]);
+  const card = out[0]?.body;
+  assert.ok(card?.type === "view" && card.view.name === "workDelivered");
+  assert.equal(card.view.model.text, "v3 已交付：已推到 fix 分支。");
+  assert.deepEqual(card.view.model.item.delivered, { version: 3, watching: [] });
+  assert.equal(card.view.model.item.canAccept, false);
+  assert.equal(store.assistantCards.autoReply(ALICE, "it-1"), null);
+  // Watching its pull request: the card names it.
+  const watching = {
+    ...ITEM,
+    board_state: "in_progress",
+    can_accept: false,
+    delivered_version: 1,
+    watching_pr: ["acme/app#7"],
+  };
+  const [w] = say.messages(ALICE, { type: "assistant.say", text: "Opened acme/app#7.", item: watching });
+  assert.ok(w?.body.type === "view" && w.body.view.name === "workDelivered");
+  assert.deepEqual(w.body.view.model.item.delivered, { version: 1, watching: ["acme/app#7"] });
+});
+
+it("the system's own notice of a delivered result is its words alone", () => {
+  const { say } = planner();
+  const delivered = { ...ITEM, board_state: "done", outcome: "accepted", can_accept: false, delivered_version: 3 };
+  const text = '#2 "Fix the flaky test" v3 delivered: pushed.\nReply to me to have it changed.';
+  assert.deepEqual(shape(say.messages(ALICE, { type: "work_item.needs_you", text, item: delivered })), [
+    `rich:${text}`,
+  ]);
+});
+
+it("an item that still waits for the accept gets the accept card, whatever else it carries", () => {
+  const { say } = planner();
+  const out = say.messages(ALICE, { type: "assistant.say", text: "Done.", item: { ...ITEM, delivered_version: 3 } });
+  assert.deepEqual(shape(out), ["view:workCard"]);
+});

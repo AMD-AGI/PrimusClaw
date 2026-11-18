@@ -7,7 +7,9 @@
  * - What was said, whole and once: a long text is split into up to three messages at paragraph breaks, never cut, after what the
  *   receipt already shows of it (`shown`). It is an AI answer: the AI label and the thumbs under it, a citation for each source it
  *   cites as [n], and the replies to tap under the last of its messages when no card follows.
- * - When the event's item holds a result that waits, a card with Accept and Stop; when it holds a write for the person, a card
+ * - When the event's item holds a result that waits, a card with Accept and Stop; when Claw delivered the result without an Accept,
+ *   a card that says so, with the pull request it still watches and that a reply changes it (none for the system's own notice, whose
+ *   words say all that); when it holds a write for the person, a card
  *   that lets it through or not; when it puts a command to the person, a card with Run and Cancel; when it puts a choice to the
  *   person, a card with the options and Send; when it is about one of the person's skills, the skill's card with Undo and Edit,
  *   or a draft's with Save and Discard (each recorded first, so its buttons mean something). A card holds the words only when they
@@ -156,6 +158,12 @@ export class SayPlanner {
     const inCard = said.inCard ? said.text : "";
     if (item?.canAccept)
       return { message: this.workCard(userId, item, said.text, inCard, said.lang), holdsWords: said.inCard };
+    if (item?.delivered && event["type"] === "assistant.say") {
+      return {
+        message: view({ name: "workDelivered", model: { item, text: inCard, lang: said.lang } }),
+        holdsWords: said.inCard,
+      };
+    }
     // A personal skill's card says all its words say (what was saved, its buttons), so they are not said apart.
     const skill = item === null ? this.skillCard(userId, event, said.text, said.lang) : undefined;
     if (skill !== undefined) return { message: skill, holdsWords: true };
