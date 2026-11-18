@@ -605,6 +605,12 @@ export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
 export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
 // Work items one user may have unfinished (not on the done board) at once.
 export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+// `true` delivers a worker's ready result without asking: the item closes as accepted, by policy, the way a review item closes when
+// it posts its review, and the user changes the result by replying (`work_send` reopens an item delivered in the last
+// DONE_WINDOW_DAYS). An item whose result names a pull request it watches stays open and holds no slot until that pull request is
+// merged or closed (`params.watching_pr`): new comments and failed CI still reach its worker. Off (the default), a ready result
+// waits for the user's Accept, as before.
+export const CLAW_ASSISTANT_AUTO_DELIVER = envBool("CLAW_ASSISTANT_AUTO_DELIVER", false);
 // On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
 // CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
 export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);

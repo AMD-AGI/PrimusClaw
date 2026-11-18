@@ -79,6 +79,12 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
        lower(params->'pr'->>'owner'), lower(params->'pr'->>'repo'), (params->'pr'->>'number'))
      WHERE kind = 'review' AND board_state <> 'done'`,
   );
+  // Delivered results' items that stay open watching their pull request (`watching_pr`), which the GitHub poll looks over each pass
+  // (`closeEndedWatches`).
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_items_watching_pr ON claw_work_items(updated_at)
+     WHERE params ? 'watching_pr' AND board_state <> 'done'`,
+  );
   // The reviews a person asked of others, which their own assistant lists read-only (`requester-view.ts`) on every turn.
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_work_items_requested_by ON claw_work_items((params->>'requested_by'), updated_at DESC)

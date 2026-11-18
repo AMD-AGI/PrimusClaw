@@ -52,7 +52,9 @@ export async function startWorkerRun(workerSessionId: string, runId: string): Pr
     if (prior) return started({ generation: Number(prior.generation), closed: item.board_state === "done" });
     if (item.board_state === "done") return started({ generation: Number(item.generation), closed: true });
     const bumped = (await query(
-      `UPDATE claw_work_items SET generation = generation + 1, updated_at = NOW()
+      // A run on the item is work on it: whatever started it, it no longer only watches its pull request (`watching_pr`), so it holds
+      // a slot and no watch can close it under the run; its next ready or quiet waiting report decides whether it watches again.
+      `UPDATE claw_work_items SET generation = generation + 1, params = params - 'watching_pr', updated_at = NOW()
         WHERE item_id = $1 RETURNING generation`,
       [item.item_id],
     )).rows[0] as { generation: number };

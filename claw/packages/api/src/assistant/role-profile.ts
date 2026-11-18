@@ -158,7 +158,17 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
     ...(remote.has(String(r.item_id)) ? { remote: remote.get(String(r.item_id)) } : {}),
     ...(watches.has(String(r.item_id)) ? { watches: watches.get(String(r.item_id)) } : {}),
+    ...deliveredOf(r.params),
   }));
+}
+
+/** A result delivered by policy (`applyWorkerReport`): its version, and the pull requests the item stays open watching. */
+function deliveredOf(params: unknown): { delivered?: NonNullable<ManifestItem["delivered"]> } {
+  const p = params !== null && typeof params === "object" ? params as Record<string, unknown> : {};
+  const version = Number(p.delivered);
+  if (!Number.isInteger(version) || version < 1) return {};
+  const watching = Array.isArray(p.watching_pr) ? p.watching_pr.filter((x): x is string => typeof x === "string") : [];
+  return { delivered: { version, watching } };
 }
 
 /** The active pull request watches of these items of the user's, by item. */

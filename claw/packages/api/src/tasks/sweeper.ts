@@ -103,7 +103,8 @@ const WAITING_ITEM_SANDBOX_RELEASE_SEC = envInt(
 
 /**
  * The work item `sessionId` is the worker of (one at most: the column is
- * unique), when it waits for a person or is over, nothing is queued for the
+ * unique), when it waits for a person, only watches a pull request after its
+ * result was delivered, or is over, nothing is queued for the
  * session, and the session's last run -- or the item's last change, whichever
  * is later -- is at least WAITING_ITEM_SANDBOX_RELEASE_SEC ago. Null otherwise,
  * and null on a failed read: keeping the sandbox one more tick is what the
@@ -117,7 +118,7 @@ export async function waitingItemPastRelease(
   if (!sessionId || !CLAW_ASSISTANT_ENABLED) return null;
   try {
     const r = await db.query(
-      `SELECT w.item_id, w.board_state,
+      `SELECT w.item_id, w.board_state, w.params ? 'watching_pr' AS watching,
               EXTRACT(EPOCH FROM NOW() - GREATEST(
                 w.updated_at,
                 (SELECT MAX(COALESCE(t.completed_at, t.started_at, t.created_at)) FROM claw_tasks t WHERE t.session_id = $1)
@@ -128,9 +129,10 @@ export async function waitingItemPastRelease(
       [sessionId],
     );
     const row = r.rows[0] as
-      | { item_id: string; board_state: string; quiet_sec: number | string | null; queued: boolean }
+      | { item_id: string; board_state: string; watching: boolean; quiet_sec: number | string | null; queued: boolean }
       | undefined;
-    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done") || row.queued) return null;
+    // A delivered result's item that only watches its pull request (`watching_pr`) waits for GitHub as one in needs_you waits for a person.
+    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done" && !row.watching) || row.queued) return null;
     const quietSec = Number(row.quiet_sec);
     if (row.quiet_sec === null || !Number.isFinite(quietSec) || quietSec < releaseSec) return null;
     return { itemId: row.item_id, boardState: row.board_state, quietSec: Math.round(quietSec) };

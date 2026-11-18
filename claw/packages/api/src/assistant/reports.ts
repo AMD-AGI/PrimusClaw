@@ -125,6 +125,8 @@ export async function queueRouterWake(q: StatementRunner, e: {
   itemId: string; userId: string; eventId: number; kind: ReportKind; version: number; summary: string; question: string | null;
   /** The answer is stored for sending whole in this same transaction (`storeAnswerWhole`): the router is told so. */
   sentInFull?: boolean;
+  /** A ready result delivered by policy (`applyWorkerReport`): the router is told there is nothing to accept, and what it still watches. */
+  delivered?: { watching: string[] } | null;
 }): Promise<RouterWake> {
   const target = (await q.query(
     `SELECT w.seq, a.session_id AS router_session_id, w.router_session_id AS own_session_id,
@@ -140,7 +142,7 @@ export async function queueRouterWake(q: StatementRunner, e: {
     userId: e.userId,
     content: formatWorkEvent({
       itemId: e.itemId, seq: Number(target.seq), kind: e.kind, version: e.version, summary: e.summary, question: e.question,
-      sentInFull: e.sentInFull === true, fromEarlierConversation,
+      sentInFull: e.sentInFull === true, fromEarlierConversation, delivered: e.delivered ?? null,
     }),
     dedupeKey: `wi-evt:${e.eventId}`,
   });
@@ -202,6 +204,7 @@ export async function ingestReport(
         ? await queueRouterWake(q, {
           itemId: run.itemId, userId: applied.userId, eventId: applied.eventId, kind: recorded.kind,
           version: applied.resultVersion, summary: recorded.summary, question: recorded.question ?? null, sentInFull: answer !== null,
+          delivered: applied.delivered,
         })
         : null;
       return {

@@ -23,6 +23,13 @@ export interface AssistantItemSnapshot {
   board_state: string;
   result_version: number;
   can_accept: boolean;
+  /**
+   * The result version Claw delivered without the user's Accept (`CLAW_ASSISTANT_AUTO_DELIVER`), while the item stands delivered:
+   * closed by that delivery, or open only to watch a pull request (`watching_pr`). Absent otherwise, and from an API without it.
+   */
+  delivered_version?: number;
+  /** The pull requests, as owner/repo#123, a delivered item stays open watching for comments and failed CI. Absent when none. */
+  watching_pr?: string[];
 }
 
 interface AssistantEventBase {
