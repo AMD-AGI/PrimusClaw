@@ -74,6 +74,22 @@ describe("what a question on the screen asks", () => {
     // (the mask is kept whole where the cut would take what is before it: only the path around it goes)
     assert.equal(asks(`cat /srv/conf/sk-${"Ab3x".repeat(6)}/env`), "Bash command: cat …/[hidden]/env");
   });
+  test("a credential the pane wrapped onto two rows is masked whole, broken inside it or at the space before it (codex on #865)", () => {
+    // (a command wider than the pane is drawn on several rows between the dashed rules: `\n` here is where the pane wrapped it)
+    const asks = (command: string) => dialogSummary(on(bashQuestion({ command, description: "Run" })))!;
+    const key = `a1${"Q".repeat(40)}`;
+    const hard = asks(`export API_KEY=${key.slice(0, 11)}\n${key.slice(11)}`);
+    assert.equal(hard, "Bash command: export API_KEY=[hidden]");
+    const soft = asks('curl -H "Authorization: Bearer\nabcdefgh1234/ijklmnopqrstuvwxyz5678" https://example.com/v1/api');
+    assert.equal(soft, 'Bash command: curl -H "Authorization: [hidden]" https:…/api');
+    // (the token itself wider than the pane: broken inside it, after a row that ends at a space)
+    const long = `${"Zz9".repeat(40)}`;
+    const both = asks(`curl -H "Authorization: Bearer\n${long.slice(0, 80)}\n${long.slice(80)}" x`);
+    assert.ok(!both.includes("Zz9Zz9"), both);
+    assert.match(both, /^Bash command: curl -H "Authorization: \[hidden\]/);
+    // (rows of a command that are its own lines still read as one line, a path on the second one cut too)
+    assert.equal(asks("cd /home/dev/project &&\nmake -C /srv/build/out all"), "Bash command: cd …/project && make -C …/out all");
+  });
   test("no part of a credential the masking knows survives, wherever its slashes are and whatever path is around it", () => {
     // (seeded: the same cases every run)
     let seed = 0x865;
@@ -94,10 +110,20 @@ describe("what a question on the screen asks", () => {
       () => { const v = `ghp_${pick(ALNUM, 24)}`; return { secret: v, command: `cat /home/dev/${v}/notes` }; },
       () => { const v = `sk-${pick(ALNUM, 20)}`; return { secret: v, command: `run --out=/var/tmp/${v} x` }; },
     ];
-    for (let i = 0; i < 300; i++) {
-      const { secret, command } = shapes[i % shapes.length]!();
-      // (only what the masking itself knows as a credential: the cut must not lose it)
-      assert.ok(!redactText(command).text.includes(secret), command);
+    // (a third of them drawn on two or three rows: the pane wrapped the command anywhere, inside the credential or at a space)
+    const wrap = (command: string) => {
+      let rows = command;
+      for (let k = 1 + rand(2); k > 0; k--) {
+        const at = 1 + rand(rows.length - 2);
+        rows = rows[at] === " " ? `${rows.slice(0, at)}\n${rows.slice(at + 1)}` : `${rows.slice(0, at)}\n${rows.slice(at)}`;
+      }
+      return rows.replace(/\n{2,}/g, "\n").replace(/^\n|\n$/g, "");
+    };
+    for (let i = 0; i < 600; i++) {
+      const { secret, command: whole } = shapes[i % shapes.length]!();
+      const command = i % 3 === 2 ? wrap(whole) : whole;
+      // (only what the masking itself knows as a credential: the cut and the wrap must not lose it)
+      assert.ok(!redactText(whole).text.includes(secret), whole);
       const said = dialogSummary(on(bashQuestion({ command, description: "Run" })))!;
       assert.ok(said.includes("[hidden]"), `${command} -> ${said}`);
       const body = secret.replace(/^(?:ghp_|sk-)/, "");

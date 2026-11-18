@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
-import { MASK, redactText } from "./redact.js";
+import { MASK, credentialSpans, redactText } from "./redact.js";
 import { errMessage } from "./util.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -346,13 +346,60 @@ export function dialogSummary(screen: string): string | null {
   } else {
     const title = head[0]!;
     const dash = head.findIndex((l) => DASHED_RE.test(l));
-    const shown = dash >= 0 ? head.slice(dash + 1).find((l) => !DASHED_RE.test(l)) ?? "" : "";
-    const about = head.slice(1, dash >= 0 ? dash : undefined).find((l) => !/^Tip:/i.test(l) && !DASHED_RE.test(l)) ?? "";
+    // (each with the rows the pane wrapped it onto: a credential cut by the wrap is masked whole, `joinRows`)
+    const shownAt = dash >= 0 ? head.findIndex((l, i) => i > dash && !DASHED_RE.test(l)) : -1;
+    const shown = shownAt >= 0 ? joinRows(rowsFrom(head, shownAt)) : "";
+    const aboutAt = head.findIndex((l, i) => i > 0 && (dash < 0 || i < dash) && !/^Tip:/i.test(l) && !DASHED_RE.test(l));
+    const about = aboutAt >= 0 ? joinRows(rowsFrom(head, aboutAt)) : "";
     // (a command's own words say what it does; a file question names the file before its content)
     const detail = /\bcommand\b/i.test(title) ? shown || about : about || shown;
     summary = detail && !DASHED_RE.test(title) ? `${title}: ${detail}` : title;
   }
   return shortLine(summary) || null;
+}
+
+/** The rows from `at` on that hold one text the pane wrapped: up to a dashed rule or a `Tip:` line. */
+function rowsFrom(head: string[], at: number): string[] {
+  const rows: string[] = [];
+  for (let i = at; i < head.length && !DASHED_RE.test(head[i]!) && (i === at || !/^Tip:/i.test(head[i]!)); i++) rows.push(head[i]!);
+  return rows;
+}
+
+/**
+ * Rows of one text the pane wrapped, as one line: a row as wide as the widest of them was broken inside a word (joined as it is),
+ * any other at a space (joined with one). Every credential found in that line, or in the rows joined either way throughout, is
+ * masked whole: a key the wrap cut in two never leaves the machine as its first part (a guess at where the wrap fell cannot unmask).
+ */
+function joinRows(rows: string[]): string {
+  if (rows.length < 2) return rows[0] ?? "";
+  const widest = Math.max(...rows.map(displayWidth));
+  const guessed = rows.slice(0, -1).map((r) => (displayWidth(r) >= widest ? "" : " "));
+  const joined = (seps: string[]) => {
+    let text = "";
+    const starts: number[] = [];
+    rows.forEach((r, k) => { starts.push(text.length); text += r + (seps[k] ?? ""); });
+    return { text, starts };
+  };
+  const line = joined(guessed);
+  const hidden = new Array<boolean>(line.text.length).fill(false);
+  // (a position in a joining: its row and column, then where that is in `line`)
+  const toLine = (starts: number[], at: number) => {
+    let k = starts.length - 1;
+    while (k > 0 && starts[k]! > at) k--;
+    return line.starts[k]! + Math.min(at - starts[k]!, rows[k]!.length - 1);
+  };
+  for (const seps of [guessed, guessed.map(() => ""), guessed.map(() => " ")]) {
+    const other = joined(seps);
+    for (const [s, e] of credentialSpans(other.text)) {
+      for (let q = toLine(other.starts, s); q <= toLine(other.starts, e - 1); q++) hidden[q] = true;
+    }
+  }
+  let out = "";
+  for (let q = 0; q < line.text.length; q++) {
+    if (!hidden[q]) out += line.text[q];
+    else if (q === 0 || !hidden[q - 1]) out += MASK;
+  }
+  return out;
 }
 
 /** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */
