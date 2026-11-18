@@ -15,6 +15,27 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.10.3
+
+A patch release: a chat attached to a session on a machine shows a long turn's progress while it runs, and a message sent to
+a busy session is said to be queued at once (#866). No plugin port (core's `src/plugins/`) or store change; works with any
+Claw and any connector. The step counts take a step's tool from `@primusclaw/connector` 0.2.3's `toolName`, else from the
+step's title. The queued notice for a message Claude Code holds behind its running turn comes from connector 0.2.3; an
+older connector reports such a message only when its paste was drawn late.
+
+### Fixed
+
+- `@primusclaw/personal-agent`: in a chat attached to a session on a machine, the floating status (in a chat that streams,
+  until the agent's first words) and the progress message count the turn's steps by tool next to the step running now,
+  for example "Working: Bash ×3, Read ×2" ("正在：Bash ×3, Read ×2"); the agent's words between steps still show as they come.
+  A turn of minutes that only ran tools used to show "Thinking…" and its step's title alone. The progress message of such a
+  turn is edited at most every 3 seconds (it was 1.5). The assistant's own turns are unchanged (#866).
+- A message sent to a session that is busy with a turn in its terminal is said to be queued at once, in the chat, once per
+  message: "The session is busy: your message is queued and goes in when the current turn ends.", with how to take it back
+  (press ↑ in that terminal when Claude Code's own queue holds it, else /stop); a message said to wait that Claude Code's
+  queue takes afterwards is told once more where it is now. Before, it was at most a short "Queued" line in the floating
+  status or the progress message (#866).
+
 ## 0.10.2
 
 A patch release: a group chat switched to one of a member's machine sessions can talk to that session (#855). No plugin

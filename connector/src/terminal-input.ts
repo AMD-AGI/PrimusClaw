@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
+import { MASK, credentialSpans, redactText } from "./redact.js";
 import { errMessage } from "./util.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -292,6 +293,164 @@ export function dialogOnScreen(screen: string): boolean {
   return plain.slice(end + 1).some((l) => DIALOG_RE.test(l));
 }
 
+/** A dashed rule inside a question (`╌╌╌╌`): Claude Code draws one above and one below the command or the change it asks about. */
+const DASHED_RE = /^╌{8,}$/;
+/** OSC sequences (a link drawn as one: `ESC ] 8 ; ; url ST`): not text. */
+const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+/** The longest summary of a question (code points, the ellipsis included). */
+export const DIALOG_SUMMARY_MAX = 100;
+
+/**
+ * What a question on Claude Code's screen asks, in one short line for the phone: its title and the command (a `Bash command`) or what
+ * it is about (the file of a `Create file`, `Edit file`), as Claude Code 2.1.325 draws one in place of the input box (measured
+ * 2026-11-18):
+ *
+ * ```
+ * ────────────────────────────
+ *  Bash command
+ *  Remove the build folder              (its description; a `Tip:` line may come first)
+ * ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ *  rm -rf "$(echo /home/me/build)"
+ * ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ *  │ Dangerous rm operation on statically-unresolvable target: command substitution output
+ *
+ *  Do you want to proceed?
+ *  ❯ 1. Yes
+ *    2. No
+ *
+ *  Esc to cancel · Tab to amend
+ * ```
+ *
+ * `Bash command: rm -rf "$(echo …/build)"`. A question it cannot split that way is named by its own question line (`Do you want to
+ * proceed?`). Every path is cut to its last part (`…/build`) and every credential-shaped string masked: the line leaves the machine.
+ * Null when no question is on the screen. It only describes the question: nothing on the screen is ever answered from here.
+ */
+export function dialogSummary(screen: string): string | null {
+  if (!dialogOnScreen(screen)) return null;
+  const { plain, at, end } = boxOf(screen.replace(OSC_RE, ""));
+  const lines = plain.map((l) => l.replace(/^\s*[│|]\s?/, "").replace(/\s*│\s*$/, "").trim());
+  // Where the question starts: below the input box when one is drawn, else below the last rule above its first question line.
+  let from = 0;
+  if (at >= 0 && end >= 0) {
+    from = end + 1;
+  } else {
+    const first = lines.findIndex((l) => DIALOG_RE.test(l));
+    for (let i = first; i >= 0; i--) if (RULE_RE.test(lines[i]!)) { from = i + 1; break; }
+  }
+  const asked = lines.slice(from).findIndex((l) => DIALOG_RE.test(l));
+  if (asked < 0) return null;
+  const head = lines.slice(from, from + asked).filter((l) => l && !MODE_RE_ONE.test(l) && !/for shortcuts$/.test(l));
+  let summary: string;
+  if (!head.length || DIALOG_RE.test(head[0]!)) {
+    summary = lines[from + asked] ?? "";
+  } else {
+    const title = head[0]!;
+    const dash = head.findIndex((l) => DASHED_RE.test(l));
+    // (each with the rows the pane wrapped it onto: a credential cut by the wrap is masked whole, `joinRows`)
+    const shownAt = dash >= 0 ? head.findIndex((l, i) => i > dash && !DASHED_RE.test(l)) : -1;
+    const shown = shownAt >= 0 ? joinRows(rowsFrom(head, shownAt)) : "";
+    const aboutAt = head.findIndex((l, i) => i > 0 && (dash < 0 || i < dash) && !/^Tip:/i.test(l) && !DASHED_RE.test(l));
+    const about = aboutAt >= 0 ? joinRows(rowsFrom(head, aboutAt)) : "";
+    // (a command's own words say what it does; a file question names the file before its content)
+    const detail = /\bcommand\b/i.test(title) ? shown || about : about || shown;
+    summary = detail && !DASHED_RE.test(title) ? `${title}: ${detail}` : title;
+  }
+  return shortLine(summary) || null;
+}
+
+/** The rows from `at` on that hold one text the pane wrapped: up to a dashed rule or a `Tip:` line. */
+function rowsFrom(head: string[], at: number): string[] {
+  const rows: string[] = [];
+  for (let i = at; i < head.length && !DASHED_RE.test(head[i]!) && (i === at || !/^Tip:/i.test(head[i]!)); i++) rows.push(head[i]!);
+  return rows;
+}
+
+/** The most rows of one wrapped text a summary reads (every way of joining them is tried: 2^(n-1)); more is far past what it says. */
+const WRAPPED_ROWS_MAX = 8;
+
+/**
+ * Rows of one text the pane wrapped, as one line: a row as wide as the widest of them was broken inside a word (joined as it is),
+ * any other at a space (joined with one). Where the wrap fell is only a guess, so every credential found with the rows joined in any
+ * way at all (each wrap inside a word or at a space) is masked whole: a key the wrap cut in parts never leaves the machine as one of
+ * them. Rows past WRAPPED_ROWS_MAX are left out, and with them the word they cut (it may be a credential's first part).
+ */
+function joinRows(all: string[]): string {
+  if (all.length < 2) return all[0] ?? "";
+  const rows = all.slice(0, WRAPPED_ROWS_MAX);
+  const widest = Math.max(...rows.map(displayWidth));
+  const joined = (seps: string[]) => {
+    let text = "";
+    const starts: number[] = [];
+    rows.forEach((r, k) => { starts.push(text.length); text += r + (seps[k] ?? ""); });
+    return { text, starts };
+  };
+  const line = joined(rows.slice(0, -1).map((r) => (displayWidth(r) >= widest ? "" : " ")));
+  const hidden = new Array<boolean>(line.text.length).fill(false);
+  // (a position in a joining: its row and column, then where that is in `line`)
+  const toLine = (starts: number[], at: number) => {
+    let k = starts.length - 1;
+    while (k > 0 && starts[k]! > at) k--;
+    return line.starts[k]! + Math.min(at - starts[k]!, rows[k]!.length - 1);
+  };
+  for (let mask = 0; mask < 1 << (rows.length - 1); mask++) {
+    const other = joined(rows.slice(0, -1).map((_, k) => (mask & (1 << k) ? " " : "")));
+    for (const [s, e] of credentialSpans(other.text)) {
+      for (let q = toLine(other.starts, s); q <= toLine(other.starts, e - 1); q++) hidden[q] = true;
+    }
+  }
+  let out = "";
+  for (let q = 0; q < line.text.length; q++) {
+    if (!hidden[q]) out += line.text[q];
+    else if (q === 0 || !hidden[q - 1]) out += MASK;
+  }
+  return all.length > rows.length ? out.replace(/\S*$/, "…") : out;
+}
+
+/** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */
+const MODE_RE_ONE = new RegExp(`(?:^|[\\s·⏵⏸▶])(?:${Object.keys(CLAUDE_MODE_INDICATORS).join("|")}) on\\b`);
+
+/**
+ * A word of a command line as a shell splits it: quoted parts (spaces and all; one left open runs to the end of the line), escaped
+ * characters and anything else up to an unquoted space, joined: `/a/"b c"/d` is one word.
+ */
+const WORD_RE = /(?:"[^"]*(?:"|$)|'[^']*(?:'|$)|\\.|[^\s"'\\])+/g;
+/** What a path in a word starts after: a space or quote inside it, `=` (`--out=/a`), `(`, `$`, `:`, a backtick. */
+const PATH_START = /[\s"'=($:`]/;
+
+/**
+ * Every path in a line said by its last part only (`/home/me/build` -> `…/build`): in each word, everything from where its first
+ * path starts to its last slash goes, whatever quotes or escapes it is written with (`cat /a/"b c"/key` -> `cat …/key`). A path of
+ * one part (`/`, `/tmp`) is said as it is: what a dangerous `rm` reaches is never hidden that way. A credential's mask (`[hidden]`)
+ * is kept as it is: the parts of a word around it are cut each on its own.
+ */
+function cutPaths(text: string): string {
+  return text.replace(WORD_RE, (word) => word.split(MASK).map(cutWord).join(MASK));
+}
+
+function cutWord(word: string): string {
+  const first = word.indexOf("/");
+  if (first < 0) return word;
+  const last = word.lastIndexOf("/");
+  let from = first;
+  while (from > 0 && !PATH_START.test(word[from - 1]!)) from--;
+  // (only a leading slash, or `~/`, `./`: one part)
+  if (/^(?:~|\.{1,2})?\/$/.test(word.slice(from, last + 1))) return word;
+  return `${word.slice(0, from)}…/${word.slice(last + 1)}`;
+}
+
+/**
+ * A line of the screen for the phone: credentials masked, then paths cut to their last part, at most DIALOG_SUMMARY_MAX code points.
+ * Masked first: a credential with a `/` in it (`Bearer abc/def…`) would lose its head to the cut and no longer look like one, and
+ * its tail would leave the machine as it is.
+ */
+function shortLine(text: string): string {
+  const masked = redactText(text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")).text;
+  // (and again after: what the cut joins is masked too)
+  const cut = redactText(cutPaths(masked).replace(/\s+/g, " ").trim()).text;
+  const cps = [...cut];
+  return cps.length <= DIALOG_SUMMARY_MAX ? cut : `${cps.slice(0, DIALOG_SUMMARY_MAX - 1).join("").trimEnd()}…`;
+}
+
 /**
  * Why Enter must not be sent now for a message typed into the box (null: it may). All on the one screen read: Claude Code's input
  * box is there, the bottom-most thing on the screen apart from its footer; it holds exactly what was typed (whitespace aside, as the
@@ -376,12 +535,16 @@ export const ECHO_SLOW_MS = 3_000;
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
 export const ENTER_SETTLE_MS = 250;
 
-export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" | "dialog" };
+export type Readiness =
+  | { ready: true; mode: string | null }
+  | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" }
+  /** `dialog`: what the question on the screen asks ({@link dialogSummary}), null when it cannot be read. */
+  | { ready: false; why: "dialog"; dialog: string | null };
 
 /** How a message is typed: what to do when a question shows before its Enter, and whether it is still wanted while one does. */
 export interface TypeOptions {
-  /** Called once when a question or a menu shows after the text was typed: the Enter waits for it to go. */
-  onDialog?: () => void;
+  /** Called once when a question or a menu shows after the text was typed (what it asks: {@link dialogSummary}): the Enter waits for it to go. */
+  onDialog?: (dialog: string | null) => void;
   /** Asked while a question shows: false ends the wait (`TerminalNotSubmitted`), nothing more is typed. */
   stillWanted?: () => boolean;
   /** Whether the terminal's transcript already shows the message submitted (by the person at the terminal): it is not typed again. */
@@ -452,7 +615,7 @@ export class TerminalInput {
     if (dead === "1" || !this.stillThere(Number(panePid))) return { ready: false, why: "gone" };
     if (mode !== "0") return { ready: false, why: "copy_mode" };
     const screen = await this.screen();
-    if (dialogOnScreen(screen)) return { ready: false, why: "dialog" };
+    if (dialogOnScreen(screen)) return { ready: false, why: "dialog", dialog: dialogSummary(screen) };
     const box = inputBox(screen);
     return box === "empty" ? { ready: true, mode: terminalMode(screen) } : { ready: false, why: box === "typed" ? "typing" : "screen" };
   }
@@ -518,7 +681,7 @@ export class TerminalInput {
     };
     // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
     const waitOutDialog = async () => {
-      if (!told) { told = true; opts.onDialog?.(); }
+      if (!told) { told = true; opts.onDialog?.(dialogSummary(await this.screen())); }
       for (;;) {
         await stillWanted();
         if (!(await this.alive())) throw new TerminalNotSubmitted("the terminal went away while a question was on the screen");

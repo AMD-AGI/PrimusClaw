@@ -15,7 +15,7 @@ import { remoteText } from "../locales/remote.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, textMessage } from "../ports/surface.js";
 import { type RemoteStep, decode } from "./events.js";
-import { noAskLine, readOnlyRefused } from "./lines.js";
+import { noAskLine, readOnlyRefused, rowUnreadableLine } from "./lines.js";
 import { neutral } from "../text/neutral.js";
 import type { StatusBoard } from "./board.js";
 import type { RemoteContext } from "./context.js";
@@ -169,6 +169,9 @@ export class Watches {
     // A terminal that runs what it is sent without asking: said once, as the chat attaches to it.
     const warning = step.terminal === true ? noAskLine(step.terminalMode, lang) : null;
     if (warning) await w.to.send(textMessage(warning));
+    // (and, once, that its process cannot be recognized from its registry row: a confirmation on its screen hides it)
+    if (step.terminal === true && step.rowUnreadable && this.state.chats.firstRowHint(w.chatKey, w.sessionId))
+      await w.to.send(textMessage(rowUnreadableLine(lang)));
     const switched = w.want ? await this.approvalNote(w, w.want, signal) : "";
     const state = this.state.attached(w.chatKey);
     if (state?.sessionId !== w.sessionId) return;

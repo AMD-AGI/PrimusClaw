@@ -166,3 +166,55 @@ test("an outbox that fails in another way breaks the stream as a refusal, never 
   });
   assert.ok(!(await opened.value.inform("c")).ok);
 });
+
+/** A stream whose final Teams answers with `refusal`; returns whether the conversation can stream again at once. */
+async function afterRefusedFinal(refusal: StreamRefusedError): Promise<{ finished: boolean; again: boolean }> {
+  const direct = new RecordingDirect();
+  direct.answerStream = (e, n) => (n === 1 ? "stream-1" : e.activity["type"] === "message" ? refusal : "stream-2");
+  const { conversation, clock, busy } = build(direct);
+  const opened = await conversation.openStream("user-msg-1", "a");
+  assert.ok(opened.ok);
+  const finished = opened.value.finish(textMessage("the answer"));
+  await flushMicrotasks();
+  await clock.advance(1000);
+  const outcome = await finished;
+  const again = !busy.isBusy("conv") && (await conversation.openStream("user-msg-2", "b")).ok;
+  return { finished: outcome.ok, again };
+}
+
+test("a final Teams refuses because the stream is over (403 ContentStreamNotAllowed) frees the conversation at once", async () => {
+  const over = new StreamRefusedError("status 403 ContentStreamNotAllowed", 403, "ContentStreamNotAllowed");
+  assert.deepEqual(await afterRefusedFinal(over), { finished: false, again: true });
+});
+
+test("a final that failed any other way keeps the conversation busy: the stream may still be open on Teams' side", async () => {
+  for (const refusal of [
+    new StreamRefusedError("TimeoutError"),
+    new StreamRefusedError("status 503", 503),
+    new StreamRefusedError("status 403 Forbidden", 403, "Forbidden"),
+    new StreamRefusedError("status 404 ContentStreamNotAllowed", 404, "ContentStreamNotAllowed"),
+  ]) {
+    assert.deepEqual(await afterRefusedFinal(refusal), { finished: false, again: false }, refusal.message);
+  }
+});
+
+test("a stream whose final Teams refused as over takes nothing more", async () => {
+  const direct = new RecordingDirect();
+  direct.answerStream = (_e, n) =>
+    n === 1 ? "stream-1" : new StreamRefusedError("status 403 ContentStreamNotAllowed", 403, "ContentStreamNotAllowed");
+  const { conversation, clock } = build(direct);
+  const opened = await conversation.openStream("user-msg-1", "a");
+  assert.ok(opened.ok);
+  const finished = opened.value.finish(textMessage("the answer"));
+  await flushMicrotasks();
+  await clock.advance(1000);
+  assert.equal((await finished).ok, false);
+  const again = opened.value.finish(textMessage("the answer"));
+  await flushMicrotasks();
+  await clock.advance(1000);
+  assert.deepEqual(await again, {
+    ok: false,
+    error: { kind: "stream_refused", reason: "the stream is over", status: 0, code: "" },
+  });
+  assert.equal(direct.streamed.length, 2);
+});

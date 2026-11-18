@@ -482,7 +482,11 @@ has queued it (its `queue-operation` enqueue in the transcript), the phone is to
 `reason` `terminal_working`; `held: "terminal"` once it is in Claude Code's queue, where only the terminal can take it back, with ↑). It waits (one notice, `terminal_input_queued`, with `reason`
 `terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
 box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
-question it would approve a tool call), or the pane is scrolled back. It is pasted as one bracketed paste (`load-buffer` and
+question it would approve a tool call), or the pane is scrolled back. A `terminal_dialog` notice also says what the question asks
+(`dialog`: its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and
+credentials masked), and a question is waited out for as long as it is up, even while it hides what proves that the process holds the
+conversation (a process whose registry row cannot be read is proven by the conversation's name above its input box); the notice and
+`session_started` say `registry_row_unreadable: true` for such a process (restarting it with `claude --resume` writes a new row). It is pasted as one bracketed paste (`load-buffer` and
 `paste-buffer -p -d`), one line or several: nothing in it is read as a key name, and a question that shows at that moment does not
 take it as its choice (a typed `1` would approve a permission question), and it is
 submitted with Enter once the box shows it (a busy Claude Code may draw a paste late: it is waited for up to 20 seconds, the phone

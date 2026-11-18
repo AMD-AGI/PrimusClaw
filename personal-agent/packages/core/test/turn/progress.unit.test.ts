@@ -342,3 +342,87 @@ it("a stream handle refuses what its stream can no longer take", async () => {
   const refusedOpen = new StreamHandle(new Bus(clock, { stream: { refuse: () => 403 } }), "act", clock);
   assert.equal((await refusedOpen.start("hi")).ok, false);
 });
+
+function progressOnly(lang = "en", options: BusOptions = {}) {
+  const clock = new Timeline();
+  const bus = new Bus(clock, options);
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger(), lang });
+  return { clock, bus, status };
+}
+
+it("a turn cancelled with its progress message on screen retires it: no stale progress stays in the chat", async () => {
+  const { clock, bus, status } = progressOnly();
+  status.begin();
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + 2);
+  assert.equal(bus.chat.length, 1);
+  status.close(true);
+  await clock.drain();
+  assert.deepEqual(bus.chat, []);
+  assert.deepEqual(
+    bus.sent.map((s) => s.operation),
+    ["send", "update", "delete"],
+  );
+});
+
+it("a cancelled turn's progress message the chat will not delete is left as one Interrupted line, in the person's language", async () => {
+  const { clock, bus, status } = progressOnly("zh", { fail: (s) => s.operation === "delete" });
+  status.begin();
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + 2);
+  status.close(true);
+  await clock.drain();
+  assert.deepEqual(
+    bus.chat.map((m) => textOf(m.message)),
+    ["已中断。"],
+  );
+  // (a live edit went out before the cancel, so the line is sent once more after one that might still be on its way)
+  assert.deepEqual(
+    bus.sent
+      .filter((s) => s.operation === "update")
+      .map((s) => textOf(s.message))
+      .slice(-2),
+    ["已中断。", "已中断。"],
+  );
+});
+
+it("a turn cancelled before its progress message was posted retires it once it has an id, and cancelling twice is once", async () => {
+  const { clock, bus, status } = progressOnly("en", { delay: (s) => (s.operation === "send" ? 3 : 0) });
+  status.begin();
+  status.close(true);
+  status.close(true);
+  await clock.drain();
+  assert.deepEqual(bus.chat, []);
+  assert.deepEqual(
+    bus.sent.map((s) => s.operation),
+    ["send", "delete"],
+  );
+});
+
+it("a turn cancelled after its answer went out leaves the chat as the answer left it", async () => {
+  const { clock, bus, status } = progressOnly();
+  status.begin();
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + 2);
+  await clock.pump(status.finish(["the answer"]));
+  const sent = bus.sent.length;
+  status.close(true);
+  await clock.drain();
+  assert.equal(bus.sent.length, sent);
+  assert.deepEqual(
+    bus.chat.map((m) => textOf(m.message)),
+    ["the answer"],
+  );
+});
+
+it("a turn cancelled after its stream was refused closes the stream and retires the progress message", async () => {
+  const { clock, bus, status } = streaming({ stream: { refuse: (op) => (op.op === "inform" ? 403 : undefined) } });
+  status.begin();
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + 4);
+  assert.equal(bus.chat.length, 1); // (the progress message took over)
+  status.close(true);
+  await clock.drain();
+  assert.deepEqual(bus.chat, []);
+  assert.deepEqual(bus.streamOps.map((o) => [o.op, o.text]).at(-1), ["finish", "Interrupted."]);
+});

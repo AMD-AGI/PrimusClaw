@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.3 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.2 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.3 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -137,6 +137,21 @@ release version, and its `appVersion` stays `latest`.
   could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
   `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
   its code). Task and DAG runs report the same through their callback.
+- Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
+  `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
+  background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
+  connector proves which conversation the process holds by the name above its input box, and a question hides the box; it now
+  looks at the pane it types into, and a question there is waited out for as long as it is up, then the messages go in, in
+  order. A question on a terminal whose process nothing proves for another reason (no row, or a row that says no status) is
+  said too, but waits `terminalWaitMs` as before. Nothing is ever typed into the question. The `terminal_input_queued` notice says what the question asks (`dialog`:
+  its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and credentials
+  masked first, so that a credential with a `/` in it is never cut into a tail that no longer looks like one, and masked whole
+  when the pane wrapped it onto two rows), and both it and `session_started` say `registry_row_unreadable: true` when the process's row cannot be read.
+- Personal agent: while a message waits for a question on the terminal, the chat says what it asks ("The terminal is
+  waiting for your confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says
+  "Confirm there" (等你确认) instead of the bare "Waiting" (等终端). When the connector says Claude Code's registry row for the
+  terminal cannot be read, the chat says once per attach that reopening the conversation there with `claude --resume` makes
+  it recognized reliably.
 - Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
   window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
   quoting the card reached the session), and every button on the group's session card answered "That button is not active
@@ -162,6 +177,16 @@ release version, and its `appVersion` stays `latest`.
   `terminal_working`, `held: "terminal"`), also after a notice that the paste was drawn late; before, it said nothing unless
   the paste was drawn late. After a restart, the events still to be sent go in each session's own order whatever time they
   carry.
+- Personal agent: when Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (for example
+  because the person stopped the stream in the chat), the stream is over on Teams' side and the conversation streams
+  again from the next turn. Before, the worker treated the stream as possibly still open for up to 10 minutes after it
+  opened, and every turn in that time showed no floating status: it posted a progress message, sent the answer as a new
+  message and deleted the progress message, which Teams shows as a deleted message above each answer. A final that fails
+  any other way (no answer, a timeout, a server error) still keeps the conversation off streams until Teams' 10-minute
+  limit, since that stream may still be open.
+- Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
+  is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
+  deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
 
 ## [0.5.7] - 2026-11-17
 
