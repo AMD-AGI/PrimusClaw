@@ -70,6 +70,19 @@ export function failingAdvisories(report: unknown): Advisory[] {
   return [...out.values()];
 }
 
+/** An `npm audit --json` report: an object with `metadata` and a `vulnerabilities` object, and no `error` (npm prints one when it cannot audit). */
+export function isReport(report: unknown): boolean {
+  if (typeof report !== "object" || report === null) return false;
+  const r = report as { metadata?: unknown; vulnerabilities?: unknown; error?: unknown };
+  return (
+    typeof r.metadata === "object" &&
+    r.metadata !== null &&
+    typeof r.vulnerabilities === "object" &&
+    r.vulnerabilities !== null &&
+    r.error === undefined
+  );
+}
+
 export interface GateResult {
   ok: boolean;
   /** One line per advisory: why it fails, or which exception lets it pass. */
@@ -87,6 +100,15 @@ export function gate(
   exceptions: readonly AuditException[] = AUDIT_EXCEPTIONS,
 ): GateResult {
   const lines: string[] = [];
+  // Without both reports nothing can be said clean: a production audit that failed would let any advisory pass as dev-only.
+  if (!isReport(all) || !isReport(prod)) {
+    return {
+      ok: false,
+      lines: [
+        `::error::npm audit gave no report${isReport(all) ? " without development dependencies" : ""}; refusing to report a clean result`,
+      ],
+    };
+  }
   let ok = true;
   const inProd = new Set(failingAdvisories(prod).map((a) => a.id));
   const seen = new Set<string>();
@@ -139,10 +161,6 @@ function main(argv: readonly string[]): number {
     return 2;
   }
   const all = audit(dir, false);
-  if (!(all as { metadata?: unknown } | null)?.metadata) {
-    console.error(`${dir}: npm audit gave no report; refusing to report a clean result`);
-    return 1;
-  }
   const { ok, lines } = gate(all, audit(dir, true), today);
   for (const l of lines) console.log(l);
   const excepted = lines.filter((l) => l.startsWith("::warning::")).length;

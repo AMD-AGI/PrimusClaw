@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AUDIT_EXCEPTIONS, failingAdvisories, gate } from "../scripts/audit-gate.js";
+import { AUDIT_EXCEPTIONS, failingAdvisories, gate, isReport } from "../scripts/audit-gate.js";
 
 /** An `npm audit --json` report naming `advisories` (id, severity), each on its own package. */
 function report(...advisories: Array<[string, string]>): unknown {
@@ -83,4 +83,22 @@ test("any other high or critical advisory fails, in development dependencies too
   assert.equal(gate(report(["GHSA-other", "critical"], [EXCEPTED, "high"]), NONE, "2026-11-18").ok, false);
   assert.equal(gate(report(["GHSA-other", "moderate"]), NONE, "2026-11-18").ok, true);
   assert.deepEqual(gate(NONE, NONE, "2026-11-18"), { ok: true, lines: [] });
+});
+
+test("a missing or failed report is never clean, the production one included", () => {
+  const dev = report([EXCEPTED, "high"]);
+  const failed = { error: { code: "ENOLOCK", summary: "no lockfile" } };
+  for (const bad of [
+    null,
+    {},
+    failed,
+    { metadata: {} },
+    { vulnerabilities: {} },
+    { ...(NONE as object), error: { code: "E" } },
+  ]) {
+    assert.equal(isReport(bad), false, JSON.stringify(bad));
+    assert.equal(gate(dev, bad, "2026-11-18").ok, false, `production ${JSON.stringify(bad)}`);
+    assert.equal(gate(bad, NONE, "2026-11-18").ok, false, `all ${JSON.stringify(bad)}`);
+  }
+  assert.equal(isReport(NONE), true);
 });
