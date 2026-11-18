@@ -62,6 +62,7 @@ export * from "./app-resources.js";
 export * from "./sandbox-grant.js";
 export * from "./app-sandbox-templates.js";
 export * from "./session-repo.js";
+export * from "./sandbox-placement.js";
 export * from "./deliveries.js";
 export * from "./citations.js";
 export * from "./user-skill-names.js";

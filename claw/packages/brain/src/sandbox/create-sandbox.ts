@@ -10,8 +10,10 @@
  * and the provider call here means the two cannot drift on the parts Pulse and
  * the sweepers read.
  */
+import { parseSandboxPlacement, type ExecuteRequest } from "@claw/protocol";
 import type { SandboxCreateParams, SandboxInstance } from "./provider.js";
 import { getSafeWorkloadProvider } from "./factory.js";
+import { SandboxProvisionTerminalError } from "./errors.js";
 
 /** Idle TTL (ttlSecondsAfterFinished) create falls back to when the spec names none. */
 export const DEFAULT_SANDBOX_TTL_SEC = 10;
@@ -51,4 +53,24 @@ export function composeSandboxLabels(args: {
 /** Create a SaFE workload sandbox through the shared provider. */
 export function createSafeWorkloadSandbox(params: SandboxCreateParams): Promise<SandboxInstance> {
   return getSafeWorkloadProvider().create(params);
+}
+
+/** Failure reason of a sandbox whose request carries a placement that does not pass the check. */
+export const SANDBOX_PLACEMENT_INVALID = "sandbox_placement_invalid";
+
+/**
+ * The node labels every sandbox of this request must require (the session's
+ * `placement.nodeLabels`), or undefined when it names none.
+ *
+ * Checked again here although the API checked it at create: Brain does not know
+ * the value came through that door. A placement that does not pass is refused
+ * rather than dropped, because a sandbox created without it would run on nodes the
+ * session excluded; the run fails with a reason instead.
+ */
+export function placementNodeLabels(request: Pick<ExecuteRequest, "placement">): Record<string, string> | undefined {
+  const parsed = parseSandboxPlacement(request.placement);
+  if (!parsed.ok) {
+    throw new SandboxProvisionTerminalError(SANDBOX_PLACEMENT_INVALID, `sandbox not created: ${parsed.error}`);
+  }
+  return parsed.placement?.nodeLabels;
 }

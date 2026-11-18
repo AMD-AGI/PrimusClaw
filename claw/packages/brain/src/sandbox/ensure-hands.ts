@@ -52,7 +52,7 @@ import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import {
-  DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox,
+  DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox, placementNodeLabels,
 } from "./create-sandbox.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
@@ -2805,6 +2805,8 @@ async function provisionHands(
   // Before the provider is called at all: a ceiling checked once the sandbox
   // exists is not a ceiling, because two provisions racing the last slot both
   // start and both are then live work nothing may evict.
+  // Before admission and the create: a placement that does not pass is refused with nothing created.
+  const sessionNodeLabels = placementNodeLabels(request);
   const hold = await admitSandbox(sessionId, options.signal);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
@@ -2852,6 +2854,8 @@ async function provisionHands(
       // A requested review's sandbox gets none of the workspace's storage: SaFE then mounts neither the owner's directory nor the
       // workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true).
       ...(isReviewProfile(request) ? { useWorkspaceStorage: false } : {}),
+      // The session's placement, on this sandbox and on every rebuild of it.
+      nodeLabels: sessionNodeLabels,
     });
   } catch (err) {
     await hold.release();

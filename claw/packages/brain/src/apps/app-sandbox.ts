@@ -66,6 +66,8 @@ export interface AppSandboxRun {
   sandboxWorkloadId?: string | null;
   /** The session owner's platform key: SaFE create / poll / stop. */
   platformKey: string;
+  /** Node labels the sandbox requires: the session's placement. Absent: none. */
+  nodeLabels?: Record<string, string>;
 }
 
 /**
@@ -443,6 +445,8 @@ export async function ensureAppSandbox(
       // leaves it when it hands the run over.
       ...(abort.signal ? { signal: abort.signal } : {}),
       ...(abort.reclaimOnAbort ? { reclaimOnAbort: abort.reclaimOnAbort } : {}),
+      // The session's placement: the run's sandbox, and every one it is rebuilt as, keeps it.
+      ...(run.nodeLabels ? { nodeLabels: run.nodeLabels } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
     // The handle is built here, as on the adopt path: the provider's carries a Hands
@@ -522,6 +526,8 @@ export async function createAppReaderSandbox(
       ...(abort.signal ? { signal: abort.signal } : {}),
       // A reader is nobody's to adopt: whatever cut its wait short, it is stopped.
       reclaimOnAbort: () => true,
+      // In the session's placement too: it is a sandbox of the session like any other.
+      ...(run.nodeLabels ? { nodeLabels: run.nodeLabels } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.reader_created");
     return { instance: appSandboxInstance(run, inst.id), workloadId: inst.id, created: true };

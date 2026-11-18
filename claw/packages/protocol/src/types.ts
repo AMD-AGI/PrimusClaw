@@ -5,6 +5,7 @@ import type { RunTimeReport } from "./run-time.js";
 
 import type { EnvironmentTopology } from "./topology.js";
 import type { SessionRepo } from "./session-repo.js";
+import type { SandboxPlacement } from "./sandbox-placement.js";
 
 /** The reasoning efforts every provider Brain speaks to accepts under the same name. */
 export const REASONING_EFFORTS = ["low", "medium", "high"] as const;
@@ -564,6 +565,13 @@ export interface ExecuteRequest {
    * is exactly what it was before the field existed.
    */
   repo?: SessionRepo;
+  /**
+   * Where this session's sandboxes may be scheduled (`placement` at session create). Brain sends
+   * `nodeLabels` to SaFE as the workload's `customerLabels` on every sandbox it creates for the run,
+   * so a sandbox rebuilt later in the session keeps the constraint. Absent means no constraint, and
+   * the workload request is exactly what it was before the field existed.
+   */
+  placement?: SandboxPlacement;
   /** Per-session (request-level) environment variables from the POST body; highest precedence in the sandbox env merge chain, validated against `isUserEnvKeyAllowed`. */
   session_env?: Record<string, string>;
   /** Local + marketplace skills available to this task; `files` holds optional sub-files (relative path -> content) under references/, templates/, scripts/, assets/, materialized onto the sandbox fs alongside SKILL.md. */

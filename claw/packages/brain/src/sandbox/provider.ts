@@ -47,6 +47,10 @@ export interface SandboxCreateParams {
   /** safe-workload: `false` creates the workload without the workspace's storage (SaFE's `useWorkspaceStorage`: no owner
    *  directory, no workspace volumes). Absent: SaFE's default, which mounts both. Sent only when false. */
   useWorkspaceStorage?: false;
+  /** safe-workload: node labels the workload requires (SaFE's `customerLabels`, a required node affinity), from the
+   *  session's `placement`. Absent or empty sends no `customerLabels` at all. Checked by the caller
+   *  (`placementNodeLabels`). */
+  nodeLabels?: Record<string, string>;
 }
 
 /** Handle to a provisioned sandbox, provider-agnostic. */

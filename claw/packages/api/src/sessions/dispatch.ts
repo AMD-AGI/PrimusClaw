@@ -34,6 +34,7 @@ import { admissionAskFor } from "../tasks/run-dispatch.js";
 import { stripRunSecrets } from "../tasks/run-spec.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
+import { sessionPlacementFromRow } from "./session-placement.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
 import { applySessionRoleToTask } from "../assistant/role-profile.js";
 import { applyTriggerToolsToTask } from "../triggers/mcp.js";
@@ -335,7 +336,7 @@ export async function dispatchTaskToBrain(
       task.sandbox_only = true;
     }
     const sessionMeta = (await db.query(
-      "SELECT parent_session_id, team_role, model, effort, config->'repo' AS repo FROM claw_sessions WHERE session_id = $1",
+      "SELECT parent_session_id, team_role, model, effort, config->'repo' AS repo, config->'placement' AS placement FROM claw_sessions WHERE session_id = $1",
       [sessionId],
     )).rows[0];
     if (sessionMeta?.parent_session_id) {
@@ -358,6 +359,10 @@ export async function dispatchTaskToBrain(
     // idle reclaim is a new one. No field at all for a session with no binding.
     const sessionRepo = sessionRepoFromRow(sessionMeta, sessionId);
     if (sessionRepo) task.repo = sessionRepo;
+    // Where the session's sandboxes may run, read now for the same reason: the sandbox this
+    // turn opens may be a rebuild, and it has to land where the first one was allowed to.
+    const sessionPlacement = sessionPlacementFromRow(sessionMeta, sessionId);
+    if (sessionPlacement) task.placement = sessionPlacement;
     // Names collide unhelpfully here: `workspace_id` above is the sandbox
     // namespace, this is the files. Brain gates concurrency on it, which is
     // what makes two runs over one directory queue instead of overwriting

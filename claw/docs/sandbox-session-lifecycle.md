@@ -321,3 +321,47 @@ No token is ever put in a URL, a command line or a log. The sandbox's global git
 `GH_TOKEN` at the moment git needs it, so a plain `git push` works afterwards. A clone or fetch that fails does
 not fail the run: the reason (secrets scrubbed) is written into the `[Repository]` block for the agent to
 relay. A clone has Hands' 100-second foreground limit; a repository that needs longer fails with that reason.
+
+## Placing a session's sandboxes on labelled nodes
+
+`POST /v1/sessions` accepts an optional top-level `placement`:
+
+```json
+{
+  "name": "release-test",
+  "placement": { "nodeLabels": { "autopilot.amd.com/preemptible": "false" } },
+  "message": {
+    "content": "...",
+    "workspaceId": "<workspace>",
+    "image": "<image>",
+    "resource": { "cpu": "8", "memory": "64Gi", "gpu": "8" },
+    "timeout": 43200
+  }
+}
+```
+
+Every sandbox the session creates then requires a node that carries every listed label. The example keeps
+a long run off nodes the platform may reclaim at short notice: in a workspace whose nodes are labelled
+`autopilot.amd.com/preemptible=true` or `=false`, the session's sandboxes are scheduled only on the `false`
+nodes, and wait in Pending when those are full rather than run on a `true` node.
+
+Each entry is sent to SaFE as the workload's `customerLabels`, which SaFE turns into a required node affinity
+(`<key> In [<value>]`). The placement is kept with the session (`config.placement`) and applied to every
+sandbox the session creates: the first turn's, a sandbox rebuilt after an idle reclaim or a lost container,
+a queued message's, a run reclaimed by another Brain, and the sandboxes of the session's tasks, DAG nodes and
+application runs. It cannot be changed after the session is created.
+
+| Rule | Refused with `400` and an `error` starting with `placement` |
+|---|---|
+| `placement` is an object whose only field is `nodeLabels`, an object of label key to label value | any other shape or field |
+| a key is a Kubernetes label key: an optional DNS-subdomain prefix and `/`, then a name of 1-63 characters, alphanumeric at both ends with `-`, `_` or `.` inside | anything else |
+| a value is one label value: a string of 1-63 characters, alphanumeric at both ends with `-`, `_` or `.` inside, no whitespace (SaFE would read `"a b"` as "a or b") | a number or boolean (send `"false"`, not `false`), an empty string, whitespace |
+| at most 8 entries | a ninth |
+| not a key the platform reads itself: `kubernetes.io/hostname`, `specified-nodes`, `excluded-nodes`, `autopilot.amd.com/w`, `safe-exec.amd.com/w`, or any key starting with `primus-safe.` (the workspace id label among them) | any of those |
+
+`placement` absent, `null`, `{}` or `{"nodeLabels": {}}` means no placement: nothing is stored and the workload
+request is exactly what it was before the field existed. `config.placement` is server-managed and refused
+when a client sends it. A deployment that creates sandboxes through the Kubernetes agent-sandbox backend
+(`CLAW_DEPLOY_MODE=kubernetes`) refuses a placement rather than ignore it. Brain checks the placement again
+before it creates a sandbox and fails the run with `sandbox_placement_invalid` instead of creating one
+without it.

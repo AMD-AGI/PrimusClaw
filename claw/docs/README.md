@@ -28,6 +28,7 @@ wins.
 | [`github-review.md`](github-review.md) | Reviewing and merging a public GitHub pull request with a named user's account: the tools, every gate, the high-risk hold and the acting user's confirmation, the diff-only fast path, audit and limits |
 | [`platform-access.md`](platform-access.md) | Requiring a platform role to use Claw at all: the setting, the 403 a client can show, which credentials bring roles |
 | [`run-api.md`](run-api.md) | Platform run status, terminal classification, batch reads, and cursor pagination |
+| [`sandbox-session-lifecycle.md`](sandbox-session-lifecycle.md) | A session's sandbox from create to reclaim, a session bound to a repository, and `placement.nodeLabels` for keeping its sandboxes on labelled nodes |
 | `architecture.drawio` | Editable source for the architecture diagram |
 
 ## Documents referenced from the code but not published here

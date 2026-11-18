@@ -163,6 +163,11 @@ export class SafeWorkloadProvider implements SandboxProvider {
       resources: params.resourcesArray ?? resourcesMapToWorkloadArray(params.resources),
       timeout,
       ...(params.useWorkspaceStorage === false ? { useWorkspaceStorage: false } : {}),
+      // The session's placement: each entry is a node label the sandbox's pod requires. Last,
+      // and only when there is one, so a session without one sends the body it always did.
+      ...(params.nodeLabels && Object.keys(params.nodeLabels).length > 0
+        ? { customerLabels: { ...params.nodeLabels } }
+        : {}),
     };
 
     const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads`, {

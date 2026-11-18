@@ -8,7 +8,7 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED, isKubernetesMode } from "../config.js";
 import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
 import { armFirstAck } from "../assistant/lookup-ack.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
@@ -59,7 +59,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { ZipArchive } from "archiver";
 import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
-import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
+import { handsSessionKey, parseSandboxPlacement, parseSessionRepo, putTerminalHold } from "@claw/protocol";
 import { toolsAllowlistProblem } from "../tasks/dags/admission.js";
 import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
@@ -1134,6 +1134,8 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       // (`assistant/review-items.ts`), from the authenticated caller. A session made here that carried them would
       // pass for a review the acting user was asked to make.
       ...REQUESTED_REVIEW_CONFIG_KEYS,
+      // Written below from the checked top-level `placement`, never taken from `config` unchecked.
+      "placement",
     ];
     const suppliedReservedKey = reservedConfigKeys.find((key) =>
       Object.prototype.hasOwnProperty.call(sessionConfig, key)
@@ -1152,6 +1154,25 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     const parsedRepo = parseSessionRepo(sessionConfig.repo);
     if (!parsedRepo.ok) {
       return reply.status(400).send({ ok: false, error: parsedRepo.error });
+    }
+
+    // Where the session's sandboxes may run: `placement.nodeLabels`, sent to SaFE as the
+    // workload's customerLabels on every sandbox this session creates. Checked here, before
+    // any row or run exists. Kept on the session (`config.placement`) because a sandbox is
+    // rebuilt after an idle reclaim or a lost container, and every rebuild must keep it.
+    // Absent, the config and every workload request are exactly what they were before.
+    const parsedPlacement = parseSandboxPlacement(body.placement);
+    if (!parsedPlacement.ok) {
+      return reply.status(400).send({ ok: false, error: parsedPlacement.error });
+    }
+    if (parsedPlacement.placement) {
+      // Only the SaFE workload backend has node labels to require; refused rather than ignored.
+      if (isKubernetesMode()) {
+        return reply.status(400).send({
+          ok: false, error: "placement is supported only when sandboxes are created through SaFE",
+        });
+      }
+      sessionConfig.placement = parsedPlacement.placement;
     }
 
     // `acting_as`, `review_target`, `review_only`, the model and the effort, and for a session that acts as a user the person's own
