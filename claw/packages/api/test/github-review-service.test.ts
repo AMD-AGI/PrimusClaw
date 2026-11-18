@@ -291,6 +291,8 @@ describe("D delegation and permissions", () => {
     assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     const o = await merge();
     assert.equal(o.body.status, "merged", o.text);
+    // The commit the merge made is kept on its audit row: the owner of a review that merged in its run is told it (N55).
+    assert.deepEqual((await e.sql("SELECT tool, merge_sha FROM claw_github_audit WHERE merge_sha IS NOT NULL")).map((r: any) => [r.tool, r.merge_sha]), [["gh_pr_merge", "m".repeat(40)]]);
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
     assert.equal(e.gh.calls.every((c) => c.authorization.includes(TOKEN)), true);
     assert.equal(e.gh.calls.some((c) => c.authorization.includes(REQUESTER_TOKEN)), false);
