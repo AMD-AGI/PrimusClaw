@@ -37,8 +37,11 @@ import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
 import { getOrCreateAssistant } from "./assistant.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
-import { queueRouterWake, tellUnwoken } from "./reports.js";
+import { queueRouterWake, reportPorts, tellUnwoken } from "./reports.js";
 import { freezeRequesterView } from "./requester-view.js";
+import { itemSession, personWritesChinese, storeGithubConfirmCard } from "./outbound.js";
+import { confirmationRef } from "./prompts.js";
+import { typedCommand } from "./typed-commands.js";
 import { checkConflictLater } from "./review-conflict.js";
 import { ciNamesOf, tellReviewResultLater } from "./review-result.js";
 import { REVIEW_QUESTIONS as RQ } from "./review-questions.js";
@@ -1586,14 +1589,16 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   let authorWaiting = false;
   let told: ReviewResult | null = null;
   let rerun: { sessionId: string; userId: string } | null = null;
+  let cards: Array<() => Promise<void>> = [];
   const woke = await inTransaction(async (query) => {
     needsYou = false;
     authorWaiting = false;
     told = null;
     rerun = null;
+    cards = [];
     const q = { query };
     const row = (await query(
-      `SELECT item_id, user_id, worker_session_id, params, kind, board_state, last_report_kind, summary, pending_question, generation, attention_seq
+      `SELECT item_id, seq, title, user_id, worker_session_id, params, kind, board_state, last_report_kind, summary, pending_question, generation, attention_seq
          FROM claw_work_items WHERE item_id = $1 AND kind = 'review' AND board_state <> 'done' FOR UPDATE`,
       [itemId],
     )).rows[0] as Record<string, unknown> | undefined;
@@ -1612,6 +1617,9 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
       }
       state = reviewState(facts);
     }
+    // What the owner's own review holds for them goes to their chat as a card, once per held write, whether or not the state changed
+    // (a new head's held merge reads as the same state).
+    if (state.boardState === "needs_you") cards = await storeHeldWriteCards(query, row, params);
     const reportKind = state.boardState === "needs_you" ? state.reportKind : state.boardState === "done" ? null : "progress";
     const question = state.boardState === "done" ? null : state.question;
     const summary = clipOneLine(state.summary, 80);
@@ -1666,6 +1674,7 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
       itemId, userId: row.user_id as string, eventId: Number(event.id), kind: state.reportKind, version: 0, summary: state.summary, question,
     });
   });
+  for (const announce of cards) await announce().catch((err) => logger.warn({ err, itemId }, "assistant.review_confirm_card_announce_failed"));
   if (woke?.status === "queued") await drainSessionIfIdle(woke.sessionId, woke.userId);
   else if (woke?.status === "refused") await tellUnwoken(itemId);
   const again = rerun as { sessionId: string; userId: string } | null;
@@ -1679,6 +1688,51 @@ export async function syncReviewItem(itemId: string): Promise<WorkItemView | nul
   if (told) tellReviewResultLater(itemId, told);
   const after = (await db.query("SELECT * FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0] as Record<string, unknown> | undefined;
   return after ? itemView(after) : null;
+}
+
+/**
+ * The cards for the merges and approvals a review the assistant started for its owner's own account holds for them now: one message
+ * carrying each pending confirmation of its session that asks the owner (`storeGithubConfirmCard`), its button the same decision as
+ * `approve #<ref>`. Without it the owner was told to press a card nobody drew (N54, 2026-11-18: Primus-SaFE#892's merge was held, the
+ * assistant said "press the card's button", and no card came). A review asked of someone else, or one a chat started over the route,
+ * is not one: the chat that started it draws the card for the reviewer itself. Stored in the caller's transaction, once per confirmation;
+ * the announces are for after the commit.
+ */
+async function storeHeldWriteCards(
+  query: Querier, row: Record<string, unknown>, params: ReviewParams,
+): Promise<Array<() => Promise<void>>> {
+  const userId = String(row.user_id);
+  const byAssistant = params.started_by_assistant === true || params.merge_needs_confirmation === true;
+  if (!byAssistant || params.requested_by || params.acting_as !== userId) return [];
+  const held = (await query(
+    `SELECT confirmation_id::text AS id, kind, repo, pr, expires_at FROM claw_github_confirmations
+      WHERE session_id = $1 AND actor_user_id = $2 AND status = 'pending' AND expires_at > NOW() ORDER BY created_at`,
+    [row.worker_session_id, userId],
+  )).rows as Array<{ id: string; kind: string; repo: string; pr: number; expires_at: Date | string }>;
+  if (!held.length) return [];
+  const where = await itemSession(query, String(row.item_id));
+  const zh = await personWritesChinese(query, userId, String(row.title ?? ""));
+  const lang = zh ? "zh" : "en";
+  const announces: Array<() => Promise<void>> = [];
+  for (const c of held) {
+    const merge = c.kind !== "review";
+    const ref = confirmationRef(c.id);
+    const allow = merge ? (zh ? "合入" : "Merge") : (zh ? "发出批准" : "Post the approval");
+    const pr = `${c.repo.split("/").pop()}#${c.pr}`;
+    const [approve, deny] = [typedCommand("approve", ref, lang), typedCommand("deny", ref, lang)];
+    const text = zh
+      ? `#${String(row.seq)} ${pr} ${merge ? "的合入" : "的批准"}在等你确认：点「${allow}」，或回复 ${approve}；不想${merge ? "合" : "批准"}就回复 ${deny}。`
+      : `#${String(row.seq)} ${merge ? "The merge" : "The approval"} of ${pr} waits for your confirmation: press "${allow}", or reply ${approve}; reply ${deny} to ${merge ? "not merge it" : "not approve it"}.`;
+    const stored = await storeGithubConfirmCard(query, {
+      userId, sessionId: where?.sessionId ?? null, text,
+      confirm: {
+        confirmation_id: c.id, ref, kind: merge ? "github_merge" : "github_review", allow_label: allow,
+        expires_at: new Date(c.expires_at).toISOString(),
+      },
+    }, reportPorts.sayDeps);
+    if (stored) announces.push(stored.announce);
+  }
+  return announces;
 }
 
 /** For a session whose turn ended or whose held write was answered: true when it is a review item's (synced), false when it is not. */

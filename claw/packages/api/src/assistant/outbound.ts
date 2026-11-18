@@ -992,7 +992,7 @@ export function withMovedPrefix(text: string): string {
  * was recorded goes to the current session, as before. A user with no assistant at all has only their channels (no session). Null when
  * the user's assistant has no session that is still there: nobody would read it.
  */
-async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean } | null> {
+export async function itemSession(q: Querier, itemId: string): Promise<{ sessionId: string | null; moved: boolean } | null> {
   const row = (await q(
     `SELECT w.router_session_id AS own, a.session_id AS current,
             EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = w.router_session_id AND s.deleted_at IS NULL) AS own_live,
@@ -1220,6 +1220,24 @@ export async function recordWriteConfirm(
   // shown, and read as no card because its event named no turn). Only the event: the delivery's payload, which `turnFirstSay` matches
   // a later say against, is unchanged.
   return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps, input.turnMessageId) };
+}
+
+/**
+ * A merge or an approval that a review the assistant started for the user's own account holds for them (`claw_github_confirmations`,
+ * `review-items.ts`): the system's message saying so, carrying the confirmation for a channel to draw as a card whose button answers it
+ * as `approve #<ref>` does (`POST /v1/assistant/confirmations/:id/decision`). Stored in the caller's transaction, as a fallback, once per
+ * confirmation: `null` when it was stored before. `announce` after the commit.
+ */
+export async function storeGithubConfirmCard(
+  q: Querier, input: { userId: string; sessionId: string | null; text: string; confirm: AssistantConfirmWrite }, deps: SayDeps = {},
+): Promise<{ sayId: string; subscribers: number; announce: () => Promise<void> } | null> {
+  const stored = await store(q, {
+    type: "assistant.say", fallback: true, item: null, confirmWrite: input.confirm,
+    sayId: deterministicEventId("assistant.github_confirm", input.userId, input.confirm.confirmation_id),
+    userId: input.userId, sessionId: input.sessionId, text: input.text,
+  });
+  if (!stored) return null;
+  return { sayId: stored.sayId, subscribers: stored.subscribers, announce: () => announce(stored, deps) };
 }
 
 /**

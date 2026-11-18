@@ -81,9 +81,11 @@ export interface AssistantConfirmWrite {
   /**
    * `devenv_send`: an instruction for an agent on the person's own machine (`assistant/devenv-tools.ts`). `skill_save`: a personal skill
    * the assistant drafted on its own, saved only when the person lets it through (`assistant/skill-writes.ts`); its message carries
-   * `skill_card` with what would be saved.
+   * `skill_card` with what would be saved. `github_merge` and `github_review`: a merge, or an approval, that a review the assistant
+   * started for the person's own account holds for them (`claw_github_confirmations`, `assistant/review-items.ts`); the same decision
+   * route answers it, and it is made exactly as `POST /v1/github-review/confirmations/{confirmation_id}/decision` makes it.
    */
-  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save";
+  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save" | "github_merge" | "github_review";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;

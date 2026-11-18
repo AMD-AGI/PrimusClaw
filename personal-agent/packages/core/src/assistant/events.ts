@@ -27,6 +27,8 @@ export const CONFIRM_KINDS = [
   "github_comment",
   "devenv_hide",
   "skill_save",
+  "github_merge",
+  "github_review",
 ] as const;
 
 /** The default replies under what the assistant said: (what the button says, what it sends). */

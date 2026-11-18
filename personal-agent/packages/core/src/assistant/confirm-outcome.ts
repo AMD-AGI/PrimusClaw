@@ -178,10 +178,43 @@ export function skillSaveOutcome(status: string, out: Fields, lang: Lang): strin
   return s.refused({ why: or(result["message"], or(result["error"], status)) });
 }
 
+/** A merge or an approval a review holds (`github_merge`, `github_review`). */
+export function isGithubWrite(kind: string): boolean {
+  return kind === "github_merge" || kind === "github_review";
+}
+
+/**
+ * What came of a press on a merge's or an approval's card: Claw's answer to the review's own decision
+ * (`POST /v1/github-review/confirmations/:id/decision`: `merged`, `queued`, `submitted`, `denied`, `stale`, `expired`, `refused`, `retry`).
+ */
+export function githubWriteOutcome(kind: string, out: Fields, lang: Lang): string {
+  const t = assistantActionText.in(lang);
+  const merge = kind === "github_merge";
+  switch (or(out["status"], "")) {
+    case "merged":
+      return t.githubMerged;
+    case "queued":
+      return t.githubQueued;
+    case "submitted":
+      return t.githubApproved;
+    case "denied":
+      return merge ? t.githubNotMerged : t.githubNotApproved;
+    case "stale":
+      return t.githubStale;
+    case "expired":
+      return t.expired;
+    case "retry":
+      return t.githubRetry;
+    default:
+      return t.notDone({ why: or(out["reason"], or(out["status"], "?")) });
+  }
+}
+
 /** What came of a press on a held write's card of `kind`, in one line: Claw's answer said plainly. */
 export function confirmOutcome(kind: string, out: Fields, lang: Lang): string {
   const t = assistantActionText.in(lang);
   const status = or(out["status"], "");
+  if (isGithubWrite(kind)) return githubWriteOutcome(kind, out, lang);
   const create = kind === "trigger_create";
   if (kind === "devenv_send") return devenvSendOutcome(status, out, lang);
   if (kind === "devenv_hide") return devenvHideOutcome(status, out, lang);
