@@ -117,6 +117,13 @@ release version, and its `appVersion` stays `latest`.
   it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
+- Personal agent: the worker's `inbound message` line for a Teams activity also says when the client sent the message:
+  `client_ts` (the activity's `localTimestamp`, the client's own clock with its zone offset), `server_ts` (the activity's
+  `timestamp`, or in a 1:1 chat the time its message id encodes), `client_lag_raw_ms` (the second less the first, as
+  measured) and `client_lag_ms` (the same lag, only when it lies between 0 and 24 hours; otherwise the two clocks disagree
+  and only the raw value is logged), and `client_msg_id` when the client put its own message id in `channelData`. A
+  message that reaches the bot late can now be told apart: a large `client_lag_ms` means the client held it, a small one
+  that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it.
 
 ### Fixed
 
